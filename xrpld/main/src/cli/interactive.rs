@@ -467,7 +467,7 @@ pub fn run(url: &str) {
                         from_history = false;
                     }
                     KeyCode::Up => {
-                        if from_history || (input.is_empty() && !history.is_empty()) {
+                        if !history.is_empty() {
                             let idx = match history_idx {
                                 Some(i) if i > 0 => i - 1,
                                 Some(i) => i,
@@ -476,12 +476,6 @@ pub fn run(url: &str) {
                             history_idx = Some(idx);
                             input = history[idx].clone();
                             from_history = true;
-                        } else if !filtered.is_empty() {
-                            selected = if selected == 0 {
-                                filtered.len() - 1
-                            } else {
-                                selected - 1
-                            };
                         }
                     }
                     KeyCode::Down => {
@@ -495,12 +489,21 @@ pub fn run(url: &str) {
                                 input.clear();
                                 from_history = false;
                             }
-                        } else if !filtered.is_empty() {
-                            selected = (selected + 1) % filtered.len();
                         }
                     }
                     KeyCode::Tab => {
                         if !filtered.is_empty() {
+                            selected = (selected + 1) % filtered.len();
+                            input = filtered[selected].name.to_string();
+                        }
+                    }
+                    KeyCode::BackTab => {
+                        if !filtered.is_empty() {
+                            selected = if selected == 0 {
+                                filtered.len() - 1
+                            } else {
+                                selected - 1
+                            };
                             input = filtered[selected].name.to_string();
                         }
                     }

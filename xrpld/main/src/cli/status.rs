@@ -38,8 +38,13 @@ pub fn run(url: &str) {
             println!();
             super::kv("Server State", state);
             let seq = info["validated_ledger"]["seq"].as_u64().unwrap_or(0);
-            super::kv("Validated", &super::format_number(seq));
-            super::kv("Complete", info["complete_ledgers"].as_str().unwrap_or("?"));
+            let validated = if seq > 0 {
+                super::format_number(seq)
+            } else {
+                "—".to_string()
+            };
+            super::kv("Validated", &validated);
+            super::kv("Complete", info["complete_ledgers"].as_str().unwrap_or("—"));
             let uptime = info["uptime"].as_u64().unwrap_or(0);
             let uptime_str = if uptime >= 3600 {
                 format!("{}h {}m", uptime / 3600, (uptime % 3600) / 60)
@@ -63,7 +68,7 @@ pub fn run(url: &str) {
                 "Queue",
                 &format!("{}", info["txn_queue_size"].as_u64().unwrap_or(0)),
             );
-            super::kv("Node Size", info["node_size"].as_str().unwrap_or("?"));
+            super::kv("Node Size", info["node_size"].as_str().unwrap_or("—"));
         }
         Err(e) => {
             eprintln!(
