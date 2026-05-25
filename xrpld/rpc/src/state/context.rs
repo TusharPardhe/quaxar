@@ -2451,10 +2451,9 @@ impl RpcRuntime for ApplicationRoot {
         self.overlay_runtime()
             .as_ref()
             .map(|o| {
-                let peers: Vec<JsonValue> = o.overlay().active_peers_snapshot().iter().map(|p| {
-                    p.json()
-                }).collect();
-                protocol::json!({ "peers": peers })
+                let peers = o.overlay().active_peers();
+                let arr: Vec<JsonValue> = peers.iter().map(|p| p.json()).collect();
+                protocol::json!({ "peers": arr })
             })
             .unwrap_or_else(|| protocol::json!({ "peers": [] }))
     }
