@@ -2450,7 +2450,12 @@ impl RpcRuntime for ApplicationRoot {
     fn peers_get(&self) -> JsonValue {
         self.overlay_runtime()
             .as_ref()
-            .map(|o| o.overlay().json())
+            .map(|o| {
+                let peers: Vec<JsonValue> = o.overlay().active_peers_snapshot().iter().map(|p| {
+                    p.json()
+                }).collect();
+                protocol::json!({ "peers": peers })
+            })
             .unwrap_or_else(|| protocol::json!({ "peers": [] }))
     }
 
