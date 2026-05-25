@@ -612,21 +612,23 @@ impl Peer for PeerImp {
                 JsonValue::String(self.node_public.to_node_public_base58()),
             ),
             (
-                "remote".to_owned(),
+                "address".to_owned(),
                 JsonValue::String(self.remote_address.to_string()),
             ),
             (
-                "cluster".to_owned(),
-                JsonValue::Bool(self.clustered.load(Ordering::Relaxed)),
+                "latency".to_owned(),
+                JsonValue::Unsigned(self.latency_ms.load(Ordering::Relaxed) as u64),
             ),
             (
-                "fixed".to_owned(),
-                JsonValue::Bool(self.fixed.load(Ordering::Relaxed)),
+                "version".to_owned(),
+                JsonValue::String(format!(
+                    "{}",
+                    self.protocol_version
+                        .read()
+                        .expect("peer protocol version lock")
+                )),
             ),
-            (
-                "reserved".to_owned(),
-                JsonValue::Bool(self.reserved.load(Ordering::Relaxed)),
-            ),
+            ("inbound".to_owned(), JsonValue::Bool(self.inbound)),
         ]))
     }
 
