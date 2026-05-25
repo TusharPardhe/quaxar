@@ -4,6 +4,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use overlay::Overlay;
+
 use basics::{
     base_uint::{Uint160, Uint256},
     chrono::NetClockTimePoint,
@@ -235,6 +237,17 @@ impl<V: AppServerInfoView> LedgerClosedSource for ApplicationServerInfo<V> {
 impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
     fn app(&self) -> Option<&ApplicationRoot> {
         self.view.app()
+    }
+
+    fn peers_get(&self) -> JsonValue {
+        self.view
+            .app()
+            .and_then(|app| app.overlay_runtime())
+            .map(|o| {
+                let peers = o.overlay().peers_json();
+                protocol::json!({ "peers": peers })
+            })
+            .unwrap_or_else(|| protocol::json!({ "peers": [] }))
     }
 
     fn network_ops_runtime(&self) -> Option<std::sync::Arc<app::AppNetworkOpsRuntime>> {
