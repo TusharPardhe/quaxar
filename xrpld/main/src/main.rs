@@ -2924,6 +2924,12 @@ fn run_acquisition_thread(
                 &mut |peer| peer.has_ledger(acq_hash, seq),
                 &mut |peer| newly_added.push(Arc::clone(peer)),
             );
+            // Fallback: if no peers claim to have the ledger, send blind requests
+            if newly_added.is_empty() {
+                peer_set.add_peers(PEER_COUNT_START, &mut |_peer| true, &mut |peer| {
+                    newly_added.push(Arc::clone(peer))
+                });
+            }
             for peer in &newly_added {
                 let peer_ref = peer.clone();
                 let mut send_fn = |msg: overlay::ProtocolMessage| {
