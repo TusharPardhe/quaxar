@@ -52,13 +52,7 @@ pub fn run(url: &str) {
             "    {}",
             console::Style::new()
                 .dim()
-                .apply_to("Node is idle — no ledger acquisition in progress.")
-        );
-        println!(
-            "    {}",
-            console::Style::new()
-                .dim()
-                .apply_to("Stats populate once the node begins syncing.")
+                .apply_to("Cache is cold — data flows directly to NuDB on disk."),
         );
     }
 }

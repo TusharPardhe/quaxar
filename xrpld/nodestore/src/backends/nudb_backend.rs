@@ -2509,7 +2509,9 @@ fn write_u64_be(bytes: &mut [u8], offset: &mut usize, value: u64) {
 
 fn write_u48_be(bytes: &mut [u8], offset: &mut usize, value: u64) -> Result<(), String> {
     if value > NUDB_U48_MAX {
-        return Err("NuDB 48-bit value overflow".to_owned());
+        return Err(format!(
+            "NuDB 48-bit value overflow: {value} (0x{value:016X})"
+        ));
     }
     bytes[*offset..*offset + 6].copy_from_slice(&[
         ((value >> 40) & 0xff) as u8,
@@ -2526,7 +2528,9 @@ fn write_u48_be(bytes: &mut [u8], offset: &mut usize, value: u64) -> Result<(), 
 #[allow(dead_code)]
 fn write_u48_be_to_writer(writer: &mut dyn Write, value: u64) -> Result<(), String> {
     if value > NUDB_U48_MAX {
-        return Err("NuDB 48-bit value overflow".to_owned());
+        return Err(format!(
+            "NuDB 48-bit value overflow: {value} (0x{value:016X})"
+        ));
     }
     let bytes = [
         ((value >> 40) & 0xff) as u8,
