@@ -200,7 +200,7 @@ impl<A: RclValidationsAdapter> RclValidations<A> {
         }
 
         if !validation.trusted {
-            tracing::warn!(target: "consensus", signer = %node_id, "Untrusted validation dropped");
+            tracing::debug!(target: "consensus", signer = %node_id, "Untrusted validation dropped");
         }
 
         let seq = validation.seq;
