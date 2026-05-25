@@ -396,7 +396,11 @@ pub fn run(url: &str) {
     // Record the prompt row (current cursor position)
     let mut prompt_row = cursor::position().map(|(_, r)| r).unwrap_or(12);
 
-    terminal::enable_raw_mode().expect("Failed to enable raw mode");
+    terminal::enable_raw_mode().unwrap_or_else(|e| {
+        eprintln!("    Cannot enter interactive mode: {e}");
+        eprintln!("    Use individual commands instead (e.g. xrpld status)");
+        std::process::exit(1);
+    });
     let mut stdout = stdout();
     let _ = execute!(stdout, cursor::Hide);
 
@@ -566,7 +570,9 @@ pub fn run(url: &str) {
                         println!();
                         // Update prompt_row to current cursor position after output
                         prompt_row = cursor::position().map(|(_, r)| r).unwrap_or(prompt_row);
-                        terminal::enable_raw_mode().expect("Failed to re-enable raw mode");
+                        if terminal::enable_raw_mode().is_err() {
+                            return;
+                        }
                         let _ = execute!(stdout, cursor::Hide);
                         input.clear();
                         selected = 0;
