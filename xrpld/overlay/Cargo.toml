@@ -1,0 +1,34 @@
+[package]
+name = "overlay"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "overlay"
+path = "src/lib.rs"
+
+[dependencies]
+xrpld-metrics = { path = "../metrics" }
+basics = { path = "../../xrpl/basics" }
+protocol = { path = "../../xrpl/protocol" }
+resource = { path = "../../xrpl/resource" }
+xrpl_core = { path = "../../xrpl/core" }
+http = "1"
+lz4_flex = "0.11"
+openssl = { version = "0.10", features = ["vendored"] }
+prost = "0.13"
+serde_json = "1"
+rand = "0.8"
+tracing = "0.1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-openssl = "0.6"
+tokio-rustls = "0.26"
+rustls = "0.23"
+
+[dev-dependencies]
+rcgen = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"

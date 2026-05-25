@@ -1,0 +1,18 @@
+[package]
+name = "xrpld_core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "xrpld_core"
+path = "src/lib.rs"
+
+[dependencies]
+basics = { path = "../../xrpl/basics" }
+ipnet = "2"
+protocol = { path = "../../xrpl/protocol" }
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"

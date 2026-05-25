@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "xrpl/basics",
+    "xrpl/core",
+    "xrpl/resource",
+    "xrpl/protocol",
+    "xrpl/shamap",
+    "xrpld/app",
+    "xrpld/consensus",
+    "xrpld/core",
+    "xrpld/perflog",
+    "xrpld/ledger",
+    "xrpld/nodestore",
+    "xrpld/overlay",
+    "xrpld/rdb",
+    "xrpld/server",
+    "xrpld/rpc",
+    "xrpld/rpc-integration-tests",
+    "xrpld/tx",
+    "xrpld/main",
+    "xrpld/replay-test",
+    "xrpld/metrics",
+]
+resolver = "2"

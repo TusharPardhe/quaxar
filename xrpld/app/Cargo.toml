@@ -1,0 +1,45 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "app"
+path = "src/lib.rs"
+
+[dependencies]
+tracing = "0.1"
+xrpld-metrics = { path = "../metrics" }
+parking_lot = "0.12"
+basics = { path = "../../xrpl/basics" }
+bs58 = "0.5"
+consensus = { path = "../consensus" }
+http = "1"
+libc = "0.2"
+ipnet = "2"
+ledger = { path = "../ledger" }
+nodestore = { path = "../nodestore" }
+rdb = { path = "../rdb" }
+overlay = { path = "../overlay" }
+perflog = { path = "../perflog" }
+protocol = { path = "../../xrpl/protocol" }
+resource = { path = "../../xrpl/resource" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+rusqlite = { version = "0.31", features = ["bundled"] }
+secp256k1 = "0.31"
+serde_json = "1"
+shamap = { path = "../../xrpl/shamap" }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "signal", "time", "fs"] }
+tokio-util = "0.7"
+time = "0.3"
+tx = { path = "../tx" }
+webpki-roots = "1"
+xrpl_core = { path = "../../xrpl/core" }
+xrpld_core = { path = "../core" }
+
+[dev-dependencies]
+tempfile = "3"

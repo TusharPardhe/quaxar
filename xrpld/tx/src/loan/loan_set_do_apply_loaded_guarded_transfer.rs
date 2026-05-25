@@ -1,0 +1,632 @@
+//! Current Rust helper mirroring the higher
+//! the LoanSet transactor shell after the front ledger state is loaded and
+//! before borrower-reserve and transfer side effects begin.
+//!
+//! This module preserves the deterministic behavior around:
+//!
+//! - reading `AssetsAvailable`, `AssetsTotal`, `getAssetsTotalScale(...)`, and
+//!   the loaded broker management-fee rate through the landed helper,
+//! - reading `DebtTotal`, `DebtMaximum`, `CoverRateMinimum`, and
+//!   `CoverAvailable` only after the derived loan state exists,
+//! - computing `newDebtTotal` from loaded broker debt plus
+//!   `principalRequested + interestDue`, and
+//! - delegating into the landed guarded-transfer shell with the first failing
+//!   `TER` returned unchanged.
+
+use std::{fmt::Display, ops::Add};
+
+use protocol::Ter;
+
+use crate::loan_set_do_apply_loaded_pre_guarded_transfer::{
+    LoanSetDoApplyLoadedPreGuardedTransferBroker, LoanSetDoApplyLoadedPreGuardedTransferVault,
+    load_loan_set_do_apply_loaded_pre_guarded_transfer_derived,
+};
+use crate::{
+    LoanSetDoApplyPreGuardedTransferProperties, LoanSetDoApplyPreGuardedTransferState,
+    LoanSetDoApplyPreGuardedTransferTx, LoanSetRepresentabilityField,
+    check_loan_set_do_apply_computed_values, check_loan_set_do_apply_cover_rate_minimum,
+    check_loan_set_do_apply_debt_maximum, check_loan_set_do_apply_representability,
+    check_loan_set_do_apply_vault_available, check_loan_set_do_apply_vault_maximum,
+    run_loan_set_do_apply_check_loan_guards,
+};
+
+pub trait LoanSetDoApplyLoadedGuardedTransferBroker:
+    LoanSetDoApplyLoadedPreGuardedTransferBroker
+{
+    type Amount;
+    type CoverRate: Copy;
+
+    fn debt_total(&self) -> &Self::Amount;
+    fn debt_maximum(&self) -> &Self::Amount;
+    fn cover_available(&self) -> &Self::Amount;
+    fn cover_rate_minimum(&self) -> Self::CoverRate;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_loan_set_do_apply_loaded_guarded_transfer<
+    Tx,
+    Broker,
+    Vault,
+    Asset,
+    Amount,
+    InterestRate,
+    Properties,
+    State,
+    ComputeVaultScale,
+    ComputeLoanProperties,
+    ConstructLoanState,
+    CanRepresent,
+    CheckLoanGuards,
+    ComputeRequiredCover,
+    RunTransferAndPostTransfer,
+>(
+    tx: &Tx,
+    broker: &Broker,
+    vault: &Vault,
+    vault_asset: &Asset,
+    default_interest_rate: InterestRate,
+    default_payment_interval: u32,
+    default_payment_total: u32,
+    zero: &Amount,
+    compute_vault_scale: ComputeVaultScale,
+    compute_loan_properties: ComputeLoanProperties,
+    construct_loan_state: ConstructLoanState,
+    can_represent: CanRepresent,
+    check_loan_guards: CheckLoanGuards,
+    compute_required_cover: ComputeRequiredCover,
+    run_transfer_and_post_transfer: RunTransferAndPostTransfer,
+) -> Ter
+where
+    Tx: LoanSetDoApplyPreGuardedTransferTx<Amount = Amount, InterestRate = InterestRate>,
+    Broker: LoanSetDoApplyLoadedGuardedTransferBroker<Amount = Amount>,
+    Vault: LoanSetDoApplyLoadedPreGuardedTransferVault<Amount = Amount>,
+    Amount: Clone
+        + Display
+        + PartialEq
+        + PartialOrd
+        + Add<Output = Amount>
+        + std::ops::Sub<Output = Amount>,
+    InterestRate: Copy + PartialEq,
+    Properties: LoanSetDoApplyPreGuardedTransferProperties<Amount = Amount>,
+    State: LoanSetDoApplyPreGuardedTransferState<Amount = Amount>,
+    ComputeVaultScale: FnOnce(&Vault) -> i32,
+    ComputeLoanProperties: FnOnce(
+        &Asset,
+        &Amount,
+        InterestRate,
+        u32,
+        u32,
+        Broker::ManagementFeeRate,
+        i32,
+    ) -> Properties,
+    ConstructLoanState: FnOnce(&Amount, &Amount, &Amount) -> State,
+    CanRepresent: FnMut(LoanSetRepresentabilityField, &Tx::Value) -> bool,
+    CheckLoanGuards: FnOnce(&Asset, &Amount, bool, u32, &Properties) -> Ter,
+    ComputeRequiredCover: FnOnce(&Amount, Broker::CoverRate) -> Amount,
+    RunTransferAndPostTransfer: FnOnce() -> Ter,
+{
+    let derived = load_loan_set_do_apply_loaded_pre_guarded_transfer_derived(
+        tx,
+        broker,
+        vault,
+        vault_asset,
+        default_interest_rate,
+        default_payment_interval,
+        default_payment_total,
+        compute_vault_scale,
+        compute_loan_properties,
+        construct_loan_state,
+    );
+
+    if let Err(err) = check_loan_set_do_apply_vault_available(
+        derived.vault_available,
+        derived.pre_guarded.principal_requested,
+    ) {
+        return err.ter();
+    }
+
+    if let Err(err) = check_loan_set_do_apply_vault_maximum(
+        derived.vault_maximum,
+        derived.vault_total,
+        derived.pre_guarded.state.interest_due(),
+        zero,
+    ) {
+        return err.ter();
+    }
+
+    if let Err(err) = check_loan_set_do_apply_representability(
+        tx,
+        derived.pre_guarded.properties.total_value_outstanding(),
+        derived.pre_guarded.properties.loan_scale(),
+        can_represent,
+    ) {
+        return err.ter();
+    }
+
+    let loan_guards_result = run_loan_set_do_apply_check_loan_guards(
+        vault_asset,
+        derived.pre_guarded.principal_requested,
+        derived.pre_guarded.interest_rate != default_interest_rate,
+        derived.pre_guarded.payment_total,
+        &derived.pre_guarded.properties,
+        check_loan_guards,
+    );
+    if loan_guards_result != Ter::TES_SUCCESS {
+        return loan_guards_result;
+    }
+
+    if let Err(err) =
+        check_loan_set_do_apply_computed_values(&derived.pre_guarded.computed_values, zero)
+    {
+        return err.ter();
+    }
+
+    let new_debt_delta = derived.pre_guarded.principal_requested.clone()
+        + derived.pre_guarded.state.interest_due().clone();
+    let new_debt_total = broker.debt_total().clone() + new_debt_delta;
+
+    if let Err(err) =
+        check_loan_set_do_apply_debt_maximum(broker.debt_maximum(), &new_debt_total, zero)
+    {
+        return err.ter();
+    }
+
+    if let Err(err) = check_loan_set_do_apply_cover_rate_minimum(
+        broker.cover_available(),
+        &new_debt_total,
+        broker.cover_rate_minimum(),
+        compute_required_cover,
+    ) {
+        return err.ter();
+    }
+
+    run_transfer_and_post_transfer()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+
+    use protocol::{Ter, trans_token};
+
+    use super::{
+        LoanSetDoApplyLoadedGuardedTransferBroker, run_loan_set_do_apply_loaded_guarded_transfer,
+    };
+    use crate::{
+        LoanSetDoApplyLoadedPreGuardedTransferVault, LoanSetDoApplyPreGuardedTransferProperties,
+        LoanSetDoApplyPreGuardedTransferState, LoanSetDoApplyPreGuardedTransferTx,
+        LoanSetDoApplyRepresentabilityTx, LoanSetRepresentabilityField,
+    };
+
+    struct TestTx {
+        principal_requested: i64,
+        interest_rate: Option<u32>,
+        payment_interval: Option<u32>,
+        payment_total: Option<u32>,
+        values: BTreeMap<LoanSetRepresentabilityField, &'static str>,
+    }
+
+    impl LoanSetDoApplyRepresentabilityTx for TestTx {
+        type Value = &'static str;
+
+        fn value(&self, field: LoanSetRepresentabilityField) -> Option<&Self::Value> {
+            self.values.get(&field)
+        }
+    }
+
+    impl LoanSetDoApplyPreGuardedTransferTx for TestTx {
+        type Amount = i64;
+        type InterestRate = u32;
+
+        fn principal_requested(&self) -> &Self::Amount {
+            &self.principal_requested
+        }
+
+        fn interest_rate(&self) -> Option<Self::InterestRate> {
+            self.interest_rate
+        }
+
+        fn payment_interval(&self) -> Option<u32> {
+            self.payment_interval
+        }
+
+        fn payment_total(&self) -> Option<u32> {
+            self.payment_total
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestProperties {
+        loan_scale: i32,
+        total_value_outstanding: i64,
+        management_fee_due: i64,
+        periodic_payment: i64,
+    }
+
+    impl LoanSetDoApplyPreGuardedTransferProperties for TestProperties {
+        type Amount = i64;
+
+        fn loan_scale(&self) -> i32 {
+            self.loan_scale
+        }
+
+        fn total_value_outstanding(&self) -> &Self::Amount {
+            &self.total_value_outstanding
+        }
+
+        fn management_fee_due(&self) -> &Self::Amount {
+            &self.management_fee_due
+        }
+
+        fn periodic_payment(&self) -> &Self::Amount {
+            &self.periodic_payment
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TestState {
+        interest_due: i64,
+    }
+
+    impl LoanSetDoApplyPreGuardedTransferState for TestState {
+        type Amount = i64;
+
+        fn interest_due(&self) -> &Self::Amount {
+            &self.interest_due
+        }
+    }
+
+    struct TestBroker {
+        management_fee_rate: u16,
+        debt_total: i64,
+        debt_maximum: i64,
+        cover_available: i64,
+        cover_rate_minimum: u32,
+        steps: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl crate::LoanSetDoApplyLoadedPreGuardedTransferBroker for TestBroker {
+        type ManagementFeeRate = u16;
+
+        fn management_fee_rate(&self) -> Self::ManagementFeeRate {
+            self.steps
+                .borrow_mut()
+                .push("management_fee_rate".to_string());
+            self.management_fee_rate
+        }
+    }
+
+    impl LoanSetDoApplyLoadedGuardedTransferBroker for TestBroker {
+        type Amount = i64;
+        type CoverRate = u32;
+
+        fn debt_total(&self) -> &Self::Amount {
+            self.steps.borrow_mut().push("debt_total".to_string());
+            &self.debt_total
+        }
+
+        fn debt_maximum(&self) -> &Self::Amount {
+            self.steps.borrow_mut().push("debt_maximum".to_string());
+            &self.debt_maximum
+        }
+
+        fn cover_available(&self) -> &Self::Amount {
+            self.steps.borrow_mut().push("cover_available".to_string());
+            &self.cover_available
+        }
+
+        fn cover_rate_minimum(&self) -> Self::CoverRate {
+            self.steps
+                .borrow_mut()
+                .push("cover_rate_minimum".to_string());
+            self.cover_rate_minimum
+        }
+    }
+
+    struct TestVault {
+        assets_available: i64,
+        assets_total: i64,
+        assets_maximum: i64,
+        steps: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl LoanSetDoApplyLoadedPreGuardedTransferVault for TestVault {
+        type Amount = i64;
+
+        fn assets_available(&self) -> &Self::Amount {
+            self.steps.borrow_mut().push("assets_available".to_string());
+            &self.assets_available
+        }
+
+        fn assets_total(&self) -> &Self::Amount {
+            self.steps.borrow_mut().push("assets_total".to_string());
+            &self.assets_total
+        }
+
+        fn assets_maximum(&self) -> &Self::Amount {
+            self.steps.borrow_mut().push("assets_maximum".to_string());
+            &self.assets_maximum
+        }
+    }
+
+    fn valid_tx() -> TestTx {
+        TestTx {
+            principal_requested: 100,
+            interest_rate: Some(250),
+            payment_interval: Some(45),
+            payment_total: Some(9),
+            values: BTreeMap::from([
+                (LoanSetRepresentabilityField::PrincipalRequested, "100"),
+                (LoanSetRepresentabilityField::LoanOriginationFee, "5"),
+            ]),
+        }
+    }
+
+    fn valid_properties() -> TestProperties {
+        TestProperties {
+            loan_scale: 4,
+            total_value_outstanding: 1_250,
+            management_fee_due: 25,
+            periodic_payment: 150,
+        }
+    }
+
+    #[test]
+    fn loan_set_do_apply_loaded_guarded_transfer_uses_current_on_success() {
+        let steps = Rc::new(RefCell::new(Vec::new()));
+        let broker = TestBroker {
+            management_fee_rate: 12,
+            debt_total: 1_000,
+            debt_maximum: 2_000,
+            cover_available: 500,
+            cover_rate_minimum: 10_000,
+            steps: Rc::clone(&steps),
+        };
+        let vault = TestVault {
+            assets_available: 200,
+            assets_total: 100,
+            assets_maximum: 500,
+            steps: Rc::clone(&steps),
+        };
+
+        let result = run_loan_set_do_apply_loaded_guarded_transfer(
+            &valid_tx(),
+            &broker,
+            &vault,
+            &"USD",
+            0_u32,
+            30,
+            12,
+            &0_i64,
+            |vault| {
+                vault.steps.borrow_mut().push("vault_scale".to_string());
+                4
+            },
+            |asset, principal, interest, interval, total, management_fee_rate, scale| {
+                steps.borrow_mut().push(format!(
+                    "compute_properties={asset}:{principal}:{interest}:{interval}:{total}:{management_fee_rate}:{scale}"
+                ));
+                valid_properties()
+            },
+            |value_outstanding, principal, management_fee_due| {
+                steps.borrow_mut().push(format!(
+                    "construct_state={value_outstanding}:{principal}:{management_fee_due}"
+                ));
+                TestState { interest_due: 25 }
+            },
+            |field, _| {
+                steps
+                    .borrow_mut()
+                    .push(format!("representability={field:?}"));
+                true
+            },
+            |asset, principal, expect_interest, payment_total, properties| {
+                steps.borrow_mut().push(format!(
+                    "loan_guards={asset}:{principal}:{expect_interest}:{payment_total}:{}",
+                    properties.total_value_outstanding
+                ));
+                Ter::TES_SUCCESS
+            },
+            |new_debt_total, cover_rate_minimum| {
+                steps.borrow_mut().push(format!(
+                    "compute_required_cover={new_debt_total}:{cover_rate_minimum}"
+                ));
+                400_i64
+            },
+            || {
+                steps.borrow_mut().push("transfer_shell".to_string());
+                Ter::TES_SUCCESS
+            },
+        );
+
+        assert_eq!(result, Ter::TES_SUCCESS);
+        assert_eq!(
+            steps.borrow().as_slice(),
+            [
+                "assets_available",
+                "assets_total",
+                "vault_scale",
+                "management_fee_rate",
+                "compute_properties=USD:100:250:45:9:12:4",
+                "construct_state=1250:100:25",
+                "assets_maximum",
+                "representability=PrincipalRequested",
+                "representability=LoanOriginationFee",
+                "loan_guards=USD:100:true:9:1250",
+                "debt_total",
+                "debt_maximum",
+                "cover_available",
+                "cover_rate_minimum",
+                "compute_required_cover=1125:10000",
+                "transfer_shell",
+            ]
+        );
+    }
+
+    #[test]
+    fn loan_set_do_apply_loaded_guarded_transfer_returns_limit_exceeded_from_loaded_debt_maximum() {
+        let steps = Rc::new(RefCell::new(Vec::new()));
+        let broker = TestBroker {
+            management_fee_rate: 12,
+            debt_total: 1_100,
+            debt_maximum: 1_124,
+            cover_available: 500,
+            cover_rate_minimum: 10_000,
+            steps: Rc::clone(&steps),
+        };
+        let vault = TestVault {
+            assets_available: 200,
+            assets_total: 100,
+            assets_maximum: 500,
+            steps: Rc::clone(&steps),
+        };
+
+        let result = run_loan_set_do_apply_loaded_guarded_transfer(
+            &valid_tx(),
+            &broker,
+            &vault,
+            &"USD",
+            0_u32,
+            30,
+            12,
+            &0_i64,
+            |vault| {
+                vault.steps.borrow_mut().push("vault_scale".to_string());
+                4
+            },
+            |_, _, _, _, _, _, _| {
+                steps.borrow_mut().push("compute_properties".to_string());
+                valid_properties()
+            },
+            |_, _, _| {
+                steps.borrow_mut().push("construct_state".to_string());
+                TestState { interest_due: 25 }
+            },
+            |field, _| {
+                steps
+                    .borrow_mut()
+                    .push(format!("representability={field:?}"));
+                true
+            },
+            |_, _, _, _, _| {
+                steps.borrow_mut().push("loan_guards".to_string());
+                Ter::TES_SUCCESS
+            },
+            |_, _| {
+                steps
+                    .borrow_mut()
+                    .push("compute_required_cover".to_string());
+                400_i64
+            },
+            || {
+                steps.borrow_mut().push("transfer_shell".to_string());
+                Ter::TES_SUCCESS
+            },
+        );
+
+        assert_eq!(result, Ter::TEC_LIMIT_EXCEEDED);
+        assert_eq!(trans_token(result), "tecLIMIT_EXCEEDED");
+        assert_eq!(
+            steps.borrow().as_slice(),
+            [
+                "assets_available",
+                "assets_total",
+                "vault_scale",
+                "management_fee_rate",
+                "compute_properties",
+                "construct_state",
+                "assets_maximum",
+                "representability=PrincipalRequested",
+                "representability=LoanOriginationFee",
+                "loan_guards",
+                "debt_total",
+                "debt_maximum",
+            ]
+        );
+    }
+
+    #[test]
+    fn loan_set_do_apply_loaded_guarded_transfer_returns_insufficient_funds_from_loaded_cover() {
+        let steps = Rc::new(RefCell::new(Vec::new()));
+        let broker = TestBroker {
+            management_fee_rate: 12,
+            debt_total: 1_000,
+            debt_maximum: 2_000,
+            cover_available: 399,
+            cover_rate_minimum: 10_000,
+            steps: Rc::clone(&steps),
+        };
+        let vault = TestVault {
+            assets_available: 200,
+            assets_total: 100,
+            assets_maximum: 500,
+            steps: Rc::clone(&steps),
+        };
+
+        let result = run_loan_set_do_apply_loaded_guarded_transfer(
+            &valid_tx(),
+            &broker,
+            &vault,
+            &"USD",
+            0_u32,
+            30,
+            12,
+            &0_i64,
+            |vault| {
+                vault.steps.borrow_mut().push("vault_scale".to_string());
+                4
+            },
+            |_, _, _, _, _, _, _| {
+                steps.borrow_mut().push("compute_properties".to_string());
+                valid_properties()
+            },
+            |_, _, _| {
+                steps.borrow_mut().push("construct_state".to_string());
+                TestState { interest_due: 25 }
+            },
+            |field, _| {
+                steps
+                    .borrow_mut()
+                    .push(format!("representability={field:?}"));
+                true
+            },
+            |_, _, _, _, _| {
+                steps.borrow_mut().push("loan_guards".to_string());
+                Ter::TES_SUCCESS
+            },
+            |new_debt_total, cover_rate_minimum| {
+                steps.borrow_mut().push(format!(
+                    "compute_required_cover={new_debt_total}:{cover_rate_minimum}"
+                ));
+                400_i64
+            },
+            || {
+                steps.borrow_mut().push("transfer_shell".to_string());
+                Ter::TES_SUCCESS
+            },
+        );
+
+        assert_eq!(result, Ter::TEC_INSUFFICIENT_FUNDS);
+        assert_eq!(trans_token(result), "tecINSUFFICIENT_FUNDS");
+        assert_eq!(
+            steps.borrow().as_slice(),
+            [
+                "assets_available",
+                "assets_total",
+                "vault_scale",
+                "management_fee_rate",
+                "compute_properties",
+                "construct_state",
+                "assets_maximum",
+                "representability=PrincipalRequested",
+                "representability=LoanOriginationFee",
+                "loan_guards",
+                "debt_total",
+                "debt_maximum",
+                "cover_available",
+                "cover_rate_minimum",
+                "compute_required_cover=1125:10000",
+            ]
+        );
+    }
+}

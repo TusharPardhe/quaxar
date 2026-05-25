@@ -1,0 +1,18 @@
+[package]
+name = "consensus"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "consensus"
+path = "src/lib.rs"
+
+[dependencies]
+basics = { path = "../../xrpl/basics" }
+protocol = { path = "../../xrpl/protocol" }
+rand = "0.8"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time"] }
+time = "0.3"
+tracing = "0.1"

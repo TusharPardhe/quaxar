@@ -1,0 +1,16 @@
+[package]
+name = "perflog"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "perflog"
+path = "src/lib.rs"
+
+[dependencies]
+basics = { path = "../../xrpl/basics" }
+libc = "0.2"
+serde_json = "1"
+time = "0.3"
+tracing = "0.1"

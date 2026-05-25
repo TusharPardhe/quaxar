@@ -1,0 +1,16 @@
+[package]
+name = "shamap"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "shamap"
+path = "src/lib.rs"
+
+[dependencies]
+parking_lot = "0.12"
+basics = { path = "../basics" }
+sha2 = "0.10"
+time = "0.3"
+tracing = "0.1"

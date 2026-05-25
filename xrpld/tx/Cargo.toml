@@ -1,0 +1,18 @@
+[package]
+name = "tx"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "tx"
+path = "src/lib.rs"
+
+[dependencies]
+basics = { path = "../../xrpl/basics" }
+protocol = { path = "../../xrpl/protocol" }
+ledger = { path = "../ledger" }
+tracing = "0.1"
+xrpl_core = { path = "../../xrpl/core" }
+
+[dev-dependencies]

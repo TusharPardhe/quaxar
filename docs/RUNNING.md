@@ -1,0 +1,184 @@
+# Running xrpld
+
+Guide for node operators running the Rust implementation of the XRP Ledger server.
+
+## Hardware Requirements
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| CPU | 4 cores | 8+ cores |
+| RAM | 16 GB | 32 GB |
+| Disk | 500 GB NVMe SSD | 1 TB NVMe SSD |
+| Network | 100 Mbps | 1 Gbps |
+
+Disk usage grows over time with ledger history. NVMe is strongly recommended for NuDB performance.
+
+## Supported Platforms
+
+- Linux x86_64 (Ubuntu 22.04+, Debian 12+, RHEL 9+)
+- macOS arm64 (Apple Silicon)
+- macOS x86_64
+
+## Building from Source
+
+```bash
+# Install Rust toolchain (1.75+)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Clone and build
+git clone https://github.com/xrpl/rippled-rust-migration.git
+cd rippled-rust-migration
+cargo build --release -p xrpld-main
+```
+
+The binary is at `target/release/xrpld`.
+
+## Configuration
+
+Create a configuration file (e.g., `/etc/xrpld/xrpld.cfg`):
+
+```ini
+[server]
+port_rpc_admin
+port_peer
+port_ws_public
+
+[port_rpc_admin]
+port = 5005
+ip = 127.0.0.1
+protocol = http
+admin = 127.0.0.1
+
+[port_peer]
+port = 51235
+ip = 0.0.0.0
+protocol = peer
+
+[port_ws_public]
+port = 6006
+ip = 0.0.0.0
+protocol = ws
+
+[node_db]
+type = NuDB
+path = /var/lib/xrpld/db/nudb
+online_delete = 2000
+advisory_delete = 0
+
+[node_size]
+huge
+
+[ledger_history]
+full
+
+[validator_list_sites]
+https://vl.xrplf.org
+
+[validator_list_keys]
+ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
+
+[ips_fixed]
+s1.ripple.com 51235
+s2.ripple.com 51235
+```
+
+### Configuration Sections
+
+| Section | Purpose |
+|---------|---------|
+| `[server]` | Lists port definitions to activate |
+| `[port_*]` | Port binding: port number, IP, protocol (http/ws/peer), admin access |
+| `[node_db]` | Database backend (NuDB), path, deletion policy |
+| `[node_size]` | Memory tuning hint: tiny, small, medium, large, huge |
+| `[ledger_history]` | How much history to keep (number or `full`) |
+| `[validator_list_sites]` | URLs to fetch trusted validator lists |
+| `[validator_list_keys]` | Public keys of validator list publishers |
+| `[ips_fixed]` | Peer endpoints to always connect to |
+
+## Starting the Node
+
+```bash
+./xrpld --conf /path/to/xrpld.cfg
+```
+
+## Systemd Service
+
+Create `/etc/systemd/system/xrpld.service`:
+
+```ini
+[Unit]
+Description=XRP Ledger Node (Rust)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xrpld
+Group=xrpld
+ExecStart=/usr/local/bin/xrpld --conf /etc/xrpld/xrpld.cfg
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now xrpld
+```
+
+## Monitoring
+
+### Prometheus Metrics
+
+Metrics are exposed at the admin HTTP port:
+
+```
+GET http://127.0.0.1:5005/metrics
+```
+
+### Health Check
+
+```bash
+xrpld health
+# Exit code 0 = healthy, 1 = unhealthy
+```
+
+Or via RPC:
+
+```bash
+curl -s http://127.0.0.1:5005 -d '{"method":"server_info"}' | jq .result.info.server_state
+```
+
+Expected states: `full`, `proposing`, `validating`.
+
+## Log Management
+
+Control log verbosity with the `RUST_LOG` environment variable:
+
+```bash
+# Levels: error, warn, info, debug, trace
+RUST_LOG=info ./xrpld --conf /etc/xrpld/xrpld.cfg
+
+# Per-module control
+RUST_LOG=xrpld=info,consensus=debug,peer=warn ./xrpld --conf /etc/xrpld/xrpld.cfg
+```
+
+Change at runtime:
+
+```bash
+xrpld log-level debug
+```
+
+## Common Issues
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| OOM during sync | Insufficient RAM for state acquisition | Increase RAM to 32 GB or use `[node_size] medium` |
+| Slow sync | Spinning disk or limited bandwidth | Use NVMe SSD, ensure 100+ Mbps |
+| Port already in use | Another process on same port | Check with `lsof -i :51235`, change port in config |
+| Permission denied on DB path | Wrong file ownership | `chown -R xrpld:xrpld /var/lib/xrpld` |
+| No peers connecting | Firewall blocking port 51235 | Open TCP 51235 inbound |

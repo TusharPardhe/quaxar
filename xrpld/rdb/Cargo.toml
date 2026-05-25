@@ -1,0 +1,14 @@
+[package]
+name = "rdb"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "rdb"
+path = "src/lib.rs"
+
+[dependencies]
+protocol = { path = "../../xrpl/protocol" }
+basics = { path = "../../xrpl/basics" }
+rusqlite = { version = "0.31", features = ["bundled"] }

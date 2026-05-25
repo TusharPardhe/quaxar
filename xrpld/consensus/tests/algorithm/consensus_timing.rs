@@ -1,0 +1,401 @@
+use basics::chrono::NetClockTimePoint;
+use consensus::{
+    ConsensusParms, ConsensusState, DECREASE_LEDGER_TIME_RESOLUTION_EVERY,
+    INCREASE_LEDGER_TIME_RESOLUTION_EVERY, LEDGER_DEFAULT_TIME_RESOLUTION,
+    LEDGER_GENESIS_TIME_RESOLUTION, LEDGER_POSSIBLE_TIME_RESOLUTIONS, check_consensus,
+    effective_close_time, get_next_ledger_time_resolution, round_close_time, should_close_ledger,
+};
+use std::time::Duration as StdDuration;
+use time::Duration as TimeDuration;
+
+#[test]
+fn close_time_resolution_increase_and_decrease_schedule() {
+    assert_eq!(
+        get_next_ledger_time_resolution(
+            LEDGER_DEFAULT_TIME_RESOLUTION,
+            true,
+            INCREASE_LEDGER_TIME_RESOLUTION_EVERY
+        ),
+        LEDGER_POSSIBLE_TIME_RESOLUTIONS[1]
+    );
+    assert_eq!(
+        get_next_ledger_time_resolution(
+            LEDGER_DEFAULT_TIME_RESOLUTION,
+            false,
+            DECREASE_LEDGER_TIME_RESOLUTION_EVERY
+        ),
+        LEDGER_POSSIBLE_TIME_RESOLUTIONS[3]
+    );
+    assert_eq!(
+        get_next_ledger_time_resolution(
+            LEDGER_GENESIS_TIME_RESOLUTION,
+            true,
+            INCREASE_LEDGER_TIME_RESOLUTION_EVERY
+        ),
+        LEDGER_GENESIS_TIME_RESOLUTION
+    );
+    assert_eq!(
+        get_next_ledger_time_resolution(
+            *LEDGER_POSSIBLE_TIME_RESOLUTIONS.last().unwrap(),
+            false,
+            DECREASE_LEDGER_TIME_RESOLUTION_EVERY
+        ),
+        *LEDGER_POSSIBLE_TIME_RESOLUTIONS.last().unwrap()
+    );
+}
+
+#[test]
+fn round_close_time_midpoint_round_up_rule() {
+    let close_time = NetClockTimePoint::new(95);
+    assert_eq!(
+        round_close_time(close_time, TimeDuration::seconds(30)),
+        NetClockTimePoint::new(90)
+    );
+
+    let midpoint = NetClockTimePoint::new(75);
+    assert_eq!(
+        round_close_time(midpoint, TimeDuration::seconds(30)),
+        NetClockTimePoint::new(90)
+    );
+}
+
+#[test]
+fn effective_close_time_prior_close_floor() {
+    let raw = NetClockTimePoint::new(91);
+    let prior = NetClockTimePoint::new(95);
+    assert_eq!(
+        effective_close_time(raw, TimeDuration::seconds(10), prior),
+        NetClockTimePoint::new(96)
+    );
+
+    let later = NetClockTimePoint::new(125);
+    assert_eq!(
+        effective_close_time(later, TimeDuration::seconds(10), prior),
+        NetClockTimePoint::new(130)
+    );
+}
+
+#[test]
+fn should_close_ledger_reference_vectors() {
+    let parms = ConsensusParms::default();
+
+    assert!(should_close_ledger(
+        true,
+        10,
+        10,
+        10,
+        StdDuration::from_secs(10 * 60 + 1),
+        StdDuration::from_secs(10),
+        StdDuration::from_secs(1),
+        StdDuration::from_secs(1),
+        &parms,
+    ));
+    assert!(should_close_ledger(
+        true,
+        10,
+        10,
+        10,
+        StdDuration::from_secs(10),
+        StdDuration::from_secs(10 * 60 + 1),
+        StdDuration::from_secs(1),
+        StdDuration::from_secs(1),
+        &parms,
+    ));
+    assert!(should_close_ledger(
+        true,
+        10,
+        3,
+        5,
+        StdDuration::from_secs(10),
+        StdDuration::from_secs(10),
+        StdDuration::from_secs(10),
+        StdDuration::from_secs(10),
+        &parms,
+    ));
+    assert!(!should_close_ledger(
+        false,
+        10,
+        0,
+        0,
+        StdDuration::from_secs(1),
+        StdDuration::from_secs(1),
+        StdDuration::from_secs(1),
+        StdDuration::from_secs(10),
+        &parms,
+    ));
+    assert!(should_close_ledger(
+        false,
+        10,
+        0,
+        0,
+        StdDuration::from_secs(1),
+        StdDuration::from_secs(10),
+        StdDuration::from_secs(1),
+        StdDuration::from_secs(10),
+        &parms,
+    ));
+    assert!(!should_close_ledger(
+        true,
+        10,
+        0,
+        0,
+        StdDuration::from_secs(10),
+        StdDuration::from_secs(10),
+        StdDuration::from_secs(1),
+        StdDuration::from_secs(10),
+        &parms,
+    ));
+    assert!(!should_close_ledger(
+        true,
+        10,
+        0,
+        0,
+        StdDuration::from_secs(10),
+        StdDuration::from_secs(10),
+        StdDuration::from_secs(3),
+        StdDuration::from_secs(10),
+        &parms,
+    ));
+    assert!(should_close_ledger(
+        true,
+        10,
+        0,
+        0,
+        StdDuration::from_secs(10),
+        StdDuration::from_secs(10),
+        StdDuration::from_secs(10),
+        StdDuration::from_secs(10),
+        &parms,
+    ));
+}
+
+#[test]
+fn check_consensus_reference_vectors() {
+    let parms = ConsensusParms::default();
+
+    assert_eq!(
+        check_consensus(
+            10,
+            2,
+            2,
+            0,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(2),
+            false,
+            &parms,
+            true,
+        ),
+        ConsensusState::No
+    );
+    assert_eq!(
+        check_consensus(
+            10,
+            2,
+            2,
+            0,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(4),
+            false,
+            &parms,
+            true,
+        ),
+        ConsensusState::No
+    );
+    assert_eq!(
+        check_consensus(
+            10,
+            2,
+            2,
+            0,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(10),
+            false,
+            &parms,
+            true,
+        ),
+        ConsensusState::Yes
+    );
+    assert_eq!(
+        check_consensus(
+            10,
+            2,
+            1,
+            0,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(10),
+            false,
+            &parms,
+            true,
+        ),
+        ConsensusState::No
+    );
+    assert_eq!(
+        check_consensus(
+            10,
+            2,
+            1,
+            8,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(10),
+            false,
+            &parms,
+            true,
+        ),
+        ConsensusState::MovedOn
+    );
+    assert_eq!(
+        check_consensus(
+            0,
+            0,
+            0,
+            0,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(10),
+            false,
+            &parms,
+            true,
+        ),
+        ConsensusState::No
+    );
+    assert_eq!(
+        check_consensus(
+            0,
+            0,
+            0,
+            0,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(16),
+            false,
+            &parms,
+            true,
+        ),
+        ConsensusState::Yes
+    );
+    assert_eq!(
+        check_consensus(
+            10,
+            8,
+            1,
+            0,
+            StdDuration::from_secs(1),
+            StdDuration::from_secs(19),
+            false,
+            &parms,
+            true,
+        ),
+        ConsensusState::Expired
+    );
+
+    assert_eq!(
+        check_consensus(
+            10,
+            2,
+            2,
+            0,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(2),
+            true,
+            &parms,
+            true,
+        ),
+        ConsensusState::No
+    );
+    assert_eq!(
+        check_consensus(
+            10,
+            2,
+            2,
+            0,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(4),
+            true,
+            &parms,
+            true,
+        ),
+        ConsensusState::No
+    );
+    assert_eq!(
+        check_consensus(
+            10,
+            2,
+            2,
+            0,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(10),
+            true,
+            &parms,
+            true,
+        ),
+        ConsensusState::Yes
+    );
+    assert_eq!(
+        check_consensus(
+            10,
+            2,
+            1,
+            0,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(10),
+            true,
+            &parms,
+            true,
+        ),
+        ConsensusState::Yes
+    );
+    assert_eq!(
+        check_consensus(
+            10,
+            2,
+            1,
+            8,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(10),
+            true,
+            &parms,
+            true,
+        ),
+        ConsensusState::Yes
+    );
+    assert_eq!(
+        check_consensus(
+            0,
+            0,
+            0,
+            0,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(10),
+            true,
+            &parms,
+            true,
+        ),
+        ConsensusState::No
+    );
+    assert_eq!(
+        check_consensus(
+            0,
+            0,
+            0,
+            0,
+            StdDuration::from_secs(3),
+            StdDuration::from_secs(16),
+            true,
+            &parms,
+            true,
+        ),
+        ConsensusState::Yes
+    );
+    assert_eq!(
+        check_consensus(
+            10,
+            8,
+            1,
+            0,
+            StdDuration::from_secs(1),
+            StdDuration::from_secs(19),
+            true,
+            &parms,
+            true,
+        ),
+        ConsensusState::Yes
+    );
+}

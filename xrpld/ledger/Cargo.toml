@@ -1,0 +1,19 @@
+[package]
+name = "ledger"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "ledger"
+path = "src/lib.rs"
+
+[dependencies]
+basics = { path = "../../xrpl/basics" }
+overlay = { path = "../overlay" }
+protocol = { path = "../../xrpl/protocol" }
+shamap = { path = "../../xrpl/shamap" }
+serde_json = "1"
+sha2 = "0.10"
+time = "0.3"
+tracing = "0.1"

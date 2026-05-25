@@ -1,0 +1,604 @@
+//! Higher post-transfer tail for the LoanSet transactor after
+//! `accountSendMulti(...)` succeeds.
+//!
+//! This module preserves the exact deterministic behavior around:
+//!
+//! - loading `startDate` and `LoanSequence`,
+//! - allocating the loan from `loan(brokerID, loanSequence)`,
+//! - running the fixed-field, transaction-field, and dynamic-field loan setup
+//!   in the reference implementation order,
+//! - then updating the vault, updating the broker, linking the broker pseudo
+//!   directory, linking the borrower owner directory, associating assets, and
+//!   returning the first failing `TER` unchanged.
+
+use std::ops::Add;
+
+use basics::base_uint::Uint256;
+use protocol::Ter;
+
+use crate::{
+    LoanSetDoApplyAssociateAssetsSink, LoanSetDoApplyBrokerUpdate, LoanSetDoApplyBrokerUpdateSink,
+    LoanSetDoApplyLoanDynamicFieldSink, LoanSetDoApplyLoanDynamicFields,
+    LoanSetDoApplyLoanFixedFieldSink, LoanSetDoApplyLoanFixedFields, LoanSetDoApplyVaultUpdate,
+    LoanSetDoApplyVaultUpdateSink, load_loan_set_do_apply_loan_setup,
+    run_loan_set_do_apply_associate_assets, run_loan_set_do_apply_borrower_owner_dir_link,
+    run_loan_set_do_apply_broker_pseudo_dir_link, run_loan_set_do_apply_broker_update,
+    run_loan_set_do_apply_loan_allocation, run_loan_set_do_apply_loan_dynamic_fields,
+    run_loan_set_do_apply_loan_fixed_fields, run_loan_set_do_apply_loan_transaction_fields,
+    run_loan_set_do_apply_vault_update,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoanSetDoApplyPostTransfer<
+    LoanScale,
+    Date,
+    AccountId,
+    Amount,
+    PaymentCount,
+    DebtDelta,
+    Asset,
+    Scale,
+> {
+    pub loan_broker_id: Uint256,
+    pub loan_scale: LoanScale,
+    pub payment_interval: Date,
+    pub borrower: AccountId,
+    pub overpayment_enabled: bool,
+    pub default_grace_period: u32,
+    pub principal_outstanding: Amount,
+    pub periodic_payment: Amount,
+    pub total_value_outstanding: Amount,
+    pub management_fee_outstanding: Amount,
+    pub payment_remaining: PaymentCount,
+    pub vault_update: LoanSetDoApplyVaultUpdate<Amount>,
+    pub new_debt_delta: DebtDelta,
+    pub vault_asset: Asset,
+    pub vault_scale: Scale,
+}
+
+pub fn run_loan_set_do_apply_post_transfer<
+    Sink,
+    LoanScale,
+    Date,
+    AccountId,
+    Amount,
+    PaymentCount,
+    DebtDelta,
+    Asset,
+    Scale,
+    GetStartDate,
+    GetLoanSequence,
+    AllocateLoan,
+    CopyField,
+    BrokerPseudoDirLink,
+    BorrowerOwnerDirLink,
+    Loan,
+>(
+    sink: &mut Sink,
+    post_transfer: LoanSetDoApplyPostTransfer<
+        LoanScale,
+        Date,
+        AccountId,
+        Amount,
+        PaymentCount,
+        DebtDelta,
+        Asset,
+        Scale,
+    >,
+    get_start_date: GetStartDate,
+    get_loan_sequence: GetLoanSequence,
+    allocate_loan: AllocateLoan,
+    copy_field: CopyField,
+    broker_pseudo_dir_link: BrokerPseudoDirLink,
+    borrower_owner_dir_link: BorrowerOwnerDirLink,
+) -> Ter
+where
+    Sink: LoanSetDoApplyLoanFixedFieldSink<
+            LoanScale = LoanScale,
+            StartDate = Date,
+            PaymentInterval = Date,
+            BrokerId = Uint256,
+            AccountId = AccountId,
+        > + LoanSetDoApplyLoanDynamicFieldSink<
+            Amount = Amount,
+            Date = Date,
+            PaymentCount = PaymentCount,
+        > + LoanSetDoApplyVaultUpdateSink<Amount = Amount>
+        + LoanSetDoApplyBrokerUpdateSink<DebtDelta = DebtDelta, Asset = Asset, Scale = Scale>
+        + LoanSetDoApplyAssociateAssetsSink<Asset = Asset>,
+    Amount: PartialOrd,
+    Date: Add<Date, Output = Date> + Copy + From<u32>,
+    Asset: Clone,
+    GetStartDate: FnOnce() -> Date,
+    GetLoanSequence: FnOnce() -> u32,
+    AllocateLoan: FnOnce(Uint256) -> Loan,
+    CopyField: FnMut(crate::LoanSetDoApplyLoanTransactionField, Option<u32>),
+    BrokerPseudoDirLink: FnOnce() -> Ter,
+    BorrowerOwnerDirLink: FnOnce() -> Ter,
+{
+    let loan_setup = load_loan_set_do_apply_loan_setup(get_start_date, get_loan_sequence);
+
+    let _loan = run_loan_set_do_apply_loan_allocation(
+        post_transfer.loan_broker_id,
+        loan_setup.loan_sequence,
+        allocate_loan,
+    );
+
+    run_loan_set_do_apply_loan_fixed_fields(
+        sink,
+        LoanSetDoApplyLoanFixedFields {
+            loan_scale: post_transfer.loan_scale,
+            start_date: loan_setup.start_date,
+            payment_interval: post_transfer.payment_interval,
+            loan_sequence: loan_setup.loan_sequence,
+            loan_broker_id: post_transfer.loan_broker_id,
+            borrower: post_transfer.borrower,
+            overpayment_enabled: post_transfer.overpayment_enabled,
+        },
+    );
+
+    run_loan_set_do_apply_loan_transaction_fields(post_transfer.default_grace_period, copy_field);
+
+    run_loan_set_do_apply_loan_dynamic_fields(
+        sink,
+        LoanSetDoApplyLoanDynamicFields {
+            principal_outstanding: post_transfer.principal_outstanding,
+            periodic_payment: post_transfer.periodic_payment,
+            total_value_outstanding: post_transfer.total_value_outstanding,
+            management_fee_outstanding: post_transfer.management_fee_outstanding,
+            start_date: loan_setup.start_date,
+            payment_interval: post_transfer.payment_interval,
+            payment_remaining: post_transfer.payment_remaining,
+        },
+    );
+
+    run_loan_set_do_apply_vault_update(sink, post_transfer.vault_update);
+
+    let broker_update_result = run_loan_set_do_apply_broker_update(
+        sink,
+        LoanSetDoApplyBrokerUpdate {
+            new_debt_delta: post_transfer.new_debt_delta,
+            vault_asset: post_transfer.vault_asset.clone(),
+            vault_scale: post_transfer.vault_scale,
+        },
+    );
+    if broker_update_result != Ter::TES_SUCCESS {
+        return broker_update_result;
+    }
+
+    let broker_dir_link_result =
+        run_loan_set_do_apply_broker_pseudo_dir_link(broker_pseudo_dir_link);
+    if broker_dir_link_result != Ter::TES_SUCCESS {
+        return broker_dir_link_result;
+    }
+
+    let borrower_dir_link_result =
+        run_loan_set_do_apply_borrower_owner_dir_link(borrower_owner_dir_link);
+    if borrower_dir_link_result != Ter::TES_SUCCESS {
+        return borrower_dir_link_result;
+    }
+
+    run_loan_set_do_apply_associate_assets(sink, &post_transfer.vault_asset)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use basics::base_uint::Uint256;
+    use protocol::{Ter, loan_key, trans_token};
+
+    use super::{
+        LoanSetDoApplyPostTransfer, LoanSetDoApplyVaultUpdate, run_loan_set_do_apply_post_transfer,
+    };
+
+    #[derive(Clone)]
+    struct RecordingSink {
+        steps: Rc<RefCell<Vec<String>>>,
+        next_broker_sequence: u32,
+    }
+
+    impl RecordingSink {
+        fn new(steps: Rc<RefCell<Vec<String>>>, next_broker_sequence: u32) -> Self {
+            Self {
+                steps,
+                next_broker_sequence,
+            }
+        }
+    }
+
+    impl crate::LoanSetDoApplyLoanFixedFieldSink for RecordingSink {
+        type LoanScale = &'static str;
+        type StartDate = u32;
+        type PaymentInterval = u32;
+        type BrokerId = Uint256;
+        type AccountId = &'static str;
+
+        fn set_loan_scale(&mut self, value: Self::LoanScale) {
+            self.steps.borrow_mut().push(format!("loan_scale={value}"));
+        }
+
+        fn set_start_date(&mut self, value: Self::StartDate) {
+            self.steps.borrow_mut().push(format!("start_date={value}"));
+        }
+
+        fn set_payment_interval(&mut self, value: Self::PaymentInterval) {
+            self.steps
+                .borrow_mut()
+                .push(format!("payment_interval={value}"));
+        }
+
+        fn set_loan_sequence(&mut self, value: u32) {
+            self.steps
+                .borrow_mut()
+                .push(format!("loan_sequence={value}"));
+        }
+
+        fn set_loan_broker_id(&mut self, value: Self::BrokerId) {
+            self.steps
+                .borrow_mut()
+                .push(format!("loan_broker_id={value}"));
+        }
+
+        fn set_borrower(&mut self, value: Self::AccountId) {
+            self.steps.borrow_mut().push(format!("borrower={value}"));
+        }
+
+        fn set_overpayment_flag(&mut self) {
+            self.steps.borrow_mut().push("overpayment_flag".to_string());
+        }
+    }
+
+    impl crate::LoanSetDoApplyLoanDynamicFieldSink for RecordingSink {
+        type Amount = i64;
+        type Date = u32;
+        type PaymentCount = u32;
+
+        fn set_principal_outstanding(&mut self, value: Self::Amount) {
+            self.steps
+                .borrow_mut()
+                .push(format!("principal_outstanding={value}"));
+        }
+
+        fn set_periodic_payment(&mut self, value: Self::Amount) {
+            self.steps
+                .borrow_mut()
+                .push(format!("periodic_payment={value}"));
+        }
+
+        fn set_total_value_outstanding(&mut self, value: Self::Amount) {
+            self.steps
+                .borrow_mut()
+                .push(format!("total_value_outstanding={value}"));
+        }
+
+        fn set_management_fee_outstanding(&mut self, value: Self::Amount) {
+            self.steps
+                .borrow_mut()
+                .push(format!("management_fee_outstanding={value}"));
+        }
+
+        fn set_previous_payment_due_date(&mut self, value: Self::Date) {
+            self.steps
+                .borrow_mut()
+                .push(format!("previous_payment_due_date={value}"));
+        }
+
+        fn set_next_payment_due_date(&mut self, value: Self::Date) {
+            self.steps
+                .borrow_mut()
+                .push(format!("next_payment_due_date={value}"));
+        }
+
+        fn set_payment_remaining(&mut self, value: Self::PaymentCount) {
+            self.steps
+                .borrow_mut()
+                .push(format!("payment_remaining={value}"));
+        }
+
+        fn insert_loan(&mut self) {
+            self.steps.borrow_mut().push("insert_loan".to_string());
+        }
+    }
+
+    impl crate::LoanSetDoApplyVaultUpdateSink for RecordingSink {
+        type Amount = i64;
+
+        fn subtract_assets_available(&mut self, value: Self::Amount) {
+            self.steps
+                .borrow_mut()
+                .push(format!("assets_available-={value}"));
+        }
+
+        fn add_assets_total(&mut self, value: Self::Amount) {
+            self.steps
+                .borrow_mut()
+                .push(format!("assets_total+={value}"));
+        }
+
+        fn assets_available(&self) -> &Self::Amount {
+            static AVAILABLE: i64 = 10;
+            &AVAILABLE
+        }
+
+        fn assets_total(&self) -> &Self::Amount {
+            static TOTAL: i64 = 20;
+            &TOTAL
+        }
+
+        fn update_vault(&mut self) {
+            self.steps.borrow_mut().push("update_vault".to_string());
+        }
+    }
+
+    impl crate::LoanSetDoApplyBrokerUpdateSink for RecordingSink {
+        type DebtDelta = i64;
+        type Asset = &'static str;
+        type Scale = u32;
+
+        fn adjust_debt_total(
+            &mut self,
+            delta: Self::DebtDelta,
+            asset: Self::Asset,
+            scale: Self::Scale,
+        ) {
+            self.steps.borrow_mut().push(format!(
+                "adjust_debt_total delta={delta} asset={asset} scale={scale}"
+            ));
+        }
+
+        fn increment_owner_count(&mut self) {
+            self.steps
+                .borrow_mut()
+                .push("increment_owner_count".to_string());
+        }
+
+        fn increment_loan_sequence(&mut self) -> u32 {
+            self.steps.borrow_mut().push(format!(
+                "increment_loan_sequence={}",
+                self.next_broker_sequence
+            ));
+            self.next_broker_sequence
+        }
+
+        fn update_broker(&mut self) {
+            self.steps.borrow_mut().push("update_broker".to_string());
+        }
+    }
+
+    impl crate::LoanSetDoApplyAssociateAssetsSink for RecordingSink {
+        type Asset = &'static str;
+
+        fn associate_vault_asset(&mut self, asset: &Self::Asset) {
+            self.steps.borrow_mut().push(format!("vault={asset}"));
+        }
+
+        fn associate_broker_asset(&mut self, asset: &Self::Asset) {
+            self.steps.borrow_mut().push(format!("broker={asset}"));
+        }
+
+        fn associate_loan_asset(&mut self, asset: &Self::Asset) {
+            self.steps.borrow_mut().push(format!("loan={asset}"));
+        }
+    }
+
+    fn sample_broker_id() -> Uint256 {
+        Uint256::from_hex("0123456789ABCDEFFEDCBA98765432100123456789ABCDEFFEDCBA9876543210")
+            .expect("expected loan broker id should parse")
+    }
+
+    fn sample_post_transfer()
+    -> LoanSetDoApplyPostTransfer<&'static str, u32, &'static str, i64, u32, i64, &'static str, u32>
+    {
+        LoanSetDoApplyPostTransfer {
+            loan_broker_id: sample_broker_id(),
+            loan_scale: "scale",
+            payment_interval: 60,
+            borrower: "borrower",
+            overpayment_enabled: true,
+            default_grace_period: 30,
+            principal_outstanding: 1_000,
+            periodic_payment: 125,
+            total_value_outstanding: 1_250,
+            management_fee_outstanding: 25,
+            payment_remaining: 24,
+            vault_update: LoanSetDoApplyVaultUpdate {
+                principal_requested: 1_000,
+                interest_due: 250,
+            },
+            new_debt_delta: 1_250,
+            vault_asset: "USD",
+            vault_scale: 6,
+        }
+    }
+
+    #[test]
+    fn loan_set_do_apply_post_transfer_uses_current_on_success() {
+        let steps = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = RecordingSink::new(steps.clone(), 8);
+        let allocated_loan_key = RefCell::new(None);
+
+        let result = run_loan_set_do_apply_post_transfer(
+            &mut sink,
+            sample_post_transfer(),
+            || {
+                steps.borrow_mut().push("setup.start_date".to_string());
+                55
+            },
+            || {
+                steps.borrow_mut().push("setup.loan_sequence".to_string());
+                7
+            },
+            |loan_id| {
+                steps.borrow_mut().push("allocate_loan".to_string());
+                *allocated_loan_key.borrow_mut() = Some(loan_id);
+                "loan"
+            },
+            |field, default_value| {
+                steps
+                    .borrow_mut()
+                    .push(format!("copy_field={field:?}:{default_value:?}"));
+            },
+            || {
+                steps.borrow_mut().push("broker_dir_link".to_string());
+                Ter::TES_SUCCESS
+            },
+            || {
+                steps.borrow_mut().push("borrower_dir_link".to_string());
+                Ter::TES_SUCCESS
+            },
+        );
+
+        assert_eq!(result, Ter::TES_SUCCESS);
+        assert_eq!(
+            *allocated_loan_key.borrow(),
+            Some(loan_key(sample_broker_id(), 7))
+        );
+        assert_eq!(
+            steps.borrow().as_slice(),
+            [
+                "setup.start_date",
+                "setup.loan_sequence",
+                "allocate_loan",
+                "loan_scale=scale",
+                "start_date=55",
+                "payment_interval=60",
+                "loan_sequence=7",
+                "loan_broker_id=0123456789ABCDEFFEDCBA98765432100123456789ABCDEFFEDCBA9876543210",
+                "borrower=borrower",
+                "overpayment_flag",
+                "copy_field=LoanOriginationFee:None",
+                "copy_field=LoanServiceFee:None",
+                "copy_field=LatePaymentFee:None",
+                "copy_field=ClosePaymentFee:None",
+                "copy_field=OverpaymentFee:None",
+                "copy_field=InterestRate:None",
+                "copy_field=LateInterestRate:None",
+                "copy_field=CloseInterestRate:None",
+                "copy_field=OverpaymentInterestRate:None",
+                "copy_field=GracePeriod:Some(30)",
+                "principal_outstanding=1000",
+                "periodic_payment=125",
+                "total_value_outstanding=1250",
+                "management_fee_outstanding=25",
+                "previous_payment_due_date=0",
+                "next_payment_due_date=115",
+                "payment_remaining=24",
+                "insert_loan",
+                "assets_available-=1000",
+                "assets_total+=250",
+                "update_vault",
+                "adjust_debt_total delta=1250 asset=USD scale=6",
+                "increment_owner_count",
+                "increment_loan_sequence=8",
+                "update_broker",
+                "broker_dir_link",
+                "borrower_dir_link",
+                "vault=USD",
+                "broker=USD",
+                "loan=USD",
+            ]
+        );
+    }
+
+    #[test]
+    fn loan_set_do_apply_post_transfer_returns_broker_update_failure_unchanged() {
+        let steps = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = RecordingSink::new(steps.clone(), 0);
+
+        let result = run_loan_set_do_apply_post_transfer(
+            &mut sink,
+            sample_post_transfer(),
+            || 55,
+            || 7,
+            |_| "loan",
+            |_, _| {},
+            || {
+                steps.borrow_mut().push("broker_dir_link".to_string());
+                Ter::TES_SUCCESS
+            },
+            || {
+                steps.borrow_mut().push("borrower_dir_link".to_string());
+                Ter::TES_SUCCESS
+            },
+        );
+
+        assert_eq!(result, Ter::TEC_MAX_SEQUENCE_REACHED);
+        assert_eq!(trans_token(result), "tecMAX_SEQUENCE_REACHED");
+        assert!(!steps.borrow().iter().any(|step| step == "broker_dir_link"));
+        assert!(
+            !steps
+                .borrow()
+                .iter()
+                .any(|step| step == "borrower_dir_link")
+        );
+        assert!(!steps.borrow().iter().any(|step| step == "vault=USD"));
+    }
+
+    #[test]
+    fn loan_set_do_apply_post_transfer_short_circuits_on_broker_dir_link_failure() {
+        let steps = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = RecordingSink::new(steps.clone(), 8);
+
+        let result = run_loan_set_do_apply_post_transfer(
+            &mut sink,
+            sample_post_transfer(),
+            || 55,
+            || 7,
+            |_| "loan",
+            |_, _| {},
+            || {
+                steps.borrow_mut().push("broker_dir_link".to_string());
+                Ter::TEC_DIR_FULL
+            },
+            || {
+                steps.borrow_mut().push("borrower_dir_link".to_string());
+                Ter::TES_SUCCESS
+            },
+        );
+
+        assert_eq!(result, Ter::TEC_DIR_FULL);
+        assert_eq!(trans_token(result), "tecDIR_FULL");
+        assert!(
+            !steps
+                .borrow()
+                .iter()
+                .any(|step| step == "borrower_dir_link")
+        );
+        assert!(!steps.borrow().iter().any(|step| step == "vault=USD"));
+    }
+
+    #[test]
+    fn loan_set_do_apply_post_transfer_short_circuits_on_borrower_dir_link_failure() {
+        let steps = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = RecordingSink::new(steps.clone(), 8);
+
+        let result = run_loan_set_do_apply_post_transfer(
+            &mut sink,
+            sample_post_transfer(),
+            || 55,
+            || 7,
+            |_| "loan",
+            |_, _| {},
+            || {
+                steps.borrow_mut().push("broker_dir_link".to_string());
+                Ter::TES_SUCCESS
+            },
+            || {
+                steps.borrow_mut().push("borrower_dir_link".to_string());
+                Ter::TEC_DIR_FULL
+            },
+        );
+
+        assert_eq!(result, Ter::TEC_DIR_FULL);
+        assert_eq!(trans_token(result), "tecDIR_FULL");
+        assert!(steps.borrow().iter().any(|step| step == "broker_dir_link"));
+        assert!(
+            steps
+                .borrow()
+                .iter()
+                .any(|step| step == "borrower_dir_link")
+        );
+        assert!(!steps.borrow().iter().any(|step| step == "vault=USD"));
+    }
+}

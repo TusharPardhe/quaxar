@@ -1,0 +1,26 @@
+// check test module
+pub mod check_cancel;
+pub mod check_cash;
+pub mod check_create;
+pub mod check_validity;
+pub mod payment_channel_claim;
+pub mod payment_channel_claim_destination;
+pub mod payment_channel_claim_loaded;
+pub mod payment_channel_claim_loaded_apply;
+pub mod payment_channel_claim_loaded_destination_apply;
+pub mod payment_channel_claim_loaded_destination_preauth_apply;
+pub mod payment_channel_claim_loaded_destination_preauth_mutation_apply;
+pub mod payment_channel_claim_loaded_preauth_apply;
+pub mod payment_channel_claim_payment;
+pub mod payment_channel_claim_settle;
+pub mod payment_channel_create;
+pub mod payment_channel_due;
+pub mod payment_channel_fund;
+pub mod payment_channel_fund_destination;
+pub mod payment_channel_fund_loaded;
+pub mod payment_channel_fund_loaded_apply;
+pub mod payment_channel_fund_loaded_destination_guarded_apply;
+pub mod payment_channel_fund_loaded_destination_mutation_guarded_apply;
+pub mod payment_channel_fund_loaded_guarded_apply;
+pub mod payment_channel_fund_owner;
+pub mod payment_channel_helpers;

@@ -1,0 +1,36 @@
+[package]
+name = "rpc"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "rpc"
+path = "src/lib.rs"
+
+[dependencies]
+tracing = "0.1"
+xrpld-metrics = { path = "../metrics" }
+app = { path = "../app" }
+basics = { path = "../../xrpl/basics" }
+ledger = { path = "../ledger" }
+nodestore = { path = "../nodestore" }
+overlay = { path = "../overlay" }
+ipnet = "2"
+protocol = { path = "../../xrpl/protocol" }
+rand = "0.8"
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+shamap = { path = "../../xrpl/shamap" }
+time = "0.3"
+tx = { path = "../tx" }
+tokio = { version = "1", features = ["sync"] }
+xrpl_core = { path = "../../xrpl/core" }
+xrpld_core = { path = "../core" }
+
+[dev-dependencies]
+http = "1"
+perflog = { path = "../perflog" }
+resource = { path = "../../xrpl/resource" }
+rustls = "0.23"

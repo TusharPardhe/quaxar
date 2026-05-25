@@ -1,0 +1,19 @@
+[package]
+name = "rpc-integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+app = { path = "../app" }
+basics = { path = "../../xrpl/basics" }
+ledger = { path = "../ledger" }
+protocol = { path = "../../xrpl/protocol" }
+rpc = { path = "../rpc" }
+server = { path = "../server" }
+shamap = { path = "../../xrpl/shamap" }
+tx = { path = "../tx" }
+tokio = { version = "1", features = ["sync"] }
+
+[lib]
+path = "src/lib.rs"

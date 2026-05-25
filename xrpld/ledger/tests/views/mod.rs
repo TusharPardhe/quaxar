@@ -1,0 +1,21 @@
+// views test module
+pub mod acceptance_edge;
+pub mod canonical_tx_set;
+pub mod cleaner;
+pub mod constructors;
+pub mod genesis;
+pub mod genesis_more;
+pub mod holder;
+pub mod load_constructors;
+pub mod load_helpers;
+pub mod load_setup_edge;
+pub mod master_sweep;
+pub mod negative_unl;
+pub mod persistence;
+pub mod sensible;
+pub mod setup;
+pub mod setup_family;
+pub mod state_lifecycle;
+pub mod tx_exists;
+pub mod tx_read;
+pub mod walk_ledger;

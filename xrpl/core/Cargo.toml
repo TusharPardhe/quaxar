@@ -1,0 +1,19 @@
+[package]
+name = "xrpl_core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "xrpl_core"
+path = "src/lib.rs"
+
+[dependencies]
+basics = { path = "../basics" }
+generator = "0.8"
+protocol = { path = "../protocol" }
+serde_json = "1"
+xrpld_core = { path = "../../xrpld/core" }
+
+[dev-dependencies]
+tempfile = "3"
