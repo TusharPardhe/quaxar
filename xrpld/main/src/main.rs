@@ -441,6 +441,94 @@ fn bootstrap_acquire_budget_available(
 
 /// Try to parse CLI subcommands. Returns Some(ExitCode) if a subcommand was
 /// handled, None if the node should start normally.
+/// Resolve the RPC URL: if user passed --url explicitly, use it.
+/// Otherwise, try to parse the config file to find the HTTP admin port.
+fn resolve_rpc_url(parsed: &cli::Cli) -> String {
+    // If user explicitly set --rpc-url (not the default), use it as-is
+    if parsed.rpc_url != "http://127.0.0.1:5005" {
+        return parsed.rpc_url.clone();
+    }
+
+    // Try to find config and extract the RPC port
+    let conf_path = parsed.conf.as_deref().unwrap_or_else(|| {
+        if std::path::Path::new("xrpld.cfg").exists() {
+            "xrpld.cfg"
+        } else {
+            ""
+        }
+    });
+
+    if !conf_path.is_empty() {
+        if let Ok(content) = std::fs::read_to_string(conf_path) {
+            if let Some(url) = parse_rpc_url_from_config(&content) {
+                return url;
+            }
+        }
+    }
+
+    parsed.rpc_url.clone()
+}
+
+/// Parse config to find the first port with protocol = http
+fn parse_rpc_url_from_config(content: &str) -> Option<String> {
+    let mut in_port_section = false;
+    let mut port: Option<u16> = None;
+    let mut ip: Option<String> = None;
+    let mut is_http = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("[port_") {
+            // Save previous section if it was HTTP
+            if in_port_section && is_http {
+                if let Some(p) = port {
+                    let host = ip.as_deref().unwrap_or("127.0.0.1");
+                    return Some(format!("http://{}:{}", host, p));
+                }
+            }
+            in_port_section = true;
+            port = None;
+            ip = None;
+            is_http = false;
+        } else if trimmed.starts_with('[') {
+            if in_port_section && is_http {
+                if let Some(p) = port {
+                    let host = ip.as_deref().unwrap_or("127.0.0.1");
+                    return Some(format!("http://{}:{}", host, p));
+                }
+            }
+            in_port_section = false;
+        } else if in_port_section {
+            if let Some(val) = trimmed.strip_prefix("port") {
+                if let Some(val) = val.trim().strip_prefix('=') {
+                    port = val.trim().parse().ok();
+                }
+            } else if let Some(val) = trimmed.strip_prefix("ip") {
+                if let Some(val) = val.trim().strip_prefix('=') {
+                    ip = Some(val.trim().to_string());
+                }
+            } else if let Some(val) = trimmed.strip_prefix("protocol") {
+                if let Some(val) = val.trim().strip_prefix('=') {
+                    is_http = val.trim().contains("http");
+                }
+            }
+        }
+    }
+
+    // Check last section
+    if in_port_section && is_http {
+        if let Some(p) = port {
+            let host = ip.as_deref().unwrap_or("127.0.0.1");
+            return Some(format!("http://{}:{}", host, p));
+        }
+    }
+
+    None
+}
+
 fn try_cli_subcommand() -> Option<ExitCode> {
     use clap::Parser;
     // Only parse if the first arg looks like a subcommand (not --conf, etc.)
@@ -484,8 +572,9 @@ fn try_cli_subcommand() -> Option<ExitCode> {
     }
 
     let parsed = cli::Cli::parse();
+    let url = resolve_rpc_url(&parsed);
+    let url = url.as_str();
     let cmd = parsed.command?;
-    let url = &parsed.rpc_url;
 
     match cmd {
         cli::Command::Status => cli::status::run(url),

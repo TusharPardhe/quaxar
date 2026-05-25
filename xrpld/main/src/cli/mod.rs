@@ -28,7 +28,7 @@ pub struct Cli {
     pub command: Option<Command>,
 
     /// RPC endpoint URL
-    #[arg(long, default_value = "http://127.0.0.1:5055", global = true)]
+    #[arg(long, default_value = "http://127.0.0.1:5005", global = true)]
     pub rpc_url: String,
 
     /// Config file path (for config check and node startup)
