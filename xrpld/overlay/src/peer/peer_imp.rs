@@ -82,6 +82,7 @@ pub struct PeerImp {
     listener_check: Mutex<ListenerCheckState>,
     charges: Mutex<Vec<(Charge, String)>>,
     squelch: Mutex<Squelch>,
+    created_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -168,6 +169,7 @@ impl PeerImp {
             }),
             charges: Mutex::new(Vec::new()),
             squelch: Mutex::new(Squelch::new(Arc::new(SystemClock))),
+            created_at: Instant::now(),
         })
     }
 
@@ -629,6 +631,10 @@ impl Peer for PeerImp {
                 )),
             ),
             ("inbound".to_owned(), JsonValue::Bool(self.inbound)),
+            (
+                "uptime".to_owned(),
+                JsonValue::Unsigned(self.created_at.elapsed().as_secs()),
+            ),
         ]))
     }
 
