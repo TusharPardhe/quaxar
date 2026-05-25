@@ -12,35 +12,34 @@ pub fn run(url: &str) {
     super::section_header("Database Statistics");
     println!();
 
-    if let Some(writes) = result["write_load"].as_u64() {
-        super::kv("Write Load", &super::format_number(writes));
-    }
-    if let Some(sz) = result["node_store_size"].as_str() {
-        super::kv("Node Store Size", sz);
-    }
-    if let Some(rate) = result["AL_hit_rate"].as_f64() {
-        super::kv("Cache Hit Rate", &format!("{rate:.1}%"));
-    }
-    if let Some(count) = result["dbKBTotal"].as_u64() {
-        super::kv(
-            "DB Total",
-            &format!("{} MB", super::format_number(count / 1024)),
-        );
-    }
-
-    println!();
-    super::section_separator();
-    println!();
-
-    for key in ["SLE_hit_rate", "node_hit_rate", "ledger_hit_rate"] {
-        if let Some(v) = result[key].as_f64() {
-            super::kv(key, &format!("{v:.1}%"));
-        }
-    }
-
-    if let Ok(info) = rpc_call(url, "server_info", serde_json::json!({})) {
-        if let Some(complete) = info["info"]["complete_ledgers"].as_str() {
-            super::kv("Complete Ledgers", complete);
-        }
-    }
+    super::kv(
+        "Write Load",
+        &result["write_load"]
+            .as_u64()
+            .map(|v| super::format_number(v))
+            .unwrap_or_else(|| "—".to_string()),
+    );
+    super::kv(
+        "Cache Hit Rate",
+        &result["AL_hit_rate"]
+            .as_f64()
+            .map(|v| format!("{v:.1}%"))
+            .unwrap_or_else(|| "—".to_string()),
+    );
+    super::kv(
+        "Tree Nodes",
+        &super::format_number(result["treenode_cache_size"].as_u64().unwrap_or(0)),
+    );
+    super::kv(
+        "Full Below",
+        &super::format_number(result["fullbelow_size"].as_u64().unwrap_or(0)),
+    );
+    super::kv(
+        "Ledger Hit Rate",
+        &result["ledger_hit_rate"]
+            .as_f64()
+            .map(|v| format!("{v:.1}%"))
+            .unwrap_or_else(|| "—".to_string()),
+    );
+    super::kv("Uptime", result["uptime"].as_str().unwrap_or("—"));
 }
