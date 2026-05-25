@@ -34,6 +34,7 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 console = "0.15"
 crossterm = "0.27"
 indicatif = "0.17"
+terminal_size = "0.4"
 comfy-table = "7"
 hex = "0.4"
 base64 = "0.22"

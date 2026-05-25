@@ -42,4 +42,23 @@ pub fn run(url: &str) {
             .unwrap_or_else(|| "—".to_string()),
     );
     super::kv("Uptime", result["uptime"].as_str().unwrap_or("—"));
+
+    // Show hint if everything is idle
+    let tree = result["treenode_cache_size"].as_u64().unwrap_or(0);
+    let writes = result["write_load"].as_u64();
+    if tree == 0 && writes.is_none() {
+        println!();
+        println!(
+            "    {}",
+            console::Style::new()
+                .dim()
+                .apply_to("Node is idle — no ledger acquisition in progress.")
+        );
+        println!(
+            "    {}",
+            console::Style::new()
+                .dim()
+                .apply_to("Stats populate once the node begins syncing.")
+        );
+    }
 }
