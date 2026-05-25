@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn cli_default_rpc_url() {
         let cli = Cli::try_parse_from(["xrpld", "status"]).unwrap();
-        assert_eq!(cli.rpc_url, "http://127.0.0.1:5055");
+        assert_eq!(cli.rpc_url, "http://127.0.0.1:5005");
     }
 
     #[test]
