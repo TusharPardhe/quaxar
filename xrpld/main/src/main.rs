@@ -627,6 +627,12 @@ fn try_cli_subcommand() -> Option<ExitCode> {
 
 fn main() -> ExitCode {
     // Initialize structured logging
+    // Check for CLI subcommands first (status, health, peers, etc.)
+    // If a subcommand is present, run it and exit without starting the node.
+    if let Some(exit) = try_cli_subcommand() {
+        return exit;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -637,12 +643,6 @@ fn main() -> ExitCode {
         .init();
 
     tracing::info!(target: "main", version = env!("CARGO_PKG_VERSION"), "XRPLD starting");
-
-    // Check for CLI subcommands first (status, health, peers, etc.)
-    // If a subcommand is present, run it and exit without starting the node.
-    if let Some(exit) = try_cli_subcommand() {
-        return exit;
-    }
 
     let start_time = Instant::now();
 
