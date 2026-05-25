@@ -535,7 +535,46 @@ pub fn load_basic_config_file(path: impl AsRef<Path>) -> Result<BasicConfig, Str
     tracing::info!(target: "bootstrap", config_path = %path.display(), "Loading configuration");
     let contents = fs::read_to_string(path)
         .map_err(|error| format!("failed to read config file {}: {error}", path.display()))?;
-    parse_basic_config_text(&contents)
+    let mut config = parse_basic_config_text(&contents)?;
+
+    // Load [validators_file] if present (mimics C++ Config::loadValidatorFile)
+    if config.exists("validators_file") {
+        let validators_file = config
+            .section("validators_file")
+            .legacy()
+            .unwrap_or_default();
+        if !validators_file.is_empty() {
+            let vf_path = if Path::new(&validators_file).is_absolute() {
+                PathBuf::from(&validators_file)
+            } else {
+                path.parent()
+                    .unwrap_or(Path::new("."))
+                    .join(&validators_file)
+            };
+            match fs::read_to_string(&vf_path) {
+                Ok(vf_contents) => {
+                    tracing::info!(target: "bootstrap", path = %vf_path.display(), "Loading validators file");
+                    let vf_config = parse_basic_config_text(&vf_contents)?;
+                    // Merge validator sections into main config
+                    for section_name in
+                        ["validator_list_sites", "validator_list_keys", "validators"]
+                    {
+                        if vf_config.exists(section_name) {
+                            let values = vf_config.section(section_name).values().to_vec();
+                            if !values.is_empty() {
+                                config.section_mut(section_name).append_lines(values);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target: "bootstrap", path = %vf_path.display(), error = %e, "Failed to load validators file");
+                }
+            }
+        }
+    }
+
+    Ok(config)
 }
 
 pub fn build_bootstrap_runtime(
