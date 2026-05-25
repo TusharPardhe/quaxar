@@ -88,6 +88,7 @@ pub trait Overlay: Send + Sync {
     fn size(&self) -> usize;
     fn json(&self) -> JsonValue;
     fn active_peers(&self) -> Vec<Arc<dyn Peer>>;
+    fn peers_json(&self) -> Vec<JsonValue>;
     fn find_peer_by_short_id(&self, id: PeerId) -> Option<Arc<dyn Peer>>;
     fn find_peer_by_public_key(&self, public_key: PublicKey) -> Option<Arc<dyn Peer>>;
     fn check_tracking(&self, index: u32);

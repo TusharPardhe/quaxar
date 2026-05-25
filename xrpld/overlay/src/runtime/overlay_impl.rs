@@ -2376,6 +2376,15 @@ impl Overlay for OverlayImpl {
         stats_to_json(self.stats())
     }
 
+    fn peers_json(&self) -> Vec<JsonValue> {
+        self.active_peers
+            .read()
+            .expect("overlay peers lock")
+            .values()
+            .map(|peer| peer.json())
+            .collect()
+    }
+
     fn active_peers(&self) -> Vec<Arc<dyn Peer>> {
         self.active_peers_snapshot()
             .into_iter()
