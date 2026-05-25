@@ -190,13 +190,21 @@ pub fn rpc_call(
     let resp = ureq::post(url)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
-        .map_err(|e| format!("Connection failed: {e}"))?;
+        .map_err(|e| format!("Connection failed: {url}: {e}"))?;
     let text = resp
         .into_string()
         .map_err(|e| format!("Read failed: {e}"))?;
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("Invalid JSON: {e}"))?;
-    Ok(json["result"].clone())
+    let result = &json["result"];
+    if result["status"].as_str() == Some("error") {
+        let msg = result["error_message"]
+            .as_str()
+            .or_else(|| result["error"].as_str())
+            .unwrap_or("Unknown error");
+        return Err(format!("{msg} (node is syncing, try again shortly)"));
+    }
+    Ok(result.clone())
 }
 
 /// RPC call with a spinner shown while waiting.
