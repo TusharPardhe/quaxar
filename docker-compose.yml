@@ -4,18 +4,19 @@ services:
     container_name: xrpld
     restart: unless-stopped
     ports:
-      - "5055:5055"   # RPC
-      - "6066:6066"   # WebSocket
+      - "5005:5005"   # RPC
+      - "6006:6006"   # WebSocket
       - "51235:51235" # Peer protocol
     volumes:
       - xrpld-data:/var/lib/xrpld
       - ./xrpld.cfg:/etc/xrpld/xrpld.cfg:ro
+      - ./validators.txt:/etc/xrpld/validators.txt:ro
     deploy:
       resources:
         limits:
           memory: 16G
     healthcheck:
-      test: ["CMD", "xrpld", "health", "--rpc-url", "http://127.0.0.1:5055"]
+      test: ["CMD", "xrpld", "health", "--rpc-url", "http://127.0.0.1:5005"]
       interval: 30s
       timeout: 5s
       retries: 3

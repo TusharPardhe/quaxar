@@ -21,39 +21,87 @@ Disk usage grows over time with ledger history. NVMe is strongly recommended for
 
 ## Building from Source
 
+### Automated Setup (recommended)
+
 ```bash
-# Install Rust toolchain (1.90+)
+# Download and run the interactive installer
+curl -sSf https://raw.githubusercontent.com/TusharPardhe/xrpld/main/install.sh -o install.sh
+chmod +x install.sh
+./install.sh
+
+# Or non-interactive (all defaults, local build)
+./install.sh -y
+```
+
+The installer will:
+- Assess your hardware and warn if below requirements
+- Let you choose Docker or local build
+- Install all dependencies
+- Build and install `xrpld` to your PATH
+- Generate config files (all fields configurable)
+- Optionally set up a systemd service
+
+### Manual Setup
+
+### Prerequisites
+
+**Rust toolchain (1.90+):**
+```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
 
-# Install system dependencies (Linux)
-sudo apt install libssl-dev pkg-config librocksdb-dev clang
+**Linux (Ubuntu/Debian):**
+```bash
+sudo apt install build-essential pkg-config libssl-dev librocksdb-dev clang cmake
+```
 
-# Clone and build
+**macOS:**
+```bash
+brew install openssl rocksdb cmake
+```
+
+### Build & Install
+
+```bash
 git clone https://github.com/TusharPardhe/xrpld.git
 cd xrpld
-cargo build --release -p xrpld-main
+cargo install --path xrpld/main
 ```
 
-The binary is at `target/release/xrpld`.
+This builds the release binary and installs it to `~/.cargo/bin/xrpld` (already in PATH).
 
-### Installing to PATH
+### Build Troubleshooting
 
-To use `xrpld` from anywhere:
+**RocksDB compilation segfault / OOM (common on ≤16GB RAM):**
+
+The RocksDB C++ library compiles from source by default and can exhaust memory. Fix by installing the system package:
 
 ```bash
-# Using just (recommended)
-just install
-
-# Or manually
-sudo cp target/release/xrpld /usr/local/bin/xrpld
+# Linux
+sudo apt install librocksdb-dev
+ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu cargo install --path xrpld/main
 ```
 
-After installation, `xrpld` is available system-wide:
+**Rustc segfault during build (too many parallel jobs):**
 
 ```bash
-xrpld --conf /etc/xrpld/xrpld.cfg
-xrpld status
-xrpld cli
+CARGO_BUILD_JOBS=2 cargo install --path xrpld/main
+```
+
+**OpenSSL build failure:**
+
+```bash
+sudo apt install libssl-dev pkg-config
+```
+
+**`.cargo/config.toml` linker error:**
+
+The repo includes an optional `lld` linker config for faster builds. If `lld` is not installed:
+
+```bash
+rm .cargo/config.toml
+# Or install lld:
+sudo apt install lld clang
 ```
 
 ### Build Notes
