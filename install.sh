@@ -330,6 +330,12 @@ CONF_DIR="/etc/xrpld"
 CONF_FILE="$CONF_DIR/xrpld.cfg"
 GENERATE_CONF=true
 
+# Fall back to user-local config if sudo not available
+if ! sudo -n true 2>/dev/null; then
+    CONF_DIR="$HOME/.config/xrpld"
+    CONF_FILE="$CONF_DIR/xrpld.cfg"
+fi
+
 if [ -f "$CONF_FILE" ] && [ "$AUTO_YES" = false ]; then
     warn "Config already exists at $CONF_FILE"
     ask_yn "Overwrite?" "N" || GENERATE_CONF=false
@@ -344,14 +350,14 @@ if [ "$GENERATE_CONF" = true ]; then
     WS_PORT="6006"
     WS_IP="127.0.0.1"
     DB_TYPE="NuDB"
-    DATA_DIR="/var/lib/xrpld"
+    DATA_DIR="$HOME/.local/share/xrpld"
     DB_PATH="$DATA_DIR/db/nudb"
     SQLITE_PATH="$DATA_DIR/db"
     ONLINE_DELETE="512"
     NODE_SIZE="medium"
     LEDGER_HISTORY="256"
     NETWORK="mainnet"
-    LOG_FILE="/var/log/xrpld/xrpld.log"
+    LOG_FILE="$HOME/.local/share/xrpld/xrpld.log"
     LOG_LEVEL="info"
 
     if [ "$AUTO_YES" = false ]; then
@@ -411,11 +417,11 @@ if [ "$GENERATE_CONF" = true ]; then
     esac
 
     # Create directories
-    sudo mkdir -p "$CONF_DIR" "$DATA_DIR/db/nudb" "$(dirname "$LOG_FILE")"
-    sudo chown -R "$(whoami)" "$DATA_DIR" "$(dirname "$LOG_FILE")"
+    mkdir -p "$CONF_DIR" "$DATA_DIR/db/nudb" "$(dirname "$LOG_FILE")"
+    chown -R "$(whoami)" "$DATA_DIR" "$(dirname "$LOG_FILE")"
 
     # Write xrpld.cfg
-    sudo tee "$CONF_FILE" > /dev/null << EOF
+    tee "$CONF_FILE" > /dev/null << EOF
 [server]
 port_rpc_admin_local
 port_peer
@@ -468,7 +474,7 @@ $(echo -e "$PEERS")
 EOF
 
     # Write validators.txt
-    sudo tee "$CONF_DIR/validators.txt" > /dev/null << EOF
+    tee "$CONF_DIR/validators.txt" > /dev/null << EOF
 [validator_list_sites]
 $VL_SITE
 
@@ -488,7 +494,7 @@ if [ "$AUTO_YES" = false ]; then
     ask_yn "Install systemd service?" "Y" || INSTALL_SERVICE=false
 fi
 
-if [ "$INSTALL_SERVICE" = true ] && command -v systemctl &>/dev/null; then
+if [ "$INSTALL_SERVICE" = true ] && command -v systemctl &>/dev/null && sudo -n true 2>/dev/null; then
     XRPLD_BIN=$(which xrpld 2>/dev/null || echo "$HOME/.cargo/bin/xrpld")
 
     sudo tee /etc/systemd/system/xrpld.service > /dev/null << EOF
