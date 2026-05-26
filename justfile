@@ -20,6 +20,16 @@ test:
 build:
     cargo build --release -p xrpld-main
 
+# Install xrpld to system PATH
+install: build
+    sudo cp target/release/xrpld /usr/local/bin/xrpld
+    @echo "Installed xrpld to /usr/local/bin/xrpld"
+
+# Uninstall xrpld from system PATH
+uninstall:
+    sudo rm -f /usr/local/bin/xrpld
+    @echo "Removed /usr/local/bin/xrpld"
+
 # Check compilation
 check:
     cargo check --workspace

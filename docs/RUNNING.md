@@ -36,6 +36,26 @@ cargo build --release -p xrpld-main
 
 The binary is at `target/release/xrpld`.
 
+### Installing to PATH
+
+To use `xrpld` from anywhere:
+
+```bash
+# Using just (recommended)
+just install
+
+# Or manually
+sudo cp target/release/xrpld /usr/local/bin/xrpld
+```
+
+After installation, `xrpld` is available system-wide:
+
+```bash
+xrpld --conf /etc/xrpld/xrpld.cfg
+xrpld status
+xrpld cli
+```
+
 ### Build Notes
 
 - **Linux without librocksdb-dev:** Set `ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu` or RocksDB will compile from source (slow, may OOM on 16GB machines)
