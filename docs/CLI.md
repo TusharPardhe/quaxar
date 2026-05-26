@@ -10,39 +10,40 @@ xrpld --conf /etc/xrpld/xrpld.cfg
 
 ## Interactive Mode
 
-Launch an interactive shell with autocomplete and fuzzy search:
+Launch an interactive shell with fuzzy search and inline suggestions:
 
 ```bash
 xrpld cli
 ```
 
 Features:
-- Tab completion for all commands and parameters
-- Fuzzy search — type partial command names to match
-- Arrow keys for history navigation
-- Ctrl+R for reverse history search
+- Type to filter — suggestions appear below the prompt with descriptions
+- Arrow keys to scroll through the suggestion list
+- Tab to autocomplete the selected command
+- Enter to execute
+- Command history (Up arrow when no suggestions visible)
+- Ctrl+C to exit
 
 ## Subcommands
 
 | Command | Description |
 |---------|-------------|
 | `status` | Server state, uptime, ledger range |
-| `health` | Quick health check (exit 0=healthy, 1=unhealthy) |
+| `health` | Health check with semantic states |
 | `peers` | Connected peers with latency and version |
 | `fee` | Current transaction fee |
-| `ledger` | Latest validated ledger info |
+| `ledger [seq]` | Ledger info (latest validated or by sequence) |
 | `account <address>` | Account balance and details |
 | `sync-status` | Current sync progress and state |
 | `validators` | Trusted validator list and agreement |
 | `amendments` | Amendment status and voting |
-| `db-stats` | Database size, cache hit rate, node counts |
+| `db-stats` | NuDB disk usage and database statistics |
 | `log-level [level]` | Get or set log level |
 | `benchmark` | Run internal performance benchmarks |
 | `validator-keys` | Key management (see below) |
 | `doctor` | Diagnose common configuration issues |
-| `config` | Show active configuration |
 | `stop` | Graceful shutdown |
-| `version` | Build version and commit hash |
+| `version` | Build version, commit hash, and build time |
 
 ### validator-keys Subcommands
 
@@ -54,10 +55,20 @@ Features:
 | `validator-keys revoke` | Revoke a validator key (publish revocation) |
 | `validator-keys show` | Display public key and manifest |
 
+## RPC Port Auto-Discovery
+
+The CLI automatically finds the RPC port by:
+1. Reading `--conf <path>` if provided
+2. Looking for `xrpld.cfg` in the current directory
+3. Parsing the first `[port_*]` section with `protocol = http`
+4. Falling back to `http://127.0.0.1:5005`
+
+Override with `--rpc-url http://host:port`.
+
 ## Examples
 
 ```bash
-# Check if node is healthy
+# Check node health
 xrpld health
 
 # View current sync progress
@@ -78,17 +89,14 @@ xrpld log-level debug
 # View latest ledger
 xrpld ledger
 
-# Check amendment voting
-xrpld amendments
+# View specific ledger
+xrpld ledger 95000000
 
-# Database statistics
+# Database statistics (NuDB disk usage)
 xrpld db-stats
 
 # Generate validator keys
 xrpld validator-keys generate
-
-# Create token for config
-xrpld validator-keys create-token
 
 # Diagnose issues
 xrpld doctor
@@ -104,7 +112,15 @@ xrpld stop
 
 | Command | Code | Meaning |
 |---------|------|---------|
-| `health` | 0 | Node is healthy and synced |
-| `health` | 1 | Node is unhealthy or not synced |
+| `health` | 0 | Node is reachable (healthy or syncing) |
+| `health` | 1 | Node is unreachable (down) |
 | All others | 0 | Success |
 | All others | 1 | Error |
+
+## Health States
+
+| State | Display | Meaning |
+|-------|---------|---------|
+| `full` / `proposing` / `validating` | ● Healthy (green) | Fully synced |
+| `tracking` / `syncing` / `connected` | ◐ Syncing (yellow) | Alive, not yet ready |
+| Unreachable | ● Down (red) | Cannot connect |

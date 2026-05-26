@@ -22,42 +22,47 @@ Disk usage grows over time with ledger history. NVMe is strongly recommended for
 ## Building from Source
 
 ```bash
-# Install Rust toolchain (1.75+)
+# Install Rust toolchain (1.90+)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
+# Install system dependencies (Linux)
+sudo apt install libssl-dev pkg-config librocksdb-dev clang
+
 # Clone and build
-git clone https://github.com/xrpl/rippled-rust-migration.git
-cd rippled-rust-migration
+git clone https://github.com/TusharPardhe/xrpld.git
+cd xrpld
 cargo build --release -p xrpld-main
 ```
 
 The binary is at `target/release/xrpld`.
 
+### Build Notes
+
+- **Linux without librocksdb-dev:** Set `ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu` or RocksDB will compile from source (slow, may OOM on 16GB machines)
+- **Low-memory machines:** Use `CARGO_BUILD_JOBS=2` to limit parallelism
+- **`.cargo/config.toml`:** The repo includes an optional lld linker config for faster builds. If `lld` is not installed, remove this file: `rm .cargo/config.toml`
+
 ## Configuration
 
-Create a configuration file (e.g., `/etc/xrpld/xrpld.cfg`):
+Create a configuration file (e.g., `xrpld.cfg`):
 
 ```ini
 [server]
-port_rpc_admin
+port_rpc_admin_local
 port_peer
-port_ws_public
 
-[port_rpc_admin]
+[port_rpc_admin_local]
 port = 5005
 ip = 127.0.0.1
 protocol = http
-admin = 127.0.0.1
 
 [port_peer]
 port = 51235
 ip = 0.0.0.0
 protocol = peer
 
-[port_ws_public]
-port = 6006
-ip = 0.0.0.0
-protocol = ws
+[node_size]
+medium
 
 [node_db]
 type = NuDB
@@ -65,40 +70,53 @@ path = /var/lib/xrpld/db/nudb
 online_delete = 2000
 advisory_delete = 0
 
-[node_size]
-huge
+[database_path]
+/var/lib/xrpld/db
 
-[ledger_history]
-full
+[validators_file]
+validators.txt
 
-[validator_list_sites]
-https://vl.xrplf.org
-
-[validator_list_keys]
-ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
-
-[ips_fixed]
+[ips]
 s1.ripple.com 51235
 s2.ripple.com 51235
 ```
+
+### Validator List (validators.txt)
+
+The `[validators_file]` directive loads a separate file containing trusted validator list sources. Create `validators.txt` alongside your config:
+
+```ini
+[validator_list_sites]
+https://vl.ripple.com
+
+[validator_list_keys]
+ED2677ABFFD1B33AC6FBC3062B71F1E8397C1505E1C42C64D11AD1B28FF73F4734
+```
+
+Alternatively, place these sections directly in `xrpld.cfg`.
 
 ### Configuration Sections
 
 | Section | Purpose |
 |---------|---------|
 | `[server]` | Lists port definitions to activate |
-| `[port_*]` | Port binding: port number, IP, protocol (http/ws/peer), admin access |
+| `[port_*]` | Port binding: port number, IP, protocol (http/ws/peer) |
 | `[node_db]` | Database backend (NuDB), path, deletion policy |
-| `[node_size]` | Memory tuning hint: tiny, small, medium, large, huge |
-| `[ledger_history]` | How much history to keep (number or `full`) |
+| `[node_size]` | Memory tuning: tiny, small, medium, large, huge |
+| `[validators_file]` | Path to file with validator list sites and keys |
 | `[validator_list_sites]` | URLs to fetch trusted validator lists |
 | `[validator_list_keys]` | Public keys of validator list publishers |
-| `[ips_fixed]` | Peer endpoints to always connect to |
+| `[ips]` | Peer endpoints to connect to on startup |
 
 ## Starting the Node
 
 ```bash
-./xrpld --conf /path/to/xrpld.cfg
+RUST_LOG=info ./target/release/xrpld --conf xrpld.cfg
+```
+
+Background:
+```bash
+RUST_LOG=info nohup ./target/release/xrpld --conf xrpld.cfg > xrpld.log 2>&1 &
 ```
 
 ## Systemd Service
@@ -132,19 +150,12 @@ sudo systemctl enable --now xrpld
 
 ## Monitoring
 
-### Prometheus Metrics
-
-Metrics are exposed at the admin HTTP port:
-
-```
-GET http://127.0.0.1:5005/metrics
-```
-
 ### Health Check
 
 ```bash
 xrpld health
-# Exit code 0 = healthy, 1 = unhealthy
+# Exit code 0 = reachable (healthy or syncing)
+# Exit code 1 = unreachable (down)
 ```
 
 Or via RPC:
@@ -153,7 +164,15 @@ Or via RPC:
 curl -s http://127.0.0.1:5005 -d '{"method":"server_info"}' | jq .result.info.server_state
 ```
 
-Expected states: `full`, `proposing`, `validating`.
+Expected healthy states: `full`, `proposing`, `validating`.
+
+### Database Usage
+
+```bash
+xrpld db-stats
+```
+
+Shows NuDB data file size, key file size, and total disk usage.
 
 ## Log Management
 
@@ -161,10 +180,10 @@ Control log verbosity with the `RUST_LOG` environment variable:
 
 ```bash
 # Levels: error, warn, info, debug, trace
-RUST_LOG=info ./xrpld --conf /etc/xrpld/xrpld.cfg
+RUST_LOG=info ./xrpld --conf xrpld.cfg
 
 # Per-module control
-RUST_LOG=xrpld=info,consensus=debug,peer=warn ./xrpld --conf /etc/xrpld/xrpld.cfg
+RUST_LOG=info,consensus=debug,overlay=warn ./xrpld --conf xrpld.cfg
 ```
 
 Change at runtime:
@@ -178,7 +197,10 @@ xrpld log-level debug
 | Problem | Cause | Fix |
 |---------|-------|-----|
 | OOM during sync | Insufficient RAM for state acquisition | Increase RAM to 32 GB or use `[node_size] medium` |
+| RocksDB build segfault | GCC OOM during compilation | `sudo apt install librocksdb-dev` or `CARGO_BUILD_JOBS=1` |
+| OpenSSL build failure | Missing system OpenSSL | `sudo apt install libssl-dev pkg-config` |
+| Node stuck in "connected" | Validator list not loading | Ensure `[validators_file]` points to valid file, or add `[validator_list_sites]` directly to config |
 | Slow sync | Spinning disk or limited bandwidth | Use NVMe SSD, ensure 100+ Mbps |
 | Port already in use | Another process on same port | Check with `lsof -i :51235`, change port in config |
-| Permission denied on DB path | Wrong file ownership | `chown -R xrpld:xrpld /var/lib/xrpld` |
 | No peers connecting | Firewall blocking port 51235 | Open TCP 51235 inbound |
+| `.cargo/config.toml` error | lld linker not installed | `rm .cargo/config.toml` or `sudo apt install lld clang` |
