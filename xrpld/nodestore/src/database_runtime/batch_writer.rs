@@ -273,4 +273,101 @@ mod tests {
         let result = catch_unwind(AssertUnwindSafe(|| drop(writer)));
         assert!(result.is_ok());
     }
+
+    // === Adversarial / Fault-Injection: Disk Failure Simulation ===
+
+    #[test]
+    fn disk_failure_intermittent_write_errors_do_not_lose_subsequent_data() {
+        // Simulates disk returning IO errors on first N writes, then recovering.
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let successful_writes = Arc::new(Mutex::new(Vec::new()));
+        let writes_clone = Arc::clone(&successful_writes);
+        let count_clone = Arc::clone(&call_count);
+
+        let scheduler = Arc::new(CountingScheduler::default());
+        let writer = BatchWriter::new(
+            move |batch| {
+                let n = count_clone.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    // First batch "fails" — simulate disk error by panicking
+                    panic!("simulated disk I/O error: ENOSPC");
+                }
+                // Subsequent writes succeed
+                writes_clone
+                    .lock()
+                    .expect("writes mutex")
+                    .extend(batch.iter().map(|obj| *obj.hash()));
+            },
+            Arc::clone(&scheduler) as Arc<dyn Scheduler>,
+        );
+
+        // First store triggers the failing batch
+        writer.store(sample_object(0xAA));
+        let task = scheduler
+            .task
+            .lock()
+            .expect("task mutex")
+            .take()
+            .expect("first task");
+        let result = catch_unwind(AssertUnwindSafe(|| task.perform_scheduled_task()));
+        assert!(result.is_err(), "first write should fail");
+
+        // Writer should still be usable after disk failure
+        writer.store(sample_object(0xBB));
+        writer.store(sample_object(0xCC));
+        // Trigger the second batch
+        let task = scheduler
+            .task
+            .lock()
+            .expect("task mutex")
+            .take()
+            .expect("second task");
+        task.perform_scheduled_task();
+        writer.wait_for_writing();
+
+        let written = successful_writes.lock().expect("writes mutex");
+        assert_eq!(written.len(), 2, "recovery writes should succeed");
+    }
+
+    #[test]
+    fn disk_failure_writer_remains_functional_after_multiple_consecutive_failures() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = Arc::clone(&call_count);
+
+        let scheduler = Arc::new(CountingScheduler::default());
+        let writer = BatchWriter::new(
+            move |_batch| {
+                let n = count_clone.fetch_add(1, Ordering::Relaxed);
+                if n < 3 {
+                    panic!("disk failure #{}", n + 1);
+                }
+            },
+            Arc::clone(&scheduler) as Arc<dyn Scheduler>,
+        );
+
+        // Fail 3 times
+        for i in 0..3 {
+            writer.store(sample_object(i));
+            let task = scheduler
+                .task
+                .lock()
+                .expect("task mutex")
+                .take()
+                .expect("task");
+            let _ = catch_unwind(AssertUnwindSafe(|| task.perform_scheduled_task()));
+        }
+
+        // 4th write should succeed
+        writer.store(sample_object(0xDD));
+        let task = scheduler
+            .task
+            .lock()
+            .expect("task mutex")
+            .take()
+            .expect("recovery task");
+        task.perform_scheduled_task();
+        writer.wait_for_writing();
+
+        assert_eq!(call_count.load(Ordering::Relaxed), 4);
+    }
 }

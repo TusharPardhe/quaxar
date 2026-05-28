@@ -399,3 +399,59 @@ fn check_consensus_reference_vectors() {
         ConsensusState::Yes
     );
 }
+
+// === Adversarial / Fault-Injection: Clock Jump Backward ===
+
+#[test]
+fn clock_jump_backward_effective_close_time_clamps_to_parent() {
+    // If system clock jumps backward, effective_close_time should never
+    // produce a close time earlier than the parent's close time.
+    let parent_close = NetClockTimePoint::new(1000);
+    let resolution = TimeDuration::seconds(10);
+
+    // Clock jumped backward — raw close time is before parent
+    let raw_close = NetClockTimePoint::new(900);
+    let effective = effective_close_time(raw_close, resolution, parent_close);
+
+    // Must be >= parent close time (clamped)
+    assert!(
+        effective >= parent_close,
+        "effective_close_time must not go backward: got {:?} < parent {:?}",
+        effective,
+        parent_close
+    );
+}
+
+#[test]
+fn clock_jump_backward_should_close_ledger_handles_zero_elapsed() {
+    // If clock jumps backward, open_time could appear as zero.
+    // should_close_ledger must not panic and should respect min_close time.
+    let parms = ConsensusParms::default();
+
+    // With transactions pending but zero open_time (clock jumped back),
+    // the ledger should NOT close because open_time < ledger_min_close.
+    let result = should_close_ledger(
+        true,                       // any transactions
+        5,                          // prev proposers
+        0,                          // proposers closed
+        0,                          // proposers validated
+        StdDuration::from_secs(4),  // previous round time
+        StdDuration::from_secs(0),  // time since prev close
+        StdDuration::from_secs(0),  // open time (clock jumped back → appears zero)
+        StdDuration::from_secs(15), // idle interval
+        &parms,
+    );
+    // With zero open_time and transactions, should not close (below min_close)
+    assert!(!result, "should not close ledger when open_time is zero due to clock jump");
+}
+
+#[test]
+fn clock_jump_backward_round_close_time_never_before_epoch() {
+    // Ensure round_close_time handles a time point near zero gracefully
+    let close_time = NetClockTimePoint::new(5);
+    let resolution = TimeDuration::seconds(30);
+
+    let rounded = round_close_time(close_time, resolution);
+    // Should not underflow or wrap
+    assert!(rounded.as_seconds() < 1_000_000_000);
+}

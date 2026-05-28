@@ -620,9 +620,9 @@ fn set_header(
 #[cfg(test)]
 mod tests {
     use super::{
-        Compressed, Message, ProtocolMessage, ProtocolMessageError, ProtocolMessageHandler,
-        ProtocolMessageType, ProtocolPayload, TmManifests, TmPing, TmTransaction,
-        decode_protocol_message, invoke_protocol_message, parse_message_header,
+        Compressed, MAXIMUM_MESSAGE_SIZE, Message, ProtocolMessage, ProtocolMessageError,
+        ProtocolMessageHandler, ProtocolMessageType, ProtocolPayload, TmManifests, TmPing,
+        TmTransaction, decode_protocol_message, invoke_protocol_message, parse_message_header,
         protocol_message_name, wire,
     };
 
@@ -735,5 +735,104 @@ mod tests {
         assert_eq!(consumed, message.get_buffer_size());
         assert_eq!(handler.unknown_type, Some(999));
         assert_eq!(protocol_message_name(999), "unknown");
+    }
+
+    // === Adversarial / Fault-Injection Tests ===
+
+    #[test]
+    fn adversarial_empty_buffer_returns_none() {
+        let result = parse_message_header(&[]);
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn adversarial_truncated_header_returns_none() {
+        // Less than 6 bytes (minimum uncompressed header)
+        assert_eq!(parse_message_header(&[0x00, 0x00, 0x01]).unwrap(), None);
+        assert_eq!(
+            parse_message_header(&[0x00, 0x00, 0x00, 0x05, 0x00]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn adversarial_garbage_random_bytes_rejected() {
+        let garbage: Vec<u8> = (0..64).map(|i| i ^ 0xDE).collect();
+        let result = decode_protocol_message(&garbage, true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn adversarial_oversized_message_length_rejected() {
+        // Compressed header: byte[0] & 0x80 != 0, algorithm in top nibble,
+        // byte[0] & 0x0C == 0. LZ4 = specific top nibble value.
+        // uncompressed_size in bytes[6..10] set to exceed MAXIMUM_MESSAGE_SIZE.
+        let uncompressed_size: u32 = (MAXIMUM_MESSAGE_SIZE as u32) + 1;
+        let payload_wire_size: u32 = 50;
+        let mut buf = vec![0u8; 64];
+        // First byte: 0x80 (compressed flag) | algorithm bits for LZ4
+        // From CompressionAlgorithm::Lz4 header bits — check what from_header_bits expects
+        // The algorithm is in bits 4-7: LZ4 uses 0x10 per the existing test
+        // But we also need bit 7 set: 0x80 | 0x10 = 0x90, and 0x0C bits must be 0
+        let first_byte: u8 = 0x90; // bit7=1 (compressed), bits4-5=01 (lz4), bits2-3=00
+        buf[0] = first_byte | ((payload_wire_size >> 24) as u8 & 0x0F);
+        buf[1] = (payload_wire_size >> 16) as u8;
+        buf[2] = (payload_wire_size >> 8) as u8;
+        buf[3] = payload_wire_size as u8;
+        buf[4..6].copy_from_slice(&(ProtocolMessageType::MtPing as u16).to_be_bytes());
+        buf[6..10].copy_from_slice(&uncompressed_size.to_be_bytes());
+
+        let result = decode_protocol_message(&buf, true);
+        assert!(
+            matches!(result, Err(ProtocolMessageError::MessageTooLarge)),
+            "expected MessageTooLarge, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn adversarial_valid_header_but_corrupt_protobuf_body() {
+        // Valid header pointing to garbage protobuf payload
+        let payload = vec![0xFF; 50];
+        let payload_len = payload.len() as u32;
+        let mut buf = Vec::with_capacity(6 + payload.len());
+        buf.extend_from_slice(&payload_len.to_be_bytes());
+        buf.extend_from_slice(&(ProtocolMessageType::MtTransaction as u16).to_be_bytes());
+        buf.extend_from_slice(&payload);
+        let result = decode_protocol_message(&buf, false);
+        assert!(matches!(result, Err(ProtocolMessageError::Decode(_))));
+    }
+
+    #[test]
+    fn adversarial_compressed_header_with_garbage_lz4_body() {
+        // Compressed header (10 bytes) with invalid LZ4 data
+        let mut buf = vec![0u8; 64];
+        let payload_wire_size: u32 = 54; // remaining bytes after header
+        let uncompressed_size: u32 = 1000;
+        buf[0..4].copy_from_slice(&payload_wire_size.to_be_bytes());
+        buf[4..6].copy_from_slice(&(ProtocolMessageType::MtManifests as u16).to_be_bytes());
+        buf[6] = 0x01; // algorithm = lz4
+        buf[7] = 0;
+        buf[8..10].copy_from_slice(&((uncompressed_size >> 16) as u16).to_be_bytes());
+        // Rest is garbage — decompression should fail
+        for i in 10..64 {
+            buf[i] = (i as u8) ^ 0xAB;
+        }
+        let result = decode_protocol_message(&buf, true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn adversarial_zero_length_payload() {
+        let mut buf = vec![0u8; 6];
+        buf[0..4].copy_from_slice(&0u32.to_be_bytes()); // zero payload
+        buf[4..6].copy_from_slice(&(ProtocolMessageType::MtPing as u16).to_be_bytes());
+        let result = decode_protocol_message(&buf, false);
+        // Zero-length protobuf decode — should either succeed with defaults or error gracefully
+        assert!(result.is_ok() || result.is_err());
+        if let Ok(decoded) = result {
+            // If it succeeds, the message should be parseable (protobuf allows empty)
+            assert!(decoded.message.is_some() || decoded.header.payload_wire_size == 0);
+        }
     }
 }

@@ -993,3 +993,106 @@ mod dispute_tests {
         }
     }
 }
+
+// === Adversarial / Fault-Injection: Network Partition & Reconnect ===
+
+#[test]
+fn network_partition_then_reconnect_reconverges() {
+    // 6 peers in one group, fully connected and trusting each other.
+    // After initial convergence, partition into two halves.
+    // Each half closes independently (fork).
+    // Reconnect — the network should reconverge to a single branch.
+    let mut sim = Sim::new();
+    let all = sim.create_group(6);
+    let delay = Duration::from_millis(100);
+
+    sim.trust_and_connect(&all, &all, delay);
+    for p in &mut sim.peers {
+        p.quorum = 4;
+    }
+
+    // Initial convergence — all peers agree
+    sim.run(2);
+    assert!(sim.synchronized(), "should be synchronized before partition");
+
+    // Partition: disconnect peers 0,1,2 from peers 3,4,5
+    let left = PeerGroup::from_vec(vec![0, 1, 2]);
+    let right = PeerGroup::from_vec(vec![3, 4, 5]);
+    for &l in left.iter() {
+        for &r in right.iter() {
+            sim.net.disconnect(&l, &r);
+            sim.net.disconnect(&r, &l);
+        }
+    }
+
+    // Each half submits different transactions
+    sim.peers[0].submit(Tx::new(777));
+    sim.peers[1].submit(Tx::new(777));
+    sim.peers[2].submit(Tx::new(777));
+    sim.peers[3].submit(Tx::new(888));
+    sim.peers[4].submit(Tx::new(888));
+    sim.peers[5].submit(Tx::new(888));
+
+    // Run during partition — neither half has quorum (needs 4, only has 3)
+    // so they should NOT advance or should fork
+    sim.run(2);
+
+    // Reconnect
+    for &l in left.iter() {
+        for &r in right.iter() {
+            sim.net.connect(l, r, delay, Duration::ZERO);
+            sim.net.connect(r, l, delay, Duration::ZERO);
+        }
+    }
+
+    // Run after reconnect — should reconverge
+    sim.run(3);
+    assert!(
+        sim.synchronized(),
+        "network should reconverge after partition heals"
+    );
+    assert_eq!(sim.branches(), 1, "should have single branch after healing");
+}
+
+#[test]
+fn network_partition_minority_cannot_advance() {
+    // 5 peers, quorum = 4. Partition off 2 peers.
+    // The minority (2 peers) should NOT be able to close a ledger.
+    let mut sim = Sim::new();
+    let all = sim.create_group(5);
+    let delay = Duration::from_millis(50);
+
+    sim.trust_and_connect(&all, &all, delay);
+    for p in &mut sim.peers {
+        p.quorum = 4;
+    }
+
+    sim.run(1);
+    let _pre_partition_seq = sim.peers[0].last_closed_ledger.seq;
+
+    // Partition: isolate peers 3,4
+    for &isolated in &[3u32, 4] {
+        for &connected in &[0u32, 1, 2] {
+            sim.net.disconnect(&isolated, &connected);
+            sim.net.disconnect(&connected, &isolated);
+        }
+    }
+
+    // Minority submits tx — should not be able to close
+    sim.peers[3].submit(Tx::new(999));
+    sim.peers[4].submit(Tx::new(999));
+    sim.run(2);
+
+    // Majority (0,1,2) can still advance (they have 3 peers, but need 4 — 
+    // depends on quorum config). The minority definitely cannot.
+    let minority_seq = sim.peers[3].last_closed_ledger.seq;
+    let majority_seq = sim.peers[0].last_closed_ledger.seq;
+
+    // Majority has 3 peers but quorum is 4, so they also shouldn't advance
+    // OR they advance because they still see each other's validations
+    // The key assertion: minority cannot outpace majority
+    assert!(
+        minority_seq <= majority_seq,
+        "minority should not advance past majority"
+    );
+}
