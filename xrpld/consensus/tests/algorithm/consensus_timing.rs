@@ -442,7 +442,10 @@ fn clock_jump_backward_should_close_ledger_handles_zero_elapsed() {
         &parms,
     );
     // With zero open_time and transactions, should not close (below min_close)
-    assert!(!result, "should not close ledger when open_time is zero due to clock jump");
+    assert!(
+        !result,
+        "should not close ledger when open_time is zero due to clock jump"
+    );
 }
 
 #[test]

@@ -1013,7 +1013,10 @@ fn network_partition_then_reconnect_reconverges() {
 
     // Initial convergence — all peers agree
     sim.run(2);
-    assert!(sim.synchronized(), "should be synchronized before partition");
+    assert!(
+        sim.synchronized(),
+        "should be synchronized before partition"
+    );
 
     // Partition: disconnect peers 0,1,2 from peers 3,4,5
     let left = PeerGroup::from_vec(vec![0, 1, 2]);
@@ -1083,7 +1086,7 @@ fn network_partition_minority_cannot_advance() {
     sim.peers[4].submit(Tx::new(999));
     sim.run(2);
 
-    // Majority (0,1,2) can still advance (they have 3 peers, but need 4 — 
+    // Majority (0,1,2) can still advance (they have 3 peers, but need 4 —
     // depends on quorum config). The minority definitely cannot.
     let minority_seq = sim.peers[3].last_closed_ledger.seq;
     let majority_seq = sim.peers[0].last_closed_ledger.seq;
