@@ -43,6 +43,10 @@
 - All peers serve data in parallel (not round-robin)
 - ~1500 nodes per response from each peer
 - Shared NuDB means work on one ledger benefits all others
+- Cold-bootstrap active acquisition count comes from `[node_size]` and can be
+  overridden with `[ledger_acquisition] ledger_fetch_limit` for expert tuning
+- Future ledgers can be acquired and written while an earlier gap ledger is
+  still downloading; final validated advancement remains ordered by sequence
 
 ### 9. Clock Sync from Validator Sign Time
 - Node clock synced from trusted validator sign_time

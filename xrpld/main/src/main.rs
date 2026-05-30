@@ -428,7 +428,17 @@ impl CatchupResourceProfile {
             },
         }
     }
+
+    fn with_ledger_fetch_limit_override(mut self, ledger_fetch_limit: Option<usize>) -> Self {
+        if let Some(ledger_fetch_limit) = ledger_fetch_limit {
+            self.ledger_fetch_limit = ledger_fetch_limit;
+        }
+        self
+    }
 }
+
+const LEDGER_FETCH_LIMIT_OVERRIDE_MIN: usize = 1;
+const LEDGER_FETCH_LIMIT_OVERRIDE_MAX: usize = 32;
 
 fn bootstrap_acquire_budget_available(
     validated: u32,
@@ -437,6 +447,28 @@ fn bootstrap_acquire_budget_available(
     already_tracked: bool,
 ) -> bool {
     validated > 1 || already_tracked || active_count < ledger_fetch_limit.max(1)
+}
+
+fn ledger_fetch_limit_override(config: &BasicConfig) -> Result<Option<usize>, String> {
+    if !config.exists("ledger_acquisition") {
+        return Ok(None);
+    }
+
+    let Some(limit) = config
+        .section("ledger_acquisition")
+        .get::<usize>("ledger_fetch_limit")
+        .map_err(|_| "Configured ledger_acquisition.ledger_fetch_limit is invalid".to_owned())?
+    else {
+        return Ok(None);
+    };
+
+    if !(LEDGER_FETCH_LIMIT_OVERRIDE_MIN..=LEDGER_FETCH_LIMIT_OVERRIDE_MAX).contains(&limit) {
+        return Err(format!(
+            "Configured ledger_acquisition.ledger_fetch_limit must be between {LEDGER_FETCH_LIMIT_OVERRIDE_MIN} and {LEDGER_FETCH_LIMIT_OVERRIDE_MAX}"
+        ));
+    }
+
+    Ok(Some(limit))
 }
 
 /// Try to parse CLI subcommands. Returns Some(ExitCode) if a subcommand was
@@ -530,16 +562,13 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
 }
 
 fn try_cli_subcommand() -> Option<ExitCode> {
-    use clap::Parser;
-    // Only parse if the first arg looks like a subcommand (not --conf, etc.)
+    use clap::{Parser, error::ErrorKind};
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         return None;
     }
-    let first = &args[1];
-    if first.starts_with('-') {
-        return None; // It's a flag like --conf, let existing parser handle it
-    }
+
     // Known subcommands
     let subcommands = [
         "status",
@@ -567,11 +596,29 @@ fn try_cli_subcommand() -> Option<ExitCode> {
         "--version",
         "-V",
     ];
-    if !subcommands.contains(&first.as_str()) {
-        return None; // Unknown first arg — might be the existing RPC client mode
-    }
 
-    let parsed = cli::Cli::parse();
+    let parsed = match cli::Cli::try_parse() {
+        Ok(parsed) => parsed,
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            let _ = err.print();
+            return Some(ExitCode::SUCCESS);
+        }
+        Err(err)
+            if args
+                .iter()
+                .skip(1)
+                .any(|arg| subcommands.contains(&arg.as_str())) =>
+        {
+            let _ = err.print();
+            return Some(ExitCode::FAILURE);
+        }
+        Err(_) => return None,
+    };
     let url = resolve_rpc_url(&parsed);
     let url = url.as_str();
     let cmd = parsed.command?;
@@ -706,6 +753,7 @@ struct BoundServerRuntime<D> {
     catch_up_state: Arc<CatchUpState>,
     node_store_usage_path: Option<PathBuf>,
     peerfinder_bootcache_path: Option<PathBuf>,
+    ledger_fetch_limit_override: Option<usize>,
 }
 
 fn select_target_seq(
@@ -3469,6 +3517,7 @@ impl<D> BoundServerRuntime<D> {
         app: app::ApplicationRoot,
         node_store_usage_path: Option<PathBuf>,
         peerfinder_bootcache_path: Option<PathBuf>,
+        ledger_fetch_limit_override: Option<usize>,
     ) -> Self {
         Self {
             runtime,
@@ -3477,6 +3526,7 @@ impl<D> BoundServerRuntime<D> {
             catch_up_state: Arc::new(CatchUpState::default()),
             node_store_usage_path,
             peerfinder_bootcache_path,
+            ledger_fetch_limit_override,
         }
     }
 
@@ -3486,6 +3536,7 @@ impl<D> BoundServerRuntime<D> {
         let state = Arc::clone(&self.catch_up_state);
         let node_store_usage_path = self.node_store_usage_path.clone();
         let peerfinder_bootcache_path = self.peerfinder_bootcache_path.clone();
+        let ledger_fetch_limit_override = self.ledger_fetch_limit_override;
         let rt_handle_persist = tokio::runtime::Handle::current();
         let handle = thread::Builder::new()
             .name("xrpld-ledger-catchup".to_owned())
@@ -3496,7 +3547,8 @@ impl<D> BoundServerRuntime<D> {
                 let acq_registry: AcqRegistry = Arc::new(Mutex::new(HashMap::new()));
                 // InboundLedgers manager replaces persistent_acqs
                 let catchup_profile =
-                    CatchupResourceProfile::for_node_size(app.status_rpc_node_size().as_deref());
+                    CatchupResourceProfile::for_node_size(app.status_rpc_node_size().as_deref())
+                        .with_ledger_fetch_limit_override(ledger_fetch_limit_override);
                 // Shared tree-node cache and full-below cache across all
                 // acquisition threads, matching reference where all InboundLedgers
                 // share the same NodeFamily's caches. This prevents duplicate
@@ -5242,6 +5294,7 @@ fn build_composed_runtime_from_path(
     let config = load_basic_config_file(&options.config_path)?;
     let node_store_usage_path = node_store_usage_path(&config);
     let peerfinder_bootcache_path = peerfinder_bootcache_path(&config);
+    let ledger_fetch_limit_override = ledger_fetch_limit_override(&config)?;
     let bootstrap = build_bootstrap_root(&config, &options)?;
     let mut report = bootstrap.report;
     let mut root = bootstrap.root;
@@ -5288,6 +5341,7 @@ fn build_composed_runtime_from_path(
             server_build,
             node_store_usage_path,
             peerfinder_bootcache_path,
+            ledger_fetch_limit_override,
         );
     }
 
@@ -5303,6 +5357,7 @@ fn bind_server_runtime_into_root<D>(
     server_build: ServerRuntimeBuildReport<D>,
     node_store_usage_path: Option<PathBuf>,
     peerfinder_bootcache_path: Option<PathBuf>,
+    ledger_fetch_limit_override: Option<usize>,
 ) where
     D: server::RpcDispatcher + Clone + Send + Sync + 'static,
 {
@@ -5324,6 +5379,7 @@ fn bind_server_runtime_into_root<D>(
         app_for_runtime,
         node_store_usage_path,
         peerfinder_bootcache_path,
+        ledger_fetch_limit_override,
     ));
     let _ = root.bind_server(runtime);
     report.has_server_runtime = true;

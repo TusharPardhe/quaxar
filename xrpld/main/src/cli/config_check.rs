@@ -23,20 +23,29 @@ pub fn run(conf_path: Option<&str>) {
     println!("  ✅ File readable ({} bytes)", content.len());
 
     // Check required sections
-    let required = [
-        "[server]",
-        "[node_db]",
-        "[ips_fixed]",
-        "[validator_list_sites]",
-        "[validator_list_keys]",
-    ];
+    let required = ["[server]", "[node_db]"];
     let mut all_ok = true;
     for section in required {
         if content.contains(section) {
             println!("  ✅ {section}");
         } else {
-            println!("  ⚠️  {section} — missing (may be optional)");
+            println!("  ❌ {section} — missing");
             all_ok = false;
+        }
+    }
+
+    if content.contains("[validators_file]")
+        || (content.contains("[validator_list_sites]") && content.contains("[validator_list_keys]"))
+    {
+        println!("  ✅ validator list configured");
+    } else {
+        println!("  ⚠️  validator list not configured");
+        all_ok = false;
+    }
+
+    for optional in ["[ips]", "[ips_fixed]"] {
+        if content.contains(optional) {
+            println!("  ✅ {optional}");
         }
     }
 

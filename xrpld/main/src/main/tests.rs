@@ -7,11 +7,11 @@ use super::{
     candidate_ledger_for_seq, candidate_reference_hash_from_reference_ledger,
     classify_completed_ledger_acceptance, classify_publish_advance,
     cold_bootstrap_persisted_validated_target, current_ledger_is_fresh, flush_nodestore_writes,
-    hash_for_seq_from_reference_ledger, node_store_usage_path, path_size_bytes,
-    peerfinder_canonical_ip, peerfinder_outbound_target, preferred_closed_ledger_hash,
-    preferred_closed_ledger_hash_from_hashes, promote_current_ledger, prune_known_endpoints,
-    prune_recent_connect_attempts, remember_known_endpoint, select_autoconnect_endpoints,
-    select_bootcache_endpoints, select_consensus_acquisition_target,
+    hash_for_seq_from_reference_ledger, ledger_fetch_limit_override, node_store_usage_path,
+    path_size_bytes, peerfinder_canonical_ip, peerfinder_outbound_target,
+    preferred_closed_ledger_hash, preferred_closed_ledger_hash_from_hashes, promote_current_ledger,
+    prune_known_endpoints, prune_recent_connect_attempts, remember_known_endpoint,
+    select_autoconnect_endpoints, select_bootcache_endpoints, select_consensus_acquisition_target,
     select_post_acquisition_operating_mode, select_target_seq,
     should_attempt_completed_ledger_promotion, should_retry_publish_after_completed_history,
 };
@@ -39,6 +39,29 @@ impl RpcDispatcher for TestDispatcher {
     fn dispatch(&self, _request: RpcRequest<'_>) -> RpcReply {
         RpcReply::result(JsonValue::Object(Default::default()))
     }
+}
+
+fn config(text: &str) -> basics::basic_config::BasicConfig {
+    let mut config = basics::basic_config::BasicConfig::new();
+    let mut sections = basics::basic_config::IniFileSections::new();
+    let mut current = String::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            current = line[1..line.len() - 1].trim().to_owned();
+            let _ = sections.entry(current.clone()).or_default();
+            continue;
+        }
+        sections
+            .entry(current.clone())
+            .or_default()
+            .push(raw_line.to_owned());
+    }
+    config.build(&sections);
+    config
 }
 
 #[test]
@@ -126,6 +149,7 @@ path = {}
                 reason: "test handoff".to_owned(),
             }],
         },
+        None,
         None,
         None,
     );
@@ -1005,12 +1029,61 @@ fn catchup_resource_profile_defaults_to_medium_when_missing() {
 }
 
 #[test]
+fn catchup_resource_profile_applies_ledger_fetch_limit_override() {
+    let tiny = CatchupResourceProfile::for_node_size(Some("tiny"))
+        .with_ledger_fetch_limit_override(Some(8));
+    assert_eq!(tiny.run_data_concurrency, 2);
+    assert_eq!(tiny.acq_tree_cache_size, 262_144);
+    assert_eq!(tiny.ledger_fetch_limit, 8);
+
+    let medium =
+        CatchupResourceProfile::for_node_size(None).with_ledger_fetch_limit_override(Some(1));
+    assert_eq!(medium.run_data_concurrency, 6);
+    assert_eq!(medium.ledger_fetch_limit, 1);
+}
+
+#[test]
 fn bootstrap_acquire_budget_ledger_fetch_shape() {
     assert!(bootstrap_acquire_budget_available(0, 0, 5, false));
     assert!(bootstrap_acquire_budget_available(0, 4, 5, false));
     assert!(!bootstrap_acquire_budget_available(0, 5, 5, false));
     assert!(bootstrap_acquire_budget_available(0, 5, 5, true));
     assert!(bootstrap_acquire_budget_available(2, 99, 2, false));
+}
+
+#[test]
+fn ledger_fetch_limit_override_parses_optional_expert_config() {
+    assert_eq!(
+        ledger_fetch_limit_override(&config("")).expect("missing section"),
+        None
+    );
+    assert_eq!(
+        ledger_fetch_limit_override(&config("[ledger_acquisition]\nledger_fetch_limit = 8\n"))
+            .expect("valid override"),
+        Some(8)
+    );
+    assert_eq!(
+        ledger_fetch_limit_override(&config("[ledger_acquisition]\n")).expect("missing key"),
+        None
+    );
+
+    let zero =
+        ledger_fetch_limit_override(&config("[ledger_acquisition]\nledger_fetch_limit = 0\n"))
+            .expect_err("zero rejected");
+    assert!(zero.contains("between 1 and 32"));
+
+    let high =
+        ledger_fetch_limit_override(&config("[ledger_acquisition]\nledger_fetch_limit = 33\n"))
+            .expect_err("too high rejected");
+    assert!(high.contains("between 1 and 32"));
+
+    let invalid =
+        ledger_fetch_limit_override(&config("[ledger_acquisition]\nledger_fetch_limit = many\n"))
+            .expect_err("invalid rejected");
+    assert_eq!(
+        invalid,
+        "Configured ledger_acquisition.ledger_fetch_limit is invalid"
+    );
 }
 
 #[test]

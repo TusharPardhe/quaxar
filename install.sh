@@ -445,6 +445,10 @@ protocol = ws
 [node_size]
 $NODE_SIZE
 
+[ledger_acquisition]
+# Optional cold-bootstrap acquisition override. Omit to use [node_size].
+# ledger_fetch_limit = 8
+
 [node_db]
 type = $DB_TYPE
 path = $DB_PATH
