@@ -162,21 +162,6 @@ pub fn print_error(msg: &str) {
     eprintln!("    {} {}", console::Style::new().red().apply_to("●"), msg);
 }
 
-/// The solid divider printed between command output and next prompt
-pub fn command_divider() {
-    let width = crossterm::terminal::size()
-        .map(|(w, _)| w as usize)
-        .unwrap_or(80);
-    let line_width = (width * 9) / 10; // 90% of terminal width
-    let padding = (width - line_width) / 2;
-    let dim = console::Style::new().color256(238); // very dim
-    println!(
-        "{}{}",
-        " ".repeat(padding),
-        dim.apply_to("╌".repeat(line_width))
-    );
-}
-
 /// Send an RPC request and return the parsed JSON result.
 pub fn rpc_call(
     url: &str,
