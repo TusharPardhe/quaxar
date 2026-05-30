@@ -399,6 +399,24 @@ fn decode_negative_unl_public_key(bytes: &[u8]) -> Option<[u8; 33]> {
     Some(key)
 }
 
+fn decode_tx_node(
+    ledger_seq: u32,
+    node: &shamap::tree_node::SHAMapTreeNode,
+) -> Result<Option<LedgerTxRead>, LedgerTxReadError> {
+    if !node.is_leaf() {
+        return Ok(None);
+    }
+    if node.get_type() != SHAMapNodeType::TransactionMd {
+        return Err(LedgerTxReadError::Decode(
+            "closed ledger transaction reads require metadata payloads".to_string(),
+        ));
+    }
+    let Some(item) = node.peek_item() else {
+        return Ok(None);
+    };
+    Ok(Some(decode_tx_item(ledger_seq, &item)?))
+}
+
 fn decode_tx_item(ledger_seq: u32, item: &SHAMapItem) -> Result<LedgerTxRead, LedgerTxReadError> {
     let (tx_bytes, meta_bytes) = split_transaction_with_meta(item.data())?;
     let tx = parse_sttx(&tx_bytes)?;
@@ -1219,18 +1237,11 @@ impl Ledger {
         let Some(node) = self.tx_map.find_key(key, &mut |_| None)? else {
             return Ok(None);
         };
-        if !node.is_leaf() {
-            return Ok(None);
-        }
-
-        let Some(item) = node.peek_item() else {
+        let Some(decoded) = decode_tx_node(self.header.seq, &node)? else {
             return Ok(None);
         };
-        if item.key() != key {
-            return Ok(None);
-        }
 
-        Ok(Some(decode_tx_item(self.header.seq, &item)?))
+        Ok((decoded.0.get_transaction_id() == key).then_some(decoded))
     }
 
     pub fn tx_snapshot(&self) -> Result<Vec<LedgerTxRead>, LedgerTxReadError> {
@@ -1246,7 +1257,9 @@ impl Ledger {
             let item = node
                 .peek_item()
                 .expect("ledger tx snapshot leaf nodes should carry an item");
-            snapshot.push(decode_tx_item(self.header.seq, &item)?);
+            if let Some(decoded) = decode_tx_node(self.header.seq, &node)? {
+                snapshot.push(decoded);
+            }
             current = self
                 .tx_map
                 .peek_next_item(item.key(), &mut stack, &mut |_| None)?;

@@ -2324,7 +2324,7 @@ fn xrp_to_iou_via_amm_delivers_partial() {
 
 #[test]
 fn offer_create_reuses_funds_freed_by_cancelled_offer() {
-    use protocol::{LedgerEntryType, offer_keylet};
+    use protocol::{Book, LedgerEntryType, STVector256, offer_keylet, quality_keylet};
 
     let account = acct(0x55);
     let issuer = acct(0x66);
@@ -2337,16 +2337,18 @@ fn offer_create_reuses_funds_freed_by_cancelled_offer() {
     let existing_offer_kl = offer_keylet(raw_id(account), 1);
     let mut existing_offer =
         STLedgerEntry::from_type_and_key(LedgerEntryType::Offer, existing_offer_kl.key);
+    let existing_taker_pays = STAmount::from_xrp_amount(XRPAmount::from_drops(1_000));
+    let existing_taker_gets =
+        STAmount::from_iou_amount(sf("sfTakerGets"), iou(50_000_000, -6), issue);
+    let book = Book::new(protocol::xrp_issue(), issue, None);
+    let book_base = protocol::book_keylet(book);
+    let rate = protocol::get_rate(&existing_taker_gets, &existing_taker_pays);
+    let book_dir_kl = quality_keylet(book_base, rate);
     existing_offer.set_account_id(sf("sfAccount"), account);
     existing_offer.set_field_u32(sf("sfSequence"), 1);
-    existing_offer.set_field_amount(
-        sf("sfTakerPays"),
-        STAmount::from_xrp_amount(XRPAmount::from_drops(1_000)),
-    );
-    existing_offer.set_field_amount(
-        sf("sfTakerGets"),
-        STAmount::from_iou_amount(sf("sfTakerGets"), iou(50_000_000, -6), issue),
-    );
+    existing_offer.set_field_amount(sf("sfTakerPays"), existing_taker_pays);
+    existing_offer.set_field_amount(sf("sfTakerGets"), existing_taker_gets);
+    existing_offer.set_field_h256(sf("sfBookDirectory"), book_dir_kl.key);
     existing_offer.set_field_u64(sf("sfOwnerNode"), 0);
     existing_offer.set_field_u64(sf("sfBookNode"), 0);
 
@@ -2355,10 +2357,18 @@ fn offer_create_reuses_funds_freed_by_cancelled_offer() {
     let mut owner_dir_sle =
         STLedgerEntry::from_type_and_key(LedgerEntryType::DirectoryNode, owner_dir_kl.key);
     {
-        use protocol::STVector256;
         let indexes = STVector256::from_values(sf("sfIndexes"), vec![existing_offer_kl.key]);
         owner_dir_sle.set_field_v256(sf("sfIndexes"), indexes);
     }
+
+    let mut book_dir_sle =
+        STLedgerEntry::from_type_and_key(LedgerEntryType::DirectoryNode, book_dir_kl.key);
+    book_dir_sle.set_field_h256(sf("sfRootIndex"), book_base.key);
+    book_dir_sle.set_field_u64(sf("sfExchangeRate"), rate);
+    book_dir_sle.set_field_v256(
+        sf("sfIndexes"),
+        STVector256::from_values(sf("sfIndexes"), vec![existing_offer_kl.key]),
+    );
 
     // Trust line so account can hold the IOU
     let tl = trust_line_entry(
@@ -2382,6 +2392,10 @@ fn offer_create_reuses_funds_freed_by_cancelled_offer() {
             (
                 owner_dir_kl.key,
                 owner_dir_sle.get_serializer().data().to_vec(),
+            ),
+            (
+                book_dir_kl.key,
+                book_dir_sle.get_serializer().data().to_vec(),
             ),
             tl,
         ],

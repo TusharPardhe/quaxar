@@ -237,6 +237,16 @@ fn ripple_calculate_inner<V: ApplyView>(
     let mut total_in = max_source_amount.zeroed();
     let mut total_out = dst_amount.zeroed();
 
+    if frozen_iou_endpoint(view, dst_amount, src_account, dst_account)
+        || frozen_iou_endpoint(view, max_source_amount, src_account, dst_account)
+    {
+        return Ok(RippleCalcOutput {
+            result: Ter::TEC_PATH_DRY,
+            actual_amount_in: max_source_amount.zeroed(),
+            actual_amount_out: dst_amount.zeroed(),
+        });
+    }
+
     // This replaces the simplified try_default_path approach.
     let deliver_asset = dst_amount.asset();
     let send_max_asset = if max_source_amount.asset() != dst_amount.asset() {
@@ -479,6 +489,24 @@ fn ripple_calculate_inner<V: ApplyView>(
             actual_amount_out: total_out,
         })
     }
+}
+
+fn frozen_iou_endpoint<V: ApplyView>(
+    view: &mut V,
+    amount: &STAmount,
+    src_account: &AccountID,
+    dst_account: &AccountID,
+) -> bool {
+    let Asset::Issue(issue) = amount.asset() else {
+        return false;
+    };
+
+    if amount.native() || *src_account == issue.account || *dst_account == issue.account {
+        return false;
+    }
+
+    crate::domain::ripple_state_helpers::is_frozen(view, src_account, &issue)
+        || crate::domain::ripple_state_helpers::is_frozen(view, dst_account, &issue)
 }
 
 fn try_default_path<V: ApplyView>(

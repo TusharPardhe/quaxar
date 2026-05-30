@@ -21052,7 +21052,7 @@ fn amm_ext50() {
     let cur = protocol::currency_from_string("USD");
     let l = build_ledger_with_features(
         vec![
-            account_root(a, 50_000_000_000, 1, 0),
+            account_root(a, 50_000_000_010, 1, 0),
             account_root(gw, 50_000_000_000, 0, 0x00800000),
             trust_line(a, gw, cur, 100000, 1000000, 0),
         ],
@@ -23402,7 +23402,7 @@ fn amm_ext2_50() {
     let cur = protocol::currency_from_string("EUR");
     let l = build_ledger_with_features(
         vec![
-            account_root(a, 50_000_000_000, 1, 0),
+            account_root(a, 50_000_000_010, 1, 0),
             account_root(gw, 50_000_000_000, 0, 0x00800000),
             trust_line(a, gw, cur, 100000, 1000000, 0),
         ],
@@ -25752,7 +25752,7 @@ fn amm_ext3_50() {
     let cur = protocol::currency_from_string("GBP");
     let l = build_ledger_with_features(
         vec![
-            account_root(a, 50_000_000_000, 1, 0),
+            account_root(a, 50_000_000_010, 1, 0),
             account_root(gw, 50_000_000_000, 0, 0x00800000),
             trust_line(a, gw, cur, 100000, 1000000, 0),
         ],

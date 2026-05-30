@@ -579,9 +579,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     if is_hybrid {
         offer_flags |= protocol::lsfHybrid;
     }
-    if offer_flags != 0 {
-        offer_obj.set_field_u32(sf("sfFlags"), offer_flags);
-    }
+    offer_obj.set_field_u32(sf("sfFlags"), offer_flags);
 
     if is_hybrid {
         let open_rate = if view

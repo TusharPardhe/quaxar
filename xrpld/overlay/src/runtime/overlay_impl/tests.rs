@@ -806,16 +806,29 @@ async fn inbound_session_routes_runtime_messages_and_tracks_metrics() {
     .await
     .expect("wait for inbound routing");
 
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let counts = overlay.traffic.counts();
+            let total = counts.get(&TrafficCategory::Total).expect("total traffic");
+            let transactions = counts
+                .get(&TrafficCategory::Transaction)
+                .expect("transaction traffic");
+            if total.messages_in.load(Ordering::Relaxed) >= 5
+                && transactions.messages_in.load(Ordering::Relaxed) >= 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("wait for traffic metrics");
+
     let total = overlay
         .traffic
         .counts()
         .get(&TrafficCategory::Total)
         .expect("total traffic");
-    assert!(total.messages_in.load(Ordering::Relaxed) >= 5);
-    // Allow async message processing to complete
-    tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
     assert!(total.bytes_in.load(Ordering::Relaxed) > 0);
 
     let transactions = overlay
