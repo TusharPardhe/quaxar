@@ -259,6 +259,59 @@ fn transaction_sign_for_injects_multisign_entry() {
 }
 
 #[test]
+fn transaction_sign_for_rejects_delegate_fee_payer_as_signer() {
+    let (_seed, secret_text, delegate) = seeded_account(0x34);
+    let source = AccountID::from_array([0x44; 20]);
+    let destination = AccountID::from_array([0x55; 20]);
+    let params = object([
+        ("secret", JsonValue::String(secret_text)),
+        ("account", JsonValue::String(protocol::to_base58(delegate))),
+        (
+            "tx_json",
+            object([
+                ("TransactionType", JsonValue::String("Payment".to_owned())),
+                ("Account", JsonValue::String(protocol::to_base58(source))),
+                ("Delegate", JsonValue::String(protocol::to_base58(delegate))),
+                (
+                    "Destination",
+                    JsonValue::String(protocol::to_base58(destination)),
+                ),
+                ("Amount", JsonValue::String("1000".to_owned())),
+                ("Fee", JsonValue::String("10".to_owned())),
+                ("Sequence", JsonValue::Unsigned(9)),
+                ("SigningPubKey", JsonValue::String(String::new())),
+            ]),
+        ),
+    ]);
+    let ctx = RpcRequestContext {
+        params: &params,
+        env: &SignForSource,
+        runtime: &(),
+        role: RpcRole::Admin,
+        api_version: 2,
+        headers: rpc::JsonContextHeaders {
+            user: "",
+            forwarded_for: "",
+        },
+        request_headers: BTreeMap::new(),
+        unlimited: true,
+        remote_ip: None,
+        load_type: rpc::RpcLoadType::Reference,
+    };
+
+    assert_eq!(
+        transaction_sign_for(&ctx),
+        Err(RpcStatus::with_message(
+            RpcErrorCode::InvalidParams,
+            format!(
+                "A Signer may not be the transaction's Account ({}).",
+                protocol::to_base58(delegate)
+            )
+        ))
+    );
+}
+
+#[test]
 fn channel_authorize_returns_real_signature_hex() {
     let (seed, secret_text, _account) = seeded_account(0x66);
     let secret = generate_secret_key(KeyType::Secp256k1, &seed).expect("secret");

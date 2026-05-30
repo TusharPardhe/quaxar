@@ -10,7 +10,7 @@ use crate::read_view::ViewError;
 use crate::views::apply_view::ApplyView;
 use basics::base_uint::Uint160;
 use protocol::{
-    AccountID, STAmount, STLedgerEntry, STPathSet, Ter, get_field_by_symbol, is_tes_success,
+    AccountID, Asset, STAmount, STLedgerEntry, STPathSet, Ter, get_field_by_symbol, is_tes_success,
 };
 use std::sync::Arc;
 
@@ -696,8 +696,8 @@ fn try_xrp_to_iou_default_path<V: ApplyView>(
     let dst_issue = dst_amount.issue();
     // Book: XRP → destination IOU
     let book = book_step::Book {
-        r#in: protocol::xrp_issue(),
-        out: dst_issue,
+        r#in: Asset::Issue(protocol::xrp_issue()),
+        out: Asset::Issue(dst_issue),
     };
     let result = book_step::execute_book_step(
         view,
@@ -769,8 +769,8 @@ fn try_iou_to_xrp_default_path<V: ApplyView>(
     let src_issue = max_source_amount.issue();
     // Book: source IOU → XRP
     let book = book_step::Book {
-        r#in: src_issue,
-        out: protocol::xrp_issue(),
+        r#in: Asset::Issue(src_issue),
+        out: Asset::Issue(protocol::xrp_issue()),
     };
     let result = book_step::execute_book_step(
         view,

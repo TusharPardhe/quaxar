@@ -463,7 +463,6 @@ fn escrow_create_cancel_before_finish() {
 }
 
 /// C++ Escrow_test — finish nonexistent escrow.
-/// NOTE: Dispatcher gap — returns TES_SUCCESS instead of error for nonexistent escrow.
 #[test]
 fn escrow_finish_nonexistent() {
     let alice = acct(0x11);
@@ -476,16 +475,10 @@ fn escrow_finish_nonexistent() {
 
     let tx = escrow_finish_tx(bob, alice, 1, 99);
     let result = full_apply(&mut view, &tx, TxType::ESCROW_FINISH);
-    // Gap: dispatcher returns TES_SUCCESS for nonexistent escrow (C++ returns tecNO_ENTRY)
-    assert!(
-        result == Ter::TES_SUCCESS || result == Ter::TEC_NO_ENTRY,
-        "Got {:?}",
-        result
-    );
+    assert_eq!(result, Ter::TEC_NO_TARGET);
 }
 
 /// C++ Escrow_test — cancel nonexistent escrow.
-/// NOTE: Dispatcher gap — returns TES_SUCCESS instead of error for nonexistent escrow.
 #[test]
 fn escrow_cancel_nonexistent() {
     let alice = acct(0x11);
@@ -498,12 +491,7 @@ fn escrow_cancel_nonexistent() {
 
     let tx = escrow_cancel_tx(bob, alice, 1, 99);
     let result = full_apply(&mut view, &tx, TxType::ESCROW_CANCEL);
-    // Gap: dispatcher returns TES_SUCCESS for nonexistent escrow (C++ returns tecNO_ENTRY)
-    assert!(
-        result == Ter::TES_SUCCESS || result == Ter::TEC_NO_ENTRY,
-        "Got {:?}",
-        result
-    );
+    assert_eq!(result, Ter::TEC_NO_TARGET);
 }
 
 // ─── Escrow: 50 Different Accounts ──────────────────────────────────────────

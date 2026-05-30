@@ -68,14 +68,28 @@ pub(crate) fn fill_json_queue(
 
             let temp = fill_json_queue_tx(fill, tx.tx.as_ref());
             let mut entry = JsonValue::Object(tx_json);
-            if fill.api_version() > 1 {
-                copy_from(&mut entry, &temp);
-            } else {
-                let JsonValue::Object(object) = &mut entry else {
-                    unreachable!("queue entry shell should be an object");
-                };
-                let nested = object.entry("tx".to_owned()).or_insert(JsonValue::Null);
-                copy_from(nested, &temp);
+            match temp {
+                JsonValue::Object(_) => {
+                    if fill.api_version() > 1 {
+                        copy_from(&mut entry, &temp);
+                    } else {
+                        let JsonValue::Object(object) = &mut entry else {
+                            unreachable!("queue entry shell should be an object");
+                        };
+                        let nested = object.entry("tx".to_owned()).or_insert(JsonValue::Null);
+                        copy_from(nested, &temp);
+                    }
+                }
+                other => {
+                    let JsonValue::Object(object) = &mut entry else {
+                        unreachable!("queue entry shell should be an object");
+                    };
+                    if fill.api_version() > 1 {
+                        object.insert("hash".to_owned(), other);
+                    } else {
+                        object.insert("tx".to_owned(), other);
+                    }
+                }
             }
 
             entry

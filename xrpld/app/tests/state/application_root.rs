@@ -274,6 +274,7 @@ fn overlay_setup(network_id: Option<u32>) -> Setup {
         public_ip: None,
         ip_limit: 0,
         peer_limit: 0,
+        verify_endpoints: true,
         crawl_options: 0,
         network_id,
         fixed_peer_ips: std::collections::HashSet::new(),

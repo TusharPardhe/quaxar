@@ -6,9 +6,9 @@ use std::sync::Arc;
 use crate::{ApplyView, Ledger, ReadView, is_deep_frozen, is_frozen};
 use basics::base_uint::Uint160;
 use protocol::{
-    AccountID, Asset, IOUAmount, Issue, LedgerEntryType, MPTIssue, STAmount, STLedgerEntry,
-    STObject, StBase, XRPAmount, account_keylet, get_field_by_symbol, line, lsfDefaultRipple,
-    owner_dir_keylet, sf_generic,
+    AccountID, Asset, IOUAmount, Issue, LedgerEntryType, MPTAmount, MPTIssue, STAmount,
+    STLedgerEntry, STObject, StBase, XRPAmount, account_keylet, get_field_by_symbol, line,
+    lsfDefaultRipple, lsfMPTLocked, owner_dir_keylet, sf_generic,
 };
 use shamap::traversal::TraversalError;
 
@@ -24,6 +24,10 @@ fn confine_owner_count(current: u32, adjustment: i32) -> u32 {
 
 fn zero_iou(issue: Issue) -> STAmount {
     STAmount::from_iou_amount(sf_generic(), IOUAmount::new(), issue)
+}
+
+fn zero_mpt(issue: MPTIssue) -> STAmount {
+    STAmount::from_mpt_amount(sf_generic(), MPTAmount::new(), issue)
 }
 
 fn to_uint160(account: AccountID) -> Uint160 {
@@ -68,11 +72,52 @@ pub fn account_funds(
     default_amount: &STAmount,
     freeze_handling: FreezeHandling,
 ) -> Result<STAmount, TraversalError> {
-    if default_amount.native() {
+    let Asset::Issue(issue) = default_amount.asset() else {
+        let Asset::MPTIssue(issue) = default_amount.asset() else {
+            unreachable!("all assets are handled");
+        };
+
+        if issue.issuer() == account {
+            let Some(issuance) =
+                ledger.read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))?
+            else {
+                return Ok(zero_mpt(issue));
+            };
+            return Ok(STAmount::from_mpt_amount(
+                sf_generic(),
+                MPTAmount::from_value(crate::mptoken_helpers::available_mpt_amount(&issuance)),
+                issue,
+            ));
+        }
+
+        let token_key = protocol::mptoken_keylet_from_mptid(issue.mpt_id(), to_uint160(account));
+        if freeze_handling == FreezeHandling::ZeroIfFrozen
+            && ledger
+                .read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))?
+                .as_ref()
+                .is_some_and(|issuance| issuance.is_flag(lsfMPTLocked))
+        {
+            return Ok(zero_mpt(issue));
+        }
+
+        let Some(token) = ledger.read(token_key)? else {
+            return Ok(zero_mpt(issue));
+        };
+        if freeze_handling == FreezeHandling::ZeroIfFrozen && token.is_flag(lsfMPTLocked) {
+            return Ok(zero_mpt(issue));
+        }
+
+        return Ok(STAmount::from_mpt_amount(
+            sf_generic(),
+            MPTAmount::from_value(token.get_field_u64(sf("sfMPTAmount")) as i64),
+            issue,
+        ));
+    };
+
+    if issue.native() {
         return Ok(STAmount::from_xrp_amount(xrp_liquid(ledger, account, 0)?));
     }
 
-    let issue = default_amount.issue();
     if issue.issuer() == account {
         return Ok(default_amount.clone());
     }
@@ -447,8 +492,10 @@ mod tests {
     use crate::{Fees, Ledger, LedgerHeader};
     use basics::base_uint::{Uint160, Uint256};
     use protocol::{
-        AccountID, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry,
-        account_keylet, currency_from_string, get_field_by_symbol, line, sf_generic,
+        AccountID, Currency, IOUAmount, Issue, LedgerEntryType, MPTAmount, MPTIssue, STAmount,
+        STLedgerEntry, account_keylet, currency_from_string, get_field_by_symbol, line,
+        lsfMPTLocked, make_mpt_id, mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid,
+        sf_generic,
     };
     use shamap::item::SHAMapItem;
     use shamap::mutation::MutableTree;
@@ -547,6 +594,44 @@ mod tests {
         entry.get_serializer().data().to_vec()
     }
 
+    fn mpt_issuance_entry(
+        issuer: AccountID,
+        sequence: u32,
+        max_amount: u64,
+        outstanding: u64,
+        flags: u32,
+    ) -> Vec<u8> {
+        let id = make_mpt_id(sequence, issuer);
+        let mut entry = STLedgerEntry::from_type_and_key(
+            LedgerEntryType::MPTokenIssuance,
+            mpt_issuance_keylet_from_mptid(id).key,
+        );
+        entry.set_account_id(get_field_by_symbol("sfIssuer"), issuer);
+        entry.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+        entry.set_field_u64(get_field_by_symbol("sfOwnerNode"), 0);
+        entry.set_field_u64(get_field_by_symbol("sfMaximumAmount"), max_amount);
+        entry.set_field_u64(get_field_by_symbol("sfOutstandingAmount"), outstanding);
+        entry.set_field_u32(get_field_by_symbol("sfFlags"), flags);
+        entry.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), sample_uint256(0x71));
+        entry.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), 1);
+        entry.get_serializer().data().to_vec()
+    }
+
+    fn mptoken_entry(id: protocol::MPTID, holder: AccountID, amount: u64, flags: u32) -> Vec<u8> {
+        let mut entry = STLedgerEntry::from_type_and_key(
+            LedgerEntryType::MPToken,
+            mptoken_keylet_from_mptid(id, Uint160::from_slice(holder.data()).expect("holder")).key,
+        );
+        entry.set_account_id(get_field_by_symbol("sfAccount"), holder);
+        entry.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), id);
+        entry.set_field_u64(get_field_by_symbol("sfMPTAmount"), amount);
+        entry.set_field_u64(get_field_by_symbol("sfOwnerNode"), 0);
+        entry.set_field_u32(get_field_by_symbol("sfFlags"), flags);
+        entry.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), sample_uint256(0x72));
+        entry.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), 1);
+        entry.get_serializer().data().to_vec()
+    }
+
     #[test]
     fn xrp_liquid_subtracts_reserve() {
         let account = sample_account(0x11);
@@ -599,5 +684,86 @@ mod tests {
             funds.iou(),
             IOUAmount::from_parts(77, 0).expect("expected canonical amount")
         );
+    }
+
+    #[test]
+    fn account_funds_returns_mpt_holder_balance_without_panicking() {
+        let issuer = to_account_id(sample_account(0x41));
+        let holder = to_account_id(sample_account(0x42));
+        let id = make_mpt_id(3, issuer);
+        let issue = MPTIssue::new(id);
+        let ledger = build_ledger(
+            &[
+                (
+                    mpt_issuance_keylet_from_mptid(id).key,
+                    mpt_issuance_entry(issuer, 3, 1_000, 200, 0),
+                ),
+                (
+                    mptoken_keylet_from_mptid(id, sample_account(0x42)).key,
+                    mptoken_entry(id, holder, 77, 0),
+                ),
+            ],
+            Fees::default(),
+        );
+
+        let funds = account_funds(
+            &ledger,
+            holder,
+            &STAmount::from_mpt_amount(
+                get_field_by_symbol("sfTakerGets"),
+                MPTAmount::from_value(1),
+                issue,
+            ),
+            FreezeHandling::IgnoreFreeze,
+        )
+        .expect("account funds lookup should succeed");
+
+        assert_eq!(funds.asset(), protocol::Asset::from(issue));
+        assert_eq!(funds.mpt(), MPTAmount::from_value(77));
+    }
+
+    #[test]
+    fn account_funds_returns_bounded_mpt_issuer_capacity_and_honors_locks() {
+        let issuer = to_account_id(sample_account(0x51));
+        let holder = to_account_id(sample_account(0x52));
+        let id = make_mpt_id(4, issuer);
+        let issue = MPTIssue::new(id);
+        let default_amount = STAmount::from_mpt_amount(
+            get_field_by_symbol("sfTakerGets"),
+            MPTAmount::from_value(1),
+            issue,
+        );
+
+        let ledger = build_ledger(
+            &[
+                (
+                    mpt_issuance_keylet_from_mptid(id).key,
+                    mpt_issuance_entry(issuer, 4, 1_000, 225, 0),
+                ),
+                (
+                    mptoken_keylet_from_mptid(id, sample_account(0x52)).key,
+                    mptoken_entry(id, holder, 77, lsfMPTLocked),
+                ),
+            ],
+            Fees::default(),
+        );
+
+        let issuer_funds = account_funds(
+            &ledger,
+            issuer,
+            &default_amount,
+            FreezeHandling::ZeroIfFrozen,
+        )
+        .expect("issuer funds lookup should succeed");
+        assert_eq!(issuer_funds.mpt(), MPTAmount::from_value(775));
+
+        let frozen_holder_funds = account_funds(
+            &ledger,
+            holder,
+            &default_amount,
+            FreezeHandling::ZeroIfFrozen,
+        )
+        .expect("holder funds lookup should succeed");
+        assert_eq!(frozen_holder_funds.mpt(), MPTAmount::new());
     }
 }

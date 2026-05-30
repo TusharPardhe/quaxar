@@ -43,7 +43,7 @@ fn server_definitions_includes_special_fields() {
         })
         .collect();
 
-    assert!(field_names.contains(&"Generic".to_owned()));
+    assert!(!field_names.contains(&"Generic".to_owned()));
     assert!(field_names.contains(&"Invalid".to_owned()));
     assert!(field_names.contains(&"ObjectEndMarker".to_owned()));
     assert!(field_names.contains(&"ArrayEndMarker".to_owned()));

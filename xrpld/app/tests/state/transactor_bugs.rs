@@ -6,6 +6,7 @@
 
 use app::apply_submit_transactor_shell;
 use basics::base_uint::{Uint160, Uint256};
+use basics::number::{MantissaScale, NumberMantissaScaleGuard};
 use ledger::{Ledger, LedgerHeader, Sandbox};
 use protocol::{
     AccountID, ApplyFlags, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry,
@@ -34,6 +35,7 @@ fn iou_currency(tag: &[u8; 3]) -> Currency {
     Currency::from(d)
 }
 fn iou(mantissa: i64, exponent: i32) -> IOUAmount {
+    let _scale = NumberMantissaScaleGuard::new(MantissaScale::Small);
     IOUAmount::from_parts(mantissa, exponent).unwrap_or_default()
 }
 

@@ -12,7 +12,7 @@ use protocol::keylet::{
     vault,
 };
 use protocol::{
-    AccountID, Asset, Book, Currency, DIRECT_ACCOUNT_KEYLETS, Issue, account_keylet,
+    AccountID, Asset, Book, Currency, DIRECT_ACCOUNT_KEYLETS, Issue, MPTIssue, account_keylet,
     account_root_key, amm, amm_keylet, book_keylet, bridge_keylet_from_door_issue,
     check_keylet_from_key, credential_keylet_from_key, deposit_preauth_keylet_from_key, did_keylet,
     escrow_keylet_from_key, get_book_base, get_quality_next, ledger_hashes_keylet, line,
@@ -320,6 +320,35 @@ fn protocol_amm_keylet_matches_current_cpp_vectors_and_canonicalization() {
 }
 
 #[test]
+fn protocol_amm_keylet_accepts_mpt_assets_and_canonicalizes() {
+    let account = AccountID::from_hex("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        .expect("expected account should parse");
+    let currency = Currency::from_hex("0102030405060708090A0B0C0D0E0F1011121314")
+        .expect("expected currency should parse");
+    let issue_asset = Asset::from(Issue::new(currency, account));
+    let first_mpt = Asset::from(MPTIssue::new(
+        protocol::MPTID::from_hex("00000001BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
+            .expect("first mpt id should parse"),
+    ));
+    let second_mpt = Asset::from(MPTIssue::new(
+        protocol::MPTID::from_hex("00000002CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
+            .expect("second mpt id should parse"),
+    ));
+
+    assert_eq!(amm(issue_asset, first_mpt), amm(first_mpt, issue_asset));
+    assert_eq!(amm(first_mpt, second_mpt), amm(second_mpt, first_mpt));
+    assert_eq!(
+        amm(issue_asset, first_mpt).entry_type,
+        protocol::LedgerEntryType::AMM
+    );
+    assert_eq!(
+        amm(first_mpt, second_mpt).entry_type,
+        protocol::LedgerEntryType::AMM
+    );
+    assert_ne!(amm(issue_asset, first_mpt), amm(first_mpt, second_mpt));
+}
+
+#[test]
 fn protocol_bridge_and_xchain_keylets_match_current_cpp_vectors() {
     let locking_door = Uint160::from_hex("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
         .expect("locking door should parse");
@@ -425,6 +454,71 @@ fn protocol_book_base_includes_domain() {
         Uint256::from_hex("1E9AC7B1CFFAEF3A8E81ED8133431F717C7DE3CCC7F3B3510000000000000000")
             .expect("expected domain book base should parse")
     );
+}
+
+#[test]
+fn protocol_mpt_book_base_uses_mpt_id() {
+    let issuer = AccountID::from_hex("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC").expect("issuer");
+    let mpt = protocol::MPTIssue::new(protocol::make_mpt_id(7, issuer));
+    let xrp_to_mpt = Book::new(protocol::xrp_issue(), mpt, None);
+    let mpt_to_xrp = Book::new(mpt, protocol::xrp_issue(), None);
+
+    let xrp_to_mpt_base = get_book_base(xrp_to_mpt);
+    let mpt_to_xrp_base = get_book_base(mpt_to_xrp);
+
+    assert!(!xrp_to_mpt_base.is_zero());
+    assert!(!mpt_to_xrp_base.is_zero());
+    assert_ne!(xrp_to_mpt_base, mpt_to_xrp_base);
+    assert_eq!(book_keylet(xrp_to_mpt).key, xrp_to_mpt_base);
+}
+
+#[test]
+fn protocol_mpt_book_base_tags_mixed_asset_collision_preimages() {
+    let issuer_b =
+        AccountID::from_hex("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA00000007").expect("issuer b");
+    let issuer_a =
+        AccountID::from_hex("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB").expect("issuer a");
+    let currency_b =
+        Currency::from_hex("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB").expect("currency b");
+    let currency_a =
+        Currency::from_hex("00000005AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").expect("currency a");
+    let shared_iou_issuer =
+        AccountID::from_hex("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC").expect("iou issuer");
+
+    let book_a = Book::new(
+        Issue::new(currency_a, shared_iou_issuer),
+        protocol::MPTIssue::new(protocol::make_mpt_id(7, issuer_a)),
+        None,
+    );
+    let book_b = Book::new(
+        protocol::MPTIssue::new(protocol::make_mpt_id(5, issuer_b)),
+        Issue::new(currency_b, shared_iou_issuer),
+        None,
+    );
+
+    assert_ne!(book_a, book_b);
+    assert_ne!(get_book_base(book_a), get_book_base(book_b));
+}
+
+#[test]
+fn protocol_mpt_book_base_tags_mpt_mpt_branch() {
+    let issuer_x =
+        AccountID::from_hex("1111111111111111111111111111111111111111").expect("issuer x");
+    let issuer_y =
+        AccountID::from_hex("2222222222222222222222222222222222222222").expect("issuer y");
+    let currency =
+        Currency::from_hex("3333333333333333333333333333333333333333").expect("currency");
+    let iou_issuer =
+        AccountID::from_hex("4444444444444444444444444444444444444444").expect("iou issuer");
+
+    let mpt_x = protocol::MPTIssue::new(protocol::make_mpt_id(1, issuer_x));
+    let mpt_y = protocol::MPTIssue::new(protocol::make_mpt_id(2, issuer_y));
+    let mpt_book = Book::new(mpt_x, mpt_y, None);
+    let mixed_book = Book::new(mpt_x, Issue::new(currency, iou_issuer), None);
+    let reversed_mpt_book = Book::new(mpt_y, mpt_x, None);
+
+    assert_ne!(get_book_base(mpt_book), get_book_base(mixed_book));
+    assert_ne!(get_book_base(mpt_book), get_book_base(reversed_mpt_book));
 }
 
 #[test]

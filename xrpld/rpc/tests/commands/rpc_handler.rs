@@ -241,8 +241,10 @@ fn handler_table_path() -> PathBuf {
 
     let mut candidates = Vec::new();
     candidates.push(repo_root.join("../xrpld/src/xrpld/rpc/detail/Handler.cpp"));
+    candidates.push(repo_root.join("../rippled/src/xrpld/rpc/detail/Handler.cpp"));
     if let Ok(current_dir) = std::env::current_dir() {
         candidates.push(current_dir.join("../xrpld/src/xrpld/rpc/detail/Handler.cpp"));
+        candidates.push(current_dir.join("../rippled/src/xrpld/rpc/detail/Handler.cpp"));
         candidates.extend(sibling_xrpld_candidates(&current_dir));
     }
     candidates.extend(sibling_xrpld_candidates(repo_root));
@@ -257,7 +259,12 @@ fn handler_table_path() -> PathBuf {
 fn sibling_xrpld_candidates(start: &Path) -> Vec<PathBuf> {
     start
         .ancestors()
-        .map(|ancestor| ancestor.join("xrpld/src/xrpld/rpc/detail/Handler.cpp"))
+        .flat_map(|ancestor| {
+            [
+                ancestor.join("xrpld/src/xrpld/rpc/detail/Handler.cpp"),
+                ancestor.join("rippled/src/xrpld/rpc/detail/Handler.cpp"),
+            ]
+        })
         .collect()
 }
 

@@ -649,6 +649,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         field_specs: &[
             FormatFieldSpec { field_symbol: "sfLedgerFixType", style: SOEStyle::Required, mpt: SOETxMPTIssue::None },
             FormatFieldSpec { field_symbol: "sfOwner", style: SOEStyle::Optional, mpt: SOETxMPTIssue::None },
+            FormatFieldSpec { field_symbol: "sfBookDirectory", style: SOEStyle::Optional, mpt: SOETxMPTIssue::None },
         ],
     },
     TxFormatSpecInit {

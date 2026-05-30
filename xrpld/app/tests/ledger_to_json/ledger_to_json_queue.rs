@@ -177,6 +177,35 @@ fn ledger_to_json_queue_v2_expanded_merges_tx_shape_into_queue_entry() {
 }
 
 #[test]
+fn ledger_to_json_queue_v2_non_expanded_uses_hash_field() {
+    let ledger = ledger(77, true);
+    let queue = [queue_entry()];
+    let fill = AppLedgerFill::new(&ledger, LedgerFillOptions::DUMP_QUEUE)
+        .with_api_version(2)
+        .with_tx_queue(&queue);
+
+    let mut rendered = JsonValue::Null;
+    add_json(&mut rendered, &fill).expect("queue json should render");
+    let rendered = object(rendered);
+    let JsonValue::Array(entries) = rendered
+        .get("queue_data")
+        .cloned()
+        .expect("queue_data should be present")
+    else {
+        panic!("queue_data should be an array");
+    };
+
+    let entry = object(entries[0].clone());
+    assert_eq!(
+        entry.get("hash"),
+        Some(&JsonValue::String(
+            queue[0].tx.get_transaction_id().to_string()
+        ))
+    );
+    assert!(!entry.contains_key("tx"));
+}
+
+#[test]
 fn ledger_to_json_queue_legacy_non_expanded_nests_tx_under_tx() {
     let ledger = ledger(77, true);
     let queue = [queue_entry()];

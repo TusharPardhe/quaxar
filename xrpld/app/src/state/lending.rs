@@ -1,17 +1,19 @@
 use std::{fmt, sync::Arc};
 
 use basics::{
-    base_uint::{Uint160, Uint256},
+    base_uint::{Uint160, Uint192, Uint256},
     number::{
         NumberParts as RuntimeNumber, NumberRoundModeGuard, RoundingMode, get_mantissa_scale,
     },
 };
-use ledger::{RelativeDistanceAmount, has_expired, views::apply_view::ApplyView};
+use ledger::{ReadView, RelativeDistanceAmount, has_expired, views::apply_view::ApplyView};
 use protocol::StBase;
 use protocol::{
-    AccountID, Asset, LedgerEntryType, STAmount, STLedgerEntry, STNumber, STTx, TenthBips16,
-    TenthBips32, Ter, XRPAmount, account_keylet, feature_id, get_field_by_symbol, loan_key,
-    owner_dir_keylet, tfLoanDefault, tfLoanImpair, tfLoanUnimpair, to_amount_from_number,
+    AccountID, Asset, LedgerEntryType, MPTIssue, STAmount, STLedgerEntry, STNumber, STTx,
+    TenthBips16, TenthBips32, Ter, XRPAmount, account_keylet, feature_id, get_field_by_symbol,
+    lending::LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION, loan_key, mpt_issuance_keylet_from_mptid,
+    mptoken_keylet_from_mptid, owner_dir_keylet, tfLoanDefault, tfLoanImpair, tfLoanUnimpair,
+    to_amount_from_number,
 };
 
 fn sf(name: &str) -> &'static protocol::SField {
@@ -28,43 +30,331 @@ fn account_send<V: ApplyView>(
     to: &AccountID,
     amount: &STAmount,
 ) -> Ter {
-    if amount.native() {
-        let from_keylet = account_keylet(to_160(from));
-        let to_keylet = account_keylet(to_160(to));
-        let Ok(Some(from_sle)) = view.peek(from_keylet) else {
+    account_send_with_mpt_transfer_waiver(view, from, to, amount, false)
+}
+
+fn account_send_with_mpt_transfer_waiver<V: ApplyView>(
+    view: &mut V,
+    from: &AccountID,
+    to: &AccountID,
+    amount: &STAmount,
+    waive_mpt_can_transfer: bool,
+) -> Ter {
+    match amount.asset() {
+        Asset::Issue(issue) if issue.native() => {
+            let from_keylet = account_keylet(to_160(from));
+            let to_keylet = account_keylet(to_160(to));
+            let Ok(Some(from_sle)) = view.peek(from_keylet) else {
+                return Ter::TEF_BAD_LEDGER;
+            };
+            let Ok(Some(to_sle)) = view.peek(to_keylet) else {
+                return Ter::TEF_BAD_LEDGER;
+            };
+            let from_balance = from_sle.get_field_amount(sf("sfBalance")).xrp().drops();
+            let to_balance = to_sle.get_field_amount(sf("sfBalance")).xrp().drops();
+            let drops = amount.xrp().drops();
+            if from_balance < drops {
+                return Ter::TEC_INSUFFICIENT_FUNDS;
+            }
+            let mut from_obj = from_sle.clone_as_object();
+            from_obj.set_field_amount(
+                sf("sfBalance"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(from_balance - drops)),
+            );
+            let mut to_obj = to_sle.clone_as_object();
+            to_obj.set_field_amount(
+                sf("sfBalance"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(to_balance + drops)),
+            );
+            let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
+                from_obj,
+                *from_sle.key(),
+            )));
+            let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
+                to_obj,
+                *to_sle.key(),
+            )));
+            Ter::TES_SUCCESS
+        }
+        Asset::Issue(_) => ledger::ripple_state_helpers::account_send(view, from, to, amount),
+        Asset::MPTIssue(issue) => transfer_mpt(
+            view,
+            issue,
+            from,
+            to,
+            amount.mpt().value().unsigned_abs(),
+            waive_mpt_can_transfer,
+        ),
+    }
+}
+
+fn asset_issuer(asset: Asset) -> AccountID {
+    match asset {
+        Asset::Issue(issue) => issue.account,
+        Asset::MPTIssue(issue) => issue.issuer(),
+    }
+}
+
+fn token_balance<V: ApplyView>(view: &mut V, mpt_id: Uint192, account: &AccountID) -> Option<u64> {
+    view.peek(mptoken_keylet_from_mptid(mpt_id, to_160(account)))
+        .ok()
+        .flatten()
+        .map(|sle| sle.get_field_u64(sf("sfMPTAmount")))
+}
+
+fn set_token_balance<V: ApplyView>(
+    view: &mut V,
+    mpt_id: Uint192,
+    account: &AccountID,
+    balance: u64,
+) -> Ter {
+    let Ok(Some(sle)) = view.peek(mptoken_keylet_from_mptid(mpt_id, to_160(account))) else {
+        return Ter::TEF_BAD_LEDGER;
+    };
+    let mut obj = sle.clone_as_object();
+    obj.set_field_u64(sf("sfMPTAmount"), balance);
+    view.update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())))
+        .map(|_| Ter::TES_SUCCESS)
+        .unwrap_or(Ter::TEF_BAD_LEDGER)
+}
+
+fn transfer_mpt<V: ApplyView>(
+    view: &mut V,
+    issue: MPTIssue,
+    from: &AccountID,
+    to: &AccountID,
+    amount: u64,
+    waive_can_transfer: bool,
+) -> Ter {
+    if amount == 0 || from == to {
+        return Ter::TES_SUCCESS;
+    }
+    if ledger::mptoken_helpers::is_frozen_mpt(view, from, &issue).unwrap_or(false)
+        || ledger::mptoken_helpers::is_frozen_mpt(view, to, &issue).unwrap_or(false)
+    {
+        return Ter::TEC_LOCKED;
+    }
+    if !waive_can_transfer {
+        match ledger::mptoken_helpers::can_transfer_mpt(view, &issue, from, to) {
+            Ok(Ter::TES_SUCCESS) => {}
+            Ok(ter) => return ter,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        }
+    }
+
+    let mpt_id = issue.mpt_id();
+    let issuer = issue.issuer();
+    if *from != issuer {
+        let Some(balance) = token_balance(view, mpt_id, from) else {
             return Ter::TEF_BAD_LEDGER;
         };
-        let Ok(Some(to_sle)) = view.peek(to_keylet) else {
-            return Ter::TEF_BAD_LEDGER;
-        };
-        let from_balance = from_sle.get_field_amount(sf("sfBalance")).xrp().drops();
-        let to_balance = to_sle.get_field_amount(sf("sfBalance")).xrp().drops();
-        let drops = amount.xrp().drops();
-        if from_balance < drops {
+        if balance < amount {
             return Ter::TEC_INSUFFICIENT_FUNDS;
         }
-        let mut from_obj = from_sle.clone_as_object();
-        from_obj.set_field_amount(
-            sf("sfBalance"),
-            STAmount::from_xrp_amount(XRPAmount::from_drops(from_balance - drops)),
-        );
-        let mut to_obj = to_sle.clone_as_object();
-        to_obj.set_field_amount(
-            sf("sfBalance"),
-            STAmount::from_xrp_amount(XRPAmount::from_drops(to_balance + drops)),
-        );
-        let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
-            from_obj,
-            *from_sle.key(),
-        )));
-        let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
-            to_obj,
-            *to_sle.key(),
-        )));
-        Ter::TES_SUCCESS
-    } else {
-        ledger::ripple_state_helpers::account_send(view, from, to, amount)
+        let ter = set_token_balance(view, mpt_id, from, balance - amount);
+        if ter != Ter::TES_SUCCESS {
+            return ter;
+        }
     }
+
+    if *to != issuer {
+        let prior_balance = view
+            .peek(account_keylet(to_160(to)))
+            .ok()
+            .flatten()
+            .map(|sle| sle.get_field_amount(sf("sfBalance")).xrp())
+            .unwrap_or_default();
+        let ter = ledger::add_empty_holding(view, to, prior_balance, &Asset::from(issue));
+        if ter != Ter::TES_SUCCESS && ter != Ter::TEC_DUPLICATE {
+            return ter;
+        }
+        let Some(balance) = token_balance(view, mpt_id, to) else {
+            return Ter::TEF_BAD_LEDGER;
+        };
+        let Some(next) = balance.checked_add(amount) else {
+            return Ter::TEF_INTERNAL;
+        };
+        let ter = set_token_balance(view, mpt_id, to, next);
+        if ter != Ter::TES_SUCCESS {
+            return ter;
+        }
+    }
+
+    let Ok(Some(issuance)) = view.peek(mpt_issuance_keylet_from_mptid(mpt_id)) else {
+        return Ter::TEF_BAD_LEDGER;
+    };
+    let mut obj = issuance.clone_as_object();
+    let outstanding = issuance.get_field_u64(sf("sfOutstandingAmount"));
+    match (*from == issuer, *to == issuer) {
+        (true, false) => obj.set_field_u64(sf("sfOutstandingAmount"), outstanding + amount),
+        (false, true) => obj.set_field_u64(
+            sf("sfOutstandingAmount"),
+            outstanding.saturating_sub(amount),
+        ),
+        _ => {}
+    }
+    view.update(Arc::new(STLedgerEntry::from_stobject(obj, *issuance.key())))
+        .map(|_| Ter::TES_SUCCESS)
+        .unwrap_or(Ter::TEF_BAD_LEDGER)
+}
+
+fn check_cover_sendable<V: ApplyView>(view: &mut V, account: &AccountID, asset: Asset) -> Ter {
+    match asset {
+        Asset::Issue(issue) if issue.native() => Ter::TES_SUCCESS,
+        Asset::Issue(issue) => {
+            if ledger::ripple_state_helpers::is_frozen(view, account, &issue) {
+                Ter::TEC_FROZEN
+            } else {
+                Ter::TES_SUCCESS
+            }
+        }
+        Asset::MPTIssue(issue) => {
+            if ledger::mptoken_helpers::is_frozen_mpt(view, account, &issue).unwrap_or(false) {
+                Ter::TEC_LOCKED
+            } else {
+                Ter::TES_SUCCESS
+            }
+        }
+    }
+}
+
+fn asset_deep_frozen<V: ApplyView>(view: &mut V, account: &AccountID, asset: Asset) -> bool {
+    match asset {
+        Asset::Issue(issue) if issue.native() || issue.account == *account => false,
+        Asset::Issue(issue) => {
+            let Some(line) = view
+                .peek(protocol::line(*account, issue.account, issue.currency))
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    view.read(protocol::line(*account, issue.account, issue.currency))
+                        .ok()
+                        .flatten()
+                })
+            else {
+                return false;
+            };
+            line.is_flag(protocol::lsfLowDeepFreeze) || line.is_flag(protocol::lsfHighDeepFreeze)
+        }
+        Asset::MPTIssue(issue) => {
+            ledger::mptoken_helpers::is_frozen_mpt(view, account, &issue).unwrap_or(true)
+        }
+    }
+}
+
+fn check_asset_deep_frozen<V: ApplyView>(view: &mut V, account: &AccountID, asset: Asset) -> Ter {
+    if !asset_deep_frozen(view, account, asset) {
+        return Ter::TES_SUCCESS;
+    }
+    match asset {
+        Asset::MPTIssue(_) => Ter::TEC_LOCKED,
+        Asset::Issue(_) => Ter::TEC_FROZEN,
+    }
+}
+
+fn asset_requires_strong_auth<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    asset: Asset,
+) -> bool {
+    match asset {
+        Asset::Issue(issue) if issue.native() || issue.account == *account => false,
+        Asset::Issue(issue) => {
+            let line_keylet = protocol::line(*account, issue.account, issue.currency);
+            let trust_line = view
+                .peek(line_keylet)
+                .ok()
+                .flatten()
+                .or_else(|| view.read(line_keylet).ok().flatten());
+            let Some(trust_line) = trust_line else {
+                return true;
+            };
+
+            let issuer_keylet = protocol::account_keylet(to_160(&issue.account));
+            if let Some(issuer) = view
+                .peek(issuer_keylet)
+                .ok()
+                .flatten()
+                .or_else(|| view.read(issuer_keylet).ok().flatten())
+                && issuer.is_flag(protocol::lsfRequireAuth)
+            {
+                let auth_flag = if *account > issue.account {
+                    protocol::lsfLowAuth
+                } else {
+                    protocol::lsfHighAuth
+                };
+                return !trust_line.is_flag(auth_flag);
+            }
+
+            false
+        }
+        Asset::MPTIssue(issue) => ledger::mptoken_helpers::require_auth_mpt(view, &issue, account)
+            .map(|ter| ter != Ter::TES_SUCCESS)
+            .unwrap_or(true),
+    }
+}
+
+fn check_mpt_cover_destination_auth<V: ApplyView>(
+    view: &mut V,
+    destination: &AccountID,
+    issue: &MPTIssue,
+    require_holding: bool,
+) -> Ter {
+    if require_holding
+        && view
+            .read(mptoken_keylet_from_mptid(
+                issue.mpt_id(),
+                to_160(destination),
+            ))
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        return Ter::TEC_NO_AUTH;
+    }
+
+    ledger::mptoken_helpers::require_auth_mpt(view, issue, destination)
+        .unwrap_or(Ter::TEF_BAD_LEDGER)
+}
+
+fn check_mpt_cover_transfer<V: ApplyView>(
+    view: &mut V,
+    source: &AccountID,
+    destination: &AccountID,
+    owner: &AccountID,
+    asset: Asset,
+    waive_can_transfer: bool,
+) -> Ter {
+    let Asset::MPTIssue(issue) = asset else {
+        return Ter::TES_SUCCESS;
+    };
+    let issuer = issue.issuer();
+
+    if source != &issuer
+        && ledger::mptoken_helpers::is_frozen_mpt(view, source, &issue).unwrap_or(true)
+    {
+        return Ter::TEC_LOCKED;
+    }
+    if destination != &issuer
+        && ledger::mptoken_helpers::is_frozen_mpt(view, destination, &issue).unwrap_or(true)
+    {
+        return Ter::TEC_LOCKED;
+    }
+
+    if !waive_can_transfer {
+        let transfer = ledger::mptoken_helpers::can_transfer_mpt(view, &issue, source, destination)
+            .unwrap_or(Ter::TEF_BAD_LEDGER);
+        if transfer != Ter::TES_SUCCESS {
+            return transfer;
+        }
+    }
+
+    let auth = check_mpt_cover_destination_auth(view, destination, &issue, destination != owner);
+    if auth != Ter::TES_SUCCESS {
+        return auth;
+    }
+
+    Ter::TES_SUCCESS
 }
 
 fn with_asset_number(value: RuntimeNumber, asset: Asset) -> STNumber {
@@ -76,14 +366,18 @@ fn with_asset_number(value: RuntimeNumber, asset: Asset) -> STNumber {
 #[derive(Clone)]
 struct BrokerCoverState {
     key: Uint256,
+    owner: AccountID,
     vault_id: Uint256,
     pseudo_account: AccountID,
     cover_available: RuntimeNumber,
+    debt_total: RuntimeNumber,
+    cover_rate_minimum: u32,
     cover_asset: Asset,
 }
 
 #[derive(Clone)]
 struct VaultCoverState {
+    entry: STLedgerEntry,
     asset: Asset,
 }
 
@@ -94,9 +388,20 @@ fn load_broker<V: ApplyView>(view: &mut V, broker_id: Uint256) -> Option<BrokerC
         .flatten()?;
     Some(BrokerCoverState {
         key: *broker_sle.key(),
+        owner: broker_sle.get_account_id(sf("sfOwner")),
         vault_id: broker_sle.get_field_h256(sf("sfVaultID")),
         pseudo_account: broker_sle.get_account_id(sf("sfAccount")),
         cover_available: broker_sle.get_field_number(sf("sfCoverAvailable")).value(),
+        debt_total: if broker_sle.is_field_present(sf("sfDebtTotal")) {
+            broker_sle.get_field_number(sf("sfDebtTotal")).value()
+        } else {
+            RuntimeNumber::zero()
+        },
+        cover_rate_minimum: if broker_sle.is_field_present(sf("sfCoverRateMinimum")) {
+            broker_sle.get_field_u32(sf("sfCoverRateMinimum"))
+        } else {
+            0
+        },
         cover_asset: broker_sle.get_field_issue(sf("sfAsset")).asset(),
     })
 }
@@ -107,6 +412,7 @@ fn load_vault<V: ApplyView>(view: &mut V, vault_id: Uint256) -> Option<VaultCove
         .ok()
         .flatten()?;
     Some(VaultCoverState {
+        entry: (*vault_sle).clone(),
         asset: vault_sle.get_field_issue(sf("sfAsset")).asset(),
     })
 }
@@ -126,6 +432,174 @@ fn persist_broker_cover<V: ApplyView>(
     );
     let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, broker.key)));
     Ter::TES_SUCCESS
+}
+
+fn runtime_number_floor_to_u32(value: RuntimeNumber) -> u32 {
+    if value <= RuntimeNumber::zero() {
+        return 0;
+    }
+
+    let Ok((mantissa, exponent)) = value.external_parts() else {
+        return u32::MAX;
+    };
+    if mantissa <= 0 {
+        return 0;
+    }
+
+    let mut magnitude = mantissa as u128;
+    if exponent >= 0 {
+        for _ in 0..exponent {
+            magnitude = magnitude.saturating_mul(10);
+            if magnitude > u128::from(u32::MAX) {
+                return u32::MAX;
+            }
+        }
+    } else {
+        for _ in 0..(-exponent) {
+            magnitude /= 10;
+            if magnitude == 0 {
+                return 0;
+            }
+        }
+    }
+
+    u32::try_from(magnitude).unwrap_or(u32::MAX)
+}
+
+fn runtime_number_ceil_to_u64(value: RuntimeNumber) -> u64 {
+    if value <= RuntimeNumber::zero() {
+        return 0;
+    }
+
+    let Ok((mantissa, exponent)) = value.external_parts() else {
+        return u64::MAX;
+    };
+    if mantissa <= 0 {
+        return 0;
+    }
+
+    let mut magnitude = mantissa as u128;
+    let mut remainder = false;
+    if exponent >= 0 {
+        for _ in 0..exponent {
+            magnitude = magnitude.saturating_mul(10);
+            if magnitude > u128::from(u64::MAX) {
+                return u64::MAX;
+            }
+        }
+    } else {
+        for _ in 0..(-exponent) {
+            remainder |= magnitude % 10 != 0;
+            magnitude /= 10;
+        }
+    }
+
+    if remainder {
+        magnitude = magnitude.saturating_add(1);
+    }
+    u64::try_from(magnitude).unwrap_or(u64::MAX)
+}
+
+pub fn calculate_loan_pay_base_fee<V: ReadView>(view: &V, sttx: &STTx, normal_cost: u64) -> u64 {
+    if sttx.is_flag(protocol::tfLoanFullPayment) || sttx.is_flag(protocol::tfLoanLatePayment) {
+        return normal_cost;
+    }
+
+    let loan_id = sttx.get_field_h256(sf("sfLoanID"));
+    let Ok(Some(loan_sle)) = view.read(protocol::loan_keylet_from_key(loan_id)) else {
+        return normal_cost;
+    };
+
+    let payments_remaining = loan_sle.get_field_u32(sf("sfPaymentRemaining"));
+    if payments_remaining <= tx::LOAN_PAYMENTS_PER_FEE_INCREMENT {
+        return normal_cost;
+    }
+    if has_expired(
+        view,
+        loan_sle
+            .is_field_present(sf("sfNextPaymentDueDate"))
+            .then(|| loan_sle.get_field_u32(sf("sfNextPaymentDueDate"))),
+    ) {
+        return normal_cost;
+    }
+
+    let Ok(Some(broker_sle)) = view.read(protocol::loan_broker_keylet_from_key(
+        loan_sle.get_field_h256(sf("sfLoanBrokerID")),
+    )) else {
+        return normal_cost;
+    };
+    let Ok(Some(vault_sle)) = view.read(protocol::vault_keylet_from_key(
+        broker_sle.get_field_h256(sf("sfVaultID")),
+    )) else {
+        return normal_cost;
+    };
+
+    let amount = sttx.get_field_amount(sf("sfAmount"));
+    let vault_asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
+    if amount.asset() != vault_asset {
+        return normal_cost;
+    }
+
+    let periodic_payment = loan_sle.get_field_number(sf("sfPeriodicPayment")).value();
+    let service_fee = if loan_sle.is_field_present(sf("sfLoanServiceFee")) {
+        amount_number(&loan_sle.get_field_amount(sf("sfLoanServiceFee")))
+    } else {
+        RuntimeNumber::zero()
+    };
+    let loan_scale = loan_sle.get_field_i32(sf("sfLoanScale"));
+    let regular_payment = round_number_to_asset_with_scale(
+        vault_asset,
+        periodic_payment,
+        loan_scale,
+        RoundingMode::Upward,
+    ) + service_fee;
+    if regular_payment <= RuntimeNumber::zero() {
+        return normal_cost;
+    }
+
+    let payment_amount = amount_number(&amount);
+    let fix_security_3_1_3 = view.rules().enabled(&feature_id("fixSecurity3_1_3"));
+    if fix_security_3_1_3
+        && payment_amount
+            >= regular_payment
+                * RuntimeNumber::from_i64(i64::from(LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION))
+    {
+        return normal_cost.saturating_mul(tx::LOAN_MAXIMUM_FEE_INCREMENTS);
+    }
+
+    let estimate = payment_amount / regular_payment;
+    let payment_estimate = if sttx.is_flag(protocol::tfLoanOverpayment) {
+        runtime_number_ceil_to_u64(estimate)
+    } else {
+        u64::from(runtime_number_floor_to_u32(estimate))
+    };
+    let increments =
+        tx::compute_loan_pay_fee_increments(i64::try_from(payment_estimate).unwrap_or(i64::MAX));
+    let increments = if fix_security_3_1_3 {
+        increments.min(tx::LOAN_MAXIMUM_FEE_INCREMENTS)
+    } else {
+        increments
+    };
+    normal_cost.saturating_mul(increments)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_number_floor_to_u32_handles_integral_fractional_and_large_values() {
+        assert_eq!(runtime_number_floor_to_u32(RuntimeNumber::from_i64(3)), 3);
+        assert_eq!(
+            runtime_number_floor_to_u32(RuntimeNumber::from_i64_and_exponent(39, -1)),
+            3
+        );
+        assert_eq!(runtime_number_floor_to_u32(RuntimeNumber::zero()), 0);
+        assert_eq!(
+            runtime_number_floor_to_u32(RuntimeNumber::from_i64_and_exponent(5, 12)),
+            u32::MAX
+        );
+    }
 }
 
 fn persist_entry<V: ApplyView>(view: &mut V, entry: STLedgerEntry) -> Ter {
@@ -151,6 +625,9 @@ fn round_number_to_asset(asset: Asset, value: RuntimeNumber) -> RuntimeNumber {
 fn vault_scale(vault_sle: &STLedgerEntry, asset: Asset) -> i32 {
     if asset.integral() {
         return 0;
+    }
+    if vault_sle.is_field_present(sf("sfScale")) {
+        return -(vault_sle.get_field_u8(sf("sfScale")) as i32);
     }
     asset
         .amount(vault_sle.get_field_number(sf("sfAssetsTotal")).value())
@@ -205,7 +682,7 @@ fn round_number_to_asset_with_scale(
 ) -> RuntimeNumber {
     let rounded_to_asset = round_number_to_asset(asset, value);
     if asset.integral() {
-        return rounded_to_asset;
+        return round_runtime_to_scale(value, 0, rounding);
     }
     round_runtime_to_scale(rounded_to_asset, scale, rounding)
 }
@@ -225,12 +702,528 @@ fn adjust_imprecise_number(
     }
 }
 
+fn effective_loan_pay_amount(
+    payment_type: tx::LoanPayPaymentType,
+    fix_security_3_1_3: bool,
+    fix_cleanup_3_2_0: bool,
+    asset: Asset,
+    payment_amount: RuntimeNumber,
+    loan_scale: i32,
+) -> RuntimeNumber {
+    if payment_type == tx::LoanPayPaymentType::Overpayment
+        && (fix_security_3_1_3 || fix_cleanup_3_2_0)
+    {
+        round_number_to_asset_with_scale(
+            asset,
+            payment_amount,
+            loan_scale,
+            RoundingMode::TowardsZero,
+        )
+    } else {
+        payment_amount
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoanPayComponentParts {
+    principal_paid: RuntimeNumber,
+    interest_paid: RuntimeNumber,
+    management_fee_paid: RuntimeNumber,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_loan_pay_periodic_components(
+    rules: &protocol::Rules,
+    asset: Asset,
+    loan_scale: i32,
+    total_value_outstanding: RuntimeNumber,
+    principal_outstanding: RuntimeNumber,
+    management_fee_outstanding: RuntimeNumber,
+    periodic_payment: RuntimeNumber,
+    interest_rate: TenthBips32,
+    payment_interval: u32,
+    payments_remaining: u32,
+    management_fee_rate: TenthBips16,
+) -> LoanPayComponentParts {
+    let rounded_periodic_payment =
+        round_number_to_asset_with_scale(asset, periodic_payment, loan_scale, RoundingMode::Upward);
+    if payments_remaining <= 1 || total_value_outstanding <= rounded_periodic_payment {
+        let interest_paid =
+            total_value_outstanding - principal_outstanding - management_fee_outstanding;
+        return LoanPayComponentParts {
+            principal_paid: principal_outstanding,
+            interest_paid: interest_paid.max(RuntimeNumber::zero()),
+            management_fee_paid: management_fee_outstanding,
+        };
+    }
+
+    let periodic_rate = tx::loan_set_periodic_rate(interest_rate, payment_interval);
+    let target = tx::compute_theoretical_loan_state(
+        rules,
+        asset,
+        periodic_payment,
+        periodic_rate,
+        payments_remaining.saturating_sub(1),
+        management_fee_rate,
+    );
+    let fix_cleanup_3_2_0 = rules.enabled(&feature_id("fixCleanup3_2_0"));
+    let principal_rounding = if fix_cleanup_3_2_0 {
+        RoundingMode::Upward
+    } else {
+        RoundingMode::ToNearest
+    };
+    let interest_rounding = if fix_cleanup_3_2_0 {
+        RoundingMode::Downward
+    } else {
+        RoundingMode::ToNearest
+    };
+    let rounded_target_value = round_number_to_asset_with_scale(
+        asset,
+        target.value_outstanding,
+        loan_scale,
+        RoundingMode::ToNearest,
+    );
+    let rounded_target_principal = round_number_to_asset_with_scale(
+        asset,
+        target.principal_outstanding,
+        loan_scale,
+        principal_rounding,
+    );
+    let rounded_target_interest =
+        round_number_to_asset_with_scale(asset, target.interest_due, loan_scale, interest_rounding);
+    let rounded_target_management_fee = round_number_to_asset_with_scale(
+        asset,
+        target.management_fee_due,
+        loan_scale,
+        RoundingMode::ToNearest,
+    );
+
+    let current_interest =
+        (total_value_outstanding - principal_outstanding - management_fee_outstanding)
+            .max(RuntimeNumber::zero());
+    let mut principal_paid =
+        (principal_outstanding - rounded_target_principal).max(RuntimeNumber::zero());
+    let mut interest_paid = (current_interest - rounded_target_interest).max(RuntimeNumber::zero());
+    let mut management_fee_paid =
+        (management_fee_outstanding - rounded_target_management_fee).max(RuntimeNumber::zero());
+
+    principal_paid = principal_paid.min(principal_outstanding);
+    interest_paid = interest_paid
+        .min(current_interest)
+        .min((rounded_periodic_payment - principal_paid).max(RuntimeNumber::zero()));
+    management_fee_paid = management_fee_paid.min(management_fee_outstanding).min(
+        (rounded_periodic_payment - principal_paid - interest_paid).max(RuntimeNumber::zero()),
+    );
+
+    let mut total_value_paid = principal_paid + interest_paid + management_fee_paid;
+    if total_value_paid > total_value_outstanding {
+        total_value_paid = total_value_outstanding;
+    }
+    if total_value_paid > rounded_periodic_payment {
+        let excess = total_value_paid - rounded_periodic_payment;
+        let interest_reduction = interest_paid.min(excess);
+        interest_paid -= interest_reduction;
+        let remaining_excess = excess - interest_reduction;
+        let fee_reduction = management_fee_paid.min(remaining_excess);
+        management_fee_paid -= fee_reduction;
+        let remaining_excess = remaining_excess - fee_reduction;
+        principal_paid -= principal_paid.min(remaining_excess);
+        total_value_paid = principal_paid + interest_paid + management_fee_paid;
+    }
+    if total_value_paid == RuntimeNumber::zero() && rounded_target_value < total_value_outstanding {
+        interest_paid = current_interest.min(rounded_periodic_payment);
+    }
+
+    LoanPayComponentParts {
+        principal_paid,
+        interest_paid,
+        management_fee_paid,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_loan_pay_scheduled_payment_loop(
+    rules: &protocol::Rules,
+    asset: Asset,
+    loan_scale: i32,
+    payment_amount: RuntimeNumber,
+    total_value_outstanding: RuntimeNumber,
+    principal_outstanding: RuntimeNumber,
+    management_fee_outstanding: RuntimeNumber,
+    periodic_payment: RuntimeNumber,
+    interest_rate: TenthBips32,
+    payment_interval: u32,
+    payments_remaining: u32,
+    management_fee_rate: TenthBips16,
+    service_fee: RuntimeNumber,
+) -> (
+    RuntimeNumber,
+    RuntimeNumber,
+    RuntimeNumber,
+    RuntimeNumber,
+    RuntimeNumber,
+    u32,
+) {
+    let mut current_total = total_value_outstanding;
+    let mut current_principal = principal_outstanding;
+    let mut current_management_fee = management_fee_outstanding;
+    let mut current_remaining = payments_remaining;
+
+    let mut principal_paid = RuntimeNumber::zero();
+    let mut interest_paid = RuntimeNumber::zero();
+    let mut management_fee_paid = RuntimeNumber::zero();
+    let mut fee_paid = RuntimeNumber::zero();
+    let mut total_paid = RuntimeNumber::zero();
+    let mut periods_paid = 0_u32;
+
+    while current_remaining > 0
+        && periods_paid < tx::LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION
+        && current_total > RuntimeNumber::zero()
+    {
+        let components = compute_loan_pay_periodic_components(
+            rules,
+            asset,
+            loan_scale,
+            current_total,
+            current_principal,
+            current_management_fee,
+            periodic_payment,
+            interest_rate,
+            payment_interval,
+            current_remaining,
+            management_fee_rate,
+        );
+        let tracked_due =
+            components.principal_paid + components.interest_paid + components.management_fee_paid;
+        let period_due = tracked_due + service_fee;
+        if period_due <= RuntimeNumber::zero() || total_paid + period_due > payment_amount {
+            break;
+        }
+
+        principal_paid += components.principal_paid;
+        interest_paid += components.interest_paid;
+        management_fee_paid += components.management_fee_paid;
+        fee_paid += components.management_fee_paid + service_fee;
+        total_paid += period_due;
+
+        current_principal =
+            (current_principal - components.principal_paid).max(RuntimeNumber::zero());
+        current_management_fee =
+            (current_management_fee - components.management_fee_paid).max(RuntimeNumber::zero());
+        current_total = (current_total - tracked_due).max(RuntimeNumber::zero());
+        current_remaining = current_remaining.saturating_sub(1);
+        periods_paid += 1;
+    }
+
+    (
+        principal_paid,
+        interest_paid,
+        management_fee_paid,
+        fee_paid,
+        RuntimeNumber::zero(),
+        periods_paid,
+    )
+}
+
 fn zero_asset_number(asset: Asset) -> STNumber {
     with_asset_number(RuntimeNumber::zero(), asset)
 }
 
 fn tenth_bips_of_runtime_number(value: RuntimeNumber, rate: u32) -> RuntimeNumber {
     value * RuntimeNumber::from_i64(i64::from(rate)) / RuntimeNumber::from_i64(100_000)
+}
+
+fn compute_interest_and_fee_parts(
+    asset: Asset,
+    interest: RuntimeNumber,
+    management_fee_rate: TenthBips16,
+    loan_scale: i32,
+) -> (RuntimeNumber, RuntimeNumber) {
+    let fee = tx::compute_management_fee(asset, interest, management_fee_rate, loan_scale);
+    (interest - fee, fee)
+}
+
+fn loan_accrued_interest(
+    principal_outstanding: RuntimeNumber,
+    periodic_rate: RuntimeNumber,
+    parent_close_time: u32,
+    start_date: u32,
+    previous_payment_date: u32,
+    payment_interval: u32,
+) -> RuntimeNumber {
+    if periodic_rate == RuntimeNumber::zero() || payment_interval == 0 {
+        return RuntimeNumber::zero();
+    }
+
+    let last_payment_date = previous_payment_date.max(start_date);
+    if parent_close_time <= last_payment_date {
+        return RuntimeNumber::zero();
+    }
+
+    principal_outstanding
+        * periodic_rate
+        * RuntimeNumber::from_i64(i64::from(parent_close_time - last_payment_date))
+        / RuntimeNumber::from_i64(i64::from(payment_interval))
+}
+
+fn loan_late_payment_interest(
+    principal_outstanding: RuntimeNumber,
+    late_interest_rate: TenthBips32,
+    parent_close_time: u32,
+    next_payment_due_date: u32,
+) -> RuntimeNumber {
+    if principal_outstanding == RuntimeNumber::zero() || late_interest_rate.value() == 0 {
+        return RuntimeNumber::zero();
+    }
+
+    if parent_close_time <= next_payment_due_date {
+        return RuntimeNumber::zero();
+    }
+
+    let seconds_overdue = parent_close_time - next_payment_due_date;
+    principal_outstanding * tx::loan_set_periodic_rate(late_interest_rate, seconds_overdue)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_full_payment_parts(
+    rules: &protocol::Rules,
+    asset: Asset,
+    loan_scale: i32,
+    parent_close_time: u32,
+    total_interest_outstanding: RuntimeNumber,
+    periodic_payment: RuntimeNumber,
+    periodic_rate: RuntimeNumber,
+    payments_remaining: u32,
+    previous_payment_date: u32,
+    start_date: u32,
+    payment_interval: u32,
+    close_interest_rate: TenthBips32,
+    close_payment_fee: RuntimeNumber,
+    management_fee_rate: TenthBips16,
+) -> (RuntimeNumber, RuntimeNumber, RuntimeNumber) {
+    let theoretical_principal = tx::loan_principal_from_periodic_payment(
+        rules,
+        periodic_payment,
+        periodic_rate,
+        payments_remaining,
+    );
+    let accrued_interest = loan_accrued_interest(
+        theoretical_principal,
+        periodic_rate,
+        parent_close_time,
+        start_date,
+        previous_payment_date,
+        payment_interval,
+    );
+    let prepayment_penalty =
+        tenth_bips_of_runtime_number(theoretical_principal, close_interest_rate.value());
+    let full_interest = round_number_to_asset_with_scale(
+        asset,
+        accrued_interest + prepayment_penalty,
+        loan_scale,
+        RoundingMode::Downward,
+    );
+    let (net_interest, management_fee) =
+        compute_interest_and_fee_parts(asset, full_interest, management_fee_rate, loan_scale);
+    let value_change = net_interest - total_interest_outstanding;
+    let fee_paid = close_payment_fee + management_fee;
+    (net_interest, fee_paid, value_change)
+}
+
+struct OverpaymentReamortization {
+    principal_paid: RuntimeNumber,
+    interest_paid: RuntimeNumber,
+    management_fee_paid: RuntimeNumber,
+    fee_paid: RuntimeNumber,
+    value_change: RuntimeNumber,
+    periodic_payment: RuntimeNumber,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_overpayment_reamortization(
+    rules: &protocol::Rules,
+    asset: Asset,
+    loan_scale: i32,
+    overpayment: RuntimeNumber,
+    old_total_value: RuntimeNumber,
+    old_principal: RuntimeNumber,
+    old_management_fee: RuntimeNumber,
+    periodic_payment: RuntimeNumber,
+    interest_rate: TenthBips32,
+    payment_interval: u32,
+    periodic_rate: RuntimeNumber,
+    payment_remaining: u32,
+    management_fee_rate: TenthBips16,
+    overpayment_interest_rate: TenthBips32,
+    overpayment_fee_rate: TenthBips32,
+) -> Option<OverpaymentReamortization> {
+    if overpayment <= RuntimeNumber::zero() || payment_remaining == 0 {
+        return None;
+    }
+
+    let overpayment_fee = round_number_to_asset_with_scale(
+        asset,
+        tenth_bips_of_runtime_number(overpayment, overpayment_fee_rate.value()),
+        loan_scale,
+        RoundingMode::ToNearest,
+    );
+    let overpayment_interest = round_number_to_asset_with_scale(
+        asset,
+        tenth_bips_of_runtime_number(overpayment, overpayment_interest_rate.value()),
+        loan_scale,
+        RoundingMode::ToNearest,
+    );
+    let (net_overpayment_interest, overpayment_management_fee) = compute_interest_and_fee_parts(
+        asset,
+        overpayment_interest,
+        management_fee_rate,
+        loan_scale,
+    );
+    let tracked_principal_delta =
+        overpayment - net_overpayment_interest - overpayment_management_fee - overpayment_fee;
+    if tracked_principal_delta <= RuntimeNumber::zero() {
+        return None;
+    }
+
+    let old_interest =
+        (old_total_value - old_principal - old_management_fee).max(RuntimeNumber::zero());
+    let old_state =
+        tx::construct_loan_set_state(old_total_value, old_principal, old_management_fee);
+    let theoretical_state = tx::compute_theoretical_loan_state(
+        rules,
+        asset,
+        periodic_payment,
+        periodic_rate,
+        payment_remaining,
+        management_fee_rate,
+    );
+    let value_error = old_state.value_outstanding - theoretical_state.value_outstanding;
+    let principal_error = old_state.principal_outstanding - theoretical_state.principal_outstanding;
+    let interest_error = old_state.interest_due - theoretical_state.interest_due;
+    let management_error = old_state.management_fee_due - theoretical_state.management_fee_due;
+
+    let new_theoretical_principal = (theoretical_state.principal_outstanding
+        - tracked_principal_delta)
+        .max(RuntimeNumber::zero());
+
+    let mut new_loan_properties = tx::compute_loan_set_properties(
+        rules,
+        asset,
+        new_theoretical_principal,
+        interest_rate,
+        payment_interval,
+        payment_remaining,
+        management_fee_rate,
+        loan_scale,
+    );
+    let new_theoretical_state = tx::compute_theoretical_loan_state(
+        rules,
+        asset,
+        new_loan_properties.periodic_payment,
+        periodic_rate,
+        payment_remaining,
+        management_fee_rate,
+    );
+    let new_theoretical_state = tx::LoanSetLoanState {
+        value_outstanding: new_theoretical_state.value_outstanding + value_error,
+        principal_outstanding: new_theoretical_state.principal_outstanding + principal_error,
+        interest_due: new_theoretical_state.interest_due + interest_error,
+        management_fee_due: new_theoretical_state.management_fee_due + management_error,
+    };
+
+    let new_principal = round_number_to_asset_with_scale(
+        asset,
+        new_theoretical_state.principal_outstanding,
+        loan_scale,
+        RoundingMode::Upward,
+    )
+    .max(RuntimeNumber::zero())
+    .min(old_principal);
+    let total_value_outstanding = round_number_to_asset_with_scale(
+        asset,
+        new_principal + new_theoretical_state.interest_due,
+        loan_scale,
+        RoundingMode::Upward,
+    )
+    .max(RuntimeNumber::zero())
+    .min(old_total_value);
+    let new_management_fee = round_number_to_asset_with_scale(
+        asset,
+        new_theoretical_state.management_fee_due,
+        loan_scale,
+        RoundingMode::ToNearest,
+    )
+    .max(RuntimeNumber::zero())
+    .min(old_management_fee);
+    let rounded_new_state =
+        tx::construct_loan_set_state(total_value_outstanding, new_principal, new_management_fee);
+    new_loan_properties.loan_state = rounded_new_state.clone();
+
+    let guards = tx::LoanSetLoanGuardProperties {
+        periodic_payment: new_loan_properties.periodic_payment,
+        total_value_outstanding: rounded_new_state.value_outstanding,
+        loan_scale: new_loan_properties.loan_scale,
+        first_payment_principal: new_loan_properties.first_payment_principal,
+    };
+    if tx::check_loan_set_loan_guards(
+        &asset,
+        &rounded_new_state.principal_outstanding,
+        rounded_new_state.interest_due != RuntimeNumber::zero(),
+        payment_remaining,
+        &guards,
+        &RuntimeNumber::zero(),
+        |asset, value, scale| {
+            round_number_to_asset_with_scale(*asset, *value, scale, RoundingMode::ToNearest)
+        },
+        |total, rounded| {
+            if *rounded <= RuntimeNumber::zero() {
+                0
+            } else {
+                let mut payments = 0_i64;
+                let mut remaining = *total;
+                while remaining > RuntimeNumber::zero() {
+                    remaining -= *rounded;
+                    payments += 1;
+                    if payments > i64::from(u32::MAX) {
+                        break;
+                    }
+                }
+                payments
+            }
+        },
+    )
+    .is_err()
+    {
+        return None;
+    }
+
+    if new_loan_properties.periodic_payment <= RuntimeNumber::zero()
+        || rounded_new_state.value_outstanding <= RuntimeNumber::zero()
+        || rounded_new_state.management_fee_due < RuntimeNumber::zero()
+    {
+        return None;
+    }
+
+    if rounded_new_state.principal_outstanding >= old_principal {
+        return None;
+    }
+
+    let principal_paid = old_principal - rounded_new_state.principal_outstanding;
+    let management_fee_paid = old_management_fee - rounded_new_state.management_fee_due;
+    let new_interest = rounded_new_state.interest_due.max(RuntimeNumber::zero());
+    let value_change = new_interest - old_interest + net_overpayment_interest;
+    if value_change > net_overpayment_interest {
+        return None;
+    }
+
+    Some(OverpaymentReamortization {
+        principal_paid,
+        interest_paid: net_overpayment_interest,
+        management_fee_paid,
+        fee_paid: overpayment_fee + overpayment_management_fee,
+        value_change,
+        periodic_payment: new_loan_properties.periodic_payment,
+    })
 }
 
 #[derive(Clone)]
@@ -483,12 +1476,122 @@ fn amount_number(amount: &STAmount) -> RuntimeNumber {
     amount.as_number()
 }
 
+fn asset_scale_from_value(asset: Asset, value: RuntimeNumber) -> i32 {
+    if asset.integral() {
+        return 0;
+    }
+    asset
+        .amount(value)
+        .map(|amount| amount.exponent())
+        .unwrap_or(0)
+}
+
+fn minimum_broker_cover(
+    asset: Asset,
+    debt_total: RuntimeNumber,
+    cover_rate_minimum: u32,
+    vault_sle: &STLedgerEntry,
+    fix_cleanup_3_2_0: bool,
+) -> RuntimeNumber {
+    let scale = if fix_cleanup_3_2_0 {
+        vault_scale(vault_sle, asset)
+    } else {
+        asset_scale_from_value(asset, debt_total)
+    };
+    round_number_to_asset_with_scale(
+        asset,
+        tenth_bips_of_runtime_number(debt_total, cover_rate_minimum),
+        scale,
+        RoundingMode::Upward,
+    )
+}
+
+fn loan_pay_fee_route_minimum_cover(
+    asset: Asset,
+    debt_total: RuntimeNumber,
+    cover_rate_minimum: u32,
+    loan_scale: i32,
+    vault_scale: i32,
+    fix_cleanup_3_2_0: bool,
+) -> RuntimeNumber {
+    let scale = if fix_cleanup_3_2_0 {
+        vault_scale
+    } else {
+        loan_scale
+    };
+    round_number_to_asset_with_scale(
+        asset,
+        tenth_bips_of_runtime_number(debt_total, cover_rate_minimum),
+        scale,
+        RoundingMode::Upward,
+    )
+}
+
+fn loan_set_debt_total_update(
+    asset: Asset,
+    current: RuntimeNumber,
+    adjustment: RuntimeNumber,
+    vault_sle: &STLedgerEntry,
+    loan_scale: i32,
+    fix_cleanup_3_2_0: bool,
+) -> RuntimeNumber {
+    let scale = if fix_cleanup_3_2_0 {
+        vault_scale(vault_sle, asset)
+    } else {
+        loan_scale
+    };
+    adjust_imprecise_number(current, adjustment, asset, scale)
+}
+
+fn is_pseudo_account<V: ApplyView>(view: &mut V, account: &AccountID) -> bool {
+    let Ok(Some(account_sle)) = view.peek(account_keylet(to_160(account))) else {
+        return false;
+    };
+    account_sle.is_field_present(sf("sfVaultID"))
+        || account_sle.is_field_present(sf("sfLoanBrokerID"))
+}
+
 fn runtime_to_amount(
     asset: Asset,
     value: RuntimeNumber,
     rounding: RoundingMode,
 ) -> Option<STAmount> {
     to_amount_from_number(asset, value, rounding).ok()
+}
+
+fn rounded_cover_deposit_amount(
+    asset: Asset,
+    cover_available: RuntimeNumber,
+    amount: &STAmount,
+    fix_cleanup_3_2_0: bool,
+) -> Option<(STAmount, RuntimeNumber)> {
+    if !fix_cleanup_3_2_0 {
+        return Some((amount.clone(), amount_number(amount)));
+    }
+
+    let scale = asset_scale_from_value(asset, cover_available);
+    let rounded = round_number_to_asset_with_scale(
+        asset,
+        amount_number(amount),
+        scale,
+        RoundingMode::Downward,
+    );
+    runtime_to_amount(asset, rounded, RoundingMode::Downward).map(|amount| (amount, rounded))
+}
+
+fn cover_amount_is_zero_at_cover_scale(
+    asset: Asset,
+    cover_available: RuntimeNumber,
+    amount: &STAmount,
+    fix_cleanup_3_2_0: bool,
+) -> bool {
+    if !fix_cleanup_3_2_0 {
+        return false;
+    }
+
+    let scale = asset_scale_from_value(asset, cover_available);
+    round_number_to_asset_with_scale(asset, amount_number(amount), scale, RoundingMode::ToNearest)
+        == RuntimeNumber::zero()
 }
 
 fn load_loan_set_tx_view(sttx: &STTx) -> LoanSetTxView<'_> {
@@ -806,7 +1909,27 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
                 Err(err) => err.ter(),
             }
         },
-        |debt_total, cover_rate| tenth_bips_of_runtime_number(*debt_total, cover_rate),
+        |debt_total, cover_rate| {
+            let view = unsafe { &mut *view_ptr };
+            let broker_id = sttx.get_field_h256(sf("sfLoanBrokerID"));
+            let Ok(Some(broker_sle)) = view.peek(protocol::loan_broker_keylet_from_key(broker_id))
+            else {
+                return tenth_bips_of_runtime_number(*debt_total, cover_rate);
+            };
+            let Ok(Some(vault_sle)) = view.peek(protocol::vault_keylet_from_key(
+                broker_sle.get_field_h256(sf("sfVaultID")),
+            )) else {
+                return tenth_bips_of_runtime_number(*debt_total, cover_rate);
+            };
+            let asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
+            minimum_broker_cover(
+                asset,
+                *debt_total,
+                cover_rate,
+                &vault_sle,
+                view.rules().enabled(&feature_id("fixCleanup3_2_0")),
+            )
+        },
         || {
             let view = unsafe { &mut *view_ptr };
             let borrower = if sttx.is_field_present(sf("sfCounterparty")) {
@@ -1090,11 +2213,13 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
             broker_obj.set_field_number(
                 sf("sfDebtTotal"),
                 with_asset_number(
-                    adjust_imprecise_number(
+                    loan_set_debt_total_update(
+                        vault.asset,
                         broker.debt_total,
                         amount_number(&principal_requested_amount) + state.interest_due,
-                        vault.asset,
+                        &vault.entry,
                         properties.loan_scale,
+                        rules.enabled(&feature_id("fixCleanup3_2_0")),
                     ),
                     vault.asset,
                 ),
@@ -1299,6 +2424,45 @@ pub fn apply_loan_broker_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter 
     let vault_asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
     let broker_pseudo_id = broker_sle.get_account_id(sf("sfAccount"));
 
+    if account != broker_sle.get_account_id(sf("sfOwner")) {
+        return Ter::TEC_NO_PERMISSION;
+    }
+    if broker_sle.get_field_u32(sf("sfOwnerCount")) != 0 {
+        return Ter::TEC_HAS_OBLIGATIONS;
+    }
+    let debt_total = broker_sle.get_field_number(sf("sfDebtTotal")).value();
+    if debt_total != RuntimeNumber::zero() {
+        let rounded = round_number_to_asset_with_scale(
+            vault_asset,
+            debt_total,
+            vault_scale(&vault_sle, vault_asset),
+            RoundingMode::TowardsZero,
+        );
+        if rounded != RuntimeNumber::zero() {
+            return Ter::TEC_HAS_OBLIGATIONS;
+        }
+    }
+    let cover_available = broker_sle.get_field_number(sf("sfCoverAvailable")).value();
+    if view.rules().enabled(&feature_id("fixCleanup3_2_0"))
+        && cover_available > RuntimeNumber::zero()
+    {
+        let ter = check_cover_sendable(view, &broker_pseudo_id, vault_asset);
+        if ter != Ter::TES_SUCCESS {
+            return ter;
+        }
+        let ter = check_mpt_cover_transfer(
+            view,
+            &broker_pseudo_id,
+            &account,
+            &account,
+            vault_asset,
+            true,
+        );
+        if ter != Ter::TES_SUCCESS {
+            return ter;
+        }
+    }
+
     if !matches!(
         ledger::dir_remove(
             view,
@@ -1324,11 +2488,17 @@ pub fn apply_loan_broker_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter 
         return Ter::TEF_BAD_LEDGER;
     }
 
-    let cover_available = broker_sle.get_field_number(sf("sfCoverAvailable")).value();
     let Ok(cover_amount) = vault_asset.amount(cover_available) else {
         return Ter::TEF_BAD_LEDGER;
     };
-    let payout = account_send(view, &broker_pseudo_id, &account, &cover_amount);
+    let waive_mpt_can_transfer = view.rules().enabled(&feature_id("fixCleanup3_2_0"));
+    let payout = account_send_with_mpt_transfer_waiver(
+        view,
+        &broker_pseudo_id,
+        &account,
+        &cover_amount,
+        waive_mpt_can_transfer,
+    );
     if payout != Ter::TES_SUCCESS {
         return payout;
     }
@@ -1473,13 +2643,30 @@ pub fn apply_loan_broker_cover_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) 
     let Some(vault) = load_vault(view, broker.vault_id) else {
         return Ter::TEF_INTERNAL;
     };
+    if account != broker.owner {
+        return Ter::TEC_NO_PERMISSION;
+    }
+    if amount.asset() != vault.asset {
+        return Ter::TEC_WRONG_ASSET;
+    }
 
-    let transfer_result = account_send(view, &account, &broker.pseudo_account, &amount);
+    let Some((deposit_amount, added)) = rounded_cover_deposit_amount(
+        vault.asset,
+        broker.cover_available,
+        &amount,
+        view.rules().enabled(&feature_id("fixCleanup3_2_0")),
+    ) else {
+        return Ter::TEF_INTERNAL;
+    };
+    if added == RuntimeNumber::zero() {
+        return Ter::TEC_PRECISION_LOSS;
+    }
+
+    let transfer_result = account_send(view, &account, &broker.pseudo_account, &deposit_amount);
     if transfer_result != Ter::TES_SUCCESS {
         return transfer_result;
     }
 
-    let added = amount.as_number();
     broker.cover_available += added;
     broker.cover_asset = vault.asset;
 
@@ -1502,24 +2689,77 @@ pub fn apply_loan_broker_cover_withdraw<V: ApplyView>(
     } else {
         sttx.get_account_id(sf("sfAccount"))
     };
+    let account = sttx.get_account_id(sf("sfAccount"));
 
     let Some(mut broker) = load_broker(view, broker_id) else {
         return Ter::TEC_INTERNAL;
     };
-    let Some(vault) = load_vault(view, broker.vault_id) else {
+    let Ok(Some(vault_sle)) = view.peek(protocol::vault_keylet_from_key(broker.vault_id)) else {
         return Ter::TEC_INTERNAL;
     };
+    let vault_asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
+
+    if is_pseudo_account(view, &destination) {
+        return Ter::TEC_PSEUDO_ACCOUNT;
+    }
+    if account != broker.owner {
+        return Ter::TEC_NO_PERMISSION;
+    }
+    if amount.asset() != vault_asset {
+        return Ter::TEC_WRONG_ASSET;
+    }
+    if cover_amount_is_zero_at_cover_scale(
+        vault_asset,
+        broker.cover_available,
+        &amount,
+        view.rules().enabled(&feature_id("fixCleanup3_2_0")),
+    ) {
+        return Ter::TEC_PRECISION_LOSS;
+    }
 
     let deducted = amount.as_number();
+    if broker.cover_available < deducted {
+        return Ter::TEC_INSUFFICIENT_FUNDS;
+    }
+    let minimum_cover = minimum_broker_cover(
+        vault_asset,
+        broker.debt_total,
+        broker.cover_rate_minimum,
+        &vault_sle,
+        view.rules().enabled(&feature_id("fixCleanup3_2_0")),
+    );
+    if broker.cover_available - deducted < minimum_cover {
+        return Ter::TEC_INSUFFICIENT_FUNDS;
+    }
+
+    let waive_mpt_can_transfer = view.rules().enabled(&feature_id("fixCleanup3_2_0"));
+    let transfer_check = check_mpt_cover_transfer(
+        view,
+        &broker.pseudo_account,
+        &destination,
+        &account,
+        vault_asset,
+        waive_mpt_can_transfer,
+    );
+    if transfer_check != Ter::TES_SUCCESS {
+        return transfer_check;
+    }
+
     broker.cover_available -= deducted;
-    broker.cover_asset = vault.asset;
+    broker.cover_asset = vault_asset;
 
     let update_result = persist_broker_cover(view, broker_id, &broker);
     if update_result != Ter::TES_SUCCESS {
         return update_result;
     }
 
-    account_send(view, &broker.pseudo_account, &destination, &amount)
+    account_send_with_mpt_transfer_waiver(
+        view,
+        &broker.pseudo_account,
+        &destination,
+        &amount,
+        waive_mpt_can_transfer,
+    )
 }
 
 pub fn apply_loan_broker_cover_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
@@ -1529,7 +2769,6 @@ pub fn apply_loan_broker_cover_clawback<V: ApplyView>(view: &mut V, sttx: &STTx)
 
     let account = sttx.get_account_id(sf("sfAccount"));
     let broker_id = sttx.get_field_h256(sf("sfLoanBrokerID"));
-    let amount = sttx.get_field_amount(sf("sfAmount"));
 
     let Some(mut broker) = load_broker(view, broker_id) else {
         return Ter::TEC_INTERNAL;
@@ -1538,7 +2777,52 @@ pub fn apply_loan_broker_cover_clawback<V: ApplyView>(view: &mut V, sttx: &STTx)
         return Ter::TEC_INTERNAL;
     };
 
-    let deducted = amount.as_number();
+    if vault.asset.native() || asset_issuer(vault.asset) != account {
+        return Ter::TEC_NO_PERMISSION;
+    }
+
+    let requested = sttx
+        .is_field_present(sf("sfAmount"))
+        .then(|| sttx.get_field_amount(sf("sfAmount")));
+    if let Some(amount) = &requested
+        && amount.asset() != vault.asset
+    {
+        return Ter::TEC_WRONG_ASSET;
+    }
+
+    let minimum_cover = minimum_broker_cover(
+        vault.asset,
+        broker.debt_total,
+        broker.cover_rate_minimum,
+        &vault.entry,
+        view.rules().enabled(&feature_id("fixCleanup3_2_0")),
+    );
+    let max_claw_amount = broker.cover_available - minimum_cover;
+    if max_claw_amount <= RuntimeNumber::zero() {
+        return Ter::TEC_INSUFFICIENT_FUNDS;
+    }
+
+    let deducted = requested
+        .as_ref()
+        .filter(|amount| amount.signum() > 0)
+        .map(amount_number)
+        .unwrap_or(max_claw_amount)
+        .min(max_claw_amount);
+    let Some(claw_amount) = runtime_to_amount(vault.asset, deducted, RoundingMode::Downward) else {
+        return Ter::TEC_INTERNAL;
+    };
+    if claw_amount.signum() == 0 {
+        return Ter::TEC_PRECISION_LOSS;
+    }
+    if cover_amount_is_zero_at_cover_scale(
+        vault.asset,
+        broker.cover_available,
+        &claw_amount,
+        view.rules().enabled(&feature_id("fixCleanup3_2_0")),
+    ) {
+        return Ter::TEC_PRECISION_LOSS;
+    }
+
     broker.cover_available -= deducted;
     broker.cover_asset = vault.asset;
 
@@ -1547,7 +2831,7 @@ pub fn apply_loan_broker_cover_clawback<V: ApplyView>(view: &mut V, sttx: &STTx)
         return update_result;
     }
 
-    account_send(view, &broker.pseudo_account, &account, &amount)
+    account_send(view, &broker.pseudo_account, &account, &claw_amount)
 }
 
 pub fn apply_loan_manage<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
@@ -2133,6 +3417,24 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     } else {
         RuntimeNumber::zero()
     };
+    let close_payment_fee = if loan_sle.is_field_present(sf("sfClosePaymentFee")) {
+        amount_number(&loan_sle.get_field_amount(sf("sfClosePaymentFee")))
+    } else {
+        RuntimeNumber::zero()
+    };
+    let late_payment_fee = if loan_sle.is_field_present(sf("sfLatePaymentFee")) {
+        amount_number(&loan_sle.get_field_amount(sf("sfLatePaymentFee")))
+    } else {
+        RuntimeNumber::zero()
+    };
+    let management_fee_outstanding = if loan_sle.is_field_present(sf("sfManagementFeeOutstanding"))
+    {
+        loan_sle
+            .get_field_number(sf("sfManagementFeeOutstanding"))
+            .value()
+    } else {
+        RuntimeNumber::zero()
+    };
     let principal_outstanding = if loan_sle.is_field_present(sf("sfPrincipalOutstanding")) {
         loan_sle
             .get_field_number(sf("sfPrincipalOutstanding"))
@@ -2152,10 +3454,77 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     } else {
         0
     };
+    let interest_rate = if loan_sle.is_field_present(sf("sfInterestRate")) {
+        TenthBips32::new(loan_sle.get_field_u32(sf("sfInterestRate")))
+    } else {
+        TenthBips32::new(0)
+    };
+    let late_interest_rate = if loan_sle.is_field_present(sf("sfLateInterestRate")) {
+        TenthBips32::new(loan_sle.get_field_u32(sf("sfLateInterestRate")))
+    } else {
+        TenthBips32::new(0)
+    };
+    let close_interest_rate = if loan_sle.is_field_present(sf("sfCloseInterestRate")) {
+        TenthBips32::new(loan_sle.get_field_u32(sf("sfCloseInterestRate")))
+    } else {
+        TenthBips32::new(0)
+    };
+    let overpayment_interest_rate = if loan_sle.is_field_present(sf("sfOverpaymentInterestRate")) {
+        TenthBips32::new(loan_sle.get_field_u32(sf("sfOverpaymentInterestRate")))
+    } else {
+        TenthBips32::new(0)
+    };
+    let overpayment_fee_rate = if loan_sle.is_field_present(sf("sfOverpaymentFee")) {
+        TenthBips32::new(loan_sle.get_field_u32(sf("sfOverpaymentFee")))
+    } else {
+        TenthBips32::new(0)
+    };
+    let payment_interval = if loan_sle.is_field_present(sf("sfPaymentInterval")) {
+        loan_sle.get_field_u32(sf("sfPaymentInterval"))
+    } else {
+        0
+    };
+    let previous_payment_date = if loan_sle.is_field_present(sf("sfPreviousPaymentDueDate")) {
+        loan_sle.get_field_u32(sf("sfPreviousPaymentDueDate"))
+    } else {
+        0
+    };
+    let start_date = if loan_sle.is_field_present(sf("sfStartDate")) {
+        loan_sle.get_field_u32(sf("sfStartDate"))
+    } else {
+        0
+    };
+    let management_fee_rate = if broker_sle.is_field_present(sf("sfManagementFeeRate")) {
+        TenthBips16::new(broker_sle.get_field_u16(sf("sfManagementFeeRate")))
+    } else {
+        TenthBips16::new(0)
+    };
 
     // Compute payment parts (reference loanMakePayment logic)
-    let regular_payment = round_number_to_asset(vault_asset, periodic_payment) + service_fee;
-    let (principal_paid, interest_paid, fee_paid, value_change) = match payment_type {
+    let rounded_periodic_payment = round_number_to_asset_with_scale(
+        vault_asset,
+        periodic_payment,
+        loan_scale,
+        RoundingMode::Upward,
+    );
+    let regular_payment = rounded_periodic_payment + service_fee;
+    let effective_overpayment_amount = effective_loan_pay_amount(
+        payment_type,
+        view.rules().enabled(&feature_id("fixSecurity3_1_3")),
+        view.rules().enabled(&feature_id("fixCleanup3_2_0")),
+        vault_asset,
+        payment_amount,
+        loan_scale,
+    );
+    let (
+        principal_paid,
+        interest_paid,
+        management_fee_paid,
+        fee_paid,
+        value_change,
+        payment_remaining_decrement,
+        periodic_payment_override,
+    ) = match payment_type {
         tx::LoanPayPaymentType::Regular => {
             if regular_payment <= RuntimeNumber::zero() {
                 let p = payment_amount.min(principal_outstanding);
@@ -2164,47 +3533,227 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
                     RuntimeNumber::zero(),
                     RuntimeNumber::zero(),
                     RuntimeNumber::zero(),
+                    RuntimeNumber::zero(),
+                    1,
+                    None,
                 )
+            } else if payment_amount < regular_payment {
+                return Ter::TEC_INSUFFICIENT_PAYMENT;
             } else {
-                let actual = payment_amount.min(regular_payment);
-                let fee = actual.min(service_fee);
-                let p = (actual - fee).min(principal_outstanding);
-                (p, RuntimeNumber::zero(), fee, RuntimeNumber::zero())
+                let parts = compute_loan_pay_scheduled_payment_loop(
+                    &view.rules(),
+                    vault_asset,
+                    loan_scale,
+                    payment_amount,
+                    total_value_outstanding,
+                    principal_outstanding,
+                    management_fee_outstanding,
+                    periodic_payment,
+                    interest_rate,
+                    payment_interval,
+                    payments_remaining,
+                    management_fee_rate,
+                    service_fee,
+                );
+                (parts.0, parts.1, parts.2, parts.3, parts.4, parts.5, None)
             }
         }
         tx::LoanPayPaymentType::Late => {
-            let fee = payment_amount.min(service_fee);
-            let p = (payment_amount - fee).min(principal_outstanding);
-            (p, RuntimeNumber::zero(), fee, RuntimeNumber::zero())
+            let next_payment_due_date = loan_sle
+                .is_field_present(sf("sfNextPaymentDueDate"))
+                .then(|| loan_sle.get_field_u32(sf("sfNextPaymentDueDate")));
+            if !has_expired(view, next_payment_due_date) {
+                return Ter::TEC_TOO_SOON;
+            }
+            let components = compute_loan_pay_periodic_components(
+                &view.rules(),
+                vault_asset,
+                loan_scale,
+                total_value_outstanding,
+                principal_outstanding,
+                management_fee_outstanding,
+                periodic_payment,
+                interest_rate,
+                payment_interval,
+                payments_remaining,
+                management_fee_rate,
+            );
+            let late_interest = round_number_to_asset_with_scale(
+                vault_asset,
+                loan_late_payment_interest(
+                    principal_outstanding,
+                    late_interest_rate,
+                    view.parent_close_time().as_seconds(),
+                    next_payment_due_date.unwrap_or(0),
+                ),
+                loan_scale,
+                RoundingMode::ToNearest,
+            );
+            let (late_net_interest, late_management_fee) = compute_interest_and_fee_parts(
+                vault_asset,
+                late_interest,
+                management_fee_rate,
+                loan_scale,
+            );
+            let tracked_due = components.principal_paid
+                + components.interest_paid
+                + components.management_fee_paid;
+            let fee = components.management_fee_paid
+                + service_fee
+                + late_payment_fee
+                + late_management_fee;
+            let total_due = tracked_due + service_fee + late_payment_fee + late_interest;
+            if payment_amount < total_due {
+                return Ter::TEC_INSUFFICIENT_PAYMENT;
+            }
+            (
+                components.principal_paid,
+                components.interest_paid + late_net_interest,
+                components.management_fee_paid,
+                fee,
+                late_net_interest,
+                1,
+                None,
+            )
         }
         tx::LoanPayPaymentType::Full => {
-            let needed = principal_outstanding + service_fee;
+            if payments_remaining <= 1 {
+                return Ter::TEC_KILLED;
+            }
+            let outstanding_interest =
+                (total_value_outstanding - principal_outstanding - management_fee_outstanding)
+                    .max(RuntimeNumber::zero());
+            let periodic_rate = tx::loan_set_periodic_rate(interest_rate, payment_interval);
+            let (full_interest_paid, full_fee_paid, value_change) = compute_full_payment_parts(
+                &view.rules(),
+                vault_asset,
+                loan_scale,
+                view.parent_close_time().as_seconds(),
+                outstanding_interest,
+                periodic_payment,
+                periodic_rate,
+                payments_remaining,
+                previous_payment_date,
+                start_date,
+                payment_interval,
+                close_interest_rate,
+                close_payment_fee,
+                management_fee_rate,
+            );
+            let needed =
+                total_value_outstanding + value_change + full_fee_paid - management_fee_outstanding;
             if payment_amount < needed {
                 return Ter::TEC_INSUFFICIENT_PAYMENT;
             }
-            let vc = payment_amount - needed;
             (
                 principal_outstanding,
-                RuntimeNumber::zero(),
-                service_fee,
-                vc,
+                full_interest_paid,
+                management_fee_outstanding,
+                full_fee_paid,
+                value_change,
+                payments_remaining,
+                None,
             )
         }
         tx::LoanPayPaymentType::Overpayment => {
             if regular_payment <= RuntimeNumber::zero() {
-                let p = payment_amount.min(principal_outstanding);
+                let p = effective_overpayment_amount.min(principal_outstanding);
                 (
                     p,
                     RuntimeNumber::zero(),
                     RuntimeNumber::zero(),
                     RuntimeNumber::zero(),
+                    RuntimeNumber::zero(),
+                    1,
+                    None,
                 )
             } else {
-                let max_p = RuntimeNumber::from_i64(payments_remaining as i64);
-                let periods = (payment_amount / regular_payment).min(max_p);
-                let fee = service_fee * periods;
-                let p = (payment_amount - fee).min(principal_outstanding);
-                (p, RuntimeNumber::zero(), fee, RuntimeNumber::zero())
+                let (
+                    mut principal_paid,
+                    mut interest_paid,
+                    mut management_fee_paid,
+                    mut fee_paid,
+                    mut value_change,
+                    periods_paid,
+                ) = compute_loan_pay_scheduled_payment_loop(
+                    &view.rules(),
+                    vault_asset,
+                    loan_scale,
+                    effective_overpayment_amount,
+                    total_value_outstanding,
+                    principal_outstanding,
+                    management_fee_outstanding,
+                    periodic_payment,
+                    interest_rate,
+                    payment_interval,
+                    payments_remaining,
+                    management_fee_rate,
+                    service_fee,
+                );
+                let total_scheduled_paid = principal_paid + interest_paid + fee_paid;
+                let mut periodic_payment_override = None;
+                if loan_sle.is_flag(protocol::lsfLoanOverpayment)
+                    && periods_paid < payments_remaining
+                    && total_scheduled_paid < effective_overpayment_amount
+                    && periods_paid < tx::LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION
+                {
+                    let current_total = (total_value_outstanding
+                        - principal_paid
+                        - interest_paid
+                        - management_fee_paid)
+                        .max(RuntimeNumber::zero());
+                    let current_principal =
+                        (principal_outstanding - principal_paid).max(RuntimeNumber::zero());
+                    let current_management_fee = (management_fee_outstanding - management_fee_paid)
+                        .max(RuntimeNumber::zero());
+                    let remaining_payments = payments_remaining.saturating_sub(periods_paid);
+                    let overpayment_raw =
+                        (effective_overpayment_amount - total_scheduled_paid).min(current_total);
+                    let overpayment = if view.rules().enabled(&feature_id("fixCleanup3_2_0")) {
+                        round_number_to_asset_with_scale(
+                            vault_asset,
+                            overpayment_raw,
+                            loan_scale,
+                            RoundingMode::Downward,
+                        )
+                    } else {
+                        overpayment_raw
+                    };
+                    let periodic_rate = tx::loan_set_periodic_rate(interest_rate, payment_interval);
+                    if let Some(extra) = compute_overpayment_reamortization(
+                        &view.rules(),
+                        vault_asset,
+                        loan_scale,
+                        overpayment,
+                        current_total,
+                        current_principal,
+                        current_management_fee,
+                        periodic_payment,
+                        interest_rate,
+                        payment_interval,
+                        periodic_rate,
+                        remaining_payments,
+                        management_fee_rate,
+                        overpayment_interest_rate,
+                        overpayment_fee_rate,
+                    ) {
+                        principal_paid += extra.principal_paid;
+                        interest_paid += extra.interest_paid;
+                        management_fee_paid += extra.management_fee_paid;
+                        fee_paid += extra.fee_paid;
+                        value_change += extra.value_change;
+                        periodic_payment_override = Some(extra.periodic_payment);
+                    }
+                }
+                (
+                    principal_paid,
+                    interest_paid,
+                    management_fee_paid,
+                    fee_paid,
+                    value_change,
+                    periods_paid.max(1),
+                    periodic_payment_override,
+                )
             }
         }
     };
@@ -2217,22 +3766,76 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     }
 
     // Broker fee routing (reference sendBrokerFeeToOwner)
-    let required_cover = round_number_to_asset_with_scale(
+    let required_cover = loan_pay_fee_route_minimum_cover(
         vault_asset,
-        tenth_bips_of_runtime_number(broker_view.debt_total, broker_view.cover_rate_minimum),
+        broker_view.debt_total,
+        broker_view.cover_rate_minimum,
         loan_scale,
-        RoundingMode::Upward,
+        v_scale,
+        view.rules().enabled(&feature_id("fixCleanup3_2_0")),
     );
-    let send_fee_to_owner = broker_view.cover_available >= required_cover;
+    let send_fee_to_owner = broker_view.cover_available >= required_cover
+        && !asset_deep_frozen(view, &broker_view.owner, vault_asset)
+        && !asset_requires_strong_auth(view, &broker_view.owner, vault_asset);
     let broker_payee = if send_fee_to_owner {
         broker_view.owner
     } else {
         broker_view.pseudo
     };
+    if !send_fee_to_owner {
+        let ter = check_asset_deep_frozen(view, &broker_payee, vault_asset);
+        if ter != Ter::TES_SUCCESS {
+            return ter;
+        }
+    }
+
+    // Update cached views and validate precision before moving funds. C++ applies these
+    // guards before accountSendMulti so failed rounding does not transfer balances.
+    let assets_available_before = vault_view.assets_available;
+    let assets_total_before = vault_view.assets_total;
+    let rounded_to_vault = round_number_to_asset_with_scale(
+        vault_asset,
+        total_to_vault,
+        v_scale,
+        RoundingMode::Downward,
+    );
+    vault_view.assets_available += rounded_to_vault;
+    if value_change != RuntimeNumber::zero() {
+        vault_view.assets_total += value_change;
+    }
+    let assets_available_after = vault_view.assets_available;
+    let assets_total_after = vault_view.assets_total;
+    if assets_available_after > assets_total_after {
+        return Ter::TEC_INTERNAL;
+    }
+    if assets_available_after == assets_available_before {
+        return Ter::TEC_PRECISION_LOSS;
+    }
+    if value_change != RuntimeNumber::zero() && assets_total_after == assets_total_before {
+        return Ter::TEC_PRECISION_LOSS;
+    }
+    if value_change == RuntimeNumber::zero() && assets_total_after != assets_total_before {
+        return Ter::TEC_INTERNAL;
+    }
+    if rounded_to_vault + total_to_broker > payment_amount {
+        return Ter::TEC_INSUFFICIENT_PAYMENT;
+    }
+
+    let debt_reduction = total_to_vault - value_change;
+    let new_debt = broker_view.debt_total + (-debt_reduction);
+    broker_view.debt_total = if new_debt < RuntimeNumber::zero() {
+        RuntimeNumber::zero()
+    } else {
+        new_debt
+    };
+    if !send_fee_to_owner && total_to_broker > RuntimeNumber::zero() {
+        broker_view.cover_available += total_to_broker;
+    }
 
     // Fund transfers
-    if total_to_vault > RuntimeNumber::zero() {
-        if let Some(xfer) = runtime_to_amount(vault_asset, total_to_vault, RoundingMode::Downward) {
+    if rounded_to_vault > RuntimeNumber::zero() {
+        if let Some(xfer) = runtime_to_amount(vault_asset, rounded_to_vault, RoundingMode::Downward)
+        {
             let ter = account_send(view, &borrower, &vault_view.pseudo, &xfer);
             if !protocol::is_tes_success(ter) {
                 return ter;
@@ -2249,28 +3852,6 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         }
     }
 
-    // Update cached views
-    let rounded_to_vault = round_number_to_asset_with_scale(
-        vault_asset,
-        total_to_vault,
-        v_scale,
-        RoundingMode::Downward,
-    );
-    vault_view.assets_available += rounded_to_vault;
-    if value_change != RuntimeNumber::zero() {
-        vault_view.assets_total += value_change;
-    }
-    let debt_reduction = total_to_vault - value_change;
-    let new_debt = broker_view.debt_total + (-debt_reduction);
-    broker_view.debt_total = if new_debt < RuntimeNumber::zero() {
-        RuntimeNumber::zero()
-    } else {
-        new_debt
-    };
-    if !send_fee_to_owner && total_to_broker > RuntimeNumber::zero() {
-        broker_view.cover_available += total_to_broker;
-    }
-
     // Persist loan update
     let loan_sle_now = match view.peek(loan_keylet) {
         Ok(Some(s)) => s,
@@ -2282,7 +3863,15 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         sf("sfPrincipalOutstanding"),
         with_asset_number(principal_outstanding - principal_paid, vault_asset),
     );
-    let new_total = total_value_outstanding - total_paid - value_change;
+    lu.set_field_number(
+        sf("sfManagementFeeOutstanding"),
+        with_asset_number(
+            (management_fee_outstanding - management_fee_paid).max(RuntimeNumber::zero()),
+            vault_asset,
+        ),
+    );
+    let tracked_value_paid = principal_paid + interest_paid + management_fee_paid - value_change;
+    let new_total = total_value_outstanding - tracked_value_paid;
     lu.set_field_number(
         sf("sfTotalValueOutstanding"),
         with_asset_number(
@@ -2294,17 +3883,20 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
             vault_asset,
         ),
     );
+    if let Some(periodic_payment) = periodic_payment_override {
+        lu.set_field_number(
+            sf("sfPeriodicPayment"),
+            with_asset_number(periodic_payment, vault_asset),
+        );
+    }
     if lu.is_field_present(sf("sfPaymentRemaining")) {
         let r = lu.get_field_u32(sf("sfPaymentRemaining"));
         let dec = match payment_type {
             tx::LoanPayPaymentType::Full => r,
-            tx::LoanPayPaymentType::Overpayment if regular_payment > RuntimeNumber::zero() => {
-                let _periods = ((total_paid / regular_payment)
-                    .min(RuntimeNumber::from_i64(r as i64)))
-                .max(RuntimeNumber::from_i64(1));
-                1u32 // simplified: at least 1
-            }
-            _ => 1,
+            _ => payment_remaining_decrement
+                .max(1)
+                .min(r)
+                .min(tx::LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION),
         };
         lu.set_field_u32(sf("sfPaymentRemaining"), r.saturating_sub(dec));
     }
@@ -2348,4 +3940,170 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     let _ = view.update(Arc::new(bu));
 
     Ter::TES_SUCCESS
+}
+
+#[cfg(test)]
+mod loan_pay_effective_amount_tests {
+    use super::*;
+    use protocol::{Issue, currency_from_string};
+
+    fn account(byte: u8) -> AccountID {
+        AccountID::from_array([byte; 20])
+    }
+
+    fn usd_asset() -> Asset {
+        Asset::Issue(Issue::new(currency_from_string("USD"), account(0x55)))
+    }
+
+    fn vault_with_assets_total(asset: Asset, assets_total: RuntimeNumber) -> STLedgerEntry {
+        let keylet = protocol::vault_keylet(Uint160::from_void(account(0x54).data()), 1);
+        let mut vault = STLedgerEntry::from_type_and_key(LedgerEntryType::Vault, keylet.key);
+        vault.set_field_number(sf("sfAssetsTotal"), with_asset_number(assets_total, asset));
+        vault.set_field_u8(sf("sfScale"), 2);
+        vault
+    }
+
+    #[test]
+    fn loan_pay_overpayment_amount_truncates_at_loan_scale_after_fix_security_3_1_3() {
+        let amount = RuntimeNumber::try_from_external_parts(123_456_789, -8, get_mantissa_scale())
+            .expect("valid runtime number");
+
+        let rounded = effective_loan_pay_amount(
+            tx::LoanPayPaymentType::Overpayment,
+            true,
+            false,
+            usd_asset(),
+            amount,
+            -6,
+        );
+
+        assert_eq!(
+            rounded,
+            RuntimeNumber::try_from_external_parts(1_234_567, -6, get_mantissa_scale())
+                .expect("expected rounded number")
+        );
+    }
+
+    #[test]
+    fn loan_pay_overpayment_amount_keeps_legacy_precision_without_fix_security_3_1_3() {
+        let amount = RuntimeNumber::try_from_external_parts(123_456_789, -8, get_mantissa_scale())
+            .expect("valid runtime number");
+
+        let legacy = effective_loan_pay_amount(
+            tx::LoanPayPaymentType::Overpayment,
+            false,
+            false,
+            usd_asset(),
+            amount,
+            -6,
+        );
+
+        assert_eq!(legacy, amount);
+    }
+
+    #[test]
+    fn loan_pay_regular_amount_keeps_precision_after_fix_security_3_1_3() {
+        let amount = RuntimeNumber::try_from_external_parts(123_456_789, -8, get_mantissa_scale())
+            .expect("valid runtime number");
+
+        let regular = effective_loan_pay_amount(
+            tx::LoanPayPaymentType::Regular,
+            true,
+            true,
+            usd_asset(),
+            amount,
+            -6,
+        );
+
+        assert_eq!(regular, amount);
+    }
+
+    #[test]
+    fn loan_pay_overpayment_amount_truncates_at_loan_scale_after_fix_cleanup_3_2_0() {
+        let amount = RuntimeNumber::try_from_external_parts(123_456_789, -8, get_mantissa_scale())
+            .expect("valid runtime number");
+
+        let rounded = effective_loan_pay_amount(
+            tx::LoanPayPaymentType::Overpayment,
+            false,
+            true,
+            usd_asset(),
+            amount,
+            -6,
+        );
+
+        assert_eq!(
+            rounded,
+            RuntimeNumber::try_from_external_parts(1_234_567, -6, get_mantissa_scale())
+                .expect("expected rounded number")
+        );
+    }
+
+    #[test]
+    fn loan_pay_fee_route_cover_uses_loan_scale_before_cleanup_3_2_0() {
+        let debt_total = RuntimeNumber::try_from_external_parts(12345, -4, get_mantissa_scale())
+            .expect("valid debt total");
+
+        let required =
+            loan_pay_fee_route_minimum_cover(usd_asset(), debt_total, 100_000, -4, -2, false);
+
+        assert_eq!(
+            required,
+            RuntimeNumber::try_from_external_parts(12345, -4, get_mantissa_scale())
+                .expect("legacy loan-scale threshold")
+        );
+    }
+
+    #[test]
+    fn loan_pay_fee_route_cover_uses_vault_scale_after_cleanup_3_2_0() {
+        let debt_total = RuntimeNumber::try_from_external_parts(12345, -4, get_mantissa_scale())
+            .expect("valid debt total");
+
+        let required =
+            loan_pay_fee_route_minimum_cover(usd_asset(), debt_total, 100_000, -4, -2, true);
+
+        assert_eq!(
+            required,
+            RuntimeNumber::try_from_external_parts(124, -2, get_mantissa_scale())
+                .expect("post-fix vault-scale threshold")
+        );
+    }
+
+    #[test]
+    fn loan_set_debt_total_update_uses_loan_scale_before_cleanup_3_2_0() {
+        let asset = usd_asset();
+        let vault_total = RuntimeNumber::try_from_external_parts(100, -2, get_mantissa_scale())
+            .expect("valid vault total");
+        let vault = vault_with_assets_total(asset, vault_total);
+        let adjustment = RuntimeNumber::try_from_external_parts(12345, -4, get_mantissa_scale())
+            .expect("valid adjustment");
+
+        let debt_total =
+            loan_set_debt_total_update(asset, RuntimeNumber::zero(), adjustment, &vault, -4, false);
+
+        assert_eq!(
+            debt_total,
+            RuntimeNumber::try_from_external_parts(12345, -4, get_mantissa_scale())
+                .expect("legacy loan-scale debt total")
+        );
+    }
+
+    #[test]
+    fn loan_set_debt_total_update_uses_vault_scale_after_cleanup_3_2_0() {
+        let asset = usd_asset();
+        let vault_total = RuntimeNumber::try_from_external_parts(100, -2, get_mantissa_scale())
+            .expect("valid vault total");
+        let vault = vault_with_assets_total(asset, vault_total);
+        let adjustment = RuntimeNumber::try_from_external_parts(12345, -4, get_mantissa_scale())
+            .expect("valid adjustment");
+
+        let debt_total =
+            loan_set_debt_total_update(asset, RuntimeNumber::zero(), adjustment, &vault, -4, true);
+
+        assert_eq!(
+            debt_total,
+            RuntimeNumber::try_from_external_parts(123, -2, get_mantissa_scale())
+                .expect("post-fix vault-scale debt total")
+        );
+    }
 }

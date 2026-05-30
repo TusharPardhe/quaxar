@@ -40,6 +40,8 @@ fn protocol_quality_function_amm_formula_matches_current_cpp_out_limit_math() {
             .map(|value| value.to_string()),
         Some("5.00000000000000075".to_string())
     );
+    assert!(function.satisfies_avg_q(requested_quality, RuntimeNumber::from_i64(5)));
+    assert!(!function.satisfies_avg_q(requested_quality, RuntimeNumber::from_i64(6)));
 }
 
 #[test]

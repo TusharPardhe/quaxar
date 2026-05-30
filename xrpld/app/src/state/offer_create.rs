@@ -22,6 +22,41 @@ fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
 }
 
+fn check_mpt_offer_global_and_trade_allowed<V: ledger::ApplyView>(
+    view: &V,
+    asset: protocol::Asset,
+) -> Ter {
+    let protocol::Asset::MPTIssue(issue) = asset else {
+        return Ter::TES_SUCCESS;
+    };
+
+    if ledger::mptoken_helpers::is_global_frozen_mpt(view, &issue).unwrap_or(true) {
+        return Ter::TEC_LOCKED;
+    }
+
+    ledger::mptoken_helpers::can_trade(view, &asset).unwrap_or(Ter::TEF_INTERNAL)
+}
+
+fn check_mpt_offer_accept_asset_allowed<V: ledger::ApplyView>(
+    view: &V,
+    account: &AccountID,
+    asset: protocol::Asset,
+) -> Ter {
+    let protocol::Asset::MPTIssue(issue) = asset else {
+        return Ter::TES_SUCCESS;
+    };
+
+    let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, account)
+        .unwrap_or(Ter::TEF_INTERNAL);
+    if auth != Ter::TES_SUCCESS {
+        return auth;
+    }
+    if ledger::mptoken_helpers::is_frozen_mpt(view, account, &issue).unwrap_or(true) {
+        return Ter::TEC_LOCKED;
+    }
+    Ter::TES_SUCCESS
+}
+
 const TF_PASSIVE: u32 = 0x0001_0000;
 const TF_IMMEDIATE_OR_CANCEL: u32 = 0x0002_0000;
 const TF_FILL_OR_KILL: u32 = 0x0004_0000;
@@ -42,7 +77,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     if taker_pays.native() && taker_gets.native() {
         return Ter::TEM_BAD_OFFER;
     }
-    if !taker_pays.native() && !taker_gets.native() && taker_pays.issue() == taker_gets.issue() {
+    if !taker_pays.native() && !taker_gets.native() && taker_pays.asset() == taker_gets.asset() {
         return Ter::TEM_BAD_OFFER;
     }
 
@@ -50,10 +85,38 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         return Ter::TEM_BAD_OFFER;
     }
 
+    let mpt_allowed = check_mpt_offer_global_and_trade_allowed(view, taker_pays.asset());
+    if mpt_allowed != Ter::TES_SUCCESS {
+        return mpt_allowed;
+    }
+    let mpt_allowed = check_mpt_offer_global_and_trade_allowed(view, taker_gets.asset());
+    if mpt_allowed != Ter::TES_SUCCESS {
+        return mpt_allowed;
+    }
+    let mpt_allowed = check_mpt_offer_accept_asset_allowed(view, &account, taker_pays.asset());
+    if mpt_allowed != Ter::TES_SUCCESS {
+        return mpt_allowed;
+    }
+
     let is_passive = (tx_flags & TF_PASSIVE) != 0;
     let is_ioc = (tx_flags & TF_IMMEDIATE_OR_CANCEL) != 0;
     let is_fok = (tx_flags & TF_FILL_OR_KILL) != 0;
     let is_sell = (tx_flags & TF_SELL) != 0;
+    let is_hybrid = (tx_flags & protocol::tfHybrid) != 0;
+    let domain_id = sttx
+        .is_field_present(sf("sfDomainID"))
+        .then(|| sttx.get_field_h256(sf("sfDomainID")));
+
+    if is_hybrid && domain_id.is_none() {
+        return Ter::TEM_INVALID_FLAG;
+    }
+    if domain_id.is_some()
+        && !view
+            .rules()
+            .enabled(&protocol::feature_id("PermissionedDEX"))
+    {
+        return Ter::TEM_DISABLED;
+    }
 
     // Get offer sequence (for the new offer's key)
     let offer_sequence = sttx.get_seq_value();
@@ -186,10 +249,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             true, // offer crossing
         );
 
-        let cross_book = ledger::ripple_calc::book_step::Book {
-            r#in: protocol::issue_from_asset(taker_gets.asset()).unwrap_or_default(),
-            out: protocol::issue_from_asset(taker_pays.asset()).unwrap_or_default(),
-        };
+        let cross_book = Some((taker_gets.asset(), taker_pays.asset()));
 
         // Execute strands
         // reference: flow(deliver=TakerGets, sendMax=TakerPays)
@@ -204,7 +264,11 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                 &account,
                 Some(quality_threshold),
             )
-        } else {
+        } else if let Some((book_in, book_out)) = cross_book {
+            let cross_book = ledger::ripple_calc::book_step::Book {
+                r#in: book_in,
+                out: book_out,
+            };
             // Fallback to direct book step if strand building fails
             let result = ledger::ripple_calc::book_step::execute_book_step(
                 view,
@@ -220,12 +284,23 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                 actual_in: result.amount_in,
                 actual_out: result.amount_out,
             }
+        } else {
+            ledger::flow_engine::FlowResult {
+                ter: Ter::TEC_PATH_DRY,
+                actual_in: taker_pays.zeroed(),
+                actual_out: taker_gets.zeroed(),
+            }
         };
 
         if !strands.is_empty()
             && flow_result.actual_in.signum() == 0
             && flow_result.actual_out.signum() == 0
+            && let Some((book_in, book_out)) = cross_book
         {
+            let cross_book = ledger::ripple_calc::book_step::Book {
+                r#in: book_in,
+                out: book_out,
+            };
             let result = ledger::ripple_calc::book_step::execute_book_step(
                 view,
                 &cross_book,
@@ -444,39 +519,16 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
     // Add to book directory
     let book = protocol::Book {
-        r#in: protocol::issue_from_asset(taker_pays.asset()).unwrap_or_default(),
-        out: protocol::issue_from_asset(taker_gets.asset()).unwrap_or_default(),
-        domain: None,
+        r#in: taker_pays.asset(),
+        out: taker_gets.asset(),
+        domain: domain_id,
     };
     let book_base = protocol::book_keylet(book);
     let rate = get_rate(&taker_gets, &taker_pays);
     let quality_dir = protocol::quality_keylet(book_base, rate);
 
     let book_node = match ledger::dir_append(view, &quality_dir, offer_keylet.key, &|sle| {
-        // Set book directory fields (reference setBookDir lambda)
-        if !taker_pays.native() {
-            let issue = taker_pays.issue();
-            sle.set_field_h160(
-                sf("sfTakerPaysCurrency"),
-                Uint160::from_void(issue.currency.data()),
-            );
-            sle.set_field_h160(
-                sf("sfTakerPaysIssuer"),
-                Uint160::from_void(issue.account.data()),
-            );
-        }
-        if !taker_gets.native() {
-            let issue = taker_gets.issue();
-            sle.set_field_h160(
-                sf("sfTakerGetsCurrency"),
-                Uint160::from_void(issue.currency.data()),
-            );
-            sle.set_field_h160(
-                sf("sfTakerGetsIssuer"),
-                Uint160::from_void(issue.account.data()),
-            );
-        }
-        sle.set_field_u64(sf("sfExchangeRate"), rate);
+        set_book_directory_fields(sle, &taker_pays, &taker_gets, rate, domain_id);
     }) {
         Ok(Some(page)) => page,
         other => {
@@ -509,6 +561,9 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     offer_obj.set_field_amount(sf("sfTakerGets"), remaining_gets);
     offer_obj.set_field_u64(sf("sfOwnerNode"), owner_node);
     offer_obj.set_field_u64(sf("sfBookNode"), book_node);
+    if let Some(domain_id) = domain_id {
+        offer_obj.set_field_h256(sf("sfDomainID"), domain_id);
+    }
 
     if sttx.is_field_present(sf("sfExpiration")) {
         offer_obj.set_field_u32(sf("sfExpiration"), sttx.get_field_u32(sf("sfExpiration")));
@@ -521,14 +576,99 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     if is_sell {
         offer_flags |= 0x0002_0000; // lsfSell
     }
+    if is_hybrid {
+        offer_flags |= protocol::lsfHybrid;
+    }
     if offer_flags != 0 {
         offer_obj.set_field_u32(sf("sfFlags"), offer_flags);
+    }
+
+    if is_hybrid {
+        let open_rate = if view
+            .rules()
+            .enabled(&protocol::feature_id(protocol::FIX_CLEANUP_3_2_0_NAME))
+        {
+            rate
+        } else {
+            get_rate(
+                &offer_obj.get_field_amount(sf("sfTakerGets")),
+                &offer_obj.get_field_amount(sf("sfTakerPays")),
+            )
+        };
+        let open_book = protocol::Book {
+            r#in: taker_pays.asset(),
+            out: taker_gets.asset(),
+            domain: None,
+        };
+        let open_quality_dir =
+            protocol::quality_keylet(protocol::book_keylet(open_book), open_rate);
+        let open_book_node =
+            match ledger::dir_append(view, &open_quality_dir, offer_keylet.key, &|sle| {
+                // The legacy open-book key may use post-crossing quality, but
+                // C++ still records the original placement rate in metadata.
+                set_book_directory_fields(sle, &taker_pays, &taker_gets, rate, None);
+            }) {
+                Ok(Some(page)) => page,
+                _ => return Ter::TEC_DIR_FULL,
+            };
+
+        let mut additional_books = protocol::STArray::new(sf("sfAdditionalBooks"));
+        let mut book_info = protocol::STObject::make_inner_object(sf("sfBook"));
+        book_info.set_field_h256(sf("sfBookDirectory"), open_quality_dir.key);
+        book_info.set_field_u64(sf("sfBookNode"), open_book_node);
+        additional_books.push_back(book_info);
+        offer_obj.set_field_array(sf("sfAdditionalBooks"), additional_books);
     }
 
     let offer_sle = STLedgerEntry::from_stobject(offer_obj, offer_keylet.key);
     let _ = view.insert(Arc::new(offer_sle));
 
     Ter::TES_SUCCESS
+}
+
+fn set_book_directory_fields(
+    sle: &mut protocol::STObject,
+    taker_pays: &STAmount,
+    taker_gets: &STAmount,
+    rate: u64,
+    domain_id: Option<protocol::Domain>,
+) {
+    match taker_pays.asset() {
+        protocol::Asset::Issue(issue) if !issue.native() => {
+            sle.set_field_h160(
+                sf("sfTakerPaysCurrency"),
+                Uint160::from_void(issue.currency.data()),
+            );
+            sle.set_field_h160(
+                sf("sfTakerPaysIssuer"),
+                Uint160::from_void(issue.account.data()),
+            );
+        }
+        protocol::Asset::MPTIssue(issue) => {
+            sle.set_field_h192(sf("sfTakerPaysMPT"), issue.mpt_id());
+        }
+        _ => {}
+    }
+    match taker_gets.asset() {
+        protocol::Asset::Issue(issue) if !issue.native() => {
+            sle.set_field_h160(
+                sf("sfTakerGetsCurrency"),
+                Uint160::from_void(issue.currency.data()),
+            );
+            sle.set_field_h160(
+                sf("sfTakerGetsIssuer"),
+                Uint160::from_void(issue.account.data()),
+            );
+        }
+        protocol::Asset::MPTIssue(issue) => {
+            sle.set_field_h192(sf("sfTakerGetsMPT"), issue.mpt_id());
+        }
+        _ => {}
+    }
+    sle.set_field_u64(sf("sfExchangeRate"), rate);
+    if let Some(domain_id) = domain_id {
+        sle.set_field_h256(sf("sfDomainID"), domain_id);
+    }
 }
 
 /// Delete an offer — remove from owner dir, book dir, and erase SLE.
@@ -556,20 +696,64 @@ fn get_account_funds_for_offer<V: ledger::ApplyView>(
             STAmount::default()
         }
     } else {
-        let issue = taker_gets.issue();
-        if *account == issue.account {
-            taker_gets.clone()
-        } else {
-            // return zero if the trust line or issuer is frozen.
-            if ledger::ripple_state_helpers::is_frozen(view, account, &issue) {
-                taker_gets.zeroed()
-            } else {
-                ledger::ripple_state_helpers::credit_balance(
-                    view,
-                    account,
-                    &issue.account,
-                    issue.currency,
-                )
+        match taker_gets.asset() {
+            protocol::Asset::Issue(issue) => {
+                if *account == issue.account {
+                    taker_gets.clone()
+                } else {
+                    // return zero if the trust line or issuer is frozen.
+                    if ledger::ripple_state_helpers::is_frozen(view, account, &issue) {
+                        taker_gets.zeroed()
+                    } else {
+                        ledger::ripple_state_helpers::credit_balance(
+                            view,
+                            account,
+                            &issue.account,
+                            issue.currency,
+                        )
+                    }
+                }
+            }
+            protocol::Asset::MPTIssue(issue) => {
+                if issue.issuer() == *account {
+                    view.read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
+                        .ok()
+                        .flatten()
+                        .map(|issuance| {
+                            STAmount::from_mpt_amount(
+                                sf("sfAmount"),
+                                protocol::MPTAmount::from_value(
+                                    ledger::mptoken_helpers::available_mpt_amount(&issuance),
+                                ),
+                                issue,
+                            )
+                        })
+                        .unwrap_or_else(|| taker_gets.zeroed())
+                } else if ledger::mptoken_helpers::is_frozen_mpt(view, account, &issue)
+                    .unwrap_or(true)
+                    || ledger::mptoken_helpers::require_auth_mpt(view, &issue, account)
+                        .unwrap_or(Ter::TEF_INTERNAL)
+                        != Ter::TES_SUCCESS
+                {
+                    taker_gets.zeroed()
+                } else {
+                    view.read(protocol::mptoken_keylet_from_mptid(
+                        issue.mpt_id(),
+                        Uint160::from_void(account.data()),
+                    ))
+                    .ok()
+                    .flatten()
+                    .map(|token| {
+                        STAmount::from_mpt_amount(
+                            sf("sfAmount"),
+                            protocol::MPTAmount::from_value(
+                                token.get_field_u64(sf("sfMPTAmount")) as i64
+                            ),
+                            issue,
+                        )
+                    })
+                    .unwrap_or_else(|| taker_gets.zeroed())
+                }
             }
         }
     };
@@ -611,32 +795,8 @@ fn offer_delete<V: ledger::ApplyView>(
     account: &AccountID,
     offer_sle: Arc<STLedgerEntry>,
 ) -> Ter {
-    // Remove from owner directory
-    let owner_node = offer_sle.get_field_u64(sf("sfOwnerNode"));
-    let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-    let _ = ledger::dir_remove(view, &owner_dir, owner_node, *offer_sle.key(), false);
-
-    // Remove from book directory
-    let book_node = offer_sle.get_field_u64(sf("sfBookNode"));
-    let book_dir_key = offer_sle.get_field_h256(sf("sfBookDirectory"));
-    if !book_dir_key.is_zero() {
-        let book_dir = protocol::Keylet {
-            key: book_dir_key,
-            entry_type: protocol::LedgerEntryType::DirectoryNode,
-        };
-        let _ = ledger::dir_remove(view, &book_dir, book_node, *offer_sle.key(), true);
-    }
-
-    // Adjust owner count
-    let acct_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
-    if let Ok(Some(acct_sle)) = view.peek(acct_keylet) {
-        let _ = ledger::adjust_owner_count(view, &acct_sle, -1);
-    }
-
-    // Erase the offer
-    let _ = view.erase(offer_sle);
-
-    Ter::TES_SUCCESS
+    let _ = account;
+    ledger::offer_helpers::offer_delete(view, offer_sle).unwrap_or(Ter::TEF_BAD_LEDGER)
 }
 
 /// Returns the exchange rate encoded as u64: top 8 bits = exponent+100, lower 56 bits = mantissa.
@@ -669,8 +829,10 @@ fn get_tick_size<V: ledger::ApplyView>(
     let mut tick_size: u8 = 15; // Quality::kMAX_TICK_SIZE
 
     // Check pays issuer
-    if !taker_pays.native() {
-        let issuer = taker_pays.issue().account;
+    if let protocol::Asset::Issue(issue) = taker_pays.asset()
+        && !issue.native()
+    {
+        let issuer = issue.account;
         let issuer_keylet = protocol::account_keylet(Uint160::from_void(issuer.data()));
         if let Ok(Some(sle)) = view.read(issuer_keylet) {
             if sle.is_field_present(sf("sfTickSize")) {
@@ -683,8 +845,10 @@ fn get_tick_size<V: ledger::ApplyView>(
     }
 
     // Check gets issuer
-    if !taker_gets.native() {
-        let issuer = taker_gets.issue().account;
+    if let protocol::Asset::Issue(issue) = taker_gets.asset()
+        && !issue.native()
+    {
+        let issuer = issue.account;
         let issuer_keylet = protocol::account_keylet(Uint160::from_void(issuer.data()));
         if let Ok(Some(sle)) = view.read(issuer_keylet) {
             if sle.is_field_present(sf("sfTickSize")) {
@@ -749,4 +913,29 @@ fn quality_to_rate_amount(quality: u64, _pays: &STAmount, _gets: &STAmount) -> O
         exponent,
         false,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_book_directory_metadata_can_keep_original_exchange_rate() {
+        let issuer = protocol::AccountID::from_array([0x55; 20]);
+        let currency = protocol::currency_from_string("USD");
+        let taker_pays = STAmount::from_iou_amount(
+            sf("sfTakerPays"),
+            protocol::IOUAmount::from_parts(100, 0).expect("valid iou"),
+            protocol::Issue::new(currency, issuer),
+        );
+        let taker_gets = STAmount::from_xrp_amount(XRPAmount::from_drops(250));
+        let mut dir = protocol::STObject::new(sf("sfLedgerEntry"));
+
+        set_book_directory_fields(&mut dir, &taker_pays, &taker_gets, 42, None);
+
+        assert_eq!(dir.get_field_u64(sf("sfExchangeRate")), 42);
+        assert!(!dir.is_field_present(sf("sfDomainID")));
+        assert!(dir.is_field_present(sf("sfTakerPaysCurrency")));
+        assert!(dir.is_field_present(sf("sfTakerPaysIssuer")));
+    }
 }

@@ -24,7 +24,7 @@ fn server_definitions_matches_current_cpp_catalog_hash_and_shape() {
                 _ => None,
             })
             .map(get_str),
-        Some("Generic")
+        Some("Invalid")
     );
     assert_eq!(
         get_object(root.get("LEDGER_ENTRY_TYPES").expect("LEDGER_ENTRY_TYPES")).get("AccountRoot"),
@@ -412,11 +412,7 @@ fn server_definitions_first_field_is_special() {
     let JsonValue::String(first_name) = &first[0] else {
         panic!("first name must be a string");
     };
-    // First field should be a special field (Generic or Invalid)
-    assert!(
-        first_name == "Generic" || first_name == "Invalid",
-        "first field should be Generic or Invalid, got: {first_name}"
-    );
+    assert_eq!(first_name, "Invalid");
     // Should have properties object
     assert!(matches!(&first[1], JsonValue::Object(_)));
 }

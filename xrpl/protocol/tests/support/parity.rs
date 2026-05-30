@@ -5,8 +5,9 @@ use basics::local_value::{LocalSlotOwner, install_local_slot_owner};
 use basics::number::{MantissaScale, get_mantissa_scale, set_mantissa_scale};
 use protocol::{
     NumberSo, Rules, SeqProxy, Ter, TransactionApplyRuntimeGuard, TransactionStepRuntimeGuard,
-    feature_single_asset_vault, feature_universal_number, get_current_transaction_rules,
-    get_st_number_switchover, set_current_transaction_rules, set_st_number_switchover,
+    feature_single_asset_vault, feature_universal_number, fix_cleanup_3_2_0,
+    get_current_transaction_rules, get_st_number_switchover, set_current_transaction_rules,
+    set_st_number_switchover,
 };
 use std::thread;
 
@@ -147,6 +148,15 @@ fn transaction_step_runtime_guard_uses_new_feature_path_when_single_asset_vault_
     {
         let _guard = TransactionStepRuntimeGuard::new(&rules);
         assert_eq!(get_current_transaction_rules(), Some(rules.clone()));
+        assert!(!get_st_number_switchover());
+        assert_eq!(get_mantissa_scale(), MantissaScale::LargeLegacy);
+    }
+
+    let fixed_rules = Rules::new([feature_single_asset_vault(), fix_cleanup_3_2_0()]);
+
+    {
+        let _guard = TransactionStepRuntimeGuard::new(&fixed_rules);
+        assert_eq!(get_current_transaction_rules(), Some(fixed_rules.clone()));
         assert!(!get_st_number_switchover());
         assert_eq!(get_mantissa_scale(), MantissaScale::Large);
     }

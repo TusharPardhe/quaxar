@@ -95,9 +95,18 @@ pub fn offer_in_domain(
         return Ok(false);
     }
 
-    // Validate hybrid offer structure
-    if sle_offer.is_flag(lsfHybrid) && !sle_offer.is_field_present(sf("sfAdditionalBooks")) {
-        return Ok(false);
+    if sle_offer.is_flag(lsfHybrid) {
+        if !sle_offer.is_field_present(sf("sfAdditionalBooks")) {
+            return Ok(false);
+        }
+
+        if view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_1_3"))
+            && sle_offer.get_field_array(sf("sfAdditionalBooks")).len() != 1
+        {
+            return Ok(false);
+        }
     }
 
     let account = sle_offer.get_account_id(sf("sfAccount"));

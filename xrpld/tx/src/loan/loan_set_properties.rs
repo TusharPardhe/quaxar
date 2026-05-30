@@ -359,18 +359,24 @@ pub fn compute_loan_set_properties(
 
 #[cfg(test)]
 mod tests {
-    use basics::number::NumberParts as RuntimeNumber;
+    use basics::number::{NumberParts as RuntimeNumber, power};
     use protocol::{
-        Asset, Issue, Rules, TenthBips16, TenthBips32, percentage_to_tenth_bips, xrp_issue,
+        Asset, Issue, Rules, TenthBips16, TenthBips32, feature_id, percentage_to_tenth_bips,
+        xrp_issue,
     };
 
     use super::{
-        LoanSetLoanState, compute_loan_set_properties, construct_loan_set_state,
-        loan_set_periodic_rate,
+        LoanSetLoanState, compute_loan_set_properties, compute_power_minus_one,
+        compute_power_minus_one_hybrid, compute_theoretical_loan_state, construct_loan_set_state,
+        loan_periodic_payment, loan_principal_from_periodic_payment, loan_set_periodic_rate,
     };
 
     fn no_features() -> Rules {
         Rules::new(std::iter::empty())
+    }
+
+    fn cleanup_3_2_0() -> Rules {
+        Rules::new([feature_id("fixCleanup3_2_0")])
     }
 
     #[test]
@@ -451,5 +457,75 @@ mod tests {
         assert!(props.loan_state.management_fee_due >= RuntimeNumber::zero());
         assert!(props.first_payment_principal > RuntimeNumber::zero());
         assert!(props.loan_scale >= -6);
+    }
+
+    #[test]
+    fn compute_power_minus_one_hybrid_matches_upstream_threshold_routing() {
+        let above_rate = RuntimeNumber::from_i64_and_exponent(5, -2);
+        let above_n = 3;
+        let closed = power(RuntimeNumber::from_i64(1) + above_rate, above_n)
+            .expect("closed form should fit")
+            - RuntimeNumber::from_i64(1);
+        assert_eq!(compute_power_minus_one_hybrid(above_rate, above_n), closed);
+
+        let below_rate = loan_set_periodic_rate(TenthBips32::new(1), 600);
+        let below_n = 2;
+        assert_eq!(
+            compute_power_minus_one_hybrid(below_rate, below_n),
+            compute_power_minus_one(below_rate, below_n)
+        );
+
+        let boundary_rate = RuntimeNumber::from_i64_and_exponent(1, -12);
+        let boundary_n = 1_000;
+        let boundary_closed = power(RuntimeNumber::from_i64(1) + boundary_rate, boundary_n)
+            .expect("boundary closed form should fit")
+            - RuntimeNumber::from_i64(1);
+        assert_eq!(
+            compute_power_minus_one_hybrid(boundary_rate, boundary_n),
+            boundary_closed
+        );
+    }
+
+    #[test]
+    fn loan_principal_from_periodic_payment_near_zero_rate_respects_payment_bound() {
+        let rules = cleanup_3_2_0();
+        let periodic_rate = loan_set_periodic_rate(TenthBips32::new(1), 600);
+        let periodic_payment =
+            loan_periodic_payment(&rules, RuntimeNumber::from_i64(100), periodic_rate, 3);
+
+        for payments_remaining in [3, 2, 1] {
+            let computed = loan_principal_from_periodic_payment(
+                &rules,
+                periodic_payment,
+                periodic_rate,
+                payments_remaining,
+            );
+            let upper_bound =
+                periodic_payment * RuntimeNumber::from_i64(i64::from(payments_remaining));
+            assert!(
+                computed <= upper_bound,
+                "payments_remaining={payments_remaining}: principal={computed:?} upper_bound={upper_bound:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compute_theoretical_loan_state_near_zero_rate_has_non_negative_interest_due() {
+        let rules = cleanup_3_2_0();
+        let periodic_rate = loan_set_periodic_rate(TenthBips32::new(1), 600);
+        let periodic_payment =
+            loan_periodic_payment(&rules, RuntimeNumber::from_i64(100), periodic_rate, 3);
+        let state = compute_theoretical_loan_state(
+            &rules,
+            Asset::Issue(xrp_issue()),
+            periodic_payment,
+            periodic_rate,
+            2,
+            TenthBips16::new(0),
+        );
+
+        assert!(state.principal_outstanding <= state.value_outstanding);
+        assert!(state.interest_due >= RuntimeNumber::zero());
+        assert_eq!(state.management_fee_due, RuntimeNumber::zero());
     }
 }

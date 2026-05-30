@@ -46,12 +46,6 @@ pub fn do_payment<V: ledger::ApplyView>(
     let account = sttx.get_account_id(sf("sfAccount"));
     let dst_account_id = sttx.get_account_id(sf("sfDestination"));
 
-    if account == dst_account_id {
-        return Ter::TEM_REDUNDANT;
-    }
-
-    // path returns tecPATH_DRY. Direct XRP self-payments are allowed.
-    // Check after reading both accounts but before any path logic.
     let dst_amount = sttx.get_field_amount(sf("sfAmount"));
     let tx_flags = sttx.get_field_u32(sf("sfFlags"));
     let has_paths = sttx.is_field_present(sf("sfPaths"));
@@ -89,6 +83,9 @@ pub fn do_payment<V: ledger::ApplyView>(
     let is_ripple = has_paths || send_max.is_some() || !dst_amount.native();
     if account == dst_account_id && is_ripple {
         return Ter::TEC_PATH_DRY;
+    }
+    if account == dst_account_id {
+        return Ter::TEM_REDUNDANT;
     }
 
     // Peek destination account

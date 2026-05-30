@@ -271,10 +271,7 @@ fn bridge_and_xchain_selector_helpers_match_current_cpp_rules() {
             "LockingChainIssue",
             object([
                 ("currency", JsonValue::String("USD".to_owned())),
-                (
-                    "issuer",
-                    JsonValue::String("rrrrrrrrrrrrrrrrrrrrrhoLvTp".to_owned()),
-                ),
+                ("issuer", JsonValue::String(to_base58(locking_door))),
             ]),
         ),
         (
@@ -285,10 +282,7 @@ fn bridge_and_xchain_selector_helpers_match_current_cpp_rules() {
             "IssuingChainIssue",
             object([
                 ("currency", JsonValue::String("CNY".to_owned())),
-                (
-                    "issuer",
-                    JsonValue::String("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh".to_owned()),
-                ),
+                ("issuer", JsonValue::String(to_base58(issuing_door))),
             ]),
         ),
     ]);
@@ -319,10 +313,7 @@ fn bridge_and_xchain_selector_helpers_match_current_cpp_rules() {
                     "LockingChainIssue",
                     object([
                         ("currency", JsonValue::String("USD".to_owned())),
-                        (
-                            "issuer",
-                            JsonValue::String("rrrrrrrrrrrrrrrrrrrrrhoLvTp".to_owned()),
-                        ),
+                        ("issuer", JsonValue::String(to_base58(locking_door))),
                     ]),
                 ),
                 (
@@ -333,10 +324,7 @@ fn bridge_and_xchain_selector_helpers_match_current_cpp_rules() {
                     "IssuingChainIssue",
                     object([
                         ("currency", JsonValue::String("CNY".to_owned())),
-                        (
-                            "issuer",
-                            JsonValue::String("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh".to_owned()),
-                        ),
+                        ("issuer", JsonValue::String(to_base58(issuing_door))),
                     ]),
                 ),
                 ("xchain_owned_claim_id", JsonValue::Unsigned(7)),
@@ -363,10 +351,7 @@ fn bridge_and_xchain_selector_helpers_match_current_cpp_rules() {
                     "LockingChainIssue",
                     object([
                         ("currency", JsonValue::String("USD".to_owned())),
-                        (
-                            "issuer",
-                            JsonValue::String("rrrrrrrrrrrrrrrrrrrrrhoLvTp".to_owned()),
-                        ),
+                        ("issuer", JsonValue::String(to_base58(locking_door))),
                     ]),
                 ),
                 (
@@ -377,10 +362,7 @@ fn bridge_and_xchain_selector_helpers_match_current_cpp_rules() {
                     "IssuingChainIssue",
                     object([
                         ("currency", JsonValue::String("CNY".to_owned())),
-                        (
-                            "issuer",
-                            JsonValue::String("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh".to_owned()),
-                        ),
+                        ("issuer", JsonValue::String(to_base58(issuing_door))),
                     ]),
                 ),
                 (

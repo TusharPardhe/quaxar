@@ -2045,6 +2045,33 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
         let mut tip_index = book_base;
         let mut remaining = limit.min(256);
         let mut offers = Vec::new();
+        let mut owner_balances = BTreeMap::<AccountID, protocol::STAmount>::new();
+        let asset_is_global_frozen = |asset: protocol::Asset| match asset {
+            protocol::Asset::Issue(issue) if issue.native() => false,
+            protocol::Asset::Issue(issue) => Uint160::from_slice(issue.issuer().data())
+                .and_then(|issuer| {
+                    ledger::account_root_helpers::is_global_frozen(ledger.as_ref(), issuer).ok()
+                })
+                .unwrap_or(false),
+            protocol::Asset::MPTIssue(issue) => {
+                ledger::mptoken_helpers::is_global_frozen_mpt(ledger.as_ref(), &issue)
+                    .unwrap_or(false)
+            }
+        };
+        let global_freeze = asset_is_global_frozen(book.out) || asset_is_global_frozen(book.r#in);
+        let transfer_rate = match book.out {
+            protocol::Asset::Issue(issue) if issue.native() => protocol::PARITY_RATE,
+            protocol::Asset::Issue(issue) => Uint160::from_slice(issue.issuer().data())
+                .and_then(|issuer| {
+                    ledger::account_root_helpers::transfer_rate(ledger.as_ref(), issuer).ok()
+                })
+                .map(protocol::Rate::new)
+                .unwrap_or(protocol::PARITY_RATE),
+            protocol::Asset::MPTIssue(issue) => {
+                ledger::mptoken_helpers::transfer_rate_mpt(ledger.as_ref(), issue.mpt_id())
+                    .unwrap_or(protocol::PARITY_RATE)
+            }
+        };
 
         while remaining > 0 {
             let next = match ledger.succ(tip_index, Some(book_end)) {
@@ -2079,51 +2106,97 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
                     let quality_bytes = &next.data()[24..32];
                     let quality_u64 =
                         u64::from_be_bytes(quality_bytes.try_into().unwrap_or([0; 8]));
-                    offer_obj.insert(
-                        "quality".to_owned(),
-                        JsonValue::String(quality_u64.to_string()),
-                    );
+                    let dir_rate = protocol::amount_from_quality(quality_u64);
+                    offer_obj.insert("quality".to_owned(), JsonValue::String(dir_rate.text()));
 
-                    // Compute owner_funds: read owner's balance for the TakerGets asset
+                    // Compute owner_funds: read owner's balance for the TakerGets asset.
                     let owner = offer_sle.get_account_id(get_field_by_symbol("sfAccount"));
                     let taker_gets = offer_sle.get_field_amount(get_field_by_symbol("sfTakerGets"));
-                    if taker_gets.native() {
-                        // XRP: read account balance
-                        let owner_key = Uint160::from_slice(owner.data()).unwrap_or_default();
-                        let owner_keylet = protocol::account_keylet(owner_key);
-                        if let Ok(Some(owner_sle)) = ledger.read(owner_keylet) {
-                            let balance =
-                                owner_sle.get_field_amount(get_field_by_symbol("sfBalance"));
-                            offer_obj.insert(
-                                "owner_funds".to_owned(),
-                                JsonValue::String(balance.text()),
-                            );
-                        }
-                    } else {
-                        // IOU: read trust line balance
-                        let issue = taker_gets.issue();
-                        let (low, high) = if owner < issue.account {
-                            (owner, issue.account)
-                        } else {
-                            (issue.account, owner)
-                        };
-                        let line_keylet = protocol::line(low, high, issue.currency);
-                        if let Ok(Some(line_sle)) = ledger.read(line_keylet) {
-                            let balance =
-                                line_sle.get_field_amount(get_field_by_symbol("sfBalance"));
-                            let bal_text = balance.text();
-                            // Negate if owner is high account
-                            let funds = if owner > issue.account {
-                                if bal_text.starts_with('-') {
-                                    bal_text[1..].to_owned()
+                    let taker_pays = offer_sle.get_field_amount(get_field_by_symbol("sfTakerPays"));
+                    let mut zero_out = taker_gets.clone();
+                    zero_out.clear_with_asset(book.out);
+                    let mut first_owner_offer = true;
+                    let mut owner_funds = if book.out.issuer() == owner {
+                        match book.out {
+                            protocol::Asset::Issue(_) => taker_gets.clone(),
+                            protocol::Asset::MPTIssue(issue) => {
+                                if let Some(balance) = owner_balances.get(&owner) {
+                                    first_owner_offer = false;
+                                    balance.clone()
                                 } else {
-                                    format!("-{bal_text}")
+                                    ledger::mptoken_helpers::issuer_funds_to_self_issue(
+                                        ledger.as_ref(),
+                                        &issue,
+                                    )
+                                    .unwrap_or_else(|_| zero_out.clone())
                                 }
-                            } else {
-                                bal_text
-                            };
-                            offer_obj.insert("owner_funds".to_owned(), JsonValue::String(funds));
+                            }
                         }
+                    } else if global_freeze {
+                        zero_out.clone()
+                    } else if let Some(balance) = owner_balances.get(&owner) {
+                        first_owner_offer = false;
+                        balance.clone()
+                    } else {
+                        let funds = ledger::account_funds(
+                            ledger.as_ref(),
+                            owner,
+                            &taker_gets,
+                            ledger::FreezeHandling::ZeroIfFrozen,
+                        )
+                        .unwrap_or_else(|_| zero_out.clone());
+                        if funds < zero_out {
+                            zero_out.clone()
+                        } else {
+                            funds
+                        }
+                    };
+
+                    let owner_funds_before = owner_funds.clone();
+                    let mut owner_funds_limit = owner_funds.clone();
+                    let mut offer_rate = protocol::PARITY_RATE;
+                    if transfer_rate != protocol::PARITY_RATE
+                        && _taker != book.out.issuer()
+                        && book.out.issuer() != owner
+                    {
+                        offer_rate = transfer_rate;
+                        owner_funds_limit = protocol::divide_rate(&owner_funds, offer_rate);
+                    }
+
+                    let taker_gets_funded = if owner_funds_limit >= taker_gets {
+                        taker_gets.clone()
+                    } else {
+                        offer_obj.insert(
+                            "taker_gets_funded".to_owned(),
+                            owner_funds_limit.json(JsonOptions::NONE),
+                        );
+                        let pays_funded = std::cmp::min(
+                            taker_pays.clone(),
+                            owner_funds_limit.multiply(&dir_rate, taker_pays.asset()),
+                        );
+                        offer_obj.insert(
+                            "taker_pays_funded".to_owned(),
+                            pays_funded.json(JsonOptions::NONE),
+                        );
+                        owner_funds_limit
+                    };
+
+                    let owner_pays = if offer_rate == protocol::PARITY_RATE {
+                        taker_gets_funded.clone()
+                    } else {
+                        std::cmp::min(
+                            owner_funds.clone(),
+                            protocol::multiply_rate(&taker_gets_funded, offer_rate),
+                        )
+                    };
+                    owner_funds -= owner_pays;
+                    owner_balances.insert(owner, owner_funds.clone());
+
+                    if first_owner_offer {
+                        offer_obj.insert(
+                            "owner_funds".to_owned(),
+                            JsonValue::String(owner_funds_before.text()),
+                        );
                     }
                 }
                 offers.push(offer_json);

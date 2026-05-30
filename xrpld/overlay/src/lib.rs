@@ -35,8 +35,8 @@ pub use connect_attempt::{
 pub use handshake::{
     FEATURE_COMPR, FEATURE_LEDGER_REPLAY, FEATURE_TXRR, FEATURE_VPRR, HandshakeContext,
     HandshakePeer, HandshakeVerificationContext, feature_enabled, get_feature_value,
-    is_feature_value, make_features_request_header, make_features_response_header, make_request,
-    make_response, make_shared_value_from_finished_messages, parse_http_request,
+    is_feature_value, is_public_ip, make_features_request_header, make_features_response_header,
+    make_request, make_response, make_shared_value_from_finished_messages, parse_http_request,
     parse_http_response, serialize_request, serialize_response, verify_handshake,
 };
 pub use inbound::{

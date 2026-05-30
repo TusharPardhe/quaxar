@@ -367,6 +367,12 @@ pub fn collect_account_objects<V: AccountObjectsView>(
 
         // Once NFT pages are exhausted the reference code falls back to directory
         // traversal and resets the entry marker.
+        if type_filter.is_some_and(|filter| filter == [LedgerEntryType::NFTokenPage]) {
+            return Ok(AccountObjectsTraversal {
+                items,
+                marker: None,
+            });
+        }
     }
 
     let root = account_objects_owner_root(account);

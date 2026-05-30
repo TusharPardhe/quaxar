@@ -39,30 +39,68 @@ impl Default for ServerAuth {
 }
 
 pub fn forwarded_for(headers: &HeaderMap) -> Option<String> {
-    fn strip_port(candidate: &str) -> &str {
-        let candidate = candidate.trim();
-        if candidate.starts_with('[') {
-            if let Some(close) = candidate.find(']') {
-                return &candidate[1..close];
+    fn forwarded_for_directive_start(value: &str) -> Option<usize> {
+        let lower = value.to_ascii_lowercase();
+        let bytes = lower.as_bytes();
+        let mut start = 0;
+        while start + 4 <= bytes.len() {
+            let Some(offset) = lower[start..].find("for=") else {
+                return None;
+            };
+            let index = start + offset;
+            let at_boundary =
+                index == 0 || matches!(bytes[index.saturating_sub(1)], b';' | b',' | b' ' | b'\t');
+            if at_boundary {
+                return Some(index + 4);
             }
-            return candidate;
+            start = index + 1;
+        }
+        None
+    }
+
+    fn forwarded_address(candidate: &str) -> Option<&str> {
+        let candidate = candidate.trim();
+        let candidate = if candidate.starts_with('"') {
+            candidate.strip_prefix('"')?.strip_suffix('"')?.trim()
+        } else {
+            candidate
+        };
+        if candidate.is_empty() {
+            return None;
+        }
+
+        if candidate.starts_with('[') {
+            let close = candidate.find(']')?;
+            let remainder = candidate[close + 1..].trim();
+            if !remainder.is_empty() && !remainder.starts_with(':') {
+                return None;
+            }
+            let address = candidate[1..close].trim();
+            return (!address.is_empty()).then_some(address);
+        }
+        if candidate.contains(']') {
+            return None;
         }
 
         let colon_count = candidate.chars().filter(|c| *c == ':').count();
         if colon_count == 1 {
-            candidate.split(':').next().unwrap_or(candidate)
+            let (address, _port) = candidate.split_once(':')?;
+            if address.parse::<std::net::Ipv4Addr>().is_ok() {
+                return Some(address.trim());
+            }
         } else {
-            candidate
+            return Some(candidate);
         }
+
+        Some(candidate)
     }
 
     if let Some(value) = headers.get("forwarded") {
         let value = value.to_str().ok()?;
-        if let Some(index) = value.to_ascii_lowercase().find("for=") {
-            let raw = &value[index + 4..];
+        if let Some(index) = forwarded_for_directive_start(value) {
+            let raw = &value[index..];
             let candidate = raw.split([';', ',']).next()?.trim();
-            let candidate = candidate.trim_matches('"');
-            let candidate = strip_port(candidate);
+            let candidate = forwarded_address(candidate)?;
             if !candidate.is_empty() {
                 return Some(candidate.to_owned());
             }
@@ -72,7 +110,7 @@ pub fn forwarded_for(headers: &HeaderMap) -> Option<String> {
     if let Some(value) = headers.get("x-forwarded-for") {
         let value = value.to_str().ok()?;
         let candidate = value.split(',').next()?.trim();
-        let candidate = strip_port(candidate);
+        let candidate = forwarded_address(candidate)?;
         if !candidate.is_empty() {
             return Some(candidate.to_owned());
         }
@@ -195,7 +233,7 @@ fn request_role_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerAuthConfig, authorized_http};
+    use super::{ServerAuthConfig, authorized_http, forwarded_for};
     use http::{HeaderMap, HeaderValue, header};
 
     #[test]
@@ -218,5 +256,40 @@ mod tests {
             HeaderValue::from_static("Basic cnBjOndyb25n"),
         );
         assert!(!authorized_http(&config, &headers));
+    }
+
+    #[test]
+    fn forwarded_for_trims_quotes_and_rejects_malformed_brackets() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "forwarded",
+            HeaderValue::from_static("for=\"[2001:4860:4860::8888]:443\""),
+        );
+        assert_eq!(
+            forwarded_for(&headers),
+            Some("2001:4860:4860::8888".to_owned())
+        );
+
+        headers.insert(
+            "forwarded",
+            HeaderValue::from_static("for=\"[2001:4860:4860::8888:443\""),
+        );
+        assert_eq!(forwarded_for(&headers), None);
+    }
+
+    #[test]
+    fn forwarded_for_requires_for_directive_boundary() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "forwarded",
+            HeaderValue::from_static("xfor=198.51.100.1;proto=https"),
+        );
+        assert_eq!(forwarded_for(&headers), None);
+
+        headers.insert(
+            "forwarded",
+            HeaderValue::from_static("xfor=198.51.100.1; for=203.0.113.9"),
+        );
+        assert_eq!(forwarded_for(&headers), Some("203.0.113.9".to_owned()));
     }
 }

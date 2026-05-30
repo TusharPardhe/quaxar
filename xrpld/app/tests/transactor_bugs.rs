@@ -12,8 +12,9 @@ use app::apply_submit_transactor_shell;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{Fees, Ledger, LedgerHeader, Sandbox};
 use protocol::{
-    AccountID, ApplyFlags, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STArray,
-    STLedgerEntry, STObject, STTx, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol,
+    AccountID, ApplyFlags, Currency, IOUAmount, Issue, LedgerEntryType, MPTAmount, MPTIssue,
+    STAmount, STArray, STLedgerEntry, STObject, STTx, Ter, TxType, XRPAmount, account_keylet,
+    get_field_by_symbol,
 };
 use shamap::{
     item::SHAMapItem,
@@ -144,11 +145,128 @@ fn nft_sell_offer_entry(
     (keylet.key, sle.get_serializer().data().to_vec())
 }
 
+fn escrow_entry(
+    owner: AccountID,
+    sequence: u32,
+    destination: AccountID,
+    amount: STAmount,
+    cancel_after: u32,
+) -> (Uint256, Vec<u8>) {
+    escrow_entry_with_transfer_rate(owner, sequence, destination, amount, cancel_after, None)
+}
+
+fn escrow_entry_with_transfer_rate(
+    owner: AccountID,
+    sequence: u32,
+    destination: AccountID,
+    amount: STAmount,
+    cancel_after: u32,
+    transfer_rate: Option<u32>,
+) -> (Uint256, Vec<u8>) {
+    let keylet = protocol::escrow_keylet(raw_id(owner), sequence);
+    let mut sle = STLedgerEntry::from_type_and_key(LedgerEntryType::Escrow, keylet.key);
+    sle.set_account_id(sf("sfAccount"), owner);
+    sle.set_account_id(sf("sfDestination"), destination);
+    sle.set_field_amount(sf("sfAmount"), amount);
+    sle.set_field_u32(sf("sfCancelAfter"), cancel_after);
+    if let Some(transfer_rate) = transfer_rate {
+        sle.set_field_u32(sf("sfTransferRate"), transfer_rate);
+    }
+    sle.set_field_u64(sf("sfOwnerNode"), 0);
+    (keylet.key, sle.get_serializer().data().to_vec())
+}
+
+fn check_entry(
+    source: AccountID,
+    destination: AccountID,
+    sequence: u32,
+    send_max: STAmount,
+) -> (Uint256, Vec<u8>) {
+    let keylet = protocol::check_keylet(raw_id(source), sequence);
+    let mut sle = STLedgerEntry::from_type_and_key(LedgerEntryType::Check, keylet.key);
+    sle.set_account_id(sf("sfAccount"), source);
+    sle.set_account_id(sf("sfDestination"), destination);
+    sle.set_field_amount(sf("sfSendMax"), send_max);
+    sle.set_field_u32(sf("sfSequence"), sequence);
+    sle.set_field_u64(sf("sfOwnerNode"), 0);
+    (keylet.key, sle.get_serializer().data().to_vec())
+}
+
+fn mpt_id(issuer: AccountID, sequence: u32) -> basics::base_uint::Uint192 {
+    let mut bytes = [0_u8; 24];
+    bytes[..4].copy_from_slice(&sequence.to_be_bytes());
+    bytes[4..].copy_from_slice(issuer.data());
+    basics::base_uint::Uint192::from_slice(&bytes).expect("mpt id width")
+}
+
+fn mpt_issuance_entry(
+    issuer: AccountID,
+    sequence: u32,
+    outstanding: u64,
+    locked: u64,
+) -> (Uint256, Vec<u8>) {
+    mpt_issuance_entry_with_fee(issuer, sequence, outstanding, locked, None)
+}
+
+fn mpt_issuance_entry_with_fee(
+    issuer: AccountID,
+    sequence: u32,
+    outstanding: u64,
+    locked: u64,
+    transfer_fee: Option<u16>,
+) -> (Uint256, Vec<u8>) {
+    let id = mpt_id(issuer, sequence);
+    let keylet = protocol::mpt_issuance_keylet_from_mptid(id);
+    let mut sle = STLedgerEntry::from_type_and_key(LedgerEntryType::MPTokenIssuance, keylet.key);
+    sle.set_account_id(sf("sfIssuer"), issuer);
+    sle.set_field_u32(sf("sfSequence"), sequence);
+    sle.set_field_u64(sf("sfOutstandingAmount"), outstanding);
+    sle.set_field_u32(sf("sfFlags"), protocol::lsfMPTCanTransfer);
+    sle.set_field_u64(sf("sfOwnerNode"), 0);
+    if locked != 0 {
+        sle.set_field_u64(sf("sfLockedAmount"), locked);
+    }
+    if let Some(transfer_fee) = transfer_fee {
+        sle.set_field_u16(sf("sfTransferFee"), transfer_fee);
+    }
+    (keylet.key, sle.get_serializer().data().to_vec())
+}
+
+fn mptoken_entry(
+    holder: AccountID,
+    issuer: AccountID,
+    sequence: u32,
+    amount: u64,
+    locked: u64,
+) -> (Uint256, Vec<u8>) {
+    let id = mpt_id(issuer, sequence);
+    let keylet = protocol::mptoken_keylet_from_mptid(id, raw_id(holder));
+    let mut sle = STLedgerEntry::from_type_and_key(LedgerEntryType::MPToken, keylet.key);
+    sle.set_account_id(sf("sfAccount"), holder);
+    sle.set_field_h192(sf("sfMPTokenIssuanceID"), id);
+    sle.set_field_u64(sf("sfMPTAmount"), amount);
+    sle.set_field_u32(sf("sfFlags"), 0);
+    sle.set_field_u64(sf("sfOwnerNode"), 0);
+    if locked != 0 {
+        sle.set_field_u64(sf("sfLockedAmount"), locked);
+    }
+    (keylet.key, sle.get_serializer().data().to_vec())
+}
+
 fn run(ledger: &Ledger, tx: STTx) -> Ter {
     let base = Arc::new(ledger.clone());
     let mut view = Sandbox::new(base, ApplyFlags::default());
     let txn_type = tx.get_txn_type();
     apply_submit_transactor_shell(&mut view, &tx, txn_type)
+}
+
+fn run_and_apply(ledger: &mut Ledger, tx: STTx) -> Ter {
+    let base = Arc::new(ledger.clone());
+    let mut view = Sandbox::new(base, ApplyFlags::default());
+    let txn_type = tx.get_txn_type();
+    let ter = apply_submit_transactor_shell(&mut view, &tx, txn_type);
+    view.apply(ledger).expect("sandbox apply");
+    ter
 }
 
 // ── Bug A: self-payment returns tecPATH_DRY ──────────────────────────────────
@@ -237,6 +355,595 @@ fn self_payment_iou_to_xrp_returns_tec_path_dry() {
         Ter::TEC_PATH_DRY,
         "self-payment IOU→XRP must return tecPATH_DRY"
     );
+}
+
+#[test]
+fn escrow_cancel_iou_does_not_credit_xrp_drops() {
+    // Mirrors #6171's core safety point for Rust's current IOU unlock surface:
+    // non-XRP escrow cancel must restore the IOU, not add the IOU mantissa to XRP.
+    let owner = acct(0x10);
+    let destination = acct(0x11);
+    let issuer = acct(0x20);
+    let currency = iou_currency(b"USD");
+    let issue = Issue {
+        currency,
+        account: issuer,
+    };
+    let amount = STAmount::from_iou_amount(sf("sfAmount"), iou(1_000, 0), issue);
+    let mut ledger = build_ledger(
+        104111034,
+        vec![
+            account_entry(owner, 100_000_000, 1),
+            account_entry(destination, 100_000_000, 0),
+            account_entry(issuer, 100_000_000, 0),
+            escrow_entry(owner, 1, destination, amount, 0),
+        ],
+    );
+
+    let tx = STTx::new(TxType::ESCROW_CANCEL, |tx| {
+        tx.set_account_id(sf("sfAccount"), owner);
+        tx.set_account_id(sf("sfOwner"), owner);
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_vl(sf("sfSigningPubKey"), &[0u8; 33]);
+    });
+
+    assert_eq!(run_and_apply(&mut ledger, tx), Ter::TES_SUCCESS);
+
+    let owner_sle = ledger
+        .peek(account_keylet(raw_id(owner)))
+        .expect("owner read")
+        .expect("owner exists");
+    assert_eq!(
+        owner_sle.get_field_amount(sf("sfBalance")).xrp().drops(),
+        99_999_990
+    );
+    assert!(
+        ledger
+            .peek(protocol::line(issuer, owner, currency))
+            .expect("line read")
+            .is_some(),
+        "IOU cancel should restore/create the owner trust line"
+    );
+}
+
+#[test]
+fn escrow_cancel_mpt_unlocks_locked_amount_accounting() {
+    let owner = acct(0x10);
+    let destination = acct(0x11);
+    let issuer = acct(0x20);
+    let issuance_id = mpt_id(issuer, 1);
+    let issue = MPTIssue::new(issuance_id);
+    let amount = STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(10), issue);
+    let mut ledger = build_ledger(
+        104111034,
+        vec![
+            account_entry(owner, 100_000_000, 1),
+            account_entry(destination, 100_000_000, 0),
+            account_entry(issuer, 100_000_000, 0),
+            mpt_issuance_entry(issuer, 1, 100, 10),
+            mptoken_entry(owner, issuer, 1, 90, 10),
+            escrow_entry(owner, 1, destination, amount, 0),
+        ],
+    );
+
+    let tx = STTx::new(TxType::ESCROW_CANCEL, |tx| {
+        tx.set_account_id(sf("sfAccount"), owner);
+        tx.set_account_id(sf("sfOwner"), owner);
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_vl(sf("sfSigningPubKey"), &[0u8; 33]);
+    });
+
+    assert_eq!(run_and_apply(&mut ledger, tx), Ter::TES_SUCCESS);
+
+    let token = ledger
+        .peek(protocol::mptoken_keylet_from_mptid(
+            issuance_id,
+            raw_id(owner),
+        ))
+        .expect("token read")
+        .expect("token exists");
+    assert_eq!(token.get_field_u64(sf("sfMPTAmount")), 100);
+    assert!(!token.is_field_present(sf("sfLockedAmount")));
+
+    let issuance = ledger
+        .peek(protocol::mpt_issuance_keylet_from_mptid(issuance_id))
+        .expect("issuance read")
+        .expect("issuance exists");
+    assert_eq!(issuance.get_field_u64(sf("sfOutstandingAmount")), 100);
+    assert!(!issuance.is_field_present(sf("sfLockedAmount")));
+}
+
+#[test]
+fn escrow_cancel_mpt_preserves_remaining_locked_amount_accounting() {
+    let owner = acct(0x12);
+    let destination = acct(0x13);
+    let issuer = acct(0x21);
+    let issuance_id = mpt_id(issuer, 1);
+    let issue = MPTIssue::new(issuance_id);
+    let amount = STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(10), issue);
+    let mut ledger = build_ledger(
+        104111034,
+        vec![
+            account_entry(owner, 100_000_000, 1),
+            account_entry(destination, 100_000_000, 0),
+            account_entry(issuer, 100_000_000, 0),
+            mpt_issuance_entry(issuer, 1, 100, 25),
+            mptoken_entry(owner, issuer, 1, 75, 25),
+            escrow_entry(owner, 1, destination, amount, 0),
+        ],
+    );
+
+    let tx = STTx::new(TxType::ESCROW_CANCEL, |tx| {
+        tx.set_account_id(sf("sfAccount"), owner);
+        tx.set_account_id(sf("sfOwner"), owner);
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_vl(sf("sfSigningPubKey"), &[0u8; 33]);
+    });
+
+    assert_eq!(run_and_apply(&mut ledger, tx), Ter::TES_SUCCESS);
+
+    let token = ledger
+        .peek(protocol::mptoken_keylet_from_mptid(
+            issuance_id,
+            raw_id(owner),
+        ))
+        .expect("token read")
+        .expect("token exists");
+    assert_eq!(token.get_field_u64(sf("sfMPTAmount")), 85);
+    assert_eq!(token.get_field_u64(sf("sfLockedAmount")), 15);
+
+    let issuance = ledger
+        .peek(protocol::mpt_issuance_keylet_from_mptid(issuance_id))
+        .expect("issuance read")
+        .expect("issuance exists");
+    assert_eq!(issuance.get_field_u64(sf("sfOutstandingAmount")), 100);
+    assert_eq!(issuance.get_field_u64(sf("sfLockedAmount")), 15);
+}
+
+#[test]
+fn escrow_finish_mpt_uses_lower_current_transfer_rate_and_unlocks_gross_amount() {
+    let owner = acct(0x16);
+    let destination = acct(0x17);
+    let issuer = acct(0x23);
+    let issuance_id = mpt_id(issuer, 1);
+    let issue = MPTIssue::new(issuance_id);
+    let amount = STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(100), issue);
+    let expected_net = protocol::divide_round(&amount, protocol::Rate::new(1_100_000_000), true)
+        .mpt()
+        .value() as u64;
+    let mut ledger = build_ledger(
+        104111034,
+        vec![
+            account_entry(owner, 100_000_000, 1),
+            account_entry(destination, 100_000_000, 0),
+            account_entry(issuer, 100_000_000, 0),
+            mpt_issuance_entry_with_fee(issuer, 1, 1_000, 100, Some(10_000)),
+            mptoken_entry(owner, issuer, 1, 900, 100),
+            mptoken_entry(destination, issuer, 1, 0, 0),
+            escrow_entry_with_transfer_rate(owner, 1, destination, amount, 0, Some(1_200_000_000)),
+        ],
+    );
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("fixTokenEscrowV1"),
+        protocol::feature_id("fixCleanup3_2_0"),
+    ]));
+
+    let tx = STTx::new(TxType::ESCROW_FINISH, |tx| {
+        tx.set_account_id(sf("sfAccount"), destination);
+        tx.set_account_id(sf("sfOwner"), owner);
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_vl(sf("sfSigningPubKey"), &[0u8; 33]);
+    });
+
+    assert_eq!(run_and_apply(&mut ledger, tx), Ter::TES_SUCCESS);
+
+    let destination_token = ledger
+        .peek(protocol::mptoken_keylet_from_mptid(
+            issuance_id,
+            raw_id(destination),
+        ))
+        .expect("destination token read")
+        .expect("destination token exists");
+    assert_eq!(
+        destination_token.get_field_u64(sf("sfMPTAmount")),
+        expected_net
+    );
+
+    let owner_token = ledger
+        .peek(protocol::mptoken_keylet_from_mptid(
+            issuance_id,
+            raw_id(owner),
+        ))
+        .expect("owner token read")
+        .expect("owner token exists");
+    assert!(!owner_token.is_field_present(sf("sfLockedAmount")));
+
+    let issuance = ledger
+        .peek(protocol::mpt_issuance_keylet_from_mptid(issuance_id))
+        .expect("issuance read")
+        .expect("issuance exists");
+    assert!(!issuance.is_field_present(sf("sfLockedAmount")));
+    assert_eq!(
+        issuance.get_field_u64(sf("sfOutstandingAmount")),
+        1_000 - (100 - expected_net)
+    );
+}
+
+#[test]
+fn escrow_create_mpt_locks_holder_and_issuance_amounts() {
+    let owner = acct(0x10);
+    let destination = acct(0x11);
+    let issuer = acct(0x20);
+    let issuance_id = mpt_id(issuer, 1);
+    let issue = MPTIssue::new(issuance_id);
+    let amount = STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(10), issue);
+    let mut ledger = build_ledger(
+        104111034,
+        vec![
+            account_entry(owner, 100_000_000, 0),
+            account_entry(destination, 100_000_000, 0),
+            account_entry(issuer, 100_000_000, 0),
+            mpt_issuance_entry(issuer, 1, 100, 0),
+            mptoken_entry(owner, issuer, 1, 100, 0),
+        ],
+    );
+
+    let tx = STTx::new(TxType::ESCROW_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), owner);
+        tx.set_account_id(sf("sfDestination"), destination);
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_vl(sf("sfSigningPubKey"), &[0u8; 33]);
+        tx.set_field_amount(sf("sfAmount"), amount);
+        tx.set_field_u32(sf("sfCancelAfter"), 1);
+    });
+
+    assert_eq!(run_and_apply(&mut ledger, tx), Ter::TES_SUCCESS);
+
+    let token = ledger
+        .peek(protocol::mptoken_keylet_from_mptid(
+            issuance_id,
+            raw_id(owner),
+        ))
+        .expect("token read")
+        .expect("token exists");
+    assert_eq!(token.get_field_u64(sf("sfMPTAmount")), 90);
+    assert_eq!(token.get_field_u64(sf("sfLockedAmount")), 10);
+
+    let issuance = ledger
+        .peek(protocol::mpt_issuance_keylet_from_mptid(issuance_id))
+        .expect("issuance read")
+        .expect("issuance exists");
+    assert_eq!(issuance.get_field_u64(sf("sfOutstandingAmount")), 100);
+    assert_eq!(issuance.get_field_u64(sf("sfLockedAmount")), 10);
+}
+
+#[test]
+fn escrow_create_mpt_records_locked_transfer_rate() {
+    let owner = acct(0x10);
+    let destination = acct(0x11);
+    let issuer = acct(0x20);
+    let issuance_id = mpt_id(issuer, 1);
+    let issue = MPTIssue::new(issuance_id);
+    let amount = STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(10), issue);
+    let mut ledger = build_ledger(
+        104111034,
+        vec![
+            account_entry(owner, 100_000_000, 0),
+            account_entry(destination, 100_000_000, 0),
+            account_entry(issuer, 100_000_000, 0),
+            mpt_issuance_entry_with_fee(issuer, 1, 100, 0, Some(10_000)),
+            mptoken_entry(owner, issuer, 1, 100, 0),
+        ],
+    );
+
+    let tx = STTx::new(TxType::ESCROW_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), owner);
+        tx.set_account_id(sf("sfDestination"), destination);
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_vl(sf("sfSigningPubKey"), &[0u8; 33]);
+        tx.set_field_amount(sf("sfAmount"), amount);
+        tx.set_field_u32(sf("sfCancelAfter"), 1);
+    });
+
+    assert_eq!(run_and_apply(&mut ledger, tx), Ter::TES_SUCCESS);
+    let escrow = ledger
+        .peek(protocol::escrow_keylet(raw_id(owner), 1))
+        .expect("escrow read")
+        .expect("escrow exists");
+    assert_eq!(escrow.get_field_u32(sf("sfTransferRate")), 1_100_000_000);
+}
+
+#[test]
+fn escrow_finish_mpt_applies_transfer_fee_and_burns_fee_from_outstanding() {
+    let owner = acct(0x10);
+    let destination = acct(0x11);
+    let issuer = acct(0x20);
+    let issuance_id = mpt_id(issuer, 1);
+    let issue = MPTIssue::new(issuance_id);
+    let amount = STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(100), issue);
+    let expected_net = protocol::divide_round(&amount, protocol::Rate::new(1_100_000_000), true)
+        .mpt()
+        .value() as u64;
+    let mut ledger = build_ledger(
+        104111034,
+        vec![
+            account_entry(owner, 100_000_000, 1),
+            account_entry(destination, 100_000_000, 0),
+            account_entry(issuer, 100_000_000, 0),
+            mpt_issuance_entry_with_fee(issuer, 1, 1_000, 100, Some(10_000)),
+            mptoken_entry(owner, issuer, 1, 900, 100),
+            mptoken_entry(destination, issuer, 1, 0, 0),
+            escrow_entry_with_transfer_rate(owner, 1, destination, amount, 0, Some(1_100_000_000)),
+        ],
+    );
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id(
+        "fixTokenEscrowV1",
+    )]));
+
+    let tx = STTx::new(TxType::ESCROW_FINISH, |tx| {
+        tx.set_account_id(sf("sfAccount"), destination);
+        tx.set_account_id(sf("sfOwner"), owner);
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_vl(sf("sfSigningPubKey"), &[0u8; 33]);
+    });
+
+    assert_eq!(run_and_apply(&mut ledger, tx), Ter::TES_SUCCESS);
+
+    let destination_token = ledger
+        .peek(protocol::mptoken_keylet_from_mptid(
+            issuance_id,
+            raw_id(destination),
+        ))
+        .expect("destination token read")
+        .expect("destination token exists");
+    assert_eq!(
+        destination_token.get_field_u64(sf("sfMPTAmount")),
+        expected_net
+    );
+
+    let owner_token = ledger
+        .peek(protocol::mptoken_keylet_from_mptid(
+            issuance_id,
+            raw_id(owner),
+        ))
+        .expect("owner token read")
+        .expect("owner token exists");
+    assert!(!owner_token.is_field_present(sf("sfLockedAmount")));
+
+    let issuance = ledger
+        .peek(protocol::mpt_issuance_keylet_from_mptid(issuance_id))
+        .expect("issuance read")
+        .expect("issuance exists");
+    assert!(!issuance.is_field_present(sf("sfLockedAmount")));
+    assert_eq!(
+        issuance.get_field_u64(sf("sfOutstandingAmount")),
+        1_000 - (100 - expected_net)
+    );
+}
+
+#[test]
+fn escrow_finish_mpt_to_issuer_burns_gross_locked_amount() {
+    let owner = acct(0x10);
+    let issuer = acct(0x20);
+    let issuance_id = mpt_id(issuer, 1);
+    let issue = MPTIssue::new(issuance_id);
+    let amount = STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(100), issue);
+    let mut ledger = build_ledger(
+        104111034,
+        vec![
+            account_entry(owner, 100_000_000, 1),
+            account_entry(issuer, 100_000_000, 0),
+            mpt_issuance_entry_with_fee(issuer, 1, 1_000, 100, Some(10_000)),
+            mptoken_entry(owner, issuer, 1, 900, 100),
+            escrow_entry_with_transfer_rate(owner, 1, issuer, amount, 0, Some(1_100_000_000)),
+        ],
+    );
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id(
+        "fixTokenEscrowV1",
+    )]));
+
+    let tx = STTx::new(TxType::ESCROW_FINISH, |tx| {
+        tx.set_account_id(sf("sfAccount"), issuer);
+        tx.set_account_id(sf("sfOwner"), owner);
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_vl(sf("sfSigningPubKey"), &[0u8; 33]);
+    });
+
+    assert_eq!(run_and_apply(&mut ledger, tx), Ter::TES_SUCCESS);
+
+    let owner_token = ledger
+        .peek(protocol::mptoken_keylet_from_mptid(
+            issuance_id,
+            raw_id(owner),
+        ))
+        .expect("owner token read")
+        .expect("owner token exists");
+    assert_eq!(owner_token.get_field_u64(sf("sfMPTAmount")), 900);
+    assert!(!owner_token.is_field_present(sf("sfLockedAmount")));
+
+    let issuance = ledger
+        .peek(protocol::mpt_issuance_keylet_from_mptid(issuance_id))
+        .expect("issuance read")
+        .expect("issuance exists");
+    assert!(!issuance.is_field_present(sf("sfLockedAmount")));
+    assert_eq!(issuance.get_field_u64(sf("sfOutstandingAmount")), 900);
+    assert!(
+        ledger
+            .peek(protocol::mptoken_keylet_from_mptid(
+                issuance_id,
+                raw_id(issuer),
+            ))
+            .expect("issuer token read")
+            .is_none()
+    );
+}
+
+#[test]
+fn fix_cleanup_3_2_0_rejects_recursive_invalid_mpt_amount_in_tx_array() {
+    let account = acct(0x10);
+    let issuer = acct(0x20);
+    let issuance_id = mpt_id(issuer, 1);
+    let issue = MPTIssue::new(issuance_id);
+    let mut ledger = build_ledger(104111034, vec![account_entry(account, 100_000_000, 0)]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id(
+        "fixCleanup3_2_0",
+    )]));
+
+    let tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_account_id(sf("sfDestination"), acct(0x11));
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_vl(sf("sfSigningPubKey"), &[0u8; 33]);
+        tx.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
+        );
+
+        let mut memo = STObject::make_inner_object(sf("sfMemo"));
+        memo.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(-1), issue),
+        );
+        let mut memos = STArray::new(sf("sfMemos"));
+        memos.push_back(memo);
+        tx.set_field_array(sf("sfMemos"), memos);
+    });
+
+    assert_eq!(run(&ledger, tx), Ter::TEM_BAD_AMOUNT);
+}
+
+#[test]
+fn check_cash_rejects_legacy_check_with_invalid_mpt_send_max_after_fix_cleanup_3_2_0() {
+    let source = acct(0x14);
+    let destination = acct(0x15);
+    let issuer = acct(0x22);
+    let issuance_id = mpt_id(issuer, 1);
+    let issue = MPTIssue::new(issuance_id);
+    let invalid_send_max =
+        STAmount::from_mpt_amount(sf("sfSendMax"), MPTAmount::from_value(-1), issue);
+    let valid_amount = STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(1), issue);
+    let check_key = protocol::check_keylet(raw_id(source), 1).key;
+    let mut ledger = build_ledger(
+        104111034,
+        vec![
+            account_entry(source, 100_000_000, 1),
+            account_entry(destination, 100_000_000, 0),
+            account_entry(issuer, 100_000_000, 0),
+            mpt_issuance_entry(issuer, 1, 10, 0),
+            mptoken_entry(source, issuer, 1, 10, 0),
+            mptoken_entry(destination, issuer, 1, 0, 0),
+            check_entry(source, destination, 1, invalid_send_max),
+        ],
+    );
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id(
+        "fixCleanup3_2_0",
+    )]));
+
+    let tx = STTx::new(TxType::CHECK_CASH, |tx| {
+        tx.set_account_id(sf("sfAccount"), destination);
+        tx.set_field_h256(sf("sfCheckID"), check_key);
+        tx.set_field_amount(sf("sfAmount"), valid_amount);
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_vl(sf("sfSigningPubKey"), &[0u8; 33]);
+    });
+
+    assert_eq!(run(&ledger, tx), Ter::TEF_BAD_LEDGER);
+}
+
+#[test]
+fn escrow_finish_mpt_create_holding_uses_pre_fee_reserve_balance() {
+    let owner = acct(0x10);
+    let destination = acct(0x11);
+    let issuer = acct(0x20);
+    let issuance_id = mpt_id(issuer, 1);
+    let issue = MPTIssue::new(issuance_id);
+    let amount = STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(10), issue);
+    let mut ledger = build_ledger(
+        104111034,
+        vec![
+            account_entry(owner, 100_000_000, 1),
+            account_entry(destination, 1_200_000, 0),
+            account_entry(issuer, 100_000_000, 0),
+            mpt_issuance_entry(issuer, 1, 100, 10),
+            mptoken_entry(owner, issuer, 1, 90, 10),
+            escrow_entry(owner, 1, destination, amount, 0),
+        ],
+    );
+
+    let tx = STTx::new(TxType::ESCROW_FINISH, |tx| {
+        tx.set_account_id(sf("sfAccount"), destination);
+        tx.set_account_id(sf("sfOwner"), owner);
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_vl(sf("sfSigningPubKey"), &[0u8; 33]);
+    });
+
+    assert_eq!(run_and_apply(&mut ledger, tx), Ter::TES_SUCCESS);
+
+    let destination_root = ledger
+        .peek(protocol::account_keylet(raw_id(destination)))
+        .expect("destination account read")
+        .expect("destination account exists");
+    assert_eq!(destination_root.get_field_u32(sf("sfOwnerCount")), 1);
+
+    let destination_token = ledger
+        .peek(protocol::mptoken_keylet_from_mptid(
+            issuance_id,
+            raw_id(destination),
+        ))
+        .expect("destination token read")
+        .expect("destination token exists");
+    assert_eq!(destination_token.get_field_u64(sf("sfMPTAmount")), 10);
 }
 
 // ── Bug B: tecUNFUNDED_OFFER ─────────────────────────────────────────────────
@@ -698,11 +1405,7 @@ fn xrp_to_iou_payment_delivers_partial_not_path_dry() {
     // Build offer: TakerPays=16366110 XRP, TakerGets=163.66 GiB
     let offer_seq = 1u32;
     let offer_kl = offer_keylet(Uint160::from_slice(offer_owner.data()).unwrap(), offer_seq);
-    let book = Book {
-        r#in: protocol::xrp_issue(),
-        out: issue,
-        domain: None,
-    };
+    let book = Book::new(protocol::xrp_issue(), issue, None);
     let book_base = protocol::book_keylet(book);
     let rate = {
         // quality = TakerPays / TakerGets encoded as u64
@@ -846,11 +1549,7 @@ fn ledger_with_offer(
     } else {
         offer_taker_gets.clone().issue()
     };
-    let book = Book {
-        r#in: in_issue,
-        out: out_issue,
-        domain: None,
-    };
+    let book = Book::new(in_issue, out_issue, None);
     let book_base = protocol::book_keylet(book);
 
     // Encode quality as u64 (exponent << 56 | mantissa)
@@ -1040,11 +1739,7 @@ fn iou_to_xrp_limit_step_in_delivers_partial() {
     let offer_kl = offer_keylet(Uint160::from_slice(issuer.data()).unwrap(), offer_seq);
     let in_issue = issue; // IOU
     let out_issue = protocol::xrp_issue(); // XRP
-    let book = Book {
-        r#in: in_issue,
-        out: out_issue,
-        domain: None,
-    };
+    let book = Book::new(in_issue, out_issue, None);
     let book_base = protocol::book_keylet(book);
     let quality = {
         let tp_val = 1_252_559_499_500_057f64 * 10f64.powi(-14);
@@ -1201,11 +1896,7 @@ fn offer_create_partial_crossing_xrp_iou_limit_step_in() {
     );
     let in_issue = protocol::xrp_issue();
     let out_issue = issue;
-    let book = Book {
-        r#in: in_issue,
-        out: out_issue,
-        domain: None,
-    };
+    let book = Book::new(in_issue, out_issue, None);
     let book_base = protocol::book_keylet(book);
     let quality = {
         let tp_val = 2_649_775_829f64;
@@ -1379,11 +2070,7 @@ fn offer_create_no_crossing_when_book_quality_worse_than_taker() {
     );
     let in_issue = usd_issue;
     let out_issue = dsh_issue;
-    let book = Book {
-        r#in: in_issue,
-        out: out_issue,
-        domain: None,
-    };
+    let book = Book::new(in_issue, out_issue, None);
     let book_base = protocol::book_keylet(book);
     let quality = {
         let tp_val = 1_903_940_848_168_491f64 * 10f64.powi(-12);

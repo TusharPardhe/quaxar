@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use basics::{
     base_uint::{Uint160, Uint192, Uint256},
-    number::NumberParts as RuntimeNumber,
+    number::{MantissaScale, NumberParts as RuntimeNumber, RoundingMode, get_mantissa_scale},
 };
 use ledger::{
     ApplyView, account_root_helpers::create_pseudo_account, adjust_owner_count,
@@ -10,9 +10,9 @@ use ledger::{
 };
 use protocol::{
     AccountID, Asset, LedgerEntryType, MPTIssue, STAmount, STLedgerEntry, STNumber, STTx, Ter,
-    XRPAmount, account_keylet, associate_asset, feature_id, get_field_by_symbol,
-    mpt_issuance_keylet, mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid,
-    owner_dir_keylet, to_amount_from_number,
+    VAULT_DEFAULT_IOU_SCALE, XRPAmount, account_keylet, associate_asset, feature_id,
+    get_field_by_symbol, mpt_issuance_keylet, mpt_issuance_keylet_from_mptid,
+    mptoken_keylet_from_mptid, owner_dir_keylet, to_amount_from_number,
 };
 use tx::{
     MPT_CAN_ESCROW_FLAG, MPT_CAN_TRADE_FLAG, MPT_CAN_TRANSFER_FLAG, MPT_REQUIRE_AUTH_FLAG,
@@ -48,6 +48,115 @@ fn zero_amount(asset: Asset) -> STAmount {
 
 fn runtime_to_amount(asset: Asset, value: RuntimeNumber) -> Option<STAmount> {
     to_amount_from_number(asset, value, basics::number::RoundingMode::TowardsZero).ok()
+}
+
+fn round_runtime_to_scale(
+    value: RuntimeNumber,
+    target_scale: i32,
+    rounding: RoundingMode,
+) -> RuntimeNumber {
+    let Ok((mantissa, mut exponent)) = value.external_parts() else {
+        return value;
+    };
+    if mantissa == 0 || exponent >= target_scale {
+        return value;
+    }
+
+    let negative = mantissa < 0;
+    let mut abs = mantissa.unsigned_abs() as u128;
+    let mut removed = Vec::new();
+    while exponent < target_scale {
+        removed.push((abs % 10) as u8);
+        abs /= 10;
+        exponent += 1;
+    }
+
+    let first = removed.first().copied().unwrap_or(0);
+    let has_more = removed.iter().skip(1).any(|digit| *digit != 0);
+    let round_up = match rounding {
+        RoundingMode::TowardsZero => false,
+        RoundingMode::Downward => negative && (first != 0 || has_more),
+        RoundingMode::Upward => !negative && (first != 0 || has_more),
+        RoundingMode::ToNearest => {
+            first > 5 || (first == 5 && (has_more || ((abs as u64) & 1) == 1))
+        }
+    };
+    if round_up {
+        abs += 1;
+    }
+
+    let signed = if negative { -(abs as i64) } else { abs as i64 };
+    RuntimeNumber::try_from_external_parts(signed, exponent, get_mantissa_scale()).unwrap_or(value)
+}
+
+fn round_number_to_asset(asset: Asset, value: RuntimeNumber) -> RuntimeNumber {
+    let mut number = STNumber::from(value);
+    number.associate_asset(asset);
+    number.value()
+}
+
+fn round_number_to_asset_with_scale(
+    asset: Asset,
+    value: RuntimeNumber,
+    scale: i32,
+    rounding: RoundingMode,
+) -> RuntimeNumber {
+    let rounded_to_asset = round_number_to_asset(asset, value);
+    if asset.integral() {
+        return rounded_to_asset;
+    }
+    round_runtime_to_scale(rounded_to_asset, scale, rounding)
+}
+
+fn amount_is_zero_at_scale(asset: Asset, amount: &STAmount, scale: i32) -> bool {
+    amount.signum() == 0
+        || round_number_to_asset_with_scale(
+            asset,
+            amount_number(amount),
+            scale,
+            RoundingMode::ToNearest,
+        ) == RuntimeNumber::zero()
+}
+
+fn vault_deposit_amount_at_scale(
+    vault: &LoadedVault,
+    amount: &STAmount,
+    fix_cleanup_3_2_0: bool,
+) -> Option<STAmount> {
+    if !fix_cleanup_3_2_0 || amount.integral() {
+        return Some(amount.clone());
+    }
+
+    let posterior_total =
+        round_number_to_asset(vault.asset, vault.assets_total + amount_number(amount));
+    let scale = vault
+        .asset
+        .amount(posterior_total)
+        .map(|amount| amount.exponent())
+        .unwrap_or(0);
+    let rounded = round_number_to_asset_with_scale(
+        vault.asset,
+        amount_number(amount),
+        scale,
+        RoundingMode::Downward,
+    );
+    runtime_to_amount(vault.asset, rounded)
+}
+
+fn number_to_mpt_units_truncated(value: RuntimeNumber) -> Option<u64> {
+    value
+        .truncate(MantissaScale::Large)
+        .try_to_i64()
+        .ok()
+        .and_then(|value| u64::try_from(value).ok())
+}
+
+fn vault_scale(vault: &LoadedVault) -> i32 {
+    if vault.entry.is_field_present(sf("sfScale")) {
+        vault.entry.get_field_u8(sf("sfScale")) as i32
+    } else {
+        0
+    }
 }
 
 fn mpt_id_for(account: &AccountID, sequence: u32) -> Uint192 {
@@ -120,6 +229,7 @@ fn load_issuance<V: ApplyView>(view: &mut V, mpt_id: Uint192) -> Option<LoadedIs
         key: *sle.key(),
         entry: (*sle).clone(),
         issuer: sle.get_account_id(sf("sfIssuer")),
+        sequence: sle.get_field_u32(sf("sfSequence")),
         owner_node: sle.get_field_u64(sf("sfOwnerNode")),
         outstanding_amount: sle.get_field_u64(sf("sfOutstandingAmount")),
     })
@@ -234,6 +344,69 @@ fn account_send<V: ApplyView>(
     }
 }
 
+fn account_holds_vault_asset<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    asset: Asset,
+) -> STAmount {
+    let Asset::Issue(issue) = asset else {
+        return zero_amount(asset);
+    };
+    if issue.native() {
+        return read_balance_drops(view, account)
+            .map(STAmount::from_xrp_amount)
+            .unwrap_or_else(|| zero_amount(asset));
+    }
+    if issue.issuer() == *account {
+        return asset
+            .amount(RuntimeNumber::max(get_mantissa_scale()))
+            .unwrap_or_else(|_| zero_amount(asset));
+    }
+    let mut amount = view
+        .peek(protocol::line(*account, issue.issuer(), issue.currency))
+        .ok()
+        .flatten()
+        .map(|line| line.get_field_amount(sf("sfBalance")))
+        .unwrap_or_else(|| zero_amount(asset));
+    if *account > issue.issuer() {
+        amount.negate();
+    }
+    amount.set_issuer(issue.issuer());
+    amount
+}
+
+fn account_holds_vault_asset_full_balance<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    asset: Asset,
+) -> STAmount {
+    let balance = account_holds_vault_asset(view, account, asset);
+    let Asset::Issue(issue) = asset else {
+        return balance;
+    };
+    if issue.native() || issue.issuer() == *account {
+        return balance;
+    }
+
+    let Some(line) = view
+        .peek(protocol::line(*account, issue.issuer(), issue.currency))
+        .ok()
+        .flatten()
+    else {
+        return balance;
+    };
+    let opposite_limit = if *account > issue.issuer() {
+        line.get_field_amount(sf("sfLowLimit"))
+    } else {
+        line.get_field_amount(sf("sfHighLimit"))
+    };
+    runtime_to_amount(
+        asset,
+        amount_number(&balance) + amount_number(&opposite_limit),
+    )
+    .unwrap_or(balance)
+}
+
 fn assets_to_shares_deposit(
     vault: &LoadedVault,
     issuance: &LoadedIssuance,
@@ -244,11 +417,16 @@ fn assets_to_shares_deposit(
     }
     let assets = amount_number(amount);
     let shares = if vault.assets_total == RuntimeNumber::zero() {
-        assets
+        RuntimeNumber::try_from_external_parts(
+            amount.mantissa() as i64,
+            amount.exponent() + vault_scale(vault),
+            get_mantissa_scale(),
+        )
+        .ok()?
     } else {
         RuntimeNumber::from_i64(issuance.outstanding_amount as i64) * assets / vault.assets_total
     };
-    shares.try_to_i64().ok().map(|value| value.unsigned_abs())
+    number_to_mpt_units_truncated(shares)
 }
 
 fn shares_to_assets(
@@ -256,16 +434,26 @@ fn shares_to_assets(
     issuance: &LoadedIssuance,
     shares: u64,
     withdraw: bool,
+    waive_unrealized_loss: bool,
 ) -> Option<STAmount> {
     let share_total = RuntimeNumber::from_i64(issuance.outstanding_amount as i64);
     let share_number = RuntimeNumber::from_i64(shares as i64);
     let asset_total = if withdraw {
-        vault.assets_total - vault.loss_unrealized
+        if waive_unrealized_loss {
+            vault.assets_total
+        } else {
+            vault.assets_total - vault.loss_unrealized
+        }
     } else {
         vault.assets_total
     };
     let amount = if asset_total == RuntimeNumber::zero() {
-        share_number
+        RuntimeNumber::try_from_external_parts(
+            shares as i64,
+            -vault_scale(vault),
+            get_mantissa_scale(),
+        )
+        .ok()?
     } else {
         asset_total * share_number / share_total
     };
@@ -276,11 +464,16 @@ fn assets_to_shares_withdraw(
     vault: &LoadedVault,
     issuance: &LoadedIssuance,
     amount: &STAmount,
+    waive_unrealized_loss: bool,
 ) -> Option<u64> {
     if amount.negative() || amount.asset() != vault.asset {
         return None;
     }
-    let asset_total = vault.assets_total - vault.loss_unrealized;
+    let asset_total = if waive_unrealized_loss {
+        vault.assets_total
+    } else {
+        vault.assets_total - vault.loss_unrealized
+    };
     if asset_total == RuntimeNumber::zero() {
         return Some(0);
     }
@@ -288,6 +481,31 @@ fn assets_to_shares_withdraw(
         * amount_number(amount)
         / asset_total;
     shares.try_to_i64().ok().map(|value| value.unsigned_abs())
+}
+
+fn is_sole_shareholder<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    issuance: &LoadedIssuance,
+) -> bool {
+    if issuance.outstanding_amount == 0 {
+        return false;
+    }
+    token_balance(
+        view,
+        mpt_id_for(&issuance.issuer, issuance.sequence),
+        account,
+    )
+    .is_some_and(|balance| balance == issuance.outstanding_amount)
+}
+
+fn should_waive_withdrawal<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    issuance: &LoadedIssuance,
+) -> bool {
+    view.rules().enabled(&feature_id("fixCleanup3_2_0"))
+        && is_sole_shareholder(view, account, issuance)
 }
 
 #[derive(Clone)]
@@ -308,6 +526,7 @@ struct LoadedIssuance {
     key: Uint256,
     entry: STLedgerEntry,
     issuer: AccountID,
+    sequence: u32,
     owner_node: u64,
     outstanding_amount: u64,
 }
@@ -322,7 +541,7 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     let asset = sttx.get_field_amount(sf("sfAsset")).asset();
     let keylet = protocol::vault_keylet(to_160(&owner), sequence);
 
-    let pseudo = match create_pseudo_account(view, keylet.key, sf("sfRegularKey")) {
+    let pseudo = match create_pseudo_account(view, keylet.key, sf("sfVaultID")) {
         Ok(sle) => sle.get_account_id(sf("sfAccount")),
         Err(err) => return err,
     };
@@ -365,6 +584,23 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     if sttx.is_field_present(sf("sfDomainID")) {
         issuance.set_field_h256(sf("sfDomainID"), sttx.get_field_h256(sf("sfDomainID")));
     }
+    if view.rules().enabled(&feature_id("fixCleanup3_2_0")) && !asset.native() {
+        let reference_holding = match asset {
+            Asset::MPTIssue(issue) => {
+                mptoken_keylet_from_mptid(issue.mpt_id(), to_160(&pseudo)).key
+            }
+            Asset::Issue(issue) => protocol::line(pseudo, issue.account, issue.currency).key,
+        };
+        issuance.set_field_h256(sf("sfReferenceHolding"), reference_holding);
+    }
+    let share_asset_scale = if asset.integral() {
+        0
+    } else if sttx.is_field_present(sf("sfScale")) {
+        sttx.get_field_u8(sf("sfScale"))
+    } else {
+        VAULT_DEFAULT_IOU_SCALE
+    };
+    issuance.set_field_u8(sf("sfAssetScale"), share_asset_scale);
     let _ = view.insert(Arc::new(issuance));
     if let Ok(Some(pseudo_root)) = view.peek(account_keylet(to_160(&pseudo))) {
         let _ = adjust_owner_count(view, &pseudo_root, 1);
@@ -427,8 +663,8 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
             0
         },
     );
-    if sttx.is_field_present(sf("sfScale")) {
-        vault.set_field_u8(sf("sfScale"), sttx.get_field_u8(sf("sfScale")));
+    if share_asset_scale != 0 {
+        vault.set_field_u8(sf("sfScale"), share_asset_scale);
     }
     associate_asset(&mut vault, asset);
     let _ = view.insert(Arc::new(vault));
@@ -558,20 +794,52 @@ pub fn apply_vault_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
 
     let vault_id = sttx.get_field_h256(sf("sfVaultID"));
     let account = sttx.get_account_id(sf("sfAccount"));
-    let amount = sttx.get_field_amount(sf("sfAmount"));
+    let tx_amount = sttx.get_field_amount(sf("sfAmount"));
     let Some(mut vault) = load_vault(view, vault_id) else {
         return Ter::TEF_BAD_LEDGER;
     };
     let Some(issuance) = load_issuance(view, vault.share_id) else {
         return Ter::TEF_BAD_LEDGER;
     };
+    let Some(amount) = vault_deposit_amount_at_scale(
+        &vault,
+        &tx_amount,
+        view.rules().enabled(&feature_id("fixCleanup3_2_0")),
+    ) else {
+        return Ter::TEC_INTERNAL;
+    };
+    if amount.signum() == 0 {
+        return Ter::TEC_PRECISION_LOSS;
+    }
 
     let Some(shares_created) = assets_to_shares_deposit(&vault, &issuance, &amount) else {
         return Ter::TEC_INTERNAL;
     };
-    let Some(assets_deposited) = shares_to_assets(&vault, &issuance, shares_created, false) else {
+    if shares_created == 0 {
+        return Ter::TEC_PRECISION_LOSS;
+    }
+
+    if view.rules().enabled(&feature_id("fixCleanup3_2_0"))
+        && !amount.integral()
+        && account != amount.issue().issuer()
+    {
+        let balance = account_holds_vault_asset_full_balance(view, &account, vault.asset);
+        if balance < amount {
+            return Ter::TEC_INSUFFICIENT_FUNDS;
+        }
+        let trustline_balance = account_holds_vault_asset(view, &account, vault.asset);
+        if amount_is_zero_at_scale(vault.asset, &tx_amount, trustline_balance.exponent()) {
+            return Ter::TEC_PRECISION_LOSS;
+        }
+    }
+
+    let Some(assets_deposited) = shares_to_assets(&vault, &issuance, shares_created, false, false)
+    else {
         return Ter::TEC_INTERNAL;
     };
+    if assets_deposited.signum() <= 0 || amount_number(&assets_deposited) > amount_number(&amount) {
+        return Ter::TEC_INTERNAL;
+    }
 
     let ter = ensure_holding(view, &account, share_asset(vault.share_id));
     if ter != Ter::TES_SUCCESS && ter != Ter::TEC_DUPLICATE {
@@ -631,18 +899,26 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     let Some(issuance) = load_issuance(view, vault.share_id) else {
         return Ter::TEF_BAD_LEDGER;
     };
+    let waive_unrealized_loss = should_waive_withdrawal(view, &account, &issuance);
 
     let (shares_redeemed, assets_withdrawn) = if amount.asset() == vault.asset {
-        let Some(shares) = assets_to_shares_withdraw(&vault, &issuance, &amount) else {
+        let Some(shares) =
+            assets_to_shares_withdraw(&vault, &issuance, &amount, waive_unrealized_loss)
+        else {
             return Ter::TEC_INTERNAL;
         };
-        let Some(assets) = shares_to_assets(&vault, &issuance, shares, true) else {
+        if shares == 0 {
+            return Ter::TEC_PRECISION_LOSS;
+        }
+        let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, waive_unrealized_loss)
+        else {
             return Ter::TEC_INTERNAL;
         };
         (shares, assets)
     } else if amount.asset() == share_asset(vault.share_id) {
         let shares = amount.mpt().value().unsigned_abs();
-        let Some(assets) = shares_to_assets(&vault, &issuance, shares, true) else {
+        let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, waive_unrealized_loss)
+        else {
             return Ter::TEC_INTERNAL;
         };
         (shares, assets)
@@ -653,8 +929,18 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     if token_balance(view, vault.share_id, &account).unwrap_or_default() < shares_redeemed {
         return Ter::TEC_INSUFFICIENT_FUNDS;
     }
+    let final_withdrawal = view.rules().enabled(&feature_id("fixCleanup3_2_0"))
+        && shares_redeemed == issuance.outstanding_amount;
+    let mut assets_withdrawn = assets_withdrawn;
     if vault.assets_available < amount_number(&assets_withdrawn) {
         return Ter::TEC_INSUFFICIENT_FUNDS;
+    }
+    if final_withdrawal {
+        if vault.loss_unrealized != RuntimeNumber::zero() {
+            return Ter::TEF_INTERNAL;
+        }
+        assets_withdrawn = runtime_to_amount(vault.asset, vault.assets_available)
+            .unwrap_or_else(|| zero_amount(vault.asset));
     }
 
     let ter = transfer_mpt(
@@ -683,8 +969,13 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     }
 
     let withdrawn_number = amount_number(&assets_withdrawn);
-    vault.assets_total -= withdrawn_number;
-    vault.assets_available -= withdrawn_number;
+    if final_withdrawal {
+        vault.assets_total = RuntimeNumber::zero();
+        vault.assets_available = RuntimeNumber::zero();
+    } else {
+        vault.assets_total -= withdrawn_number;
+        vault.assets_available -= withdrawn_number;
+    }
     persist_vault(view, &mut vault)
 }
 
@@ -706,7 +997,7 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     let (shares_destroyed, assets_recovered) = match sttx.is_field_present(sf("sfAmount")) {
         false if account == vault.owner => {
             let shares = token_balance(view, vault.share_id, &holder).unwrap_or_default();
-            let assets = shares_to_assets(&vault, &issuance, shares, true)
+            let assets = shares_to_assets(&vault, &issuance, shares, true, false)
                 .unwrap_or_else(|| zero_amount(vault.asset));
             (shares, assets)
         }
@@ -720,10 +1011,11 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
                 let shares = token_balance(view, vault.share_id, &holder).unwrap_or_default();
                 (shares, zero_amount(vault.asset))
             } else {
-                let Some(shares) = assets_to_shares_withdraw(&vault, &issuance, &amount) else {
+                let Some(shares) = assets_to_shares_withdraw(&vault, &issuance, &amount, false)
+                else {
                     return Ter::TEC_INTERNAL;
                 };
-                let Some(assets) = shares_to_assets(&vault, &issuance, shares, true) else {
+                let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, false) else {
                     return Ter::TEC_INTERNAL;
                 };
                 (shares, assets)

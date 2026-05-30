@@ -46,6 +46,7 @@ pub const fn is_power_of_ten(value: u64) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MantissaScale {
     Small,
+    LargeLegacy,
     Large,
 }
 
@@ -53,6 +54,7 @@ impl MantissaScale {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Small => "small",
+            Self::LargeLegacy => "largeLegacy",
             Self::Large => "large",
         }
     }
@@ -121,6 +123,7 @@ pub fn current_mantissa_range() -> MantissaRange {
 pub const fn mantissa_range_min(scale: MantissaScale) -> u64 {
     match scale {
         MantissaScale::Small => MANTISSA_SMALL_MIN,
+        MantissaScale::LargeLegacy => MANTISSA_LARGE_MIN,
         MantissaScale::Large => MANTISSA_LARGE_MIN,
     }
 }
@@ -128,6 +131,7 @@ pub const fn mantissa_range_min(scale: MantissaScale) -> u64 {
 pub const fn mantissa_range_max(scale: MantissaScale) -> u64 {
     match scale {
         MantissaScale::Small => MANTISSA_SMALL_MAX,
+        MantissaScale::LargeLegacy => MANTISSA_LARGE_MAX,
         MantissaScale::Large => MANTISSA_LARGE_MAX,
     }
 }
@@ -135,6 +139,7 @@ pub const fn mantissa_range_max(scale: MantissaScale) -> u64 {
 pub const fn mantissa_range_log(scale: MantissaScale) -> i32 {
     match scale {
         MantissaScale::Small => 15,
+        MantissaScale::LargeLegacy => 18,
         MantissaScale::Large => 18,
     }
 }
@@ -142,6 +147,7 @@ pub const fn mantissa_range_log(scale: MantissaScale) -> i32 {
 pub const fn signed_external_mantissa_bounds(scale: MantissaScale) -> (i64, i64) {
     match scale {
         MantissaScale::Small => (-(MANTISSA_SMALL_MAX as i64), MANTISSA_SMALL_MAX as i64),
+        MantissaScale::LargeLegacy => (-NUMBER_MAX_REP, NUMBER_MAX_REP),
         MantissaScale::Large => (-NUMBER_MAX_REP, NUMBER_MAX_REP),
     }
 }
@@ -245,6 +251,7 @@ impl NumberParts {
     pub const fn one(scale: MantissaScale) -> Self {
         match scale {
             MantissaScale::Small => Self::one_small(),
+            MantissaScale::LargeLegacy => Self::one_large(),
             MantissaScale::Large => Self::one_large(),
         }
     }
@@ -576,7 +583,14 @@ impl NumberParts {
                 xm /= 10;
                 xe = xe.checked_add(1).ok_or(NumberArithmeticError::Overflow)?;
             }
-            guard.do_round_up(&mut xn, &mut xm, &mut xe, min_mantissa, max_mantissa)?;
+            guard.do_round_up(
+                &mut xn,
+                &mut xm,
+                &mut xe,
+                min_mantissa,
+                max_mantissa,
+                scale == MantissaScale::Large,
+            )?;
         } else {
             if xm > ym {
                 xm -= ym;
@@ -638,7 +652,14 @@ impl NumberParts {
             ze = ze.checked_add(1).ok_or(NumberArithmeticError::Overflow)?;
         }
 
-        guard.do_round_up(&mut zn, &mut zm, &mut ze, min_mantissa, max_mantissa)?;
+        guard.do_round_up(
+            &mut zn,
+            &mut zm,
+            &mut ze,
+            min_mantissa,
+            max_mantissa,
+            scale == MantissaScale::Large,
+        )?;
         *self = Self::finish_arithmetic_result(zn, zm, ze, scale)?;
         Ok(())
     }
@@ -776,6 +797,7 @@ impl NumberParts {
             &mut exponent,
             min_mantissa,
             max_mantissa,
+            scale == MantissaScale::Large,
         )?;
 
         Self::finish_arithmetic_result(negative, mantissa, exponent, scale)
@@ -892,24 +914,54 @@ impl ArithmeticGuard {
     }
 
     fn do_round_up(
-        &self,
+        &mut self,
         negative: &mut bool,
         mantissa: &mut u128,
         exponent: &mut i32,
         min_mantissa: u64,
         max_mantissa: u64,
+        cusp_rounding_fix_enabled: bool,
     ) -> Result<(), NumberArithmeticError> {
         let rounded = self.round();
         if rounded == 1 || (rounded == 0 && (*mantissa & 1) == 1) {
-            *mantissa = mantissa
-                .checked_add(1)
-                .ok_or(NumberArithmeticError::Overflow)?;
-            if *mantissa > u128::from(max_mantissa) || *mantissa > u128::from(NUMBER_MAX_REP as u64)
-            {
-                *mantissa /= 10;
-                *exponent = exponent
+            let safe_to_increment = |mantissa: u128| {
+                mantissa < u128::from(max_mantissa) && mantissa < u128::from(NUMBER_MAX_REP as u64)
+            };
+
+            if cusp_rounding_fix_enabled {
+                if safe_to_increment(*mantissa) {
+                    *mantissa += 1;
+                } else {
+                    self.push((*mantissa % 10) as u8);
+                    *mantissa /= 10;
+                    *exponent = exponent
+                        .checked_add(1)
+                        .ok_or(NumberArithmeticError::Overflow)?;
+                    if !safe_to_increment(*mantissa) {
+                        return Err(NumberArithmeticError::Overflow);
+                    }
+                    self.do_round_up(
+                        negative,
+                        mantissa,
+                        exponent,
+                        min_mantissa,
+                        max_mantissa,
+                        cusp_rounding_fix_enabled,
+                    )?;
+                    return Ok(());
+                }
+            } else {
+                *mantissa = mantissa
                     .checked_add(1)
                     .ok_or(NumberArithmeticError::Overflow)?;
+                if *mantissa > u128::from(max_mantissa)
+                    || *mantissa > u128::from(NUMBER_MAX_REP as u64)
+                {
+                    *mantissa /= 10;
+                    *exponent = exponent
+                        .checked_add(1)
+                        .ok_or(NumberArithmeticError::Overflow)?;
+                }
             }
         }
         self.bring_into_range(negative, mantissa, exponent, min_mantissa);
@@ -1515,6 +1567,15 @@ mod tests {
                 scale: MantissaScale::Large,
             }
         );
+        assert_eq!(
+            MantissaRange::new(MantissaScale::LargeLegacy),
+            MantissaRange {
+                min: 1_000_000_000_000_000_000,
+                max: 9_999_999_999_999_999_999,
+                log: 18,
+                scale: MantissaScale::LargeLegacy,
+            }
+        );
     }
 
     #[test]
@@ -1531,14 +1592,27 @@ mod tests {
         assert_eq!(mantissa_range_max(MantissaScale::Small), MANTISSA_SMALL_MAX);
         assert_eq!(mantissa_range_min(MantissaScale::Large), MANTISSA_LARGE_MIN);
         assert_eq!(mantissa_range_max(MantissaScale::Large), MANTISSA_LARGE_MAX);
+        assert_eq!(
+            mantissa_range_min(MantissaScale::LargeLegacy),
+            MANTISSA_LARGE_MIN
+        );
+        assert_eq!(
+            mantissa_range_max(MantissaScale::LargeLegacy),
+            MANTISSA_LARGE_MAX
+        );
         assert_eq!(mantissa_range_log(MantissaScale::Small), 15);
         assert_eq!(mantissa_range_log(MantissaScale::Large), 18);
+        assert_eq!(mantissa_range_log(MantissaScale::LargeLegacy), 18);
         assert_eq!(
             signed_external_mantissa_bounds(MantissaScale::Small),
             (-(MANTISSA_SMALL_MAX as i64), MANTISSA_SMALL_MAX as i64)
         );
         assert_eq!(
             signed_external_mantissa_bounds(MantissaScale::Large),
+            (-i64::MAX, i64::MAX)
+        );
+        assert_eq!(
+            signed_external_mantissa_bounds(MantissaScale::LargeLegacy),
             (-i64::MAX, i64::MAX)
         );
     }
@@ -1948,8 +2022,13 @@ mod tests {
     fn scale_display_strings() {
         assert_eq!(MantissaScale::Small.to_string(), "small");
         assert_eq!(MantissaScale::Large.to_string(), "large");
+        assert_eq!(MantissaScale::LargeLegacy.to_string(), "largeLegacy");
         assert_eq!(mantissa_scale_to_string(MantissaScale::Small), "small");
         assert_eq!(mantissa_scale_to_string(MantissaScale::Large), "large");
+        assert_eq!(
+            mantissa_scale_to_string(MantissaScale::LargeLegacy),
+            "largeLegacy"
+        );
     }
 
     #[test]

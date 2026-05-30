@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Sub, SubAssign};
 
 use crate::{
-    Asset, IOUAmount, Issue, JsonOptions, JsonValue, MPTAmount, MPTIssue, SField, SerialIter,
-    SerializedTypeId, Serializer, StBase, StBaseCore, ValidationError, XRPAmount, div_round,
-    divide, is_xrp_currency, issued_exponent_from_nonzero_header_bits,
+    Asset, IOUAmount, Issue, JsonOptions, JsonValue, MPTAmount, MPTIssue, SField, STArray,
+    STObject, SerialIter, SerializedTypeId, Serializer, StBase, StBaseCore, ValidationError,
+    XRPAmount, div_round, divide, is_xrp_currency, issued_exponent_from_nonzero_header_bits,
     issued_header_bits_from_word, issued_header_is_negative, issued_mantissa_from_word,
     issued_zero_header_bits, issued_zero_header_word, mpt_wire_header_byte, mul_round, multiply,
     native_wire_word, sf_generic, xrp_issue,
@@ -475,6 +475,13 @@ impl STAmount {
         true
     }
 
+    pub fn is_legal_mpt(&self) -> bool {
+        !self.holds_mpt_issue()
+            || (!self.negative()
+                && self.exponent() == 0
+                && self.mantissa() <= crate::MAX_MP_TOKEN_AMOUNT as u64)
+    }
+
     pub fn round(&self, digits: usize) -> Self {
         if self.native() || self.holds_mpt_issue() || self.value == 0 {
             return self.clone();
@@ -509,6 +516,43 @@ impl STAmount {
         result.canonicalize();
         result
     }
+}
+
+pub fn is_legal_net(value: &STAmount) -> bool {
+    value.is_legal_net()
+}
+
+pub fn is_legal_mpt(value: &STAmount) -> bool {
+    value.is_legal_mpt()
+}
+
+pub fn has_invalid_amount(field: &dyn StBase) -> bool {
+    has_invalid_amount_with_depth(field, 0)
+}
+
+fn has_invalid_amount_with_depth(field: &dyn StBase, depth: i32) -> bool {
+    if depth > 10 {
+        return true;
+    }
+
+    if let Some(amount) = field.as_any().downcast_ref::<STAmount>() {
+        return !amount.is_legal_mpt() || !amount.is_legal_net();
+    }
+
+    if let Some(object) = field.as_any().downcast_ref::<STObject>() {
+        return object
+            .iter()
+            .any(|field| has_invalid_amount_with_depth(field, depth + 1));
+    }
+
+    if let Some(array) = field.as_any().downcast_ref::<STArray>() {
+        return array.iter().any(|object| {
+            let field: &dyn StBase = object;
+            has_invalid_amount_with_depth(field, depth + 1)
+        });
+    }
+
+    false
 }
 
 impl Default for STAmount {
@@ -825,9 +869,11 @@ impl StBase for STAmount {
 
 #[cfg(test)]
 mod tests {
-    use super::{ST_AMOUNT_MAX_NATIVE_NETWORK, STAmount, ValidationError};
+    use super::{ST_AMOUNT_MAX_NATIVE_NETWORK, STAmount, ValidationError, has_invalid_amount};
     use crate::sf_generic;
     use crate::stbase::StBase;
+    use crate::{AccountID, MPTAmount, MPTIssue, STArray, STObject, get_field_by_symbol};
+    use basics::base_uint::Uint192;
 
     #[test]
     fn native_zero_constructor_clears_negative_zero() {
@@ -900,5 +946,47 @@ mod tests {
         let amount = STAmount::new_with_asset(sf_generic(), issue, 1234567890123456, -15, false);
         let rounded = amount.round(2); // Should round to 1.2
         assert_eq!(rounded.mantissa(), 1300000000000000);
+    }
+
+    #[test]
+    fn recursive_invalid_amount_detects_negative_mpt_inside_array() {
+        let issuer = AccountID::from_array([0x22; 20]);
+        let mut mpt_bytes = [0_u8; 24];
+        mpt_bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
+        mpt_bytes[4..].copy_from_slice(issuer.data());
+        let mpt_id = Uint192::from_slice(&mpt_bytes).expect("mpt id");
+        let issue = MPTIssue::new(mpt_id);
+
+        let mut inner = STObject::make_inner_object(get_field_by_symbol("sfMemo"));
+        inner.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::from_mpt_amount(
+                get_field_by_symbol("sfAmount"),
+                MPTAmount::from_value(-1),
+                issue,
+            ),
+        );
+        let mut array = STArray::new(get_field_by_symbol("sfMemos"));
+        array.push_back(inner);
+        let mut outer = STObject::new(get_field_by_symbol("sfTransaction"));
+        outer.set_field_array(get_field_by_symbol("sfMemos"), array);
+
+        assert!(has_invalid_amount(&outer));
+    }
+
+    #[test]
+    fn recursive_invalid_amount_accepts_positive_mpt() {
+        let issuer = AccountID::from_array([0x33; 20]);
+        let mut mpt_bytes = [0_u8; 24];
+        mpt_bytes[..4].copy_from_slice(&1_u32.to_be_bytes());
+        mpt_bytes[4..].copy_from_slice(issuer.data());
+        let issue = MPTIssue::new(Uint192::from_slice(&mpt_bytes).expect("mpt id"));
+        let amount = STAmount::from_mpt_amount(
+            get_field_by_symbol("sfAmount"),
+            MPTAmount::from_value(1),
+            issue,
+        );
+
+        assert!(!has_invalid_amount(&amount));
     }
 }

@@ -164,6 +164,123 @@ fn account_objects_stepped_pagination_with_limit() {
 }
 
 #[test]
+fn account_objects_marker_transitions_from_last_nft_page_to_owner_directory() {
+    let account = sample_account(0x3A);
+    let issuer = sample_account(0x3B);
+    let token = make_nft_id(0, 0, issuer, 1, 1);
+    let check_key = sample_hash(0x8A);
+    let nft_start = nft_page_keylet(
+        nft_page_min_keylet(Uint160::from_slice(account.data()).expect("account width")),
+        Uint256::zero(),
+    )
+    .key;
+    let nft_page_key = nft_start.next();
+
+    let mut source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    source
+        .entries
+        .insert(account_root_key(account), make_account_root(account));
+    source.entries.insert(
+        Keylet::new(LedgerEntryType::NFTokenPage, nft_page_key),
+        make_nft_page(nft_page_key, &[token], None),
+    );
+    source.entries.insert(
+        owner_root_key(account),
+        make_owner_dir_page(account, &[check_key], None),
+    );
+    source
+        .entries
+        .insert(child_keylet(check_key), make_check_entry(check_key));
+
+    let response = do_account_objects(
+        &AccountObjectsRequest {
+            params: &object([
+                ("account", JsonValue::String(to_base58(account))),
+                ("limit", JsonValue::Unsigned(1)),
+            ]),
+            api_version: 1,
+            role: Role::Admin,
+        },
+        &source,
+    );
+    let JsonValue::Object(response) = response else {
+        panic!("response must be an object");
+    };
+    let JsonValue::Array(items) = response.get("account_objects").expect("account_objects") else {
+        panic!("account_objects must be an array");
+    };
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        response.get("marker"),
+        Some(&JsonValue::String(format!(
+            "{},{}",
+            owner_root_key(account).key,
+            check_key
+        )))
+    );
+}
+
+#[test]
+fn account_objects_nft_page_filter_does_not_marker_into_owner_directory() {
+    let account = sample_account(0x3C);
+    let issuer = sample_account(0x3D);
+    let token = make_nft_id(0, 0, issuer, 1, 1);
+    let check_key = sample_hash(0x8C);
+    let nft_start = nft_page_keylet(
+        nft_page_min_keylet(Uint160::from_slice(account.data()).expect("account width")),
+        Uint256::zero(),
+    )
+    .key;
+    let nft_page_key = nft_start.next();
+
+    let mut source = FakeSource {
+        ledger: Some(closed_ledger()),
+        ..Default::default()
+    };
+    source
+        .entries
+        .insert(account_root_key(account), make_account_root(account));
+    source.entries.insert(
+        Keylet::new(LedgerEntryType::NFTokenPage, nft_page_key),
+        make_nft_page(nft_page_key, &[token], None),
+    );
+    source.entries.insert(
+        owner_root_key(account),
+        make_owner_dir_page(account, &[check_key], None),
+    );
+    source
+        .entries
+        .insert(child_keylet(check_key), make_check_entry(check_key));
+
+    let response = do_account_objects(
+        &AccountObjectsRequest {
+            params: &object([
+                ("account", JsonValue::String(to_base58(account))),
+                ("type", JsonValue::String("nft_page".to_owned())),
+                ("limit", JsonValue::Unsigned(1)),
+            ]),
+            api_version: 1,
+            role: Role::Admin,
+        },
+        &source,
+    );
+    let JsonValue::Object(response) = response else {
+        panic!("response must be an object");
+    };
+    let JsonValue::Array(items) = response.get("account_objects").expect("account_objects") else {
+        panic!("account_objects must be an array");
+    };
+    assert_eq!(items.len(), 1);
+    assert!(
+        !response.contains_key("marker"),
+        "nft_page-only scan must not continue into owner directory"
+    );
+}
+
+#[test]
 fn account_objects_type_filter_check_only() {
     let account = sample_account(0x35);
     let offer_key = sample_hash(0x81);

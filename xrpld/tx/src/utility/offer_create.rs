@@ -11,7 +11,7 @@ use ledger::views::apply_view::ApplyView;
 use ledger::views::bridge::{adjust_owner_count, dir_append, dir_insert};
 use protocol::{
     Book, Keylet, LedgerEntryType, NotTec, SField, STAmount, STLedgerEntry, STObject, Ter,
-    feature_batch, get_field_by_symbol, is_tes_success, issue_from_asset,
+    feature_batch, get_field_by_symbol, is_tes_success,
 };
 use std::sync::Arc;
 
@@ -141,13 +141,13 @@ where
     }
 
     let book = Book {
-        r#in: issue_from_asset(taker_pays.asset()).unwrap_or_default(),
-        out: issue_from_asset(taker_gets.asset()).unwrap_or_default(),
+        r#in: taker_pays.asset(),
+        out: taker_gets.asset(),
         domain: None,
     };
     let reverse_book = Book {
-        r#in: issue_from_asset(taker_gets.asset()).unwrap_or_default(),
-        out: issue_from_asset(taker_pays.asset()).unwrap_or_default(),
+        r#in: taker_gets.asset(),
+        out: taker_pays.asset(),
         domain: None,
     };
 

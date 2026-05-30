@@ -6,7 +6,8 @@ use std::{cell::RefCell, collections::BTreeMap, time::Duration};
 
 use basics::base_uint::Uint256;
 use protocol::{
-    AccountID, Book, Issue, JsonValue, currency_from_string, to_base58, xrp_account, xrp_currency,
+    AccountID, Asset, Book, Issue, JsonValue, MPTIssue, currency_from_string, make_mpt_id,
+    to_base58, xrp_account, xrp_currency,
 };
 use rpc::Role;
 use rpc::{BookOffersRequest, BookOffersRuntime, BookOffersSource, do_book_offers};

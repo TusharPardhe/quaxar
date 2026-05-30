@@ -177,8 +177,8 @@ fn execute_book_fwd<V: ApplyView>(
     quality_threshold: Option<Quality>,
 ) -> Result<(STAmount, STAmount), Ter> {
     let book = crate::domain::ripple_calc::book_step::Book {
-        r#in: *book_in,
-        out: *book_out,
+        r#in: protocol::Asset::Issue(*book_in),
+        out: protocol::Asset::Issue(*book_out),
     };
     // Use the actual max_out limit from the strand (TakerPays for OfferCreate,
     // dst_amount for payments). reference BookStep uses the strand's out-limit.

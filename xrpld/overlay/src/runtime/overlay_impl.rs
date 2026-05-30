@@ -52,6 +52,7 @@ use crate::router::{MessageRouter, route_message};
 use crate::session::{PeerSessionHooks, PeerSessionStarter};
 use crate::slot::{Clock, Slots, SquelchHandler, SystemClock};
 use crate::traffic_count::{TrafficCategory, TrafficCount};
+use crate::transport::handshake::is_public_ip;
 use crate::tx_metrics::TxMetrics;
 use crate::{HARD_MAX_REPLY_NODES, ProtocolFeature, ProtocolVersion, parse_protocol_versions};
 
@@ -564,6 +565,9 @@ impl MessageRouter for OverlayInboundRouter<'_> {
                 saw_self = true;
                 parsed = SocketAddr::new(self.peer.remote_address().ip(), parsed.port());
             }
+            if self.overlay.setup.verify_endpoints && !is_valid_peer_endpoint(parsed) {
+                continue;
+            }
             if !seen_endpoints.insert(parsed) {
                 continue;
             }
@@ -1046,6 +1050,13 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             .on_replay_delta_response(self.peer, message.clone());
         crate::router::RouteAction::Continue
     }
+}
+
+fn is_valid_peer_endpoint(endpoint: SocketAddr) -> bool {
+    endpoint.port() != 0
+        && !endpoint.ip().is_unspecified()
+        && !endpoint.ip().is_loopback()
+        && is_public_ip(endpoint.ip())
 }
 
 pub struct OverlayImpl {
@@ -2477,6 +2488,10 @@ impl Overlay for OverlayImpl {
         self.setup.network_id
     }
 
+    fn verify_endpoints(&self) -> bool {
+        self.setup.verify_endpoints
+    }
+
     fn tx_metrics(&self) -> JsonValue {
         self.tx_metrics.json()
     }
@@ -2542,7 +2557,7 @@ mod tests {
     use super::{
         OverlayHandoff, OverlayImpl, OverlayInboundRouter, PEERFINDER_LIVE_CACHE_TTL,
         PEERFINDER_MAX_ACCEPTED_ENDPOINTS, PEERFINDER_MAX_HOPS, PEERFINDER_REDIRECT_ENDPOINT_COUNT,
-        PeerReservation, PeerReservationSource, PeerReservationTable,
+        PeerReservation, PeerReservationSource, PeerReservationTable, is_valid_peer_endpoint,
     };
     use crate::message::{
         Message, ProtocolMessage, ProtocolPayload, TmEndpoints, TmGetLedger, TmGetObjectByHash,
@@ -2683,6 +2698,7 @@ mod tests {
             )),
             tx_reduce_relay_min_peers: 1,
             tx_relay_percentage: 0,
+            verify_endpoints: false,
             vp_reduce_relay_max_selected_peers: 3,
             reduce_relay_wait: Duration::from_secs(0),
             ..Default::default()
@@ -3963,6 +3979,41 @@ mod tests {
         let second = overlay.queued_inbound_snapshot();
         assert!(second.endpoints.is_empty());
         drop_overlay_safely(overlay);
+    }
+
+    #[test]
+    fn endpoint_verification_rejects_private_loopback_and_zero_ports() {
+        assert!(is_valid_peer_endpoint(
+            "8.8.8.8:51235".parse().expect("public endpoint")
+        ));
+        assert!(!is_valid_peer_endpoint(
+            "10.0.0.1:51235".parse().expect("private endpoint")
+        ));
+        assert!(!is_valid_peer_endpoint(
+            "127.0.0.1:51235".parse().expect("loopback endpoint")
+        ));
+        assert!(!is_valid_peer_endpoint(
+            "[::1]:51235".parse().expect("ipv6 loopback endpoint")
+        ));
+        assert!(!is_valid_peer_endpoint(
+            "8.8.8.8:0".parse().expect("zero port endpoint")
+        ));
+    }
+
+    #[test]
+    fn overlay_json_exposes_verify_endpoints_config_surface() {
+        let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+
+        assert!(!overlay.stats().verify_endpoints);
+        match overlay.json() {
+            JsonValue::Object(object) => {
+                assert_eq!(
+                    object.get("verify_endpoints"),
+                    Some(&JsonValue::Bool(false))
+                );
+            }
+            other => panic!("overlay json should be an object, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

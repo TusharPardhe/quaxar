@@ -4,6 +4,9 @@ mod application_open_ledger_txq;
 #[path = "application_root.rs"]
 mod application_root;
 
+#[path = "invariants.rs"]
+mod invariants;
+
 #[path = "manifest.rs"]
 mod manifest;
 

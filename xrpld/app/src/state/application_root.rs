@@ -869,7 +869,10 @@ pub fn apply_submit_transactor_shell<V: ledger::ApplyView>(
     tx: &STTx,
     txn_type: TxType,
 ) -> Ter {
-    apply_submit_transactor_shell_impl(view, tx, txn_type, true)
+    let rules = view.rules();
+    tx::with_transaction_apply_runtime(&rules, || {
+        apply_submit_transactor_shell_impl(view, tx, txn_type, true)
+    })
 }
 
 fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
@@ -900,6 +903,15 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
     let account_txn_id_field = get_field_by_symbol("sfAccountTxnID");
     if tx.get_seq_proxy().is_ticket() && tx.is_field_present(account_txn_id_field) {
         return Ter::TEM_INVALID;
+    }
+
+    let tx_object: &protocol::STObject = tx;
+    if view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_2_0"))
+        && protocol::has_invalid_amount(tx_object)
+    {
+        return Ter::TEM_BAD_AMOUNT;
     }
 
     if !tx.is_field_present(account_field) {
@@ -1017,7 +1029,7 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
             } else {
                 protocol::XRPAmount::from_drops(0)
             };
-            result = crate::state::invariants::check_invariants(&inner, txn_type, result, fee_amt);
+            result = crate::state::invariants::check_invariants_for_tx(&inner, tx, result, fee_amt);
         }
 
         // tecOVERSIZE check
@@ -1187,16 +1199,17 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
                         protocol::LedgerEntryType::Credential,
                         index,
                     )) {
-                        let issuer = sle.get_account_id(protocol::get_field_by_symbol("sfIssuer"));
-                        let node = sle.get_field_u64(protocol::get_field_by_symbol("sfOwnerNode"));
-                        let dir = protocol::owner_dir_keylet(Uint160::from_void(issuer.data()));
-                        let _ = ledger::dir_remove(view, &dir, node, index, false);
-                        if let Ok(Some(acct)) =
-                            view.peek(protocol::account_keylet(Uint160::from_void(issuer.data())))
-                        {
-                            let _ = ledger::adjust_owner_count(view, &acct, -1);
+                        match ledger::credential_helpers::delete_sle(view, sle) {
+                            Ok(ter) if protocol::is_tes_success(ter) => {}
+                            Ok(ter) => {
+                                result = ter;
+                                break;
+                            }
+                            Err(_) => {
+                                result = Ter::TEF_BAD_LEDGER;
+                                break;
+                            }
                         }
-                        let _ = view.erase(sle);
                     }
                 }
             }
@@ -1393,10 +1406,22 @@ impl
     fn calculate_base_fee(
         &mut self,
         base: &Option<Arc<Ledger>>,
-        _tx: &AcceptLedgerPendingTransaction,
-        _txn_type: TxType,
+        tx: &AcceptLedgerPendingTransaction,
+        txn_type: TxType,
     ) -> Self::Fee {
-        base.as_ref().map(|ledger| ledger.fees().base).unwrap_or(0)
+        let Some(ledger) = base.as_ref() else {
+            return 0;
+        };
+        let normal_cost = ledger.fees().base;
+        if txn_type == TxType::LOAN_PAY {
+            let sttx = Self::read_sttx(tx);
+            return crate::state::lending::calculate_loan_pay_base_fee(
+                ledger.as_ref(),
+                sttx.as_ref(),
+                normal_cost,
+            );
+        }
+        normal_cost
     }
 
     fn zero_fee(&mut self) -> Self::Fee {

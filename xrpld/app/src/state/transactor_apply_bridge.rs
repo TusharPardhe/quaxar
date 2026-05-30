@@ -3,8 +3,8 @@
 use basics::math::base_uint::{Uint160, Uint256};
 use ledger::views::apply_view::{ApplyView, adjust_owner_count};
 use protocol::{
-    AccountID, Keylet, LedgerEntryType, STAmount, STLedgerEntry, STObject, STTx, Ter,
-    get_field_by_symbol,
+    AccountID, Asset, Keylet, LedgerEntryType, STAmount, STIssue, STLedgerEntry, STObject, STTx,
+    Ter, get_field_by_symbol,
 };
 use std::sync::Arc;
 use tx::*;
@@ -183,12 +183,75 @@ pub fn apply_ledger_state_fix<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     let owner = sttx
         .is_field_present(sf("sfOwner"))
         .then(|| sttx.get_account_id(sf("sfOwner")));
+    let book_directory = sttx
+        .is_field_present(sf("sfBookDirectory"))
+        .then(|| sttx.get_field_h256(sf("sfBookDirectory")));
 
-    run_ledger_state_fix_do_apply(fix_type, || {
-        owner
+    let preflight = run_ledger_state_fix_preflight_facts(LedgerStateFixPreflightFacts {
+        fix_type,
+        owner_present: owner.is_some(),
+        book_directory_present: book_directory.is_some(),
+        fix_cleanup_3_2_0_enabled: view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_2_0")),
+    });
+    if preflight != Ter::TES_SUCCESS {
+        return preflight;
+    }
+
+    let book_dir = book_directory.and_then(|dir_key| {
+        view.peek(Keylet::new(LedgerEntryType::DirectoryNode, dir_key))
+            .ok()
+            .flatten()
+    });
+    let preclaim = run_ledger_state_fix_preclaim_facts(LedgerStateFixPreclaimFacts {
+        fix_type,
+        owner_exists: owner.as_ref().is_some_and(|owner| {
+            matches!(
+                view.peek(protocol::account_keylet(to_160(owner))),
+                Ok(Some(_))
+            )
+        }),
+        book_directory_exists: book_dir.is_some(),
+        book_directory_has_exchange_rate: book_dir
             .as_ref()
-            .is_some_and(|owner| repair_nftoken_directory_links(view, owner))
-    })
+            .is_some_and(|dir| dir.is_field_present(sf("sfExchangeRate"))),
+        book_directory_exchange_rate_matches_key: book_dir.as_ref().is_some_and(|dir| {
+            dir.is_field_present(sf("sfExchangeRate"))
+                && dir.get_field_u64(sf("sfExchangeRate")) == protocol::quality_from_key(*dir.key())
+        }),
+    });
+    if preclaim != Ter::TES_SUCCESS {
+        return preclaim;
+    }
+
+    match fix_type {
+        LedgerStateFixType::NfTokenPageLink => run_ledger_state_fix_do_apply(fix_type, || {
+            owner
+                .as_ref()
+                .is_some_and(|owner| repair_nftoken_directory_links(view, owner))
+        }),
+        LedgerStateFixType::BookExchangeRate => run_ledger_state_fix_do_apply_with_book(
+            fix_type,
+            || false,
+            || {
+                let Some(dir_key) = book_directory else {
+                    return false;
+                };
+                let Ok(Some(dir)) = view.peek(Keylet::new(LedgerEntryType::DirectoryNode, dir_key))
+                else {
+                    return false;
+                };
+                let mut obj = dir.clone_as_object();
+                obj.set_field_u64(sf("sfExchangeRate"), protocol::quality_from_key(*dir.key()));
+                view.update(Arc::new(STLedgerEntry::from_stobject(obj, *dir.key())))
+                    .is_ok()
+            },
+        ),
+        LedgerStateFixType::Unknown(_) => {
+            run_ledger_state_fix_do_apply_with_book(fix_type, || false, || false)
+        }
+    }
 }
 
 pub struct ViewBackedAccountSetSink<'a, V> {
@@ -968,33 +1031,231 @@ impl<'a, V: ApplyView> NFTokenMintApplySink for ViewBackedNFTokenMintSink<'a, V>
 pub struct ViewBackedAMMCreateSink<'a, V> {
     pub view: &'a mut V,
     pub account: AccountID,
+    pub amount1: STAmount,
+    pub amount2: STAmount,
+    pub trading_fee: u16,
+    pub(crate) amm_keylet: Option<Keylet>,
+    pub(crate) amm_account: Option<AccountID>,
+    pub(crate) lp_tokens: Option<STAmount>,
 }
 
 impl<'a, V: ApplyView> AMMCreateApplySink for ViewBackedAMMCreateSink<'a, V> {
-    fn create_amm_entry(&mut self) {
-        // Placeholder for AMM SLE creation. In real logic, this creates the AMM object with trading fee, LP tokens, etc.
-        // Requires full AMM keylet and fact passing.
+    fn create_amm_account(&mut self) -> Ter {
+        let amm_keylet = protocol::keylet::amm(self.amount1.asset(), self.amount2.asset());
+        if matches!(self.view.read(amm_keylet), Ok(Some(_))) {
+            return Ter::TEC_DUPLICATE;
+        }
+
+        let pseudo = match ledger::create_pseudo_account(self.view, amm_keylet.key, sf("sfAMMID")) {
+            Ok(pseudo) => pseudo,
+            Err(err) => return err,
+        };
+        self.amm_account = Some(pseudo.get_account_id(sf("sfAccount")));
+        self.amm_keylet = Some(amm_keylet);
+        Ter::TES_SUCCESS
     }
-    fn create_amm_account(&mut self) {
-        let keylet = protocol::account_keylet(to_160(&self.account));
-        let mut sle = STLedgerEntry::new(keylet);
-        sle.set_field_u32(get_field_by_symbol("sfSequence"), 0);
-        let _ = self.view.insert(Arc::new(sle));
+
+    fn create_amm_entry(&mut self) -> Ter {
+        let Some(amm_keylet) = self.amm_keylet else {
+            return Ter::TEC_INTERNAL;
+        };
+        let Some(amm_account) = self.amm_account else {
+            return Ter::TEC_INTERNAL;
+        };
+
+        let lpt_issue = protocol::amm_lpt_issue_from_assets(
+            self.amount1.asset(),
+            self.amount2.asset(),
+            amm_account,
+        );
+        let lp_tokens = ledger::amm_helpers::amm_lp_tokens(&self.amount1, &self.amount2, lpt_issue);
+        let (asset, asset2) = if self.amount1.asset() <= self.amount2.asset() {
+            (self.amount1.asset(), self.amount2.asset())
+        } else {
+            (self.amount2.asset(), self.amount1.asset())
+        };
+
+        let owner_node = match ledger::dir_insert(
+            self.view,
+            &protocol::owner_dir_keylet(to_160(&amm_account)),
+            amm_keylet.key,
+            &|_| {},
+        ) {
+            Ok(Some(node)) => node,
+            Ok(None) => return Ter::TEC_DIR_FULL,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+
+        let mut amm = STLedgerEntry::new(amm_keylet);
+        amm.set_account_id(sf("sfAccount"), amm_account);
+        amm.set_field_u16(sf("sfTradingFee"), self.trading_fee);
+        amm.set_field_amount(sf("sfLPTokenBalance"), lp_tokens.clone());
+        amm.set_field_issue(sf("sfAsset"), STIssue::new_with_asset(sf("sfAsset"), asset));
+        amm.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), asset2),
+        );
+        amm.set_field_u64(sf("sfOwnerNode"), owner_node);
+        if self.view.insert(Arc::new(amm)).is_err() {
+            return Ter::TEF_BAD_LEDGER;
+        }
+        self.lp_tokens = Some(lp_tokens);
+        Ter::TES_SUCCESS
     }
-    fn deposit_initial_liquidity(&mut self) {
-        // Update trustlines or XRP balances for initial deposit
+
+    fn deposit_initial_liquidity(&mut self) -> Ter {
+        let Some(amm_account) = self.amm_account else {
+            return Ter::TEC_INTERNAL;
+        };
+        for amount in [self.amount1.clone(), self.amount2.clone()] {
+            let result = send_amm_initial_asset(self.view, &self.account, &amm_account, &amount);
+            if result != Ter::TES_SUCCESS {
+                return result;
+            }
+        }
+        Ter::TES_SUCCESS
     }
-    fn mint_lp_tokens(&mut self) {
-        // Mint LP tokens to the creator
+
+    fn mint_lp_tokens(&mut self) -> Ter {
+        let Some(amm_account) = self.amm_account else {
+            return Ter::TEC_INTERNAL;
+        };
+        let Some(lp_tokens) = self.lp_tokens.clone() else {
+            return Ter::TEC_INTERNAL;
+        };
+        ledger::ripple_state_helpers::account_send(
+            self.view,
+            &amm_account,
+            &self.account,
+            &lp_tokens,
+        )
     }
-    fn adjust_owner_count(&mut self, delta: i32) {
+
+    fn adjust_owner_count(&mut self, delta: i32) -> Ter {
         if let Ok(Some(sle)) = self
             .view
             .peek(protocol::account_keylet(to_160(&self.account)))
         {
-            let _ = adjust_owner_count(self.view, &sle, delta);
+            return adjust_owner_count(self.view, &sle, delta)
+                .map(|_| Ter::TES_SUCCESS)
+                .unwrap_or(Ter::TEF_BAD_LEDGER);
+        }
+        Ter::TER_NO_ACCOUNT
+    }
+}
+
+fn send_amm_initial_asset<V: ApplyView>(
+    view: &mut V,
+    sender: &AccountID,
+    amm_account: &AccountID,
+    amount: &STAmount,
+) -> Ter {
+    match amount.asset() {
+        Asset::MPTIssue(issue) => send_amm_initial_mpt(view, sender, amm_account, amount, issue),
+        Asset::Issue(issue) => {
+            let result =
+                ledger::ripple_state_helpers::account_send(view, sender, amm_account, amount);
+            if result != Ter::TES_SUCCESS || issue.native() {
+                return result;
+            }
+            if let Ok(Some(line)) =
+                view.peek(protocol::line(*amm_account, issue.issuer(), issue.currency))
+            {
+                let mut updated = (*line).clone();
+                let flags = updated.get_flags() | protocol::lsfAMMNode;
+                updated.set_field_u32(sf("sfFlags"), flags);
+                return view
+                    .update(Arc::new(updated))
+                    .map(|_| Ter::TES_SUCCESS)
+                    .unwrap_or(Ter::TEF_BAD_LEDGER);
+            }
+            Ter::TEC_INTERNAL
         }
     }
+}
+
+fn send_amm_initial_mpt<V: ApplyView>(
+    view: &mut V,
+    sender: &AccountID,
+    amm_account: &AccountID,
+    amount: &STAmount,
+    issue: protocol::MPTIssue,
+) -> Ter {
+    let value = amount.mpt().value();
+    if value <= 0 {
+        return Ter::TEC_INTERNAL;
+    }
+    let value = value as u64;
+    let mpt_id = issue.mpt_id();
+    let issuer = issue.issuer();
+
+    let Some(issuance) = view
+        .peek(protocol::mpt_issuance_keylet_from_mptid(mpt_id))
+        .ok()
+        .flatten()
+    else {
+        return Ter::TEC_OBJECT_NOT_FOUND;
+    };
+
+    if sender == &issuer {
+        let outstanding = issuance.get_field_u64(sf("sfOutstandingAmount"));
+        let Some(next) = outstanding.checked_add(value) else {
+            return Ter::TEC_INTERNAL;
+        };
+        let mut updated = (*issuance).clone();
+        updated.set_field_u64(sf("sfOutstandingAmount"), next);
+        if view.update(Arc::new(updated)).is_err() {
+            return Ter::TEF_BAD_LEDGER;
+        }
+    } else {
+        let Some(sender_token) = view
+            .peek(protocol::mptoken_keylet_from_mptid(mpt_id, to_160(sender)))
+            .ok()
+            .flatten()
+        else {
+            return Ter::TEC_NO_AUTH;
+        };
+        let current = sender_token.get_field_u64(sf("sfMPTAmount"));
+        let Some(next) = current.checked_sub(value) else {
+            return Ter::TEC_INSUFFICIENT_FUNDS;
+        };
+        let mut updated = (*sender_token).clone();
+        updated.set_field_u64(sf("sfMPTAmount"), next);
+        if view.update(Arc::new(updated)).is_err() {
+            return Ter::TEF_BAD_LEDGER;
+        }
+    }
+
+    let flags = protocol::lsfMPTAMM | protocol::lsfMPTAuthorized;
+    let result = ledger::mptoken_helpers::create_mp_token(view, mpt_id, amm_account, flags)
+        .unwrap_or(Ter::TEF_BAD_LEDGER);
+    if result != Ter::TES_SUCCESS && result != Ter::TEC_DUPLICATE {
+        return result;
+    }
+
+    let Some(amm_token) = view
+        .peek(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            to_160(amm_account),
+        ))
+        .ok()
+        .flatten()
+    else {
+        return Ter::TEC_OBJECT_NOT_FOUND;
+    };
+    let current = if amm_token.is_field_present(sf("sfMPTAmount")) {
+        amm_token.get_field_u64(sf("sfMPTAmount"))
+    } else {
+        0
+    };
+    let Some(next) = current.checked_add(value) else {
+        return Ter::TEC_INTERNAL;
+    };
+    let mut updated = (*amm_token).clone();
+    updated.set_field_u64(sf("sfMPTAmount"), next);
+    view.update(Arc::new(updated))
+        .map(|_| Ter::TES_SUCCESS)
+        .unwrap_or(Ter::TEF_BAD_LEDGER)
 }
 
 pub struct ViewBackedPaymentSink<'a, V> {

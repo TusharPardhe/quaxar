@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::ApplyView;
 use protocol::{
-    AccountID, Currency, Issue, STAmount, STLedgerEntry, STObject, Ter, XRPAmount,
+    AccountID, Asset, Currency, Issue, MPTIssue, STAmount, STLedgerEntry, STObject, Ter, XRPAmount,
     get_field_by_symbol as sf,
 };
 
@@ -426,6 +426,10 @@ pub fn account_send<V: ApplyView>(
         return transfer_xrp(view, from, to, amount.xrp());
     }
 
+    if let Asset::MPTIssue(issue) = amount.asset() {
+        return account_send_mpt(view, from, to, amount, &issue);
+    }
+
     let issue = amount.issue();
 
     // If sender or receiver is issuer, or issuer is noAccount → direct send (no fee)
@@ -457,6 +461,140 @@ pub fn account_send<V: ApplyView>(
     direct_send_no_fee_iou(view, from, &issue.account, &actual_cost, true)
 }
 
+fn update_mpt_amount<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    issue: &MPTIssue,
+    delta: i64,
+) -> Ter {
+    if *account == issue.issuer() || delta == 0 {
+        return Ter::TES_SUCCESS;
+    }
+
+    let token_key = protocol::mptoken_keylet_from_mptid(
+        issue.mpt_id(),
+        basics::base_uint::Uint160::from_void(account.data()),
+    );
+    let Some(token) = view.peek(token_key).ok().flatten() else {
+        return Ter::TEC_NO_AUTH;
+    };
+    let current = token.get_field_u64(sf("sfMPTAmount"));
+    let Some(next) = (if delta.is_negative() {
+        current.checked_sub(delta.unsigned_abs())
+    } else {
+        current.checked_add(delta as u64)
+    }) else {
+        return if delta.is_negative() {
+            Ter::TEC_INSUFFICIENT_FUNDS
+        } else {
+            Ter::TEC_INTERNAL
+        };
+    };
+
+    let mut updated = (*token).clone();
+    updated.set_field_u64(sf("sfMPTAmount"), next);
+    view.update(Arc::new(updated))
+        .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
+}
+
+fn account_send_mpt<V: ApplyView>(
+    view: &mut V,
+    from: &AccountID,
+    to: &AccountID,
+    amount: &STAmount,
+    issue: &MPTIssue,
+) -> Ter {
+    let value = amount.mpt().value();
+    if value <= 0 || from == to {
+        return Ter::TES_SUCCESS;
+    }
+
+    let issuer = issue.issuer();
+    let debit_value = if from != &issuer && to != &issuer {
+        let rate = crate::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
+            .unwrap_or(protocol::PARITY_RATE);
+        protocol::multiply_round(amount, rate, true).mpt().value()
+    } else {
+        value
+    };
+    if debit_value < value {
+        return Ter::TEC_INTERNAL;
+    }
+
+    let Some(issuance) = view
+        .peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
+        .ok()
+        .flatten()
+    else {
+        return Ter::TEC_OBJECT_NOT_FOUND;
+    };
+    let amount = value as u64;
+    let debit_amount = debit_value as u64;
+    let outstanding = issuance.get_field_u64(sf("sfOutstandingAmount"));
+
+    if from == &issuer {
+        let maximum = crate::mptoken_helpers::max_mpt_amount(&issuance);
+        if crate::mptoken_helpers::is_mpt_overflow(value, outstanding, maximum) {
+            return Ter::TEC_PATH_DRY;
+        }
+        let Some(next_outstanding) = outstanding.checked_add(amount) else {
+            return Ter::TEC_INTERNAL;
+        };
+        let mut updated = (*issuance).clone();
+        updated.set_field_u64(sf("sfOutstandingAmount"), next_outstanding);
+        if view.update(Arc::new(updated)).is_err() {
+            return Ter::TEF_BAD_LEDGER;
+        }
+    } else {
+        let result = update_mpt_amount(view, from, issue, -debit_value);
+        if result != Ter::TES_SUCCESS {
+            return result;
+        }
+    }
+
+    if to == &issuer {
+        let Some(issuance) = view
+            .peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
+            .ok()
+            .flatten()
+        else {
+            return Ter::TEC_OBJECT_NOT_FOUND;
+        };
+        let outstanding = issuance.get_field_u64(sf("sfOutstandingAmount"));
+        let Some(next_outstanding) = outstanding.checked_sub(amount) else {
+            return Ter::TEC_INTERNAL;
+        };
+        let mut updated = (*issuance).clone();
+        updated.set_field_u64(sf("sfOutstandingAmount"), next_outstanding);
+        view.update(Arc::new(updated))
+            .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
+    } else {
+        let result = update_mpt_amount(view, to, issue, value);
+        if result != Ter::TES_SUCCESS {
+            return result;
+        }
+        let fee = debit_amount - amount;
+        if fee == 0 {
+            return Ter::TES_SUCCESS;
+        }
+        let Some(issuance) = view
+            .peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
+            .ok()
+            .flatten()
+        else {
+            return Ter::TEC_OBJECT_NOT_FOUND;
+        };
+        let outstanding = issuance.get_field_u64(sf("sfOutstandingAmount"));
+        let Some(next_outstanding) = outstanding.checked_sub(fee) else {
+            return Ter::TEC_INTERNAL;
+        };
+        let mut updated = (*issuance).clone();
+        updated.set_field_u64(sf("sfOutstandingAmount"), next_outstanding);
+        view.update(Arc::new(updated))
+            .map_or(Ter::TEF_BAD_LEDGER, |_| Ter::TES_SUCCESS)
+    }
+}
+
 /// This is the core function that handles reserve cleanup.
 fn direct_send_no_fee_iou<V: ApplyView>(
     view: &mut V,
@@ -482,22 +620,6 @@ fn direct_send_no_fee_iou<V: ApplyView>(
         let mut balance = state.get_field_amount(sf("sfBalance"));
         if b_sender_high {
             balance.negate();
-        }
-
-        let receiver_balance_after: i64 = if b_sender_high {
-            let low_balance = state.get_field_amount(sf("sfBalance"));
-            low_balance.mantissa() as i64 + amount.mantissa() as i64
-        } else {
-            let low_balance = state.get_field_amount(sf("sfBalance"));
-            -(low_balance.mantissa() as i64 - amount.mantissa() as i64)
-        };
-        let receiver_limit: i64 = if b_sender_high {
-            state.get_field_amount(sf("sfLowLimit")).mantissa() as i64
-        } else {
-            state.get_field_amount(sf("sfHighLimit")).mantissa() as i64
-        };
-        if receiver_limit > 0 && receiver_balance_after > receiver_limit {
-            return Ter::TEC_PATH_PARTIAL;
         }
 
         let before = balance.clone();
@@ -729,6 +851,10 @@ pub fn account_send_with_fee<V: ApplyView>(
 
     if amount.native() {
         return transfer_xrp(view, from, to, amount.xrp());
+    }
+
+    if let Asset::MPTIssue(issue) = amount.asset() {
+        return account_send_mpt(view, from, to, amount, &issue);
     }
 
     let issue = amount.issue();
