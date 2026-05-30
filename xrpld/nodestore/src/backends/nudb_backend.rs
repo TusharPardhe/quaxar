@@ -818,13 +818,12 @@ impl NuDbBackend {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::FileExt;
-                // Use tracked offset instead of fstat() syscall
-                let offset = self
-                    .data_file_size
-                    .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                let offset = self.data_file_size.load(Ordering::Relaxed);
                 fds.data_write
                     .write_all_at(buf, offset)
                     .map_err(|e| format!("NuDB append data @{offset}: {e}"))?;
+                self.data_file_size
+                    .store(offset + buf.len() as u64, Ordering::Relaxed);
                 return Ok(offset);
             }
         }
@@ -846,12 +845,12 @@ impl NuDbBackend {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::FileExt;
-                let offset = self
-                    .key_file_size
-                    .fetch_add(buf.len() as u64, Ordering::Relaxed);
+                let offset = self.key_file_size.load(Ordering::Relaxed);
                 fds.key_write
                     .write_all_at(buf, offset)
                     .map_err(|e| format!("NuDB append key @{offset}: {e}"))?;
+                self.key_file_size
+                    .store(offset + buf.len() as u64, Ordering::Relaxed);
                 return Ok(offset);
             }
         }

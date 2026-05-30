@@ -437,8 +437,8 @@ impl CatchupResourceProfile {
     }
 }
 
-const LEDGER_FETCH_LIMIT_OVERRIDE_MIN: usize = 1;
-const LEDGER_FETCH_LIMIT_OVERRIDE_MAX: usize = 32;
+pub(crate) const LEDGER_FETCH_LIMIT_OVERRIDE_MIN: usize = 1;
+pub(crate) const LEDGER_FETCH_LIMIT_OVERRIDE_MAX: usize = 8;
 
 fn bootstrap_acquire_budget_available(
     validated: u32,
@@ -447,6 +447,16 @@ fn bootstrap_acquire_budget_available(
     already_tracked: bool,
 ) -> bool {
     validated > 1 || already_tracked || active_count < ledger_fetch_limit.max(1)
+}
+
+fn should_process_acquisition_tick(
+    has_queued_data: bool,
+    timer_due: bool,
+    fetch_pack_ready: bool,
+    first_add_peers: bool,
+    peers_updated: bool,
+) -> bool {
+    has_queued_data || timer_due || fetch_pack_ready || (first_add_peers && peers_updated)
 }
 
 fn ledger_fetch_limit_override(config: &BasicConfig) -> Result<Option<usize>, String> {
@@ -2862,6 +2872,7 @@ fn run_acquisition_thread(
 
         let mut got_stop = false;
         let mut fetch_pack_ready = false;
+        let mut peers_updated = false;
         let msg_count = msgs.len();
         if msg_count == 0 {
             empty_wakeups += 1;
@@ -2899,6 +2910,7 @@ fn run_acquisition_thread(
                 }
                 AcqMsg::Peers(p) => {
                     peer_set.refresh_peers(p.iter().cloned());
+                    peers_updated = true;
                 }
                 AcqMsg::Stop => {
                     got_stop = true;
@@ -2915,7 +2927,13 @@ fn run_acquisition_thread(
         // was queued, which prevented addPeers from triggering requests.
         let has_queued_data = inbound.received_data_len() > 0;
         let timer_due = last_timer.elapsed() >= Duration::from_secs(3);
-        if !has_queued_data && !timer_due && !fetch_pack_ready {
+        if !should_process_acquisition_tick(
+            has_queued_data,
+            timer_due,
+            fetch_pack_ready,
+            first_add_peers,
+            peers_updated,
+        ) {
             // Check completion before spinning — trigger may have set
             // have_state/have_tx on a previous iteration.
             if !inbound.is_done()
@@ -3010,6 +3028,7 @@ fn run_acquisition_thread(
             }
             if !newly_added.is_empty() {
                 first_add_peers = false;
+                last_timer = Instant::now();
             }
         }
 

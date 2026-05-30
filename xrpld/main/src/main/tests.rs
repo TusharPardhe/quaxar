@@ -13,7 +13,8 @@ use super::{
     prune_known_endpoints, prune_recent_connect_attempts, remember_known_endpoint,
     select_autoconnect_endpoints, select_bootcache_endpoints, select_consensus_acquisition_target,
     select_post_acquisition_operating_mode, select_target_seq,
-    should_attempt_completed_ledger_promotion, should_retry_publish_after_completed_history,
+    should_attempt_completed_ledger_promotion, should_process_acquisition_tick,
+    should_retry_publish_after_completed_history,
 };
 use app::{AppBootstrapOptions, build_bootstrap_root, load_basic_config_file};
 use basics::base_uint::Uint256;
@@ -1070,12 +1071,12 @@ fn ledger_fetch_limit_override_parses_optional_expert_config() {
     let zero =
         ledger_fetch_limit_override(&config("[ledger_acquisition]\nledger_fetch_limit = 0\n"))
             .expect_err("zero rejected");
-    assert!(zero.contains("between 1 and 32"));
+    assert!(zero.contains("between 1 and 8"));
 
     let high =
-        ledger_fetch_limit_override(&config("[ledger_acquisition]\nledger_fetch_limit = 33\n"))
+        ledger_fetch_limit_override(&config("[ledger_acquisition]\nledger_fetch_limit = 9\n"))
             .expect_err("too high rejected");
-    assert!(high.contains("between 1 and 32"));
+    assert!(high.contains("between 1 and 8"));
 
     let invalid =
         ledger_fetch_limit_override(&config("[ledger_acquisition]\nledger_fetch_limit = many\n"))
@@ -1084,6 +1085,19 @@ fn ledger_fetch_limit_override_parses_optional_expert_config() {
         invalid,
         "Configured ledger_acquisition.ledger_fetch_limit is invalid"
     );
+}
+
+#[test]
+fn acquisition_tick_processes_initial_peer_updates_before_timeout() {
+    assert!(should_process_acquisition_tick(
+        false, false, false, true, true
+    ));
+    assert!(!should_process_acquisition_tick(
+        false, false, false, true, false
+    ));
+    assert!(!should_process_acquisition_tick(
+        false, false, false, false, true
+    ));
 }
 
 #[test]

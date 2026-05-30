@@ -74,7 +74,7 @@ ledger_fetch_limit = 8
 
 | Key | Meaning |
 |-----|---------|
-| `ledger_fetch_limit` | Overrides the `[node_size]` cold-bootstrap active inbound-ledger acquisition limit. Valid range: `1..32`. |
+| `ledger_fetch_limit` | Overrides the `[node_size]` cold-bootstrap active inbound-ledger acquisition limit. Valid range: `1..8`. |
 
 If omitted, `node_size` decides the limit. Set `ledger_fetch_limit = 1` for the
 most conservative cold-bootstrap behavior. Raising the value can improve
