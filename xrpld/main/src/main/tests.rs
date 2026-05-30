@@ -1046,10 +1046,10 @@ fn catchup_resource_profile_applies_ledger_fetch_limit_override() {
 #[test]
 fn bootstrap_acquire_budget_ledger_fetch_shape() {
     assert!(bootstrap_acquire_budget_available(0, 0, 5, false));
-    assert!(bootstrap_acquire_budget_available(0, 4, 5, false));
-    assert!(!bootstrap_acquire_budget_available(0, 5, 5, false));
+    assert!(!bootstrap_acquire_budget_available(0, 1, 5, false));
     assert!(bootstrap_acquire_budget_available(0, 5, 5, true));
-    assert!(bootstrap_acquire_budget_available(2, 99, 2, false));
+    assert!(bootstrap_acquire_budget_available(2, 1, 2, false));
+    assert!(!bootstrap_acquire_budget_available(2, 2, 2, false));
 }
 
 #[test]

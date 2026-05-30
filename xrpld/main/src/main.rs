@@ -446,7 +446,18 @@ fn bootstrap_acquire_budget_available(
     ledger_fetch_limit: usize,
     already_tracked: bool,
 ) -> bool {
-    validated > 1 || already_tracked || active_count < ledger_fetch_limit.max(1)
+    if already_tracked {
+        return true;
+    }
+
+    if validated <= 1 {
+        // A cold node must finish one full account-state acquisition before
+        // run-ahead can help. Starting several full-state ledgers here only
+        // splits peer/disk budget and delays the first accepted ledger.
+        return active_count == 0;
+    }
+
+    active_count < ledger_fetch_limit.max(1)
 }
 
 fn should_process_acquisition_tick(
