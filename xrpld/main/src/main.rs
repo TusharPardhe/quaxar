@@ -2786,6 +2786,9 @@ fn run_acquisition_thread(
     let mut total_response_latency_ms = 0u64;
     let mut response_count = 0u64;
     let mut last_reported_response_count = 0u64;
+    let mut last_debug_outbound_requests = 0u64;
+    let mut last_debug_response_count = 0u64;
+    let mut last_debug_write_count = 0u64;
     let mut acq_peer_stats: HashMap<u64, AcqPeerPacketStats> = HashMap::new();
     const PEER_COUNT_START: usize = 5;
     const PEER_COUNT_ADD: usize = 3;
@@ -3334,6 +3337,13 @@ fn run_acquisition_thread(
         if last_counter_log.elapsed() >= Duration::from_secs(5) {
             last_counter_log = Instant::now();
             counters.log_status(seq, inbound.stats(), inbound.is_complete());
+            let write_count = store.write_count.get();
+            let outbound_delta = outbound_requests.saturating_sub(last_debug_outbound_requests);
+            let response_delta = response_count.saturating_sub(last_debug_response_count);
+            let write_delta = write_count.saturating_sub(last_debug_write_count);
+            last_debug_outbound_requests = outbound_requests;
+            last_debug_response_count = response_count;
+            last_debug_write_count = write_count;
             if inbound.progress() || response_count > last_reported_response_count {
                 let _ = result_tx.send(AcqResult::Progress {
                     good_nodes: inbound.stats().get_good().max(0) as usize,
@@ -3347,6 +3357,7 @@ fn run_acquisition_thread(
             };
             tracing::debug!(target: "inbound_ledger",
                 seq, outbound_requests, peers = peer_set.peer_count(),
+                outbound_delta, response_delta, write_delta,
                 progress = inbound.progress(),
                 have_header = inbound.planner_state().have_header,
                 have_state = inbound.planner_state().have_state,
