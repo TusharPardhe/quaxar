@@ -900,33 +900,6 @@ impl NuDbBackend {
         read_nudb_key_file_header(&plan.layout.key_path)
     }
 
-    /// Update only the key_file_size field in the log header after a bucket split.
-    /// This prevents crash recovery from truncating the key file to the pre-split size.
-    /// Byte offset of key_file_size in log header:
-    ///   8 (magic) + 2 (version) + 8 (uid) + 8 (appnum) + 2 (key_size) +
-    ///   8 (salt) + 8 (pepper) + 2 (block_size) = 46
-    fn update_log_key_file_size(&self, new_key_file_size: u64) -> Result<(), String> {
-        // Only update if the log file has a valid header (size >= NUDB_LOG_FILE_HEADER_SIZE).
-        // If the log is empty (after a commit) or missing, no update needed.
-        let log_size = match fs::metadata(&self.config.layout.log_path) {
-            Ok(m) => m.len(),
-            Err(_) => return Ok(()), // log doesn't exist, nothing to update
-        };
-        if log_size < NUDB_LOG_FILE_HEADER_SIZE as u64 {
-            return Ok(()); // log is empty or too small, nothing to update
-        }
-        let bytes = new_key_file_size.to_be_bytes();
-        let mut file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.config.layout.log_path)
-            .map_err(|e| e.to_string())?;
-        file.seek(SeekFrom::Start(46))
-            .map_err(|e| format!("NuDB update log seek: {e}"))?;
-        file.write_all(&bytes)
-            .map_err(|e| format!("NuDB update log key_file_size: {e}"))
-    }
-
     fn clear_log_file(&self) -> Result<(), String> {
         let file = fs::OpenOptions::new()
             .create(true)
@@ -997,13 +970,18 @@ impl NuDbBackend {
             .map_err(|error| error.to_string())?;
 
         let mut offset = NUDB_LOG_FILE_HEADER_SIZE as u64;
+        let mut max_replayed_bucket_index = None::<u32>;
+        let mut replay_complete = true;
         while offset < log_size {
             let remaining = log_size - offset;
             if remaining < 8 {
+                replay_complete = false;
                 break;
             }
             let bucket_index = read_u64_be_from_reader(&mut log_file, "NuDB log bucket index")?;
             offset += 8;
+            let bucket_index = u32::try_from(bucket_index)
+                .map_err(|_| "NuDB log bucket index exceeds u32".to_owned())?;
 
             let bucket_start = log_file
                 .stream_position()
@@ -1011,7 +989,10 @@ impl NuDbBackend {
             let mut bucket_prefix = [0u8; NUDB_BUCKET_COUNT_SIZE + NUDB_BUCKET_SPILL_SIZE];
             match log_file.read_exact(&mut bucket_prefix) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    replay_complete = false;
+                    break;
+                }
                 Err(error) => return Err(error.to_string()),
             }
             let mut bucket_offset = 0usize;
@@ -1027,7 +1008,10 @@ impl NuDbBackend {
             let mut compact = vec![0u8; compact_size];
             match log_file.read_exact(&mut compact) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    replay_complete = false;
+                    break;
+                }
                 Err(error) => return Err(error.to_string()),
             }
             offset += u64::try_from(compact_size).expect("compact size must fit u64");
@@ -1037,17 +1021,32 @@ impl NuDbBackend {
                 usize::from(key_header.capacity),
                 &compact,
             )?;
-            let key_offset = (bucket_index + 1) * u64::from(key_header.block_size);
+            let key_offset = u64::from(bucket_index + 1) * u64::from(key_header.block_size);
             key_file
                 .seek(SeekFrom::Start(key_offset))
                 .map_err(|error| error.to_string())?;
             key_file
                 .write_all(&bucket.encode_key_block()?)
                 .map_err(|error| error.to_string())?;
+            max_replayed_bucket_index = Some(
+                max_replayed_bucket_index.map_or(bucket_index, |current| current.max(bucket_index)),
+            );
         }
 
         key_file.flush().map_err(|error| error.to_string())?;
         key_file.sync_all().map_err(|error| error.to_string())?;
+
+        let recovered_key_file_size = if replay_complete {
+            max_replayed_bucket_index
+                .map(|bucket_index| {
+                    u64::from(bucket_index + 2).saturating_mul(u64::from(log_header.block_size))
+                })
+                .map_or(log_header.key_file_size, |replayed_size| {
+                    log_header.key_file_size.min(replayed_size)
+                })
+        } else {
+            log_header.key_file_size
+        };
 
         let key_file = fs::OpenOptions::new()
             .read(true)
@@ -1055,7 +1054,7 @@ impl NuDbBackend {
             .open(&self.config.layout.key_path)
             .map_err(|error| error.to_string())?;
         key_file
-            .set_len(log_header.key_file_size)
+            .set_len(recovered_key_file_size)
             .map_err(|error| error.to_string())?;
         key_file.sync_all().map_err(|error| error.to_string())?;
 
@@ -1532,17 +1531,6 @@ impl NuDbBackend {
         header.modulus = new_modulus;
         self.write_key_bucket_with_header(left_index, &left, header)?;
         self.write_key_bucket_with_header(right_index, &right, header)?;
-
-        // After a split, the key file grew by one block. Update the log header's
-        // key_file_size so that crash recovery does not truncate the new bucket.
-        // header size field to achieve the same crash-safety guarantee.
-        let new_key_file_size = u64::from(new_buckets + 1) * u64::from(header.block_size);
-        if let Err(e) = self.update_log_key_file_size(new_key_file_size) {
-            self.journal.log(
-                JournalLevel::Warn,
-                &format!("NuDB: failed to update log key_file_size after split: {e}"),
-            );
-        }
 
         Ok(())
     }
