@@ -28,7 +28,10 @@ use shamap::sync::{
     get_missing_nodes, get_node_fat, walk_map,
 };
 use shamap::traversal::{TraversalError, descend, descend_no_store, descend_throw};
-use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
+use shamap::tree_node::{
+    SHAMapCodecError, SHAMapNodeType, SHAMapTreeNode, WIRE_TYPE_ACCOUNT_STATE,
+    WIRE_TYPE_TRANSACTION,
+};
 use shamap::tree_node_cache::TreeNodeCache;
 use shamap::visitor::{visit_leaves, visit_nodes};
 use std::collections::{BTreeSet, HashMap};
@@ -176,46 +179,27 @@ fn shamap_wire_and_prefix_round_trip_match_narrow_cpp_roles() {
 }
 
 #[test]
-fn shamap_leaf_nodes_accept_short_payloads() {
-    let tx_payload = vec![0xAA, 0xBB, 0xCC];
-    let tx_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
-        SHAMapNodeType::TransactionNm,
-        SHAMapItem::new(sample_uint256(0x11), tx_payload.clone()),
-        1,
-    ));
-    let tx_wire = tx_leaf
-        .serialize_for_wire()
-        .expect("transaction wire serialization should succeed");
-    let parsed_tx = SHAMapTreeNode::make_from_wire(&tx_wire)
-        .expect("transaction wire decoding should succeed")
-        .expect("transaction wire decoding should produce a node");
-    assert_eq!(parsed_tx.get_type(), SHAMapNodeType::TransactionNm);
+fn shamap_leaf_nodes_reject_short_payloads() {
+    let tx_wire = vec![0xAA, 0xBB, 0xCC, WIRE_TYPE_TRANSACTION];
     assert_eq!(
-        parsed_tx
-            .peek_item()
-            .expect("transaction leaf should carry an item")
-            .data(),
-        tx_payload.as_slice()
+        SHAMapTreeNode::make_from_wire(&tx_wire).expect_err("short tx leaf should be rejected"),
+        SHAMapCodecError::ShortLeafNode {
+            node_type: SHAMapNodeType::TransactionNm,
+            len: 3,
+        }
     );
 
     let state_key = sample_uint256(0x22);
-    let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
-        SHAMapNodeType::AccountState,
-        SHAMapItem::new(state_key, Vec::<u8>::new()),
-        1,
-    ));
-    let state_wire = state_leaf
-        .serialize_for_wire()
-        .expect("account-state wire serialization should succeed");
-    let parsed_state = SHAMapTreeNode::make_from_wire(&state_wire)
-        .expect("account-state wire decoding should succeed")
-        .expect("account-state wire decoding should produce a node");
-    assert_eq!(parsed_state.get_type(), SHAMapNodeType::AccountState);
+    let mut state_wire = vec![0xAA; 11];
+    state_wire.extend_from_slice(state_key.data());
+    state_wire.push(WIRE_TYPE_ACCOUNT_STATE);
     assert_eq!(
-        parsed_state
-            .peek_item()
-            .expect("account-state leaf should carry an item"),
-        SHAMapItem::new(state_key, Vec::<u8>::new())
+        SHAMapTreeNode::make_from_wire(&state_wire)
+            .expect_err("short account-state leaf should be rejected"),
+        SHAMapCodecError::ShortLeafNode {
+            node_type: SHAMapNodeType::AccountState,
+            len: 11,
+        }
     );
 }
 
@@ -2737,47 +2721,47 @@ fn shamap_loaded_tree_mutation_helpers_match_narrow_cpp_roles() {
 }
 
 #[test]
-fn shamap_loaded_tree_mutation_helpers_accept_short_payloads() {
+fn shamap_loaded_tree_mutation_helpers_accept_minimum_payloads() {
     let key = Uint256::from_array([0x5A; 32]);
     let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
 
     let inserted = add_item(
         &root,
         SHAMapNodeType::TransactionNm,
-        SHAMapItem::new(key, vec![0x01]),
+        SHAMapItem::new(key, vec![0x01; 12]),
     )
-    .expect("short transaction insert should succeed");
+    .expect("minimum transaction insert should succeed");
     assert!(inserted);
 
     let found = find_key(&root, key, false, &mut |_| None)
         .expect("lookup should succeed")
-        .expect("short transaction leaf should resolve");
+        .expect("minimum transaction leaf should resolve");
     assert_eq!(found.get_type(), SHAMapNodeType::TransactionNm);
     assert_eq!(
         found
             .peek_item()
-            .expect("short transaction leaf should carry an item")
+            .expect("minimum transaction leaf should carry an item")
             .data(),
-        &[0x01]
+        &[0x01; 12]
     );
 
     let updated = update_item(
         &root,
         SHAMapNodeType::TransactionNm,
-        SHAMapItem::new(key, vec![0x02, 0x03]),
+        SHAMapItem::new(key, vec![0x02; 12]),
     )
-    .expect("short transaction update should succeed");
+    .expect("minimum transaction update should succeed");
     assert!(updated);
 
     let updated_found = find_key(&root, key, false, &mut |_| None)
         .expect("updated lookup should succeed")
-        .expect("updated short transaction leaf should resolve");
+        .expect("updated minimum transaction leaf should resolve");
     assert_eq!(
         updated_found
             .peek_item()
-            .expect("updated short transaction leaf should carry an item")
+            .expect("updated minimum transaction leaf should carry an item")
             .data(),
-        &[0x02, 0x03]
+        &[0x02; 12]
     );
 }
 

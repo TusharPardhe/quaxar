@@ -29,6 +29,7 @@ pub const WIRE_TYPE_ACCOUNT_STATE: u8 = 1;
 pub const WIRE_TYPE_INNER: u8 = 2;
 pub const WIRE_TYPE_COMPRESSED_INNER: u8 = 3;
 pub const WIRE_TYPE_TRANSACTION_WITH_META: u8 = 4;
+const MIN_SHAMAP_ITEM_BYTES: usize = 12;
 const TAGGED_POINTER_BOUNDARIES: [usize; 4] = [2, 4, 6, BRANCH_FACTOR];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,6 +358,10 @@ pub enum SHAMapCodecError {
     InvalidFullInnerSize(usize),
     InvalidCompressedInnerSize(usize),
     InvalidCompressedInnerBranch(u8),
+    ShortLeafNode {
+        node_type: SHAMapNodeType,
+        len: usize,
+    },
     ShortTransactionWithMetaNode(usize),
     ShortAccountStateNode(usize),
     InvalidAccountStateNode,
@@ -411,6 +416,10 @@ impl SHAMapTreeNode {
     }
 
     pub fn new_leaf(node_type: SHAMapNodeType, item: SHAMapItem, cowid: u32) -> Self {
+        assert!(
+            item.size() >= MIN_SHAMAP_ITEM_BYTES,
+            "SHAMap leaf item payload below minimum size"
+        );
         let hash = compute_leaf_hash(node_type, &item);
         Self::new_leaf_with_hash(node_type, item, cowid, hash)
     }
@@ -421,6 +430,10 @@ impl SHAMapTreeNode {
         cowid: u32,
         hash: SHAMapHash,
     ) -> Self {
+        assert!(
+            item.size() >= MIN_SHAMAP_ITEM_BYTES,
+            "SHAMap leaf item payload below minimum size"
+        );
         Self {
             ref_counts: IntrusiveRefCounts::new(),
             hash: std::cell::UnsafeCell::new(hash),
@@ -898,7 +911,7 @@ impl SHAMapTreeNode {
         };
 
         let node = match node_type {
-            WIRE_TYPE_TRANSACTION => make_transaction_node(payload, None),
+            WIRE_TYPE_TRANSACTION => make_transaction_node(payload, None)?,
             WIRE_TYPE_ACCOUNT_STATE => make_account_state_node(payload, None)?,
             WIRE_TYPE_INNER => make_full_inner(payload, None)?,
             WIRE_TYPE_COMPRESSED_INNER => make_compressed_inner(payload)?,
@@ -929,7 +942,7 @@ impl SHAMapTreeNode {
         );
 
         match prefix {
-            HASH_PREFIX_TRANSACTION_ID => Ok(make_transaction_node(payload, Some(hash))),
+            HASH_PREFIX_TRANSACTION_ID => make_transaction_node(payload, Some(hash)),
             HASH_PREFIX_LEAF_NODE => make_account_state_node(payload, Some(hash)),
             HASH_PREFIX_INNER_NODE => make_full_inner(payload, Some(hash)),
             HASH_PREFIX_TX_NODE => make_transaction_with_meta_node(payload, Some(hash)),
@@ -1097,15 +1110,16 @@ fn serialize_inner_with_prefix(
 fn make_transaction_node(
     data: &[u8],
     known_hash: Option<SHAMapHash>,
-) -> SharedIntrusive<SHAMapTreeNode> {
+) -> Result<SharedIntrusive<SHAMapTreeNode>, SHAMapCodecError> {
+    validate_leaf_payload(SHAMapNodeType::TransactionNm, data)?;
     let key = sha512_half_bytes(HASH_PREFIX_TRANSACTION_ID, [data]);
     let item = SHAMapItem::new(key, data.to_vec());
-    make_shared_intrusive(match known_hash {
+    Ok(make_shared_intrusive(match known_hash {
         Some(hash) => {
             SHAMapTreeNode::new_leaf_with_hash(SHAMapNodeType::TransactionNm, item, 0, hash)
         }
         None => SHAMapTreeNode::new_leaf(SHAMapNodeType::TransactionNm, item, 0),
-    })
+    }))
 }
 
 fn make_transaction_with_meta_node(
@@ -1118,6 +1132,7 @@ fn make_transaction_with_meta_node(
 
     let split = data.len() - Uint256::BYTES;
     let (payload, tag_bytes) = data.split_at(split);
+    validate_leaf_payload(SHAMapNodeType::TransactionMd, payload)?;
     let tag = Uint256::from_slice(tag_bytes).expect("slice length should already be validated");
     let item = SHAMapItem::new(tag, payload.to_vec());
 
@@ -1139,6 +1154,7 @@ fn make_account_state_node(
 
     let split = data.len() - Uint256::BYTES;
     let (payload, tag_bytes) = data.split_at(split);
+    validate_leaf_payload(SHAMapNodeType::AccountState, payload)?;
     let tag = Uint256::from_slice(tag_bytes).expect("slice length should already be validated");
     if tag.is_zero() {
         return Err(SHAMapCodecError::InvalidAccountStateNode);
@@ -1151,6 +1167,16 @@ fn make_account_state_node(
         }
         None => SHAMapTreeNode::new_leaf(SHAMapNodeType::AccountState, item, 0),
     }))
+}
+
+fn validate_leaf_payload(node_type: SHAMapNodeType, data: &[u8]) -> Result<(), SHAMapCodecError> {
+    if data.len() < MIN_SHAMAP_ITEM_BYTES {
+        return Err(SHAMapCodecError::ShortLeafNode {
+            node_type,
+            len: data.len(),
+        });
+    }
+    Ok(())
 }
 
 fn make_full_inner(
