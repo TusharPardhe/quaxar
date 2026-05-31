@@ -5624,6 +5624,8 @@ fn amm_deposit_clears_stale_auth_accounts_after_empty_pool_reinit() {
 
     let mut ledger = empty_ledger(vec![
         account_root(depositor, 0, 0),
+        account_root(usd_issuer, 0, 0),
+        account_root(eur_issuer, 0, 0),
         account_root(amm_account, 0, 0),
         amm,
     ]);
@@ -5635,13 +5637,21 @@ fn amm_deposit_clears_stale_auth_accounts_after_empty_pool_reinit() {
 
     let tx = STTx::new(TxType::AMM_DEPOSIT, |tx| {
         tx.set_account_id(sf("sfAccount"), depositor);
-        tx.set_field_amount(sf("sfAsset"), iou_amount(sf("sfAsset"), usd, 0));
-        tx.set_field_amount(sf("sfAsset2"), iou_amount(sf("sfAsset2"), eur, 0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(sf("sfAsset"), Asset::Issue(usd)),
+        );
+        tx.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), Asset::Issue(eur)),
+        );
         tx.set_field_amount(sf("sfAmount"), iou_amount(sf("sfAmount"), usd, 100));
+        tx.set_field_amount(sf("sfAmount2"), iou_amount(sf("sfAmount2"), eur, 100));
         tx.set_field_amount(
             sf("sfFee"),
             STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
         );
+        tx.set_field_u32(sf("sfFlags"), 0x0080_0000);
         tx.set_field_u32(sf("sfSequence"), 1);
     });
 
@@ -5654,6 +5664,55 @@ fn amm_deposit_clears_stale_auth_accounts_after_empty_pool_reinit() {
         .expect("amm should remain");
     let updated_slot = updated.get_field_object(sf("sfAuctionSlot"));
     assert!(!updated_slot.is_field_present(sf("sfAuthAccounts")));
+}
+
+#[test]
+fn amm_deposit_submit_shell_preserves_pool_invariant() {
+    let depositor = sample_account(0x41);
+    let amm_account = sample_account(0x42);
+    let usd_issuer = sample_account(0x51);
+    let eur_issuer = sample_account(0x52);
+    let usd = Issue::new(currency_from_string("USD"), usd_issuer);
+    let eur = Issue::new(currency_from_string("EUR"), eur_issuer);
+
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(depositor, 0, 0, 1_000_000_000),
+        account_root(usd_issuer, 0, 0),
+        account_root(eur_issuer, 0, 0),
+        account_root(amm_account, 0, 0),
+        amm_entry(amm_account, usd, eur, 1_000, vec![], 0),
+        trust_line_entry(amm_account, usd_issuer, usd.currency, 1_000),
+        trust_line_entry(amm_account, eur_issuer, eur.currency, 1_000),
+    ]);
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("AMM"),
+        protocol::fix_ammv1_3(),
+        protocol::feature_id("fixCleanup3_2_0"),
+    ]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let tx = STTx::new(TxType::AMM_DEPOSIT, |tx| {
+        tx.set_account_id(sf("sfAccount"), depositor);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(sf("sfAsset"), Asset::Issue(usd)),
+        );
+        tx.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), Asset::Issue(eur)),
+        );
+        tx.set_field_amount(sf("sfAmount"), iou_amount(sf("sfAmount"), usd, 100));
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfFlags"), 0x0008_0000);
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    let result = apply_submit_transactor_shell(&mut view, &tx, TxType::AMM_DEPOSIT);
+
+    assert_eq!(result, Ter::TES_SUCCESS);
 }
 
 #[test]
@@ -5877,13 +5936,19 @@ fn amm_deposit_rejects_locked_mpt_asset_before_pool_mutation() {
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::AMM_DEPOSIT, |tx| {
         tx.set_account_id(sf("sfAccount"), account);
-        tx.set_field_amount(sf("sfAsset"), mpt_asset);
-        tx.set_field_amount(sf("sfAsset2"), xrp_asset);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(sf("sfAsset"), mpt_asset.asset()),
+        );
+        tx.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), xrp_asset.asset()),
+        );
         tx.set_field_amount(
             sf("sfAmount"),
             STAmount::from_mpt_amount(
                 sf("sfAmount"),
-                protocol::MPTAmount::from_value(5),
+                protocol::MPTAmount::from_value(50),
                 mpt_issue,
             ),
         );
@@ -5891,6 +5956,7 @@ fn amm_deposit_rejects_locked_mpt_asset_before_pool_mutation() {
             sf("sfFee"),
             STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
         );
+        tx.set_field_u32(sf("sfFlags"), 0x0008_0000);
         tx.set_field_u32(sf("sfSequence"), 1);
     });
 
@@ -5928,13 +5994,19 @@ fn amm_deposit_rejects_locked_mpt_pool_holding_before_pool_mutation() {
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::AMM_DEPOSIT, |tx| {
         tx.set_account_id(sf("sfAccount"), account);
-        tx.set_field_amount(sf("sfAsset"), mpt_asset);
-        tx.set_field_amount(sf("sfAsset2"), xrp_asset);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(sf("sfAsset"), mpt_asset.asset()),
+        );
+        tx.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), xrp_asset.asset()),
+        );
         tx.set_field_amount(
             sf("sfAmount"),
             STAmount::from_mpt_amount(
                 sf("sfAmount"),
-                protocol::MPTAmount::from_value(5),
+                protocol::MPTAmount::from_value(50),
                 mpt_issue,
             ),
         );
@@ -5942,6 +6014,7 @@ fn amm_deposit_rejects_locked_mpt_pool_holding_before_pool_mutation() {
             sf("sfFee"),
             STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
         );
+        tx.set_field_u32(sf("sfFlags"), 0x0008_0000);
         tx.set_field_u32(sf("sfSequence"), 1);
     });
 
@@ -5976,13 +6049,19 @@ fn amm_deposit_rejects_mpt_deposit_amount_without_holder_token() {
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
     let tx = STTx::new(TxType::AMM_DEPOSIT, |tx| {
         tx.set_account_id(sf("sfAccount"), account);
-        tx.set_field_amount(sf("sfAsset"), mpt_asset);
-        tx.set_field_amount(sf("sfAsset2"), xrp_asset);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(sf("sfAsset"), mpt_asset.asset()),
+        );
+        tx.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), xrp_asset.asset()),
+        );
         tx.set_field_amount(
             sf("sfAmount"),
             STAmount::from_mpt_amount(
                 sf("sfAmount"),
-                protocol::MPTAmount::from_value(5),
+                protocol::MPTAmount::from_value(50),
                 mpt_issue,
             ),
         );
@@ -5990,6 +6069,7 @@ fn amm_deposit_rejects_mpt_deposit_amount_without_holder_token() {
             sf("sfFee"),
             STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
         );
+        tx.set_field_u32(sf("sfFlags"), 0x0008_0000);
         tx.set_field_u32(sf("sfSequence"), 1);
     });
 

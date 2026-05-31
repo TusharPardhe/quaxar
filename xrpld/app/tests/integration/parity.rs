@@ -22,8 +22,9 @@ use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView};
 use protocol::{
-    AccountID, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STArray, STLedgerEntry,
-    STObject, STTx, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol, sf_generic,
+    AccountID, Asset, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STArray, STIssue,
+    STLedgerEntry, STObject, STTx, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol,
+    sf_generic,
 };
 
 use super::fixtures::*;
@@ -13876,10 +13877,17 @@ fn amm_create_then_deposit() {
     assert_eq!(r1, Ter::TES_SUCCESS);
     let tx2 = STTx::new(TxType::AMM_DEPOSIT, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, usd, 0));
-        tx.set_field_amount(sf("sfAsset2"), xrp(0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(sf("sfAsset"), Asset::Issue(Issue::new(usd, gw))),
+        );
+        tx.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), Asset::Issue(protocol::xrp_issue())),
+        );
         tx.set_field_amount(sf("sfAmount"), iou(gw, usd, 1000));
         tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfFlags"), 0x0008_0000);
         tx.set_field_u32(sf("sfSequence"), 2);
     });
     let r2 = full_apply(&mut v, &tx2, TxType::AMM_DEPOSIT);

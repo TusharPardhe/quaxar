@@ -12,8 +12,8 @@ use std::sync::Arc;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ApplyViewImpl, Ledger, LedgerHeader, ReadView};
 use protocol::{
-    AccountID, ApplyFlags, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry,
-    STTx, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol, sf_generic,
+    AccountID, ApplyFlags, Asset, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STIssue,
+    STLedgerEntry, STTx, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol, sf_generic,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -429,10 +429,20 @@ fn amm_create_then_deposit() {
     // Deposit more
     let tx_deposit = STTx::new(TxType::AMM_DEPOSIT, |tx| {
         tx.set_account_id(sf("sfAccount"), alice);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, "USD", 0));
-        tx.set_field_amount(sf("sfAsset2"), xrp(0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(
+                sf("sfAsset"),
+                Asset::Issue(Issue::new(protocol::currency_from_string("USD"), gw)),
+            ),
+        );
+        tx.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), Asset::Issue(protocol::xrp_issue())),
+        );
         tx.set_field_amount(sf("sfAmount"), iou(gw, "USD", 1000));
         tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfFlags"), 0x0008_0000);
         tx.set_field_u32(sf("sfSequence"), 2);
     });
     let r2 = full_apply(&mut view, &tx_deposit, TxType::AMM_DEPOSIT);
