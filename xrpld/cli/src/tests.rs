@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::cli::{Cli, Command, rpc_call};
+    use crate::{Cli, Command, ValidatorKeysAction, logo, rpc_call};
     use clap::Parser;
 
     #[test]
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn logo_does_not_panic() {
         // Just ensure print_logo doesn't panic
-        crate::cli::logo::print_logo();
+        logo::print_logo();
     }
 
     #[test]
@@ -256,7 +256,7 @@ mod tests {
         let cli = Cli::try_parse_from(["xrpld", "validator-keys", "generate"]).unwrap();
         match cli.command {
             Some(Command::ValidatorKeys { action }) => {
-                assert!(matches!(action, crate::cli::ValidatorKeysAction::Generate));
+                assert!(matches!(action, ValidatorKeysAction::Generate));
             }
             _ => panic!("expected ValidatorKeys"),
         }
@@ -269,7 +269,7 @@ mod tests {
             Some(Command::ValidatorKeys { action }) => {
                 assert!(matches!(
                     action,
-                    crate::cli::ValidatorKeysAction::CreateToken { secret: None }
+                    ValidatorKeysAction::CreateToken { secret: None }
                 ));
             }
             _ => panic!("expected ValidatorKeys"),
@@ -281,7 +281,7 @@ mod tests {
         let cli = Cli::try_parse_from(["xrpld", "validator-keys", "sign", "hello"]).unwrap();
         match cli.command {
             Some(Command::ValidatorKeys { action }) => match action {
-                crate::cli::ValidatorKeysAction::Sign { data } => assert_eq!(data, "hello"),
+                ValidatorKeysAction::Sign { data } => assert_eq!(data, "hello"),
                 _ => panic!("expected Sign"),
             },
             _ => panic!("expected ValidatorKeys"),
@@ -299,7 +299,7 @@ mod tests {
         let cli = Cli::try_parse_from(["xrpld", "validator-keys", "revoke"]).unwrap();
         match cli.command {
             Some(Command::ValidatorKeys { action }) => {
-                assert!(matches!(action, crate::cli::ValidatorKeysAction::Revoke));
+                assert!(matches!(action, ValidatorKeysAction::Revoke));
             }
             _ => panic!("expected ValidatorKeys"),
         }
@@ -310,7 +310,7 @@ mod tests {
         let cli = Cli::try_parse_from(["xrpld", "validator-keys", "show"]).unwrap();
         match cli.command {
             Some(Command::ValidatorKeys { action }) => {
-                assert!(matches!(action, crate::cli::ValidatorKeysAction::Show));
+                assert!(matches!(action, ValidatorKeysAction::Show));
             }
             _ => panic!("expected ValidatorKeys"),
         }

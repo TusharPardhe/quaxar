@@ -17,6 +17,7 @@ members = [
     "xrpld/rpc",
     "xrpld/rpc-integration-tests",
     "xrpld/tx",
+    "xrpld/cli",
     "xrpld/main",
     "xrpld/replay-test",
     "xrpld/metrics",

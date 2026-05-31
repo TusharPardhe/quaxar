@@ -3965,6 +3965,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "xrpld-cli"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "basics",
+ "chrono",
+ "clap",
+ "comfy-table",
+ "console",
+ "crossterm 0.27.0",
+ "hex",
+ "indicatif",
+ "ipnet",
+ "protocol",
+ "reqwest",
+ "serde_json",
+ "terminal_size",
+ "ureq",
+]
+
+[[package]]
 name = "xrpld-main"
 version = "0.1.0"
 dependencies = [
@@ -3973,14 +3994,10 @@ dependencies = [
  "basics",
  "chrono",
  "clap",
- "comfy-table",
  "consensus",
  "console",
- "crossterm 0.27.0",
  "futures",
  "hex",
- "indicatif",
- "ipnet",
  "ledger",
  "nodestore",
  "overlay",
@@ -3993,13 +4010,12 @@ dependencies = [
  "server",
  "shamap",
  "tempfile",
- "terminal_size",
  "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "ureq",
  "xrpl_core",
+ "xrpld-cli",
 ]
 
 [[package]]

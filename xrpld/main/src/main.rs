@@ -21,8 +21,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-mod cli;
-
 const PEERFINDER_LIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const PEERFINDER_RECENT_ATTEMPT_DURATION: Duration = Duration::from_secs(60);
 const PEERFINDER_SECONDS_PER_MESSAGE: Duration = Duration::from_secs(151);
@@ -437,9 +435,6 @@ impl CatchupResourceProfile {
     }
 }
 
-pub(crate) const LEDGER_FETCH_LIMIT_OVERRIDE_MIN: usize = 1;
-pub(crate) const LEDGER_FETCH_LIMIT_OVERRIDE_MAX: usize = 8;
-
 fn bootstrap_acquire_budget_available(
     validated: u32,
     active_count: usize,
@@ -483,9 +478,13 @@ fn ledger_fetch_limit_override(config: &BasicConfig) -> Result<Option<usize>, St
         return Ok(None);
     };
 
-    if !(LEDGER_FETCH_LIMIT_OVERRIDE_MIN..=LEDGER_FETCH_LIMIT_OVERRIDE_MAX).contains(&limit) {
+    if !(xrpld_cli::LEDGER_FETCH_LIMIT_OVERRIDE_MIN..=xrpld_cli::LEDGER_FETCH_LIMIT_OVERRIDE_MAX)
+        .contains(&limit)
+    {
         return Err(format!(
-            "Configured ledger_acquisition.ledger_fetch_limit must be between {LEDGER_FETCH_LIMIT_OVERRIDE_MIN} and {LEDGER_FETCH_LIMIT_OVERRIDE_MAX}"
+            "Configured ledger_acquisition.ledger_fetch_limit must be between {} and {}",
+            xrpld_cli::LEDGER_FETCH_LIMIT_OVERRIDE_MIN,
+            xrpld_cli::LEDGER_FETCH_LIMIT_OVERRIDE_MAX
         ));
     }
 
@@ -496,7 +495,7 @@ fn ledger_fetch_limit_override(config: &BasicConfig) -> Result<Option<usize>, St
 /// handled, None if the node should start normally.
 /// Resolve the RPC URL: if user passed --url explicitly, use it.
 /// Otherwise, try to parse the config file to find the HTTP admin port.
-fn resolve_rpc_url(parsed: &cli::Cli) -> String {
+fn resolve_rpc_url(parsed: &xrpld_cli::Cli) -> String {
     // If user explicitly set --rpc-url (not the default), use it as-is
     if parsed.rpc_url != "http://127.0.0.1:5005" {
         return parsed.rpc_url.clone();
@@ -587,7 +586,7 @@ fn try_cli_subcommand() -> Option<ExitCode> {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        let _ = cli::Cli::command().print_help();
+        let _ = xrpld_cli::Cli::command().print_help();
         println!();
         return Some(ExitCode::SUCCESS);
     }
@@ -639,7 +638,7 @@ fn try_cli_subcommand() -> Option<ExitCode> {
         "-V",
     ];
 
-    let parsed = match cli::Cli::try_parse() {
+    let parsed = match xrpld_cli::Cli::try_parse() {
         Ok(parsed) => parsed,
         Err(err)
             if matches!(
@@ -682,61 +681,73 @@ fn try_cli_subcommand() -> Option<ExitCode> {
     let cmd = parsed.command?;
 
     let ok = match cmd {
-        cli::Command::Status => cli::status::run(url),
-        cli::Command::Health => {
-            if !cli::health::run(url) {
+        xrpld_cli::Command::Status => xrpld_cli::status::run(url),
+        xrpld_cli::Command::Health => {
+            if !xrpld_cli::health::run(url) {
                 return Some(ExitCode::FAILURE);
             }
             true
         }
-        cli::Command::Peers => cli::peers::run(url),
-        cli::Command::SyncStatus => cli::sync_status::run(url),
-        cli::Command::Rpc {
+        xrpld_cli::Command::Peers => xrpld_cli::peers::run(url),
+        xrpld_cli::Command::SyncStatus => xrpld_cli::sync_status::run(url),
+        xrpld_cli::Command::Rpc {
             method,
             params,
             raw,
-        } => cli::rpc_cmd::run(url, &method, params.as_deref(), raw),
-        cli::Command::Ping => cli::rpc_cmd::run_no_params(url, "ping"),
-        cli::Command::ServerInfo => cli::rpc_cmd::run_no_params(url, "server_info"),
-        cli::Command::ServerState => cli::rpc_cmd::run_no_params(url, "server_state"),
-        cli::Command::ServerDefinitions => cli::rpc_cmd::run_no_params(url, "server_definitions"),
-        cli::Command::LedgerClosed => cli::rpc_cmd::run_no_params(url, "ledger_closed"),
-        cli::Command::LedgerCurrent => cli::rpc_cmd::run_no_params(url, "ledger_current"),
-        cli::Command::LedgerHeader => cli::rpc_cmd::run_no_params(url, "ledger_header"),
-        cli::Command::FetchInfo => cli::rpc_cmd::run_no_params(url, "fetch_info"),
-        cli::Command::GetCounts => cli::rpc_cmd::run_no_params(url, "get_counts"),
-        cli::Command::CanDelete { value } => cli::rpc_cmd::run_can_delete(url, value.as_deref()),
-        cli::Command::LogRotate => cli::rpc_cmd::run_logrotate(url),
-        cli::Command::Random => cli::rpc_cmd::run_no_params(url, "random"),
-        cli::Command::ValidatorInfo => cli::rpc_cmd::run_no_params(url, "validator_info"),
-        cli::Command::ValidatorListSites => {
-            cli::rpc_cmd::run_no_params(url, "validator_list_sites")
+        } => xrpld_cli::rpc_cmd::run(url, &method, params.as_deref(), raw),
+        xrpld_cli::Command::Ping => xrpld_cli::rpc_cmd::run_no_params(url, "ping"),
+        xrpld_cli::Command::ServerInfo => xrpld_cli::rpc_cmd::run_no_params(url, "server_info"),
+        xrpld_cli::Command::ServerState => xrpld_cli::rpc_cmd::run_no_params(url, "server_state"),
+        xrpld_cli::Command::ServerDefinitions => {
+            xrpld_cli::rpc_cmd::run_no_params(url, "server_definitions")
         }
-        cli::Command::UnlList => cli::rpc_cmd::run_no_params(url, "unl_list"),
-        cli::Command::ConsensusInfo => cli::rpc_cmd::run_no_params(url, "consensus_info"),
-        cli::Command::TxReduceRelay => cli::rpc_cmd::run_no_params(url, "tx_reduce_relay"),
-        cli::Command::DbStats => cli::db_stats::run(url, parsed.conf.as_deref()),
-        cli::Command::LogLevel { level } => cli::log_level::run(url, level.as_deref()),
-        cli::Command::ConfigCheck => {
-            cli::config_check::run(parsed.conf.as_deref());
+        xrpld_cli::Command::LedgerClosed => xrpld_cli::rpc_cmd::run_no_params(url, "ledger_closed"),
+        xrpld_cli::Command::LedgerCurrent => {
+            xrpld_cli::rpc_cmd::run_no_params(url, "ledger_current")
+        }
+        xrpld_cli::Command::LedgerHeader => xrpld_cli::rpc_cmd::run_no_params(url, "ledger_header"),
+        xrpld_cli::Command::FetchInfo => xrpld_cli::rpc_cmd::run_no_params(url, "fetch_info"),
+        xrpld_cli::Command::GetCounts => xrpld_cli::rpc_cmd::run_no_params(url, "get_counts"),
+        xrpld_cli::Command::CanDelete { value } => {
+            xrpld_cli::rpc_cmd::run_can_delete(url, value.as_deref())
+        }
+        xrpld_cli::Command::LogRotate => xrpld_cli::rpc_cmd::run_logrotate(url),
+        xrpld_cli::Command::Random => xrpld_cli::rpc_cmd::run_no_params(url, "random"),
+        xrpld_cli::Command::ValidatorInfo => {
+            xrpld_cli::rpc_cmd::run_no_params(url, "validator_info")
+        }
+        xrpld_cli::Command::ValidatorListSites => {
+            xrpld_cli::rpc_cmd::run_no_params(url, "validator_list_sites")
+        }
+        xrpld_cli::Command::UnlList => xrpld_cli::rpc_cmd::run_no_params(url, "unl_list"),
+        xrpld_cli::Command::ConsensusInfo => {
+            xrpld_cli::rpc_cmd::run_no_params(url, "consensus_info")
+        }
+        xrpld_cli::Command::TxReduceRelay => {
+            xrpld_cli::rpc_cmd::run_no_params(url, "tx_reduce_relay")
+        }
+        xrpld_cli::Command::DbStats => xrpld_cli::db_stats::run(url, parsed.conf.as_deref()),
+        xrpld_cli::Command::LogLevel { level } => xrpld_cli::log_level::run(url, level.as_deref()),
+        xrpld_cli::Command::ConfigCheck => {
+            xrpld_cli::config_check::run(parsed.conf.as_deref());
             true
         }
-        cli::Command::Doctor => {
-            cli::doctor::run(url, parsed.conf.as_deref());
+        xrpld_cli::Command::Doctor => {
+            xrpld_cli::doctor::run(url, parsed.conf.as_deref());
             true
         }
-        cli::Command::Version => {
-            cli::version::run();
+        xrpld_cli::Command::Version => {
+            xrpld_cli::version::run();
             true
         }
-        cli::Command::Validators => cli::validators::run(url),
-        cli::Command::Amendments => cli::amendments::run(url),
-        cli::Command::Fee => cli::fee::run(url),
-        cli::Command::Ledger { seq } => cli::ledger_cmd::run(url, seq),
-        cli::Command::Account { address } => cli::account::run(url, &address),
-        cli::Command::Stop => cli::stop::run(url),
-        cli::Command::Connect { address } => {
-            let result = cli::rpc_call(url, "connect", serde_json::json!({"ip": address}));
+        xrpld_cli::Command::Validators => xrpld_cli::validators::run(url),
+        xrpld_cli::Command::Amendments => xrpld_cli::amendments::run(url),
+        xrpld_cli::Command::Fee => xrpld_cli::fee::run(url),
+        xrpld_cli::Command::Ledger { seq } => xrpld_cli::ledger_cmd::run(url, seq),
+        xrpld_cli::Command::Account { address } => xrpld_cli::account::run(url, &address),
+        xrpld_cli::Command::Stop => xrpld_cli::stop::run(url),
+        xrpld_cli::Command::Connect { address } => {
+            let result = xrpld_cli::rpc_call(url, "connect", serde_json::json!({"ip": address}));
             match result {
                 Ok(_) => {
                     println!(
@@ -752,24 +763,24 @@ fn try_cli_subcommand() -> Option<ExitCode> {
                 }
             }
         }
-        cli::Command::Benchmark => {
-            cli::benchmark::run();
+        xrpld_cli::Command::Benchmark => {
+            xrpld_cli::benchmark::run();
             true
         }
-        cli::Command::Cli => {
-            cli::interactive::run(url);
+        xrpld_cli::Command::Cli => {
+            xrpld_cli::interactive::run(url);
             true
         }
-        cli::Command::ValidatorKeys { action } => {
-            use cli::ValidatorKeysAction;
+        xrpld_cli::Command::ValidatorKeys { action } => {
+            use xrpld_cli::ValidatorKeysAction;
             match action {
-                ValidatorKeysAction::Generate => cli::validator_keys::run_generate(),
+                ValidatorKeysAction::Generate => xrpld_cli::validator_keys::run_generate(),
                 ValidatorKeysAction::CreateToken { secret } => {
-                    cli::validator_keys::run_create_token(secret.as_deref())
+                    xrpld_cli::validator_keys::run_create_token(secret.as_deref())
                 }
-                ValidatorKeysAction::Sign { data } => cli::validator_keys::run_sign(&data),
-                ValidatorKeysAction::Revoke => cli::validator_keys::run_revoke(),
-                ValidatorKeysAction::Show => cli::validator_keys::run_show(),
+                ValidatorKeysAction::Sign { data } => xrpld_cli::validator_keys::run_sign(&data),
+                ValidatorKeysAction::Revoke => xrpld_cli::validator_keys::run_revoke(),
+                ValidatorKeysAction::Show => xrpld_cli::validator_keys::run_show(),
             }
             true
         }
