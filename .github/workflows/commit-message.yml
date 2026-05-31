@@ -1,0 +1,40 @@
+name: Commit Message
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  conventional-commits:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate commit messages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+
+          if [[ "${base}" =~ ^0+$ ]]; then
+            range="${head}"
+          else
+            range="${base}..${head}"
+          fi
+
+          tmp="$(mktemp)"
+          while read -r commit; do
+            git log -1 --format=%B "${commit}" > "${tmp}"
+            ./scripts/validate_commit_message.sh "${tmp}"
+          done < <(git rev-list --no-merges "${range}")

@@ -22,8 +22,9 @@ use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView};
 use protocol::{
-    AccountID, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STArray, STLedgerEntry,
-    STObject, STTx, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol, sf_generic,
+    AccountID, Asset, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STArray, STIssue,
+    STLedgerEntry, STObject, STTx, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol,
+    sf_generic,
 };
 
 use super::fixtures::*;
@@ -13876,10 +13877,17 @@ fn amm_create_then_deposit() {
     assert_eq!(r1, Ter::TES_SUCCESS);
     let tx2 = STTx::new(TxType::AMM_DEPOSIT, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_amount(sf("sfAsset"), iou(gw, usd, 0));
-        tx.set_field_amount(sf("sfAsset2"), xrp(0));
+        tx.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(sf("sfAsset"), Asset::Issue(Issue::new(usd, gw))),
+        );
+        tx.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), Asset::Issue(protocol::xrp_issue())),
+        );
         tx.set_field_amount(sf("sfAmount"), iou(gw, usd, 1000));
         tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfFlags"), 0x0008_0000);
         tx.set_field_u32(sf("sfSequence"), 2);
     });
     let r2 = full_apply(&mut v, &tx2, TxType::AMM_DEPOSIT);
@@ -17291,11 +17299,7 @@ fn ledger_offer_creates_book_directory() {
         handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None),
         Ter::TES_SUCCESS
     );
-    let book = protocol::Book {
-        r#in: protocol::xrp_issue(),
-        out: Issue::new(usd, gw),
-        domain: None,
-    };
+    let book = protocol::Book::new(protocol::xrp_issue(), Issue::new(usd, gw), None);
     let book_base = protocol::get_book_base(book);
     let book_end = protocol::get_quality_next(book_base);
     let next = v.succ(book_base, Some(book_end));
@@ -20320,33 +20324,33 @@ fn proto_sttx_is_field_present() {
 
 #[test]
 fn proto_book_keylet() {
-    let book = protocol::Book {
-        r#in: protocol::xrp_issue(),
-        out: Issue::new(usd_currency(), acct(0x33)),
-        domain: None,
-    };
+    let book = protocol::Book::new(
+        protocol::xrp_issue(),
+        Issue::new(usd_currency(), acct(0x33)),
+        None,
+    );
     let k = protocol::book_keylet(book);
     assert!(!k.key.is_zero());
 }
 
 #[test]
 fn proto_get_book_base() {
-    let book = protocol::Book {
-        r#in: protocol::xrp_issue(),
-        out: Issue::new(usd_currency(), acct(0x33)),
-        domain: None,
-    };
+    let book = protocol::Book::new(
+        protocol::xrp_issue(),
+        Issue::new(usd_currency(), acct(0x33)),
+        None,
+    );
     let base = protocol::get_book_base(book);
     assert!(!base.is_zero());
 }
 
 #[test]
 fn proto_quality_next() {
-    let book = protocol::Book {
-        r#in: protocol::xrp_issue(),
-        out: Issue::new(usd_currency(), acct(0x33)),
-        domain: None,
-    };
+    let book = protocol::Book::new(
+        protocol::xrp_issue(),
+        Issue::new(usd_currency(), acct(0x33)),
+        None,
+    );
     let base = protocol::get_book_base(book);
     let next = protocol::get_quality_next(base);
     assert!(next > base);
@@ -20975,11 +20979,7 @@ fn proto3_st_amount_asset() {
 fn proto3_book_in_out() {
     let gw = acct(0x33);
     let usd = usd_currency();
-    let book = protocol::Book {
-        r#in: protocol::xrp_issue(),
-        out: Issue::new(usd, gw),
-        domain: None,
-    };
+    let book = protocol::Book::new(protocol::xrp_issue(), Issue::new(usd, gw), None);
     assert!(book.r#in.native());
     assert!(!book.out.native());
 }

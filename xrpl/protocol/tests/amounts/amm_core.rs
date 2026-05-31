@@ -1,7 +1,9 @@
 use protocol::{
-    AccountID, Currency, Issue, Rules, STAmount, STObject, Ter, amm_auction_time_slot, amm_enabled,
-    amm_lpt_currency, amm_lpt_issue, bad_currency, currency_from_string, feature_amm,
+    AccountID, Asset, Currency, Issue, MPTIssue, Rules, STAmount, STObject, Ter,
+    amm_auction_time_slot, amm_enabled, amm_lpt_currency, amm_lpt_currency_from_assets,
+    amm_lpt_issue, amm_lpt_issue_from_assets, bad_currency, currency_from_string, feature_amm,
     feature_universal_number, get_field_by_symbol, invalid_amm_amount, invalid_amm_asset_pair,
+    make_mpt_id,
 };
 
 fn sample_account(fill: u8) -> AccountID {
@@ -30,6 +32,25 @@ fn amm_lpt_currency_order_independence_and_prefix_rules() {
     let issue = amm_lpt_issue(usd, eur, amm_account);
 
     assert_eq!(left, right);
+    assert_eq!(left.data()[0], 0x03);
+    assert_eq!(issue, Issue::new(left, amm_account));
+}
+
+#[test]
+fn amm_lpt_currency_uses_full_asset_identity_for_mpt_assets() {
+    let issuer = sample_account(0x42);
+    let usd = Asset::from(Issue::new(currency_from_string("USD"), issuer));
+    let mpt = Asset::from(MPTIssue::new(make_mpt_id(7, issuer)));
+    let other_mpt = Asset::from(MPTIssue::new(make_mpt_id(8, issuer)));
+    let amm_account = sample_account(0x43);
+
+    let left = amm_lpt_currency_from_assets(usd, mpt);
+    let right = amm_lpt_currency_from_assets(mpt, usd);
+    let distinct = amm_lpt_currency_from_assets(usd, other_mpt);
+    let issue = amm_lpt_issue_from_assets(usd, mpt, amm_account);
+
+    assert_eq!(left, right);
+    assert_ne!(left, distinct);
     assert_eq!(left.data()[0], 0x03);
     assert_eq!(issue, Issue::new(left, amm_account));
 }

@@ -83,6 +83,13 @@ perf: parallelize state map acquisition across 4 threads
 docs: add architecture diagram to ARCHITECTURE.md
 ```
 
+Commit message validation is enforced in CI for pull requests and pushes to `main`.
+To install the same blocking check locally, run:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## PR Process
 
 1. **Fork** the repository

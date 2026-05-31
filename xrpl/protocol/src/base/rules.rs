@@ -9,7 +9,7 @@ use basics::number::{MantissaScale, set_mantissa_scale};
 use basics::unordered_containers::{HardenedHashSet, HashSet};
 use std::sync::OnceLock;
 
-use crate::{feature_lending_protocol, feature_single_asset_vault};
+use crate::{feature_lending_protocol, feature_single_asset_vault, fix_cleanup_3_2_0};
 
 #[derive(Debug, Clone, Default)]
 pub struct Rules {
@@ -65,19 +65,21 @@ pub fn get_current_transaction_rules() -> Option<Rules> {
 }
 
 pub fn set_current_transaction_rules(rules: Option<Rules>) {
-    let enable_large_numbers = match &rules {
-        None => true,
+    let mantissa_scale = match &rules {
+        None => MantissaScale::Large,
         Some(rules) => {
-            rules.enabled(&feature_single_asset_vault())
-                || rules.enabled(&feature_lending_protocol())
+            let enable_vault_numbers = rules.enabled(&feature_single_asset_vault())
+                || rules.enabled(&feature_lending_protocol());
+            let enable_cusp_fix = rules.enabled(&fix_cleanup_3_2_0());
+            match (enable_vault_numbers, enable_cusp_fix) {
+                (true, true) => MantissaScale::Large,
+                (true, false) => MantissaScale::LargeLegacy,
+                (false, _) => MantissaScale::Small,
+            }
         }
     };
 
-    set_mantissa_scale(if enable_large_numbers {
-        MantissaScale::Large
-    } else {
-        MantissaScale::Small
-    });
+    set_mantissa_scale(mantissa_scale);
     current_transaction_rules_ref().set(rules);
 }
 
@@ -157,7 +159,7 @@ mod tests {
         CurrentTransactionRulesGuard, Rules, get_current_transaction_rules, is_feature_enabled,
         make_rules_given_current, make_rules_given_ledger, set_current_transaction_rules,
     };
-    use crate::{feature_lending_protocol, feature_single_asset_vault};
+    use crate::{feature_lending_protocol, feature_single_asset_vault, fix_cleanup_3_2_0};
     use basics::base_uint::Uint256;
     use basics::local_value::{LocalSlotOwner, install_local_slot_owner};
     use basics::number::{MantissaScale, get_mantissa_scale};
@@ -289,9 +291,21 @@ mod tests {
         assert_eq!(get_mantissa_scale(), MantissaScale::Small);
 
         set_current_transaction_rules(Some(Rules::new([feature_single_asset_vault()])));
-        assert_eq!(get_mantissa_scale(), MantissaScale::Large);
+        assert_eq!(get_mantissa_scale(), MantissaScale::LargeLegacy);
 
         set_current_transaction_rules(Some(Rules::new([feature_lending_protocol()])));
+        assert_eq!(get_mantissa_scale(), MantissaScale::LargeLegacy);
+
+        set_current_transaction_rules(Some(Rules::new([
+            feature_single_asset_vault(),
+            fix_cleanup_3_2_0(),
+        ])));
+        assert_eq!(get_mantissa_scale(), MantissaScale::Large);
+
+        set_current_transaction_rules(Some(Rules::new([
+            feature_lending_protocol(),
+            fix_cleanup_3_2_0(),
+        ])));
         assert_eq!(get_mantissa_scale(), MantissaScale::Large);
 
         set_current_transaction_rules(None);

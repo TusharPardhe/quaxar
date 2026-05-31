@@ -43,6 +43,9 @@ const LEDGER_NAMESPACE_XCHAIN_CREATE_ACCOUNT_CLAIM_ID: u16 = b'K' as u16;
 const LEDGER_NAMESPACE_VAULT: u16 = b'V' as u16;
 const LEDGER_NAMESPACE_LOAN_BROKER: u16 = b'l' as u16;
 const LEDGER_NAMESPACE_LOAN: u16 = b'L' as u16;
+const BOOK_BASE_ISSUE_MPT_TAG: [u8; 1] = [0x01];
+const BOOK_BASE_MPT_ISSUE_TAG: [u8; 1] = [0x02];
+const BOOK_BASE_MPT_MPT_TAG: [u8; 1] = [0x03];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u16)]
@@ -567,24 +570,79 @@ pub fn get_book_base(book: Book) -> Uint256 {
         "get_book_base requires a consistent Book"
     );
 
-    let index = match book.domain {
-        Some(domain) => index_hash_with_slices(
+    let index = match (book.r#in, book.out, book.domain) {
+        (Asset::Issue(input), Asset::Issue(output), Some(domain)) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
             &[
-                book.r#in.currency.data(),
-                book.out.currency.data(),
-                book.r#in.account.data(),
-                book.out.account.data(),
+                input.currency.data(),
+                output.currency.data(),
+                input.account.data(),
+                output.account.data(),
                 domain.data(),
             ],
         ),
-        None => index_hash_with_slices(
+        (Asset::Issue(input), Asset::Issue(output), None) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
             &[
-                book.r#in.currency.data(),
-                book.out.currency.data(),
-                book.r#in.account.data(),
-                book.out.account.data(),
+                input.currency.data(),
+                output.currency.data(),
+                input.account.data(),
+                output.account.data(),
+            ],
+        ),
+        (Asset::Issue(input), Asset::MPTIssue(output), Some(domain)) => index_hash_with_slices(
+            LEDGER_NAMESPACE_BOOK_DIR,
+            &[
+                &BOOK_BASE_ISSUE_MPT_TAG,
+                input.currency.data(),
+                output.mpt_id().data(),
+                input.account.data(),
+                domain.data(),
+            ],
+        ),
+        (Asset::Issue(input), Asset::MPTIssue(output), None) => index_hash_with_slices(
+            LEDGER_NAMESPACE_BOOK_DIR,
+            &[
+                &BOOK_BASE_ISSUE_MPT_TAG,
+                input.currency.data(),
+                output.mpt_id().data(),
+                input.account.data(),
+            ],
+        ),
+        (Asset::MPTIssue(input), Asset::Issue(output), Some(domain)) => index_hash_with_slices(
+            LEDGER_NAMESPACE_BOOK_DIR,
+            &[
+                &BOOK_BASE_MPT_ISSUE_TAG,
+                input.mpt_id().data(),
+                output.currency.data(),
+                output.account.data(),
+                domain.data(),
+            ],
+        ),
+        (Asset::MPTIssue(input), Asset::Issue(output), None) => index_hash_with_slices(
+            LEDGER_NAMESPACE_BOOK_DIR,
+            &[
+                &BOOK_BASE_MPT_ISSUE_TAG,
+                input.mpt_id().data(),
+                output.currency.data(),
+                output.account.data(),
+            ],
+        ),
+        (Asset::MPTIssue(input), Asset::MPTIssue(output), Some(domain)) => index_hash_with_slices(
+            LEDGER_NAMESPACE_BOOK_DIR,
+            &[
+                &BOOK_BASE_MPT_MPT_TAG,
+                input.mpt_id().data(),
+                output.mpt_id().data(),
+                domain.data(),
+            ],
+        ),
+        (Asset::MPTIssue(input), Asset::MPTIssue(output), None) => index_hash_with_slices(
+            LEDGER_NAMESPACE_BOOK_DIR,
+            &[
+                &BOOK_BASE_MPT_MPT_TAG,
+                input.mpt_id().data(),
+                output.mpt_id().data(),
             ],
         ),
     };
@@ -973,20 +1031,14 @@ pub const DIRECT_ACCOUNT_KEYLETS: [DirectAccountKeyletDesc; 6] = [
 ];
 
 pub fn amm(issue1: Asset, issue2: Asset) -> Keylet {
-    let (left, right) = match (issue1, issue2) {
-        (Asset::Issue(left), Asset::Issue(right)) => {
-            if left <= right {
-                (left, right)
-            } else {
-                (right, left)
-            }
-        }
-        _ => panic!("amm requires Issue assets"),
+    let (left, right) = if issue1 <= issue2 {
+        (issue1, issue2)
+    } else {
+        (issue2, issue1)
     };
 
-    Keylet::new(
-        LedgerEntryType::AMM,
-        index_hash_with_slices(
+    let key = match (left, right) {
+        (Asset::Issue(left), Asset::Issue(right)) => index_hash_with_slices(
             LEDGER_NAMESPACE_AMM,
             &[
                 left.account.data(),
@@ -995,7 +1047,29 @@ pub fn amm(issue1: Asset, issue2: Asset) -> Keylet {
                 right.currency.data(),
             ],
         ),
-    )
+        (Asset::Issue(left), Asset::MPTIssue(right)) => index_hash_with_slices(
+            LEDGER_NAMESPACE_AMM,
+            &[
+                left.account.data(),
+                left.currency.data(),
+                right.mpt_id().data(),
+            ],
+        ),
+        (Asset::MPTIssue(left), Asset::Issue(right)) => index_hash_with_slices(
+            LEDGER_NAMESPACE_AMM,
+            &[
+                left.mpt_id().data(),
+                right.account.data(),
+                right.currency.data(),
+            ],
+        ),
+        (Asset::MPTIssue(left), Asset::MPTIssue(right)) => index_hash_with_slices(
+            LEDGER_NAMESPACE_AMM,
+            &[left.mpt_id().data(), right.mpt_id().data()],
+        ),
+    };
+
+    Keylet::new(LedgerEntryType::AMM, key)
 }
 
 pub fn amm_keylet(id: Uint256) -> Keylet {

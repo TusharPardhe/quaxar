@@ -131,9 +131,9 @@ pub use amm_core::{
     AUCTION_SLOT_DISCOUNTED_FEE_FRACTION, AUCTION_SLOT_FEE_SCALE_FACTOR,
     AUCTION_SLOT_INTERVAL_DURATION, AUCTION_SLOT_MAX_AUTH_ACCOUNTS, AUCTION_SLOT_MIN_FEE_FRACTION,
     AUCTION_SLOT_TIME_INTERVALS, TOTAL_TIME_SLOT_SECS, TRADING_FEE_THRESHOLD, VOTE_MAX_SLOTS,
-    VOTE_WEIGHT_SCALE_FACTOR, amm_auction_time_slot, amm_enabled, amm_lpt_currency, amm_lpt_issue,
-    fee_mult, fee_mult_half, get_fee, invalid_amm_amount, invalid_amm_asset,
-    invalid_amm_asset_pair,
+    VOTE_WEIGHT_SCALE_FACTOR, amm_auction_time_slot, amm_enabled, amm_lpt_currency,
+    amm_lpt_currency_from_assets, amm_lpt_issue, amm_lpt_issue_from_assets, fee_mult,
+    fee_mult_half, get_fee, invalid_amm_amount, invalid_amm_asset, invalid_amm_asset_pair,
 };
 pub use amount_conversions::{
     AmountAsset, FromAmountSource, FromNumberAmount, MaxAmountForAsset, ToStAmountSource, get,
@@ -208,13 +208,13 @@ pub use feature::{
     FEATURE_AMM_NAME, FEATURE_BATCH_NAME, FEATURE_CLAWBACK_NAME, FEATURE_LENDING_PROTOCOL_NAME,
     FEATURE_SINGLE_ASSET_VAULT_NAME, FEATURE_TOKEN_ESCROW_NAME, FEATURE_UNIVERSAL_NUMBER_NAME,
     FEATURE_XCHAIN_BRIDGE_NAME, FEATURE_XRP_FEES_NAME, FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME,
-    FIX_BATCH_INNER_SIGS_NAME, FIX_INNER_OBJ_TEMPLATE_NAME, FIX_INNER_OBJ_TEMPLATE2_NAME,
-    FIX_PREVIOUS_TXN_ID_NAME, FeatureSet, REGISTERED_FEATURES, RegisteredFeature,
-    RegisteredFeatureVote, feature_amm, feature_batch, feature_clawback, feature_deep_freeze,
-    feature_id, feature_lending_protocol, feature_mp_tokens_v1, feature_name,
+    FIX_BATCH_INNER_SIGS_NAME, FIX_CLEANUP_3_2_0_NAME, FIX_INNER_OBJ_TEMPLATE_NAME,
+    FIX_INNER_OBJ_TEMPLATE2_NAME, FIX_PREVIOUS_TXN_ID_NAME, FeatureSet, REGISTERED_FEATURES,
+    RegisteredFeature, RegisteredFeatureVote, feature_amm, feature_batch, feature_clawback,
+    feature_deep_freeze, feature_id, feature_lending_protocol, feature_mp_tokens_v1, feature_name,
     feature_nftoken_mint_offer, feature_permissioned_domains, feature_single_asset_vault,
     feature_token_escrow, feature_universal_number, feature_xchain_bridge, feature_xrp_fees,
-    fix_ammv1_1, fix_ammv1_3, fix_batch_inner_sigs, fix_cleanup_3_1_3,
+    fix_ammv1_1, fix_ammv1_3, fix_batch_inner_sigs, fix_cleanup_3_1_3, fix_cleanup_3_2_0,
     fix_enforce_nftoken_trustline_v2, fix_inner_obj_template, fix_inner_obj_template2,
     fix_nftoken_page_links, fix_previous_txn_id, fix_token_escrow_v1, registered_feature,
 };
@@ -382,7 +382,7 @@ pub use signature_check::{
 };
 pub use so_template::{SOEStyle, SOETxMPTIssue, SOElement, SOTemplate, TemplateError};
 pub use st_account::STAccount;
-pub use st_amount::STAmount;
+pub use st_amount::{STAmount, has_invalid_amount, is_legal_mpt, is_legal_net};
 pub use st_bit_string::{
     STBitString, STUInt128, STUInt160, STUInt192, STUInt256, UInt128Kind, UInt160Kind, UInt192Kind,
     UInt256Kind,

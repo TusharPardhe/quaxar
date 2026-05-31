@@ -127,22 +127,31 @@ pub fn do_get_aggregate_price<S: AggregatePriceSource>(
     };
 
     // Validate required fields
-    let Some(JsonValue::Array(oracles)) = obj.get("oracles") else {
+    let Some(oracles_value) = obj.get("oracles") else {
         return missing_field_error("oracles");
+    };
+    let JsonValue::Array(oracles) = oracles_value else {
+        return oracle_malformed_error();
     };
     if oracles.is_empty() || oracles.len() > MAX_ORACLES {
         return oracle_malformed_error();
     }
 
-    let Some(JsonValue::String(base_asset)) = obj.get("base_asset") else {
+    let Some(base_asset_value) = obj.get("base_asset") else {
         return missing_field_error("base_asset");
+    };
+    let JsonValue::String(base_asset) = base_asset_value else {
+        return rpc_error(RpcErrorCode::InvalidParams);
     };
     if base_asset.is_empty() {
         return rpc_error(RpcErrorCode::InvalidParams);
     }
 
-    let Some(JsonValue::String(quote_asset)) = obj.get("quote_asset") else {
+    let Some(quote_asset_value) = obj.get("quote_asset") else {
         return missing_field_error("quote_asset");
+    };
+    let JsonValue::String(quote_asset) = quote_asset_value else {
+        return rpc_error(RpcErrorCode::InvalidParams);
     };
     if quote_asset.is_empty() {
         return rpc_error(RpcErrorCode::InvalidParams);
@@ -407,6 +416,13 @@ mod tests {
         JsonValue::Object(obj)
     }
 
+    fn error_code(result: &JsonValue) -> Option<&JsonValue> {
+        let JsonValue::Object(fields) = result else {
+            return None;
+        };
+        fields.get("error")
+    }
+
     #[test]
     fn test_single_oracle() {
         let source = make_source(vec![("rABC", 1, 1000, "XRP", "USD", 50000, 4)]);
@@ -481,6 +497,75 @@ mod tests {
         assert_eq!(
             r.get("error"),
             Some(&JsonValue::String("oracleMalformed".to_string()))
+        );
+    }
+
+    #[test]
+    fn null_required_fields_are_malformed_or_invalid_not_missing() {
+        let source = make_source(vec![]);
+
+        let mut null_oracles = BTreeMap::new();
+        null_oracles.insert("oracles".to_string(), JsonValue::Null);
+        null_oracles.insert(
+            "base_asset".to_string(),
+            JsonValue::String("XRP".to_string()),
+        );
+        null_oracles.insert(
+            "quote_asset".to_string(),
+            JsonValue::String("USD".to_string()),
+        );
+        assert_eq!(
+            error_code(&do_get_aggregate_price(
+                &JsonValue::Object(null_oracles),
+                &source
+            )),
+            Some(&JsonValue::String("oracleMalformed".to_string()))
+        );
+
+        let mut null_base = BTreeMap::new();
+        null_base.insert(
+            "oracles".to_string(),
+            JsonValue::Array(vec![{
+                let mut oracle = BTreeMap::new();
+                oracle.insert("account".to_string(), JsonValue::String("rA".to_string()));
+                oracle.insert("oracle_document_id".to_string(), JsonValue::Unsigned(1));
+                JsonValue::Object(oracle)
+            }]),
+        );
+        null_base.insert("base_asset".to_string(), JsonValue::Null);
+        null_base.insert(
+            "quote_asset".to_string(),
+            JsonValue::String("USD".to_string()),
+        );
+        assert_eq!(
+            error_code(&do_get_aggregate_price(
+                &JsonValue::Object(null_base),
+                &source
+            )),
+            Some(&JsonValue::String("invalidParams".to_string()))
+        );
+
+        let mut null_quote = BTreeMap::new();
+        null_quote.insert(
+            "oracles".to_string(),
+            JsonValue::Array(vec![{
+                let mut oracle = BTreeMap::new();
+                oracle.insert("account".to_string(), JsonValue::String("rA".to_string()));
+                oracle.insert("oracle_document_id".to_string(), JsonValue::Unsigned(1));
+                JsonValue::Object(oracle)
+            }]),
+        );
+        null_quote.insert(
+            "base_asset".to_string(),
+            JsonValue::String("XRP".to_string()),
+        );
+        null_quote.insert("quote_asset".to_string(), JsonValue::Null);
+        assert_eq!(
+            error_code(&do_get_aggregate_price(
+                &JsonValue::Object(null_quote),
+                &source
+            )),
+            Some(&JsonValue::String("invalidParams".to_string()))
         );
     }
 

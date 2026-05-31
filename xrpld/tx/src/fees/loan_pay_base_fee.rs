@@ -17,6 +17,9 @@
 use std::ops::{Add, Mul};
 
 pub const LOAN_PAYMENTS_PER_FEE_INCREMENT: u32 = 5;
+pub const LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION: u32 = 100;
+pub const LOAN_MAXIMUM_FEE_INCREMENTS: u64 =
+    (LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION / LOAN_PAYMENTS_PER_FEE_INCREMENT) as u64;
 
 pub trait LoanPayBaseFeeTx {
     type Asset;
@@ -113,7 +116,8 @@ where
             + loan.loan_service_fee().clone();
     let payment_estimate =
         estimate_payment_count(tx.amount(), &regular_payment, tx.is_overpayment());
-    let fee_increments = compute_loan_pay_fee_increments(payment_estimate);
+    let fee_increments =
+        compute_loan_pay_fee_increments(payment_estimate).min(LOAN_MAXIMUM_FEE_INCREMENTS);
 
     normal_cost * fee_increments
 }
@@ -123,8 +127,8 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use super::{
-        LOAN_PAYMENTS_PER_FEE_INCREMENT, LoanPayBaseFeeBroker, LoanPayBaseFeeLoan,
-        LoanPayBaseFeeTx, LoanPayBaseFeeVault, compute_loan_pay_fee_increments,
+        LOAN_MAXIMUM_FEE_INCREMENTS, LOAN_PAYMENTS_PER_FEE_INCREMENT, LoanPayBaseFeeBroker,
+        LoanPayBaseFeeLoan, LoanPayBaseFeeTx, LoanPayBaseFeeVault, compute_loan_pay_fee_increments,
         run_loan_pay_calculate_base_fee,
     };
 
@@ -486,5 +490,39 @@ mod tests {
         );
 
         assert_eq!(fee, 10);
+    }
+
+    #[test]
+    fn loan_pay_base_fee_caps_large_payment_estimates() {
+        let fee = run_loan_pay_calculate_base_fee(
+            &TestTx {
+                full_payment: false,
+                late_payment: false,
+                overpayment: true,
+                amount: 1_000_000,
+                asset: "USD",
+            },
+            10_u64,
+            || {
+                Some(TestLoan {
+                    payment_remaining: LOAN_PAYMENTS_PER_FEE_INCREMENT + 1,
+                    next_payment_due_date: 42,
+                    broker_id: "broker",
+                    scale: 3,
+                    periodic_payment: 10,
+                    loan_service_fee: 2,
+                })
+            },
+            |_| false,
+            |_| Some(TestBroker { vault_id: "vault" }),
+            |_| Some(TestVault { asset: "USD" }),
+            |_, periodic, _| *periodic,
+            |_, _, overpayment| {
+                assert!(overpayment);
+                10_000
+            },
+        );
+
+        assert_eq!(fee, 10 * LOAN_MAXIMUM_FEE_INCREMENTS);
     }
 }

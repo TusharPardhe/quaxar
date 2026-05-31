@@ -152,8 +152,10 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
             LedgerFormatFieldSpec { field_symbol: "sfOwner", style: SOEStyle::Optional },
             LedgerFormatFieldSpec { field_symbol: "sfTakerPaysCurrency", style: SOEStyle::Optional },
             LedgerFormatFieldSpec { field_symbol: "sfTakerPaysIssuer", style: SOEStyle::Optional },
+            LedgerFormatFieldSpec { field_symbol: "sfTakerPaysMPT", style: SOEStyle::Optional },
             LedgerFormatFieldSpec { field_symbol: "sfTakerGetsCurrency", style: SOEStyle::Optional },
             LedgerFormatFieldSpec { field_symbol: "sfTakerGetsIssuer", style: SOEStyle::Optional },
+            LedgerFormatFieldSpec { field_symbol: "sfTakerGetsMPT", style: SOEStyle::Optional },
             LedgerFormatFieldSpec { field_symbol: "sfExchangeRate", style: SOEStyle::Optional },
             LedgerFormatFieldSpec { field_symbol: "sfIndexes", style: SOEStyle::Required },
             LedgerFormatFieldSpec { field_symbol: "sfRootIndex", style: SOEStyle::Required },
@@ -391,6 +393,7 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
             LedgerFormatFieldSpec { field_symbol: "sfPreviousTxnLgrSeq", style: SOEStyle::Required },
             LedgerFormatFieldSpec { field_symbol: "sfDomainID", style: SOEStyle::Optional },
             LedgerFormatFieldSpec { field_symbol: "sfMutableFlags", style: SOEStyle::Default },
+            LedgerFormatFieldSpec { field_symbol: "sfReferenceHolding", style: SOEStyle::Optional },
         ],
     },
     LedgerFormatSpecInit {

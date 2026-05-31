@@ -257,9 +257,6 @@ fn build_fields() -> JsonValue {
     let mut fields = Vec::new();
 
     fields.push(make_field_entry(
-        "Generic", 0, false, false, true, "Unknown",
-    ));
-    fields.push(make_field_entry(
         "Invalid", -1, false, false, false, "Unknown",
     ));
     fields.push(make_field_entry(
@@ -295,7 +292,6 @@ fn build_fields() -> JsonValue {
         "Amount",
     ));
 
-    // Iterate directly without sorting, matching reference behavior.
     let hardcoded = [
         "Generic",
         "Invalid",
@@ -304,7 +300,9 @@ fn build_fields() -> JsonValue {
         "taker_gets_funded",
         "taker_pays_funded",
     ];
-    for field in all_sfields() {
+    let mut sorted_fields = all_sfields().iter().collect::<Vec<_>>();
+    sorted_fields.sort_by_key(|field| field.code());
+    for field in sorted_fields {
         if field.name().is_empty() || hardcoded.contains(&field.name()) {
             continue;
         }

@@ -543,3 +543,108 @@ fn nudb_crash_recovery_matrix_recover_store_recover_sequence_preserves_commits()
         }
     }
 }
+
+#[test]
+fn nudb_crash_recovery_matrix_truncates_key_buckets_created_after_checkpoint_split() {
+    let temp = TempDir::new().expect("tempdir");
+    let path = temp.path().to_path_buf();
+    let backend = NuDbBackend::new(
+        nodestore::NodeObject::KEY_BYTES,
+        &nudb_section(&path),
+        10_000,
+        Arc::new(QuietJournal),
+    )
+    .expect("nudb backend");
+    backend
+        .open_deterministic(true, NUDB_APPNUM, 10_101, 10_201)
+        .expect("open deterministic");
+
+    let checkpoint_key_size = std::fs::metadata(path.join("nudb.key"))
+        .expect("initial key metadata")
+        .len();
+    let checkpoint_data_size = std::fs::metadata(path.join("nudb.dat"))
+        .expect("initial data metadata")
+        .len();
+    let uncommitted = object(0x61, b"uncommitted-after-split");
+    let mut stored = Vec::new();
+
+    for index in 0..300u16 {
+        let fill = 0x80u8.wrapping_add(index as u8);
+        let item = Arc::new(NodeObject::new(
+            NodeObjectType::Ledger,
+            format!("checkpoint-split-uncommitted-{index:03}").into_bytes(),
+            Uint256::from_array([fill; 32]),
+        ));
+        backend.store(Arc::clone(&item));
+        stored.push(item);
+    }
+    backend.store(Arc::clone(&uncommitted));
+
+    assert!(
+        std::fs::metadata(path.join("nudb.log"))
+            .expect("log metadata")
+            .len()
+            > 0,
+        "large burst size should leave an active checkpoint"
+    );
+    assert!(
+        std::fs::metadata(path.join("nudb.key"))
+            .expect("key metadata after split")
+            .len()
+            > checkpoint_key_size,
+        "workload should create key buckets after the checkpoint"
+    );
+    let current_key_size = std::fs::metadata(path.join("nudb.key"))
+        .expect("key metadata after split")
+        .len();
+    let mut log = OpenOptions::new()
+        .write(true)
+        .open(path.join("nudb.log"))
+        .expect("open log for legacy key size mutation");
+    log.seek(SeekFrom::Start(46))
+        .expect("seek log key_file_size");
+    log.write_all(&current_key_size.to_be_bytes())
+        .expect("write legacy enlarged key_file_size");
+    log.sync_all().expect("sync mutated log");
+    drop(backend);
+
+    let reopened = NuDbBackend::new(
+        nodestore::NodeObject::KEY_BYTES,
+        &nudb_section(&path),
+        10_000,
+        Arc::new(QuietJournal),
+    )
+    .expect("reopen backend");
+    reopened
+        .open_deterministic(false, NUDB_APPNUM, 1, 1)
+        .expect("reopen should recover checkpoint");
+
+    assert_eq!(
+        std::fs::metadata(path.join("nudb.key"))
+            .expect("key metadata after recovery")
+            .len(),
+        checkpoint_key_size,
+        "recovery must discard key buckets created after the active checkpoint"
+    );
+    assert_eq!(
+        std::fs::metadata(path.join("nudb.dat"))
+            .expect("data metadata after recovery")
+            .len(),
+        checkpoint_data_size,
+        "recovery must discard data records created after the active checkpoint"
+    );
+    assert_eq!(
+        std::fs::metadata(path.join("nudb.log"))
+            .expect("log metadata after recovery")
+            .len(),
+        0,
+        "recovery should clear the active checkpoint log"
+    );
+    for item in stored.iter().chain(std::iter::once(&uncommitted)) {
+        assert_fetch(&reopened, item, Status::NotFound, false);
+    }
+    reopened
+        .verify_backend()
+        .expect("recovered backend must not contain key entries past the data file");
+    reopened.close().expect("close recovered backend");
+}

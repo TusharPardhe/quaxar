@@ -171,6 +171,9 @@ pub fn issue_from_json(value: &JsonValue) -> Result<Issue, String> {
     let Some(issuer) = parse_base58_account_id(issuer_text) else {
         return Err("issueFromJson issuer must be a valid account".into());
     };
+    if issuer == no_account() || issuer == xrp_account() {
+        return Err("issueFromJson issuer must be a valid account".into());
+    }
 
     Ok(Issue::new(currency, issuer))
 }
@@ -431,4 +434,26 @@ pub fn asset_from_json(value: &JsonValue) -> Result<Asset, String> {
     }
 
     Err("assetFromJson must contain currency or mpt_issuance_id".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::{JsonValue, no_account, to_base58, xrp_account};
+
+    use super::issue_from_json;
+
+    fn issue_json(issuer: String) -> JsonValue {
+        JsonValue::Object(BTreeMap::from([
+            ("currency".to_owned(), JsonValue::String("USD".to_owned())),
+            ("issuer".to_owned(), JsonValue::String(issuer)),
+        ]))
+    }
+
+    #[test]
+    fn issue_from_json_rejects_special_non_xrp_issuers() {
+        assert!(issue_from_json(&issue_json(to_base58(no_account()))).is_err());
+        assert!(issue_from_json(&issue_json(to_base58(xrp_account()))).is_err());
+    }
 }

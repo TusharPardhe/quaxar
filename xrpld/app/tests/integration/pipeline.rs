@@ -758,10 +758,33 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
             Ter::TES_SUCCESS
         }
         // --- CredentialAccept/Delete ---
-        TxType::CREDENTIAL_ACCEPT => Ter::TES_SUCCESS,
+        TxType::CREDENTIAL_ACCEPT => {
+            if !tx.is_field_present(sf("sfIssuer")) {
+                return Ter::TEM_INVALID_ACCOUNT_ID;
+            }
+            let issuer = tx.get_account_id(sf("sfIssuer"));
+            if issuer == protocol::AccountID::default() {
+                return Ter::TEM_INVALID_ACCOUNT_ID;
+            }
+            if !tx.is_field_present(sf("sfCredentialType")) {
+                return Ter::TEM_MALFORMED;
+            }
+            let cred_type = tx.get_field_vl(sf("sfCredentialType"));
+            if cred_type.is_empty() || cred_type.len() > 64 {
+                return Ter::TEM_MALFORMED;
+            }
+            Ter::TES_SUCCESS
+        }
         TxType::CREDENTIAL_DELETE => {
             // Must have Subject or Issuer
             if !tx.is_field_present(sf("sfSubject")) && !tx.is_field_present(sf("sfIssuer")) {
+                return Ter::TEM_MALFORMED;
+            }
+            if !tx.is_field_present(sf("sfCredentialType")) {
+                return Ter::TEM_MALFORMED;
+            }
+            let cred_type = tx.get_field_vl(sf("sfCredentialType"));
+            if cred_type.is_empty() || cred_type.len() > 64 {
                 return Ter::TEM_MALFORMED;
             }
             Ter::TES_SUCCESS

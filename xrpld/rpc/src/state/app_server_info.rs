@@ -784,6 +784,39 @@ fn lookup_sql_transaction_by_hash<V: AppServerInfoView>(
     Some((row.0, row.1, row.2, row.3, txn_seq))
 }
 
+fn lookup_sql_tx_record<V: AppServerInfoView>(
+    view: &V,
+    hash: Uint256,
+) -> Result<Option<TxRecord>, TxLookupError> {
+    let Some((ledger_seq, status, raw_txn, raw_meta, txn_seq)) =
+        lookup_sql_transaction_by_hash(view, hash)
+    else {
+        return Ok(None);
+    };
+
+    let mut converted = Vec::new();
+    app::convert_blobs_to_tx_result(
+        &mut converted,
+        ledger_seq,
+        &status,
+        &raw_txn,
+        &raw_meta,
+        view.network_id(),
+    )
+    .map_err(|_| TxLookupError::DatabaseDeserialization)?;
+
+    Ok(converted.into_iter().next().map(|entry| TxRecord {
+        txn: std::sync::Arc::clone(entry.transaction.get_s_transaction()),
+        meta: Some(entry.meta),
+        ledger_index: ledger_seq,
+        close_time: find_close_time_by_seq(view, ledger_seq),
+        ledger_hash: find_ledger_hash_by_seq(view, ledger_seq),
+        validated: true,
+        txn_index: txn_seq,
+        network_id: Some(view.network_id()),
+    }))
+}
+
 impl<V: AppServerInfoView> LedgerLookupSource for ApplicationServerInfo<V> {
     fn get_ledger_by_hash(&self, hash: Uint256) -> Option<LedgerLookupLedger> {
         self.view
@@ -1231,63 +1264,53 @@ impl<V: AppServerInfoView> TxSource for ApplicationServerInfo<V> {
         hash: Uint256,
         ledger_range: Option<(u32, u32)>,
     ) -> Result<TxLookupOutcome, TxLookupError> {
-        if let Some(transaction) = self.view.fetch_cached_transaction(&hash) {
+        let cached = if let Some(transaction) = self.view.fetch_cached_transaction(&hash) {
             let transaction = transaction
                 .lock()
                 .expect("transaction mutex must not be poisoned");
-            if !transaction.is_validated() {
-                return Ok(TxLookupOutcome::NotFound(TxSearched::Unknown));
-            }
-            if let Some((min, max)) = ledger_range
-                && (transaction.get_ledger() < min || transaction.get_ledger() > max)
-            {
-                return Ok(TxLookupOutcome::NotFound(TxSearched::Some));
-            }
 
-            return Ok(TxLookupOutcome::Found(TxRecord {
+            Some(TxRecord {
                 txn: std::sync::Arc::clone(transaction.get_s_transaction()),
                 meta: None,
                 ledger_index: transaction.get_ledger(),
                 close_time: find_close_time_by_seq(&self.view, transaction.get_ledger()),
                 ledger_hash: find_ledger_hash_by_seq(&self.view, transaction.get_ledger()),
-                validated: true,
+                validated: transaction.is_validated(),
                 txn_index: None,
                 network_id: Some(self.view.network_id()),
-            }));
+            })
+        } else {
+            None
+        };
+
+        if let Some(record) = cached.as_ref()
+            && !record.validated
+        {
+            return Ok(TxLookupOutcome::Found(record.clone()));
         }
 
-        if let Some((ledger_seq, status, raw_txn, raw_meta, txn_seq)) =
-            lookup_sql_transaction_by_hash(&self.view, hash)
-        {
+        if let Some(record) = lookup_sql_tx_record(&self.view, hash)? {
             if let Some((min, max)) = ledger_range
-                && (ledger_seq < min || ledger_seq > max)
+                && (record.ledger_index < min || record.ledger_index > max)
             {
                 return Ok(TxLookupOutcome::NotFound(TxSearched::Some));
             }
 
-            let mut converted = Vec::new();
-            app::convert_blobs_to_tx_result(
-                &mut converted,
-                ledger_seq,
-                &status,
-                &raw_txn,
-                &raw_meta,
-                self.view.network_id(),
-            )
-            .map_err(|_| TxLookupError::DatabaseDeserialization)?;
+            return Ok(TxLookupOutcome::Found(record));
+        }
 
-            if let Some(entry) = converted.into_iter().next() {
-                return Ok(TxLookupOutcome::Found(TxRecord {
-                    txn: std::sync::Arc::clone(entry.transaction.get_s_transaction()),
-                    meta: Some(entry.meta),
-                    ledger_index: ledger_seq,
-                    close_time: find_close_time_by_seq(&self.view, ledger_seq),
-                    ledger_hash: find_ledger_hash_by_seq(&self.view, ledger_seq),
-                    validated: true,
-                    txn_index: txn_seq,
-                    network_id: Some(self.view.network_id()),
-                }));
+        // C++ TransactionMaster::fetch only returns cache hits directly while
+        // they are unvalidated. Once validated, SQL history is authoritative so
+        // metadata and TxnSeq are present. Keep this fallback for standalone
+        // harnesses or tx-table-disabled runtimes where no SQL row exists.
+        if let Some(record) = cached {
+            if let Some((min, max)) = ledger_range
+                && (record.ledger_index < min || record.ledger_index > max)
+            {
+                return Ok(TxLookupOutcome::NotFound(TxSearched::Some));
             }
+
+            return Ok(TxLookupOutcome::Found(record));
         }
 
         Ok(TxLookupOutcome::NotFound(TxSearched::Unknown))
@@ -1339,37 +1362,49 @@ impl<V: AppServerInfoView> TransactionEntrySource for ApplicationServerInfo<V> {
         ledger: &LedgerLookupLedger,
         tx_hash: Uint256,
     ) -> Option<(protocol::STTx, Option<protocol::TxMeta>)> {
-        if let Some(transaction) = self.view.fetch_cached_transaction(&tx_hash) {
-            let transaction = transaction
-                .lock()
-                .expect("transaction mutex must not be poisoned");
-            if transaction.is_validated() && transaction.get_ledger() == ledger.seq {
-                return Some(((*transaction.get_s_transaction().as_ref()).clone(), None));
+        if let Some(resolved) = resolve_lookup_ledger(&self.view, ledger)
+            && let Ok(Some(entry)) = ledger::ReadView::tx_read(resolved.as_ref(), tx_hash)
+        {
+            let (tx, meta) = entry.into_parts();
+            return Some((
+                (*tx.as_ref()).clone(),
+                meta.map(|meta| {
+                    protocol::TxMeta::from_stobject(tx_hash, ledger.seq, (*meta).clone())
+                }),
+            ));
+        }
+
+        if let Some((ledger_seq, status, raw_txn, raw_meta, _txn_seq)) =
+            lookup_sql_transaction_by_hash(&self.view, tx_hash)
+            && ledger_seq == ledger.seq
+        {
+            let mut converted = Vec::new();
+            app::convert_blobs_to_tx_result(
+                &mut converted,
+                ledger_seq,
+                &status,
+                &raw_txn,
+                &raw_meta,
+                self.view.network_id(),
+            )
+            .ok()?;
+
+            if let Some(entry) = converted.into_iter().next() {
+                return Some((
+                    (*entry.transaction.get_s_transaction().as_ref()).clone(),
+                    Some(entry.meta),
+                ));
             }
         }
 
-        let (ledger_seq, status, raw_txn, raw_meta, _txn_seq) =
-            lookup_sql_transaction_by_hash(&self.view, tx_hash)?;
-        if ledger_seq != ledger.seq {
-            return None;
+        let transaction = self.view.fetch_cached_transaction(&tx_hash)?;
+        let transaction = transaction
+            .lock()
+            .expect("transaction mutex must not be poisoned");
+        if transaction.is_validated() && transaction.get_ledger() == ledger.seq {
+            return Some(((*transaction.get_s_transaction().as_ref()).clone(), None));
         }
-
-        let mut converted = Vec::new();
-        app::convert_blobs_to_tx_result(
-            &mut converted,
-            ledger_seq,
-            &status,
-            &raw_txn,
-            &raw_meta,
-            self.view.network_id(),
-        )
-        .ok()?;
-
-        let entry = converted.into_iter().next()?;
-        Some((
-            (*entry.transaction.get_s_transaction().as_ref()).clone(),
-            Some(entry.meta),
-        ))
+        None
     }
 
     fn get_close_time_by_seq(&self, ledger_seq: u32) -> Option<NetClockTimePoint> {
@@ -2045,6 +2080,33 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
         let mut tip_index = book_base;
         let mut remaining = limit.min(256);
         let mut offers = Vec::new();
+        let mut owner_balances = BTreeMap::<AccountID, protocol::STAmount>::new();
+        let asset_is_global_frozen = |asset: protocol::Asset| match asset {
+            protocol::Asset::Issue(issue) if issue.native() => false,
+            protocol::Asset::Issue(issue) => Uint160::from_slice(issue.issuer().data())
+                .and_then(|issuer| {
+                    ledger::account_root_helpers::is_global_frozen(ledger.as_ref(), issuer).ok()
+                })
+                .unwrap_or(false),
+            protocol::Asset::MPTIssue(issue) => {
+                ledger::mptoken_helpers::is_global_frozen_mpt(ledger.as_ref(), &issue)
+                    .unwrap_or(false)
+            }
+        };
+        let global_freeze = asset_is_global_frozen(book.out) || asset_is_global_frozen(book.r#in);
+        let transfer_rate = match book.out {
+            protocol::Asset::Issue(issue) if issue.native() => protocol::PARITY_RATE,
+            protocol::Asset::Issue(issue) => Uint160::from_slice(issue.issuer().data())
+                .and_then(|issuer| {
+                    ledger::account_root_helpers::transfer_rate(ledger.as_ref(), issuer).ok()
+                })
+                .map(protocol::Rate::new)
+                .unwrap_or(protocol::PARITY_RATE),
+            protocol::Asset::MPTIssue(issue) => {
+                ledger::mptoken_helpers::transfer_rate_mpt(ledger.as_ref(), issue.mpt_id())
+                    .unwrap_or(protocol::PARITY_RATE)
+            }
+        };
 
         while remaining > 0 {
             let next = match ledger.succ(tip_index, Some(book_end)) {
@@ -2079,51 +2141,97 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
                     let quality_bytes = &next.data()[24..32];
                     let quality_u64 =
                         u64::from_be_bytes(quality_bytes.try_into().unwrap_or([0; 8]));
-                    offer_obj.insert(
-                        "quality".to_owned(),
-                        JsonValue::String(quality_u64.to_string()),
-                    );
+                    let dir_rate = protocol::amount_from_quality(quality_u64);
+                    offer_obj.insert("quality".to_owned(), JsonValue::String(dir_rate.text()));
 
-                    // Compute owner_funds: read owner's balance for the TakerGets asset
+                    // Compute owner_funds: read owner's balance for the TakerGets asset.
                     let owner = offer_sle.get_account_id(get_field_by_symbol("sfAccount"));
                     let taker_gets = offer_sle.get_field_amount(get_field_by_symbol("sfTakerGets"));
-                    if taker_gets.native() {
-                        // XRP: read account balance
-                        let owner_key = Uint160::from_slice(owner.data()).unwrap_or_default();
-                        let owner_keylet = protocol::account_keylet(owner_key);
-                        if let Ok(Some(owner_sle)) = ledger.read(owner_keylet) {
-                            let balance =
-                                owner_sle.get_field_amount(get_field_by_symbol("sfBalance"));
-                            offer_obj.insert(
-                                "owner_funds".to_owned(),
-                                JsonValue::String(balance.text()),
-                            );
-                        }
-                    } else {
-                        // IOU: read trust line balance
-                        let issue = taker_gets.issue();
-                        let (low, high) = if owner < issue.account {
-                            (owner, issue.account)
-                        } else {
-                            (issue.account, owner)
-                        };
-                        let line_keylet = protocol::line(low, high, issue.currency);
-                        if let Ok(Some(line_sle)) = ledger.read(line_keylet) {
-                            let balance =
-                                line_sle.get_field_amount(get_field_by_symbol("sfBalance"));
-                            let bal_text = balance.text();
-                            // Negate if owner is high account
-                            let funds = if owner > issue.account {
-                                if bal_text.starts_with('-') {
-                                    bal_text[1..].to_owned()
+                    let taker_pays = offer_sle.get_field_amount(get_field_by_symbol("sfTakerPays"));
+                    let mut zero_out = taker_gets.clone();
+                    zero_out.clear_with_asset(book.out);
+                    let mut first_owner_offer = true;
+                    let mut owner_funds = if book.out.issuer() == owner {
+                        match book.out {
+                            protocol::Asset::Issue(_) => taker_gets.clone(),
+                            protocol::Asset::MPTIssue(issue) => {
+                                if let Some(balance) = owner_balances.get(&owner) {
+                                    first_owner_offer = false;
+                                    balance.clone()
                                 } else {
-                                    format!("-{bal_text}")
+                                    ledger::mptoken_helpers::issuer_funds_to_self_issue(
+                                        ledger.as_ref(),
+                                        &issue,
+                                    )
+                                    .unwrap_or_else(|_| zero_out.clone())
                                 }
-                            } else {
-                                bal_text
-                            };
-                            offer_obj.insert("owner_funds".to_owned(), JsonValue::String(funds));
+                            }
                         }
+                    } else if global_freeze {
+                        zero_out.clone()
+                    } else if let Some(balance) = owner_balances.get(&owner) {
+                        first_owner_offer = false;
+                        balance.clone()
+                    } else {
+                        let funds = ledger::account_funds(
+                            ledger.as_ref(),
+                            owner,
+                            &taker_gets,
+                            ledger::FreezeHandling::ZeroIfFrozen,
+                        )
+                        .unwrap_or_else(|_| zero_out.clone());
+                        if funds < zero_out {
+                            zero_out.clone()
+                        } else {
+                            funds
+                        }
+                    };
+
+                    let owner_funds_before = owner_funds.clone();
+                    let mut owner_funds_limit = owner_funds.clone();
+                    let mut offer_rate = protocol::PARITY_RATE;
+                    if transfer_rate != protocol::PARITY_RATE
+                        && _taker != book.out.issuer()
+                        && book.out.issuer() != owner
+                    {
+                        offer_rate = transfer_rate;
+                        owner_funds_limit = protocol::divide_rate(&owner_funds, offer_rate);
+                    }
+
+                    let taker_gets_funded = if owner_funds_limit >= taker_gets {
+                        taker_gets.clone()
+                    } else {
+                        offer_obj.insert(
+                            "taker_gets_funded".to_owned(),
+                            owner_funds_limit.json(JsonOptions::NONE),
+                        );
+                        let pays_funded = std::cmp::min(
+                            taker_pays.clone(),
+                            owner_funds_limit.multiply(&dir_rate, taker_pays.asset()),
+                        );
+                        offer_obj.insert(
+                            "taker_pays_funded".to_owned(),
+                            pays_funded.json(JsonOptions::NONE),
+                        );
+                        owner_funds_limit
+                    };
+
+                    let owner_pays = if offer_rate == protocol::PARITY_RATE {
+                        taker_gets_funded.clone()
+                    } else {
+                        std::cmp::min(
+                            owner_funds.clone(),
+                            protocol::multiply_rate(&taker_gets_funded, offer_rate),
+                        )
+                    };
+                    owner_funds -= owner_pays;
+                    owner_balances.insert(owner, owner_funds.clone());
+
+                    if first_owner_offer {
+                        offer_obj.insert(
+                            "owner_funds".to_owned(),
+                            JsonValue::String(owner_funds_before.text()),
+                        );
                     }
                 }
                 offers.push(offer_json);

@@ -153,6 +153,20 @@ impl MPTokenIssuance {
             .as_st_ledger_entry()
             .is_field_present(crate::get_field_by_symbol("sfMutableFlags"))
     }
+
+    pub fn get_reference_holding(&self) -> Option<basics::base_uint::Uint256> {
+        self.has_reference_holding().then(|| {
+            self.base
+                .as_st_ledger_entry()
+                .get_field_h256(crate::get_field_by_symbol("sfReferenceHolding"))
+        })
+    }
+
+    pub fn has_reference_holding(&self) -> bool {
+        self.base
+            .as_st_ledger_entry()
+            .is_field_present(crate::get_field_by_symbol("sfReferenceHolding"))
+    }
 }
 
 impl Deref for MPTokenIssuance {
@@ -298,6 +312,13 @@ impl MPTokenIssuanceBuilder {
         self.base
             .object_mut()
             .set_field_u32(crate::get_field_by_symbol("sfMutableFlags"), value);
+        self
+    }
+
+    pub fn set_reference_holding(mut self, value: basics::base_uint::Uint256) -> Self {
+        self.base
+            .object_mut()
+            .set_field_h256(crate::get_field_by_symbol("sfReferenceHolding"), value);
         self
     }
 

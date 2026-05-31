@@ -5,16 +5,278 @@ use crate::state::transactor_escrow_bridge::*;
 use basics::math::base_uint::{Uint160, Uint256};
 use basics::number::NumberParts as RuntimeNumber;
 use protocol::{
-    AUCTION_SLOT_DISCOUNTED_FEE_FRACTION, AccountID, Asset, Keylet, LedgerEntryType, STAmount,
-    STArray, STLedgerEntry, STObject, STTx, Ter, TxType, VOTE_MAX_SLOTS, VOTE_WEIGHT_SCALE_FACTOR,
-    XRPAmount, amm_lpt_currency, get_field_by_symbol, is_tes_success, lsfDisableMaster,
-    owner_dir_keylet, signers_keylet,
+    AUCTION_SLOT_DISCOUNTED_FEE_FRACTION, AccountID, Asset, IOUAmount, Keylet, LedgerEntryType,
+    MPTAmount, STAmount, STArray, STIssue, STLedgerEntry, STObject, STTx, Ter, TxType,
+    VOTE_MAX_SLOTS, VOTE_WEIGHT_SCALE_FACTOR, XRPAmount, amm_lpt_currency, get_field_by_symbol,
+    is_tes_success, lsfDisableMaster, owner_dir_keylet, signers_keylet,
 };
 use std::sync::Arc;
 use tx::*;
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
+}
+
+const TF_AMM_DEPOSIT_SINGLE_ASSET: u32 = 0x0008_0000;
+const TF_AMM_DEPOSIT_TWO_ASSET: u32 = 0x0010_0000;
+const TF_AMM_DEPOSIT_TWO_ASSET_IF_EMPTY: u32 = 0x0080_0000;
+
+fn tx_amm_asset(tx: &STTx, field: &'static protocol::SField) -> Asset {
+    if let Some(value) = tx.peek_at_pfield(field) {
+        if let Some(issue) = value.as_any().downcast_ref::<STIssue>() {
+            return issue.asset();
+        }
+        if let Some(amount) = value.as_any().downcast_ref::<STAmount>() {
+            return amount.asset();
+        }
+    }
+    tx.get_field_issue(field).asset()
+}
+
+fn zero_amount_for_asset(field: &'static protocol::SField, asset: Asset) -> STAmount {
+    match asset {
+        Asset::Issue(issue) if issue.native() => STAmount::from_xrp_amount(XRPAmount::new()),
+        Asset::Issue(issue) => STAmount::from_iou_amount(field, IOUAmount::new(), issue),
+        Asset::MPTIssue(issue) => STAmount::from_mpt_amount(field, MPTAmount::from_value(0), issue),
+    }
+}
+
+fn account_holds_amm_asset<V: ledger::ApplyView>(
+    view: &V,
+    account: &AccountID,
+    asset: Asset,
+    field: &'static protocol::SField,
+) -> Option<STAmount> {
+    match asset {
+        Asset::Issue(issue) if issue.native() => Some(
+            view.read(protocol::account_keylet(Uint160::from_void(account.data())))
+                .ok()
+                .flatten()
+                .map(|sle| sle.get_field_amount(sf("sfBalance")))
+                .unwrap_or_else(|| STAmount::from_xrp_amount(XRPAmount::new())),
+        ),
+        Asset::Issue(issue) => {
+            if issue.account == *account {
+                return Some(STAmount::from_iou_amount(field, IOUAmount::new(), issue));
+            }
+            let mut amount = view
+                .read(protocol::line(*account, issue.account, issue.currency))
+                .ok()
+                .flatten()
+                .map(|sle| sle.get_field_amount(sf("sfBalance")))
+                .unwrap_or_else(|| STAmount::from_iou_amount(field, IOUAmount::new(), issue));
+            if *account > issue.account {
+                amount.negate();
+            }
+            amount.set_issuer(issue.account);
+            Some(amount)
+        }
+        Asset::MPTIssue(issue) => {
+            let value = view
+                .read(protocol::mptoken_keylet_from_mptid(
+                    issue.mpt_id(),
+                    Uint160::from_void(account.data()),
+                ))
+                .ok()
+                .flatten()
+                .map(|sle| {
+                    if sle.is_field_present(sf("sfMPTAmount")) {
+                        sle.get_field_u64(sf("sfMPTAmount"))
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0);
+            let value = i64::try_from(value).ok()?;
+            Some(STAmount::from_mpt_amount(
+                field,
+                MPTAmount::from_value(value),
+                issue,
+            ))
+        }
+    }
+}
+
+fn amm_deposit_asset<V: ledger::ApplyView>(
+    view: &mut V,
+    from: &AccountID,
+    amm_account: &AccountID,
+    amount: &STAmount,
+) -> Ter {
+    match amount.asset() {
+        Asset::Issue(issue) if issue.native() => {
+            ledger::ripple_state_helpers::account_send(view, from, amm_account, amount)
+        }
+        Asset::Issue(_) => {
+            ledger::ripple_state_helpers::account_send(view, from, amm_account, amount)
+        }
+        Asset::MPTIssue(_) => {
+            ledger::ripple_state_helpers::account_send(view, from, amm_account, amount)
+        }
+    }
+}
+
+fn escrow_mpt_unlock_amounts<V: ledger::ApplyView>(
+    view: &V,
+    amount: &STAmount,
+    locked_rate: u32,
+    sender: &AccountID,
+    receiver: &AccountID,
+) -> (STAmount, STAmount) {
+    let Asset::MPTIssue(issue) = amount.asset() else {
+        return (amount.clone(), amount.clone());
+    };
+    let issuer = issue.issuer();
+    let mut rate = protocol::Rate::new(locked_rate);
+    if let Ok(current_rate) = ledger::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
+        && current_rate < rate
+    {
+        rate = current_rate;
+    }
+
+    if sender != &issuer && receiver != &issuer && rate != protocol::PARITY_RATE {
+        return (protocol::divide_round(amount, rate, true), amount.clone());
+    }
+    (amount.clone(), amount.clone())
+}
+
+fn check_mpt_check_create_allowed<V: ledger::ApplyView>(
+    view: &V,
+    source: &AccountID,
+    destination: &AccountID,
+    amount: &STAmount,
+) -> Ter {
+    let Asset::MPTIssue(issue) = amount.asset() else {
+        return Ter::TES_SUCCESS;
+    };
+    let issuer = issue.issuer();
+
+    if source != &issuer
+        && ledger::mptoken_helpers::is_frozen_mpt(view, source, &issue).unwrap_or(true)
+    {
+        return Ter::TEC_LOCKED;
+    }
+    if destination != &issuer
+        && ledger::mptoken_helpers::is_frozen_mpt(view, destination, &issue).unwrap_or(true)
+    {
+        return Ter::TEC_LOCKED;
+    }
+
+    ledger::mptoken_helpers::can_transfer_mpt(view, &issue, source, destination)
+        .unwrap_or(Ter::TEF_INTERNAL)
+}
+
+fn check_mpt_check_cash_allowed<V: ledger::ApplyView>(
+    view: &mut V,
+    source: &AccountID,
+    destination: &AccountID,
+    amount: &STAmount,
+) -> Ter {
+    let Asset::MPTIssue(issue) = amount.asset() else {
+        return Ter::TES_SUCCESS;
+    };
+    let issuer = issue.issuer();
+    if view
+        .peek(protocol::account_keylet(Uint160::from_void(issuer.data())))
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return Ter::TEC_NO_ISSUER;
+    }
+    let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, destination)
+        .unwrap_or(Ter::TEF_INTERNAL);
+    if auth != Ter::TES_SUCCESS {
+        return auth;
+    }
+    if destination != &issuer
+        && ledger::mptoken_helpers::is_frozen_mpt(view, destination, &issue).unwrap_or(true)
+    {
+        return Ter::TEC_LOCKED;
+    }
+    let transfer = ledger::mptoken_helpers::can_transfer_mpt(view, &issue, source, destination)
+        .unwrap_or(Ter::TEF_INTERNAL);
+    if transfer != Ter::TES_SUCCESS {
+        return transfer;
+    }
+    ledger::mptoken_helpers::check_create_mpt(view, &issue, destination)
+        .unwrap_or(Ter::TEF_INTERNAL)
+}
+
+fn check_mpt_amm_asset_allowed<V: ledger::ApplyView>(
+    view: &V,
+    account: &AccountID,
+    asset: Asset,
+    require_holding: bool,
+) -> Ter {
+    let Asset::MPTIssue(issue) = asset else {
+        return Ter::TES_SUCCESS;
+    };
+    let issuer = issue.issuer();
+
+    if require_holding && account != &issuer {
+        match view.read(protocol::mptoken_keylet_from_mptid(
+            issue.mpt_id(),
+            Uint160::from_void(account.data()),
+        )) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ter::TEC_NO_AUTH,
+            Err(_) => return Ter::TEF_INTERNAL,
+        }
+    }
+
+    let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, account)
+        .unwrap_or(Ter::TEF_INTERNAL);
+    if auth != Ter::TES_SUCCESS {
+        return auth;
+    }
+
+    if ledger::mptoken_helpers::is_frozen_mpt(view, account, &issue).unwrap_or(true) {
+        return Ter::TEC_LOCKED;
+    }
+
+    ledger::mptoken_helpers::can_mpt_trade_and_transfer(view, &asset, account, account)
+        .unwrap_or(Ter::TEF_INTERNAL)
+}
+
+fn check_mpt_amm_withdraw_asset_allowed<V: ledger::ApplyView>(
+    view: &V,
+    account: &AccountID,
+    asset: Asset,
+) -> Ter {
+    let Asset::MPTIssue(issue) = asset else {
+        return Ter::TES_SUCCESS;
+    };
+
+    // #7040: AMMWithdraw is a recovery path. It must not require CanTransfer
+    // or CanTrade, but it still rejects globally/individually locked MPTs.
+    if ledger::mptoken_helpers::is_frozen_mpt(view, account, &issue).unwrap_or(true) {
+        return Ter::TEC_LOCKED;
+    }
+
+    let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, account)
+        .unwrap_or(Ter::TEF_INTERNAL);
+    if auth != Ter::TES_SUCCESS {
+        return auth;
+    }
+
+    Ter::TES_SUCCESS
+}
+
+fn check_mpt_amm_pool_asset_unlocked<V: ledger::ApplyView>(
+    view: &V,
+    amm_account: &AccountID,
+    asset: Asset,
+) -> Ter {
+    let Asset::MPTIssue(issue) = asset else {
+        return Ter::TES_SUCCESS;
+    };
+
+    if ledger::mptoken_helpers::is_frozen_mpt(view, amm_account, &issue).unwrap_or(true) {
+        return Ter::TEC_LOCKED;
+    }
+
+    Ter::TES_SUCCESS
 }
 
 fn nft_page_mask() -> Uint256 {
@@ -1366,28 +1628,65 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         return Ter::TEC_NO_PERMISSION;
                     }
                 }
-                let amount = escrow_sle.get_field_amount(sf("sfAmount"));
-                // IOU/token escrows (TokenEscrow feature): reference checks trust line limits
-                // and returns tecLIMIT_EXCEEDED when the destination's trust line would
-                // be exceeded. Full IOU escrow unlock is not yet implemented — return
-                // the correct TER code so state hashes match.
-                if !amount.native() {
-                    return Ter::TEC_LIMIT_EXCEEDED;
-                }
-                let amount_drops = amount.xrp().drops();
                 let destination = escrow_sle.get_account_id(sf("sfDestination"));
-                // Credit destination
-                let dst_keylet = protocol::account_keylet(Uint160::from_void(destination.data()));
-                if let Ok(Some(dst)) = view.peek(dst_keylet) {
-                    let bal = dst.get_field_amount(sf("sfBalance")).xrp();
-                    let mut obj = dst.clone_as_object();
-                    obj.set_field_amount(
-                        sf("sfBalance"),
-                        STAmount::from_xrp_amount(XRPAmount::from_drops(
-                            bal.drops() + amount_drops,
-                        )),
-                    );
-                    let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *dst.key())));
+                let amount = escrow_sle.get_field_amount(sf("sfAmount"));
+                if amount.native() {
+                    let amount_drops = amount.xrp().drops();
+                    let dst_keylet =
+                        protocol::account_keylet(Uint160::from_void(destination.data()));
+                    if let Ok(Some(dst)) = view.peek(dst_keylet) {
+                        let bal = dst.get_field_amount(sf("sfBalance")).xrp();
+                        let mut obj = dst.clone_as_object();
+                        obj.set_field_amount(
+                            sf("sfBalance"),
+                            STAmount::from_xrp_amount(XRPAmount::from_drops(
+                                bal.drops() + amount_drops,
+                            )),
+                        );
+                        let _ =
+                            view.update(Arc::new(STLedgerEntry::from_stobject(obj, *dst.key())));
+                    }
+                } else {
+                    match amount.asset() {
+                        protocol::Asset::Issue(_) => {
+                            return Ter::TEC_LIMIT_EXCEEDED;
+                        }
+                        protocol::Asset::MPTIssue(_) => {
+                            let locked_rate = escrow_sle
+                                .is_field_present(sf("sfTransferRate"))
+                                .then(|| escrow_sle.get_field_u32(sf("sfTransferRate")))
+                                .unwrap_or(protocol::PARITY_RATE.value);
+                            let (net_amount, gross_amount) = escrow_mpt_unlock_amounts(
+                                view,
+                                &amount,
+                                locked_rate,
+                                &owner,
+                                &destination,
+                            );
+                            let gross_amount = if view
+                                .rules()
+                                .enabled(&protocol::feature_id("fixTokenEscrowV1"))
+                            {
+                                &gross_amount
+                            } else {
+                                &net_amount
+                            };
+                            let submitter = sttx.get_account_id(sf("sfAccount"));
+                            let result = ledger::mptoken_helpers::unlock_escrow_mpt(
+                                view,
+                                &owner,
+                                &destination,
+                                &net_amount,
+                                gross_amount,
+                                destination == submitter,
+                                pre_fee_balance_drops,
+                            )
+                            .unwrap_or(Ter::TEF_INTERNAL);
+                            if result != Ter::TES_SUCCESS {
+                                return result;
+                            }
+                        }
+                    }
                 }
                 // Remove from owner directory and adjust owner count
                 let owner_node = escrow_sle.get_field_u64(sf("sfOwnerNode"));
@@ -1405,6 +1704,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     let _ = ledger::adjust_owner_count(view, &owner_acct, -1);
                 }
                 let _ = view.erase(escrow_sle);
+            } else {
+                return Ter::TEC_NO_TARGET;
             }
             Ter::TES_SUCCESS
         }
@@ -1421,26 +1722,65 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     }
                 }
                 let amount = escrow_sle.get_field_amount(sf("sfAmount"));
-                let amount_drops = if amount.native() {
-                    amount.xrp().drops()
+                if amount.native() {
+                    // Return XRP funds to owner.
+                    let owner_keylet = protocol::account_keylet(Uint160::from_void(owner.data()));
+                    if let Ok(Some(owner_acct)) = view.peek(owner_keylet) {
+                        let bal = owner_acct.get_field_amount(sf("sfBalance")).xrp();
+                        let mut obj = owner_acct.clone_as_object();
+                        obj.set_field_amount(
+                            sf("sfBalance"),
+                            STAmount::from_xrp_amount(XRPAmount::from_drops(
+                                bal.drops() + amount.xrp().drops(),
+                            )),
+                        );
+                        let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
+                            obj,
+                            *owner_acct.key(),
+                        )));
+                    }
                 } else {
-                    amount.mantissa() as i64
-                };
-                // Return funds to owner
-                let owner_keylet = protocol::account_keylet(Uint160::from_void(owner.data()));
-                if let Ok(Some(owner_acct)) = view.peek(owner_keylet) {
-                    let bal = owner_acct.get_field_amount(sf("sfBalance")).xrp();
-                    let mut obj = owner_acct.clone_as_object();
-                    obj.set_field_amount(
-                        sf("sfBalance"),
-                        STAmount::from_xrp_amount(XRPAmount::from_drops(
-                            bal.drops() + amount_drops,
-                        )),
-                    );
-                    let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
-                        obj,
-                        *owner_acct.key(),
-                    )));
+                    match amount.asset() {
+                        protocol::Asset::Issue(issue) => {
+                            let result = ledger::ripple_state_helpers::issue_iou(
+                                view, &owner, &amount, &issue,
+                            );
+                            if result != Ter::TES_SUCCESS {
+                                return result;
+                            }
+                        }
+                        protocol::Asset::MPTIssue(_) => {
+                            let submitter = sttx.get_account_id(sf("sfAccount"));
+                            let (net_amount, gross_amount) = escrow_mpt_unlock_amounts(
+                                view,
+                                &amount,
+                                protocol::PARITY_RATE.value,
+                                &owner,
+                                &owner,
+                            );
+                            let gross_amount = if view
+                                .rules()
+                                .enabled(&protocol::feature_id("fixTokenEscrowV1"))
+                            {
+                                &gross_amount
+                            } else {
+                                &net_amount
+                            };
+                            let result = ledger::mptoken_helpers::unlock_escrow_mpt(
+                                view,
+                                &owner,
+                                &owner,
+                                &net_amount,
+                                gross_amount,
+                                owner == submitter,
+                                pre_fee_balance_drops,
+                            )
+                            .unwrap_or(Ter::TEF_INTERNAL);
+                            if result != Ter::TES_SUCCESS {
+                                return result;
+                            }
+                        }
+                    }
                 }
                 // Remove from owner directory and adjust owner count
                 let owner_node = escrow_sle.get_field_u64(sf("sfOwnerNode"));
@@ -1453,6 +1793,18 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     let dst_dir = owner_dir_keylet(Uint160::from_void(destination.data()));
                     let _ = ledger::dir_remove(view, &dst_dir, dst_node, *escrow_sle.key(), false);
                 }
+                if !amount.native() && escrow_sle.is_field_present(sf("sfIssuerNode")) {
+                    let issuer = amount.asset().issuer();
+                    let issuer_node = escrow_sle.get_field_u64(sf("sfIssuerNode"));
+                    let issuer_dir = owner_dir_keylet(Uint160::from_void(issuer.data()));
+                    let _ = ledger::dir_remove(
+                        view,
+                        &issuer_dir,
+                        issuer_node,
+                        *escrow_sle.key(),
+                        false,
+                    );
+                }
                 // Adjust owner count
                 if let Ok(Some(oa)) =
                     view.peek(protocol::account_keylet(Uint160::from_void(owner.data())))
@@ -1460,6 +1812,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     let _ = ledger::adjust_owner_count(view, &oa, -1);
                 }
                 let _ = view.erase(escrow_sle);
+            } else {
+                return Ter::TEC_NO_TARGET;
             }
             Ter::TES_SUCCESS
         }
@@ -1469,6 +1823,10 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let account = sttx.get_account_id(sf("sfAccount"));
             let dst = sttx.get_account_id(sf("sfDestination"));
             let send_max = sttx.get_field_amount(sf("sfSendMax"));
+            let mpt_result = check_mpt_check_create_allowed(view, &account, &dst, &send_max);
+            if mpt_result != Ter::TES_SUCCESS {
+                return mpt_result;
+            }
             let check_keylet =
                 protocol::check_keylet(Uint160::from_void(account.data()), sttx.get_seq_value());
             let mut sle = STLedgerEntry::new(check_keylet);
@@ -1532,8 +1890,20 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     check_sle.get_field_amount(sf("sfSendMax"))
                 };
                 let send_max = check_sle.get_field_amount(sf("sfSendMax"));
+                if view
+                    .rules()
+                    .enabled(&protocol::feature_id("fixCleanup3_2_0"))
+                    && !send_max.is_legal_mpt()
+                {
+                    return Ter::TEF_BAD_LEDGER;
+                }
                 if sttx.is_field_present(sf("sfAmount")) && requested_amount > send_max {
                     return Ter::TEC_PATH_PARTIAL;
+                }
+                let mpt_result =
+                    check_mpt_check_cash_allowed(view, &source, &destination, &requested_amount);
+                if mpt_result != Ter::TES_SUCCESS {
+                    return mpt_result;
                 }
 
                 if requested_amount.native() {
@@ -1770,55 +2140,294 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         // --- AMM ---
         TxType::AMM_CREATE => {
             let account = sttx.get_account_id(sf("sfAccount"));
-            let mut sink = ViewBackedAMMCreateSink { view, account };
+            let amount1 = sttx.get_field_amount(sf("sfAmount"));
+            let amount2 = sttx.get_field_amount(sf("sfAmount2"));
+            let mpt_result = check_mpt_amm_asset_allowed(view, &account, amount1.asset(), true);
+            if mpt_result != Ter::TES_SUCCESS {
+                return mpt_result;
+            }
+            let mpt_result = check_mpt_amm_asset_allowed(view, &account, amount2.asset(), true);
+            if mpt_result != Ter::TES_SUCCESS {
+                return mpt_result;
+            }
             let facts = AMMCreateApplyFacts {
-                amount1: sttx.get_field_amount(sf("sfAmount")),
-                amount2: sttx.get_field_amount(sf("sfAmount2")),
+                amount1: amount1.clone(),
+                amount2: amount2.clone(),
                 trading_fee: sttx.get_field_u16(sf("sfTradingFee")),
                 account,
                 amm_account: account,
+            };
+            let mut sink = ViewBackedAMMCreateSink {
+                view,
+                account,
+                amount1,
+                amount2,
+                trading_fee: facts.trading_fee,
+                amm_keylet: None,
+                amm_account: None,
+                lp_tokens: None,
             };
             run_amm_create_do_apply(facts, &mut sink)
         }
         TxType::AMM_DEPOSIT => {
             let account = sttx.get_account_id(sf("sfAccount"));
-            let asset1 = sttx.get_field_amount(sf("sfAsset")).issue();
-            let asset2 = sttx.get_field_amount(sf("sfAsset2")).issue();
-            let amm_keylet = protocol::keylet::amm(asset1.into(), asset2.into());
+            let asset1 = tx_amm_asset(sttx, sf("sfAsset"));
+            let asset2 = tx_amm_asset(sttx, sf("sfAsset2"));
+            let mpt_result = check_mpt_amm_asset_allowed(view, &account, asset1, false);
+            if mpt_result != Ter::TES_SUCCESS {
+                return mpt_result;
+            }
+            let mpt_result = check_mpt_amm_asset_allowed(view, &account, asset2, false);
+            if mpt_result != Ter::TES_SUCCESS {
+                return mpt_result;
+            }
+            let amm_keylet = protocol::keylet::amm(asset1, asset2);
             if let Ok(Some(amm_sle)) = view.peek(amm_keylet) {
+                let amm_account = amm_sle.get_account_id(sf("sfAccount"));
+                let mpt_result = check_mpt_amm_pool_asset_unlocked(view, &amm_account, asset1);
+                if mpt_result != Ter::TES_SUCCESS {
+                    return mpt_result;
+                }
+                let mpt_result = check_mpt_amm_pool_asset_unlocked(view, &amm_account, asset2);
+                if mpt_result != Ter::TES_SUCCESS {
+                    return mpt_result;
+                }
+                let flags = sttx.get_flags();
+                if flags & TF_AMM_DEPOSIT_TWO_ASSET_IF_EMPTY != 0 {
+                    let amount = if sttx.is_field_present(sf("sfAmount")) {
+                        sttx.get_field_amount(sf("sfAmount"))
+                    } else {
+                        return Ter::TEM_MALFORMED;
+                    };
+                    let amount2 = if sttx.is_field_present(sf("sfAmount2")) {
+                        sttx.get_field_amount(sf("sfAmount2"))
+                    } else {
+                        return Ter::TEM_MALFORMED;
+                    };
+                    let lp_tokens = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
+                    if lp_tokens.signum() != 0 {
+                        return Ter::TEC_AMM_FAILED;
+                    }
+                    let deposit_result = amm_deposit_asset(view, &account, &amm_account, &amount);
+                    if deposit_result != Ter::TES_SUCCESS {
+                        return deposit_result;
+                    }
+                    let deposit2_result = amm_deposit_asset(view, &account, &amm_account, &amount2);
+                    if deposit2_result != Ter::TES_SUCCESS {
+                        return deposit2_result;
+                    }
+                    let lp_minted =
+                        ledger::amm_helpers::amm_lp_tokens(&amount, &amount2, lp_tokens.issue());
+                    if lp_minted.signum() == 0 {
+                        return Ter::TEC_AMM_INVALID_TOKENS;
+                    }
+                    let mut obj = amm_sle.clone_as_object();
+                    obj.set_field_amount(sf("sfLPTokenBalance"), lp_minted.clone());
+                    if view
+                        .rules()
+                        .enabled(&protocol::feature_id("fixCleanup3_2_0"))
+                        && obj.is_field_present(sf("sfAuctionSlot"))
+                    {
+                        let mut auction_slot = obj.peek_field_object(sf("sfAuctionSlot")).clone();
+                        if auction_slot.is_field_present(sf("sfAuthAccounts")) {
+                            auction_slot.make_field_absent(sf("sfAuthAccounts"));
+                            obj.set_field_object(sf("sfAuctionSlot"), auction_slot);
+                        }
+                    }
+                    let _ =
+                        view.update(Arc::new(STLedgerEntry::from_stobject(obj, *amm_sle.key())));
+                    let lp_result = ledger::ripple_state_helpers::direct_send_no_fee_iou_pub(
+                        view,
+                        &amm_account,
+                        &account,
+                        &lp_minted,
+                    );
+                    if lp_result != Ter::TES_SUCCESS {
+                        return lp_result;
+                    }
+                    return Ter::TES_SUCCESS;
+                }
+
+                if flags & TF_AMM_DEPOSIT_TWO_ASSET != 0 {
+                    let amount = if sttx.is_field_present(sf("sfAmount")) {
+                        sttx.get_field_amount(sf("sfAmount"))
+                    } else {
+                        return Ter::TEM_MALFORMED;
+                    };
+                    let amount2 = if sttx.is_field_present(sf("sfAmount2")) {
+                        sttx.get_field_amount(sf("sfAmount2"))
+                    } else {
+                        return Ter::TEM_MALFORMED;
+                    };
+                    let pool1 =
+                        account_holds_amm_asset(view, &amm_account, amount.asset(), sf("sfAmount"))
+                            .unwrap_or_else(|| {
+                                zero_amount_for_asset(sf("sfAmount"), amount.asset())
+                            });
+                    let pool2 = account_holds_amm_asset(
+                        view,
+                        &amm_account,
+                        amount2.asset(),
+                        sf("sfAmount2"),
+                    )
+                    .unwrap_or_else(|| zero_amount_for_asset(sf("sfAmount2"), amount2.asset()));
+                    let lp_tokens = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
+                    if pool1.signum() <= 0 || pool2.signum() <= 0 || lp_tokens.signum() <= 0 {
+                        return Ter::TEC_AMM_FAILED;
+                    }
+                    let lp1 = lp_tokens
+                        .multiply(&amount, lp_tokens.asset())
+                        .divide(&pool1, lp_tokens.asset());
+                    let lp2 = lp_tokens
+                        .multiply(&amount2, lp_tokens.asset())
+                        .divide(&pool2, lp_tokens.asset());
+                    let lp_minted = if lp1 <= lp2 { lp1 } else { lp2 };
+                    if lp_minted.signum() == 0 {
+                        return Ter::TEC_AMM_INVALID_TOKENS;
+                    }
+                    let amount_actual = pool1
+                        .multiply(&lp_minted, pool1.asset())
+                        .divide(&lp_tokens, pool1.asset());
+                    let amount2_actual = pool2
+                        .multiply(&lp_minted, pool2.asset())
+                        .divide(&lp_tokens, pool2.asset());
+                    let deposit_result =
+                        amm_deposit_asset(view, &account, &amm_account, &amount_actual);
+                    if deposit_result != Ter::TES_SUCCESS {
+                        return deposit_result;
+                    }
+                    let deposit2_result =
+                        amm_deposit_asset(view, &account, &amm_account, &amount2_actual);
+                    if deposit2_result != Ter::TES_SUCCESS {
+                        return deposit2_result;
+                    }
+                    let mut obj = amm_sle.clone_as_object();
+                    obj.set_field_amount(sf("sfLPTokenBalance"), lp_tokens + lp_minted.clone());
+                    let _ =
+                        view.update(Arc::new(STLedgerEntry::from_stobject(obj, *amm_sle.key())));
+                    let lp_result = ledger::ripple_state_helpers::direct_send_no_fee_iou_pub(
+                        view,
+                        &amm_account,
+                        &account,
+                        &lp_minted,
+                    );
+                    if lp_result != Ter::TES_SUCCESS {
+                        return lp_result;
+                    }
+                    return Ter::TES_SUCCESS;
+                }
+
+                if flags & TF_AMM_DEPOSIT_SINGLE_ASSET == 0 {
+                    return Ter::TEM_MALFORMED;
+                }
                 let deposit_amount = if sttx.is_field_present(sf("sfAmount")) {
                     sttx.get_field_amount(sf("sfAmount"))
                 } else {
                     return Ter::TEM_MALFORMED;
                 };
-                // Read current pool balances
-                let pool1 = amm_sle.get_field_amount(sf("sfAmount"));
+                let mpt_result =
+                    check_mpt_amm_pool_asset_unlocked(view, &amm_account, deposit_amount.asset());
+                if mpt_result != Ter::TES_SUCCESS {
+                    return mpt_result;
+                }
+                let mpt_result =
+                    check_mpt_amm_asset_allowed(view, &account, deposit_amount.asset(), true);
+                if mpt_result != Ter::TES_SUCCESS {
+                    return mpt_result;
+                }
+                let pool1 = account_holds_amm_asset(
+                    view,
+                    &amm_account,
+                    deposit_amount.asset(),
+                    sf("sfAmount"),
+                )
+                .unwrap_or_else(|| zero_amount_for_asset(sf("sfAmount"), deposit_amount.asset()));
                 let lp_tokens = amm_sle.get_field_amount(sf("sfLPTokenBalance"));
                 let lp_issue = lp_tokens.issue();
-                // Constant product: LP minted = totalLP * depositAmt / poolAmt
-                let lp_minted = if pool1.signum() > 0 {
-                    lp_tokens
-                        .multiply(&deposit_amount, lp_tokens.asset())
-                        .divide(&pool1, lp_tokens.asset())
-                } else {
-                    deposit_amount.clone()
-                };
-                // Update AMM pool balance and LPTokenBalance
+
+                let lp_out = ledger::amm_helpers::lp_tokens_out(
+                    &pool1,
+                    &deposit_amount,
+                    &lp_tokens,
+                    amm_sle.get_field_u16(sf("sfTradingFee")),
+                );
+                let lp_adjusted = ledger::amm_helpers::adjust_lp_tokens(
+                    &lp_tokens,
+                    &lp_out,
+                    ledger::amm_helpers::IsDeposit::Yes,
+                );
+                let (lp_minted, deposit_adjusted) = ledger::amm_helpers::adjust_asset_in_by_tokens(
+                    &view.rules(),
+                    &pool1,
+                    &deposit_amount,
+                    &lp_tokens,
+                    &lp_adjusted,
+                    amm_sle.get_field_u16(sf("sfTradingFee")),
+                );
+                if lp_minted.signum() == 0 {
+                    return Ter::TEC_AMM_INVALID_TOKENS;
+                }
+                let deposit_result =
+                    amm_deposit_asset(view, &account, &amm_account, &deposit_adjusted);
+                if deposit_result != Ter::TES_SUCCESS {
+                    return deposit_result;
+                }
+                let empty_pool_reinit = lp_tokens.signum() == 0;
                 let mut obj = amm_sle.clone_as_object();
-                obj.set_field_amount(sf("sfAmount"), pool1 + deposit_amount.clone());
                 obj.set_field_amount(sf("sfLPTokenBalance"), lp_tokens + lp_minted.clone());
+                if empty_pool_reinit
+                    && view
+                        .rules()
+                        .enabled(&protocol::feature_id("fixCleanup3_2_0"))
+                    && obj.is_field_present(sf("sfAuctionSlot"))
+                {
+                    let mut auction_slot = obj.peek_field_object(sf("sfAuctionSlot")).clone();
+                    if auction_slot.is_field_present(sf("sfAuthAccounts")) {
+                        auction_slot.make_field_absent(sf("sfAuthAccounts"));
+                        obj.set_field_object(sf("sfAuctionSlot"), auction_slot);
+                    }
+                }
                 let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *amm_sle.key())));
-                // Credit LP tokens to depositor's trust line (reference issueIOU)
-                crate::state::amm_bid_apply::issue_iou_pub(view, &account, &lp_minted, &lp_issue);
+                let lp_result = ledger::ripple_state_helpers::direct_send_no_fee_iou_pub(
+                    view,
+                    &amm_account,
+                    &account,
+                    &lp_minted,
+                );
+                if lp_result != Ter::TES_SUCCESS {
+                    return lp_result;
+                }
+                let _ = lp_issue;
             }
             Ter::TES_SUCCESS
         }
         TxType::AMM_WITHDRAW => {
             let account = sttx.get_account_id(sf("sfAccount"));
-            let asset1 = sttx.get_field_amount(sf("sfAsset")).issue();
-            let asset2 = sttx.get_field_amount(sf("sfAsset2")).issue();
-            let amm_keylet = protocol::keylet::amm(asset1.into(), asset2.into());
+            let asset_amount1 = sttx.get_field_amount(sf("sfAsset"));
+            let asset_amount2 = sttx.get_field_amount(sf("sfAsset2"));
+            let mpt_result =
+                check_mpt_amm_withdraw_asset_allowed(view, &account, asset_amount1.asset());
+            if mpt_result != Ter::TES_SUCCESS {
+                return mpt_result;
+            }
+            let mpt_result =
+                check_mpt_amm_withdraw_asset_allowed(view, &account, asset_amount2.asset());
+            if mpt_result != Ter::TES_SUCCESS {
+                return mpt_result;
+            }
+            let asset1 = asset_amount1.asset();
+            let asset2 = asset_amount2.asset();
+            let amm_keylet = protocol::keylet::amm(asset1, asset2);
             if let Ok(Some(amm_sle)) = view.peek(amm_keylet) {
+                let amm_account = amm_sle.get_account_id(sf("sfAccount"));
+                let mpt_result = check_mpt_amm_pool_asset_unlocked(view, &amm_account, asset1);
+                if mpt_result != Ter::TES_SUCCESS {
+                    return mpt_result;
+                }
+                let mpt_result = check_mpt_amm_pool_asset_unlocked(view, &amm_account, asset2);
+                if mpt_result != Ter::TES_SUCCESS {
+                    return mpt_result;
+                }
                 let lp_tokens_in = if sttx.is_field_present(sf("sfLPTokenIn")) {
                     sttx.get_field_amount(sf("sfLPTokenIn"))
                 } else if sttx.is_field_present(sf("sfAmount")) {
@@ -2487,14 +3096,21 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             if !sttx.is_field_present(sf("sfMPTokenIssuanceID")) {
                 return Ter::TEM_MALFORMED;
             }
-            let mptid = sttx.get_field_h256(sf("sfMPTokenIssuanceID"));
-            if Uint256::from(mptid).is_zero() {
+            let mptid = sttx.get_field_h192(sf("sfMPTokenIssuanceID"));
+            if mptid.is_zero() {
                 return Ter::TEC_OBJECT_NOT_FOUND;
             }
-            let issuance_keylet = protocol::mpt_issuance_keylet_from_id(Uint256::from(mptid));
+            let issuance_keylet = protocol::mpt_issuance_keylet_from_mptid(mptid);
             if let Ok(Some(iss_sle)) = view.peek(issuance_keylet) {
+                if iss_sle.get_account_id(sf("sfIssuer")) != account {
+                    return Ter::TEC_NO_PERMISSION;
+                }
                 let outstanding = iss_sle.get_field_u64(sf("sfOutstandingAmount"));
-                if outstanding > 0 {
+                let locked = iss_sle
+                    .is_field_present(sf("sfLockedAmount"))
+                    .then(|| iss_sle.get_field_u64(sf("sfLockedAmount")))
+                    .unwrap_or(0);
+                if outstanding > 0 || locked != 0 {
                     return Ter::TEC_HAS_OBLIGATIONS;
                 }
                 let _ = view.erase(iss_sle.clone());
@@ -2514,11 +3130,11 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             if !sttx.is_field_present(sf("sfMPTokenIssuanceID")) {
                 return Ter::TEM_MALFORMED;
             }
-            let mptid = sttx.get_field_h256(sf("sfMPTokenIssuanceID"));
-            if Uint256::from(mptid).is_zero() {
+            let mptid = sttx.get_field_h192(sf("sfMPTokenIssuanceID"));
+            if mptid.is_zero() {
                 return Ter::TEC_OBJECT_NOT_FOUND;
             }
-            let issuance_keylet = protocol::mpt_issuance_keylet_from_id(Uint256::from(mptid));
+            let issuance_keylet = protocol::mpt_issuance_keylet_from_mptid(mptid);
             if let Ok(Some(iss_sle)) = view.peek(issuance_keylet) {
                 let mut obj = iss_sle.clone_as_object();
                 let mut flags = obj.get_field_u32(sf("sfFlags"));
@@ -2538,34 +3154,134 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             if !sttx.is_field_present(sf("sfMPTokenIssuanceID")) {
                 return Ter::TEM_MALFORMED;
             }
-            let mptid = sttx.get_field_h256(sf("sfMPTokenIssuanceID"));
-            if Uint256::from(mptid).is_zero() {
+            let mptid = sttx.get_field_h192(sf("sfMPTokenIssuanceID"));
+            if mptid.is_zero() {
                 return Ter::TEC_OBJECT_NOT_FOUND;
             }
-            let token_keylet =
-                protocol::mptoken_keylet(Uint256::from(mptid), Uint160::from_void(account.data()));
-            if view.peek(token_keylet).ok().flatten().is_some() {
-                // Already authorized — update flags
-                Ter::TES_SUCCESS
-            } else {
-                // Create MPToken for this holder
-                let mut sle = STLedgerEntry::new(token_keylet);
-                sle.set_account_id(sf("sfAccount"), account);
-                sle.set_field_u64(sf("sfMPTAmount"), 0);
-                let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-                if let Ok(Some(page)) =
-                    ledger::dir_append(view, &owner_dir, token_keylet.key, &|_| {})
-                {
-                    sle.set_field_u64(sf("sfOwnerNode"), page);
+
+            let issuance_keylet = protocol::mpt_issuance_keylet_from_mptid(mptid);
+            let Some(issuance) = view.peek(issuance_keylet).ok().flatten() else {
+                return Ter::TEC_OBJECT_NOT_FOUND;
+            };
+            let issuer = issuance.get_account_id(sf("sfIssuer"));
+            let flags = sttx.get_field_u32(sf("sfFlags"));
+            let unauthorize = (flags & protocol::tfMPTUnauthorize) != 0;
+
+            if sttx.is_field_present(sf("sfHolder")) {
+                let holder = sttx.get_account_id(sf("sfHolder"));
+                let Some(holder_root) = view
+                    .peek(protocol::account_keylet(Uint160::from_void(holder.data())))
+                    .ok()
+                    .flatten()
+                else {
+                    return Ter::TEC_NO_DST;
+                };
+                if account != issuer {
+                    return Ter::TEC_NO_PERMISSION;
                 }
-                let _ = view.insert(Arc::new(sle));
+                if !issuance.is_flag(protocol::lsfMPTRequireAuth) {
+                    return Ter::TEC_NO_AUTH;
+                }
+                if holder_root.is_field_present(sf("sfVaultID"))
+                    || holder_root.is_field_present(sf("sfLoanBrokerID"))
+                    || holder_root.is_field_present(sf("sfAMMID"))
+                {
+                    return Ter::TEC_NO_PERMISSION;
+                }
+                let holder_keylet =
+                    protocol::mptoken_keylet_from_mptid(mptid, Uint160::from_void(holder.data()));
+                let Some(holder_token) = view.peek(holder_keylet).ok().flatten() else {
+                    return Ter::TEC_OBJECT_NOT_FOUND;
+                };
+                let mut obj = holder_token.clone_as_object();
+                let mut token_flags = obj.get_field_u32(sf("sfFlags"));
+                if unauthorize {
+                    token_flags &= !protocol::lsfMPTAuthorized;
+                } else {
+                    token_flags |= protocol::lsfMPTAuthorized;
+                }
+                obj.set_field_u32(sf("sfFlags"), token_flags);
+                let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
+                    obj,
+                    *holder_token.key(),
+                )));
+                return Ter::TES_SUCCESS;
+            }
+
+            let token_keylet =
+                protocol::mptoken_keylet_from_mptid(mptid, Uint160::from_void(account.data()));
+            if unauthorize {
+                let Some(token) = view.peek(token_keylet).ok().flatten() else {
+                    return Ter::TEC_OBJECT_NOT_FOUND;
+                };
+                if token.get_field_u64(sf("sfMPTAmount")) != 0
+                    || (view
+                        .rules()
+                        .enabled(&protocol::feature_id("fixCleanup3_1_3"))
+                        && token
+                            .is_field_present(sf("sfLockedAmount"))
+                            .then(|| token.get_field_u64(sf("sfLockedAmount")))
+                            .unwrap_or(0)
+                            != 0)
+                {
+                    return Ter::TEC_HAS_OBLIGATIONS;
+                }
+                if view
+                    .rules()
+                    .enabled(&protocol::feature_id("SingleAssetVault"))
+                    && token.is_flag(protocol::lsfMPTLocked)
+                {
+                    return Ter::TEC_NO_PERMISSION;
+                }
+                let owner_node = token.get_field_u64(sf("sfOwnerNode"));
+                let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
+                let _ = ledger::dir_remove(view, &owner_dir, owner_node, *token.key(), false);
+                let _ = view.erase(token);
                 if let Ok(Some(acct)) =
                     view.peek(protocol::account_keylet(Uint160::from_void(account.data())))
                 {
-                    let _ = ledger::adjust_owner_count(view, &acct, 1);
+                    let _ = ledger::adjust_owner_count(view, &acct, -1);
                 }
-                Ter::TES_SUCCESS
+                return Ter::TES_SUCCESS;
             }
+            if account == issuer {
+                return Ter::TEC_NO_PERMISSION;
+            }
+            if view.peek(token_keylet).ok().flatten().is_some() {
+                return Ter::TEC_DUPLICATE;
+            }
+            if let Ok(Some(acct)) =
+                view.peek(protocol::account_keylet(Uint160::from_void(account.data())))
+            {
+                let owner_count = acct.get_field_u32(sf("sfOwnerCount"));
+                let balance = acct.get_field_amount(sf("sfBalance")).xrp().drops();
+                let reserve = if owner_count < 2 {
+                    0
+                } else {
+                    view.fees().account_reserve(owner_count as usize + 1) as i64
+                };
+                if balance < reserve {
+                    return Ter::TEC_INSUFFICIENT_RESERVE;
+                }
+            }
+            let mut sle = STLedgerEntry::new(token_keylet);
+            sle.set_account_id(sf("sfAccount"), account);
+            sle.set_field_h192(sf("sfMPTokenIssuanceID"), mptid);
+            sle.set_field_u64(sf("sfMPTAmount"), 0);
+            sle.set_field_u32(sf("sfFlags"), 0);
+            let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
+            let Ok(Some(page)) = ledger::dir_append(view, &owner_dir, token_keylet.key, &|_| {})
+            else {
+                return Ter::TEC_DIR_FULL;
+            };
+            sle.set_field_u64(sf("sfOwnerNode"), page);
+            let _ = view.insert(Arc::new(sle));
+            if let Ok(Some(acct)) =
+                view.peek(protocol::account_keylet(Uint160::from_void(account.data())))
+            {
+                let _ = ledger::adjust_owner_count(view, &acct, 1);
+            }
+            Ter::TES_SUCCESS
         }
 
         // --- Permissioned domains ---
@@ -2619,6 +3335,39 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 Uint160::from_void(account.data()),
                 &cred_type,
             );
+
+            if view.peek(cred_keylet).ok().flatten().is_some() {
+                return Ter::TEC_DUPLICATE;
+            }
+            let Some(issuer_sle) = view
+                .peek(protocol::account_keylet(Uint160::from_void(account.data())))
+                .ok()
+                .flatten()
+            else {
+                return Ter::TEF_INTERNAL;
+            };
+            if view
+                .peek(protocol::account_keylet(Uint160::from_void(subject.data())))
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                return Ter::TEC_NO_TARGET;
+            }
+            if sttx.is_field_present(sf("sfExpiration")) {
+                let expiration = sttx.get_field_u32(sf("sfExpiration"));
+                if view.header().parent_close_time > expiration {
+                    return Ter::TEC_EXPIRED;
+                }
+            }
+            let owner_count = issuer_sle.get_field_u32(sf("sfOwnerCount"));
+            let balance = pre_fee_balance_drops
+                .unwrap_or_else(|| issuer_sle.get_field_amount(sf("sfBalance")).xrp().drops());
+            let reserve = view.fees().account_reserve(owner_count as usize + 1) as i64;
+            if balance < reserve {
+                return Ter::TEC_INSUFFICIENT_RESERVE;
+            }
+
             let mut sle = STLedgerEntry::new(cred_keylet);
             sle.set_account_id(sf("sfIssuer"), account);
             sle.set_account_id(sf("sfSubject"), subject);
@@ -2628,20 +3377,45 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     basics::buffer::Buffer::from(&sttx.get_field_vl(sf("sfCredentialType"))[..]),
                 ));
             }
-            let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-            if let Ok(Some(page)) = ledger::dir_append(view, &owner_dir, cred_keylet.key, &|_| {}) {
-                sle.set_field_u64(sf("sfOwnerNode"), page);
+            if sttx.is_field_present(sf("sfExpiration")) {
+                sle.set_field_u32(sf("sfExpiration"), sttx.get_field_u32(sf("sfExpiration")));
             }
-            let _ = view.insert(Arc::new(sle));
-            if let Ok(Some(acct)) =
-                view.peek(protocol::account_keylet(Uint160::from_void(account.data())))
-            {
-                let _ = ledger::adjust_owner_count(view, &acct, 1);
+            if sttx.is_field_present(sf("sfURI")) {
+                sle.set_stbase(protocol::STBlob::from_buffer(
+                    sf("sfURI"),
+                    basics::buffer::Buffer::from(&sttx.get_field_vl(sf("sfURI"))[..]),
+                ));
             }
+            let issuer_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
+            let Ok(Some(issuer_page)) =
+                ledger::dir_append(view, &issuer_dir, cred_keylet.key, &|_| {})
+            else {
+                return Ter::TEC_DIR_FULL;
+            };
+            sle.set_field_u64(sf("sfIssuerNode"), issuer_page);
+            if ledger::adjust_owner_count(view, &issuer_sle, 1).is_err() {
+                return Ter::TEF_INTERNAL;
+            }
+
+            if subject == account {
+                sle.set_field_u32(sf("sfFlags"), protocol::lsfAccepted);
+            } else {
+                let subject_dir = protocol::owner_dir_keylet(Uint160::from_void(subject.data()));
+                let Ok(Some(subject_page)) =
+                    ledger::dir_append(view, &subject_dir, cred_keylet.key, &|_| {})
+                else {
+                    return Ter::TEC_DIR_FULL;
+                };
+                sle.set_field_u64(sf("sfSubjectNode"), subject_page);
+            }
+
+            if view.insert(Arc::new(sle)).is_err() {
+                return Ter::TEF_INTERNAL;
+            }
+
             Ter::TES_SUCCESS
         }
         TxType::CREDENTIAL_ACCEPT => {
-            // Mark credential as accepted by setting a flag
             let subject = sttx.get_account_id(sf("sfAccount"));
             let issuer = sttx.get_account_id(sf("sfIssuer"));
             let cred_type = if sttx.is_field_present(sf("sfCredentialType")) {
@@ -2654,10 +3428,55 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 Uint160::from_void(issuer.data()),
                 &cred_type,
             );
-            if let Ok(Some(cred_sle)) = view.peek(cred_keylet) {
-                let mut obj = cred_sle.clone_as_object();
-                obj.set_field_u32(sf("sfFlags"), 0x0001_0000); // lsfAccepted
-                let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *cred_sle.key())));
+
+            let Some(cred_sle) = view.peek(cred_keylet).ok().flatten() else {
+                return Ter::TEC_NO_ENTRY;
+            };
+            let Some(subject_sle) = view
+                .peek(protocol::account_keylet(Uint160::from_void(subject.data())))
+                .ok()
+                .flatten()
+            else {
+                return Ter::TEF_INTERNAL;
+            };
+            let Some(issuer_sle) = view
+                .peek(protocol::account_keylet(Uint160::from_void(issuer.data())))
+                .ok()
+                .flatten()
+            else {
+                return Ter::TEF_INTERNAL;
+            };
+            if ledger::credential_helpers::check_expired(&cred_sle, view.header().parent_close_time)
+            {
+                let result = ledger::credential_helpers::delete_sle(view, cred_sle)
+                    .unwrap_or(Ter::TEF_INTERNAL);
+                return if result == Ter::TES_SUCCESS {
+                    Ter::TEC_EXPIRED
+                } else {
+                    result
+                };
+            }
+
+            let owner_count = subject_sle.get_field_u32(sf("sfOwnerCount"));
+            let balance = pre_fee_balance_drops
+                .unwrap_or_else(|| subject_sle.get_field_amount(sf("sfBalance")).xrp().drops());
+            let reserve = view.fees().account_reserve(owner_count as usize + 1) as i64;
+            if balance < reserve {
+                return Ter::TEC_INSUFFICIENT_RESERVE;
+            }
+
+            let mut obj = cred_sle.clone_as_object();
+            obj.set_field_u32(sf("sfFlags"), protocol::lsfAccepted);
+            if view
+                .update(Arc::new(STLedgerEntry::from_stobject(obj, *cred_sle.key())))
+                .is_err()
+            {
+                return Ter::TEF_INTERNAL;
+            }
+            if ledger::adjust_owner_count(view, &issuer_sle, -1).is_err()
+                || ledger::adjust_owner_count(view, &subject_sle, 1).is_err()
+            {
+                return Ter::TEF_INTERNAL;
             }
             Ter::TES_SUCCESS
         }
@@ -2683,19 +3502,19 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 Uint160::from_void(issuer.data()),
                 &cred_type,
             );
-            if let Ok(Some(cred_sle)) = view.peek(cred_keylet) {
-                // Remove from owner directory
-                let owner_node = cred_sle.get_field_u64(sf("sfOwnerNode"));
-                let owner_dir = owner_dir_keylet(Uint160::from_void(issuer.data()));
-                let _ = ledger::dir_remove(view, &owner_dir, owner_node, *cred_sle.key(), false);
-                let _ = view.erase(cred_sle);
-                if let Ok(Some(acct)) =
-                    view.peek(protocol::account_keylet(Uint160::from_void(issuer.data())))
-                {
-                    let _ = ledger::adjust_owner_count(view, &acct, -1);
-                }
+            let Some(cred_sle) = view.peek(cred_keylet).ok().flatten() else {
+                return Ter::TEC_NO_ENTRY;
+            };
+            if account != subject
+                && account != issuer
+                && !ledger::credential_helpers::check_expired(
+                    &cred_sle,
+                    view.header().parent_close_time,
+                )
+            {
+                return Ter::TEC_NO_PERMISSION;
             }
-            Ter::TES_SUCCESS
+            ledger::credential_helpers::delete_sle(view, cred_sle).unwrap_or(Ter::TEF_INTERNAL)
         }
 
         // --- AMM Clawback ---

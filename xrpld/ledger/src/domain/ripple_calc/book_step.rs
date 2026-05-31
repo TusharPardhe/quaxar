@@ -9,7 +9,7 @@ use crate::ApplyView;
 use crate::domain::ripple_state_helpers;
 use basics;
 use protocol::{
-    AccountID, Amounts, Asset, Issue, Quality, STAmount, STLedgerEntry, Ter,
+    AccountID, Amounts, Asset, MPTAmount, Quality, STAmount, STLedgerEntry, Ter,
     get_field_by_symbol as sf,
 };
 
@@ -19,8 +19,8 @@ const QUALITY_ONE: u32 = 1_000_000_000;
 /// Book: represents an order book (pair of assets to trade)
 #[derive(Debug, Clone)]
 pub struct Book {
-    pub r#in: Issue,
-    pub out: Issue,
+    pub r#in: Asset,
+    pub out: Asset,
 }
 
 /// Result of consuming offers from a book
@@ -55,21 +55,35 @@ pub fn execute_book_step<V: ApplyView>(
     // For OfferCreate context (owner_pays_transfer_fee=true): apply transfer rates,
     // but reference rate(sb, issue, dst) returns QUALITY_ONE when dst == issue.getIssuer().
     // The "dst" in OfferCreate context is the taker (offer creator).
+    if let Ok(ter) = crate::mptoken_helpers::can_trade(view, &book.r#in)
+        && ter != Ter::TES_SUCCESS
+    {
+        return BookStepResult {
+            amount_in: total_in,
+            amount_out: total_out,
+            offers_consumed,
+            ter,
+        };
+    }
+    if let Ok(ter) = crate::mptoken_helpers::can_trade(view, &book.out)
+        && ter != Ter::TES_SUCCESS
+    {
+        return BookStepResult {
+            amount_in: total_in,
+            amount_out: total_out,
+            offers_consumed,
+            ter,
+        };
+    }
+
+    let strand_deliver = max_out.asset();
     let tr_in = if owner_pays_transfer_fee {
-        if taker.is_some_and(|t| *t == book.r#in.account) {
-            QUALITY_ONE // Taker is the input issuer — no fee
-        } else {
-            ripple_state_helpers::transfer_rate(view, &book.r#in.account)
-        }
+        transfer_rate_for_asset(view, book.r#in, taker, strand_deliver)
     } else {
         QUALITY_ONE
     };
     let tr_out = if owner_pays_transfer_fee {
-        if taker.is_some_and(|t| *t == book.out.account) {
-            QUALITY_ONE // Taker is the output issuer — no fee
-        } else {
-            ripple_state_helpers::transfer_rate(view, &book.out.account)
-        }
+        transfer_rate_for_asset(view, book.out, taker, strand_deliver)
     } else {
         QUALITY_ONE
     };
@@ -244,6 +258,32 @@ pub fn execute_book_step<V: ApplyView>(
     }
 }
 
+fn transfer_rate_for_asset<V: ApplyView>(
+    view: &mut V,
+    asset: Asset,
+    dst: Option<&AccountID>,
+    strand_deliver: Asset,
+) -> u32 {
+    match asset {
+        Asset::Issue(issue) => {
+            if issue.native() || dst.is_some_and(|account| *account == issue.issuer()) {
+                QUALITY_ONE
+            } else {
+                ripple_state_helpers::transfer_rate(view, &issue.issuer())
+            }
+        }
+        Asset::MPTIssue(issue) => {
+            if asset == strand_deliver && dst.is_some_and(|account| *account == issue.issuer()) {
+                QUALITY_ONE
+            } else {
+                crate::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
+                    .map(|rate| rate.value)
+                    .unwrap_or(QUALITY_ONE)
+            }
+        }
+    }
+}
+
 // ── AMM (Automated Market Maker) support ─────────────────────────────────────
 // The AMM uses the constant product formula: pool_in * pool_out = k.
 // swapAssetIn: given input amount, compute output = pool_out - (pool_in * pool_out) / (pool_in + in * (1 - fee))
@@ -297,6 +337,12 @@ fn f64_to_amount(value: f64, asset: protocol::Asset) -> STAmount {
     }
     if asset.native() {
         STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(value as i64))
+    } else if let Asset::MPTIssue(issue) = asset {
+        STAmount::from_mpt_amount(
+            sf("sfAmount"),
+            MPTAmount::from_value(value.floor() as i64),
+            issue,
+        )
     } else {
         // Normalize to IOU range [1e15, 1e16)
         let log10 = value.log10().floor() as i32;
@@ -318,10 +364,7 @@ fn get_amm_offer<V: ApplyView>(
     max_out: &STAmount,
 ) -> Option<(AccountID, STAmount, STAmount, u16)> {
     // Find AMM SLE for this book
-    let amm_keylet = protocol::amm(
-        protocol::Asset::Issue(book.r#in),
-        protocol::Asset::Issue(book.out),
-    );
+    let amm_keylet = protocol::amm(book.r#in, book.out);
     let amm_sle = view.read(amm_keylet).ok()??;
 
     // Get AMM account
@@ -331,34 +374,54 @@ fn get_amm_offer<V: ApplyView>(
     let trading_fee = amm_sle.get_field_u16(sf("sfTradingFee"));
 
     // Get pool balances using credit_balance (handles trust line direction correctly)
-    let pool_in_amount = if book.r#in.currency == protocol::xrp_currency() {
+    let pool_in_amount = if book.r#in.native() {
         // XRP: read AMM account balance
         let acct_kl =
             protocol::account_keylet(basics::base_uint::Uint160::from_void(amm_account.data()));
         let acct_sle = view.read(acct_kl).ok()??;
         acct_sle.get_field_amount(sf("sfBalance"))
-    } else {
-        // IOU: credit_balance returns what AMM holds (positive = AMM holds)
-        ripple_state_helpers::credit_balance(
-            view,
-            &amm_account,
-            &book.r#in.account,
-            book.r#in.currency,
+    } else if let Asset::MPTIssue(issue) = book.r#in {
+        let token = view
+            .read(protocol::mptoken_keylet_from_mptid(
+                issue.mpt_id(),
+                basics::base_uint::Uint160::from_void(amm_account.data()),
+            ))
+            .ok()??;
+        STAmount::from_mpt_amount(
+            sf("sfAmount"),
+            MPTAmount::from_value(token.get_field_u64(sf("sfMPTAmount")) as i64),
+            issue,
         )
+    } else {
+        let Asset::Issue(issue) = book.r#in else {
+            unreachable!("handled above");
+        };
+        // IOU: credit_balance returns what AMM holds (positive = AMM holds)
+        ripple_state_helpers::credit_balance(view, &amm_account, &issue.account, issue.currency)
     };
 
-    let pool_out_amount = if book.out.currency == protocol::xrp_currency() {
+    let pool_out_amount = if book.out.native() {
         let acct_kl =
             protocol::account_keylet(basics::base_uint::Uint160::from_void(amm_account.data()));
         let acct_sle = view.read(acct_kl).ok()??;
         acct_sle.get_field_amount(sf("sfBalance"))
-    } else {
-        ripple_state_helpers::credit_balance(
-            view,
-            &amm_account,
-            &book.out.account,
-            book.out.currency,
+    } else if let Asset::MPTIssue(issue) = book.out {
+        let token = view
+            .read(protocol::mptoken_keylet_from_mptid(
+                issue.mpt_id(),
+                basics::base_uint::Uint160::from_void(amm_account.data()),
+            ))
+            .ok()??;
+        STAmount::from_mpt_amount(
+            sf("sfAmount"),
+            MPTAmount::from_value(token.get_field_u64(sf("sfMPTAmount")) as i64),
+            issue,
         )
+    } else {
+        let Asset::Issue(issue) = book.out else {
+            unreachable!("handled above");
+        };
+        ripple_state_helpers::credit_balance(view, &amm_account, &issue.account, issue.currency)
     };
 
     let pool_in = amount_to_f64(&pool_in_amount);
@@ -388,8 +451,8 @@ fn get_amm_offer<V: ApplyView>(
         return None;
     }
 
-    let amm_taker_pays = f64_to_amount(actual_in, protocol::Asset::Issue(book.r#in));
-    let amm_taker_gets = f64_to_amount(actual_out, protocol::Asset::Issue(book.out));
+    let amm_taker_pays = f64_to_amount(actual_in, book.r#in);
+    let amm_taker_gets = f64_to_amount(actual_out, book.out);
 
     Some((amm_account, amm_taker_pays, amm_taker_gets, trading_fee))
 }
@@ -398,18 +461,18 @@ fn get_amm_offer<V: ApplyView>(
 fn execute_amm_trade<V: ApplyView>(
     view: &mut V,
     amm_account: &AccountID,
-    book_in: &Issue,
-    book_out: &Issue,
+    book_in: &Asset,
+    book_out: &Asset,
     amount_in: &STAmount,  // what taker pays (goes into AMM pool)
     amount_out: &STAmount, // what taker gets (comes out of AMM pool)
 ) -> Ter {
     // Taker pays amount_in to AMM (AMM receives book_in)
-    let res = ripple_state_helpers::account_send(view, &book_in.account, amm_account, amount_in);
+    let res = ripple_state_helpers::account_send(view, &book_in.issuer(), amm_account, amount_in);
     if res != Ter::TES_SUCCESS {
         return res;
     }
     // AMM pays amount_out to taker (AMM sends book_out)
-    ripple_state_helpers::account_send(view, amm_account, &book_out.account, amount_out)
+    ripple_state_helpers::account_send(view, amm_account, &book_out.issuer(), amount_out)
 }
 
 /// Remove a consumed offer — reference offerDelete parity.
@@ -575,18 +638,12 @@ fn get_book_offers<V: ApplyView>(view: &mut V, book: &Book, max: u32) -> Vec<STL
 }
 
 /// Get the funds available for an offer owner to deliver.
-fn get_owner_funds<V: ApplyView>(view: &mut V, owner: &AccountID, issue: &Issue) -> STAmount {
-    if *owner == issue.account {
+fn get_owner_funds<V: ApplyView>(view: &mut V, owner: &AccountID, asset: &Asset) -> STAmount {
+    if *owner == asset.issuer() {
         // Owner is issuer — unlimited funds
-        return STAmount::new_with_asset(
-            sf("sfAmount"),
-            Asset::Issue(*issue),
-            u64::MAX / 2,
-            0,
-            false,
-        );
+        return STAmount::new_with_asset(sf("sfAmount"), *asset, u64::MAX / 2, 0, false);
     }
-    if issue.currency == protocol::xrp_currency() {
+    if asset.native() {
         // XRP: balance minus reserve
         let acct_keylet =
             protocol::account_keylet(basics::base_uint::Uint160::from_void(owner.data()));
@@ -607,8 +664,35 @@ fn get_owner_funds<V: ApplyView>(view: &mut V, owner: &AccountID, issue: &Issue)
         }
         return STAmount::default();
     }
+    if let Asset::MPTIssue(issue) = *asset {
+        let token_keylet = protocol::mptoken_keylet_from_mptid(
+            issue.mpt_id(),
+            basics::base_uint::Uint160::from_void(owner.data()),
+        );
+        let Some(token) = view
+            .peek(token_keylet)
+            .ok()
+            .flatten()
+            .or_else(|| view.read(token_keylet).ok().flatten())
+        else {
+            return STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::new(), issue);
+        };
+        if token.is_flag(protocol::lsfMPTLocked)
+            || crate::mptoken_helpers::is_global_frozen_mpt(view, &issue).unwrap_or(true)
+        {
+            return STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::new(), issue);
+        }
+        return STAmount::from_mpt_amount(
+            sf("sfAmount"),
+            MPTAmount::from_value(token.get_field_u64(sf("sfMPTAmount")) as i64),
+            issue,
+        );
+    }
+    let Asset::Issue(issue) = *asset else {
+        unreachable!("handled above");
+    };
     // IOU: check freeze status first (reference FreezeHandling::ZeroIfFrozen)
-    if ripple_state_helpers::is_frozen(view, owner, issue) {
+    if ripple_state_helpers::is_frozen(view, owner, &issue) {
         return STAmount::default();
     }
     ripple_state_helpers::credit_balance(view, owner, &issue.account, issue.currency)
@@ -844,13 +928,32 @@ fn mul_ratio_amount(
         };
         STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(result as i64))
     } else {
-        let iou = amount.iou();
-        let adjusted = crate::domain::mul_ratio::mul_ratio(iou, numerator, denominator, round_up);
-        STAmount::from_iou_amount(
-            protocol::get_field_by_symbol("sfAmount"),
-            adjusted,
-            amount.issue(),
-        )
+        match amount.asset() {
+            Asset::MPTIssue(issue) => {
+                let value = amount.mpt().value();
+                let result = if round_up {
+                    (value as i128 * numerator as i128 + denominator as i128 - 1)
+                        / denominator as i128
+                } else {
+                    (value as i128 * numerator as i128) / denominator as i128
+                };
+                STAmount::from_mpt_amount(
+                    protocol::get_field_by_symbol("sfAmount"),
+                    MPTAmount::from_value(result as i64),
+                    issue,
+                )
+            }
+            Asset::Issue(issue) => {
+                let iou = amount.iou();
+                let adjusted =
+                    crate::domain::mul_ratio::mul_ratio(iou, numerator, denominator, round_up);
+                STAmount::from_iou_amount(
+                    protocol::get_field_by_symbol("sfAmount"),
+                    adjusted,
+                    issue,
+                )
+            }
+        }
     }
 }
 
@@ -858,18 +961,18 @@ fn mul_ratio_amount(
 fn execute_offer_trade<V: ApplyView>(
     view: &mut V,
     offer_owner: &AccountID,
-    book_in: &Issue,
-    book_out: &Issue,
+    book_in: &Asset,
+    book_out: &Asset,
     amount_in: &STAmount,
     amount_out: &STAmount,
 ) -> Ter {
     // Credit offer owner with amount_in (they receive what taker pays)
-    let res = ripple_state_helpers::account_send(view, &book_in.account, offer_owner, amount_in);
+    let res = ripple_state_helpers::account_send(view, &book_in.issuer(), offer_owner, amount_in);
     if res != Ter::TES_SUCCESS {
         return res;
     }
     // Debit offer owner of amount_out (they give what taker gets)
-    ripple_state_helpers::account_send(view, offer_owner, &book_out.account, amount_out)
+    ripple_state_helpers::account_send(view, offer_owner, &book_out.issuer(), amount_out)
 }
 
 /// Result from estimate/execute that strand.rs expects
@@ -907,8 +1010,8 @@ pub fn execute_explicit_book_step<V: ApplyView>(
 ) -> Result<Option<BookStepOutput>, crate::ViewError> {
     // Determine book from the amount issues
     let book = Book {
-        r#in: max_in.issue(),
-        out: max_out.issue(),
+        r#in: max_in.asset(),
+        out: max_out.asset(),
     };
     let result = execute_book_step(view, &book, max_in, max_out, true, None, None);
     if result.ter == Ter::TES_SUCCESS && result.amount_out.signum() > 0 {

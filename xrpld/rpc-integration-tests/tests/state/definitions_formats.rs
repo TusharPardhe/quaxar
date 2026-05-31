@@ -365,7 +365,7 @@ fn definitions_format_16() {
             }
         })
         .collect();
-    assert!(names.contains(&"Generic"));
+    assert!(!names.contains(&"Generic"));
     assert!(names.contains(&"hash"));
     assert!(names.contains(&"index"));
 }

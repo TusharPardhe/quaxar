@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 
 use basics::base_uint::Uint256;
 use protocol::{
-    AccountID, Book, Currency, Issue, JsonValue, is_xrp_currency, no_account,
-    parse_base58_account_id, to_currency, to_issuer, xrp_account,
+    AccountID, Asset, Book, Currency, Issue, JsonValue, MPTID, MPTIssue, is_xrp_currency,
+    no_account, parse_base58_account_id, to_currency, to_issuer, xrp_account,
 };
 
 use crate::commands::rpc_helpers::{
@@ -121,6 +121,10 @@ fn currency_malformed_error(field: &str, code: i32, token: &str) -> JsonValue {
     )
 }
 
+fn mpt_malformed_error(field: &str, code: i32, token: &str) -> JsonValue {
+    rpc_error(code, token, format!("Invalid field '{field}'."))
+}
+
 fn issuer_unneeded_error(field: &str, code: i32, token: &str) -> JsonValue {
     rpc_error(
         code,
@@ -174,14 +178,14 @@ fn parse_domain(params: &JsonValue) -> Result<Option<Uint256>, JsonValue> {
         .map_err(|_| domain_malformed_error())
 }
 
-fn parse_issue_leg(
+fn parse_asset_leg(
     params: &JsonValue,
     leg_name: &'static str,
     currency_error_code: i32,
     currency_error_token: &'static str,
     issuer_error_code: i32,
     issuer_error_token: &'static str,
-) -> Result<Issue, JsonValue> {
+) -> Result<Asset, JsonValue> {
     let JsonValue::Object(object) = params else {
         return Err(missing_field_error(leg_name));
     };
@@ -195,6 +199,26 @@ fn parse_issue_leg(
         JsonValue::Null => None,
         _ => return Err(object_field_error(leg_name)),
     };
+
+    let mpt_field = format!("{leg_name}.mpt_issuance_id");
+    if let Some(mpt_value) = leg_object.and_then(|object| object.get("mpt_issuance_id")) {
+        if leg_object
+            .is_some_and(|object| object.contains_key("currency") || object.contains_key("issuer"))
+        {
+            return Err(invalid_field_error(leg_name));
+        }
+        let JsonValue::String(mpt_id) = mpt_value else {
+            return Err(expected_field_error(
+                &format!("{leg_name}.currency"),
+                "string",
+            ));
+        };
+        return MPTID::from_hex(mpt_id)
+            .map(|id| Asset::from(MPTIssue::new(id)))
+            .map_err(|_| {
+                mpt_malformed_error(&mpt_field, currency_error_code, currency_error_token)
+            });
+    }
 
     let currency_field = format!("{leg_name}.currency");
     let currency_text = match leg_object.and_then(|object| object.get("currency")) {
@@ -257,11 +281,11 @@ fn parse_issue_leg(
         ));
     }
 
-    Ok(Issue::new(currency, issuer))
+    Ok(Asset::from(Issue::new(currency, issuer)))
 }
 
-fn parse_taker_pays(params: &JsonValue) -> Result<Issue, JsonValue> {
-    parse_issue_leg(
+fn parse_taker_pays(params: &JsonValue) -> Result<Asset, JsonValue> {
+    parse_asset_leg(
         params,
         "taker_pays",
         SRC_CUR_MALFORMED_CODE,
@@ -271,8 +295,8 @@ fn parse_taker_pays(params: &JsonValue) -> Result<Issue, JsonValue> {
     )
 }
 
-fn parse_taker_gets(params: &JsonValue) -> Result<Issue, JsonValue> {
-    parse_issue_leg(
+fn parse_taker_gets(params: &JsonValue) -> Result<Asset, JsonValue> {
+    parse_asset_leg(
         params,
         "taker_gets",
         DST_AMT_MALFORMED_CODE,
@@ -291,7 +315,7 @@ fn parse_book_request(
     let taker = parse_taker(params)?;
     let domain = parse_domain(params)?;
 
-    if pay.currency == get.currency && pay.account == get.account {
+    if pay == get {
         return Err(bad_market_error());
     }
 

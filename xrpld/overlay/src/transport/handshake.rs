@@ -1,6 +1,6 @@
 //! XRPL HTTP Upgrade handshake helpers.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -530,11 +530,48 @@ fn set_header(headers: &mut HeaderMap, name: &str, value: &str) {
     headers.insert(name, value);
 }
 
-fn is_public_ip(ip: IpAddr) -> bool {
+pub fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ip) => !(ip.is_private() || ip.is_loopback() || ip.is_unspecified()),
-        IpAddr::V6(ip) => !(ip.is_loopback() || ip.is_unspecified()),
+        IpAddr::V4(ip) => is_public_ipv4(ip),
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(is_public_ipv4)
+            .unwrap_or_else(|| is_public_ipv6(ip)),
     }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || (octets[0] == 0)
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+        || octets[0] >= 240)
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    let first = segments[0];
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (first & 0xfe00) == 0xfc00
+        || (first & 0xffc0) == 0xfe80
+        || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0)
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || (segments[0] == 0x2001 && segments[1] == 0x0000)
+        || (segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0020)
+        || segments[0] == 0x2002)
 }
 
 fn is_unspecified_ip(ip: IpAddr) -> bool {
@@ -546,7 +583,7 @@ fn is_unspecified_ip(ip: IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use basics::base_uint::Uint256;
@@ -557,8 +594,8 @@ mod tests {
     use super::{
         EPOCH_OFFSET_SECONDS, FEATURE_COMPR, FEATURE_LEDGER_REPLAY, FEATURE_TXRR, FEATURE_VPRR,
         HandshakeContext, HandshakeVerificationContext, X_PROTOCOL_CTL, build_handshake,
-        feature_enabled, get_feature_value, is_feature_value, make_features_request_header,
-        make_features_response_header, make_request, make_response,
+        feature_enabled, get_feature_value, is_feature_value, is_public_ip,
+        make_features_request_header, make_features_response_header, make_request, make_response,
         make_shared_value_from_finished_messages, parse_http_request, parse_http_response,
         serialize_request, serialize_response, verify_handshake,
     };
@@ -636,8 +673,8 @@ mod tests {
             session_signature: base64_encode(&signature),
             instance_cookie: 4,
             server_domain: Some("example.com".to_owned()),
-            remote_ip: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
-            local_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20))),
+            remote_ip: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            local_ip: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
             closed_ledger: Some("A".repeat(64)),
             previous_ledger: Some("B".repeat(64)),
         };
@@ -647,8 +684,8 @@ mod tests {
             shared_value,
             network_id: Some(21338),
             local_public_key: None,
-            public_ip: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
-            remote_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+            public_ip: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            remote_ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             clock_tolerance: Duration::from_secs(20),
         };
         let peer = verify_handshake(&headers, &verify_context).expect("handshake should verify");
@@ -673,6 +710,50 @@ mod tests {
         build_handshake(&mut headers, &context);
         assert!(!headers.contains_key("Remote-IP"));
         assert!(!headers.contains_key("Local-IP"));
+    }
+
+    #[test]
+    fn public_ip_classifier_rejects_special_ipv4_and_ipv6_ranges() {
+        assert!(is_public_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_public_ip(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(!is_public_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+        assert!(!is_public_ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))));
+        assert!(!is_public_ip(IpAddr::V4(Ipv4Addr::new(192, 88, 99, 1))));
+        assert!(!is_public_ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 1))));
+        assert!(!is_public_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+        assert!(!is_public_ip(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))));
+
+        assert!(is_public_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111
+        ))));
+        assert!(!is_public_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(!is_public_ip(IpAddr::V6(Ipv6Addr::new(
+            0xfc00, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(!is_public_ip(IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(!is_public_ip(IpAddr::V6(Ipv6Addr::new(
+            0x0100, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(!is_public_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x0db8, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(!is_public_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(!is_public_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x0020, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(!is_public_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x002f, 0xffff, 0, 0, 0, 0, 1
+        ))));
+        assert!(!is_public_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2002, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(!is_public_ip(IpAddr::V6(Ipv6Addr::new(
+            0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001
+        ))));
     }
 
     #[test]
@@ -706,7 +787,7 @@ mod tests {
             network_id: None,
             local_public_key: None,
             public_ip: None,
-            remote_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+            remote_ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
             clock_tolerance: Duration::from_secs(20),
         };
         assert_eq!(

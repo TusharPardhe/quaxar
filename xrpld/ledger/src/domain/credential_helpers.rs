@@ -64,7 +64,10 @@ pub fn delete_sle(
 
     // Adjust owner count for issuer if they are the owner
     let issuer_is_owner = !accepted || (subject == issuer);
-    if issuer_is_owner && let Some(issuer_sle) = view.peek(account_keylet(to_uint160(issuer)))? {
+    if issuer_is_owner {
+        let Some(issuer_sle) = view.peek(account_keylet(to_uint160(issuer)))? else {
+            return Ok(Ter::TEF_BAD_LEDGER);
+        };
         adjust_owner_count(view, &issuer_sle, -1)?;
     }
 
@@ -81,7 +84,10 @@ pub fn delete_sle(
             return Ok(Ter::TEF_BAD_LEDGER);
         }
 
-        if accepted && let Some(subject_sle) = view.peek(account_keylet(to_uint160(subject)))? {
+        if accepted {
+            let Some(subject_sle) = view.peek(account_keylet(to_uint160(subject)))? else {
+                return Ok(Ter::TEF_BAD_LEDGER);
+            };
             adjust_owner_count(view, &subject_sle, -1)?;
         }
     }

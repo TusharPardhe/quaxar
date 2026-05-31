@@ -21,7 +21,8 @@ pub struct STParsedJSONObject {
     pub error: JsonValue,
 }
 
-const MAX_PARSED_JSON_DEPTH: usize = 64;
+pub const MAX_PARSED_JSON_DEPTH: usize = 64;
+pub const MAX_PARSED_JSON_ARRAY_SIZE: usize = 512;
 
 impl STParsedJSONObject {
     pub fn new(name: &str, json: &JsonValue) -> Self {
@@ -400,6 +401,11 @@ fn parse_array_field(
     let JsonValue::Array(entries) = value else {
         return Err(format!("Field '{name}' is not a JSON array."));
     };
+    if entries.len() > MAX_PARSED_JSON_ARRAY_SIZE {
+        return Err(format!(
+            "Field '{name}' exceeds allowed JSON array size of {MAX_PARSED_JSON_ARRAY_SIZE} elements per field."
+        ));
+    }
 
     let mut array = STArray::new(field);
     for (index, entry) in entries.iter().enumerate() {
@@ -508,7 +514,7 @@ mod tests {
 
     use basics::base_uint::{Uint128, Uint160, Uint192, Uint256};
 
-    use super::STParsedJSONObject;
+    use super::{MAX_PARSED_JSON_ARRAY_SIZE, STParsedJSONObject};
     use crate::{JsonValue, Permission, StBase, get_field_by_symbol};
 
     #[test]
@@ -684,5 +690,31 @@ mod tests {
 
         let json = JsonValue::Object(BTreeMap::from([("TransactionMetaData".to_owned(), nested)]));
         assert!(STParsedJSONObject::new("test", &json).object.is_none());
+    }
+
+    #[test]
+    fn parsed_json_rejects_array_fields_above_cpp_limit() {
+        let entry = JsonValue::Object(BTreeMap::from([(
+            "TransactionMetaData".to_owned(),
+            JsonValue::Object(BTreeMap::from([(
+                "TransactionResult".to_owned(),
+                JsonValue::Unsigned(1),
+            )])),
+        )]));
+        let at_limit = JsonValue::Object(BTreeMap::from([(
+            "SignerEntries".to_owned(),
+            JsonValue::Array(vec![entry.clone(); MAX_PARSED_JSON_ARRAY_SIZE]),
+        )]));
+        assert!(STParsedJSONObject::new("test", &at_limit).object.is_some());
+
+        let over_limit = JsonValue::Object(BTreeMap::from([(
+            "SignerEntries".to_owned(),
+            JsonValue::Array(vec![entry; MAX_PARSED_JSON_ARRAY_SIZE + 1]),
+        )]));
+        assert!(
+            STParsedJSONObject::new("test", &over_limit)
+                .object
+                .is_none()
+        );
     }
 }

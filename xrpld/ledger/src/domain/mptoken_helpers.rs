@@ -6,9 +6,11 @@ use crate::views::read_view::{ReadView, ViewError};
 use crate::{adjust_owner_count, dir_insert, dir_remove};
 use basics::base_uint::Uint160;
 use protocol::{
-    AccountID, Asset, MPTID, MPTIssue, Rate, STAmount, STLedgerEntry, Ter, TxType, account_keylet,
-    get_field_by_symbol, lsfMPTAuthorized, lsfMPTCanTrade, lsfMPTCanTransfer, lsfMPTLocked,
+    AccountID, Asset, Issue, LedgerEntryType, MPTID, MPTIssue, Rate, STAmount, STLedgerEntry, Ter,
+    TxType, account_keylet, get_field_by_symbol, line, lsfGlobalFreeze, lsfHighFreeze,
+    lsfLowFreeze, lsfMPTAuthorized, lsfMPTCanTrade, lsfMPTCanTransfer, lsfMPTLocked,
     lsfMPTRequireAuth, mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid, owner_dir_keylet,
+    unchecked_keylet,
 };
 use std::sync::Arc;
 
@@ -28,6 +30,7 @@ pub const MAX_TRANSFER_FEE: u16 = 50_000;
 
 /// Parity rate (no fee).
 pub const PARITY_RATE: Rate = Rate::new(1_000_000_000);
+const MAX_ASSET_CHECK_DEPTH: u8 = 8;
 
 /// Check if an MPT issuance is globally frozen (locked).
 pub fn is_global_frozen_mpt(view: &dyn ReadView, mpt_issue: &MPTIssue) -> Result<bool, ViewError> {
@@ -59,8 +62,116 @@ pub fn is_frozen_mpt(
     account: &AccountID,
     mpt_issue: &MPTIssue,
 ) -> Result<bool, ViewError> {
+    is_frozen_mpt_with_depth(view, account, mpt_issue, 0)
+}
+
+fn is_frozen_mpt_with_depth(
+    view: &dyn ReadView,
+    account: &AccountID,
+    mpt_issue: &MPTIssue,
+    depth: u8,
+) -> Result<bool, ViewError> {
     Ok(is_global_frozen_mpt(view, mpt_issue)?
-        || is_individual_frozen_mpt(view, account, mpt_issue)?)
+        || is_individual_frozen_mpt(view, account, mpt_issue)?
+        || is_vault_share_underlying_frozen(view, account, mpt_issue, depth)?)
+}
+
+fn is_frozen_issue_for_account(
+    view: &dyn ReadView,
+    account: &AccountID,
+    issue: Issue,
+) -> Result<bool, ViewError> {
+    if issue.native() || *account == issue.issuer() {
+        return Ok(false);
+    }
+
+    if let Some(issuer_root) = view.read(account_keylet(to_uint160(issue.issuer())))?
+        && issuer_root.is_flag(lsfGlobalFreeze)
+    {
+        return Ok(true);
+    }
+
+    let Some(line) = view.read(line(*account, issue.issuer(), issue.currency))? else {
+        return Ok(false);
+    };
+    Ok(line.is_flag(if issue.issuer() > *account {
+        lsfHighFreeze
+    } else {
+        lsfLowFreeze
+    }))
+}
+
+fn is_frozen_asset_for_accounts(
+    view: &dyn ReadView,
+    accounts: &[AccountID],
+    asset: Asset,
+    depth: u8,
+) -> Result<bool, ViewError> {
+    match asset {
+        Asset::Issue(issue) => accounts.iter().try_fold(false, |frozen, account| {
+            if frozen {
+                Ok(true)
+            } else {
+                is_frozen_issue_for_account(view, account, issue)
+            }
+        }),
+        Asset::MPTIssue(issue) => {
+            if is_global_frozen_mpt(view, &issue)? {
+                return Ok(true);
+            }
+            for account in accounts {
+                if is_individual_frozen_mpt(view, account, &issue)? {
+                    return Ok(true);
+                }
+            }
+            for account in accounts {
+                if is_vault_share_underlying_frozen(view, account, &issue, depth)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+    }
+}
+
+fn is_vault_share_underlying_frozen(
+    view: &dyn ReadView,
+    account: &AccountID,
+    mpt_issue: &MPTIssue,
+    depth: u8,
+) -> Result<bool, ViewError> {
+    if !view
+        .rules()
+        .enabled(&protocol::feature_id("SingleAssetVault"))
+        && !view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_2_0"))
+    {
+        return Ok(false);
+    }
+    if depth >= MAX_ASSET_CHECK_DEPTH {
+        return Ok(true);
+    }
+
+    let Some(share_issuance) = view.read(mpt_issuance_keylet_from_mptid(mpt_issue.mpt_id()))?
+    else {
+        return Ok(false);
+    };
+    if !share_issuance.is_field_present(sf("sfReferenceHolding")) {
+        return Ok(false);
+    }
+
+    let Some(holding) = view.read(unchecked_keylet(
+        share_issuance.get_field_h256(sf("sfReferenceHolding")),
+    ))?
+    else {
+        return Ok(false);
+    };
+    let Some(asset) = asset_of_holding(&share_issuance, &holding) else {
+        return Ok(false);
+    };
+    let issuer = share_issuance.get_account_id(sf("sfIssuer"));
+    is_frozen_asset_for_accounts(view, &[issuer, *account], asset, depth + 1)
 }
 
 /// Get the transfer rate for an MPT issuance.
@@ -93,21 +204,92 @@ pub fn can_transfer_mpt(
     from: &AccountID,
     to: &AccountID,
 ) -> Result<Ter, ViewError> {
+    can_transfer_mpt_with_depth(view, mpt_issue, from, to, 0)
+}
+
+fn asset_of_holding(share_issuance: &STLedgerEntry, holding: &STLedgerEntry) -> Option<Asset> {
+    match holding.get_type() {
+        LedgerEntryType::MPToken => Some(Asset::from(MPTIssue::new(
+            holding.get_field_h192(sf("sfMPTokenIssuanceID")),
+        ))),
+        LedgerEntryType::RippleState => {
+            let vault_pseudo = share_issuance.get_account_id(sf("sfIssuer"));
+            let low_limit = holding.get_field_amount(sf("sfLowLimit"));
+            let high_limit = holding.get_field_amount(sf("sfHighLimit"));
+            let low_issue = low_limit.issue();
+            let high_issue = high_limit.issue();
+            let issuer = if low_issue.issuer() != vault_pseudo {
+                low_issue.issuer()
+            } else {
+                high_issue.issuer()
+            };
+            Some(Asset::from(Issue::new(low_issue.currency, issuer)))
+        }
+        _ => None,
+    }
+}
+
+fn can_transfer_asset_with_depth(
+    view: &dyn ReadView,
+    asset: Asset,
+    from: &AccountID,
+    to: &AccountID,
+    depth: u8,
+) -> Result<Ter, ViewError> {
+    match asset {
+        Asset::MPTIssue(issue) => can_transfer_mpt_with_depth(view, &issue, from, to, depth),
+        Asset::Issue(_) => Ok(Ter::TES_SUCCESS),
+    }
+}
+
+fn can_transfer_mpt_with_depth(
+    view: &dyn ReadView,
+    mpt_issue: &MPTIssue,
+    from: &AccountID,
+    to: &AccountID,
+    depth: u8,
+) -> Result<Ter, ViewError> {
     let Some(sle_issuance) = view.read(mpt_issuance_keylet_from_mptid(mpt_issue.mpt_id()))? else {
         return Ok(Ter::TEC_OBJECT_NOT_FOUND);
     };
 
+    let issuer = sle_issuance.get_account_id(sf("sfIssuer"));
+    if from == &issuer || to == &issuer {
+        return Ok(Ter::TES_SUCCESS);
+    }
+
     if !sle_issuance.is_flag(lsfMPTCanTransfer) {
-        let issuer = sle_issuance.get_account_id(sf("sfIssuer"));
-        if from != &issuer && to != &issuer {
-            return Ok(Ter::TEC_NO_AUTH);
+        return Ok(Ter::TEC_NO_AUTH);
+    }
+
+    if view
+        .rules()
+        .enabled(&protocol::feature_id("fixCleanup3_2_0"))
+        && sle_issuance.is_field_present(sf("sfReferenceHolding"))
+    {
+        if depth >= MAX_ASSET_CHECK_DEPTH {
+            return Ok(Ter::TEC_INTERNAL);
         }
+        let Some(holding) = view.read(unchecked_keylet(
+            sle_issuance.get_field_h256(sf("sfReferenceHolding")),
+        ))?
+        else {
+            return Ok(Ter::TEF_INTERNAL);
+        };
+        let Some(asset) = asset_of_holding(&sle_issuance, &holding) else {
+            return Ok(Ter::TEF_INTERNAL);
+        };
+        return can_transfer_asset_with_depth(view, asset, from, to, depth + 1);
     }
     Ok(Ter::TES_SUCCESS)
 }
 
 /// Check if an asset can be traded on the DEX.
 pub fn can_trade(view: &dyn ReadView, asset: &Asset) -> Result<Ter, ViewError> {
+    can_trade_with_depth(view, asset, 0)
+}
+
+fn can_trade_with_depth(view: &dyn ReadView, asset: &Asset, depth: u8) -> Result<Ter, ViewError> {
     match asset {
         Asset::MPTIssue(mpt_issue) => {
             let Some(sle) = view.read(mpt_issuance_keylet_from_mptid(mpt_issue.mpt_id()))? else {
@@ -116,10 +298,45 @@ pub fn can_trade(view: &dyn ReadView, asset: &Asset) -> Result<Ter, ViewError> {
             if !sle.is_flag(lsfMPTCanTrade) {
                 return Ok(Ter::TEC_NO_PERMISSION);
             }
+            if view
+                .rules()
+                .enabled(&protocol::feature_id("fixCleanup3_2_0"))
+                && sle.is_field_present(sf("sfReferenceHolding"))
+            {
+                if depth >= MAX_ASSET_CHECK_DEPTH {
+                    return Ok(Ter::TEC_INTERNAL);
+                }
+                let Some(holding) = view.read(unchecked_keylet(
+                    sle.get_field_h256(sf("sfReferenceHolding")),
+                ))?
+                else {
+                    return Ok(Ter::TEF_INTERNAL);
+                };
+                let Some(asset) = asset_of_holding(&sle, &holding) else {
+                    return Ok(Ter::TEF_INTERNAL);
+                };
+                return can_trade_with_depth(view, &asset, depth + 1);
+            }
             Ok(Ter::TES_SUCCESS)
         }
         _ => Ok(Ter::TES_SUCCESS),
     }
+}
+
+pub fn can_mpt_trade_and_transfer(
+    view: &dyn ReadView,
+    asset: &Asset,
+    from: &AccountID,
+    to: &AccountID,
+) -> Result<Ter, ViewError> {
+    if !matches!(asset, Asset::MPTIssue(_)) {
+        return Ok(Ter::TES_SUCCESS);
+    }
+    let trade = can_trade(view, asset)?;
+    if trade != Ter::TES_SUCCESS {
+        return Ok(trade);
+    }
+    can_transfer_asset_with_depth(view, *asset, from, to, 0)
 }
 
 /// Require authorization check for MPT.
@@ -135,6 +352,21 @@ pub fn require_auth_mpt(
     let issuer = sle_issuance.get_account_id(sf("sfIssuer"));
     if &issuer == account {
         return Ok(Ter::TES_SUCCESS);
+    }
+
+    let account_key = account_keylet(to_uint160(*account));
+    if view
+        .rules()
+        .enabled(&protocol::feature_id("SingleAssetVault"))
+        || view.rules().enabled(&protocol::feature_id("MPTokensV2"))
+    {
+        if let Some(account_root) = view.read(account_key)?
+            && (account_root.is_field_present(sf("sfVaultID"))
+                || account_root.is_field_present(sf("sfLoanBrokerID"))
+                || account_root.is_field_present(sf("sfAMMID")))
+        {
+            return Ok(Ter::TES_SUCCESS);
+        }
     }
 
     let mptoken_key = mptoken_keylet_from_mptid(mpt_issue.mpt_id(), to_uint160(*account));
@@ -172,14 +404,18 @@ pub fn lock_escrow_mpt(
     sender: &AccountID,
     amount: &STAmount,
 ) -> Result<Ter, ViewError> {
-    let mpt_amount = amount.mpt();
-    let pay = mpt_amount.value() as u64;
-
-    // Get issuance ID from the amount's asset
-    let mpt_id = match amount.asset() {
-        Asset::MPTIssue(i) => i.mpt_id(),
-        _ => panic!("expected MPT"),
+    let Asset::MPTIssue(mpt_issue) = amount.asset() else {
+        return Ok(Ter::TEC_INTERNAL);
     };
+    if mpt_issue.issuer() == *sender {
+        return Ok(Ter::TEC_INTERNAL);
+    }
+    let pay = amount.mpt().value();
+    if pay <= 0 {
+        return Ok(Ter::TEC_INTERNAL);
+    }
+    let pay = pay as u64;
+    let mpt_id = mpt_issue.mpt_id();
 
     let Some(sle_issuance) = view.peek(mpt_issuance_keylet_from_mptid(mpt_id))? else {
         return Ok(Ter::TEC_OBJECT_NOT_FOUND);
@@ -204,7 +440,10 @@ pub fn lock_escrow_mpt(
     } else {
         0
     };
-    updated_token.set_field_u64(sf("sfLockedAmount"), locked + pay);
+    let Some(next_locked) = locked.checked_add(pay) else {
+        return Ok(Ter::TEC_INTERNAL);
+    };
+    updated_token.set_field_u64(sf("sfLockedAmount"), next_locked);
     view.update(Arc::new(updated_token))?;
 
     // Increase issuance LockedAmount
@@ -214,7 +453,10 @@ pub fn lock_escrow_mpt(
     } else {
         0
     };
-    updated_issuance.set_field_u64(sf("sfLockedAmount"), issuance_locked + pay);
+    let Some(next_issuance_locked) = issuance_locked.checked_add(pay) else {
+        return Ok(Ter::TEC_INTERNAL);
+    };
+    updated_issuance.set_field_u64(sf("sfLockedAmount"), next_issuance_locked);
     view.update(Arc::new(updated_issuance))?;
 
     Ok(Ter::TES_SUCCESS)
@@ -227,30 +469,75 @@ pub fn unlock_escrow_mpt(
     receiver: &AccountID,
     net_amount: &STAmount,
     gross_amount: &STAmount,
+    create_asset: bool,
+    receiver_pre_fee_balance_drops: Option<i64>,
 ) -> Result<Ter, ViewError> {
-    let mpt_id = match net_amount.asset() {
-        Asset::MPTIssue(i) => i.mpt_id(),
-        _ => panic!("expected MPT"),
+    let Asset::MPTIssue(mpt_issue) = net_amount.asset() else {
+        return Ok(Ter::TEC_INTERNAL);
     };
-    let issuer = net_amount.asset().issuer();
+    if gross_amount.asset() != net_amount.asset() {
+        return Ok(Ter::TEC_INTERNAL);
+    }
+    let gross = gross_amount.mpt().value();
+    let net = net_amount.mpt().value();
+    if gross <= 0 || net < 0 || net > gross {
+        return Ok(Ter::TEC_INTERNAL);
+    }
+    let gross = gross as u64;
+    let net = net as u64;
+    let mpt_id = mpt_issue.mpt_id();
+    let issuer = mpt_issue.issuer();
+
+    if receiver != &issuer {
+        let receiver_token_key = mptoken_keylet_from_mptid(mpt_id, to_uint160(*receiver));
+        if view.peek(receiver_token_key)?.is_none() {
+            if !create_asset {
+                return Ok(Ter::TEC_NO_PERMISSION);
+            }
+
+            let Some(receiver_sle) = view.peek(account_keylet(to_uint160(*receiver)))? else {
+                return Ok(Ter::TEC_NO_PERMISSION);
+            };
+            let owner_count = receiver_sle.get_field_u32(sf("sfOwnerCount"));
+            let balance = receiver_pre_fee_balance_drops
+                .unwrap_or_else(|| receiver_sle.get_field_amount(sf("sfBalance")).xrp().drops());
+            if balance < view.fees().account_reserve(owner_count as usize + 1) as i64 {
+                return Ok(Ter::TEC_INSUFFICIENT_RESERVE);
+            }
+
+            let result = check_create_mpt(view, &mpt_issue, receiver)?;
+            if result != Ter::TES_SUCCESS && result != Ter::TEC_DUPLICATE {
+                return Ok(result);
+            }
+        }
+    }
 
     let Some(sle_issuance) = view.peek(mpt_issuance_keylet_from_mptid(mpt_id))? else {
         return Ok(Ter::TEC_OBJECT_NOT_FOUND);
     };
 
     // Decrease issuance LockedAmount
-    let issuance_locked = sle_issuance.get_field_u64(sf("sfLockedAmount"));
-    let redeem = gross_amount.mpt().value() as u64;
-    if redeem > issuance_locked {
+    let issuance_locked = if sle_issuance.is_field_present(sf("sfLockedAmount")) {
+        sle_issuance.get_field_u64(sf("sfLockedAmount"))
+    } else {
         return Ok(Ter::TEC_INTERNAL);
-    }
+    };
 
     let mut updated_issuance = (*sle_issuance).clone();
-    let new_locked = issuance_locked - redeem;
+    let Some(new_locked) = issuance_locked.checked_sub(gross) else {
+        return Ok(Ter::TEC_INTERNAL);
+    };
     if new_locked == 0 {
         updated_issuance.make_field_absent(sf("sfLockedAmount"));
     } else {
         updated_issuance.set_field_u64(sf("sfLockedAmount"), new_locked);
+    }
+    if receiver == &issuer {
+        let outstanding = updated_issuance.get_field_u64(sf("sfOutstandingAmount"));
+        let Some(next_outstanding) = outstanding.checked_sub(net) else {
+            return Ok(Ter::TEC_INTERNAL);
+        };
+        updated_issuance.set_field_u64(sf("sfOutstandingAmount"), next_outstanding);
     }
     view.update(Arc::new(updated_issuance))?;
 
@@ -261,10 +548,16 @@ pub fn unlock_escrow_mpt(
             return Ok(Ter::TEC_OBJECT_NOT_FOUND);
         };
         let current = sle_token.get_field_u64(sf("sfMPTAmount"));
-        let delta = net_amount.mpt().value() as u64;
+        let Some(next) = current.checked_add(net) else {
+            return Ok(Ter::TEC_INTERNAL);
+        };
         let mut updated = (*sle_token).clone();
-        updated.set_field_u64(sf("sfMPTAmount"), current + delta);
+        updated.set_field_u64(sf("sfMPTAmount"), next);
         view.update(Arc::new(updated))?;
+    }
+
+    if sender == &issuer {
+        return Ok(Ter::TEC_INTERNAL);
     }
 
     // Decrease sender's LockedAmount
@@ -272,13 +565,15 @@ pub fn unlock_escrow_mpt(
     let Some(sle_sender) = view.peek(sender_key)? else {
         return Ok(Ter::TEC_OBJECT_NOT_FOUND);
     };
-    let sender_locked = sle_sender.get_field_u64(sf("sfLockedAmount"));
-    let delta = gross_amount.mpt().value() as u64;
-    if delta > sender_locked {
+    let sender_locked = if sle_sender.is_field_present(sf("sfLockedAmount")) {
+        sle_sender.get_field_u64(sf("sfLockedAmount"))
+    } else {
         return Ok(Ter::TEC_INTERNAL);
-    }
+    };
     let mut updated_sender = (*sle_sender).clone();
-    let new_sender_locked = sender_locked - delta;
+    let Some(new_sender_locked) = sender_locked.checked_sub(gross) else {
+        return Ok(Ter::TEC_INTERNAL);
+    };
     if new_sender_locked == 0 {
         updated_sender.make_field_absent(sf("sfLockedAmount"));
     } else {
@@ -286,15 +581,39 @@ pub fn unlock_escrow_mpt(
     }
     view.update(Arc::new(updated_sender))?;
 
+    let fee = gross - net;
+    if fee != 0 {
+        let Some(sle_issuance) = view.peek(mpt_issuance_keylet_from_mptid(mpt_id))? else {
+            return Ok(Ter::TEC_OBJECT_NOT_FOUND);
+        };
+        let outstanding = sle_issuance.get_field_u64(sf("sfOutstandingAmount"));
+        let Some(next_outstanding) = outstanding.checked_sub(fee) else {
+            return Ok(Ter::TEC_INTERNAL);
+        };
+        let mut updated_issuance = (*sle_issuance).clone();
+        updated_issuance.set_field_u64(sf("sfOutstandingAmount"), next_outstanding);
+        view.update(Arc::new(updated_issuance))?;
+    }
+
     Ok(Ter::TES_SUCCESS)
 }
 
 /// Check MPT allowed for a specific transaction type.
 pub fn check_mpt_tx_allowed(
     view: &dyn ReadView,
-    _tx_type: TxType,
+    tx_type: TxType,
     asset: &Asset,
     account_id: &AccountID,
+) -> Result<Ter, ViewError> {
+    check_mpt_tx_allowed_with_depth(view, tx_type, asset, account_id, 0)
+}
+
+fn check_mpt_tx_allowed_with_depth(
+    view: &dyn ReadView,
+    tx_type: TxType,
+    asset: &Asset,
+    account_id: &AccountID,
+    depth: u8,
 ) -> Result<Ter, ViewError> {
     let Asset::MPTIssue(mpt_issue) = asset else {
         return Ok(Ter::TES_SUCCESS);
@@ -329,6 +648,32 @@ pub fn check_mpt_tx_allowed(
         {
             return Ok(Ter::TEC_LOCKED);
         }
+
+        if view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_2_0"))
+            && sle.is_field_present(sf("sfReferenceHolding"))
+        {
+            if depth >= MAX_ASSET_CHECK_DEPTH {
+                return Ok(Ter::TEC_INTERNAL);
+            }
+            let Some(holding) = view.read(unchecked_keylet(
+                sle.get_field_h256(sf("sfReferenceHolding")),
+            ))?
+            else {
+                return Ok(Ter::TEF_INTERNAL);
+            };
+            let Some(underlying) = asset_of_holding(&sle, &holding) else {
+                return Ok(Ter::TEF_INTERNAL);
+            };
+            return check_mpt_tx_allowed_with_depth(
+                view,
+                tx_type,
+                &underlying,
+                account_id,
+                depth + 1,
+            );
+        }
     }
 
     Ok(Ter::TES_SUCCESS)
@@ -345,7 +690,7 @@ pub fn is_any_frozen_mpt(
         return Ok(true);
     }
     for account in accounts {
-        if is_individual_frozen_mpt(view, account, mpt_issue)? {
+        if is_frozen_mpt(view, account, mpt_issue)? {
             return Ok(true);
         }
     }
@@ -396,7 +741,17 @@ pub fn remove_empty_holding_mpt(
         return Ok(Ter::TEC_OBJECT_NOT_FOUND);
     };
 
-    if mptoken.get_field_u64(sf("sfMPTAmount")) != 0 {
+    let locked_amount = if mptoken.is_field_present(sf("sfLockedAmount")) {
+        mptoken.get_field_u64(sf("sfLockedAmount"))
+    } else {
+        0
+    };
+    if mptoken.get_field_u64(sf("sfMPTAmount")) != 0
+        || (view
+            .rules()
+            .enabled(&protocol::feature_id("fixCleanup3_1_3"))
+            && locked_amount != 0)
+    {
         return Ok(Ter::TEC_HAS_OBLIGATIONS);
     }
 

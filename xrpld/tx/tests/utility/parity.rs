@@ -719,7 +719,7 @@ fn apply_runtime_restores_prior_ambient_state_after_closure() {
 
     assert_eq!(get_current_transaction_rules(), Some(original));
     assert!(!get_st_number_switchover());
-    assert_eq!(get_mantissa_scale(), MantissaScale::Large);
+    assert_eq!(get_mantissa_scale(), MantissaScale::LargeLegacy);
     set_current_transaction_rules(None);
     set_st_number_switchover(true);
 }
@@ -760,7 +760,7 @@ fn step_runtime_closure_uses_new_feature_guard_path_when_single_asset_vault_is_e
         )
     });
 
-    assert_eq!(observed, (Some(rules), false, MantissaScale::Large));
+    assert_eq!(observed, (Some(rules), false, MantissaScale::LargeLegacy));
     assert_eq!(get_current_transaction_rules(), None);
     assert!(get_st_number_switchover());
     assert_eq!(get_mantissa_scale(), MantissaScale::Large);

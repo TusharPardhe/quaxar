@@ -66,6 +66,7 @@ pub const MPT_CAN_MUTATE_METADATA_LEDGER_FLAG: LedgerFlagValue = 0x0001_0000;
 pub const MPT_CAN_MUTATE_TRANSFER_FEE_LEDGER_FLAG: LedgerFlagValue = 0x0002_0000;
 
 pub const MPT_AUTHORIZED_LEDGER_FLAG: LedgerFlagValue = 0x0000_0002;
+pub const MPT_AMM_LEDGER_FLAG: LedgerFlagValue = 0x0000_0004;
 
 pub const ACCEPTED_LEDGER_FLAG: LedgerFlagValue = 0x0001_0000;
 
@@ -131,6 +132,7 @@ alias_consts!(
     (MPT_CAN_MUTATE_METADATA_LEDGER_FLAG => lsmfMPTCanMutateMetadata),
     (MPT_CAN_MUTATE_TRANSFER_FEE_LEDGER_FLAG => lsmfMPTCanMutateTransferFee),
     (MPT_AUTHORIZED_LEDGER_FLAG => lsfMPTAuthorized),
+    (MPT_AMM_LEDGER_FLAG => lsfMPTAMM),
     (ACCEPTED_LEDGER_FLAG => lsfAccepted),
     (VAULT_PRIVATE_LEDGER_FLAG => lsfVaultPrivate),
     (LOAN_DEFAULT_LEDGER_FLAG => lsfLoanDefault),
@@ -256,6 +258,7 @@ ledger_flag_getter!(
     [
         ("lsfMPTLocked", lsfMPTLocked),
         ("lsfMPTAuthorized", lsfMPTAuthorized),
+        ("lsfMPTAMM", lsfMPTAMM),
     ]
 );
 ledger_flag_getter!(

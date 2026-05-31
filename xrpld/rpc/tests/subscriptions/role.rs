@@ -159,6 +159,24 @@ fn forwarded_for_strips_port_from_ip() {
 }
 
 #[test]
+fn forwarded_for_handles_quoted_ipv6_and_rejects_malformed_brackets() {
+    let headers = BTreeMap::from([(
+        "forwarded".to_owned(),
+        "for=\"[2001:4860:4860::8888]:443\"".to_owned(),
+    )]);
+    assert_eq!(
+        forwarded_for(&headers),
+        Some("2001:4860:4860::8888".to_owned())
+    );
+
+    let malformed = BTreeMap::from([(
+        "forwarded".to_owned(),
+        "for=\"[2001:4860:4860::8888:443\"".to_owned(),
+    )]);
+    assert_eq!(forwarded_for(&malformed), None);
+}
+
+#[test]
 fn forwarded_for_empty_headers() {
     let headers = BTreeMap::new();
     let result = forwarded_for(&headers);
@@ -182,4 +200,19 @@ fn forwarded_for_rfc7239_multiple_for() {
     );
     let result = forwarded_for(&headers);
     assert_eq!(result, Some("55.66.77.88".to_owned()));
+}
+
+#[test]
+fn forwarded_for_requires_rfc7239_directive_boundary() {
+    let headers = BTreeMap::from([(
+        "forwarded".to_owned(),
+        "xfor=198.51.100.1;proto=https".to_owned(),
+    )]);
+    assert_eq!(forwarded_for(&headers), None);
+
+    let headers = BTreeMap::from([(
+        "forwarded".to_owned(),
+        "xfor=198.51.100.1;\tfor=203.0.113.9".to_owned(),
+    )]);
+    assert_eq!(forwarded_for(&headers), Some("203.0.113.9".to_owned()));
 }

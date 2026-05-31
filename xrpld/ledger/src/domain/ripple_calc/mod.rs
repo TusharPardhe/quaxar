@@ -10,7 +10,7 @@ use crate::read_view::ViewError;
 use crate::views::apply_view::ApplyView;
 use basics::base_uint::Uint160;
 use protocol::{
-    AccountID, STAmount, STLedgerEntry, STPathSet, Ter, get_field_by_symbol, is_tes_success,
+    AccountID, Asset, STAmount, STLedgerEntry, STPathSet, Ter, get_field_by_symbol, is_tes_success,
 };
 use std::sync::Arc;
 
@@ -236,6 +236,16 @@ fn ripple_calculate_inner<V: ApplyView>(
 ) -> Result<RippleCalcOutput, ViewError> {
     let mut total_in = max_source_amount.zeroed();
     let mut total_out = dst_amount.zeroed();
+
+    if frozen_iou_endpoint(view, dst_amount, src_account, dst_account)
+        || frozen_iou_endpoint(view, max_source_amount, src_account, dst_account)
+    {
+        return Ok(RippleCalcOutput {
+            result: Ter::TEC_PATH_DRY,
+            actual_amount_in: max_source_amount.zeroed(),
+            actual_amount_out: dst_amount.zeroed(),
+        });
+    }
 
     // This replaces the simplified try_default_path approach.
     let deliver_asset = dst_amount.asset();
@@ -481,6 +491,24 @@ fn ripple_calculate_inner<V: ApplyView>(
     }
 }
 
+fn frozen_iou_endpoint<V: ApplyView>(
+    view: &mut V,
+    amount: &STAmount,
+    src_account: &AccountID,
+    dst_account: &AccountID,
+) -> bool {
+    let Asset::Issue(issue) = amount.asset() else {
+        return false;
+    };
+
+    if amount.native() || *src_account == issue.account || *dst_account == issue.account {
+        return false;
+    }
+
+    crate::domain::ripple_state_helpers::is_frozen(view, src_account, &issue)
+        || crate::domain::ripple_state_helpers::is_frozen(view, dst_account, &issue)
+}
+
 fn try_default_path<V: ApplyView>(
     view: &mut V,
     max_source_amount: &STAmount,
@@ -696,8 +724,8 @@ fn try_xrp_to_iou_default_path<V: ApplyView>(
     let dst_issue = dst_amount.issue();
     // Book: XRP → destination IOU
     let book = book_step::Book {
-        r#in: protocol::xrp_issue(),
-        out: dst_issue,
+        r#in: Asset::Issue(protocol::xrp_issue()),
+        out: Asset::Issue(dst_issue),
     };
     let result = book_step::execute_book_step(
         view,
@@ -769,8 +797,8 @@ fn try_iou_to_xrp_default_path<V: ApplyView>(
     let src_issue = max_source_amount.issue();
     // Book: source IOU → XRP
     let book = book_step::Book {
-        r#in: src_issue,
-        out: protocol::xrp_issue(),
+        r#in: Asset::Issue(src_issue),
+        out: Asset::Issue(protocol::xrp_issue()),
     };
     let result = book_step::execute_book_step(
         view,

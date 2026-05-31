@@ -202,6 +202,14 @@ impl QualityFunction {
         None
     }
 
+    pub fn satisfies_avg_q(&self, quality: Quality, out: RuntimeNumber) -> bool {
+        if quality.rate().signum() == 0 {
+            return false;
+        }
+
+        self.m * out + self.b >= current_number_one() / quality_rate_as_number(quality)
+    }
+
     pub fn is_const(&self) -> bool {
         self.quality.is_some()
     }

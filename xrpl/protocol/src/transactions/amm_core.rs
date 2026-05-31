@@ -4,7 +4,7 @@ use basics::number::{NumberParts as RuntimeNumber, current_number_one, get_manti
 use sha2::{Digest, Sha512};
 
 use crate::{
-    AccountID, Currency, Issue, NotTec, Rules, STAmount, Ter, bad_currency, feature_amm,
+    AccountID, Asset, Currency, Issue, NotTec, Rules, STAmount, Ter, bad_currency, feature_amm,
     feature_universal_number, is_xrp_currency,
 };
 
@@ -51,6 +51,32 @@ pub fn amm_lpt_currency(cur1: Currency, cur2: Currency) -> Currency {
 
 pub fn amm_lpt_issue(cur1: Currency, cur2: Currency, amm_account_id: AccountID) -> Issue {
     Issue::new(amm_lpt_currency(cur1, cur2), amm_account_id)
+}
+
+fn amm_lpt_asset_bytes(asset: Asset) -> Vec<u8> {
+    match asset {
+        Asset::Issue(issue) => issue.currency.data().to_vec(),
+        Asset::MPTIssue(issue) => issue.mpt_id().data().to_vec(),
+    }
+}
+
+pub fn amm_lpt_currency_from_assets(asset1: Asset, asset2: Asset) -> Currency {
+    let (min_asset, max_asset) = if asset1 <= asset2 {
+        (asset1, asset2)
+    } else {
+        (asset2, asset1)
+    };
+    let min_bytes = amm_lpt_asset_bytes(min_asset);
+    let max_bytes = amm_lpt_asset_bytes(max_asset);
+    let hash = sha512_half(&[&min_bytes, &max_bytes]);
+    let mut bytes = [0u8; Currency::BYTES];
+    bytes[0] = 0x03;
+    bytes[1..].copy_from_slice(&hash[..Currency::BYTES - 1]);
+    Currency::from_array(bytes)
+}
+
+pub fn amm_lpt_issue_from_assets(asset1: Asset, asset2: Asset, amm_account_id: AccountID) -> Issue {
+    Issue::new(amm_lpt_currency_from_assets(asset1, asset2), amm_account_id)
 }
 
 pub fn invalid_amm_asset(issue: Issue, pair: Option<(Issue, Issue)>) -> NotTec {

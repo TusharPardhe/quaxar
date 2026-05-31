@@ -226,8 +226,8 @@ fn strand_quality_above_threshold<V: crate::ReadView>(
         if let StepKind::Book { book_in, book_out } = step {
             has_book_step = true;
             let book = Book {
-                r#in: *book_in,
-                out: *book_out,
+                r#in: protocol::Asset::Issue(*book_in),
+                out: protocol::Asset::Issue(*book_out),
             };
             // Get the best offer quality in this book (TakerGets/TakerPays = output/input)
             if let Some(q) = get_book_best_quality(view, &book) {

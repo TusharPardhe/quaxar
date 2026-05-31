@@ -436,7 +436,7 @@ impl STTx {
             sig_object as *const STObject,
             &self.object as *const STObject,
         )
-        .then(|| self.get_account_id(get_field_by_symbol("sfAccount")));
+        .then(|| self.get_fee_payer());
 
         check_signature(
             sig_object,

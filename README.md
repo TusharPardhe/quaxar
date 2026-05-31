@@ -67,7 +67,7 @@ The setup script will:
 - Check your system meets requirements (CPU, RAM, disk)
 - Install dependencies (Rust, OpenSSL, RocksDB, etc.)
 - Build and install `xrpld` to your PATH
-- Generate configuration files interactively
+- Generate an `xrpld.cfg` and validator list interactively
 - Optionally set up a systemd service
 
 ### From Source (manual)
@@ -90,11 +90,23 @@ cargo install --path xrpld/main
 
 After installation, `xrpld` is available in your PATH.
 
+Use the repository default config directly while developing:
+
+```bash
+xrpld --conf ./xrpld.cfg
+```
+
+The checked-in `xrpld.cfg` is intentionally small and runnable. Detailed
+parameter explanations live in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
 ### Docker
 
 ```bash
 docker compose up -d
 ```
+
+Docker Compose mounts `./xrpld.cfg` into the container as
+`/etc/xrpld/xrpld.cfg`, matching the Docker image default command.
 
 ### Binary Releases
 
@@ -194,6 +206,10 @@ protocol = peer
 [node_size]
 medium
 
+[ledger_acquisition]
+# Optional cold-bootstrap acquisition override. Omit to use [node_size].
+# ledger_fetch_limit = 8
+
 [node_db]
 type = NuDB
 path = /var/lib/xrpld/db/nudb
@@ -202,7 +218,9 @@ path = /var/lib/xrpld/db/nudb
 validators.txt
 ```
 
-See [docs/RUNNING.md](docs/RUNNING.md) for full configuration reference.
+The repository includes this as a clean runnable default in `xrpld.cfg`. See
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full configuration
+reference and [docs/RUNNING.md](docs/RUNNING.md) for operational guidance.
 
 ---
 
@@ -225,6 +243,7 @@ See [docs/RUNNING.md](docs/RUNNING.md) for full configuration reference.
 | Document | Description |
 |----------|-------------|
 | [RUNNING.md](docs/RUNNING.md) | Installation, configuration, systemd setup |
+| [CONFIGURATION.md](docs/CONFIGURATION.md) | Full configuration reference |
 | [CLI.md](docs/CLI.md) | Full CLI reference |
 | [SYNCING.md](docs/SYNCING.md) | How sync works, time estimates, troubleshooting |
 | [VALIDATORS.md](docs/VALIDATORS.md) | Validator setup and key management |

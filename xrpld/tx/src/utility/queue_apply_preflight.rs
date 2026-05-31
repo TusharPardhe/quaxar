@@ -6,12 +6,13 @@
 
 use std::fmt::Display;
 
-use protocol::{is_tes_success, trans_token};
+use protocol::{Ter, any_apply_flags, is_tes_success, trans_token};
 
 use crate::{
-    ApplyResult, PreflightResult, QueueApplyEntryStage, QueueApplyFeeContextInputs,
-    QueueApplyQueueLogMessages, QueueApplyQueuedStage, QueueApplyQueuedStageWithLogMessagesResult,
-    QueueViews, evaluate_queue_apply_fee_context, prepare_direct_apply_if_eligible,
+    ApplyFlags, ApplyResult, PreflightResult, QueueApplyEntryStage, QueueApplyFeeContextInputs,
+    QueueApplyPrerequisite, QueueApplyQueueLogMessages, QueueApplyQueuedStage,
+    QueueApplyQueuedStageWithLogMessagesResult, QueueViews, evaluate_queue_apply_fee_context,
+    evaluate_queue_apply_prerequisite, prepare_direct_apply_if_eligible,
     run_prepared_direct_apply_with_trace, run_queue_apply_entry_stage,
     run_queue_apply_entry_stage_with_log_messages,
 };
@@ -195,6 +196,24 @@ where
         ));
     }
 
+    if direct_applied.is_none() && any_apply_flags(preflight_result.flags & ApplyFlags::DRY_RUN) {
+        let prerequisite = evaluate_queue_apply_prerequisite(
+            account_exists,
+            account_seq_proxy,
+            tx_seq_proxy,
+            ticket_exists,
+        );
+        return if prerequisite == QueueApplyPrerequisite::Ready {
+            QueueApplyPreflightStage::RejectPreflight(ApplyResult::new(
+                Ter::TEL_CAN_NOT_QUEUE,
+                false,
+                false,
+            ))
+        } else {
+            QueueApplyPreflightStage::Entry(QueueApplyEntryStage::RejectPrerequisite(prerequisite))
+        };
+    }
+
     QueueApplyPreflightStage::Entry(run_queue_apply_entry_stage(
         account_exists,
         account_seq_proxy,
@@ -233,6 +252,29 @@ where
                 false,
                 false,
             )),
+            queue_log_messages: QueueApplyQueueLogMessages::default(),
+        };
+    }
+
+    if direct_applied.is_none() && any_apply_flags(preflight_result.flags & ApplyFlags::DRY_RUN) {
+        let prerequisite = evaluate_queue_apply_prerequisite(
+            account_exists,
+            account_seq_proxy,
+            tx_seq_proxy,
+            ticket_exists,
+        );
+        return QueueApplyPreflightStageWithLogMessagesResult {
+            stage: if prerequisite == QueueApplyPrerequisite::Ready {
+                QueueApplyPreflightStage::RejectPreflight(ApplyResult::new(
+                    Ter::TEL_CAN_NOT_QUEUE,
+                    false,
+                    false,
+                ))
+            } else {
+                QueueApplyPreflightStage::Entry(QueueApplyEntryStage::RejectPrerequisite(
+                    prerequisite,
+                ))
+            },
             queue_log_messages: QueueApplyQueueLogMessages::default(),
         };
     }
@@ -661,15 +703,7 @@ mod tests {
             },
         };
 
-        let stage = run_queue_apply_after_preflight_with_acquired_direct_apply::<
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            _,
-        >(
+        let stage = run_queue_apply_after_preflight_with_acquired_direct_apply(
             &preflight(Ter::TER_RETRY),
             true,
             SeqProxy::sequence(8),
@@ -732,21 +766,13 @@ mod tests {
     fn acquired_direct_apply_stage_falls_through_to_existing_queue_entry_path() {
         let ran_queued = Cell::new(false);
 
-        let stage = run_queue_apply_after_preflight_with_acquired_direct_apply::<
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            &'static str,
-            _,
-        >(
+        let stage = run_queue_apply_after_preflight_with_acquired_direct_apply(
             &preflight(Ter::TES_SUCCESS),
             true,
             SeqProxy::sequence(8),
             SeqProxy::sequence(8),
             true,
-            None,
+            None::<DirectApplyExecution<&'static str, &'static str>>,
             || {
                 ran_queued.set(true);
                 QueueApplyQueuedStage::MultiTxn(crate::QueueApplyMultiTxnStage::RejectPath(
@@ -764,6 +790,34 @@ mod tests {
             ))
         );
         assert!(ran_queued.get());
+    }
+
+    #[test]
+    fn acquired_direct_apply_stage_rejects_dry_run_before_queue_path() {
+        let ran_queued = Cell::new(false);
+        let mut preflight = preflight(Ter::TES_SUCCESS);
+        preflight.flags = ApplyFlags::DRY_RUN;
+
+        let stage = run_queue_apply_after_preflight_with_acquired_direct_apply(
+            &preflight,
+            true,
+            SeqProxy::sequence(8),
+            SeqProxy::sequence(8),
+            true,
+            None::<DirectApplyExecution<&'static str, &'static str>>,
+            || {
+                ran_queued.set(true);
+                QueueApplyQueuedStage::MultiTxn(crate::QueueApplyMultiTxnStage::RejectPath(
+                    Ter::TER_PRE_SEQ,
+                ))
+            },
+        );
+
+        assert_eq!(
+            stage.apply_result(),
+            ApplyResult::new(Ter::TEL_CAN_NOT_QUEUE, false, false)
+        );
+        assert!(!ran_queued.get());
     }
 
     #[test]

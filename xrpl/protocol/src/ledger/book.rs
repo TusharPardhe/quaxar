@@ -1,30 +1,38 @@
 //! `Book` helpers ported from `xrpl/protocol/Book.*`.
 
-use crate::{Domain, Issue, is_consistent, issue_to_string};
+use crate::{Asset, Domain, is_consistent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct Book {
-    pub r#in: Issue,
-    pub out: Issue,
+    pub r#in: Asset,
+    pub out: Asset,
     pub domain: Option<Domain>,
 }
 
 impl Book {
-    pub const fn new(r#in: Issue, out: Issue, domain: Option<Domain>) -> Self {
-        Self { r#in, out, domain }
+    pub fn new(r#in: impl Into<Asset>, out: impl Into<Asset>, domain: Option<Domain>) -> Self {
+        Self {
+            r#in: r#in.into(),
+            out: out.into(),
+            domain,
+        }
     }
 
     pub fn text(&self) -> String {
-        format!(
-            "{}->{}",
-            issue_to_string(self.r#in),
-            issue_to_string(self.out)
-        )
+        format!("{}->{}", self.r#in.text(), self.out.text())
     }
 }
 
 pub fn is_consistent_book(book: Book) -> bool {
-    is_consistent(book.r#in) && is_consistent(book.out) && book.r#in != book.out
+    let in_consistent = match book.r#in {
+        Asset::Issue(issue) => is_consistent(issue),
+        Asset::MPTIssue(issue) => !issue.issuer().is_zero(),
+    };
+    let out_consistent = match book.out {
+        Asset::Issue(issue) => is_consistent(issue),
+        Asset::MPTIssue(issue) => !issue.issuer().is_zero(),
+    };
+    in_consistent && out_consistent && book.r#in != book.out
 }
 
 pub fn reverse_book(book: Book) -> Book {

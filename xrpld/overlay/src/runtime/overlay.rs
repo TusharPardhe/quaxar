@@ -30,6 +30,7 @@ pub struct Setup {
     pub fixed_peer_ips: HashSet<IpAddr>,
     pub ip_limit: usize,
     pub peer_limit: usize,
+    pub verify_endpoints: bool,
     pub crawl_options: u32,
     pub network_id: Option<u32>,
     pub vl_enabled: bool,
@@ -50,6 +51,7 @@ impl Default for Setup {
             fixed_peer_ips: HashSet::new(),
             ip_limit: 0,
             peer_limit: 0,
+            verify_endpoints: true,
             crawl_options: 0,
             network_id: None,
             vl_enabled: true,
@@ -74,6 +76,7 @@ pub enum Handoff {
 pub struct OverlayStats {
     pub active_peers: usize,
     pub limit: usize,
+    pub verify_endpoints: bool,
     pub jq_trans_overflow: u64,
     pub peer_disconnects: u64,
     pub peer_disconnect_charges: u64,
@@ -101,11 +104,13 @@ pub trait Overlay: Send + Sync {
     fn inc_peer_disconnect_charges(&self);
     fn peer_disconnect_charges(&self) -> u64;
     fn network_id(&self) -> Option<u32>;
+    fn verify_endpoints(&self) -> bool;
     fn tx_metrics(&self) -> JsonValue;
     fn stats(&self) -> OverlayStats {
         OverlayStats {
             active_peers: self.size(),
             limit: self.limit(),
+            verify_endpoints: self.verify_endpoints(),
             jq_trans_overflow: self.jq_trans_overflow(),
             peer_disconnects: self.peer_disconnect(),
             peer_disconnect_charges: self.peer_disconnect_charges(),
@@ -124,6 +129,10 @@ pub fn stats_to_json(stats: OverlayStats) -> JsonValue {
             JsonValue::Unsigned(stats.active_peers as u64),
         ),
         ("limit".to_owned(), JsonValue::Unsigned(stats.limit as u64)),
+        (
+            "verify_endpoints".to_owned(),
+            JsonValue::Bool(stats.verify_endpoints),
+        ),
         (
             "jq_trans_overflow".to_owned(),
             JsonValue::Unsigned(stats.jq_trans_overflow),

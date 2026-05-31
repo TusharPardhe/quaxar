@@ -23,6 +23,7 @@ pub const FEATURE_SINGLE_ASSET_VAULT_NAME: &str = "SingleAssetVault";
 pub const FEATURE_UNIVERSAL_NUMBER_NAME: &str = "fixUniversalNumber";
 pub const FIX_AMMV1_1_NAME: &str = "fixAMMv1_1";
 pub const FIX_AMMV1_3_NAME: &str = "fixAMMv1_3";
+pub const FIX_CLEANUP_3_2_0_NAME: &str = "fixCleanup3_2_0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisteredFeatureVote {
@@ -53,7 +54,11 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     // credential deletion errors, PermissionedDEX hybrid validation.
     // Enabled on testnet; mark supported so node is not amendment-blocked.
     RegisteredFeature::new("fixCleanup3_1_3", true, RegisteredFeatureVote::DefaultYes),
-    RegisteredFeature::new("fixCleanup3_2_0", false, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new(
+        FIX_CLEANUP_3_2_0_NAME,
+        true,
+        RegisteredFeatureVote::DefaultYes,
+    ),
     RegisteredFeature::new("MPTokensV2", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("fixSecurity3_1_3", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
@@ -369,6 +374,10 @@ pub fn fix_enforce_nftoken_trustline_v2() -> Uint256 {
 
 pub fn fix_cleanup_3_1_3() -> Uint256 {
     feature_id("fixCleanup3_1_3")
+}
+
+pub fn fix_cleanup_3_2_0() -> Uint256 {
+    feature_id(FIX_CLEANUP_3_2_0_NAME)
 }
 
 pub fn fix_token_escrow_v1() -> Uint256 {

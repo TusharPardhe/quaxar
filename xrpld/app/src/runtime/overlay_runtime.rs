@@ -616,6 +616,7 @@ pub fn build_overlay_setup(config: &BasicConfig) -> Result<Setup, String> {
         fixed_peer_ips: std::collections::HashSet::new(),
         ip_limit: 0,
         peer_limit: 0,
+        verify_endpoints: true,
         crawl_options: CRAWL_OPTION_OVERLAY | CRAWL_OPTION_SERVER_INFO | CRAWL_OPTION_UNL,
         network_id: None,
         vl_enabled: true,
@@ -717,10 +718,20 @@ fn parse_bootstrap_peer_endpoints(
 }
 
 fn parse_fixed_peer_ips(fixed_peer_endpoints: &[String]) -> std::collections::HashSet<IpAddr> {
+    fn canonical_ip(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(ipv6) => ipv6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(ipv6)),
+            IpAddr::V4(_) => ip,
+        }
+    }
+
     fixed_peer_endpoints
         .iter()
-        .filter_map(|endpoint| endpoint.rsplit_once(':').map(|(host, _)| host))
-        .filter_map(|host| host.parse::<IpAddr>().ok())
+        .filter_map(|endpoint| endpoint.parse::<SocketAddr>().ok())
+        .map(|endpoint| canonical_ip(endpoint.ip()))
         .collect()
 }
 
@@ -809,20 +820,24 @@ fn parse_overlay_section(section: &Section, setup: &mut Setup) -> Result<(), Str
         setup.ip_limit = parsed;
     }
 
-    let Some(public_ip) = raw(section, "public_ip") else {
-        return Ok(());
-    };
-    if public_ip.is_empty() {
-        return Ok(());
+    if let Some(verify_endpoints) = raw(section, "verify_endpoints") {
+        setup.verify_endpoints = parse_bool(verify_endpoints)
+            .map_err(|_| "Configured verify_endpoints is invalid".to_owned())?;
     }
 
-    let parsed = public_ip
-        .parse::<IpAddr>()
-        .map_err(|_| "Configured public IP is invalid".to_owned())?;
-    if !is_public_ip(parsed) {
-        return Err("Configured public IP is invalid".to_owned());
+    if let Some(public_ip) = raw(section, "public_ip") {
+        if public_ip.is_empty() {
+            return Ok(());
+        }
+
+        let parsed = public_ip
+            .parse::<IpAddr>()
+            .map_err(|_| "Configured public IP is invalid".to_owned())?;
+        if !is_public_ip(parsed) {
+            return Err("Configured public IP is invalid".to_owned());
+        }
+        setup.public_ip = Some(parsed);
     }
-    setup.public_ip = Some(parsed);
     Ok(())
 }
 
@@ -971,22 +986,46 @@ fn raw(section: &Section, name: &str) -> Option<String> {
 
 fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ip) => {
-            !(ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_broadcast()
-                || ip.is_documentation()
-                || ip.is_unspecified()
-                || ip.octets()[0] == 0)
-        }
-        IpAddr::V6(ip) => {
-            !(ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_unique_local()
-                || ip.is_unicast_link_local())
-        }
+        IpAddr::V4(ip) => is_public_ipv4(ip),
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(is_public_ipv4)
+            .unwrap_or_else(|| is_public_ipv6(ip)),
     }
+}
+
+fn is_public_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || (octets[0] == 0)
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+        || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+        || octets[0] >= 240)
+}
+
+fn is_public_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    let first = segments[0];
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (first & 0xfe00) == 0xfc00
+        || (first & 0xffc0) == 0xfe80
+        || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0)
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || (segments[0] == 0x2001 && segments[1] == 0x0000)
+        || (segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0020)
+        || segments[0] == 0x2002)
 }
 
 #[cfg(test)]
@@ -996,13 +1035,15 @@ mod tests {
         CRAWL_OPTION_OVERLAY, CRAWL_OPTION_SERVER_COUNTS, CRAWL_OPTION_SERVER_INFO,
         CRAWL_OPTION_UNL, bootcache_on_failure, bootcache_on_success, bootstrap_can_dial_bootcache,
         bootstrap_needs_bootcache_dial, build_overlay_runtime, build_overlay_setup,
-        default_overlay_client_config, fixed_retry_state_or_due, overlay_server_config,
-        parse_bootstrap_peer_endpoints, parse_peer_endpoints, peerfinder_outbound_target,
-        remember_bootcache_endpoint, select_bootcache_endpoints,
+        default_overlay_client_config, fixed_retry_state_or_due, is_public_ip,
+        overlay_server_config, parse_bootstrap_peer_endpoints, parse_fixed_peer_ips,
+        parse_peer_endpoints, peerfinder_outbound_target, remember_bootcache_endpoint,
+        select_bootcache_endpoints,
     };
     use crate::runtime::main_runtime::ManagedComponent;
     use basics::basic_config::BasicConfig;
     use std::collections::{BTreeSet, HashMap};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -1052,6 +1093,7 @@ mod tests {
             defaulted.crawl_options,
             CRAWL_OPTION_OVERLAY | CRAWL_OPTION_SERVER_INFO | CRAWL_OPTION_UNL
         );
+        assert!(defaulted.verify_endpoints);
     }
 
     #[test]
@@ -1068,6 +1110,83 @@ mod tests {
             .err()
             .expect("public ip");
         assert_eq!(public_ip_error, "Configured public IP is invalid");
+
+        for ip in ["192.88.99.1", "100::1", "2001:20::1", "2001:2f:ffff::1"] {
+            let error = build_overlay_setup(&config(&format!("[overlay]\npublic_ip = {ip}\n")))
+                .err()
+                .expect("special public ip range");
+            assert_eq!(error, "Configured public IP is invalid");
+        }
+
+        let verify_error = build_overlay_setup(&config("[overlay]\nverify_endpoints = maybe\n"))
+            .err()
+            .expect("verify endpoints");
+        assert_eq!(verify_error, "Configured verify_endpoints is invalid");
+    }
+
+    #[test]
+    fn overlay_setup_parses_verify_endpoints() {
+        let disabled =
+            build_overlay_setup(&config("[overlay]\nverify_endpoints = false\n")).expect("false");
+        assert!(!disabled.verify_endpoints);
+
+        let enabled =
+            build_overlay_setup(&config("[overlay]\nverify_endpoints = 1\n")).expect("true");
+        assert!(enabled.verify_endpoints);
+    }
+
+    #[test]
+    fn overlay_public_ip_classification_matches_cpp_ranges() {
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "2001:4860:4860::8888",
+            "::ffff:8.8.4.4",
+        ] {
+            assert!(
+                is_public_ip(ip.parse::<IpAddr>().expect("public ip")),
+                "{ip}"
+            );
+        }
+
+        for ip in [
+            "0.1.2.3",
+            "10.0.0.1",
+            "100.64.0.1",
+            "100.127.255.255",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.88.99.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:10.0.0.1",
+            "100::1",
+            "2001::1",
+            "2001:20::1",
+            "2001:2f:ffff::1",
+            "2001:db8::1",
+            "2002::1",
+            "fc00::1",
+            "fd00::1",
+            "fe80::1",
+            "ff00::1",
+        ] {
+            assert!(
+                !is_public_ip(ip.parse::<IpAddr>().expect("private ip")),
+                "{ip}"
+            );
+        }
     }
 
     #[test]
@@ -1249,6 +1368,22 @@ tx_min_peers = 9
         let defaults = parse_bootstrap_peer_endpoints(&config(""), &[]).expect("defaults");
         assert_eq!(defaults.len(), 4);
         assert_eq!(defaults[0], "r.ripple.com:51235");
+    }
+
+    #[test]
+    fn fixed_peer_ips_parse_ipv6_and_canonicalize_mapped_ipv4() {
+        let fixed = parse_peer_endpoints(
+            &config("[ips_fixed]\n[2001:4860:4860::8888] 51235\n[::ffff:203.0.113.7] 51235\n"),
+            "ips_fixed",
+        )
+        .expect("fixed endpoints");
+
+        let ips = parse_fixed_peer_ips(&fixed);
+
+        assert!(ips.contains(&IpAddr::V6(
+            "2001:4860:4860::8888".parse::<Ipv6Addr>().expect("ipv6")
+        )));
+        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))));
     }
 
     #[test]

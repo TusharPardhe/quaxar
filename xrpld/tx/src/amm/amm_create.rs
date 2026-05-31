@@ -48,22 +48,37 @@ pub struct AMMCreateApplyFacts {
 }
 
 pub trait AMMCreateApplySink {
-    fn create_amm_entry(&mut self);
-    fn create_amm_account(&mut self);
-    fn deposit_initial_liquidity(&mut self);
-    fn mint_lp_tokens(&mut self);
-    fn adjust_owner_count(&mut self, delta: i32);
+    fn create_amm_account(&mut self) -> Ter;
+    fn create_amm_entry(&mut self) -> Ter;
+    fn deposit_initial_liquidity(&mut self) -> Ter;
+    fn mint_lp_tokens(&mut self) -> Ter;
+    fn adjust_owner_count(&mut self, delta: i32) -> Ter;
 }
 
 pub fn run_amm_create_do_apply<S: AMMCreateApplySink>(
     _facts: AMMCreateApplyFacts,
     sink: &mut S,
 ) -> Ter {
-    sink.create_amm_account();
-    sink.create_amm_entry();
-    sink.deposit_initial_liquidity();
-    sink.mint_lp_tokens();
-    sink.adjust_owner_count(1);
+    let result = sink.create_amm_account();
+    if result != Ter::TES_SUCCESS {
+        return result;
+    }
+    let result = sink.create_amm_entry();
+    if result != Ter::TES_SUCCESS {
+        return result;
+    }
+    let result = sink.deposit_initial_liquidity();
+    if result != Ter::TES_SUCCESS {
+        return result;
+    }
+    let result = sink.mint_lp_tokens();
+    if result != Ter::TES_SUCCESS {
+        return result;
+    }
+    let result = sink.adjust_owner_count(1);
+    if result != Ter::TES_SUCCESS {
+        return result;
+    }
     Ter::TES_SUCCESS
 }
 

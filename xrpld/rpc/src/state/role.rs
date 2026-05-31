@@ -59,7 +59,14 @@ fn extract_forwarded_ip(field: &str) -> Option<String> {
     if let Some(stripped) = value.strip_prefix('[') {
         let end = stripped.find(']')?;
         let address = trim(&stripped[..end]);
+        let remainder = trim(&stripped[end + 1..]);
+        if !remainder.is_empty() && !remainder.starts_with(':') {
+            return None;
+        }
         return (!address.is_empty()).then(|| address.to_owned());
+    }
+    if value.contains(']') {
+        return None;
     }
 
     let first_non_hex = value
@@ -75,13 +82,39 @@ fn extract_forwarded_ip(field: &str) -> Option<String> {
         return Some(value.to_owned());
     }
 
-    let value = value.split(':').next().unwrap_or(value).trim();
+    let value = if let Some((address, _port)) = value.split_once(':') {
+        address
+            .parse::<std::net::Ipv4Addr>()
+            .map(|_| address)
+            .unwrap_or(value)
+    } else {
+        value
+    }
+    .trim();
     (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn forwarded_for_value(value: &str) -> Option<String> {
-    let lower = value.to_ascii_lowercase();
-    let start = lower.find("for=")? + 4;
+    fn directive_value_start(value: &str) -> Option<usize> {
+        let lower = value.to_ascii_lowercase();
+        let bytes = lower.as_bytes();
+        let mut start = 0;
+        while start + 4 <= bytes.len() {
+            let Some(offset) = lower[start..].find("for=") else {
+                return None;
+            };
+            let index = start + offset;
+            let at_boundary =
+                index == 0 || matches!(bytes[index.saturating_sub(1)], b';' | b',' | b' ' | b'\t');
+            if at_boundary {
+                return Some(index + 4);
+            }
+            start = index + 1;
+        }
+        None
+    }
+
+    let start = directive_value_start(value)?;
     let value = value[start..]
         .split([',', ';'])
         .next()

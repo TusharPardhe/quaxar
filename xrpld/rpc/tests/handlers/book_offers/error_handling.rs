@@ -264,6 +264,120 @@ fn book_offers_delegates_page_shaping_and_preserves_ledger() {
 }
 
 #[test]
+fn book_offers_accepts_mpt_issuance_id_book_leg() {
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        client_jobs: 0,
+    };
+    let runtime = FakeRuntime::default();
+    let mpt_id = make_mpt_id(7, sample_account(0x8A));
+
+    let response = run(
+        object([
+            (
+                "taker_pays",
+                object([("currency", JsonValue::String("XRP".to_owned()))]),
+            ),
+            (
+                "taker_gets",
+                object([("mpt_issuance_id", JsonValue::String(mpt_id.to_string()))]),
+            ),
+        ]),
+        &source,
+        &runtime,
+    );
+
+    let response = result_object(response);
+    assert_eq!(response.get("error"), None);
+    let call = runtime
+        .call
+        .borrow()
+        .clone()
+        .expect("runtime should be called");
+    assert_eq!(
+        call.book,
+        Book::new(
+            Issue::new(xrp_currency(), xrp_account()),
+            Asset::from(MPTIssue::new(mpt_id)),
+            None,
+        )
+    );
+}
+
+#[test]
+fn book_offers_rejects_mpt_leg_mixed_with_currency_or_issuer() {
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        client_jobs: 0,
+    };
+    let runtime = FakeRuntime::default();
+    let mpt_id = make_mpt_id(9, sample_account(0x8B));
+
+    let response = run(
+        object([
+            (
+                "taker_pays",
+                object([("currency", JsonValue::String("XRP".to_owned()))]),
+            ),
+            (
+                "taker_gets",
+                object([
+                    ("mpt_issuance_id", JsonValue::String(mpt_id.to_string())),
+                    ("currency", JsonValue::String("USD".to_owned())),
+                ]),
+            ),
+        ]),
+        &source,
+        &runtime,
+    );
+
+    let response = result_object(response);
+    assert_eq!(
+        response.get("error_message"),
+        Some(&JsonValue::String("Invalid field 'taker_gets'.".to_owned()))
+    );
+}
+
+#[test]
+fn book_offers_rejects_malformed_mpt_issuance_id() {
+    let source = FakeSource {
+        ledger: Some(closed_ledger()),
+        client_jobs: 0,
+    };
+    let runtime = FakeRuntime::default();
+
+    let response = run(
+        object([
+            (
+                "taker_pays",
+                object([("currency", JsonValue::String("XRP".to_owned()))]),
+            ),
+            (
+                "taker_gets",
+                object([(
+                    "mpt_issuance_id",
+                    JsonValue::String("notAnMptId".to_owned()),
+                )]),
+            ),
+        ]),
+        &source,
+        &runtime,
+    );
+
+    let response = result_object(response);
+    assert_eq!(
+        response.get("error"),
+        Some(&JsonValue::String("dstAmtMalformed".to_owned()))
+    );
+    assert_eq!(
+        response.get("error_message"),
+        Some(&JsonValue::String(
+            "Invalid field 'taker_gets.mpt_issuance_id'.".to_owned()
+        ))
+    );
+}
+
+#[test]
 fn book_offers_missing_taker_pays_error() {
     let source = FakeSource {
         ledger: Some(closed_ledger()),

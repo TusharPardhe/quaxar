@@ -159,6 +159,8 @@ pub fn transaction_sign_for<Runtime: RpcRuntime, Source>(
             expected_field_message(jss::tx_json, "object"),
         ));
     };
+    let app_network_id = ctx.runtime.app().map(|app| app.network_id()).unwrap_or(0);
+    check_transaction_sign_for_network_id(tx_object, app_network_id)?;
 
     tx_object
         .entry(jss::SigningPubKey.to_owned())
@@ -190,7 +192,7 @@ pub fn transaction_sign_for<Runtime: RpcRuntime, Source>(
     let signature = sign(&public_key, &secret_key, signing_data.data())
         .map_err(|_| Status::new(RpcErrorCode::Internal))?;
 
-    let signing_for_id = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
+    let signing_for_id = st_tx.get_fee_payer();
     let mut signers = signer_target_object(&mut st_tx, signature_target)
         .get_field_array(get_field_by_symbol("sfSigners"))
         .iter()
@@ -244,6 +246,60 @@ pub fn transaction_sign_for<Runtime: RpcRuntime, Source>(
         ),
     );
     Ok(JsonValue::Object(result))
+}
+
+fn check_transaction_sign_for_network_id(
+    tx_object: &BTreeMap<String, JsonValue>,
+    app_network_id: u32,
+) -> Result<(), Status> {
+    if app_network_id <= 1024 {
+        return Ok(());
+    }
+
+    let Some(network_id) = tx_object.get(jss::NetworkID) else {
+        return Err(Status::with_message(
+            RpcErrorCode::InvalidParams,
+            missing_field_message("tx_json.NetworkID"),
+        ));
+    };
+
+    if network_id.as_u64() != Some(u64::from(app_network_id)) {
+        return Err(Status::with_message(
+            RpcErrorCode::InvalidParams,
+            invalid_field_message("tx_json.NetworkID"),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod transaction_sign_for_network_id_tests {
+    use super::*;
+
+    #[test]
+    fn network_id_is_required_and_must_match_for_networks_above_1024() {
+        let empty = BTreeMap::new();
+        assert_eq!(
+            check_transaction_sign_for_network_id(&empty, 21338),
+            Err(Status::with_message(
+                RpcErrorCode::InvalidParams,
+                missing_field_message("tx_json.NetworkID")
+            ))
+        );
+
+        let wrong = BTreeMap::from([(jss::NetworkID.to_owned(), JsonValue::Unsigned(21337))]);
+        assert_eq!(
+            check_transaction_sign_for_network_id(&wrong, 21338),
+            Err(Status::with_message(
+                RpcErrorCode::InvalidParams,
+                invalid_field_message("tx_json.NetworkID")
+            ))
+        );
+
+        let correct = BTreeMap::from([(jss::NetworkID.to_owned(), JsonValue::Unsigned(21338))]);
+        assert!(check_transaction_sign_for_network_id(&correct, 21338).is_ok());
+    }
 }
 
 pub fn get_tx_json_from_params(params: &JsonValue) -> Result<JsonValue, Status> {

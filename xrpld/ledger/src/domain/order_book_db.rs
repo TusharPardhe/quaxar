@@ -83,15 +83,15 @@ pub enum OrderBookUpdateResult {
     Updated { seq: u32, book_count: usize },
 }
 
-type DomainKey = (Issue, Domain);
-type IssueSet = HardenedHashSet<Issue>;
+type DomainKey = (Asset, Domain);
+type IssueSet = HardenedHashSet<Asset>;
 type BookListenersMap = HashMap<Book, Arc<BookListeners>>;
 
 #[derive(Default)]
 struct OrderBookIndexState {
-    all_books: HardenedHashMap<Issue, IssueSet>,
+    all_books: HardenedHashMap<Asset, IssueSet>,
     domain_books: HardenedHashMap<DomainKey, IssueSet>,
-    xrp_books: HardenedHashSet<Issue>,
+    xrp_books: HardenedHashSet<Asset>,
     xrp_domain_books: HardenedHashSet<DomainKey>,
 }
 
@@ -279,21 +279,22 @@ impl OrderBookDB {
             .lock()
             .expect("order book index mutex must not be poisoned");
 
+        let query = Asset::Issue(issue);
         let mut get_books = |books: &IssueSet| {
             ret.reserve(books.len());
             for gets in books {
-                ret.push(Book::new(issue, *gets, domain));
+                ret.push(Book::new(query, *gets, domain));
             }
         };
 
         match domain {
             Some(domain) => {
-                if let Some(books) = state.domain_books.get(&(issue, domain)) {
+                if let Some(books) = state.domain_books.get(&(query, domain)) {
                     get_books(books);
                 }
             }
             None => {
-                if let Some(books) = state.all_books.get(&issue) {
+                if let Some(books) = state.all_books.get(&query) {
                     get_books(books);
                 }
             }
@@ -308,15 +309,16 @@ impl OrderBookDB {
             .lock()
             .expect("order book index mutex must not be poisoned");
 
+        let query = Asset::Issue(issue);
         match domain {
             Some(domain) => state
                 .domain_books
-                .get(&(issue, domain))
+                .get(&(query, domain))
                 .map(|books| books.len() as i32)
                 .unwrap_or(0),
             None => state
                 .all_books
-                .get(&issue)
+                .get(&query)
                 .map(|books| books.len() as i32)
                 .unwrap_or(0),
         }
@@ -328,9 +330,10 @@ impl OrderBookDB {
             .lock()
             .expect("order book index mutex must not be poisoned");
 
+        let query = Asset::Issue(issue);
         match domain {
-            Some(domain) => state.xrp_domain_books.contains(&(issue, domain)),
-            None => state.xrp_books.contains(&issue),
+            Some(domain) => state.xrp_domain_books.contains(&(query, domain)),
+            None => state.xrp_books.contains(&query),
         }
     }
 
@@ -447,19 +450,15 @@ fn add_order_books_from_sle(
             if sle.is_field_present(get_field_by_symbol("sfExchangeRate"))
                 && sle.get_field_h256(get_field_by_symbol("sfRootIndex")) == *sle.key() =>
         {
+            let Some(taker_pays) = taker_asset_from_dir(sle, "Pays") else {
+                return 0;
+            };
+            let Some(taker_gets) = taker_asset_from_dir(sle, "Gets") else {
+                return 0;
+            };
             let book = Book::new(
-                Issue::new(
-                    currency_from_h160(
-                        sle.get_field_h160(get_field_by_symbol("sfTakerPaysCurrency")),
-                    ),
-                    account_from_h160(sle.get_field_h160(get_field_by_symbol("sfTakerPaysIssuer"))),
-                ),
-                Issue::new(
-                    currency_from_h160(
-                        sle.get_field_h160(get_field_by_symbol("sfTakerGetsCurrency")),
-                    ),
-                    account_from_h160(sle.get_field_h160(get_field_by_symbol("sfTakerGetsIssuer"))),
-                ),
+                taker_pays,
+                taker_gets,
                 sle.is_field_present(get_field_by_symbol("sfDomainID"))
                     .then(|| sle.get_field_h256(get_field_by_symbol("sfDomainID"))),
             );
@@ -491,6 +490,35 @@ fn issue_from_stissue(issue: STIssue) -> Option<Issue> {
         Asset::Issue(issue) => Some(issue),
         Asset::MPTIssue(_) => None,
     }
+}
+
+fn taker_asset_from_dir(sle: &protocol::STLedgerEntry, side: &str) -> Option<Asset> {
+    let mpt_field = get_field_by_symbol(match side {
+        "Pays" => "sfTakerPaysMPT",
+        _ => "sfTakerGetsMPT",
+    });
+    if sle.is_field_present(mpt_field) {
+        return Some(Asset::MPTIssue(protocol::MPTIssue::new(
+            sle.get_field_h192(mpt_field),
+        )));
+    }
+
+    let currency_field = get_field_by_symbol(match side {
+        "Pays" => "sfTakerPaysCurrency",
+        _ => "sfTakerGetsCurrency",
+    });
+    let issuer_field = get_field_by_symbol(match side {
+        "Pays" => "sfTakerPaysIssuer",
+        _ => "sfTakerGetsIssuer",
+    });
+    if sle.is_field_present(currency_field) && sle.is_field_present(issuer_field) {
+        return Some(Asset::Issue(Issue::new(
+            currency_from_h160(sle.get_field_h160(currency_field)),
+            account_from_h160(sle.get_field_h160(issuer_field)),
+        )));
+    }
+
+    Some(Asset::Issue(protocol::xrp_issue()))
 }
 
 fn currency_from_h160(value: basics::base_uint::Uint160) -> Currency {
