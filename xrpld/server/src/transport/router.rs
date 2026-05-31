@@ -2,6 +2,7 @@ use app::ServerPortSetup;
 use basics::make_ssl_context::{
     TlsIdentityDer, anonymous_tls_identity_der, authenticated_tls_identity_der,
 };
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -375,11 +376,11 @@ where
             Err(response) => return response.into_response(),
         };
 
-        let params = to_protocol_json(
+        let params = normalize_rpc_params(to_protocol_json(
             rpc_request
                 .params
                 .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
-        );
+        ));
         let mut metadata = request.metadata().clone();
         metadata.api_version = Self::api_version_from_params(&params);
         metadata.role = request_role(
@@ -522,7 +523,7 @@ where
                         .params
                         .clone()
                         .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-                    let params = to_protocol_json(request_params);
+                    let params = normalize_rpc_params(to_protocol_json(request_params));
                     let mut metadata = metadata.clone();
                     metadata.api_version = Self::api_version_from_params(&params);
                     metadata.role = request_role(
@@ -727,6 +728,16 @@ fn has_explicit_api_version(params: &JsonValue) -> bool {
     object.contains_key("api_version")
 }
 
+fn normalize_rpc_params(params: JsonValue) -> JsonValue {
+    match params {
+        JsonValue::Array(mut values) => values
+            .drain(..)
+            .next()
+            .unwrap_or_else(|| JsonValue::Object(BTreeMap::new())),
+        other => other,
+    }
+}
+
 fn websocket_response(
     envelope: &JsonRpcEnvelope,
     params: &JsonValue,
@@ -797,14 +808,22 @@ mod tests {
         });
     }
     use super::{
-        JsonRpcEnvelope, RpcServerPortBuild, RpcServerPortPolicy, sanitize_request_value,
-        websocket_response,
+        JsonRpcEnvelope, RpcServer, RpcServerPortBuild, RpcServerPortPolicy,
+        sanitize_request_value, websocket_response,
     };
-    use crate::transport::RpcReply;
+    use crate::transport::{RpcDispatcher, RpcReply, RpcRequest};
     use app::ServerPortSetup;
     use protocol::JsonValue;
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
+
+    struct NoopDispatcher;
+
+    impl RpcDispatcher for NoopDispatcher {
+        fn dispatch(&self, _request: RpcRequest<'_>) -> RpcReply {
+            RpcReply::result(JsonValue::Object(BTreeMap::new()))
+        }
+    }
 
     #[test]
     fn server_port_policy_rejects_unsupported_transport_modes() {
@@ -920,6 +939,33 @@ mod tests {
         assert_eq!(response["id"], 7);
         assert_eq!(response["api_version"], 2);
         assert_eq!(response["result"]["ok"], true);
+    }
+
+    #[test]
+    fn json_rpc_array_params_are_unwrapped_for_dispatch() {
+        let params = super::normalize_rpc_params(JsonValue::Array(vec![JsonValue::Object(
+            BTreeMap::from([
+                ("api_version".to_owned(), JsonValue::Unsigned(2)),
+                (
+                    "transaction".to_owned(),
+                    JsonValue::String("ABC".to_owned()),
+                ),
+            ]),
+        )]));
+
+        let JsonValue::Object(object) = &params else {
+            panic!("array params should unwrap to first object");
+        };
+
+        assert_eq!(
+            object.get("transaction"),
+            Some(&JsonValue::String("ABC".to_owned()))
+        );
+        assert_eq!(
+            RpcServer::<NoopDispatcher>::api_version_from_params(&params),
+            2
+        );
+        assert!(super::has_explicit_api_version(&params));
     }
 
     #[test]
