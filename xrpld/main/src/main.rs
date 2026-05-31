@@ -1001,6 +1001,7 @@ fn promote_current_ledger(
             .set_pub_ledger(std::sync::Arc::clone(&ledger));
     }
     app.on_closed_ledger(std::sync::Arc::clone(&ledger));
+    app.note_validated_ledger_for_sync(std::sync::Arc::clone(&ledger));
     app.on_published_ledger(std::sync::Arc::clone(&ledger));
     // Only clear need_network_ledger if we have a real validated ledger (not genesis)
     if ledger.header().seq > 1 {

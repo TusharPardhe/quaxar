@@ -268,6 +268,8 @@ path = {}
     promote_current_ledger(&root, &[], std::sync::Arc::clone(&ledger));
 
     assert_eq!(root.published_ledger_seq(), Some(1_234));
+    assert_eq!(root.validated_ledger_seq(), Some(1_234));
+    assert!(!root.need_network_ledger());
     assert_eq!(
         root.ledger_master_runtime()
             .expect("ledger master runtime")
