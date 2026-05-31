@@ -6,12 +6,13 @@ use super::{
     bind_server_runtime_into_root, bootstrap_acquire_budget_available, build_endpoint_broadcast,
     candidate_ledger_for_seq, candidate_reference_hash_from_reference_ledger,
     classify_completed_ledger_acceptance, classify_publish_advance,
-    cold_bootstrap_persisted_validated_target, current_ledger_is_fresh, flush_nodestore_writes,
-    hash_for_seq_from_reference_ledger, ledger_fetch_limit_override, node_store_usage_path,
-    path_size_bytes, peerfinder_canonical_ip, peerfinder_outbound_target,
-    preferred_closed_ledger_hash, preferred_closed_ledger_hash_from_hashes, promote_current_ledger,
-    prune_known_endpoints, prune_recent_connect_attempts, remember_known_endpoint,
-    select_autoconnect_endpoints, select_bootcache_endpoints, select_consensus_acquisition_target,
+    cold_bootstrap_persisted_validated_target, command_suggestions, current_ledger_is_fresh,
+    first_command_like_arg, flush_nodestore_writes, hash_for_seq_from_reference_ledger,
+    ledger_fetch_limit_override, node_store_usage_path, path_size_bytes, peerfinder_canonical_ip,
+    peerfinder_outbound_target, preferred_closed_ledger_hash,
+    preferred_closed_ledger_hash_from_hashes, promote_current_ledger, prune_known_endpoints,
+    prune_recent_connect_attempts, remember_known_endpoint, select_autoconnect_endpoints,
+    select_bootcache_endpoints, select_consensus_acquisition_target,
     select_post_acquisition_operating_mode, select_target_seq,
     should_attempt_completed_ledger_promotion, should_process_acquisition_tick,
     should_retry_publish_after_completed_history,
@@ -63,6 +64,26 @@ fn config(text: &str) -> basics::basic_config::BasicConfig {
     }
     config.build(&sections);
     config
+}
+
+#[test]
+fn cli_unknown_command_helpers_detect_command_and_suggest_close_matches() {
+    let args = vec![
+        "xrpld".to_owned(),
+        "--conf".to_owned(),
+        "xrpld.cfg".to_owned(),
+        "logs".to_owned(),
+    ];
+    assert_eq!(
+        first_command_like_arg(&args, &["--conf", "-c", "--rpc-url"]),
+        Some("logs")
+    );
+
+    let suggestions = command_suggestions(
+        "logs",
+        &["status", "log-level", "log-rotate", "ledger", "server-info"],
+    );
+    assert_eq!(suggestions, vec!["log-level", "log-rotate"]);
 }
 
 #[test]

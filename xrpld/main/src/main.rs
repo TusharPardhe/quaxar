@@ -592,6 +592,7 @@ fn try_cli_subcommand() -> Option<ExitCode> {
         return Some(ExitCode::SUCCESS);
     }
 
+    const VALUE_FLAGS: &[&str] = &["--conf", "-c", "--rpc-url"];
     // Known subcommands
     let subcommands = [
         "status",
@@ -658,7 +659,23 @@ fn try_cli_subcommand() -> Option<ExitCode> {
             let _ = err.print();
             return Some(ExitCode::FAILURE);
         }
-        Err(_) => return None,
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand
+            ) =>
+        {
+            if let Some(command) = first_command_like_arg(&args, VALUE_FLAGS) {
+                print_unknown_command(command, &subcommands);
+                return Some(ExitCode::FAILURE);
+            }
+            let _ = err.print();
+            return Some(ExitCode::FAILURE);
+        }
+        Err(err) => {
+            let _ = err.print();
+            return Some(ExitCode::FAILURE);
+        }
     };
     let url = resolve_rpc_url(&parsed);
     let url = url.as_str();
@@ -762,6 +779,85 @@ fn try_cli_subcommand() -> Option<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+fn first_command_like_arg<'a>(args: &'a [String], value_flags: &[&str]) -> Option<&'a str> {
+    let mut index = 1;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if value_flags.contains(&arg) {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with("--conf=") || arg.starts_with("--rpc-url=") {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return Some(arg);
+    }
+    None
+}
+
+fn print_unknown_command(command: &str, subcommands: &[&str]) {
+    eprintln!(
+        "  {} Unknown command: {command}",
+        console::Style::new().red().apply_to("●")
+    );
+
+    let suggestions = command_suggestions(command, subcommands);
+    if !suggestions.is_empty() {
+        eprintln!(
+            "    Did you mean {}?",
+            suggestions
+                .iter()
+                .map(|suggestion| format!("`{suggestion}`"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        );
+    }
+
+    eprintln!("    Run `xrpld --help` to see available commands.");
+}
+
+fn command_suggestions<'a>(command: &str, subcommands: &'a [&str]) -> Vec<&'a str> {
+    let normalized = command.to_ascii_lowercase();
+    let singular = normalized.strip_suffix('s').unwrap_or(&normalized);
+    let mut suggestions = subcommands
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            let candidate = candidate.to_ascii_lowercase();
+            candidate.starts_with(singular)
+                || candidate.contains(singular)
+                || levenshtein_distance(&normalized, &candidate) <= 3
+        })
+        .take(3)
+        .collect::<Vec<_>>();
+    suggestions.sort_unstable();
+    suggestions.dedup();
+    suggestions
+}
+
+fn levenshtein_distance(left: &str, right: &str) -> usize {
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+
+    for (left_index, left_char) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right.chars().enumerate() {
+            let substitution = previous[right_index] + usize::from(left_char != right_char);
+            let insertion = current[right_index] + 1;
+            let deletion = previous[right_index + 1] + 1;
+            current[right_index + 1] = substitution.min(insertion).min(deletion);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right.len()]
 }
 
 fn main() -> ExitCode {
