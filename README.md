@@ -67,7 +67,9 @@ The setup script will:
 - Check your system meets requirements (CPU, RAM, disk)
 - Install dependencies (Rust, OpenSSL, RocksDB, etc.)
 - Build and install `xrpld` to your PATH
-- Generate an `xrpld.cfg` and validator list interactively
+- Generate an `xrpld.cfg` and validator list interactively, including ports,
+  database, node sizing, acquisition, network, overlay, validator-list, relay,
+  logging, and service settings
 - Optionally set up a systemd service
 
 ### From Source (manual)

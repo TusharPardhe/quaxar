@@ -139,9 +139,39 @@ Peer overlay settings.
 |-----|---------|
 | `public_ip` | Advertised public endpoint IP. |
 | `ip_limit` | Incoming peer limit per public IP. |
-| `peer_private` | Request peers not broadcast your address. |
-| `max_unknown_time` | Time to keep unknown peers before pruning. |
 | `verify_endpoints` | Validate advertised endpoints before using them. |
+
+### `[crawl]`
+
+Controls peer crawl responses.
+
+| Key | Meaning |
+|-----|---------|
+| section value | `1` enables crawl responses, `0` disables crawl responses. |
+| `overlay` | Include overlay peer crawl data. |
+| `server` | Include server info crawl data. |
+| `counts` | Include server count crawl data. |
+| `unl` | Include UNL crawl data. |
+
+### `[vl]`
+
+Validator-list runtime toggle.
+
+| Key | Meaning |
+|-----|---------|
+| `enabled` | Enables validator-list fetching and processing. |
+
+### `[reduce_relay]`
+
+Controls validation and transaction relay reduction.
+
+| Key | Meaning |
+|-----|---------|
+| `vp_base_squelch_enable` | Enables validation relay base squelch. |
+| `vp_base_squelch_max_selected_peers` | Max selected validation relay peers. Must be at least `3`. |
+| `tx_enable` | Enables transaction reduce relay. |
+| `tx_min_peers` | Minimum peers before transaction reduce relay is active. Must be at least `10`. |
+| `tx_relay_percentage` | Transaction relay percentage. Valid range: `10..100`. |
 
 ### `[debug_logfile]`
 

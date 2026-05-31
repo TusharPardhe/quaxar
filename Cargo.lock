@@ -3980,6 +3980,7 @@ dependencies = [
  "futures",
  "hex",
  "indicatif",
+ "ipnet",
  "ledger",
  "nodestore",
  "overlay",
