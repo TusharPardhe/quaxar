@@ -1200,6 +1200,64 @@ fn check_cash_transfers_mpt_without_requiring_dex_trading() {
     );
 }
 
+#[test]
+fn payment_transfers_mpt_without_rewriting_issue() {
+    let source = sample_account(0xD7);
+    let destination = sample_account(0xD8);
+    let issuer = sample_account(0xD9);
+    let mpt_id = share_id_for(issuer, 1);
+    let mpt_issue = protocol::MPTIssue::new(mpt_id);
+    let amount = STAmount::from_mpt_amount(
+        get_field_by_symbol("sfAmount"),
+        protocol::MPTAmount::from_value(10),
+        mpt_issue,
+    );
+    let ledger = empty_ledger(vec![
+        account_root_with_balance(source, 1, 0, 1_000_000_000),
+        account_root_with_balance(destination, 0, 0, 1_000_000_000),
+        account_root(issuer, 1, 0),
+        mpt_issuance_entry(issuer, 1, 100, protocol::lsfMPTCanTransfer),
+        mptoken_entry(source, mpt_id, 50),
+    ]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::PAYMENT, |object| {
+        object.set_account_id(get_field_by_symbol("sfAccount"), source);
+        object.set_account_id(get_field_by_symbol("sfDestination"), destination);
+        object.set_field_amount(get_field_by_symbol("sfAmount"), amount);
+        object.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+    });
+
+    let result = handle_real_dispatch(&mut view, &tx, TxType::PAYMENT, None);
+
+    assert_eq!(result, Ter::TES_SUCCESS);
+    let source_token = view
+        .read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(source),
+        ))
+        .expect("source token read should succeed")
+        .expect("source token should exist");
+    let destination_token = view
+        .read(protocol::mptoken_keylet_from_mptid(
+            mpt_id,
+            raw_account_id(destination),
+        ))
+        .expect("destination token read should succeed")
+        .expect("destination token should be created");
+    assert_eq!(
+        source_token.get_field_u64(get_field_by_symbol("sfMPTAmount")),
+        40
+    );
+    assert_eq!(
+        destination_token.get_field_u64(get_field_by_symbol("sfMPTAmount")),
+        10
+    );
+}
+
 fn vault_create_tx(account: AccountID, asset: Asset, sequence: u32) -> STTx {
     vault_create_tx_with_scale(account, asset, sequence, None)
 }

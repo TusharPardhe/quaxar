@@ -14,8 +14,8 @@
 
 use basics::math::base_uint::Uint160;
 use protocol::{
-    AccountID, STAmount, STLedgerEntry, STTx, Ter, XRPAmount, get_field_by_symbol, is_ter_retry,
-    is_tes_success,
+    AccountID, Asset, PARITY_RATE, STAmount, STLedgerEntry, STTx, Ter, XRPAmount, divide_rate,
+    get_field_by_symbol, is_ter_retry, is_tes_success, multiply_rate,
 };
 use std::sync::Arc;
 
@@ -67,7 +67,7 @@ pub fn do_payment<V: ledger::ApplyView>(
     // Compute maxSourceAmount (reference getMaxSourceAmount)
     let max_source_amount = if let Some(ref sm) = send_max {
         sm.clone()
-    } else if dst_amount.native() {
+    } else if dst_amount.native() || dst_amount.holds_mpt_issue() {
         dst_amount.clone()
     } else {
         // IOU: use same mantissa/exponent but with source account as issuer
@@ -126,9 +126,15 @@ pub fn do_payment<V: ledger::ApplyView>(
         }
     }
 
-    // Determine if this is a "ripple" payment (IOU/path) or direct XRP
+    // Determine if this is a "ripple" payment (IOU/path) or direct XRP.
+    // In C++, MPTokensV1 direct payments bypass RippleCalc and are handled by
+    // Payment::doApply's direct-MPT branch. MPTokensV2 routes through the
+    // payment engine.
     let is_dst_native = dst_amount.native();
-    let ripple = has_paths || send_max.is_some() || !is_dst_native;
+    let is_dst_mpt = dst_amount.holds_mpt_issue();
+    let mp_tokens_v2 = view.rules().enabled(&protocol::feature_id("MPTokensV2"));
+    let ripple =
+        (has_paths || send_max.is_some() || !is_dst_native) && (!is_dst_mpt || mp_tokens_v2);
 
     if ripple {
         if is_direct_iou_payment(&dst_amount, send_max.as_ref(), has_paths) {
@@ -219,6 +225,22 @@ pub fn do_payment<V: ledger::ApplyView>(
             }
             Err(_) => Ter::TEF_INTERNAL,
         }
+    } else if is_dst_mpt {
+        if let Some(ref dst_sle) = dst_exists {
+            if let Some(ter) = check_deposit_preauth(view, &account, &dst_account_id, dst_sle) {
+                return ter;
+            }
+        }
+        do_direct_mpt_payment(
+            view,
+            &account,
+            &dst_account_id,
+            &dst_amount,
+            &max_source_amount,
+            deliver_min.as_ref(),
+            partial_payment_allowed,
+            dst_exists,
+        )
     } else {
         // Direct XRP payment
         do_direct_xrp_payment(
@@ -230,6 +252,100 @@ pub fn do_payment<V: ledger::ApplyView>(
             pre_fee_balance_drops,
         )
     }
+}
+
+fn do_direct_mpt_payment<V: ledger::ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    dst_account_id: &AccountID,
+    dst_amount: &STAmount,
+    max_source_amount: &STAmount,
+    deliver_min: Option<&STAmount>,
+    partial_payment_allowed: bool,
+    dst_sle_opt: Option<Arc<STLedgerEntry>>,
+) -> Ter {
+    let Asset::MPTIssue(mpt_issue) = dst_amount.asset() else {
+        return Ter::TEF_INTERNAL;
+    };
+
+    let Ok(auth) = ledger::mptoken_helpers::require_auth_mpt(view, &mpt_issue, account) else {
+        return Ter::TEF_BAD_LEDGER;
+    };
+    if !is_tes_success(auth) {
+        return auth;
+    }
+    let Ok(auth) = ledger::mptoken_helpers::require_auth_mpt(view, &mpt_issue, dst_account_id)
+    else {
+        return Ter::TEF_BAD_LEDGER;
+    };
+    if !is_tes_success(auth) {
+        return auth;
+    }
+    let Ok(transfer) =
+        ledger::mptoken_helpers::can_transfer_mpt(view, &mpt_issue, account, dst_account_id)
+    else {
+        return Ter::TEF_BAD_LEDGER;
+    };
+    if !is_tes_success(transfer) {
+        return transfer;
+    }
+
+    let issuer = mpt_issue.issuer();
+    let mut rate = PARITY_RATE;
+    if account != &issuer && dst_account_id != &issuer {
+        if ledger::mptoken_helpers::is_frozen_mpt(view, account, &mpt_issue).unwrap_or(true)
+            || ledger::mptoken_helpers::is_frozen_mpt(view, dst_account_id, &mpt_issue)
+                .unwrap_or(true)
+        {
+            return Ter::TEC_LOCKED;
+        }
+        rate = ledger::mptoken_helpers::transfer_rate_mpt(view, mpt_issue.mpt_id())
+            .unwrap_or(PARITY_RATE);
+    }
+
+    let mut amount_deliver = dst_amount.clone();
+    let mut required_max_source_amount = multiply_rate(dst_amount, rate);
+    if partial_payment_allowed && required_max_source_amount > *max_source_amount {
+        required_max_source_amount = max_source_amount.clone();
+        amount_deliver = divide_rate(max_source_amount, rate);
+    }
+    if required_max_source_amount > *max_source_amount
+        || deliver_min.is_some_and(|deliver_min| amount_deliver < *deliver_min)
+    {
+        return Ter::TEC_PATH_PARTIAL;
+    }
+
+    if dst_account_id != &issuer
+        && view
+            .peek(protocol::mptoken_keylet_from_mptid(
+                mpt_issue.mpt_id(),
+                Uint160::from_void(dst_account_id.data()),
+            ))
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        let Some(dst_sle) = dst_sle_opt else {
+            return Ter::TEC_NO_PERMISSION;
+        };
+        let owner_count = dst_sle.get_field_u32(sf("sfOwnerCount"));
+        let balance = dst_sle.get_field_amount(sf("sfBalance")).xrp().drops();
+        if balance < view.fees().account_reserve(owner_count as usize + 1) as i64 {
+            return Ter::TEC_INSUFFICIENT_RESERVE;
+        }
+        match ledger::mptoken_helpers::check_create_mpt(view, &mpt_issue, dst_account_id) {
+            Ok(Ter::TES_SUCCESS | Ter::TEC_DUPLICATE) => {}
+            Ok(ter) => return ter,
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        }
+    }
+
+    let mut result =
+        ledger::ripple_state_helpers::account_send(view, account, dst_account_id, &amount_deliver);
+    if matches!(result, Ter::TEC_INSUFFICIENT_FUNDS | Ter::TEC_PATH_DRY) {
+        result = Ter::TEC_PATH_PARTIAL;
+    }
+    result
 }
 
 fn is_direct_iou_payment(
