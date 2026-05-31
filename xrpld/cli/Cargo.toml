@@ -1,0 +1,26 @@
+[package]
+name = "xrpld-cli"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "xrpld_cli"
+path = "src/lib.rs"
+
+[dependencies]
+basics = { path = "../../xrpl/basics" }
+base64 = "0.22"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+console = "0.15"
+comfy-table = "7"
+crossterm = "0.27"
+hex = "0.4"
+indicatif = "0.17"
+ipnet = "2"
+protocol = { path = "../../xrpl/protocol" }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde_json = "1"
+terminal_size = "0.4"
+ureq = "2"

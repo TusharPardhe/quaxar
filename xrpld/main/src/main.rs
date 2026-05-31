@@ -21,8 +21,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-mod cli;
-
 const PEERFINDER_LIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const PEERFINDER_RECENT_ATTEMPT_DURATION: Duration = Duration::from_secs(60);
 const PEERFINDER_SECONDS_PER_MESSAGE: Duration = Duration::from_secs(151);
@@ -437,9 +435,6 @@ impl CatchupResourceProfile {
     }
 }
 
-pub(crate) const LEDGER_FETCH_LIMIT_OVERRIDE_MIN: usize = 1;
-pub(crate) const LEDGER_FETCH_LIMIT_OVERRIDE_MAX: usize = 8;
-
 fn bootstrap_acquire_budget_available(
     validated: u32,
     active_count: usize,
@@ -483,9 +478,13 @@ fn ledger_fetch_limit_override(config: &BasicConfig) -> Result<Option<usize>, St
         return Ok(None);
     };
 
-    if !(LEDGER_FETCH_LIMIT_OVERRIDE_MIN..=LEDGER_FETCH_LIMIT_OVERRIDE_MAX).contains(&limit) {
+    if !(xrpld_cli::LEDGER_FETCH_LIMIT_OVERRIDE_MIN..=xrpld_cli::LEDGER_FETCH_LIMIT_OVERRIDE_MAX)
+        .contains(&limit)
+    {
         return Err(format!(
-            "Configured ledger_acquisition.ledger_fetch_limit must be between {LEDGER_FETCH_LIMIT_OVERRIDE_MIN} and {LEDGER_FETCH_LIMIT_OVERRIDE_MAX}"
+            "Configured ledger_acquisition.ledger_fetch_limit must be between {} and {}",
+            xrpld_cli::LEDGER_FETCH_LIMIT_OVERRIDE_MIN,
+            xrpld_cli::LEDGER_FETCH_LIMIT_OVERRIDE_MAX
         ));
     }
 
@@ -496,7 +495,7 @@ fn ledger_fetch_limit_override(config: &BasicConfig) -> Result<Option<usize>, St
 /// handled, None if the node should start normally.
 /// Resolve the RPC URL: if user passed --url explicitly, use it.
 /// Otherwise, try to parse the config file to find the HTTP admin port.
-fn resolve_rpc_url(parsed: &cli::Cli) -> String {
+fn resolve_rpc_url(parsed: &xrpld_cli::Cli) -> String {
     // If user explicitly set --rpc-url (not the default), use it as-is
     if parsed.rpc_url != "http://127.0.0.1:5005" {
         return parsed.rpc_url.clone();
@@ -583,19 +582,40 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
 }
 
 fn try_cli_subcommand() -> Option<ExitCode> {
-    use clap::{Parser, error::ErrorKind};
+    use clap::{CommandFactory, Parser, error::ErrorKind};
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        return None;
+        let _ = xrpld_cli::Cli::command().print_help();
+        println!();
+        return Some(ExitCode::SUCCESS);
     }
 
+    const VALUE_FLAGS: &[&str] = &["--conf", "-c", "--rpc-url"];
     // Known subcommands
     let subcommands = [
         "status",
         "health",
         "peers",
         "sync-status",
+        "rpc",
+        "ping",
+        "server-info",
+        "server-state",
+        "server-definitions",
+        "ledger-closed",
+        "ledger-current",
+        "ledger-header",
+        "fetch-info",
+        "get-counts",
+        "can-delete",
+        "log-rotate",
+        "random",
+        "validator-info",
+        "validator-list-sites",
+        "unl-list",
+        "consensus-info",
+        "tx-reduce-relay",
         "db-stats",
         "log-level",
         "config",
@@ -618,7 +638,7 @@ fn try_cli_subcommand() -> Option<ExitCode> {
         "-V",
     ];
 
-    let parsed = match cli::Cli::try_parse() {
+    let parsed = match xrpld_cli::Cli::try_parse() {
         Ok(parsed) => parsed,
         Err(err)
             if matches!(
@@ -638,59 +658,217 @@ fn try_cli_subcommand() -> Option<ExitCode> {
             let _ = err.print();
             return Some(ExitCode::FAILURE);
         }
-        Err(_) => return None,
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand
+            ) =>
+        {
+            if let Some(command) = first_command_like_arg(&args, VALUE_FLAGS) {
+                print_unknown_command(command, &subcommands);
+                return Some(ExitCode::FAILURE);
+            }
+            let _ = err.print();
+            return Some(ExitCode::FAILURE);
+        }
+        Err(err) => {
+            let _ = err.print();
+            return Some(ExitCode::FAILURE);
+        }
     };
     let url = resolve_rpc_url(&parsed);
     let url = url.as_str();
     let cmd = parsed.command?;
 
-    match cmd {
-        cli::Command::Status => cli::status::run(url),
-        cli::Command::Health => {
-            if !cli::health::run(url) {
+    let ok = match cmd {
+        xrpld_cli::Command::Status => xrpld_cli::status::run(url),
+        xrpld_cli::Command::Health => {
+            if !xrpld_cli::health::run(url) {
                 return Some(ExitCode::FAILURE);
             }
+            true
         }
-        cli::Command::Peers => cli::peers::run(url),
-        cli::Command::SyncStatus => cli::sync_status::run(url),
-        cli::Command::DbStats => cli::db_stats::run(url),
-        cli::Command::LogLevel { level } => cli::log_level::run(url, level.as_deref()),
-        cli::Command::ConfigCheck => cli::config_check::run(parsed.conf.as_deref()),
-        cli::Command::Doctor => cli::doctor::run(url, parsed.conf.as_deref()),
-        cli::Command::Version => cli::version::run(),
-        cli::Command::Validators => cli::validators::run(url),
-        cli::Command::Amendments => cli::amendments::run(url),
-        cli::Command::Fee => cli::fee::run(url),
-        cli::Command::Ledger { seq } => cli::ledger_cmd::run(url, seq),
-        cli::Command::Account { address } => cli::account::run(url, &address),
-        cli::Command::Stop => cli::stop::run(url),
-        cli::Command::Connect { address } => {
-            let result = cli::rpc_call(url, "connect", serde_json::json!({"ip": address}));
+        xrpld_cli::Command::Peers => xrpld_cli::peers::run(url),
+        xrpld_cli::Command::SyncStatus => xrpld_cli::sync_status::run(url),
+        xrpld_cli::Command::Rpc {
+            method,
+            params,
+            raw,
+        } => xrpld_cli::rpc_cmd::run(url, &method, params.as_deref(), raw),
+        xrpld_cli::Command::Ping => xrpld_cli::rpc_cmd::run_no_params(url, "ping"),
+        xrpld_cli::Command::ServerInfo => xrpld_cli::rpc_cmd::run_no_params(url, "server_info"),
+        xrpld_cli::Command::ServerState => xrpld_cli::rpc_cmd::run_no_params(url, "server_state"),
+        xrpld_cli::Command::ServerDefinitions => {
+            xrpld_cli::rpc_cmd::run_no_params(url, "server_definitions")
+        }
+        xrpld_cli::Command::LedgerClosed => xrpld_cli::rpc_cmd::run_no_params(url, "ledger_closed"),
+        xrpld_cli::Command::LedgerCurrent => {
+            xrpld_cli::rpc_cmd::run_no_params(url, "ledger_current")
+        }
+        xrpld_cli::Command::LedgerHeader => xrpld_cli::rpc_cmd::run_no_params(url, "ledger_header"),
+        xrpld_cli::Command::FetchInfo => xrpld_cli::rpc_cmd::run_no_params(url, "fetch_info"),
+        xrpld_cli::Command::GetCounts => xrpld_cli::rpc_cmd::run_no_params(url, "get_counts"),
+        xrpld_cli::Command::CanDelete { value } => {
+            xrpld_cli::rpc_cmd::run_can_delete(url, value.as_deref())
+        }
+        xrpld_cli::Command::LogRotate => xrpld_cli::rpc_cmd::run_logrotate(url),
+        xrpld_cli::Command::Random => xrpld_cli::rpc_cmd::run_no_params(url, "random"),
+        xrpld_cli::Command::ValidatorInfo => {
+            xrpld_cli::rpc_cmd::run_no_params(url, "validator_info")
+        }
+        xrpld_cli::Command::ValidatorListSites => {
+            xrpld_cli::rpc_cmd::run_no_params(url, "validator_list_sites")
+        }
+        xrpld_cli::Command::UnlList => xrpld_cli::rpc_cmd::run_no_params(url, "unl_list"),
+        xrpld_cli::Command::ConsensusInfo => {
+            xrpld_cli::rpc_cmd::run_no_params(url, "consensus_info")
+        }
+        xrpld_cli::Command::TxReduceRelay => {
+            xrpld_cli::rpc_cmd::run_no_params(url, "tx_reduce_relay")
+        }
+        xrpld_cli::Command::DbStats => xrpld_cli::db_stats::run(url, parsed.conf.as_deref()),
+        xrpld_cli::Command::LogLevel { level } => xrpld_cli::log_level::run(url, level.as_deref()),
+        xrpld_cli::Command::ConfigCheck => {
+            xrpld_cli::config_check::run(parsed.conf.as_deref());
+            true
+        }
+        xrpld_cli::Command::Doctor => {
+            xrpld_cli::doctor::run(url, parsed.conf.as_deref());
+            true
+        }
+        xrpld_cli::Command::Version => {
+            xrpld_cli::version::run();
+            true
+        }
+        xrpld_cli::Command::Validators => xrpld_cli::validators::run(url),
+        xrpld_cli::Command::Amendments => xrpld_cli::amendments::run(url),
+        xrpld_cli::Command::Fee => xrpld_cli::fee::run(url),
+        xrpld_cli::Command::Ledger { seq } => xrpld_cli::ledger_cmd::run(url, seq),
+        xrpld_cli::Command::Account { address } => xrpld_cli::account::run(url, &address),
+        xrpld_cli::Command::Stop => xrpld_cli::stop::run(url),
+        xrpld_cli::Command::Connect { address } => {
+            let result = xrpld_cli::rpc_call(url, "connect", serde_json::json!({"ip": address}));
             match result {
-                Ok(_) => println!(
-                    "  {} Connect request sent to {}",
-                    console::Style::new().green().apply_to("●"),
-                    address
-                ),
-                Err(e) => eprintln!("  {} {}", console::Style::new().red().apply_to("●"), e),
-            }
-        }
-        cli::Command::Benchmark => cli::benchmark::run(),
-        cli::Command::Cli => cli::interactive::run(url),
-        cli::Command::ValidatorKeys { action } => {
-            use cli::ValidatorKeysAction;
-            match action {
-                ValidatorKeysAction::Generate => cli::validator_keys::run_generate(),
-                ValidatorKeysAction::CreateToken { secret } => {
-                    cli::validator_keys::run_create_token(secret.as_deref())
+                Ok(_) => {
+                    println!(
+                        "  {} Connect request sent to {}",
+                        console::Style::new().green().apply_to("●"),
+                        address
+                    );
+                    true
                 }
-                ValidatorKeysAction::Sign { data } => cli::validator_keys::run_sign(&data),
-                ValidatorKeysAction::Revoke => cli::validator_keys::run_revoke(),
-                ValidatorKeysAction::Show => cli::validator_keys::run_show(),
+                Err(e) => {
+                    eprintln!("  {} {}", console::Style::new().red().apply_to("●"), e);
+                    false
+                }
             }
         }
+        xrpld_cli::Command::Benchmark => {
+            xrpld_cli::benchmark::run();
+            true
+        }
+        xrpld_cli::Command::Cli => {
+            xrpld_cli::interactive::run(url);
+            true
+        }
+        xrpld_cli::Command::ValidatorKeys { action } => {
+            use xrpld_cli::ValidatorKeysAction;
+            match action {
+                ValidatorKeysAction::Generate => xrpld_cli::validator_keys::run_generate(),
+                ValidatorKeysAction::CreateToken { secret } => {
+                    xrpld_cli::validator_keys::run_create_token(secret.as_deref())
+                }
+                ValidatorKeysAction::Sign { data } => xrpld_cli::validator_keys::run_sign(&data),
+                ValidatorKeysAction::Revoke => xrpld_cli::validator_keys::run_revoke(),
+                ValidatorKeysAction::Show => xrpld_cli::validator_keys::run_show(),
+            }
+            true
+        }
+    };
+    Some(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+fn first_command_like_arg<'a>(args: &'a [String], value_flags: &[&str]) -> Option<&'a str> {
+    let mut index = 1;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if value_flags.contains(&arg) {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with("--conf=") || arg.starts_with("--rpc-url=") {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return Some(arg);
     }
-    Some(ExitCode::SUCCESS)
+    None
+}
+
+fn print_unknown_command(command: &str, subcommands: &[&str]) {
+    eprintln!(
+        "  {} Unknown command: {command}",
+        console::Style::new().red().apply_to("●")
+    );
+
+    let suggestions = command_suggestions(command, subcommands);
+    if !suggestions.is_empty() {
+        eprintln!(
+            "    Did you mean {}?",
+            suggestions
+                .iter()
+                .map(|suggestion| format!("`{suggestion}`"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        );
+    }
+
+    eprintln!("    Run `xrpld --help` to see available commands.");
+}
+
+fn command_suggestions<'a>(command: &str, subcommands: &'a [&str]) -> Vec<&'a str> {
+    let normalized = command.to_ascii_lowercase();
+    let singular = normalized.strip_suffix('s').unwrap_or(&normalized);
+    let mut suggestions = subcommands
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            let candidate = candidate.to_ascii_lowercase();
+            candidate.starts_with(singular)
+                || candidate.contains(singular)
+                || levenshtein_distance(&normalized, &candidate) <= 3
+        })
+        .take(3)
+        .collect::<Vec<_>>();
+    suggestions.sort_unstable();
+    suggestions.dedup();
+    suggestions
+}
+
+fn levenshtein_distance(left: &str, right: &str) -> usize {
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    let mut current = vec![0; right.len() + 1];
+
+    for (left_index, left_char) in left.chars().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_char) in right.chars().enumerate() {
+            let substitution = previous[right_index] + usize::from(left_char != right_char);
+            let insertion = current[right_index] + 1;
+            let deletion = previous[right_index + 1] + 1;
+            current[right_index + 1] = substitution.min(insertion).min(deletion);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right.len()]
 }
 
 fn main() -> ExitCode {

@@ -1,7 +1,7 @@
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
-pub fn run(url: &str) {
+pub fn run(url: &str) -> bool {
     let sp = ProgressBar::new_spinner();
     sp.set_style(
         ProgressStyle::default_spinner()
@@ -58,7 +58,11 @@ pub fn run(url: &str) {
             } else {
                 println!("    {}", dim.apply_to("No amendment data available"));
             }
+            true
         }
-        Err(e) => super::print_error(&e),
+        Err(e) => {
+            super::print_error(&e);
+            false
+        }
     }
 }

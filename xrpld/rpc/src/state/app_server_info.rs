@@ -1989,7 +1989,35 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
     fn treenode_track_size(&self) -> u64 {
         0
     }
-    fn add_node_store_counts(&self, _json: &mut BTreeMap<String, JsonValue>) {}
+    fn add_node_store_counts(&self, json: &mut BTreeMap<String, JsonValue>) {
+        let Some(app) = self.view.app() else {
+            return;
+        };
+        let Some(node_store) = app.node_store().as_ref() else {
+            return;
+        };
+
+        json.insert(
+            "node_store".to_owned(),
+            JsonValue::String(node_store.kind().to_owned()),
+        );
+        match node_store {
+            app::SHAMapStoreNodeStore::Single(database) => {
+                json.insert(
+                    "node_db_earliest_seq".to_owned(),
+                    JsonValue::Unsigned(u64::from(database.earliest_ledger_seq())),
+                );
+                database.add_counts_json(json);
+            }
+            app::SHAMapStoreNodeStore::Rotating(database) => {
+                json.insert(
+                    "node_db_earliest_seq".to_owned(),
+                    JsonValue::Unsigned(u64::from(database.earliest_ledger_seq())),
+                );
+                database.add_counts_json(json);
+            }
+        }
+    }
 }
 
 impl<V: AppServerInfoView> crate::handlers::print::PrintSource for ApplicationServerInfo<V> {

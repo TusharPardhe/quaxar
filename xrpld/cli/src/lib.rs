@@ -1,5 +1,8 @@
 use clap::{Parser, Subcommand};
 
+pub const LEDGER_FETCH_LIMIT_OVERRIDE_MIN: usize = 1;
+pub const LEDGER_FETCH_LIMIT_OVERRIDE_MAX: usize = 8;
+
 pub mod account;
 pub mod amendments;
 pub mod benchmark;
@@ -13,6 +16,7 @@ pub mod ledger_cmd;
 pub mod log_level;
 pub mod logo;
 pub mod peers;
+pub mod rpc_cmd;
 pub mod status;
 pub mod stop;
 pub mod sync_status;
@@ -46,6 +50,53 @@ pub enum Command {
     Peers,
     /// Show sync progress (useful during initial sync)
     SyncStatus,
+    /// Raw RPC call: xrpld rpc <method> ['{"json":"params"}']
+    Rpc {
+        /// RPC method name, for example server_info or can_delete
+        method: String,
+        /// JSON params object, or JSON array for multi-param JSON-RPC calls
+        params: Option<String>,
+        /// Print compact JSON instead of pretty JSON
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Ping the local RPC server
+    Ping,
+    /// Show raw server_info RPC output
+    ServerInfo,
+    /// Show raw server_state RPC output
+    ServerState,
+    /// Show raw server_definitions RPC output
+    ServerDefinitions,
+    /// Show the latest closed ledger
+    LedgerClosed,
+    /// Show the current open ledger index
+    LedgerCurrent,
+    /// Show the validated ledger header
+    LedgerHeader,
+    /// Show fetch/acquisition state
+    FetchInfo,
+    /// Show raw get_counts output
+    GetCounts,
+    /// Get or set can_delete for advisory online delete
+    CanDelete {
+        /// Ledger sequence/hash or now/always/never
+        value: Option<String>,
+    },
+    /// Rotate logs
+    LogRotate,
+    /// Generate random bytes via RPC
+    Random,
+    /// Show validator_info
+    ValidatorInfo,
+    /// Show validator_list_sites
+    ValidatorListSites,
+    /// Show UNL list
+    UnlList,
+    /// Show consensus_info
+    ConsensusInfo,
+    /// Show tx_reduce_relay state
+    TxReduceRelay,
     /// Show database statistics (NuDB size, entries, hit rate)
     DbStats,
     /// Get or set the log level at runtime
@@ -168,9 +219,18 @@ pub fn rpc_call(
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    rpc_call_params(url, method, vec![params])
+}
+
+/// Send an RPC request with an explicit JSON-RPC params array and return the parsed result.
+pub fn rpc_call_params(
+    url: &str,
+    method: &str,
+    params: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
     let body = serde_json::json!({
         "method": method,
-        "params": [params]
+        "params": params
     });
     let resp = ureq::post(url)
         .set("Content-Type", "application/json")
@@ -187,7 +247,7 @@ pub fn rpc_call(
             .as_str()
             .or_else(|| result["error"].as_str())
             .unwrap_or("Unknown error");
-        return Err(format!("{msg} (node is syncing, try again shortly)"));
+        return Err(msg.to_owned());
     }
     Ok(result.clone())
 }

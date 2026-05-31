@@ -1,7 +1,7 @@
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
-pub fn run(url: &str) {
+pub fn run(url: &str) -> bool {
     let sp = ProgressBar::new_spinner();
     sp.set_style(
         ProgressStyle::default_spinner()
@@ -24,7 +24,7 @@ pub fn run(url: &str) {
                     Style::new().green().apply_to("●"),
                     Style::new().dim().apply_to(state)
                 );
-                return;
+                return true;
             }
             println!(
                 "    {} Syncing  {}",
@@ -41,7 +41,11 @@ pub fn run(url: &str) {
             if let Some(node_size) = info["node_size"].as_str() {
                 super::kv("Node Size", node_size);
             }
+            true
         }
-        Err(e) => super::print_error(&e),
+        Err(e) => {
+            super::print_error(&e);
+            false
+        }
     }
 }

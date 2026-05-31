@@ -464,13 +464,21 @@ pub fn run(url: &str) {
 
 fn dispatch_command(url: &str, name: &str) {
     match name {
-        "status" => super::status::run(url),
+        "status" => {
+            let _ = super::status::run(url);
+        }
         "health" => {
             let _ = super::health::run(url);
         }
-        "peers" => super::peers::run(url),
-        "fee" => super::fee::run(url),
-        "ledger" => super::ledger_cmd::run(url, None),
+        "peers" => {
+            let _ = super::peers::run(url);
+        }
+        "fee" => {
+            let _ = super::fee::run(url);
+        }
+        "ledger" => {
+            let _ = super::ledger_cmd::run(url, None);
+        }
         "account" => {
             print!("  Account address: ");
             io::stdout().flush().ok();
@@ -480,18 +488,28 @@ fn dispatch_command(url: &str, name: &str) {
             if addr.is_empty() {
                 eprintln!("  {} No address provided", Style::new().red().apply_to("●"));
             } else {
-                super::account::run(url, addr);
+                let _ = super::account::run(url, addr);
             }
         }
-        "sync-status" => super::sync_status::run(url),
-        "validators" => super::validators::run(url),
-        "amendments" => super::amendments::run(url),
-        "db-stats" => super::db_stats::run(url),
+        "sync-status" => {
+            let _ = super::sync_status::run(url);
+        }
+        "validators" => {
+            let _ = super::validators::run(url);
+        }
+        "amendments" => {
+            let _ = super::amendments::run(url);
+        }
+        "db-stats" => {
+            let _ = super::db_stats::run(url, None);
+        }
         "benchmark" => super::benchmark::run(),
         "validator-keys" => super::validator_keys::run_show(),
         "doctor" => super::doctor::run(url, None),
         "version" => super::version::run(),
-        "stop" => super::stop::run(url),
+        "stop" => {
+            let _ = super::stop::run(url);
+        }
         _ => {
             eprintln!(
                 "  {} Unknown command: {}",

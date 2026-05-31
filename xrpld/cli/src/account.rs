@@ -1,6 +1,6 @@
 use indicatif::{ProgressBar, ProgressStyle};
 
-pub fn run(url: &str, address: &str) {
+pub fn run(url: &str, address: &str) -> bool {
     let sp = ProgressBar::new_spinner();
     sp.set_style(
         ProgressStyle::default_spinner()
@@ -31,7 +31,11 @@ pub fn run(url: &str, address: &str) {
                 &super::format_number(info["OwnerCount"].as_u64().unwrap_or(0)),
             );
             super::kv("Flags", &format!("{}", info["Flags"].as_u64().unwrap_or(0)));
+            true
         }
-        Err(e) => super::print_error(&e),
+        Err(e) => {
+            super::print_error(&e);
+            false
+        }
     }
 }

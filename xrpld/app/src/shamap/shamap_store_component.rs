@@ -138,6 +138,13 @@ impl SHAMapStoreComponent {
             .get_can_delete()
     }
 
+    pub fn advisory_delete(&self) -> bool {
+        self.store()
+            .lock()
+            .expect("shamap store mutex must not be poisoned")
+            .advisory_delete()
+    }
+
     pub fn set_can_delete(&self, can_delete: u32) -> Result<u32, String> {
         let mut store = self
             .store()

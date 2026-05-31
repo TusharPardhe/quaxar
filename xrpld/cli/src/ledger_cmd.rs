@@ -1,6 +1,6 @@
 use indicatif::{ProgressBar, ProgressStyle};
 
-pub fn run(url: &str, seq: Option<u64>) {
+pub fn run(url: &str, seq: Option<u64>) -> bool {
     let sp = ProgressBar::new_spinner();
     sp.set_style(
         ProgressStyle::default_spinner()
@@ -34,7 +34,11 @@ pub fn run(url: &str, seq: Option<u64>) {
                 &super::format_number(l["transaction_count"].as_u64().unwrap_or(0)),
             );
             super::kv("Total Coins", l["total_coins"].as_str().unwrap_or("?"));
+            true
         }
-        Err(e) => super::print_error(&e),
+        Err(e) => {
+            super::print_error(&e);
+            false
+        }
     }
 }
