@@ -5,7 +5,6 @@ use crate::consensus::rcl_validations::SharedAppValidations;
 use crate::job::job_queue::JobQueue;
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::ledger::ledger_master_state::SharedLedgerMasterState;
-use crate::ledger::open_ledger::OpenLedgerView as _;
 use crate::load::load_fee_track::SharedLoadFeeTrack;
 use crate::load::load_manager::{LoadManager, LoadManagerTiming};
 use crate::network::network_ops::networkops_apply_flags;
@@ -1818,11 +1817,12 @@ impl ApplicationRoot {
         base_fee_drops: u64,
         parent_hash: Uint256,
     ) {
+        let local_txs = self.local_open_ledger_records();
         let mut retries = Vec::<AppOpenLedgerTxRecord>::new();
         self.open_ledger().accept(
             || AppOpenLedgerView::with_parent_hash(next_open_index, base_fee_drops, parent_hash),
             &|_: &Uint256| false,
-            std::iter::empty::<AppOpenLedgerTxRecord>(),
+            local_txs,
             false,
             &mut retries,
             ApplyFlags::NONE,
@@ -1856,12 +1856,12 @@ impl ApplicationRoot {
         base_fee_drops: u64,
         parent_hash: Uint256,
     ) {
-        let current_locals = self.open_ledger().current().ordered_txs();
+        let local_txs = self.local_open_ledger_records();
         let mut retries = Vec::<AppOpenLedgerTxRecord>::new();
         self.open_ledger().accept(
             || AppOpenLedgerView::with_parent_hash(next_open_index, base_fee_drops, parent_hash),
             &|_: &Uint256| false,
-            current_locals,
+            local_txs,
             false,
             &mut retries,
             ApplyFlags::NONE,
@@ -1887,6 +1887,18 @@ impl ApplicationRoot {
             &mut |_tx_id: &Uint256| false,
             &mut |_tx: &AppOpenLedgerTxRecord| {},
         );
+    }
+
+    fn local_open_ledger_records(&self) -> Vec<AppOpenLedgerTxRecord> {
+        self.ledger_master_runtime()
+            .map(|runtime| {
+                runtime
+                    .local_tx_set()
+                    .iter()
+                    .map(|tx| AppOpenLedgerTxRecord::new(Arc::clone(tx)))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn on_consensus_built_ledger(&self, ledger: Arc<Ledger>) {

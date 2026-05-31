@@ -1655,6 +1655,13 @@ fn consensus_built_switches_lcl_without_promoting_validated_or_published() {
     let source = account("0000000000000000000000000000000000000044");
     let destination = account("0000000000000000000000000000000000000055");
     let current_tx = payment_tx(source, destination, 1, None, 10);
+    let local_tx = payment_tx(
+        account("0000000000000000000000000000000000000066"),
+        account("0000000000000000000000000000000000000077"),
+        1,
+        None,
+        10,
+    );
     let _ = app.open_ledger().modify(|view| {
         *view = AppOpenLedgerView::with_parent_hash(
             11,
@@ -1664,6 +1671,7 @@ fn consensus_built_switches_lcl_without_promoting_validated_or_published() {
         view.push_transaction(Arc::clone(&current_tx));
         true
     });
+    ledger_master_runtime.push_local_tx(10, Arc::clone(&local_tx));
 
     let mut built = Ledger::from_ledger_seq_and_close_time(11, 1_010, false);
     built.set_immutable(false);
@@ -1686,6 +1694,9 @@ fn consensus_built_switches_lcl_without_promoting_validated_or_published() {
     let current = app.open_ledger().current();
     assert_eq!(current.ledger_current_index, 12);
     assert_eq!(current.parent_hash, *built.header().hash.as_uint256());
-    assert!(current.tx_ids().contains(&current_tx.get_transaction_id()));
+    let tx_ids = current.tx_ids();
+    assert_eq!(tx_ids.len(), 2);
+    assert!(tx_ids.contains(&current_tx.get_transaction_id()));
+    assert!(tx_ids.contains(&local_tx.get_transaction_id()));
     assert_eq!(app.status_rpc_current_ledger_index(), Some(12));
 }

@@ -81,6 +81,10 @@ impl AppLedgerMasterRuntime {
         self.ledger_master.local_txs().size()
     }
 
+    pub fn local_tx_set(&self) -> CanonicalTXSet {
+        self.ledger_master.local_txs().get_tx_set()
+    }
+
     pub fn push_local_tx(&self, index: u32, transaction: Arc<STTx>) {
         self.ledger_master.local_txs().push_back(index, transaction);
     }
