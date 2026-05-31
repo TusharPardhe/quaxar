@@ -2316,6 +2316,18 @@ pub trait RpcRuntime {
         0
     }
 
+    fn can_delete_enabled(&self) -> bool {
+        false
+    }
+
+    fn can_delete_last_rotated(&self) -> u32 {
+        0
+    }
+
+    fn can_delete_seq_by_hash(&self, _hash: Uint256) -> Option<u32> {
+        None
+    }
+
     fn can_delete_set(&self, _seq: u32) -> Status {
         Status::OK
     }
@@ -2462,6 +2474,28 @@ impl RpcRuntime for ApplicationRoot {
         self.shamap_store_service()
             .map(|service| service.component().get_can_delete())
             .unwrap_or(0)
+    }
+
+    fn can_delete_enabled(&self) -> bool {
+        self.shamap_store_service()
+            .map(|service| service.component().advisory_delete())
+            .unwrap_or(false)
+    }
+
+    fn can_delete_last_rotated(&self) -> u32 {
+        self.shamap_store_service()
+            .map(|service| service.component().get_last_rotated())
+            .unwrap_or(0)
+    }
+
+    fn can_delete_seq_by_hash(&self, hash: Uint256) -> Option<u32> {
+        self.ledger_master_runtime()
+            .and_then(|runtime| {
+                runtime
+                    .ledger_master()
+                    .get_ledger_by_hash(SHAMapHash::new(hash))
+            })
+            .map(|ledger| ledger.header().seq)
     }
 
     fn can_delete_set(&self, seq: u32) -> Status {
