@@ -1,7 +1,7 @@
 use console::Style;
 use indicatif::{ProgressBar, ProgressStyle};
 
-pub fn run(url: &str) {
+pub fn run(url: &str) -> bool {
     let sp = ProgressBar::new_spinner();
     sp.set_style(
         ProgressStyle::default_spinner()
@@ -69,6 +69,7 @@ pub fn run(url: &str) {
                 &format!("{}", info["txn_queue_size"].as_u64().unwrap_or(0)),
             );
             super::kv("Node Size", info["node_size"].as_str().unwrap_or("—"));
+            true
         }
         Err(e) => {
             eprintln!(
@@ -76,6 +77,7 @@ pub fn run(url: &str) {
                 Style::new().red().apply_to("●"),
                 Style::new().dim().apply_to(e)
             );
+            false
         }
     }
 }

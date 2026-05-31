@@ -583,11 +583,13 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
 }
 
 fn try_cli_subcommand() -> Option<ExitCode> {
-    use clap::{Parser, error::ErrorKind};
+    use clap::{CommandFactory, Parser, error::ErrorKind};
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        return None;
+        let _ = cli::Cli::command().print_help();
+        println!();
+        return Some(ExitCode::SUCCESS);
     }
 
     // Known subcommands
@@ -596,6 +598,24 @@ fn try_cli_subcommand() -> Option<ExitCode> {
         "health",
         "peers",
         "sync-status",
+        "rpc",
+        "ping",
+        "server-info",
+        "server-state",
+        "server-definitions",
+        "ledger-closed",
+        "ledger-current",
+        "ledger-header",
+        "fetch-info",
+        "get-counts",
+        "can-delete",
+        "log-rotate",
+        "random",
+        "validator-info",
+        "validator-list-sites",
+        "unl-list",
+        "consensus-info",
+        "tx-reduce-relay",
         "db-stats",
         "log-level",
         "config",
@@ -644,20 +664,54 @@ fn try_cli_subcommand() -> Option<ExitCode> {
     let url = url.as_str();
     let cmd = parsed.command?;
 
-    match cmd {
+    let ok = match cmd {
         cli::Command::Status => cli::status::run(url),
         cli::Command::Health => {
             if !cli::health::run(url) {
                 return Some(ExitCode::FAILURE);
             }
+            true
         }
         cli::Command::Peers => cli::peers::run(url),
         cli::Command::SyncStatus => cli::sync_status::run(url),
-        cli::Command::DbStats => cli::db_stats::run(url),
+        cli::Command::Rpc {
+            method,
+            params,
+            raw,
+        } => cli::rpc_cmd::run(url, &method, params.as_deref(), raw),
+        cli::Command::Ping => cli::rpc_cmd::run_no_params(url, "ping"),
+        cli::Command::ServerInfo => cli::rpc_cmd::run_no_params(url, "server_info"),
+        cli::Command::ServerState => cli::rpc_cmd::run_no_params(url, "server_state"),
+        cli::Command::ServerDefinitions => cli::rpc_cmd::run_no_params(url, "server_definitions"),
+        cli::Command::LedgerClosed => cli::rpc_cmd::run_no_params(url, "ledger_closed"),
+        cli::Command::LedgerCurrent => cli::rpc_cmd::run_no_params(url, "ledger_current"),
+        cli::Command::LedgerHeader => cli::rpc_cmd::run_no_params(url, "ledger_header"),
+        cli::Command::FetchInfo => cli::rpc_cmd::run_no_params(url, "fetch_info"),
+        cli::Command::GetCounts => cli::rpc_cmd::run_no_params(url, "get_counts"),
+        cli::Command::CanDelete { value } => cli::rpc_cmd::run_can_delete(url, value.as_deref()),
+        cli::Command::LogRotate => cli::rpc_cmd::run_logrotate(url),
+        cli::Command::Random => cli::rpc_cmd::run_no_params(url, "random"),
+        cli::Command::ValidatorInfo => cli::rpc_cmd::run_no_params(url, "validator_info"),
+        cli::Command::ValidatorListSites => {
+            cli::rpc_cmd::run_no_params(url, "validator_list_sites")
+        }
+        cli::Command::UnlList => cli::rpc_cmd::run_no_params(url, "unl_list"),
+        cli::Command::ConsensusInfo => cli::rpc_cmd::run_no_params(url, "consensus_info"),
+        cli::Command::TxReduceRelay => cli::rpc_cmd::run_no_params(url, "tx_reduce_relay"),
+        cli::Command::DbStats => cli::db_stats::run(url, parsed.conf.as_deref()),
         cli::Command::LogLevel { level } => cli::log_level::run(url, level.as_deref()),
-        cli::Command::ConfigCheck => cli::config_check::run(parsed.conf.as_deref()),
-        cli::Command::Doctor => cli::doctor::run(url, parsed.conf.as_deref()),
-        cli::Command::Version => cli::version::run(),
+        cli::Command::ConfigCheck => {
+            cli::config_check::run(parsed.conf.as_deref());
+            true
+        }
+        cli::Command::Doctor => {
+            cli::doctor::run(url, parsed.conf.as_deref());
+            true
+        }
+        cli::Command::Version => {
+            cli::version::run();
+            true
+        }
         cli::Command::Validators => cli::validators::run(url),
         cli::Command::Amendments => cli::amendments::run(url),
         cli::Command::Fee => cli::fee::run(url),
@@ -667,16 +721,28 @@ fn try_cli_subcommand() -> Option<ExitCode> {
         cli::Command::Connect { address } => {
             let result = cli::rpc_call(url, "connect", serde_json::json!({"ip": address}));
             match result {
-                Ok(_) => println!(
-                    "  {} Connect request sent to {}",
-                    console::Style::new().green().apply_to("●"),
-                    address
-                ),
-                Err(e) => eprintln!("  {} {}", console::Style::new().red().apply_to("●"), e),
+                Ok(_) => {
+                    println!(
+                        "  {} Connect request sent to {}",
+                        console::Style::new().green().apply_to("●"),
+                        address
+                    );
+                    true
+                }
+                Err(e) => {
+                    eprintln!("  {} {}", console::Style::new().red().apply_to("●"), e);
+                    false
+                }
             }
         }
-        cli::Command::Benchmark => cli::benchmark::run(),
-        cli::Command::Cli => cli::interactive::run(url),
+        cli::Command::Benchmark => {
+            cli::benchmark::run();
+            true
+        }
+        cli::Command::Cli => {
+            cli::interactive::run(url);
+            true
+        }
         cli::Command::ValidatorKeys { action } => {
             use cli::ValidatorKeysAction;
             match action {
@@ -688,9 +754,14 @@ fn try_cli_subcommand() -> Option<ExitCode> {
                 ValidatorKeysAction::Revoke => cli::validator_keys::run_revoke(),
                 ValidatorKeysAction::Show => cli::validator_keys::run_show(),
             }
+            true
         }
-    }
-    Some(ExitCode::SUCCESS)
+    };
+    Some(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 fn main() -> ExitCode {

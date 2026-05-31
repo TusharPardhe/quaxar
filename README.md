@@ -154,7 +154,11 @@ xrpld includes a built-in CLI with an interactive mode featuring inline fuzzy se
 | `ledger [seq]` | Ledger details |
 | `account <addr>` | Account balance and info |
 | `sync-status` | Sync progress |
-| `db-stats` | NuDB disk usage |
+| `rpc <method> [params]` | Call any JSON-RPC method directly |
+| `server-info` / `server-state` | Raw node state RPC output |
+| `get-counts` | Cache, ledger, and node-store counters |
+| `db-stats` | NuDB path, file sizes, and database counters |
+| `log-rotate` | Request runtime log rotation |
 | `validators` | Trusted validator list |
 | `amendments` | Amendment voting status |
 | `doctor` | Pre-flight diagnostics |

@@ -247,10 +247,25 @@ Expected healthy states: `full`, `proposing`, `validating`.
 ### Database Usage
 
 ```bash
-xrpld db-stats
+xrpld db-stats --conf /etc/xrpld.cfg
 ```
 
-Shows NuDB data file size, key file size, and total disk usage.
+Shows the configured node-store path, NuDB data/key/log file sizes, total disk
+usage, and live node-store counters when the local RPC server is reachable.
+
+For raw counters:
+
+```bash
+xrpld get-counts
+```
+
+For one-off RPC checks:
+
+```bash
+xrpld server-info
+xrpld server-state
+xrpld rpc ledger '{"ledger_index":"validated"}'
+```
 
 ## Log Management
 
@@ -268,6 +283,7 @@ Change at runtime:
 
 ```bash
 xrpld log-level debug
+xrpld log-rotate
 ```
 
 ## Common Issues

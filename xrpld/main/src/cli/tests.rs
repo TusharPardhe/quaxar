@@ -34,6 +34,65 @@ mod tests {
     }
 
     #[test]
+    fn cli_rpc_parses_method_params_and_raw_flag() {
+        let cli = Cli::try_parse_from([
+            "xrpld",
+            "rpc",
+            "ledger",
+            r#"{"ledger_index":"validated"}"#,
+            "--raw",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Rpc {
+                method,
+                params,
+                raw,
+            }) => {
+                assert_eq!(method, "ledger");
+                assert_eq!(params.as_deref(), Some(r#"{"ledger_index":"validated"}"#));
+                assert!(raw);
+            }
+            _ => panic!("expected Rpc"),
+        }
+    }
+
+    #[test]
+    fn cli_operational_rpc_shortcuts_parse() {
+        for command in [
+            "ping",
+            "server-info",
+            "server-state",
+            "server-definitions",
+            "ledger-closed",
+            "ledger-current",
+            "ledger-header",
+            "fetch-info",
+            "get-counts",
+            "log-rotate",
+            "random",
+            "validator-info",
+            "validator-list-sites",
+            "unl-list",
+            "consensus-info",
+            "tx-reduce-relay",
+        ] {
+            Cli::try_parse_from(["xrpld", command]).unwrap_or_else(|err| {
+                panic!("{command} should parse: {err}");
+            });
+        }
+    }
+
+    #[test]
+    fn cli_can_delete_accepts_optional_value() {
+        let cli = Cli::try_parse_from(["xrpld", "can-delete", "now"]).unwrap();
+        match cli.command {
+            Some(Command::CanDelete { value }) => assert_eq!(value.as_deref(), Some("now")),
+            _ => panic!("expected CanDelete"),
+        }
+    }
+
+    #[test]
     fn cli_db_stats_parses() {
         let cli = Cli::try_parse_from(["xrpld", "db-stats"]).unwrap();
         assert!(matches!(cli.command, Some(Command::DbStats)));

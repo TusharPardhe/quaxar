@@ -1,7 +1,7 @@
 use super::rpc_call;
 use console::Style;
 
-pub fn run(url: &str, level: Option<&str>) {
+pub fn run(url: &str, level: Option<&str>) -> bool {
     match level {
         Some(new_level) => {
             let result =
@@ -9,7 +9,7 @@ pub fn run(url: &str, level: Option<&str>) {
                     Ok(r) => r,
                     Err(e) => {
                         super::print_error(&e);
-                        return;
+                        return false;
                     }
                 };
             if result["status"].as_str() == Some("success") {
@@ -18,8 +18,10 @@ pub fn run(url: &str, level: Option<&str>) {
                     Style::new().green().apply_to("●"),
                     new_level
                 );
+                true
             } else {
                 super::print_error(&format!("Failed: {}", result));
+                false
             }
         }
         None => {
@@ -27,7 +29,7 @@ pub fn run(url: &str, level: Option<&str>) {
                 Ok(r) => r,
                 Err(e) => {
                     super::print_error(&e);
-                    return;
+                    return false;
                 }
             };
             super::section_header("Current Log Levels");
@@ -39,6 +41,7 @@ pub fn run(url: &str, level: Option<&str>) {
             } else {
                 super::kv("Base", result["severity"].as_str().unwrap_or("unknown"));
             }
+            true
         }
     }
 }
