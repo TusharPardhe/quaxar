@@ -1264,14 +1264,10 @@ impl<V: AppServerInfoView> TxSource for ApplicationServerInfo<V> {
         hash: Uint256,
         ledger_range: Option<(u32, u32)>,
     ) -> Result<TxLookupOutcome, TxLookupError> {
-        let cached_validated = if let Some(transaction) = self.view.fetch_cached_transaction(&hash)
-        {
+        let cached = if let Some(transaction) = self.view.fetch_cached_transaction(&hash) {
             let transaction = transaction
                 .lock()
                 .expect("transaction mutex must not be poisoned");
-            if !transaction.is_validated() {
-                return Ok(TxLookupOutcome::NotFound(TxSearched::Unknown));
-            }
 
             Some(TxRecord {
                 txn: std::sync::Arc::clone(transaction.get_s_transaction()),
@@ -1279,13 +1275,19 @@ impl<V: AppServerInfoView> TxSource for ApplicationServerInfo<V> {
                 ledger_index: transaction.get_ledger(),
                 close_time: find_close_time_by_seq(&self.view, transaction.get_ledger()),
                 ledger_hash: find_ledger_hash_by_seq(&self.view, transaction.get_ledger()),
-                validated: true,
+                validated: transaction.is_validated(),
                 txn_index: None,
                 network_id: Some(self.view.network_id()),
             })
         } else {
             None
         };
+
+        if let Some(record) = cached.as_ref()
+            && !record.validated
+        {
+            return Ok(TxLookupOutcome::Found(record.clone()));
+        }
 
         if let Some(record) = lookup_sql_tx_record(&self.view, hash)? {
             if let Some((min, max)) = ledger_range
@@ -1301,7 +1303,7 @@ impl<V: AppServerInfoView> TxSource for ApplicationServerInfo<V> {
         // they are unvalidated. Once validated, SQL history is authoritative so
         // metadata and TxnSeq are present. Keep this fallback for standalone
         // harnesses or tx-table-disabled runtimes where no SQL row exists.
-        if let Some(record) = cached_validated {
+        if let Some(record) = cached {
             if let Some((min, max)) = ledger_range
                 && (record.ledger_index < min || record.ledger_index > max)
             {

@@ -116,6 +116,41 @@ fn tx_reads_committed_live_transactions_from_application_server_info() {
 }
 
 #[test]
+fn tx_reads_unvalidated_cached_transactions_as_proposed() {
+    let app = ApplicationRoot::with_options(app::ApplicationRootOptions {
+        standalone: true,
+        ..app::ApplicationRootOptions::default()
+    })
+    .expect("standalone root should build");
+    let (_, tx) = signed_payment_tx(0x20, account(2), 5, 10);
+    let tx_id = tx.get_transaction_id();
+    let mut cached = Arc::new(std::sync::Mutex::new(Transaction::new(Arc::clone(&tx))));
+    app.canonicalize_transaction(&mut cached);
+
+    let response = do_tx(
+        &TxRequest {
+            params: &object([("transaction", JsonValue::String(tx_id.to_string()))]),
+            api_version: 2,
+        },
+        &rpc::ApplicationServerInfo::new(&app),
+    );
+    let JsonValue::Object(object) = response else {
+        panic!("response must be an object");
+    };
+
+    assert_eq!(object.get("validated"), Some(&JsonValue::Bool(false)));
+    assert_eq!(
+        object.get("hash"),
+        Some(&JsonValue::String(tx_id.to_string()))
+    );
+    assert!(object.contains_key("tx_json"));
+    assert!(!object.contains_key("ledger_index"));
+    assert!(!object.contains_key("ledger_hash"));
+    assert!(!object.contains_key("meta"));
+    assert!(!object.contains_key("ctid"));
+}
+
+#[test]
 fn tx_prefers_sql_metadata_for_validated_cached_transactions() {
     let mut app = ApplicationRoot::with_options(app::ApplicationRootOptions {
         standalone: true,
