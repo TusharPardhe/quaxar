@@ -784,6 +784,39 @@ fn lookup_sql_transaction_by_hash<V: AppServerInfoView>(
     Some((row.0, row.1, row.2, row.3, txn_seq))
 }
 
+fn lookup_sql_tx_record<V: AppServerInfoView>(
+    view: &V,
+    hash: Uint256,
+) -> Result<Option<TxRecord>, TxLookupError> {
+    let Some((ledger_seq, status, raw_txn, raw_meta, txn_seq)) =
+        lookup_sql_transaction_by_hash(view, hash)
+    else {
+        return Ok(None);
+    };
+
+    let mut converted = Vec::new();
+    app::convert_blobs_to_tx_result(
+        &mut converted,
+        ledger_seq,
+        &status,
+        &raw_txn,
+        &raw_meta,
+        view.network_id(),
+    )
+    .map_err(|_| TxLookupError::DatabaseDeserialization)?;
+
+    Ok(converted.into_iter().next().map(|entry| TxRecord {
+        txn: std::sync::Arc::clone(entry.transaction.get_s_transaction()),
+        meta: Some(entry.meta),
+        ledger_index: ledger_seq,
+        close_time: find_close_time_by_seq(view, ledger_seq),
+        ledger_hash: find_ledger_hash_by_seq(view, ledger_seq),
+        validated: true,
+        txn_index: txn_seq,
+        network_id: Some(view.network_id()),
+    }))
+}
+
 impl<V: AppServerInfoView> LedgerLookupSource for ApplicationServerInfo<V> {
     fn get_ledger_by_hash(&self, hash: Uint256) -> Option<LedgerLookupLedger> {
         self.view
@@ -1231,20 +1264,16 @@ impl<V: AppServerInfoView> TxSource for ApplicationServerInfo<V> {
         hash: Uint256,
         ledger_range: Option<(u32, u32)>,
     ) -> Result<TxLookupOutcome, TxLookupError> {
-        if let Some(transaction) = self.view.fetch_cached_transaction(&hash) {
+        let cached_validated = if let Some(transaction) = self.view.fetch_cached_transaction(&hash)
+        {
             let transaction = transaction
                 .lock()
                 .expect("transaction mutex must not be poisoned");
             if !transaction.is_validated() {
                 return Ok(TxLookupOutcome::NotFound(TxSearched::Unknown));
             }
-            if let Some((min, max)) = ledger_range
-                && (transaction.get_ledger() < min || transaction.get_ledger() > max)
-            {
-                return Ok(TxLookupOutcome::NotFound(TxSearched::Some));
-            }
 
-            return Ok(TxLookupOutcome::Found(TxRecord {
+            Some(TxRecord {
                 txn: std::sync::Arc::clone(transaction.get_s_transaction()),
                 meta: None,
                 ledger_index: transaction.get_ledger(),
@@ -1253,41 +1282,33 @@ impl<V: AppServerInfoView> TxSource for ApplicationServerInfo<V> {
                 validated: true,
                 txn_index: None,
                 network_id: Some(self.view.network_id()),
-            }));
-        }
+            })
+        } else {
+            None
+        };
 
-        if let Some((ledger_seq, status, raw_txn, raw_meta, txn_seq)) =
-            lookup_sql_transaction_by_hash(&self.view, hash)
-        {
+        if let Some(record) = lookup_sql_tx_record(&self.view, hash)? {
             if let Some((min, max)) = ledger_range
-                && (ledger_seq < min || ledger_seq > max)
+                && (record.ledger_index < min || record.ledger_index > max)
             {
                 return Ok(TxLookupOutcome::NotFound(TxSearched::Some));
             }
 
-            let mut converted = Vec::new();
-            app::convert_blobs_to_tx_result(
-                &mut converted,
-                ledger_seq,
-                &status,
-                &raw_txn,
-                &raw_meta,
-                self.view.network_id(),
-            )
-            .map_err(|_| TxLookupError::DatabaseDeserialization)?;
+            return Ok(TxLookupOutcome::Found(record));
+        }
 
-            if let Some(entry) = converted.into_iter().next() {
-                return Ok(TxLookupOutcome::Found(TxRecord {
-                    txn: std::sync::Arc::clone(entry.transaction.get_s_transaction()),
-                    meta: Some(entry.meta),
-                    ledger_index: ledger_seq,
-                    close_time: find_close_time_by_seq(&self.view, ledger_seq),
-                    ledger_hash: find_ledger_hash_by_seq(&self.view, ledger_seq),
-                    validated: true,
-                    txn_index: txn_seq,
-                    network_id: Some(self.view.network_id()),
-                }));
+        // C++ TransactionMaster::fetch only returns cache hits directly while
+        // they are unvalidated. Once validated, SQL history is authoritative so
+        // metadata and TxnSeq are present. Keep this fallback for standalone
+        // harnesses or tx-table-disabled runtimes where no SQL row exists.
+        if let Some(record) = cached_validated {
+            if let Some((min, max)) = ledger_range
+                && (record.ledger_index < min || record.ledger_index > max)
+            {
+                return Ok(TxLookupOutcome::NotFound(TxSearched::Some));
             }
+
+            return Ok(TxLookupOutcome::Found(record));
         }
 
         Ok(TxLookupOutcome::NotFound(TxSearched::Unknown))
@@ -1339,37 +1360,49 @@ impl<V: AppServerInfoView> TransactionEntrySource for ApplicationServerInfo<V> {
         ledger: &LedgerLookupLedger,
         tx_hash: Uint256,
     ) -> Option<(protocol::STTx, Option<protocol::TxMeta>)> {
-        if let Some(transaction) = self.view.fetch_cached_transaction(&tx_hash) {
-            let transaction = transaction
-                .lock()
-                .expect("transaction mutex must not be poisoned");
-            if transaction.is_validated() && transaction.get_ledger() == ledger.seq {
-                return Some(((*transaction.get_s_transaction().as_ref()).clone(), None));
+        if let Some(resolved) = resolve_lookup_ledger(&self.view, ledger)
+            && let Ok(Some(entry)) = ledger::ReadView::tx_read(resolved.as_ref(), tx_hash)
+        {
+            let (tx, meta) = entry.into_parts();
+            return Some((
+                (*tx.as_ref()).clone(),
+                meta.map(|meta| {
+                    protocol::TxMeta::from_stobject(tx_hash, ledger.seq, (*meta).clone())
+                }),
+            ));
+        }
+
+        if let Some((ledger_seq, status, raw_txn, raw_meta, _txn_seq)) =
+            lookup_sql_transaction_by_hash(&self.view, tx_hash)
+            && ledger_seq == ledger.seq
+        {
+            let mut converted = Vec::new();
+            app::convert_blobs_to_tx_result(
+                &mut converted,
+                ledger_seq,
+                &status,
+                &raw_txn,
+                &raw_meta,
+                self.view.network_id(),
+            )
+            .ok()?;
+
+            if let Some(entry) = converted.into_iter().next() {
+                return Some((
+                    (*entry.transaction.get_s_transaction().as_ref()).clone(),
+                    Some(entry.meta),
+                ));
             }
         }
 
-        let (ledger_seq, status, raw_txn, raw_meta, _txn_seq) =
-            lookup_sql_transaction_by_hash(&self.view, tx_hash)?;
-        if ledger_seq != ledger.seq {
-            return None;
+        let transaction = self.view.fetch_cached_transaction(&tx_hash)?;
+        let transaction = transaction
+            .lock()
+            .expect("transaction mutex must not be poisoned");
+        if transaction.is_validated() && transaction.get_ledger() == ledger.seq {
+            return Some(((*transaction.get_s_transaction().as_ref()).clone(), None));
         }
-
-        let mut converted = Vec::new();
-        app::convert_blobs_to_tx_result(
-            &mut converted,
-            ledger_seq,
-            &status,
-            &raw_txn,
-            &raw_meta,
-            self.view.network_id(),
-        )
-        .ok()?;
-
-        let entry = converted.into_iter().next()?;
-        Some((
-            (*entry.transaction.get_s_transaction().as_ref()).clone(),
-            Some(entry.meta),
-        ))
+        None
     }
 
     fn get_close_time_by_seq(&self, ledger_seq: u32) -> Option<NetClockTimePoint> {
