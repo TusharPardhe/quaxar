@@ -78,9 +78,9 @@ All major RPC methods are implemented with full C++ parity:
 ## Known Limitations
 
 ### Memory During Initial Acquisition
-The node requires ~12-14GB RAM during initial mainnet sync because the full
+The node requires ~20-24GB RAM during initial mainnet sync because the full
 SHAMap state tree (~50M nodes) is held in memory for verification. After sync
-completes and the node is tracking the tip, memory drops to ~3-4GB. Future
+completes and the node is tracking the tip, memory drops to ~4-6GB. Future
 optimization: stream nodes to disk during acquisition instead of holding the
 full tree in memory.
 
