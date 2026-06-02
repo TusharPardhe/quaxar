@@ -4,12 +4,14 @@ Guide for node operators running the Rust implementation of the XRP Ledger serve
 
 ## Hardware Requirements
 
-| Resource | Minimum | Recommended |
-|----------|---------|-------------|
+| Resource | Minimum (mainnet) | Recommended |
+|----------|-------------------|-------------|
 | CPU | 4 cores | 8+ cores |
-| RAM | 16 GB | 32 GB |
-| Disk | 500 GB NVMe SSD | 1 TB NVMe SSD |
+| RAM | 32 GB | 32 GB |
+| Disk | 1 TB NVMe SSD | 1 TB NVMe SSD |
 | Network | 100 Mbps | 1 Gbps |
+
+For testnet, 16 GB RAM and a 500 GB SSD are sufficient.
 
 Disk usage grows over time with ledger history. NVMe is strongly recommended for NuDB performance.
 
@@ -290,7 +292,7 @@ xrpld log-rotate
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| OOM during sync | Insufficient RAM for state acquisition | Increase RAM to 32 GB or use `[node_size] medium` |
+| OOM during sync | Insufficient RAM for state acquisition | Ensure 32 GB RAM for mainnet or use `[node_size] medium` |
 | RocksDB build segfault | GCC OOM during compilation | `sudo apt install librocksdb-dev` or `CARGO_BUILD_JOBS=1` |
 | OpenSSL build failure | Missing system OpenSSL | `sudo apt install libssl-dev pkg-config` |
 | Node stuck in "connected" | Validator list not loading | Ensure `[validators_file]` points to valid file, or add `[validator_list_sites]` directly to config |

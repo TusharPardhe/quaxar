@@ -25,7 +25,7 @@ What happens:
 
 | Resource | During Acquisition | At Steady State |
 |----------|-------------------|-----------------|
-| RAM | 16–24 GB | 8–16 GB |
+| RAM | 24–32 GB | 8–16 GB |
 | Disk I/O | Very high (sustained writes) | Moderate |
 | Disk Space | Grows ~1 GB/hour initially | ~200 MB/day |
 | Network | 50–100 Mbps sustained | 5–20 Mbps |
@@ -36,8 +36,8 @@ What happens:
 | Hardware | Estimated Sync Time |
 |----------|-------------------|
 | 8-core, 32 GB RAM, NVMe, 1 Gbps | 4–8 hours |
-| 4-core, 16 GB RAM, NVMe, 100 Mbps | 12–24 hours |
-| 4-core, 16 GB RAM, SATA SSD, 100 Mbps | 24–48 hours |
+| 4-core, 32 GB RAM, NVMe, 100 Mbps | 8–16 hours |
+| 4-core, 32 GB RAM, SATA SSD, 100 Mbps | 16–36 hours |
 
 Times vary based on network conditions and peer availability.
 
@@ -115,7 +115,7 @@ xrpld peers
 - `[node_size]` set too high for available memory
 
 **Fix:**
-- Increase RAM to 32 GB
+- Ensure at least 32 GB RAM for mainnet
 - Reduce `[node_size]` to `medium` or `large`
 - Ensure no other memory-heavy processes running
 
