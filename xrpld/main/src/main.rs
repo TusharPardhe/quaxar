@@ -510,13 +510,11 @@ fn resolve_rpc_url(parsed: &xrpld_cli::Cli) -> String {
         }
     });
 
-    if !conf_path.is_empty() {
-        if let Ok(content) = std::fs::read_to_string(conf_path) {
-            if let Some(url) = parse_rpc_url_from_config(&content) {
+    if !conf_path.is_empty()
+        && let Ok(content) = std::fs::read_to_string(conf_path)
+            && let Some(url) = parse_rpc_url_from_config(&content) {
                 return url;
             }
-        }
-    }
 
     parsed.rpc_url.clone()
 }
@@ -535,23 +533,21 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
         }
         if trimmed.starts_with("[port_") {
             // Save previous section if it was HTTP
-            if in_port_section && is_http {
-                if let Some(p) = port {
+            if in_port_section && is_http
+                && let Some(p) = port {
                     let host = ip.as_deref().unwrap_or("127.0.0.1");
                     return Some(format!("http://{}:{}", host, p));
                 }
-            }
             in_port_section = true;
             port = None;
             ip = None;
             is_http = false;
         } else if trimmed.starts_with('[') {
-            if in_port_section && is_http {
-                if let Some(p) = port {
+            if in_port_section && is_http
+                && let Some(p) = port {
                     let host = ip.as_deref().unwrap_or("127.0.0.1");
                     return Some(format!("http://{}:{}", host, p));
                 }
-            }
             in_port_section = false;
         } else if in_port_section {
             if let Some(val) = trimmed.strip_prefix("port") {
@@ -562,21 +558,19 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
                 if let Some(val) = val.trim().strip_prefix('=') {
                     ip = Some(val.trim().to_string());
                 }
-            } else if let Some(val) = trimmed.strip_prefix("protocol") {
-                if let Some(val) = val.trim().strip_prefix('=') {
+            } else if let Some(val) = trimmed.strip_prefix("protocol")
+                && let Some(val) = val.trim().strip_prefix('=') {
                     is_http = val.trim().contains("http");
                 }
-            }
         }
     }
 
     // Check last section
-    if in_port_section && is_http {
-        if let Some(p) = port {
+    if in_port_section && is_http
+        && let Some(p) = port {
             let host = ip.as_deref().unwrap_or("127.0.0.1");
             return Some(format!("http://{}:{}", host, p));
         }
-    }
 
     None
 }
@@ -4075,8 +4069,8 @@ impl<D> BoundServerRuntime<D> {
                             }
                             process_queued_validations(&val_app, &val_accept_sink);
 
-                            if !val_app.need_network_ledger() {
-                            if let Some(rx) = &map_complete_rx {
+                            if !val_app.need_network_ledger()
+                            && let Some(rx) = &map_complete_rx {
                                 while let Ok((hash, set)) = rx.try_recv() {
                                     if let (Some(consensus_runtime), Some(network_ops_runtime)) =
                                         (val_app.consensus_runtime(), val_app.network_ops_runtime())
@@ -4089,11 +4083,10 @@ impl<D> BoundServerRuntime<D> {
                                     }
                                 }
                             }
-                            }
 
                             // Process peer proposals — feed to consensus engine (only after sync)
-                            if !val_app.need_network_ledger() {
-                            if let Some(overlay_runtime) = val_app.overlay_runtime() {
+                            if !val_app.need_network_ledger()
+                            && let Some(overlay_runtime) = val_app.overlay_runtime() {
                                 let proposals = overlay_runtime.overlay().take_proposals();
                                 if !proposals.is_empty()
                                     && let (Some(consensus_runtime), Some(network_ops_runtime)) =
@@ -4118,13 +4111,12 @@ impl<D> BoundServerRuntime<D> {
                                         }
                                     }
                             }
-                            }
                             // Drive consensus state machine — but only after initial sync.
                             // During cold bootstrap, timer_tick panics because the consensus
                             // tokio::sync::Mutex was created on the main runtime which is
                             // shutting down. Skip entirely until we have a validated ledger.
-                            if !val_app.need_network_ledger() {
-                                if let Some(consensus_runtime) = val_app.consensus_runtime() {
+                            if !val_app.need_network_ledger()
+                                && let Some(consensus_runtime) = val_app.consensus_runtime() {
                                     let tick_start = Instant::now();
                                     if let Some(network_ops_runtime) = val_app.network_ops_runtime() {
                                         network_ops_runtime
@@ -4133,7 +4125,6 @@ impl<D> BoundServerRuntime<D> {
                                     let latency_ms = tick_start.elapsed().as_millis() as u64;
                                     val_app.set_status_rpc_io_latency_ms(Some(latency_ms));
                                 }
-                            }
                             })); // end catch_unwind
                             // Wait for a validation to arrive (instant wake) or
                             // fall through after 500ms for proposal/timer work.
