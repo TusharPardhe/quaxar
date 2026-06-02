@@ -5,7 +5,7 @@
 </h1>
 
 <p align="center">
-  <strong>A Rust implementation of the XRP Ledger server</strong>
+  <strong>A Rust implementation of the XRP Ledger protocol</strong>
 </p>
 
 <p align="center">
