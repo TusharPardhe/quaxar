@@ -1652,10 +1652,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                             return Ter::TEC_LIMIT_EXCEEDED;
                         }
                         protocol::Asset::MPTIssue(_) => {
-                            let locked_rate = escrow_sle
-                                .is_field_present(sf("sfTransferRate"))
-                                .then(|| escrow_sle.get_field_u32(sf("sfTransferRate")))
-                                .unwrap_or(protocol::PARITY_RATE.value);
+                            let locked_rate = if escrow_sle
+                                .is_field_present(sf("sfTransferRate")) { escrow_sle.get_field_u32(sf("sfTransferRate")) } else { protocol::PARITY_RATE.value };
                             let (net_amount, gross_amount) = escrow_mpt_unlock_amounts(
                                 view,
                                 &amount,
@@ -3106,10 +3104,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     return Ter::TEC_NO_PERMISSION;
                 }
                 let outstanding = iss_sle.get_field_u64(sf("sfOutstandingAmount"));
-                let locked = iss_sle
-                    .is_field_present(sf("sfLockedAmount"))
-                    .then(|| iss_sle.get_field_u64(sf("sfLockedAmount")))
-                    .unwrap_or(0);
+                let locked = if iss_sle
+                    .is_field_present(sf("sfLockedAmount")) { iss_sle.get_field_u64(sf("sfLockedAmount")) } else { 0 };
                 if outstanding > 0 || locked != 0 {
                     return Ter::TEC_HAS_OBLIGATIONS;
                 }
@@ -3218,10 +3214,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     || (view
                         .rules()
                         .enabled(&protocol::feature_id("fixCleanup3_1_3"))
-                        && token
-                            .is_field_present(sf("sfLockedAmount"))
-                            .then(|| token.get_field_u64(sf("sfLockedAmount")))
-                            .unwrap_or(0)
+                        && (if token
+                            .is_field_present(sf("sfLockedAmount")) { token.get_field_u64(sf("sfLockedAmount")) } else { 0 })
                             != 0)
                 {
                     return Ter::TEC_HAS_OBLIGATIONS;

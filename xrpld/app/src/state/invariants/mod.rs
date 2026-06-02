@@ -283,12 +283,12 @@ fn check_invariants_inner<V: ApplyView>(
                 let bal_before = before_sle
                     .map(|b| b.get_field_amount(get_field_by_symbol("sfAmount")))
                     .filter(|amount| amount.native())
-                    .map(|amount| amount.xrp().drops() as i64)
+                    .map(|amount| amount.xrp().drops())
                     .unwrap_or(0);
                 let bal_after = after_sle
                     .map(|a| a.get_field_amount(get_field_by_symbol("sfAmount")))
                     .filter(|amount| amount.native())
-                    .map(|amount| amount.xrp().drops() as i64)
+                    .map(|amount| amount.xrp().drops())
                     .unwrap_or(0);
                 xrp_balance_change += bal_after - bal_before;
             }

@@ -209,7 +209,7 @@ fn parse_asset_leg(
         }
         let JsonValue::String(mpt_id) = mpt_value else {
             return Err(expected_field_error(
-                &format!("{leg_name}.currency"),
+                format!("{leg_name}.currency"),
                 "string",
             ));
         };

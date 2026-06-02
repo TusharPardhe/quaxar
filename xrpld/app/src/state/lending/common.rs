@@ -502,7 +502,7 @@ pub(super) fn runtime_number_ceil_to_u64(value: RuntimeNumber) -> u64 {
         }
     } else {
         for _ in 0..(-exponent) {
-            remainder |= magnitude % 10 != 0;
+            remainder |= !magnitude.is_multiple_of(10);
             magnitude /= 10;
         }
     }
