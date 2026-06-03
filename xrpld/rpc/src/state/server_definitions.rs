@@ -12,8 +12,9 @@ use std::{
 
 use basics::base_uint::Uint256;
 use protocol::{
-    JsonValue, LedgerFormats, SERIALIZED_TYPE_NAME_MAP, SerializedTypeId, TxFormats, all_sfields,
-    getAllLedgerFlags, getAllTxFlags, getAsfFlagMap, sha512_half, trans_results,
+    InnerObjectFormats, JsonValue, LedgerFormats, SERIALIZED_TYPE_NAME_MAP, SerializedTypeId,
+    TxFormats, all_sfields, getAllLedgerFlags, getAllTxFlags, getAsfFlagMap, sha512_half,
+    trans_results,
 };
 
 use crate::commands::rpc_helpers::invalid_field_error;
@@ -41,6 +42,10 @@ impl ServerDefinitions {
         defs.insert(
             "LEDGER_ENTRY_FORMATS".to_owned(),
             build_ledger_entry_formats(),
+        );
+        defs.insert(
+            "INNER_OBJECT_FORMATS".to_owned(),
+            build_inner_object_formats(),
         );
         defs.insert("TRANSACTION_FLAGS".to_owned(), build_transaction_flags());
         defs.insert("LEDGER_ENTRY_FLAGS".to_owned(), build_ledger_entry_flags());
@@ -428,6 +433,19 @@ fn build_ledger_entry_formats() -> JsonValue {
         formats.insert(
             format.name().to_owned(),
             build_template_array(format.so_template().elements(), &common_names),
+        );
+    }
+
+    JsonValue::Object(formats)
+}
+
+fn build_inner_object_formats() -> JsonValue {
+    let mut formats = BTreeMap::new();
+
+    for format in InnerObjectFormats::get_instance().iter() {
+        formats.insert(
+            format.name().to_owned(),
+            build_template_array(format.so_template().elements(), &BTreeSet::new()),
         );
     }
 

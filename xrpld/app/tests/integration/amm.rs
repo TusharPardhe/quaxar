@@ -303,7 +303,7 @@ fn amm_create_same_iou_rejected() {
 
 // ─── Additional AMM Tests ─────────────────────────────────────────────────
 
-/// C++ AMM_test — deposit with invalid flags.
+/// C++ AMM_test — deposit with a malformed two-asset field matrix.
 #[test]
 fn amm_deposit_invalid_flags() {
     let alice = acct(0x11);
@@ -321,10 +321,10 @@ fn amm_deposit_invalid_flags() {
         tx.set_field_amount(sf("sfAmount"), iou(gw, "USD", 100));
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
-        tx.set_field_u32(sf("sfFlags"), 0x00100000); // tfWithdrawAll (invalid for deposit)
+        tx.set_field_u32(sf("sfFlags"), 0x00100000); // tfTwoAsset without Amount2.
     });
     let result = full_apply(&mut view, &tx, TxType::AMM_DEPOSIT);
-    assert_eq!(result, Ter::TEM_INVALID_FLAG);
+    assert_eq!(result, Ter::TEM_MALFORMED);
 }
 
 /// C++ AMM_test — withdraw with invalid flags.
@@ -345,15 +345,10 @@ fn amm_withdraw_invalid_flags() {
         tx.set_field_amount(sf("sfAmount"), iou(gw, "USD", 100));
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
-        tx.set_field_u32(sf("sfFlags"), 0x00080000); // tfLPToken (invalid for withdraw without LP)
+        tx.set_field_u32(sf("sfFlags"), 0x00010000); // tfLPToken without LPTokenIn.
     });
     let result = full_apply(&mut view, &tx, TxType::AMM_WITHDRAW);
-    // Invalid flag combination
-    assert!(
-        result == Ter::TEM_INVALID_FLAG || result == Ter::TEM_MALFORMED,
-        "Got {:?}",
-        result
-    );
+    assert_eq!(result, Ter::TEM_MALFORMED);
 }
 
 /// C++ AMM_test — vote with invalid fee.

@@ -9,14 +9,18 @@ use ledger::{
     amm_helpers::stamount_as_number, dir_append, dir_remove,
 };
 use protocol::{
-    AccountID, Asset, LedgerEntryType, MPTIssue, STAmount, STLedgerEntry, STNumber, STTx, Ter,
-    VAULT_DEFAULT_IOU_SCALE, XRPAmount, account_keylet, associate_asset, feature_id,
-    get_field_by_symbol, mpt_issuance_keylet, mpt_issuance_keylet_from_mptid,
+    AccountID, Asset, LedgerEntryType, MPTIssue, STAmount, STLedgerEntry, STNumber, STTx,
+    SerializedTypeId, Ter, VAULT_DEFAULT_IOU_SCALE, XRPAmount, account_keylet, associate_asset,
+    feature_id, get_field_by_symbol, mpt_issuance_keylet, mpt_issuance_keylet_from_mptid,
     mptoken_keylet_from_mptid, owner_dir_keylet, to_amount_from_number,
 };
 use tx::{
     MPT_CAN_ESCROW_FLAG, MPT_CAN_TRADE_FLAG, MPT_CAN_TRANSFER_FLAG, MPT_REQUIRE_AUTH_FLAG,
-    VAULT_PRIVATE_FLAG, VAULT_SHARE_NON_TRANSFERABLE_FLAG,
+    VAULT_PRIVATE_FLAG, VAULT_SHARE_NON_TRANSFERABLE_FLAG, VaultClawbackPreflightFacts,
+    VaultCreatePreflightFacts, VaultDeletePreflightFacts, VaultDepositPreflightFacts,
+    VaultSetPreflightFacts, VaultWithdrawPreflightFacts, run_vault_clawback_preflight,
+    run_vault_create_preflight, run_vault_delete_preflight, run_vault_deposit_preflight,
+    run_vault_set_preflight, run_vault_withdraw_preflight,
 };
 
 fn sf(name: &str) -> &'static protocol::SField {
@@ -44,6 +48,136 @@ fn zero_amount(asset: Asset) -> STAmount {
         basics::number::RoundingMode::TowardsZero,
     )
     .expect("zero amount should be representable")
+}
+
+fn tx_asset_field(sttx: &STTx, field: &'static protocol::SField) -> Asset {
+    match sttx.peek_at_pfield(field).map(|value| value.stype()) {
+        Some(SerializedTypeId::Issue) => sttx.get_field_issue(field).asset(),
+        Some(SerializedTypeId::Amount) => sttx.get_field_amount(field).asset(),
+        _ => sttx.get_field_issue(field).asset(),
+    }
+}
+
+fn feature_enabled<V: ApplyView>(view: &V, name: &str) -> bool {
+    view.rules().enabled(&feature_id(name))
+}
+
+fn data_len(sttx: &STTx, field: &'static protocol::SField) -> Option<usize> {
+    sttx.is_field_present(field)
+        .then(|| sttx.get_field_vl(field).len())
+}
+
+fn tx_number_value_field(sttx: &STTx, field: &'static protocol::SField) -> Option<RuntimeNumber> {
+    match sttx.peek_at_pfield(field).map(|value| value.stype()) {
+        Some(SerializedTypeId::Number) => Some(sttx.get_field_number(field).value()),
+        Some(SerializedTypeId::Amount) => Some(amount_number(&sttx.get_field_amount(field))),
+        _ => None,
+    }
+}
+
+fn vault_create_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
+    if !feature_enabled(view, "SingleAssetVault") || !feature_enabled(view, "MPTokensV1") {
+        return Ter::TEM_DISABLED;
+    }
+
+    let domain_id_present = sttx.is_field_present(sf("sfDomainID"));
+    if domain_id_present && !feature_enabled(view, "PermissionedDomains") {
+        return Ter::TEM_DISABLED;
+    }
+
+    let asset = tx_asset_field(sttx, sf("sfAsset"));
+    let facts = VaultCreatePreflightFacts {
+        data_len: data_len(sttx, sf("sfData")),
+        withdrawal_policy: sttx
+            .is_field_present(sf("sfWithdrawalPolicy"))
+            .then(|| sttx.get_field_u8(sf("sfWithdrawalPolicy"))),
+        domain_id_present,
+        domain_id_is_zero: domain_id_present && sttx.get_field_h256(sf("sfDomainID")).is_zero(),
+        is_private: sttx.get_field_u32(sf("sfFlags")) & VAULT_PRIVATE_FLAG != 0,
+        assets_maximum_is_negative: tx_number_value_field(sttx, sf("sfAssetsMaximum"))
+            .is_some_and(|value| value < RuntimeNumber::zero()),
+        mptoken_metadata_len: data_len(sttx, sf("sfMPTokenMetadata")),
+        scale: sttx
+            .is_field_present(sf("sfScale"))
+            .then(|| sttx.get_field_u8(sf("sfScale"))),
+        asset_is_mpt: matches!(asset, Asset::MPTIssue(_)),
+        asset_is_native: asset.native(),
+    };
+    run_vault_create_preflight(facts)
+}
+
+fn vault_set_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
+    if !feature_enabled(view, "SingleAssetVault") {
+        return Ter::TEM_DISABLED;
+    }
+
+    if sttx.is_field_present(sf("sfDomainID")) && !feature_enabled(view, "PermissionedDomains") {
+        return Ter::TEM_DISABLED;
+    }
+
+    let facts = VaultSetPreflightFacts {
+        vault_id_is_zero: sttx.get_field_h256(sf("sfVaultID")).is_zero(),
+        data_len: data_len(sttx, sf("sfData")),
+        assets_maximum_is_negative: tx_number_value_field(sttx, sf("sfAssetsMaximum"))
+            .is_some_and(|value| value < RuntimeNumber::zero()),
+        domain_id_present: sttx.is_field_present(sf("sfDomainID")),
+        assets_maximum_present: sttx.is_field_present(sf("sfAssetsMaximum")),
+        data_present: sttx.is_field_present(sf("sfData")),
+    };
+    run_vault_set_preflight(facts)
+}
+
+fn vault_delete_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
+    if !feature_enabled(view, "SingleAssetVault") {
+        return Ter::TEM_DISABLED;
+    }
+
+    run_vault_delete_preflight(VaultDeletePreflightFacts {
+        vault_id_is_zero: sttx.get_field_h256(sf("sfVaultID")).is_zero(),
+    })
+}
+
+fn vault_deposit_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
+    if !feature_enabled(view, "SingleAssetVault") {
+        return Ter::TEM_DISABLED;
+    }
+
+    run_vault_deposit_preflight(VaultDepositPreflightFacts {
+        vault_id_is_zero: sttx.get_field_h256(sf("sfVaultID")).is_zero(),
+        amount_is_positive: sttx.get_field_amount(sf("sfAmount")).signum() > 0,
+    })
+}
+
+fn vault_withdraw_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
+    if !feature_enabled(view, "SingleAssetVault") {
+        return Ter::TEM_DISABLED;
+    }
+
+    let destination_present = sttx.is_field_present(sf("sfDestination"));
+    run_vault_withdraw_preflight(VaultWithdrawPreflightFacts {
+        vault_id_is_zero: sttx.get_field_h256(sf("sfVaultID")).is_zero(),
+        amount_is_positive: sttx.get_field_amount(sf("sfAmount")).signum() > 0,
+        destination_present,
+        destination_is_zero: destination_present
+            && sttx.get_account_id(sf("sfDestination")).is_zero(),
+    })
+}
+
+fn vault_clawback_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
+    if !feature_enabled(view, "SingleAssetVault") {
+        return Ter::TEM_DISABLED;
+    }
+
+    let amount_present = sttx.is_field_present(sf("sfAmount"));
+    let amount = amount_present.then(|| sttx.get_field_amount(sf("sfAmount")));
+    run_vault_clawback_preflight(VaultClawbackPreflightFacts {
+        vault_id_is_zero: sttx.get_field_h256(sf("sfVaultID")).is_zero(),
+        amount_present,
+        amount_is_negative: amount.as_ref().is_some_and(STAmount::negative),
+        amount_asset_is_xrp: amount
+            .as_ref()
+            .is_some_and(|amount| amount.asset().native()),
+    })
 }
 
 fn runtime_to_amount(asset: Asset, value: RuntimeNumber) -> Option<STAmount> {
@@ -340,8 +474,74 @@ fn account_send<V: ApplyView>(
             to,
             amount.mpt().value().unsigned_abs(),
         ),
-        Asset::Issue(_) => ledger::ripple_state_helpers::account_send(view, from, to, amount),
+        Asset::Issue(issue) if issue.native() => transfer_xrp(view, from, to, amount),
+        Asset::Issue(_) => transfer_iou_no_fee(view, from, to, amount),
     }
+}
+
+fn transfer_xrp<V: ApplyView>(
+    view: &mut V,
+    from: &AccountID,
+    to: &AccountID,
+    amount: &STAmount,
+) -> Ter {
+    let from_keylet = account_keylet(to_160(from));
+    let to_keylet = account_keylet(to_160(to));
+    let Ok(Some(from_sle)) = view.peek(from_keylet) else {
+        return Ter::TEF_BAD_LEDGER;
+    };
+    let Ok(Some(to_sle)) = view.peek(to_keylet) else {
+        return Ter::TEF_BAD_LEDGER;
+    };
+    let from_balance = from_sle.get_field_amount(sf("sfBalance")).xrp().drops();
+    let to_balance = to_sle.get_field_amount(sf("sfBalance")).xrp().drops();
+    let drops = amount.xrp().drops();
+    if from_balance < drops {
+        return Ter::TEC_INSUFFICIENT_FUNDS;
+    }
+
+    let mut from_obj = from_sle.clone_as_object();
+    from_obj.set_field_amount(
+        sf("sfBalance"),
+        STAmount::from_xrp_amount(XRPAmount::from_drops(from_balance - drops)),
+    );
+    let mut to_obj = to_sle.clone_as_object();
+    to_obj.set_field_amount(
+        sf("sfBalance"),
+        STAmount::from_xrp_amount(XRPAmount::from_drops(to_balance + drops)),
+    );
+    let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
+        from_obj,
+        *from_sle.key(),
+    )));
+    let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
+        to_obj,
+        *to_sle.key(),
+    )));
+    Ter::TES_SUCCESS
+}
+
+fn transfer_iou_no_fee<V: ApplyView>(
+    view: &mut V,
+    from: &AccountID,
+    to: &AccountID,
+    amount: &STAmount,
+) -> Ter {
+    if amount.signum() <= 0 || from == to {
+        return Ter::TES_SUCCESS;
+    }
+
+    let issue = amount.issue();
+    if *from == issue.account || *to == issue.account || issue.account.is_zero() {
+        return ledger::ripple_state_helpers::direct_send_no_fee_iou_pub(view, from, to, amount);
+    }
+
+    let res =
+        ledger::ripple_state_helpers::direct_send_no_fee_iou_pub(view, &issue.account, to, amount);
+    if res != Ter::TES_SUCCESS {
+        return res;
+    }
+    ledger::ripple_state_helpers::direct_send_no_fee_iou_pub(view, from, &issue.account, amount)
 }
 
 fn account_holds_vault_asset<V: ApplyView>(
@@ -532,13 +732,14 @@ struct LoadedIssuance {
 }
 
 pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
-    if !view.rules().enabled(&feature_id("SingleAssetVault")) {
-        return Ter::TEM_DISABLED;
+    let preflight = vault_create_preflight(view, sttx);
+    if preflight != Ter::TES_SUCCESS {
+        return preflight;
     }
 
     let owner = sttx.get_account_id(sf("sfAccount"));
     let sequence = sttx.get_seq_value();
-    let asset = sttx.get_field_amount(sf("sfAsset")).asset();
+    let asset = tx_asset_field(sttx, sf("sfAsset"));
     let keylet = protocol::vault_keylet(to_160(&owner), sequence);
 
     let pseudo = match create_pseudo_account(view, keylet.key, sf("sfVaultID")) {
@@ -643,13 +844,10 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         asset_number(asset, RuntimeNumber::zero()),
     );
     if sttx.is_field_present(sf("sfAssetsMaximum")) {
-        vault.set_field_number(
-            sf("sfAssetsMaximum"),
-            asset_number(
-                asset,
-                amount_number(&sttx.get_field_amount(sf("sfAssetsMaximum"))),
-            ),
-        );
+        let Some(assets_maximum) = tx_number_value_field(sttx, sf("sfAssetsMaximum")) else {
+            return Ter::TEM_MALFORMED;
+        };
+        vault.set_field_number(sf("sfAssetsMaximum"), asset_number(asset, assets_maximum));
     }
     vault.set_field_h192(sf("sfShareMPTID"), share_id);
     if sttx.is_field_present(sf("sfData")) {
@@ -670,20 +868,21 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     let _ = view.insert(Arc::new(vault));
 
     if let Ok(Some(owner_root)) = view.peek(account_keylet(to_160(&owner))) {
-        let _ = adjust_owner_count(view, &owner_root, 1);
+        let _ = adjust_owner_count(view, &owner_root, 2);
     }
 
     Ter::TES_SUCCESS
 }
 
 pub fn apply_vault_set<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
-    if !view.rules().enabled(&feature_id("SingleAssetVault")) {
-        return Ter::TEM_DISABLED;
+    let preflight = vault_set_preflight(view, sttx);
+    if preflight != Ter::TES_SUCCESS {
+        return preflight;
     }
 
     let vault_id = sttx.get_field_h256(sf("sfVaultID"));
     let Some(mut vault) = load_vault(view, vault_id) else {
-        return Ter::TEF_BAD_LEDGER;
+        return Ter::TEC_NO_ENTRY;
     };
 
     let tx_account = sttx.get_account_id(sf("sfAccount"));
@@ -691,25 +890,51 @@ pub fn apply_vault_set<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return Ter::TEC_NO_PERMISSION;
     }
 
+    let mut issuance = if sttx.is_field_present(sf("sfDomainID")) {
+        let Some(issuance) = load_issuance(view, vault.share_id) else {
+            return Ter::TEF_INTERNAL;
+        };
+        if vault.entry.get_field_u32(sf("sfFlags")) & VAULT_PRIVATE_FLAG == 0 {
+            return Ter::TEC_NO_PERMISSION;
+        }
+        if issuance.entry.get_field_u32(sf("sfFlags")) & MPT_REQUIRE_AUTH_FLAG == 0 {
+            return Ter::TEF_INTERNAL;
+        }
+        let domain = sttx.get_field_h256(sf("sfDomainID"));
+        if !domain.is_zero()
+            && view
+                .read(protocol::permissioned_domain_keylet_from_id(domain))
+                .ok()
+                .flatten()
+                .is_none()
+        {
+            return Ter::TEC_OBJECT_NOT_FOUND;
+        }
+        Some(issuance)
+    } else {
+        None
+    };
+
     if sttx.is_field_present(sf("sfData")) {
         vault
             .entry
             .set_field_vl(sf("sfData"), &sttx.get_field_vl(sf("sfData")));
     }
     if sttx.is_field_present(sf("sfAssetsMaximum")) {
+        let Some(assets_maximum) = tx_number_value_field(sttx, sf("sfAssetsMaximum")) else {
+            return Ter::TEM_MALFORMED;
+        };
+        if assets_maximum != RuntimeNumber::zero() && assets_maximum < vault.assets_total {
+            return Ter::TEC_LIMIT_EXCEEDED;
+        }
         vault.entry.set_field_number(
             sf("sfAssetsMaximum"),
-            asset_number(
-                vault.asset,
-                amount_number(&sttx.get_field_amount(sf("sfAssetsMaximum"))),
-            ),
+            asset_number(vault.asset, assets_maximum),
         );
     }
     if sttx.is_field_present(sf("sfDomainID")) {
-        let Some(mut issuance) = load_issuance(view, vault.share_id) else {
-            return Ter::TEF_BAD_LEDGER;
-        };
         let domain = sttx.get_field_h256(sf("sfDomainID"));
+        let issuance = issuance.as_mut().expect("domain update loaded issuance");
         if domain.is_zero() {
             issuance.entry.make_field_absent(sf("sfDomainID"));
         } else {
@@ -725,18 +950,35 @@ pub fn apply_vault_set<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
 }
 
 pub fn apply_vault_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
-    if !view.rules().enabled(&feature_id("SingleAssetVault")) {
-        return Ter::TEM_DISABLED;
+    let preflight = vault_delete_preflight(view, sttx);
+    if preflight != Ter::TES_SUCCESS {
+        return preflight;
     }
 
     let vault_id = sttx.get_field_h256(sf("sfVaultID"));
     let owner = sttx.get_account_id(sf("sfAccount"));
     let Some(vault) = load_vault(view, vault_id) else {
-        return Ter::TEF_BAD_LEDGER;
+        return Ter::TEC_NO_ENTRY;
     };
 
     if owner != vault.owner {
         return Ter::TEC_NO_PERMISSION;
+    }
+
+    if vault.assets_available != RuntimeNumber::zero()
+        || vault.assets_total != RuntimeNumber::zero()
+    {
+        return Ter::TEC_HAS_OBLIGATIONS;
+    }
+
+    let Some(issuance) = load_issuance(view, vault.share_id) else {
+        return Ter::TEC_OBJECT_NOT_FOUND;
+    };
+    if issuance.issuer != vault.pseudo {
+        return Ter::TEC_NO_PERMISSION;
+    }
+    if issuance.outstanding_amount != 0 {
+        return Ter::TEC_HAS_OBLIGATIONS;
     }
 
     let ter = ledger::remove_empty_holding(view, &vault.pseudo, &vault.asset);
@@ -751,18 +993,16 @@ pub fn apply_vault_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         }
     }
 
-    if let Some(issuance) = load_issuance(view, vault.share_id) {
-        let _ = dir_remove(
-            view,
-            &owner_dir_keylet(to_160(&issuance.issuer)),
-            issuance.owner_node,
-            issuance.key,
-            false,
-        );
-        let _ = view.erase(Arc::new(issuance.entry));
-        if let Ok(Some(pseudo_root)) = view.peek(account_keylet(to_160(&vault.pseudo))) {
-            let _ = adjust_owner_count(view, &pseudo_root, -1);
-        }
+    let _ = dir_remove(
+        view,
+        &owner_dir_keylet(to_160(&issuance.issuer)),
+        issuance.owner_node,
+        issuance.key,
+        false,
+    );
+    let _ = view.erase(Arc::new(issuance.entry));
+    if let Ok(Some(pseudo_root)) = view.peek(account_keylet(to_160(&vault.pseudo))) {
+        let _ = adjust_owner_count(view, &pseudo_root, -1);
     }
 
     if let Ok(Some(pseudo_root)) = view.peek(account_keylet(to_160(&vault.pseudo))) {
@@ -782,21 +1022,22 @@ pub fn apply_vault_delete<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     );
     let _ = view.erase(Arc::new(vault.entry));
     if let Ok(Some(owner_root)) = view.peek(account_keylet(to_160(&vault.owner))) {
-        let _ = adjust_owner_count(view, &owner_root, -1);
+        let _ = adjust_owner_count(view, &owner_root, -2);
     }
     Ter::TES_SUCCESS
 }
 
 pub fn apply_vault_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
-    if !view.rules().enabled(&feature_id("SingleAssetVault")) {
-        return Ter::TEM_DISABLED;
+    let preflight = vault_deposit_preflight(view, sttx);
+    if preflight != Ter::TES_SUCCESS {
+        return preflight;
     }
 
     let vault_id = sttx.get_field_h256(sf("sfVaultID"));
     let account = sttx.get_account_id(sf("sfAccount"));
     let tx_amount = sttx.get_field_amount(sf("sfAmount"));
     let Some(mut vault) = load_vault(view, vault_id) else {
-        return Ter::TEF_BAD_LEDGER;
+        return Ter::TEC_NO_ENTRY;
     };
     let Some(issuance) = load_issuance(view, vault.share_id) else {
         return Ter::TEF_BAD_LEDGER;
@@ -841,6 +1082,14 @@ pub fn apply_vault_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return Ter::TEC_INTERNAL;
     }
 
+    let deposited_number = amount_number(&assets_deposited);
+    if vault.entry.is_field_present(sf("sfAssetsMaximum")) {
+        let maximum = vault.entry.get_field_number(sf("sfAssetsMaximum")).value();
+        if maximum != RuntimeNumber::zero() && vault.assets_total + deposited_number > maximum {
+            return Ter::TEC_LIMIT_EXCEEDED;
+        }
+    }
+
     let ter = ensure_holding(view, &account, share_asset(vault.share_id));
     if ter != Ter::TES_SUCCESS && ter != Ter::TEC_DUPLICATE {
         return ter;
@@ -862,27 +1111,16 @@ pub fn apply_vault_deposit<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return ter;
     }
 
-    let deposited_number = amount_number(&assets_deposited);
     vault.assets_total += deposited_number;
     vault.assets_available += deposited_number;
-    if vault.entry.is_field_present(sf("sfAssetsMaximum")) {
-        let maximum = vault.entry.get_field_number(sf("sfAssetsMaximum")).value();
-        let ter = persist_vault(view, &mut vault);
-        if ter != Ter::TES_SUCCESS {
-            return ter;
-        }
-        if maximum != RuntimeNumber::zero() && vault.assets_total > maximum {
-            return Ter::TEC_LIMIT_EXCEEDED;
-        }
-        return Ter::TES_SUCCESS;
-    }
 
     persist_vault(view, &mut vault)
 }
 
 pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
-    if !view.rules().enabled(&feature_id("SingleAssetVault")) {
-        return Ter::TEM_DISABLED;
+    let preflight = vault_withdraw_preflight(view, sttx);
+    if preflight != Ter::TES_SUCCESS {
+        return preflight;
     }
 
     let vault_id = sttx.get_field_h256(sf("sfVaultID"));
@@ -894,7 +1132,7 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     };
     let amount = sttx.get_field_amount(sf("sfAmount"));
     let Some(mut vault) = load_vault(view, vault_id) else {
-        return Ter::TEF_BAD_LEDGER;
+        return Ter::TEC_NO_ENTRY;
     };
     let Some(issuance) = load_issuance(view, vault.share_id) else {
         return Ter::TEF_BAD_LEDGER;
@@ -980,8 +1218,9 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
 }
 
 pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
-    if !view.rules().enabled(&feature_id("SingleAssetVault")) {
-        return Ter::TEM_DISABLED;
+    let preflight = vault_clawback_preflight(view, sttx);
+    if preflight != Ter::TES_SUCCESS {
+        return preflight;
     }
 
     let vault_id = sttx.get_field_h256(sf("sfVaultID"));
@@ -1050,7 +1289,13 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         }
         let recovered = amount_number(&assets_recovered);
         vault.assets_total -= recovered;
-        vault.assets_available -= recovered;
+        // Clamp to assets_available to prevent underflow (C++ parity: fixCleanup3_1_3)
+        let clamped = if recovered > vault.assets_available {
+            vault.assets_available
+        } else {
+            recovered
+        };
+        vault.assets_available -= clamped;
     }
 
     persist_vault(view, &mut vault)

@@ -666,6 +666,7 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
             FormatFieldSpec { field_symbol: "sfMPTokenMetadata", style: SOEStyle::Optional, mpt: SOETxMPTIssue::None },
             FormatFieldSpec { field_symbol: "sfDomainID", style: SOEStyle::Optional, mpt: SOETxMPTIssue::None },
             FormatFieldSpec { field_symbol: "sfMutableFlags", style: SOEStyle::Optional, mpt: SOETxMPTIssue::None },
+            FormatFieldSpec { field_symbol: "sfReferenceHolding", style: SOEStyle::Optional, mpt: SOETxMPTIssue::None },
         ],
     },
     TxFormatSpecInit {

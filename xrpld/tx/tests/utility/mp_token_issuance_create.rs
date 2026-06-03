@@ -91,8 +91,22 @@ fn mp_token_issuance_create_flags_mask() {
 
 #[test]
 fn mp_token_issuance_create_preflight_guards() {
+    let user_reference_holding =
+        run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
+            fix_cleanup_3_2_0_enabled: true,
+            reference_holding_present: true,
+            mutable_flags: None,
+            tx_flags: 0,
+            transfer_fee: None,
+            domain_id_present: false,
+            domain_id_is_zero: false,
+            metadata_len: None,
+            maximum_amount: None,
+        });
     let invalid_mutable =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
+            fix_cleanup_3_2_0_enabled: false,
+            reference_holding_present: false,
             mutable_flags: Some(0),
             tx_flags: 0,
             transfer_fee: None,
@@ -103,6 +117,8 @@ fn mp_token_issuance_create_preflight_guards() {
         });
     let invalid_mutable_mask =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
+            fix_cleanup_3_2_0_enabled: false,
+            reference_holding_present: false,
             mutable_flags: Some(tmfMPTokenIssuanceCreateMutableMask),
             tx_flags: 0,
             transfer_fee: None,
@@ -112,6 +128,8 @@ fn mp_token_issuance_create_preflight_guards() {
             maximum_amount: None,
         });
     let bad_fee = run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
+        fix_cleanup_3_2_0_enabled: false,
+        reference_holding_present: false,
         mutable_flags: None,
         tx_flags: tfMPTCanTransfer,
         transfer_fee: Some(MAX_TRANSFER_FEE + 1),
@@ -122,6 +140,8 @@ fn mp_token_issuance_create_preflight_guards() {
     });
     let missing_transfer_flag =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
+            fix_cleanup_3_2_0_enabled: false,
+            reference_holding_present: false,
             mutable_flags: None,
             tx_flags: 0,
             transfer_fee: Some(1),
@@ -131,6 +151,8 @@ fn mp_token_issuance_create_preflight_guards() {
             maximum_amount: None,
         });
     let zero_domain = run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
+        fix_cleanup_3_2_0_enabled: false,
+        reference_holding_present: false,
         mutable_flags: None,
         tx_flags: tfMPTRequireAuth,
         transfer_fee: None,
@@ -141,6 +163,8 @@ fn mp_token_issuance_create_preflight_guards() {
     });
     let missing_require_auth =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
+            fix_cleanup_3_2_0_enabled: false,
+            reference_holding_present: false,
             mutable_flags: None,
             tx_flags: 0,
             transfer_fee: None,
@@ -151,6 +175,8 @@ fn mp_token_issuance_create_preflight_guards() {
         });
     let empty_metadata =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
+            fix_cleanup_3_2_0_enabled: false,
+            reference_holding_present: false,
             mutable_flags: None,
             tx_flags: 0,
             transfer_fee: None,
@@ -161,6 +187,8 @@ fn mp_token_issuance_create_preflight_guards() {
         });
     let oversized_metadata =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
+            fix_cleanup_3_2_0_enabled: false,
+            reference_holding_present: false,
             mutable_flags: None,
             tx_flags: 0,
             transfer_fee: None,
@@ -170,6 +198,8 @@ fn mp_token_issuance_create_preflight_guards() {
             maximum_amount: None,
         });
     let zero_max = run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
+        fix_cleanup_3_2_0_enabled: false,
+        reference_holding_present: false,
         mutable_flags: None,
         tx_flags: 0,
         transfer_fee: None,
@@ -180,6 +210,8 @@ fn mp_token_issuance_create_preflight_guards() {
     });
     let oversized_max =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
+            fix_cleanup_3_2_0_enabled: false,
+            reference_holding_present: false,
             mutable_flags: None,
             tx_flags: 0,
             transfer_fee: None,
@@ -189,6 +221,7 @@ fn mp_token_issuance_create_preflight_guards() {
             maximum_amount: Some(MAX_MPTOKEN_AMOUNT + 1),
         });
 
+    assert_eq!(user_reference_holding, Ter::TEM_MALFORMED);
     assert_eq!(invalid_mutable, Ter::TEM_INVALID_FLAG);
     assert_eq!(invalid_mutable_mask, Ter::TEM_INVALID_FLAG);
     assert_eq!(bad_fee, Ter::TEM_BAD_TRANSFER_FEE);
@@ -204,6 +237,8 @@ fn mp_token_issuance_create_preflight_guards() {
 #[test]
 fn mp_token_issuance_create_preflight_accepts_valid_inputs() {
     let result = run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
+        fix_cleanup_3_2_0_enabled: true,
+        reference_holding_present: false,
         mutable_flags: Some(tmfMPTCanMutateCanLock),
         tx_flags: tfMPTCanTransfer | tfMPTRequireAuth,
         transfer_fee: Some(MAX_TRANSFER_FEE),

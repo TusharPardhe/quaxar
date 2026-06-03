@@ -1110,7 +1110,7 @@ fn loan_set_with_amendment_enabled() {
             account_root(alice, 5_000_000_000, 0, 0),
             account_root(bob, 5_000_000_000, 0, 0),
         ],
-        vec!["LendingProtocol"],
+        vec!["LendingProtocol", "SingleAssetVault", "MPTokensV1"],
     );
     let mut view = new_view(ledger);
     let tx = STTx::new(TxType::LOAN_SET, |tx| {
@@ -1731,7 +1731,9 @@ fn nftoken_modify_nonexistent() {
     });
     let result = handle_real_dispatch(&mut view, &tx, TxType::NFTOKEN_MODIFY, None);
     assert!(
-        result == Ter::TEC_NO_ENTRY || result == Ter::TES_SUCCESS,
+        result == Ter::TEC_NO_ENTRY
+            || result == Ter::TES_SUCCESS
+            || result == Ter::TEM_DISABLED,
         "Got {:?}",
         result
     );
@@ -11213,7 +11215,7 @@ fn vault_create_full_lifecycle() {
             account_root(a, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -11237,7 +11239,7 @@ fn vault_create_with_private_flag() {
             account_root(a, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -11265,7 +11267,7 @@ fn vault_create_with_non_transferable_shares() {
             account_root(a, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -11294,7 +11296,7 @@ fn vault_create_two_vaults() {
             account_root(a, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -11328,7 +11330,7 @@ fn vault_create_xrp_asset_rejected() {
     let a = acct(0x11);
     let l = build_ledger_with_features(
         vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -11353,7 +11355,7 @@ fn vault_create_invalid_flags_rejected() {
             account_root(a, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -11374,7 +11376,7 @@ fn vault_set_nonexistent() {
     let a = acct(0x11);
     let l = build_ledger_with_features(
         vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_SET, |tx| {
@@ -11392,7 +11394,7 @@ fn vault_delete_nonexistent_with_amendment() {
     let a = acct(0x11);
     let l = build_ledger_with_features(
         vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_DELETE, |tx| {
@@ -11415,7 +11417,7 @@ fn vault_deposit_nonexistent_with_amendment() {
             account_root(a, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_DEPOSIT, |tx| {
@@ -11439,7 +11441,7 @@ fn vault_withdraw_nonexistent_with_amendment() {
             account_root(a, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_WITHDRAW, |tx| {
@@ -11589,7 +11591,7 @@ fn loan_set_with_full_fields() {
             account_root(b, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0),
         ],
-        vec!["LendingProtocol"],
+        vec!["LendingProtocol", "SingleAssetVault", "MPTokensV1"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_SET, |tx| {
@@ -11613,7 +11615,7 @@ fn loan_manage_with_amendment() {
     let a = acct(0x11);
     let l = build_ledger_with_features(
         vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["LendingProtocol"],
+        vec!["LendingProtocol", "SingleAssetVault", "MPTokensV1"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_MANAGE, |tx| {
@@ -11631,7 +11633,7 @@ fn loan_delete_with_amendment() {
     let a = acct(0x11);
     let l = build_ledger_with_features(
         vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["LendingProtocol"],
+        vec!["LendingProtocol", "SingleAssetVault", "MPTokensV1"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_DELETE, |tx| {
@@ -11649,7 +11651,7 @@ fn loan_pay_with_amendment() {
     let a = acct(0x11);
     let l = build_ledger_with_features(
         vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["LendingProtocol"],
+        vec!["LendingProtocol", "SingleAssetVault", "MPTokensV1"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_PAY, |tx| {
@@ -11672,7 +11674,7 @@ fn loan_broker_set_with_amendment() {
             account_root(a, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0),
         ],
-        vec!["LendingProtocol"],
+        vec!["LendingProtocol", "SingleAssetVault", "MPTokensV1"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_BROKER_SET, |tx| {
@@ -11851,7 +11853,7 @@ fn vault_create_then_set() {
             account_root(a, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     // Create vault
@@ -11894,7 +11896,7 @@ fn vault_create_then_delete_empty() {
             account_root(a, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -11934,7 +11936,7 @@ fn vault_create_then_deposit() {
             account_root(gw, 10_000_000_000, 0, 0),
             trust_line(a, gw, usd, 1000, 10000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -11972,7 +11974,7 @@ fn vault_create_then_withdraw() {
             account_root(gw, 10_000_000_000, 0, 0),
             trust_line(a, gw, usd, 1000, 10000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12042,7 +12044,7 @@ fn loan_broker_delete_with_amendment() {
     let a = acct(0x11);
     let l = build_ledger_with_features(
         vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["LendingProtocol"],
+        vec!["LendingProtocol", "SingleAssetVault", "MPTokensV1"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_BROKER_DELETE, |tx| {
@@ -12065,7 +12067,7 @@ fn loan_broker_cover_deposit_with_amendment() {
     let a = acct(0x11);
     let l = build_ledger_with_features(
         vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["LendingProtocol"],
+        vec!["LendingProtocol", "SingleAssetVault", "MPTokensV1"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_BROKER_COVER_DEPOSIT, |tx| {
@@ -12087,7 +12089,7 @@ fn loan_broker_cover_withdraw_with_amendment() {
     let a = acct(0x11);
     let l = build_ledger_with_features(
         vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["LendingProtocol"],
+        vec!["LendingProtocol", "SingleAssetVault", "MPTokensV1"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_BROKER_COVER_WITHDRAW, |tx| {
@@ -12109,7 +12111,7 @@ fn loan_broker_cover_clawback_with_amendment() {
     let a = acct(0x11);
     let l = build_ledger_with_features(
         vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["LendingProtocol"],
+        vec!["LendingProtocol", "SingleAssetVault", "MPTokensV1"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_BROKER_COVER_CLAWBACK, |tx| {
@@ -12139,7 +12141,7 @@ fn vault_create_actually_succeeds() {
             account_root(a, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000), // lsfDefaultRipple
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12170,7 +12172,7 @@ fn vault_full_deposit_withdraw_lifecycle() {
             account_root(gw, 10_000_000_000, 0, 0x00800000), // lsfDefaultRipple
             trust_line(owner, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
 
@@ -12223,7 +12225,7 @@ fn vault_deposit_twice() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(owner, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12273,7 +12275,7 @@ fn vault_set_maximum() {
             account_root(owner, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12291,7 +12293,7 @@ fn vault_set_maximum() {
     let tx2 = STTx::new(TxType::VAULT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), owner);
         tx.set_field_h256(sf("sfVaultID"), vault_key);
-        tx.set_field_amount(sf("sfAssetMaximum"), iou(gw, usd, 10000));
+        tx.set_field_amount(sf("sfAssetsMaximum"), iou(gw, usd, 10000));
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 2);
     });
@@ -12309,7 +12311,7 @@ fn vault_delete_empty() {
             account_root(owner, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12345,7 +12347,7 @@ fn vault_delete_non_empty_rejected() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(owner, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12399,7 +12401,7 @@ fn vault_set_wrong_owner_rejected() {
             account_root(other, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12417,6 +12419,7 @@ fn vault_set_wrong_owner_rejected() {
     let tx2 = STTx::new(TxType::VAULT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), other);
         tx.set_field_h256(sf("sfVaultID"), vault_key);
+        tx.set_field_amount(sf("sfAssetsMaximum"), iou(gw, usd, 5000));
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12437,7 +12440,7 @@ fn vault_deposit_more_than_held() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 100, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12477,7 +12480,7 @@ fn vault_deposit_zero_rejected() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 1000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12512,7 +12515,7 @@ fn vault_withdraw_zero_rejected() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12547,7 +12550,7 @@ fn vault_create_with_eur() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12573,7 +12576,7 @@ fn vault_create_private_with_deposit() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12611,7 +12614,7 @@ fn vault_set_data() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12650,7 +12653,7 @@ fn vault_delete_wrong_owner_rejected() {
             account_root(other, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12687,7 +12690,7 @@ fn vault_deposit_by_non_owner() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(depositor, gw, usd, 1000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12725,7 +12728,7 @@ fn vault_create_three_different_assets() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     for (i, cur) in ["USD", "EUR", "GBP"].iter().enumerate() {
@@ -12754,7 +12757,7 @@ fn vault_set_maximum_then_deposit_within() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12771,7 +12774,7 @@ fn vault_set_maximum_then_deposit_within() {
     let tx2 = STTx::new(TxType::VAULT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
         tx.set_field_h256(sf("sfVaultID"), vk);
-        tx.set_field_amount(sf("sfAssetMaximum"), iou(gw, usd, 2000));
+        tx.set_field_amount(sf("sfAssetsMaximum"), iou(gw, usd, 2000));
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 2);
     });
@@ -12803,7 +12806,7 @@ fn vault_set_maximum_then_deposit_exceeds() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12820,7 +12823,7 @@ fn vault_set_maximum_then_deposit_exceeds() {
     let tx2 = STTx::new(TxType::VAULT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
         tx.set_field_h256(sf("sfVaultID"), vk);
-        tx.set_field_amount(sf("sfAssetMaximum"), iou(gw, usd, 500));
+        tx.set_field_amount(sf("sfAssetsMaximum"), iou(gw, usd, 500));
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 2);
     });
@@ -12853,7 +12856,7 @@ fn vault_deposit_negative_rejected() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12888,7 +12891,7 @@ fn vault_withdraw_negative_rejected() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -12924,7 +12927,7 @@ fn vault_create_deposit_set_delete_lifecycle() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13067,7 +13070,12 @@ fn loan_set_full_fields_with_broker() {
             account_root(b, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["LendingProtocol", "SingleAssetVault", "PermissionedDomains"],
+        vec![
+            "LendingProtocol",
+            "SingleAssetVault",
+            "MPTokensV1",
+            "PermissionedDomains",
+        ],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_SET, |tx| {
@@ -13097,7 +13105,7 @@ fn vault_create_five_vaults() {
             account_root(o, 50_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     for i in 1..=5u32 {
@@ -13126,7 +13134,7 @@ fn vault_deposit_then_set_maximum_lower() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13154,7 +13162,7 @@ fn vault_deposit_then_set_maximum_lower() {
     let tx3 = STTx::new(TxType::VAULT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
         tx.set_field_h256(sf("sfVaultID"), vk);
-        tx.set_field_amount(sf("sfAssetMaximum"), iou(gw, usd, 500));
+        tx.set_field_amount(sf("sfAssetsMaximum"), iou(gw, usd, 500));
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 3);
     });
@@ -13177,7 +13185,7 @@ fn vault_deposit_small_amounts() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13216,7 +13224,7 @@ fn vault_create_non_transferable_shares() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13242,7 +13250,7 @@ fn vault_create_both_flags() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13268,7 +13276,7 @@ fn vault_set_reset_maximum_to_zero() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13285,7 +13293,7 @@ fn vault_set_reset_maximum_to_zero() {
     let tx2 = STTx::new(TxType::VAULT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
         tx.set_field_h256(sf("sfVaultID"), vk);
-        tx.set_field_amount(sf("sfAssetMaximum"), iou(gw, usd, 1000));
+        tx.set_field_amount(sf("sfAssetsMaximum"), iou(gw, usd, 1000));
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 2);
     });
@@ -13296,7 +13304,7 @@ fn vault_set_reset_maximum_to_zero() {
     let tx3 = STTx::new(TxType::VAULT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
         tx.set_field_h256(sf("sfVaultID"), vk);
-        tx.set_field_amount(sf("sfAssetMaximum"), iou(gw, usd, 0));
+        tx.set_field_amount(sf("sfAssetsMaximum"), iou(gw, usd, 0));
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 3);
     });
@@ -13316,7 +13324,7 @@ fn vault_set_idempotent() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13334,7 +13342,7 @@ fn vault_set_idempotent() {
         let tx = STTx::new(TxType::VAULT_SET, |tx| {
             tx.set_account_id(sf("sfAccount"), o);
             tx.set_field_h256(sf("sfVaultID"), vk);
-            tx.set_field_amount(sf("sfAssetMaximum"), iou(gw, usd, 5000));
+            tx.set_field_amount(sf("sfAssetsMaximum"), iou(gw, usd, 5000));
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), i);
         });
@@ -13356,7 +13364,7 @@ fn vault_deposit_large_amount() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 1_000_000, 10_000_000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13394,7 +13402,7 @@ fn vault_withdraw_more_than_deposited() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13445,7 +13453,7 @@ fn vault_clawback_with_amendment() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13599,7 +13607,7 @@ fn loan_manage_nonexistent_loan() {
     let a = acct(0x11);
     let l = build_ledger_with_features(
         vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["LendingProtocol"],
+        vec!["LendingProtocol", "SingleAssetVault", "MPTokensV1"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_MANAGE, |tx| {
@@ -13618,7 +13626,7 @@ fn loan_delete_nonexistent_loan() {
     let a = acct(0x11);
     let l = build_ledger_with_features(
         vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["LendingProtocol"],
+        vec!["LendingProtocol", "SingleAssetVault", "MPTokensV1"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_DELETE, |tx| {
@@ -13636,7 +13644,7 @@ fn loan_pay_nonexistent_loan() {
     let a = acct(0x11);
     let l = build_ledger_with_features(
         vec![account_root(a, 10_000_000_000, 0, 0)],
-        vec!["LendingProtocol"],
+        vec!["LendingProtocol", "SingleAssetVault", "MPTokensV1"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_PAY, |tx| {
@@ -13659,7 +13667,7 @@ fn vault_create_with_metadata() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13685,7 +13693,7 @@ fn vault_create_issuer_without_default_ripple_fails() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13711,7 +13719,7 @@ fn vault_deposit_from_frozen_trust_line() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             tl,
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13758,7 +13766,7 @@ fn vault_deposit_withdraw_deposit() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 10000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -13820,7 +13828,7 @@ fn vault_deposit_ten_times() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 50000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -14160,7 +14168,12 @@ fn loan_broker_requires_vault() {
             account_root(a, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["LendingProtocol", "SingleAssetVault", "PermissionedDomains"],
+        vec![
+            "LendingProtocol",
+            "SingleAssetVault",
+            "MPTokensV1",
+            "PermissionedDomains",
+        ],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::LOAN_BROKER_SET, |tx| {
@@ -14254,7 +14267,7 @@ fn vault_deposit_withdraw_five_cycles() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 50000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -14301,7 +14314,7 @@ fn vault_set_multiple_fields() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -14318,7 +14331,7 @@ fn vault_set_multiple_fields() {
     let tx2 = STTx::new(TxType::VAULT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
         tx.set_field_h256(sf("sfVaultID"), vk);
-        tx.set_field_amount(sf("sfAssetMaximum"), iou(gw, usd, 50000));
+        tx.set_field_amount(sf("sfAssetsMaximum"), iou(gw, usd, 50000));
         tx.set_field_vl(sf("sfData"), b"vault-config-v2");
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 2);
@@ -14550,7 +14563,12 @@ fn loan_set_then_manage() {
             account_root(b, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["LendingProtocol", "SingleAssetVault", "PermissionedDomains"],
+        vec![
+            "LendingProtocol",
+            "SingleAssetVault",
+            "MPTokensV1",
+            "PermissionedDomains",
+        ],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::LOAN_SET, |tx| {
@@ -14580,7 +14598,7 @@ fn vault_create_deposit_clawback_chain() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 10000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -14701,7 +14719,7 @@ fn vault_create_deposit_set_max_deposit_again() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 50000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -14729,7 +14747,7 @@ fn vault_create_deposit_set_max_deposit_again() {
     let tx3 = STTx::new(TxType::VAULT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
         tx.set_field_h256(sf("sfVaultID"), vk);
-        tx.set_field_amount(sf("sfAssetMaximum"), iou(gw, usd, 3000));
+        tx.set_field_amount(sf("sfAssetsMaximum"), iou(gw, usd, 3000));
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 3);
     });
@@ -14764,7 +14782,7 @@ fn vault_two_depositors() {
             trust_line(o, gw, usd, 5000, 100000, 0),
             trust_line(d, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -14939,7 +14957,7 @@ fn vault_create_with_different_issuers() {
             account_root(gw1, 10_000_000_000, 0, 0x00800000),
             account_root(gw2, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -15153,7 +15171,7 @@ fn vault_deposit_1_unit() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -15191,7 +15209,7 @@ fn vault_deposit_max_amount() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 999999, 1000000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -15360,7 +15378,7 @@ fn vault_create_gbp() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let gbp = protocol::currency_from_string("GBP");
@@ -15385,7 +15403,7 @@ fn vault_create_jpy() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let jpy = protocol::currency_from_string("JPY");
@@ -15410,7 +15428,7 @@ fn vault_create_chf() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let chf = protocol::currency_from_string("CHF");
@@ -15435,7 +15453,7 @@ fn vault_create_ten_currencies() {
             account_root(o, 50_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     for (i, cur) in [
@@ -15591,7 +15609,7 @@ fn vault_deposit_various_amounts() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 50000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -15632,7 +15650,12 @@ fn loan_all_types_with_amendment() {
             account_root(b, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["LendingProtocol", "SingleAssetVault", "PermissionedDomains"],
+        vec![
+            "LendingProtocol",
+            "SingleAssetVault",
+            "MPTokensV1",
+            "PermissionedDomains",
+        ],
     );
     let mut v = new_view(l);
     for tx_type in [
@@ -15670,7 +15693,7 @@ fn vault_set_data_multiple_times() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -15787,7 +15810,7 @@ fn vault_create_cad() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let cad = protocol::currency_from_string("CAD");
@@ -15812,7 +15835,7 @@ fn vault_create_aud() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let aud = protocol::currency_from_string("AUD");
@@ -15837,7 +15860,7 @@ fn vault_create_sgd() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let sgd = protocol::currency_from_string("SGD");
@@ -15862,7 +15885,7 @@ fn vault_create_hkd() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let hkd = protocol::currency_from_string("HKD");
@@ -15891,7 +15914,7 @@ fn vault_deposit_twenty_times() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 100000, 1000000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -15929,7 +15952,7 @@ fn vault_create_krw() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let krw = protocol::currency_from_string("KRW");
@@ -15954,7 +15977,7 @@ fn vault_create_inr() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let inr = protocol::currency_from_string("INR");
@@ -15979,7 +16002,7 @@ fn vault_create_brl() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let brl = protocol::currency_from_string("BRL");
@@ -16004,7 +16027,7 @@ fn vault_create_mxn() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let mxn = protocol::currency_from_string("MXN");
@@ -16030,7 +16053,7 @@ fn vault_set_max_then_increase() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -16048,7 +16071,7 @@ fn vault_set_max_then_increase() {
         let tx = STTx::new(TxType::VAULT_SET, |tx| {
             tx.set_account_id(sf("sfAccount"), o);
             tx.set_field_h256(sf("sfVaultID"), vk);
-            tx.set_field_amount(sf("sfAssetMaximum"), iou(gw, usd, *max));
+            tx.set_field_amount(sf("sfAssetsMaximum"), iou(gw, usd, *max));
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), (i + 2) as u32);
         });
@@ -16213,7 +16236,7 @@ fn vault_create_nzd() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let nzd = protocol::currency_from_string("NZD");
@@ -16238,7 +16261,7 @@ fn vault_create_twenty_currencies() {
             account_root(o, 90_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     for i in 1..=20u32 {
@@ -16383,7 +16406,10 @@ fn mptoken_create_with_transfer_fee() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x02 | 0x04);
+        tx.set_field_u32(
+            sf("sfFlags"),
+            protocol::tfMPTCanLock | protocol::tfMPTCanTransfer,
+        );
         tx.set_field_u16(sf("sfTransferFee"), 500);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -16434,7 +16460,7 @@ fn vault_deposit_then_set_then_deposit() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 50000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -16563,7 +16589,7 @@ fn vault_create_deposit_set_max_zero() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 50000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -16591,7 +16617,7 @@ fn vault_create_deposit_set_max_zero() {
     let tx3 = STTx::new(TxType::VAULT_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), o);
         tx.set_field_h256(sf("sfVaultID"), vk);
-        tx.set_field_amount(sf("sfAssetMaximum"), iou(gw, usd, 0));
+        tx.set_field_amount(sf("sfAssetsMaximum"), iou(gw, usd, 0));
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 3);
     });
@@ -16649,7 +16675,7 @@ fn vault_create_private_deposit_withdraw() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 10000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -16696,7 +16722,7 @@ fn vault_create_thirty_currencies() {
             account_root(o, 90_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     for i in 1..=30u32 {
@@ -16725,7 +16751,7 @@ fn vault_deposit_fifty_times() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 500000, 1000000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -16879,7 +16905,12 @@ fn loan_all_broker_types_with_amendment() {
             account_root(a, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["LendingProtocol", "SingleAssetVault", "PermissionedDomains"],
+        vec![
+            "LendingProtocol",
+            "SingleAssetVault",
+            "MPTokensV1",
+            "PermissionedDomains",
+        ],
     );
     let mut v = new_view(l);
     for tx_type in [
@@ -16914,7 +16945,7 @@ fn vault_set_max_various_values() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -16935,7 +16966,7 @@ fn vault_set_max_various_values() {
         let tx = STTx::new(TxType::VAULT_SET, |tx| {
             tx.set_account_id(sf("sfAccount"), o);
             tx.set_field_h256(sf("sfVaultID"), vk);
-            tx.set_field_amount(sf("sfAssetMaximum"), iou(gw, usd, *max));
+            tx.set_field_amount(sf("sfAssetsMaximum"), iou(gw, usd, *max));
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), (i + 2) as u32);
         });
@@ -19333,7 +19364,7 @@ fn ls5_vault_create_deposit_verify_balance() {
             account_root(gw, 10_000_000_000, 0, 0x00800000),
             trust_line(o, gw, usd, 5000, 100000, 0),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -19872,7 +19903,7 @@ fn ls6_vault_create_ten() {
             account_root(o, 90_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     for i in 1..=10u32 {
@@ -21676,7 +21707,7 @@ fn b4_vault_usd() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -21699,7 +21730,7 @@ fn b4_vault_eur() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -23833,7 +23864,7 @@ fn b5_vault_non_transferable() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -31937,7 +31968,7 @@ fn lv2_vault_creates() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -35397,7 +35428,7 @@ fn cp_vault_full() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {

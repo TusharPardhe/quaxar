@@ -14,6 +14,10 @@ use protocol::{
 use super::common::*;
 use super::helpers::*;
 
+const LOAN_BROKER_MAX_DATA_PAYLOAD_LENGTH: usize = 256;
+const LOAN_BROKER_MAX_MANAGEMENT_FEE_RATE: u16 = 10_000;
+const LOAN_BROKER_MAX_COVER_RATE: u32 = 100_000;
+
 pub(super) struct LoanSetTxView<'a> {
     _sttx: &'a STTx,
     broker_id: Uint256,
@@ -322,6 +326,67 @@ pub(super) fn load_loan_set_tx_view(sttx: &STTx) -> LoanSetTxView<'_> {
     }
 }
 
+fn loan_broker_debt_maximum_is_valid(sttx: &STTx) -> bool {
+    if !sttx.is_field_present(sf("sfDebtMaximum")) {
+        return true;
+    }
+
+    let value = sttx.get_field_number(sf("sfDebtMaximum")).value();
+    value >= RuntimeNumber::zero() && value <= RuntimeNumber::from_i64(i64::MAX)
+}
+
+fn loan_broker_debt_maximum_is_representable(sttx: &STTx, asset: Asset) -> bool {
+    if !sttx.is_field_present(sf("sfDebtMaximum")) {
+        return true;
+    }
+
+    let value = sttx.get_field_number(sf("sfDebtMaximum")).value();
+    runtime_to_amount(asset, value, RoundingMode::ToNearest)
+        .map(|amount| amount_number(&amount) == value)
+        .unwrap_or(false)
+}
+
+fn run_loan_broker_set_app_preflight(sttx: &STTx) -> Ter {
+    let data = sttx
+        .is_field_present(sf("sfData"))
+        .then(|| sttx.get_field_vl(sf("sfData")));
+    let loan_broker_id_is_present = sttx.is_field_present(sf("sfLoanBrokerID"));
+    let loan_broker_id_is_zero =
+        loan_broker_id_is_present && sttx.get_field_h256(sf("sfLoanBrokerID")).is_zero();
+    let vault_id_is_present = sttx.is_field_present(sf("sfVaultID"));
+    let vault_id_is_zero = vault_id_is_present && sttx.get_field_h256(sf("sfVaultID")).is_zero();
+    let cover_rate_minimum_value = sttx
+        .is_field_present(sf("sfCoverRateMinimum"))
+        .then(|| sttx.get_field_u32(sf("sfCoverRateMinimum")));
+    let cover_rate_liquidation_value = sttx
+        .is_field_present(sf("sfCoverRateLiquidation"))
+        .then(|| sttx.get_field_u32(sf("sfCoverRateLiquidation")));
+
+    tx::run_loan_broker_set_preflight(tx::LoanBrokerSetPreflightFacts {
+        data_is_present: data.is_some(),
+        data_is_empty: data.as_ref().is_some_and(Vec::is_empty),
+        data_length_is_valid: data
+            .as_ref()
+            .is_none_or(|data| data.len() <= LOAN_BROKER_MAX_DATA_PAYLOAD_LENGTH),
+        management_fee_rate_is_valid: !sttx.is_field_present(sf("sfManagementFeeRate"))
+            || sttx.get_field_u16(sf("sfManagementFeeRate")) <= LOAN_BROKER_MAX_MANAGEMENT_FEE_RATE,
+        cover_rate_minimum_is_valid: cover_rate_minimum_value
+            .is_none_or(|value| value <= LOAN_BROKER_MAX_COVER_RATE),
+        cover_rate_liquidation_is_valid: cover_rate_liquidation_value
+            .is_none_or(|value| value <= LOAN_BROKER_MAX_COVER_RATE),
+        debt_maximum_is_valid: loan_broker_debt_maximum_is_valid(sttx),
+        loan_broker_id_is_present,
+        management_fee_rate_is_present: sttx.is_field_present(sf("sfManagementFeeRate")),
+        cover_rate_minimum_is_present: cover_rate_minimum_value.is_some(),
+        cover_rate_liquidation_is_present: cover_rate_liquidation_value.is_some(),
+        loan_broker_id_is_zero,
+        vault_id_is_present,
+        vault_id_is_zero,
+        cover_rate_minimum_value,
+        cover_rate_liquidation_value,
+    })
+}
+
 pub(super) fn load_loan_set_broker_view(entry: STLedgerEntry) -> LoanSetBrokerView {
     LoanSetBrokerView {
         owner: entry.get_account_id(sf("sfOwner")),
@@ -462,6 +527,9 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
     if !view.rules().enabled(&feature_id("LendingProtocol")) {
         return Ter::TEM_DISABLED;
     }
+    if !lending_protocol_dependencies_enabled(view, sttx) {
+        return Ter::TEM_DISABLED;
+    }
 
     // Guard against missing required fields that would cause zero-key panics
     if !sttx.is_field_present(sf("sfLoanBrokerID"))
@@ -477,7 +545,7 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
         let broker_id = sttx.get_field_h256(sf("sfLoanBrokerID"));
         let Ok(Some(broker_sle)) = view.peek(protocol::loan_broker_keylet_from_key(broker_id))
         else {
-            return Ter::TEF_BAD_LEDGER;
+            return Ter::TEC_NO_ENTRY;
         };
         let Ok(Some(vault_sle)) = view.peek(protocol::vault_keylet_from_key(
             broker_sle.get_field_h256(sf("sfVaultID")),
@@ -939,22 +1007,46 @@ pub fn apply_loan_broker_set<V: ApplyView>(
     if !view.rules().enabled(&feature_id("LendingProtocol")) {
         return Ter::TEM_DISABLED;
     }
+    if !lending_protocol_dependencies_enabled(view, sttx) {
+        return Ter::TEM_DISABLED;
+    }
+    let preflight = run_loan_broker_set_app_preflight(sttx);
+    if preflight != Ter::TES_SUCCESS {
+        return preflight;
+    }
 
     let account = sttx.get_account_id(sf("sfAccount"));
     let vault_id = sttx.get_field_h256(sf("sfVaultID"));
+    let Ok(Some(tx_vault_sle)) = view.peek(protocol::vault_keylet_from_key(vault_id)) else {
+        return Ter::TEC_NO_ENTRY;
+    };
+    if account != tx_vault_sle.get_account_id(sf("sfOwner")) {
+        return Ter::TEC_NO_PERMISSION;
+    }
 
     if sttx.is_field_present(sf("sfLoanBrokerID")) {
         let broker_id = sttx.get_field_h256(sf("sfLoanBrokerID"));
         let Ok(Some(broker_sle)) = view.peek(protocol::loan_broker_keylet_from_key(broker_id))
         else {
-            return Ter::TEF_BAD_LEDGER;
+            return Ter::TEC_NO_ENTRY;
         };
-        let Ok(Some(vault_sle)) = view.peek(protocol::vault_keylet_from_key(
-            broker_sle.get_field_h256(sf("sfVaultID")),
-        )) else {
-            return Ter::TEC_INTERNAL;
-        };
-        let vault_asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
+        if vault_id != broker_sle.get_field_h256(sf("sfVaultID")) {
+            return Ter::TEC_NO_PERMISSION;
+        }
+        if account != broker_sle.get_account_id(sf("sfOwner")) {
+            return Ter::TEC_NO_PERMISSION;
+        }
+        if sttx.is_field_present(sf("sfDebtMaximum")) {
+            let debt_maximum = sttx.get_field_number(sf("sfDebtMaximum")).value();
+            let current_debt = broker_sle.get_field_number(sf("sfDebtTotal")).value();
+            if debt_maximum != RuntimeNumber::zero() && debt_maximum < current_debt {
+                return Ter::TEC_LIMIT_EXCEEDED;
+            }
+        }
+        let vault_asset = tx_vault_sle.get_field_issue(sf("sfAsset")).asset();
+        if !loan_broker_debt_maximum_is_representable(sttx, vault_asset) {
+            return Ter::TEC_PRECISION_LOSS;
+        }
 
         let mut obj = broker_sle.clone_as_object();
         if sttx.is_field_present(sf("sfData")) {
@@ -972,11 +1064,19 @@ pub fn apply_loan_broker_set<V: ApplyView>(
         return persist_entry(view, broker);
     }
 
-    let Ok(Some(vault_sle)) = view.peek(protocol::vault_keylet_from_key(vault_id)) else {
-        return Ter::TEF_BAD_LEDGER;
-    };
-    let vault_pseudo_id = vault_sle.get_account_id(sf("sfAccount"));
-    let vault_asset = vault_sle.get_field_issue(sf("sfAsset")).asset();
+    let vault_pseudo_id = tx_vault_sle.get_account_id(sf("sfAccount"));
+    let vault_asset = tx_vault_sle.get_field_issue(sf("sfAsset")).asset();
+    let can_add_holding = ledger::can_add_holding(view, &vault_asset);
+    if can_add_holding != Ter::TES_SUCCESS {
+        return can_add_holding;
+    }
+    let vault_frozen = check_cover_sendable(view, &vault_pseudo_id, vault_asset);
+    if vault_frozen != Ter::TES_SUCCESS {
+        return vault_frozen;
+    }
+    if !loan_broker_debt_maximum_is_representable(sttx, vault_asset) {
+        return Ter::TEC_PRECISION_LOSS;
+    }
     let sequence = sttx.get_seq_value();
 
     let Ok(Some(owner_sle)) = view.peek(account_keylet(to_160(&account))) else {

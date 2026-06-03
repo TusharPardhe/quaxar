@@ -32,6 +32,12 @@ pub const MAX_TRANSFER_FEE: u16 = 50_000;
 pub const PARITY_RATE: Rate = Rate::new(1_000_000_000);
 const MAX_ASSET_CHECK_DEPTH: u8 = 8;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MPTAuthType {
+    Weak,
+    Strong,
+}
+
 /// Check if an MPT issuance is globally frozen (locked).
 pub fn is_global_frozen_mpt(view: &dyn ReadView, mpt_issue: &MPTIssue) -> Result<bool, ViewError> {
     let Some(sle) = view.read(mpt_issuance_keylet_from_mptid(mpt_issue.mpt_id()))? else {
@@ -345,6 +351,15 @@ pub fn require_auth_mpt(
     mpt_issue: &MPTIssue,
     account: &AccountID,
 ) -> Result<Ter, ViewError> {
+    require_auth_mpt_with_type(view, mpt_issue, account, MPTAuthType::Weak)
+}
+
+pub fn require_auth_mpt_with_type(
+    view: &dyn ReadView,
+    mpt_issue: &MPTIssue,
+    account: &AccountID,
+    auth_type: MPTAuthType,
+) -> Result<Ter, ViewError> {
     let Some(sle_issuance) = view.read(mpt_issuance_keylet_from_mptid(mpt_issue.mpt_id()))? else {
         return Ok(Ter::TEC_OBJECT_NOT_FOUND);
     };
@@ -371,6 +386,10 @@ pub fn require_auth_mpt(
 
     let mptoken_key = mptoken_keylet_from_mptid(mpt_issue.mpt_id(), to_uint160(*account));
     let sle_token = view.read(mptoken_key)?;
+
+    if auth_type == MPTAuthType::Strong && sle_token.is_none() {
+        return Ok(Ter::TEC_NO_AUTH);
+    }
 
     if sle_issuance.is_flag(lsfMPTRequireAuth) {
         match sle_token {

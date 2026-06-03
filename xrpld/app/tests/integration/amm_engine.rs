@@ -617,7 +617,7 @@ fn amm2_vault_usd() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -640,7 +640,7 @@ fn amm2_vault_eur() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -663,7 +663,7 @@ fn amm2_vault_non_transferable() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -898,7 +898,7 @@ fn amm3_vault_gbp() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -922,7 +922,7 @@ fn amm3_vault_jpy() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -946,7 +946,7 @@ fn amm3_vault_chf() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -970,7 +970,7 @@ fn amm3_vault_cad() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -994,7 +994,7 @@ fn amm3_vault_aud() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -1192,7 +1192,7 @@ fn amm4_vault_2_currencies() {
             account_root(o, 10_000_000_000, 0, 0),
             account_root(gw, 10_000_000_000, 0, 0x00800000),
         ],
-        vec!["SingleAssetVault", "PermissionedDomains"],
+        vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
     );
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -1837,7 +1837,7 @@ fn amm6_vault_diff_owners() {
                 account_root(o, 10_000_000_000, 0, 0),
                 account_root(gw, 10_000_000_000, 0, 0x00800000),
             ],
-            vec!["SingleAssetVault", "PermissionedDomains"],
+            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
         );
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -2094,7 +2094,7 @@ fn amm7_vault_10_currencies() {
                 account_root(o, 10_000_000_000, 0, 0),
                 account_root(gw, 10_000_000_000, 0, 0x00800000),
             ],
-            vec!["SingleAssetVault", "PermissionedDomains"],
+            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
         );
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -2295,7 +2295,7 @@ fn amm8_vault_10_owners() {
                 account_root(o, 10_000_000_000, 0, 0),
                 account_root(gw, 10_000_000_000, 0, 0x00800000),
             ],
-            vec!["SingleAssetVault", "PermissionedDomains"],
+            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
         );
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -2427,7 +2427,7 @@ fn amm9_vault_20() {
                 account_root(o, 10_000_000_000, 0, 0),
                 account_root(gw, 10_000_000_000, 0, 0x00800000),
             ],
-            vec!["SingleAssetVault", "PermissionedDomains"],
+            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
         );
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -2863,7 +2863,7 @@ fn amm11_vault_50() {
                 account_root(o, 10_000_000_000, 0, 0),
                 account_root(gw, 10_000_000_000, 0, 0x00800000),
             ],
-            vec!["SingleAssetVault", "PermissionedDomains"],
+            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
         );
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -2968,7 +2968,7 @@ fn amm11_mptoken_max_max() {
     });
     assert_eq!(
         handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-        Ter::TES_SUCCESS
+        Ter::TEM_MALFORMED
     );
 }
 
@@ -3000,7 +3000,10 @@ fn amm11_mptoken_transfer_fee_100() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x06);
+        tx.set_field_u32(
+            sf("sfFlags"),
+            protocol::tfMPTCanLock | protocol::tfMPTCanTransfer,
+        );
         tx.set_field_u16(sf("sfTransferFee"), 100);
         tx.set_field_u64(sf("sfMaximumAmount"), 1_000_000_000);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -3018,7 +3021,10 @@ fn amm11_mptoken_transfer_fee_500() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x06);
+        tx.set_field_u32(
+            sf("sfFlags"),
+            protocol::tfMPTCanLock | protocol::tfMPTCanTransfer,
+        );
         tx.set_field_u16(sf("sfTransferFee"), 500);
         tx.set_field_u64(sf("sfMaximumAmount"), 1_000_000_000);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -3036,7 +3042,10 @@ fn amm11_mptoken_transfer_fee_5000() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x06);
+        tx.set_field_u32(
+            sf("sfFlags"),
+            protocol::tfMPTCanLock | protocol::tfMPTCanTransfer,
+        );
         tx.set_field_u16(sf("sfTransferFee"), 5000);
         tx.set_field_u64(sf("sfMaximumAmount"), 1_000_000_000);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -3054,7 +3063,10 @@ fn amm11_mptoken_transfer_fee_50000() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x06);
+        tx.set_field_u32(
+            sf("sfFlags"),
+            protocol::tfMPTCanLock | protocol::tfMPTCanTransfer,
+        );
         tx.set_field_u16(sf("sfTransferFee"), 50000);
         tx.set_field_u64(sf("sfMaximumAmount"), 1_000_000_000);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -3230,7 +3242,7 @@ fn amm12_vault_100() {
                 account_root(o, 10_000_000_000, 0, 0),
                 account_root(gw, 10_000_000_000, 0, 0x00800000),
             ],
-            vec!["SingleAssetVault", "PermissionedDomains"],
+            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
         );
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -3419,7 +3431,7 @@ fn amm14_vault_200() {
                 account_root(o, 10_000_000_000, 0, 0),
                 account_root(gw, 10_000_000_000, 0, 0x00800000),
             ],
-            vec!["SingleAssetVault", "PermissionedDomains"],
+            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
         );
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -3710,7 +3722,7 @@ fn amm18_vault_250() {
                 account_root(o, 10_000_000_000, 0, 0),
                 account_root(gw, 10_000_000_000, 0, 0x00800000),
             ],
-            vec!["SingleAssetVault", "PermissionedDomains"],
+            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
         );
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -3827,7 +3839,7 @@ fn amm20_vault_500() {
                 account_root(o, 10_000_000_000, 0, 0),
                 account_root(gw, 10_000_000_000, 0, 0x00800000),
             ],
-            vec!["SingleAssetVault", "PermissionedDomains"],
+            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
         );
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -3971,7 +3983,10 @@ fn amm21_mptoken_flag_6() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x06);
+        tx.set_field_u32(
+            sf("sfFlags"),
+            protocol::tfMPTCanLock | protocol::tfMPTCanTransfer,
+        );
         tx.set_field_u16(sf("sfTransferFee"), 500);
         tx.set_field_u64(sf("sfMaximumAmount"), 1_000_000);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -4006,7 +4021,10 @@ fn amm21_mptoken_flag_e() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x0E);
+        tx.set_field_u32(
+            sf("sfFlags"),
+            protocol::tfMPTCanLock | protocol::tfMPTCanEscrow | protocol::tfMPTCanTransfer,
+        );
         tx.set_field_u16(sf("sfTransferFee"), 1000);
         tx.set_field_u64(sf("sfMaximumAmount"), 1_000_000_000);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -4256,7 +4274,7 @@ fn amm24_vault_100_currencies() {
                 account_root(o, 10_000_000_000, 0, 0),
                 account_root(gw, 10_000_000_000, 0, 0x00800000),
             ],
-            vec!["SingleAssetVault", "PermissionedDomains"],
+            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
         );
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -4576,7 +4594,10 @@ fn amm30_30_accounts_12_mptoken() {
         for seq in 1..=12u32 {
             let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
                 tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x06);
+                tx.set_field_u32(
+                    sf("sfFlags"),
+                    protocol::tfMPTCanLock | protocol::tfMPTCanTransfer,
+                );
                 tx.set_field_u16(sf("sfTransferFee"), 200);
                 tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000_000);
                 tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -4724,7 +4745,10 @@ fn amm33_45_accounts_6_mptoken() {
         for seq in 1..=6u32 {
             let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
                 tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x06);
+                tx.set_field_u32(
+                    sf("sfFlags"),
+                    protocol::tfMPTCanLock | protocol::tfMPTCanTransfer,
+                );
                 tx.set_field_u16(sf("sfTransferFee"), 250);
                 tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000_000);
                 tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -6827,7 +6851,7 @@ fn amm48_vault_180() {
                 account_root(o, 10_000_000_000, 0, 0),
                 account_root(gw, 10_000_000_000, 0, 0x00800000),
             ],
-            vec!["SingleAssetVault", "PermissionedDomains"],
+            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
         );
         let mut v = new_view(l);
         let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
@@ -32364,7 +32388,7 @@ fn cpp_mptoken_create_fee_too_high() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x04); // tfMPTCanTransfer
+        tx.set_field_u32(sf("sfFlags"), protocol::tfMPTCanTransfer);
         tx.set_field_u16(sf("sfTransferFee"), 50001); // > 50000
         tx.set_field_u64(sf("sfMaximumAmount"), 100);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -32383,7 +32407,7 @@ fn cpp_mptoken_create_zero_max_amount() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x04); // tfMPTCanTransfer
+        tx.set_field_u32(sf("sfFlags"), protocol::tfMPTCanTransfer);
         tx.set_field_u16(sf("sfTransferFee"), 0);
         tx.set_field_u64(sf("sfMaximumAmount"), 0);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -32401,7 +32425,7 @@ fn cpp_mptoken_create_max_amount_overflow() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x04);
+        tx.set_field_u32(sf("sfFlags"), protocol::tfMPTCanTransfer);
         tx.set_field_u64(sf("sfMaximumAmount"), 0xFFFF_FFFF_FFFF_FFF0);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -32418,7 +32442,7 @@ fn cpp_mptoken_create_success() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x04); // tfMPTCanTransfer
+        tx.set_field_u32(sf("sfFlags"), protocol::tfMPTCanTransfer);
         tx.set_field_u16(sf("sfTransferFee"), 100);
         tx.set_field_u64(sf("sfMaximumAmount"), 1_000_000_000);
         tx.set_field_amount(sf("sfFee"), xrp(10));

@@ -68,6 +68,7 @@ pub struct MPTokenIssuanceSetPreclaimFacts {
     pub domain_id_is_zero: bool,
     pub issuance_requires_auth: bool,
     pub domain_exists: bool,
+    pub issuance_domain_present: bool,
     pub current_mutable_flags: u32,
     pub mutable_flags: Option<u32>,
     pub metadata_present: bool,
@@ -307,6 +308,14 @@ pub fn run_mp_token_issuance_set_preclaim(facts: MPTokenIssuanceSetPreclaimFacts
             (facts.current_mutable_flags & flag.can_mutate_flag) == 0
                 && (mutable_flags & (flag.set_flag | flag.clear_flag)) != 0
         })
+    {
+        return Ter::TEC_NO_PERMISSION;
+    }
+
+    if facts
+        .mutable_flags
+        .is_some_and(|flags| (flags & tmfMPTClearRequireAuth) != 0)
+        && facts.issuance_domain_present
     {
         return Ter::TEC_NO_PERMISSION;
     }

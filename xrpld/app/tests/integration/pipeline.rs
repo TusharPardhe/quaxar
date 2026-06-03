@@ -14,14 +14,154 @@ use app::state::application_root::apply_submit_transactor_shell;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ApplyViewImpl, Ledger, ReadView};
 use protocol::{
-    AccountID, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry, STTx, Ter,
-    TxType, XRPAmount, account_keylet, get_field_by_symbol, is_tes_success, owner_dir_keylet,
-    sf_generic,
+    AccountID, Asset, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STIssue,
+    STLedgerEntry, STTx, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol,
+    is_tes_success, owner_dir_keylet, sf_generic,
 };
 use tx::*;
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
+}
+
+fn tx_amm_asset(tx: &STTx, field: &'static protocol::SField) -> Asset {
+    if let Some(value) = tx.peek_at_pfield(field) {
+        if let Some(issue) = value.as_any().downcast_ref::<STIssue>() {
+            return issue.asset();
+        }
+        if let Some(amount) = value.as_any().downcast_ref::<STAmount>() {
+            return amount.asset();
+        }
+    }
+    tx.get_field_amount(field).asset()
+}
+
+fn optional_tx_amount(tx: &STTx, field: &'static protocol::SField) -> Option<STAmount> {
+    tx.is_field_present(field)
+        .then(|| tx.get_field_amount(field))
+}
+
+fn invalid_amm_asset_pair_for_assets(asset1: Asset, asset2: Asset) -> Ter {
+    if asset1 == asset2 {
+        return Ter::TEM_BAD_AMM_TOKENS;
+    }
+
+    match (asset1, asset2) {
+        (Asset::Issue(issue1), Asset::Issue(issue2)) => {
+            protocol::invalid_amm_asset_pair(issue1, issue2, None)
+        }
+        (Asset::Issue(issue), Asset::MPTIssue(_)) | (Asset::MPTIssue(_), Asset::Issue(issue)) => {
+            protocol::invalid_amm_asset(issue, None)
+        }
+        (Asset::MPTIssue(_), Asset::MPTIssue(_)) => Ter::TES_SUCCESS,
+    }
+}
+
+fn invalid_amm_amount_for_asset_pair(
+    amount: &STAmount,
+    pair: Option<(Asset, Asset)>,
+    valid_zero: bool,
+) -> Ter {
+    if let Some((asset1, asset2)) = pair
+        && amount.asset() != asset1
+        && amount.asset() != asset2
+    {
+        return Ter::TEM_BAD_AMM_TOKENS;
+    }
+
+    if let Asset::Issue(issue) = amount.asset() {
+        let issue_pair = pair.and_then(|(asset1, asset2)| match (asset1, asset2) {
+            (Asset::Issue(issue1), Asset::Issue(issue2)) => Some((issue1, issue2)),
+            _ => None,
+        });
+        let asset_result = protocol::invalid_amm_asset(issue, issue_pair);
+        if asset_result != Ter::TES_SUCCESS {
+            return asset_result;
+        }
+    }
+
+    if amount.signum() < 0 || (!valid_zero && amount.signum() == 0) {
+        return Ter::TEM_BAD_AMOUNT;
+    }
+
+    Ter::TES_SUCCESS
+}
+
+fn validate_amm_deposit_tx_fields(tx: &STTx) -> Ter {
+    let asset1 = tx_amm_asset(tx, sf("sfAsset"));
+    let asset2 = tx_amm_asset(tx, sf("sfAsset2"));
+    let amount = optional_tx_amount(tx, sf("sfAmount"));
+    let amount2 = optional_tx_amount(tx, sf("sfAmount2"));
+    let e_price = optional_tx_amount(tx, sf("sfEPrice"));
+    let lp_token_out = optional_tx_amount(tx, sf("sfLPTokenOut"));
+    let asset_pair_invalid = match invalid_amm_asset_pair_for_assets(asset1, asset2) {
+        Ter::TES_SUCCESS => None,
+        err => Some(err),
+    };
+    let pair = Some((asset1, asset2));
+
+    run_amm_deposit_preflight_facts(AMMDepositPreflightFacts {
+        flags: tx.get_flags(),
+        asset_pair_invalid,
+        amount: amount.as_ref().map(STAmount::asset),
+        amount_invalid: amount
+            .as_ref()
+            .map(|amount| invalid_amm_amount_for_asset_pair(amount, pair, false))
+            .filter(|result| *result != Ter::TES_SUCCESS),
+        amount2: amount2.as_ref().map(STAmount::asset),
+        amount2_invalid: amount2
+            .as_ref()
+            .map(|amount| invalid_amm_amount_for_asset_pair(amount, pair, false))
+            .filter(|result| *result != Ter::TES_SUCCESS),
+        e_price: e_price.as_ref().map(STAmount::asset),
+        e_price_invalid: e_price
+            .as_ref()
+            .map(|amount| invalid_amm_amount_for_asset_pair(amount, None, false))
+            .filter(|result| *result != Ter::TES_SUCCESS),
+        lp_token_out_signum: lp_token_out.as_ref().map(STAmount::signum),
+        trading_fee: tx
+            .is_field_present(sf("sfTradingFee"))
+            .then(|| tx.get_field_u16(sf("sfTradingFee"))),
+    })
+}
+
+fn validate_amm_withdraw_tx_fields(tx: &STTx) -> Ter {
+    let asset1 = tx_amm_asset(tx, sf("sfAsset"));
+    let asset2 = tx_amm_asset(tx, sf("sfAsset2"));
+    let amount = optional_tx_amount(tx, sf("sfAmount"));
+    let amount2 = optional_tx_amount(tx, sf("sfAmount2"));
+    let e_price = optional_tx_amount(tx, sf("sfEPrice"));
+    let lp_token_in = optional_tx_amount(tx, sf("sfLPTokenIn"));
+    let asset_pair_invalid = match invalid_amm_asset_pair_for_assets(asset1, asset2) {
+        Ter::TES_SUCCESS => None,
+        err => Some(err),
+    };
+    let pair = Some((asset1, asset2));
+    let amount_valid_zero = (tx.get_flags()
+        & (protocol::AMM_ONE_ASSET_WITHDRAW_ALL_FLAG | protocol::AMM_ONE_ASSET_LP_TOKEN_FLAG))
+        != 0
+        || e_price.is_some();
+
+    run_amm_withdraw_preflight_facts(AMMWithdrawPreflightFacts {
+        flags: tx.get_flags(),
+        asset_pair_invalid,
+        amount: amount.as_ref().map(STAmount::asset),
+        amount_invalid: amount
+            .as_ref()
+            .map(|amount| invalid_amm_amount_for_asset_pair(amount, pair, amount_valid_zero))
+            .filter(|result| *result != Ter::TES_SUCCESS),
+        amount2: amount2.as_ref().map(STAmount::asset),
+        amount2_invalid: amount2
+            .as_ref()
+            .map(|amount| invalid_amm_amount_for_asset_pair(amount, pair, false))
+            .filter(|result| *result != Ter::TES_SUCCESS),
+        e_price: e_price.as_ref().map(STAmount::asset),
+        e_price_invalid: e_price
+            .as_ref()
+            .map(|amount| invalid_amm_amount_for_asset_pair(amount, None, false))
+            .filter(|result| *result != Ter::TES_SUCCESS),
+        lp_token_in_signum: lp_token_in.as_ref().map(STAmount::signum),
+    })
 }
 
 fn acct_uint160(account: AccountID) -> Uint160 {
@@ -457,30 +597,8 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
             }
             Ter::TES_SUCCESS
         }
-        TxType::AMM_DEPOSIT => {
-            let flags = if tx.is_field_present(sf("sfFlags")) {
-                tx.get_field_u32(sf("sfFlags"))
-            } else {
-                0
-            };
-            // tfWithdrawAll (0x00100000) is invalid for deposit
-            if flags & 0x00100000 != 0 {
-                return Ter::TEM_INVALID_FLAG;
-            }
-            Ter::TES_SUCCESS
-        }
-        TxType::AMM_WITHDRAW => {
-            let flags = if tx.is_field_present(sf("sfFlags")) {
-                tx.get_field_u32(sf("sfFlags"))
-            } else {
-                0
-            };
-            // tfLPToken (0x00080000) without LPTokenIn is invalid
-            if flags & 0x00080000 != 0 && !tx.is_field_present(sf("sfLPTokenIn")) {
-                return Ter::TEM_MALFORMED;
-            }
-            Ter::TES_SUCCESS
-        }
+        TxType::AMM_DEPOSIT => validate_amm_deposit_tx_fields(tx),
+        TxType::AMM_WITHDRAW => validate_amm_withdraw_tx_fields(tx),
         TxType::AMM_VOTE => {
             let trading_fee = tx.get_field_u16(sf("sfTradingFee"));
             if trading_fee > 1000 {
@@ -495,8 +613,12 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
             } else {
                 0
             };
-            // C++: tfMPTokenIssuanceCreateMask check (valid flags: 0x02|0x04|0x08|0x10|0x20 = 0x3E)
-            let valid_flags: u32 = 0x0000003E;
+            let valid_flags: u32 = protocol::tfMPTCanLock
+                | protocol::tfMPTRequireAuth
+                | protocol::tfMPTCanEscrow
+                | protocol::tfMPTCanTrade
+                | protocol::tfMPTCanTransfer
+                | protocol::tfMPTCanClawback;
             if flags & !valid_flags != 0 {
                 return Ter::TEM_INVALID_FLAG;
             }
@@ -507,8 +629,7 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
                     // kMaxTransferFee
                     return Ter::from_int(-263); // temBAD_TRANSFER_FEE
                 }
-                // fee > 0 without tfMPTCanTransfer (0x04)
-                if fee > 0 && (flags & 0x04) == 0 {
+                if fee > 0 && (flags & protocol::tfMPTCanTransfer) == 0 {
                     return Ter::TEM_MALFORMED;
                 }
             }

@@ -8,7 +8,7 @@ use basics::number::{self, NumberParts as RuntimeNumber};
 use ledger::ApplyView;
 use protocol::{
     AUCTION_SLOT_DISCOUNTED_FEE_FRACTION, AUCTION_SLOT_MIN_FEE_FRACTION,
-    AUCTION_SLOT_TIME_INTERVALS, AccountID, Asset, Issue, STAmount, STLedgerEntry, STObject,
+    AUCTION_SLOT_TIME_INTERVALS, AccountID, Issue, STAmount, STLedgerEntry, STObject,
     TOTAL_TIME_SLOT_SECS, Ter, get_field_by_symbol as sf,
 };
 
@@ -118,9 +118,9 @@ pub fn apply_amm_bid<V: ApplyView>(view: &mut V, sttx: &protocol::STTx) -> Ter {
     let account = sttx.get_account_id(sf("sfAccount"));
 
     // Get AMM SLE
-    let asset1_issue = sttx.get_field_amount(sf("sfAsset")).issue();
-    let asset2_issue = sttx.get_field_amount(sf("sfAsset2")).issue();
-    let amm_keylet = protocol::amm(Asset::Issue(asset1_issue), Asset::Issue(asset2_issue));
+    let asset1 = sttx.get_field_issue(sf("sfAsset")).asset();
+    let asset2 = sttx.get_field_issue(sf("sfAsset2")).asset();
+    let amm_keylet = protocol::amm(asset1, asset2);
     let Some(amm_sle) = view.peek(amm_keylet).ok().flatten() else {
         return Ter::TEC_INTERNAL;
     };

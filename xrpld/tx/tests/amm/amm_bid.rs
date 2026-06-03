@@ -19,8 +19,10 @@ fn price_facts() -> AmmBidSlotPricePreclaimFacts {
 
 #[test]
 fn amm_bid_check_extra_features_gate() {
-    assert!(amm_bid_check_extra_features(true));
-    assert!(!amm_bid_check_extra_features(false));
+    assert!(amm_bid_check_extra_features(true, false, false));
+    assert!(amm_bid_check_extra_features(true, true, true));
+    assert!(!amm_bid_check_extra_features(true, false, true));
+    assert!(!amm_bid_check_extra_features(false, true, false));
 }
 
 #[test]

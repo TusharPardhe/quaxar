@@ -23895,7 +23895,7 @@ fn cpp_step2b_mptoken_create_valid() {
     let mut v = new_view(l);
     let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
-        tx.set_field_u32(sf("sfFlags"), 0x04);
+        tx.set_field_u32(sf("sfFlags"), protocol::tfMPTCanTransfer);
         tx.set_field_u16(sf("sfTransferFee"), 100);
         tx.set_field_u64(sf("sfMaximumAmount"), 1_000_000_000);
         tx.set_field_amount(sf("sfFee"), xrp(10));
