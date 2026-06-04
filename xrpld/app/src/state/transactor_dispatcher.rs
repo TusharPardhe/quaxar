@@ -1857,9 +1857,25 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         TxType::ACCOUNT_DELETE => {
             let account = sttx.get_account_id(sf("sfAccount"));
             let destination = sttx.get_account_id(sf("sfDestination"));
-            // Transfer remaining XRP to destination, delete account
+            // C++ preclaim checks
+            if account == destination {
+                return Ter::TEM_DST_IS_SRC;
+            }
             let src_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
             let dst_keylet = protocol::account_keylet(Uint160::from_void(destination.data()));
+            let Some(src) = view.peek(src_keylet).ok().flatten() else {
+                return Ter::TEF_INTERNAL;
+            };
+            if view.peek(dst_keylet).ok().flatten().is_none() {
+                return Ter::TEC_NO_DST;
+            }
+            // Sequence gap: account must be old enough (256 ledgers)
+            let acct_seq = src.get_field_u32(sf("sfSequence"));
+            let ledger_seq = view.header().seq;
+            if ledger_seq.saturating_sub(acct_seq) < 256 {
+                return Ter::TEC_TOO_SOON;
+            }
+            // Transfer remaining XRP to destination, delete account
             if let (Ok(Some(src)), Ok(Some(dst))) = (view.peek(src_keylet), view.peek(dst_keylet)) {
                 let balance = src.get_field_amount(sf("sfBalance")).xrp();
                 let mut dst_obj = dst.clone_as_object();
