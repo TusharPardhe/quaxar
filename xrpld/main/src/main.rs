@@ -446,10 +446,10 @@ fn bootstrap_acquire_budget_available(
     }
 
     if validated <= 1 {
-        // C++ allows multiple GENERIC acquisitions during cold start.
-        // Old ones die naturally via 18s no-progress timeout (peers stop
-        // responding to stale hashes). No artificial seq-distance kill.
-        return active_count < ledger_fetch_limit.max(1);
+        // A cold node must finish one full account-state acquisition before
+        // run-ahead can help. Starting several full-state ledgers here only
+        // splits peer/disk budget and delays the first accepted ledger.
+        return active_count == 0;
     }
 
     active_count < ledger_fetch_limit.max(1)
@@ -2835,32 +2835,6 @@ impl InboundLedgers {
             .count()
     }
 
-    /// Abandon in-progress acquisitions whose seq is more than `threshold`
-    /// behind `target_seq`. Returns the number of abandoned entries.
-    /// C++ parity: InboundLedgers::sweep removes entries with no activity for
-    /// >1 minute. InboundLedger::onTimer abandons after 6 timeouts (18s no progress).
-    /// We combine both: sweep entries inactive for >60s during cold bootstrap.
-    fn sweep_stale(&mut self, max_inactive: std::time::Duration) -> usize {
-        let now = Instant::now();
-        let stale: Vec<Uint256> = self
-            .entries
-            .iter()
-            .filter(|(_, e)| {
-                matches!(e.state, InboundState::InProgress)
-                    && now.duration_since(e.last_touched) > max_inactive
-            })
-            .map(|(k, _)| *k)
-            .collect();
-        let count = stale.len();
-        for hash in stale {
-            if let Some(entry) = self.entries.remove(&hash) {
-                let _ = entry.tx.send(AcqMsg::Stop);
-                tracing::info!(target: "inbound_ledger", seq = entry.seq, "Acquisition swept (inactive >{:?})", max_inactive);
-            }
-        }
-        count
-    }
-
     fn remove_in_progress_below_seq(&mut self, min_seq: u32) -> usize {
         if min_seq <= 1 {
             return 0;
@@ -5171,35 +5145,6 @@ impl<D> BoundServerRuntime<D> {
                             }
 
                             try_advance_catchup(&app, app.node_store().as_ref(), &peers, &mut inbound_ledgers);
-                        }
-                    }
-
-                    // C++ parity: InboundLedgers::sweep removes inactive entries
-                    // (>1 min no activity). InboundLedger::onTimer abandons after
-                    // 6×3s = 18s of no progress. Peers naturally stop responding to
-                    // stale hashes, causing old acquisitions to timeout.
-                    // No seq-distance kill — let progressing acquisitions finish.
-                    if validated <= 1 && last_validated_target.is_some() {
-                        let (target_hash, target_seq) = last_validated_target.unwrap();
-                        if target_seq > 1 {
-                            // Sweep entries with no activity for >18 seconds
-                            // (C++ onTimer: 6 timeouts × 3s interval)
-                            inbound_ledgers.sweep_stale(std::time::Duration::from_secs(18));
-
-                            // Start acquisition for latest target if not already tracked
-                            // (C++ checkAccept creates new entry per unique hash)
-                            if !inbound_ledgers.contains(&target_hash)
-                                && bootstrap_acquire_budget_available(
-                                    validated,
-                                    inbound_ledgers.active_count(),
-                                    catchup_profile.ledger_fetch_limit,
-                                    false,
-                                )
-                            {
-                                tracing::debug!(target: "bootstrap", seq = target_seq, hash = %debug_hash8(&target_hash), "Acquiring latest validated target");
-                                inbound_ledgers.acquire(target_hash, target_seq, validated);
-                                inbound_ledgers.send_peers(&peers);
-                            }
                         }
                     }
 
