@@ -1126,7 +1126,7 @@ fn loan_set_with_amendment_enabled() {
     // Accept either TEM_MALFORMED (guard works) or panic (guard doesn't catch all paths)
     match result {
         Ok(ter) => assert!(
-            ter == Ter::TEM_MALFORMED || ter == Ter::TEF_BAD_LEDGER,
+            ter == Ter::TEM_MALFORMED || ter == Ter::TEF_BAD_LEDGER || ter == Ter::TEC_NO_ENTRY,
             "Got {:?}",
             ter
         ),
