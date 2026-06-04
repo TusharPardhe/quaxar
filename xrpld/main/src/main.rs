@@ -2837,16 +2837,17 @@ impl InboundLedgers {
 
     /// Abandon in-progress acquisitions whose seq is more than `threshold`
     /// behind `target_seq`. Returns the number of abandoned entries.
-    /// C++ parity: InboundLedgers::sweep removes entries inactive for >1 min;
-    /// InboundLedger::onTimer abandons after 6 timeouts.
-    fn abandon_stale(&mut self, target_seq: u32, threshold: u32) -> usize {
+    /// C++ parity: InboundLedgers::sweep removes entries with no activity for
+    /// >1 minute. InboundLedger::onTimer abandons after 6 timeouts (18s no progress).
+    /// We combine both: sweep entries inactive for >60s during cold bootstrap.
+    fn sweep_stale(&mut self, max_inactive: std::time::Duration) -> usize {
+        let now = Instant::now();
         let stale: Vec<Uint256> = self
             .entries
             .iter()
             .filter(|(_, e)| {
                 matches!(e.state, InboundState::InProgress)
-                    && e.seq > 0
-                    && target_seq > e.seq + threshold
+                    && now.duration_since(e.last_touched) > max_inactive
             })
             .map(|(k, _)| *k)
             .collect();
@@ -2854,7 +2855,7 @@ impl InboundLedgers {
         for hash in stale {
             if let Some(entry) = self.entries.remove(&hash) {
                 let _ = entry.tx.send(AcqMsg::Stop);
-                tracing::debug!(target: "inbound_ledger", seq = entry.seq, "Acquisition abandoned (stale)");
+                tracing::info!(target: "inbound_ledger", seq = entry.seq, "Acquisition swept (inactive >{:?})", max_inactive);
             }
         }
         count
@@ -5173,26 +5174,42 @@ impl<D> BoundServerRuntime<D> {
                         }
                     }
 
-                    // C++ parity: when cold (validated<=1) and no acquisition in-flight,
-                    // re-trigger acquire from last_validated_target. In C++, checkAccept
-                    // is called on every incoming validation, continuously re-acquiring
-                    // the latest validated hash. Without this, Rust stalls after a stale
-                    // acquisition completes and the validated_hash_rx channel is empty.
+                    // C++ parity: InboundLedgers::sweep removes acquisitions with
+                    // no activity for >1 minute. checkAccept starts a NEW acquisition
+                    // for each new validated hash — multiple can run in parallel.
+                    // During cold bootstrap (validated<=1), we only allow one active
+                    // acquisition. If the current one targets a ledger that is far
+                    // behind the latest validated target, stop it and start fresh.
                     if validated <= 1 && last_validated_target.is_some() {
                         let (target_hash, target_seq) = last_validated_target.unwrap();
                         if target_seq > 1 {
-                            // C++ parity: InboundLedgers::sweep removes acquisitions
-                            // inactive for >1 minute, and onTimer abandons after 6
-                            // timeouts. Abandon stale acquisitions when the validated
-                            // target has moved significantly ahead.
-                            let stale_threshold = 10; // abandon if target is 10+ ledgers ahead
-                            let abandoned = inbound_ledgers.abandon_stale(target_seq, stale_threshold);
-                            if abandoned > 0 {
-                                tracing::info!(target: "bootstrap", target_seq, abandoned, "Abandoned stale acquisition(s) — target advanced");
+                            // Sweep entries inactive for >60 seconds (C++ sweep)
+                            inbound_ledgers.sweep_stale(std::time::Duration::from_secs(60));
+
+                            // If active acquisition is >30 ledgers behind target,
+                            // it will never be accepted. Stop it.
+                            // (Testnet closes ~every 4s, so 30 ledgers ≈ 2 minutes)
+                            let dominated: Vec<Uint256> = inbound_ledgers.entries
+                                .iter()
+                                .filter(|(_, e)| {
+                                    matches!(e.state, InboundState::InProgress)
+                                        && e.seq > 0
+                                        && target_seq > e.seq + 30
+                                })
+                                .map(|(k, _)| *k)
+                                .collect();
+                            for hash in &dominated {
+                                if let Some(entry) = inbound_ledgers.entries.remove(hash) {
+                                    let _ = entry.tx.send(AcqMsg::Stop);
+                                    tracing::info!(target: "bootstrap", acq_seq = entry.seq, target_seq, "Stopped dominated acquisition (>{} ledgers behind)", 30);
+                                }
                             }
 
-                            if inbound_ledgers.active_count() == 0 {
-                                tracing::debug!(target: "bootstrap", seq = target_seq, hash = %debug_hash8(&target_hash), "Re-acquiring latest target (cold bootstrap)");
+                            // Start acquisition for latest target if not tracked and slot free
+                            if !inbound_ledgers.contains(&target_hash)
+                                && inbound_ledgers.active_count() == 0
+                            {
+                                tracing::info!(target: "bootstrap", seq = target_seq, hash = %debug_hash8(&target_hash), "Acquiring latest validated target");
                                 inbound_ledgers.acquire(target_hash, target_seq, validated);
                                 inbound_ledgers.send_peers(&peers);
                             }
