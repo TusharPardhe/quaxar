@@ -368,6 +368,26 @@ fn do_direct_iou_payment<V: ledger::ApplyView>(
     partial_payment_allowed: bool,
 ) -> Ter {
     let issue = dst_amount.issue();
+
+    // C++ parity: check if the trust line is frozen before allowing transfer.
+    // Individual freeze (issuer froze this account's line) or global freeze.
+    if *account != issue.account && *dst_account_id != issue.account {
+        // Neither party is the issuer — check both sides for freeze
+        if ledger::ripple_state_helpers::is_frozen(view, account, &issue)
+            || ledger::ripple_state_helpers::is_frozen(view, dst_account_id, &issue)
+        {
+            return Ter::TEC_PATH_DRY;
+        }
+    } else if *account != issue.account {
+        if ledger::ripple_state_helpers::is_frozen(view, account, &issue) {
+            return Ter::TEC_PATH_DRY;
+        }
+    } else if *dst_account_id != issue.account {
+        if ledger::ripple_state_helpers::is_frozen(view, dst_account_id, &issue) {
+            return Ter::TEC_PATH_DRY;
+        }
+    }
+
     let available = if *account == issue.account {
         dst_amount.clone()
     } else {

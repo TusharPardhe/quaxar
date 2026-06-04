@@ -1858,6 +1858,12 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
 
         TxType::REGULAR_KEY_SET => {
             let account = sttx.get_account_id(sf("sfAccount"));
+            // C++ preflight: RegularKey == Account → temBAD_REGKEY
+            if sttx.is_field_present(sf("sfRegularKey"))
+                && sttx.get_account_id(sf("sfRegularKey")) == account
+            {
+                return Ter::TEM_BAD_REGKEY;
+            }
             let keylet = protocol::account_keylet(Uint160::from_void(account.data()));
             if let Ok(Some(sle)) = view.peek(keylet) {
                 let mut obj = sle.clone_as_object();
