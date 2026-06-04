@@ -5148,6 +5148,23 @@ impl<D> BoundServerRuntime<D> {
                         }
                     }
 
+                    // C++ parity: when cold (validated<=1) and no acquisition in-flight,
+                    // re-trigger acquire from last_validated_target. In C++, checkAccept
+                    // is called on every incoming validation, continuously re-acquiring
+                    // the latest validated hash. Without this, Rust stalls after a stale
+                    // acquisition completes and the validated_hash_rx channel is empty.
+                    if validated <= 1
+                        && inbound_ledgers.active_count() == 0
+                        && last_validated_target.is_some()
+                    {
+                        let (hash, seq) = last_validated_target.unwrap();
+                        if seq > 1 {
+                            tracing::debug!(target: "bootstrap", seq, hash = %debug_hash8(&hash), "Re-acquiring stale target (cold bootstrap retry)");
+                            inbound_ledgers.acquire(hash, seq, validated);
+                            inbound_ledgers.send_peers(&peers);
+                        }
+                    }
+
                     // --- History planner: drive fetch-pack requests when acquisitions stall ---
                     // issues fetch-pack requests to bulk-download history.
                     // Run even during initial sync (validated==0) using target_seq
