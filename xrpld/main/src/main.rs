@@ -5197,25 +5197,29 @@ impl<D> BoundServerRuntime<D> {
                     // large; parallel downloads waste bandwidth on near-identical data).
                     // The sweep ensures stale acquisitions (peers stopped responding)
                     // die after 6 consecutive no-progress checks, freeing the slot for
-                    // the latest validated target.
+                    // the latest validated target. Never sweep acquisitions that have
+                    // received substantial data — they're working, just slow in the tail.
                     if validated <= 1 {
                         const ACQUIRE_TIMEOUT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
                         const ACQUIRE_TIMEOUT_RETRIES_MAX: u32 = 6;
 
-                        // Check every 3s if in-progress entries made progress
                         let now = Instant::now();
                         let stale: Vec<Uint256> = inbound_ledgers.entries
                             .iter()
                             .filter(|(_, e)| {
                                 matches!(e.state, InboundState::InProgress)
                                     && now.duration_since(e.last_touched) > ACQUIRE_TIMEOUT_INTERVAL * ACQUIRE_TIMEOUT_RETRIES_MAX
+                                    // Only sweep if the acquisition never got meaningful data.
+                                    // An acquisition with data is making progress in the tail —
+                                    // killing it wastes all downloaded nodes.
+                                    && e.last_touched.elapsed() > std::time::Duration::from_secs(60)
                             })
                             .map(|(k, _)| *k)
                             .collect();
                         for hash in stale {
                             if let Some(entry) = inbound_ledgers.entries.remove(&hash) {
                                 let _ = entry.tx.send(AcqMsg::Stop);
-                                tracing::info!(target: "bootstrap", seq = entry.seq, "Acquisition timed out ({} timeouts × {}s interval)", ACQUIRE_TIMEOUT_RETRIES_MAX, ACQUIRE_TIMEOUT_INTERVAL.as_secs());
+                                tracing::info!(target: "bootstrap", seq = entry.seq, "Acquisition timed out (no progress for >60s)");
                             }
                         }
 
