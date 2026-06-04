@@ -60,6 +60,11 @@ pub fn do_trust_set<V: ledger::ApplyView>(
     let currency = issue.currency;
     let dst_account_id = issue.account;
 
+    // C++ preflight: cannot create trust line to self
+    if account == dst_account_id {
+        return Ter::TEM_DST_IS_SRC;
+    }
+
     // bHigh: true if current account is the "high" side
     let b_high = account > dst_account_id;
 
