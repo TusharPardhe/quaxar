@@ -1328,10 +1328,9 @@ impl Ledger {
     }
 
     pub fn read(&self, keylet: Keylet) -> Result<Option<STLedgerEntry>, TraversalError> {
-        assert!(
-            keylet.key != Uint256::zero(),
-            "xrpl::Ledger::read : zero key"
-        );
+        if keylet.key == Uint256::zero() {
+            return Ok(None);
+        }
 
         let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| -> Option<
             basics::memory::intrusive_pointer::SharedIntrusive<
