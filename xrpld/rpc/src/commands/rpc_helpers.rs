@@ -445,7 +445,26 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
         let ledger_seq = ledger.header().seq;
         let mut view = ledger::ApplyViewImpl::new(ledger, tx::ApplyFlags::NONE);
         let txn_type = tx.get_txn_type();
-        let result = app::apply_submit_transactor_shell(&mut view, tx, txn_type);
+        // C++ catches std::runtime_error from transactor apply and returns
+        // an RPC error. Match this by catching panics (e.g., STAmount overflow)
+        // to prevent mutex poisoning and server crash.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            app::apply_submit_transactor_shell(&mut view, tx, txn_type)
+        }));
+        let result = match result {
+            Ok(ter) => ter,
+            Err(_) => {
+                ret.insert(
+                    jss::engine_result.to_string(),
+                    JsonValue::String("telLOCAL_ERROR".to_string()),
+                );
+                ret.insert(
+                    jss::engine_result_code.to_string(),
+                    JsonValue::Signed(-399),
+                );
+                return Ok(JsonValue::Object(ret));
+            }
+        };
 
         ret.insert(
             jss::engine_result.to_string(),
