@@ -142,7 +142,8 @@ pub(super) fn validates_amm_general<V: ApplyView>(
         return true;
     }
     if lp_number == RuntimeNumber::zero() {
-        return false;
+        // Pool fully emptied (all LP withdrawn for AMMDelete) — valid state
+        return true;
     }
     let distance = RuntimeNumber::try_from_external_parts(1, -11, get_mantissa_scale())
         .expect("relative distance constant");
