@@ -34,6 +34,7 @@ secp256k1 = "0.31"
 serde_json = "1"
 shamap = { path = "../../xrpl/shamap" }
 sha2 = "0.10"
+ripemd = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "time", "fs"] }
 tokio-util = "0.7"
 time = "0.3"

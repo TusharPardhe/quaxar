@@ -1605,6 +1605,28 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
     txn_type: TxType,
     pre_fee_balance_drops: Option<i64>,
 ) -> Ter {
+    // C++ Transactor::checkSign parity: reject transactions signed with
+    // master key when lsfDisableMaster is set on the account.
+    let account = sttx.get_account_id(sf("sfAccount"));
+    let signing_pub_key = sttx.get_field_vl(sf("sfSigningPubKey"));
+    if !signing_pub_key.is_empty() {
+        // Non-empty SigningPubKey means single-signed (not multi-sign).
+        // Derive AccountID from signing key: SHA256 → RIPEMD160.
+        use sha2::Digest;
+        let sha = sha2::Sha256::digest(&signing_pub_key);
+        let ripe = ripemd::Ripemd160::digest(sha);
+        let derived = protocol::AccountID::from_slice(&ripe).expect("20 bytes");
+        if derived == account {
+            // Signed with master key — check if master is disabled
+            let acct_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
+            if let Ok(Some(acct_sle)) = view.peek(acct_keylet) {
+                if acct_sle.get_field_u32(sf("sfFlags")) & lsfDisableMaster != 0 {
+                    return Ter::TEF_MASTER_DISABLED;
+                }
+            }
+        }
+    }
+
     match txn_type {
         // --- XChain Bridge ---
         TxType::XCHAIN_CREATE_BRIDGE => {
