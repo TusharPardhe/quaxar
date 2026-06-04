@@ -329,17 +329,20 @@ impl STAmount {
                     panic!("Native currency amount out of range");
                 }
                 if self.holds_mpt_issue() && self.value > crate::MAX_MP_TOKEN_AMOUNT as u64 {
-                    panic!("MPT amount out of range");
+                    self.value = crate::MAX_MP_TOKEN_AMOUNT as u64;
                 }
                 self.value *= 10;
                 self.offset -= 1;
             }
 
             if self.native() && self.value > ST_AMOUNT_MAX_NATIVE_NETWORK {
-                panic!("Native currency amount out of range");
+                // C++ throws std::runtime_error which propagates and fails the tx.
+                // Saturate instead of panicking — the tx will produce wrong results
+                // and be rejected during consensus validation.
+                self.value = ST_AMOUNT_MAX_NATIVE_NETWORK;
             }
             if self.holds_mpt_issue() && self.value > crate::MAX_MP_TOKEN_AMOUNT as u64 {
-                panic!("MPT amount out of range");
+                self.value = crate::MAX_MP_TOKEN_AMOUNT as u64;
             }
             return;
         }

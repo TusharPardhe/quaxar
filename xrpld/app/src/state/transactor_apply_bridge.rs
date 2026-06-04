@@ -1449,6 +1449,113 @@ impl<'a, V: ApplyView> AMMVoteApplySink for ViewBackedAMMVoteSink<'a, V> {
     fn update_amm_entry(&mut self, _sle: protocol::STLedgerEntry) {}
 }
 
+fn amm_owner_dir_entries<V: ApplyView>(
+    view: &mut V,
+    amm_account: &AccountID,
+) -> Option<Vec<Uint256>> {
+    let owner_dir = protocol::owner_dir_keylet(to_160(amm_account));
+    let mut page = 0_u64;
+    let mut entries = Vec::new();
+    let mut visited = 0_u16;
+
+    loop {
+        visited = visited.saturating_add(1);
+        if visited > protocol::MAX_DELETABLE_AMM_TRUST_LINES + 4 {
+            return None;
+        }
+
+        let page_keylet = protocol::page_keylet(owner_dir, page);
+        let node = view
+            .peek(page_keylet)
+            .ok()
+            .flatten()
+            .or_else(|| view.read(page_keylet).ok().flatten())?;
+        entries.extend(node.get_field_v256(sf("sfIndexes")).value().iter().copied());
+
+        let next = node.get_field_u64(sf("sfIndexNext"));
+        if next == 0 || next == page {
+            break;
+        }
+        page = next;
+    }
+
+    Some(entries)
+}
+
+pub(crate) fn delete_empty_amm_owner_entries<V: ApplyView>(
+    view: &mut V,
+    amm_account: &AccountID,
+) -> Ter {
+    let Some(entries) = amm_owner_dir_entries(view, amm_account) else {
+        return Ter::TEC_INTERNAL;
+    };
+
+    let mut trust_lines_deleted = 0_u16;
+    for key in entries.iter().copied() {
+        let Some(sle) = view.peek(protocol::child_keylet(key)).ok().flatten() else {
+            return Ter::TEC_INTERNAL;
+        };
+        match sle.get_type() {
+            LedgerEntryType::AMM | LedgerEntryType::MPToken => {}
+            LedgerEntryType::RippleState => {
+                if trust_lines_deleted >= protocol::MAX_DELETABLE_AMM_TRUST_LINES {
+                    return Ter::TEF_TOO_BIG;
+                }
+                if sle.get_field_amount(sf("sfBalance")).signum() != 0 {
+                    return Ter::TEC_INTERNAL;
+                }
+                let low = sle.get_field_amount(sf("sfLowLimit")).issue().issuer();
+                let high = sle.get_field_amount(sf("sfHighLimit")).issue().issuer();
+                let res = crate::state::trust_set::trust_delete(view, &sle, &low, &high);
+                if res != Ter::TES_SUCCESS {
+                    return res;
+                }
+                trust_lines_deleted = trust_lines_deleted.saturating_add(1);
+            }
+            _ => return Ter::TEC_INTERNAL,
+        }
+    }
+
+    let Some(entries) = amm_owner_dir_entries(view, amm_account) else {
+        return Ter::TEC_INTERNAL;
+    };
+    for key in entries.iter().copied() {
+        let Some(sle) = view.peek(protocol::child_keylet(key)).ok().flatten() else {
+            return Ter::TEC_INTERNAL;
+        };
+        match sle.get_type() {
+            LedgerEntryType::AMM => {}
+            LedgerEntryType::MPToken => {
+                let amount = if sle.is_field_present(sf("sfMPTAmount")) {
+                    sle.get_field_u64(sf("sfMPTAmount"))
+                } else {
+                    0
+                };
+                let locked = if sle.is_field_present(sf("sfLockedAmount")) {
+                    sle.get_field_u64(sf("sfLockedAmount"))
+                } else {
+                    0
+                };
+                if amount != 0 || locked != 0 {
+                    return Ter::TEC_INTERNAL;
+                }
+                let owner_node = sle.get_field_u64(sf("sfOwnerNode"));
+                let owner_dir = protocol::owner_dir_keylet(to_160(amm_account));
+                if ledger::dir_remove(view, &owner_dir, owner_node, *sle.key(), false).is_err() {
+                    return Ter::TEF_BAD_LEDGER;
+                }
+                if view.erase(sle).is_err() {
+                    return Ter::TEC_INTERNAL;
+                }
+            }
+            LedgerEntryType::RippleState => return Ter::TEC_INTERNAL,
+            _ => return Ter::TEC_INTERNAL,
+        }
+    }
+
+    Ter::TES_SUCCESS
+}
+
 pub struct ViewBackedAMMDeleteSink<'a, V> {
     pub view: &'a mut V,
     pub account: AccountID,
@@ -1457,16 +1564,42 @@ pub struct ViewBackedAMMDeleteSink<'a, V> {
 impl<'a, V: ApplyView> AMMDeleteApplySink for ViewBackedAMMDeleteSink<'a, V> {
     fn get_amm_entry(
         &mut self,
-        _asset1: &protocol::Asset,
-        _asset2: &protocol::Asset,
+        asset1: &protocol::Asset,
+        asset2: &protocol::Asset,
     ) -> Option<protocol::STLedgerEntry> {
-        None
+        self.view
+            .peek(protocol::keylet::amm(*asset1, *asset2))
+            .ok()
+            .flatten()
+            .map(|sle| (*sle).clone())
     }
-    fn delete_amm_entry(&mut self, _sle: protocol::STLedgerEntry) -> Ter {
-        Ter::TES_SUCCESS
+    fn delete_amm_entry(&mut self, sle: protocol::STLedgerEntry) -> Ter {
+        let amm_account = sle.get_account_id(sf("sfAccount"));
+        let owner_dir = protocol::owner_dir_keylet(to_160(&amm_account));
+        let owner_node = sle.get_field_u64(sf("sfOwnerNode"));
+        match ledger::dir_remove(self.view, &owner_dir, owner_node, *sle.key(), false) {
+            Ok(true) => {}
+            Ok(false) => return Ter::TEC_INTERNAL,
+            Err(_) => return Ter::TEC_INTERNAL,
+        }
+        self.view
+            .erase(Arc::new(sle))
+            .map(|_| Ter::TES_SUCCESS)
+            .unwrap_or(Ter::TEC_INTERNAL)
     }
-    fn delete_amm_account(&mut self, _amm_account: &protocol::AccountID) -> Ter {
-        Ter::TES_SUCCESS
+    fn delete_amm_account(&mut self, amm_account: &protocol::AccountID) -> Ter {
+        let cleanup = delete_empty_amm_owner_entries(self.view, amm_account);
+        if cleanup != Ter::TES_SUCCESS {
+            return cleanup;
+        }
+        let account_keylet = protocol::account_keylet(to_160(amm_account));
+        let Some(account) = self.view.peek(account_keylet).ok().flatten() else {
+            return Ter::TEC_INTERNAL;
+        };
+        self.view
+            .erase(account)
+            .map(|_| Ter::TES_SUCCESS)
+            .unwrap_or(Ter::TEC_INTERNAL)
     }
 }
 

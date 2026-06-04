@@ -5,9 +5,9 @@ use std::collections::BTreeSet;
 
 use protocol::{
     Ter, lsfMPTCanLock, lsfMPTCanTransfer, lsfMPTLocked, lsfMPTRequireAuth,
-    lsmfMPTCanMutateMetadata, lsmfMPTCanMutateTransferFee, tfMPTLock, tfMPTUnlock,
-    tfMPTokenIssuanceSetMask, tfUniversalMask, tmfMPTClearCanTransfer, tmfMPTSetCanLock,
-    tmfMPTokenIssuanceSetMutableMask, trans_token,
+    lsmfMPTCanMutateMetadata, lsmfMPTCanMutateRequireAuth, lsmfMPTCanMutateTransferFee, tfMPTLock,
+    tfMPTUnlock, tfMPTokenIssuanceSetMask, tfUniversalMask, tmfMPTClearCanTransfer,
+    tmfMPTClearRequireAuth, tmfMPTSetCanLock, tmfMPTokenIssuanceSetMutableMask, trans_token,
 };
 use tx::utility::mp_token_issuance_set::{MAX_MPTOKEN_METADATA_LENGTH, MAX_TRANSFER_FEE};
 use tx::{
@@ -315,6 +315,7 @@ fn mp_token_issuance_set_preclaim_ordered_guards() {
         domain_id_is_zero: false,
         issuance_requires_auth: true,
         domain_exists: true,
+        issuance_domain_present: false,
         current_mutable_flags: 0,
         mutable_flags: None,
         metadata_present: false,
@@ -335,6 +336,7 @@ fn mp_token_issuance_set_preclaim_ordered_guards() {
         domain_id_is_zero: false,
         issuance_requires_auth: true,
         domain_exists: true,
+        issuance_domain_present: false,
         current_mutable_flags: 0,
         mutable_flags: None,
         metadata_present: false,
@@ -355,6 +357,7 @@ fn mp_token_issuance_set_preclaim_ordered_guards() {
         domain_id_is_zero: false,
         issuance_requires_auth: true,
         domain_exists: true,
+        issuance_domain_present: false,
         current_mutable_flags: 0,
         mutable_flags: None,
         metadata_present: false,
@@ -376,6 +379,7 @@ fn mp_token_issuance_set_preclaim_ordered_guards() {
             domain_id_is_zero: false,
             issuance_requires_auth: false,
             domain_exists: true,
+            issuance_domain_present: false,
             current_mutable_flags: 0,
             mutable_flags: None,
             metadata_present: false,
@@ -396,6 +400,7 @@ fn mp_token_issuance_set_preclaim_ordered_guards() {
         domain_id_is_zero: false,
         issuance_requires_auth: true,
         domain_exists: true,
+        issuance_domain_present: false,
         current_mutable_flags: 0,
         mutable_flags: None,
         metadata_present: true,
@@ -417,6 +422,7 @@ fn mp_token_issuance_set_preclaim_ordered_guards() {
             domain_id_is_zero: false,
             issuance_requires_auth: true,
             domain_exists: true,
+            issuance_domain_present: false,
             current_mutable_flags: lsfMPTCanTransfer,
             mutable_flags: None,
             metadata_present: false,
@@ -437,12 +443,35 @@ fn mp_token_issuance_set_preclaim_ordered_guards() {
         domain_id_is_zero: false,
         issuance_requires_auth: true,
         domain_exists: true,
+        issuance_domain_present: false,
         current_mutable_flags: lsmfMPTCanMutateMetadata | lsmfMPTCanMutateTransferFee,
         mutable_flags: None,
         metadata_present: true,
         transfer_fee: Some(10),
         issuance_can_transfer: true,
     });
+    let clear_require_auth_with_domain =
+        run_mp_token_issuance_set_preclaim(MPTokenIssuanceSetPreclaimFacts {
+            issuance_exists: true,
+            issuance_can_lock: true,
+            single_asset_vault_enabled: true,
+            dynamic_mpt_enabled: true,
+            tx_flags: 0,
+            issuer_matches: true,
+            holder_present: false,
+            holder_account_exists: true,
+            holder_token_exists: true,
+            domain_id_present: false,
+            domain_id_is_zero: false,
+            issuance_requires_auth: true,
+            domain_exists: true,
+            issuance_domain_present: true,
+            current_mutable_flags: lsmfMPTCanMutateRequireAuth,
+            mutable_flags: Some(tmfMPTClearRequireAuth),
+            metadata_present: false,
+            transfer_fee: None,
+            issuance_can_transfer: true,
+        });
 
     assert_eq!(missing, Ter::TEC_OBJECT_NOT_FOUND);
     assert_eq!(no_lock_permission, Ter::TEC_NO_PERMISSION);
@@ -451,6 +480,7 @@ fn mp_token_issuance_set_preclaim_ordered_guards() {
     assert_eq!(nonmutable_metadata, Ter::TEC_NO_PERMISSION);
     assert_eq!(nonmutable_transfer_fee, Ter::TEC_NO_PERMISSION);
     assert_eq!(valid, Ter::TES_SUCCESS);
+    assert_eq!(clear_require_auth_with_domain, Ter::TEC_NO_PERMISSION);
 }
 
 #[test]

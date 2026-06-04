@@ -56,6 +56,9 @@ fn next_missing_scan_first_child() -> u8 {
 const INBOUND_LEDGER_TIMEOUT_RETRIES_MAX: u32 = 6;
 const INBOUND_LEDGER_BECOME_AGGRESSIVE: u32 = 4;
 const MISSING_NODES_FIND: i32 = 256;
+/// During cold-start state acquisition, discover more missing nodes per cycle
+/// to supply work for parallel fan-out across multiple peers (6 peers × 128 nodes = 768).
+const MISSING_NODES_FIND_COLD_START: i32 = 1024;
 const REQ_NODES_REPLY: usize = 128;
 const REQ_NODES: usize = 12;
 
@@ -2169,13 +2172,18 @@ impl InboundLedgerLocal {
                 );
                 send_fn(request);
             } else {
+                let missing_limit = if self.planner_state.have_state {
+                    MISSING_NODES_FIND
+                } else {
+                    MISSING_NODES_FIND_COLD_START
+                };
                 let mut filter_ref: Option<&mut dyn shamap::fetch::SHAMapSyncFilter> =
                     Some(&mut filter);
                 let (missing, scan_stats) = if full_sync_debug_enabled() {
                     ledger
                         .state_map_mut()
                         .get_missing_nodes_with_family_diagnostics(
-                            MISSING_NODES_FIND,
+                            missing_limit,
                             &mut filter_ref,
                             family,
                             &mut next_missing_scan_first_child,
@@ -2183,7 +2191,7 @@ impl InboundLedgerLocal {
                 } else {
                     (
                         ledger.state_map_mut().get_missing_nodes_with_family(
-                            MISSING_NODES_FIND,
+                            missing_limit,
                             &mut filter_ref,
                             family,
                             &mut next_missing_scan_first_child,

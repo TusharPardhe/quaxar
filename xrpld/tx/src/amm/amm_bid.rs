@@ -38,8 +38,20 @@ pub struct AmmBidPreclaimFacts {
     pub bid_min_exceeds_bid_max: bool,
 }
 
-pub const fn amm_bid_check_extra_features(amm_enabled: bool) -> bool {
-    amm_enabled
+pub const fn amm_bid_check_extra_features(
+    amm_enabled: bool,
+    mptokens_v2_enabled: bool,
+    asset_pair_holds_mpt: bool,
+) -> bool {
+    if !amm_enabled {
+        return false;
+    }
+
+    if asset_pair_holds_mpt && !mptokens_v2_enabled {
+        return false;
+    }
+
+    true
 }
 
 pub fn run_amm_bid_preflight<AccountId>(facts: AmmBidPreflightFacts<AccountId>) -> NotTec

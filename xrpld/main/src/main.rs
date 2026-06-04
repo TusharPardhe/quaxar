@@ -3366,6 +3366,46 @@ fn run_acquisition_thread(
 
                 let trigger_elapsed = trigger_start.elapsed();
                 tracing::debug!(target: "inbound_ledger", seq, trigger_count, tracked_peers = peer_set.peer_count(), outbound_requests, trigger_ms = trigger_elapsed.as_millis(), "Reply triggered");
+
+                // Cold-start parallel fan-out: after the reply trigger (which
+                // targets the responding peer), trigger additional peers with
+                // different missing nodes. `recent_nodes` ensures each peer gets
+                // a unique partition — nodes already requested are filtered out,
+                // so each subsequent trigger call discovers fresh work.
+                if !inbound.planner_state().have_state {
+                    // Refresh tracked peers from overlay so fan-out can use all connected peers
+                    peer_set.add_peers(
+                        6,
+                        &mut |_peer| true,
+                        &mut |_peer| {},
+                    );
+                    let all_peers = peer_set.get_peers();
+                    let triggered: std::collections::HashSet<u32> =
+                        run_result.triggered_peer_ids.iter().map(|id| *id as u32).collect();
+                    let extra_peers: Vec<_> = all_peers
+                        .iter()
+                        .filter(|p| !triggered.contains(&p.id()))
+                        .take(5)
+                        .cloned()
+                        .collect();
+                    for peer in &extra_peers {
+                        let peer_ref = peer.clone();
+                        let mut fan_send = |msg: overlay::ProtocolMessage| {
+                            outbound_requests += 1;
+                            peer_set.send_request(&msg, Some(&peer_ref));
+                        };
+                        inbound.trigger_with_family(
+                            ledger::InboundLedgerRequestTrigger::Reply,
+                            &journal,
+                            &config,
+                            &mut store,
+                            &mut fetch_pack,
+                            &family,
+                            &mut fan_send,
+                        );
+                    }
+                }
+
                 last_request_at = Instant::now();
             }
         }
@@ -5145,6 +5185,54 @@ impl<D> BoundServerRuntime<D> {
                             }
 
                             try_advance_catchup(&app, app.node_store().as_ref(), &peers, &mut inbound_ledgers);
+                        }
+                    }
+
+                    // --- Cold bootstrap: sweep + re-acquire (C++ parity) ---
+                    // C++ InboundLedger::onTimer fires every 3s. If wasProgress=false,
+                    // increments timeouts_. After 6 consecutive no-progress ticks, the
+                    // acquisition is marked failed and removed.
+                    //
+                    // During cold start we keep one-at-a-time (full state trees are
+                    // large; parallel downloads waste bandwidth on near-identical data).
+                    // The sweep ensures stale acquisitions (peers stopped responding)
+                    // die after 6 consecutive no-progress checks, freeing the slot for
+                    // the latest validated target. Never sweep acquisitions that have
+                    // received substantial data — they're working, just slow in the tail.
+                    if validated <= 1 {
+                        const ACQUIRE_TIMEOUT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+                        const ACQUIRE_TIMEOUT_RETRIES_MAX: u32 = 6;
+
+                        let now = Instant::now();
+                        let stale: Vec<Uint256> = inbound_ledgers.entries
+                            .iter()
+                            .filter(|(_, e)| {
+                                matches!(e.state, InboundState::InProgress)
+                                    && now.duration_since(e.last_touched) > ACQUIRE_TIMEOUT_INTERVAL * ACQUIRE_TIMEOUT_RETRIES_MAX
+                                    // Only sweep if the acquisition never got meaningful data.
+                                    // An acquisition with data is making progress in the tail —
+                                    // killing it wastes all downloaded nodes.
+                                    && e.last_touched.elapsed() > std::time::Duration::from_secs(60)
+                            })
+                            .map(|(k, _)| *k)
+                            .collect();
+                        for hash in stale {
+                            if let Some(entry) = inbound_ledgers.entries.remove(&hash) {
+                                let _ = entry.tx.send(AcqMsg::Stop);
+                                tracing::info!(target: "bootstrap", seq = entry.seq, "Acquisition timed out (no progress for >60s)");
+                            }
+                        }
+
+                        // Re-acquire latest validated target when slot is free
+                        if let Some((target_hash, target_seq)) = last_validated_target {
+                            if target_seq > 1
+                                && inbound_ledgers.active_count() == 0
+                                && !inbound_ledgers.contains(&target_hash)
+                            {
+                                tracing::info!(target: "bootstrap", seq = target_seq, hash = %debug_hash8(&target_hash), "Acquiring validated target");
+                                inbound_ledgers.acquire(target_hash, target_seq, validated);
+                                inbound_ledgers.send_peers(&peers);
+                            }
                         }
                     }
 

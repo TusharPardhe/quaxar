@@ -2,16 +2,32 @@ use std::sync::Arc;
 
 use basics::{
     base_uint::{Uint160, Uint192, Uint256},
-    number::NumberParts as RuntimeNumber,
+    number::{NumberParts as RuntimeNumber, get_mantissa_scale},
 };
-use ledger::views::apply_view::ApplyView;
+use ledger::{RelativeDistanceAmount, views::apply_view::ApplyView};
 use protocol::{
-    AccountID, Asset, MPTIssue, STAmount, STLedgerEntry, STNumber, Ter, XRPAmount, account_keylet,
-    get_field_by_symbol, mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid,
+    AccountID, Asset, MPTIssue, STAmount, STLedgerEntry, STNumber, STTx, Ter, XRPAmount,
+    account_keylet, feature_id, get_field_by_symbol, mpt_issuance_keylet_from_mptid,
+    mptoken_keylet_from_mptid,
 };
 
 pub(super) fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
+}
+
+pub(super) fn lending_protocol_dependencies_enabled<V: ApplyView>(view: &V, sttx: &STTx) -> bool {
+    if !view.rules().enabled(&feature_id("SingleAssetVault")) {
+        return false;
+    }
+    if !view.rules().enabled(&feature_id("MPTokensV1")) {
+        return false;
+    }
+    if sttx.is_field_present(sf("sfDomainID"))
+        && !view.rules().enabled(&feature_id("PermissionedDomains"))
+    {
+        return false;
+    }
+    true
 }
 
 pub(super) fn to_160(account: &AccountID) -> Uint160 {
@@ -70,7 +86,7 @@ pub(super) fn account_send_with_mpt_transfer_waiver<V: ApplyView>(
             )));
             Ter::TES_SUCCESS
         }
-        Asset::Issue(_) => ledger::ripple_state_helpers::account_send(view, from, to, amount),
+        Asset::Issue(_) => transfer_iou_no_fee(view, from, to, amount),
         Asset::MPTIssue(issue) => transfer_mpt(
             view,
             issue,
@@ -80,6 +96,29 @@ pub(super) fn account_send_with_mpt_transfer_waiver<V: ApplyView>(
             waive_mpt_can_transfer,
         ),
     }
+}
+
+fn transfer_iou_no_fee<V: ApplyView>(
+    view: &mut V,
+    from: &AccountID,
+    to: &AccountID,
+    amount: &STAmount,
+) -> Ter {
+    if amount.signum() <= 0 || from == to {
+        return Ter::TES_SUCCESS;
+    }
+
+    let issue = amount.issue();
+    if *from == issue.account || *to == issue.account || issue.account.is_zero() {
+        return ledger::ripple_state_helpers::direct_send_no_fee_iou_pub(view, from, to, amount);
+    }
+
+    let res =
+        ledger::ripple_state_helpers::direct_send_no_fee_iou_pub(view, &issue.account, to, amount);
+    if res != Ter::TES_SUCCESS {
+        return res;
+    }
+    ledger::ripple_state_helpers::direct_send_no_fee_iou_pub(view, from, &issue.account, amount)
 }
 
 pub(super) fn asset_issuer(asset: Asset) -> AccountID {
@@ -220,6 +259,47 @@ pub(super) fn check_cover_sendable<V: ApplyView>(
     }
 }
 
+pub(super) fn cover_asset_holding_number<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    asset: Asset,
+) -> RuntimeNumber {
+    match asset {
+        Asset::Issue(issue) if issue.native() => view
+            .peek(account_keylet(to_160(account)))
+            .ok()
+            .flatten()
+            .map(|sle| RuntimeNumber::from_i64(sle.get_field_amount(sf("sfBalance")).xrp().drops()))
+            .unwrap_or_else(RuntimeNumber::zero),
+        Asset::Issue(issue) if issue.account == *account => {
+            RuntimeNumber::max(get_mantissa_scale())
+        }
+        Asset::Issue(issue) => {
+            let mut balance = view
+                .peek(protocol::line(*account, issue.account, issue.currency))
+                .ok()
+                .flatten()
+                .map(|line| line.get_field_amount(sf("sfBalance")))
+                .unwrap_or_else(|| {
+                    asset
+                        .amount(RuntimeNumber::zero())
+                        .unwrap_or_else(|_| STAmount::default())
+                });
+            if *account > issue.account {
+                balance.negate();
+            }
+            balance.as_number()
+        }
+        Asset::MPTIssue(issue) if issue.issuer() == *account => {
+            RuntimeNumber::max(get_mantissa_scale())
+        }
+        Asset::MPTIssue(issue) => token_balance(view, issue.mpt_id(), account)
+            .and_then(|balance| i64::try_from(balance).ok())
+            .map(RuntimeNumber::from_i64)
+            .unwrap_or_else(RuntimeNumber::zero),
+    }
+}
+
 pub(super) fn asset_deep_frozen<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
@@ -304,6 +384,60 @@ pub(super) fn asset_requires_strong_auth<V: ApplyView>(
     }
 }
 
+pub(super) fn check_asset_auth<V: ApplyView>(
+    view: &mut V,
+    account: &AccountID,
+    asset: Asset,
+    strong: bool,
+) -> Ter {
+    match asset {
+        Asset::Issue(issue) if issue.native() || issue.account == *account => Ter::TES_SUCCESS,
+        Asset::Issue(issue) => {
+            let line_keylet = protocol::line(*account, issue.account, issue.currency);
+            let trust_line = view
+                .peek(line_keylet)
+                .ok()
+                .flatten()
+                .or_else(|| view.read(line_keylet).ok().flatten());
+            if trust_line.is_none() && strong {
+                return Ter::TEC_NO_LINE;
+            }
+
+            let issuer_keylet = protocol::account_keylet(to_160(&issue.account));
+            let issuer_requires_auth = view
+                .peek(issuer_keylet)
+                .ok()
+                .flatten()
+                .or_else(|| view.read(issuer_keylet).ok().flatten())
+                .is_some_and(|issuer| issuer.is_flag(protocol::lsfRequireAuth));
+            if issuer_requires_auth {
+                let Some(trust_line) = trust_line else {
+                    return Ter::TEC_NO_LINE;
+                };
+                let auth_flag = if *account > issue.account {
+                    protocol::lsfLowAuth
+                } else {
+                    protocol::lsfHighAuth
+                };
+                if !trust_line.is_flag(auth_flag) {
+                    return Ter::TEC_NO_AUTH;
+                }
+            }
+
+            Ter::TES_SUCCESS
+        }
+        Asset::MPTIssue(issue) => {
+            let auth_type = if strong {
+                ledger::mptoken_helpers::MPTAuthType::Strong
+            } else {
+                ledger::mptoken_helpers::MPTAuthType::Weak
+            };
+            ledger::mptoken_helpers::require_auth_mpt_with_type(view, &issue, account, auth_type)
+                .unwrap_or(Ter::TEF_BAD_LEDGER)
+        }
+    }
+}
+
 pub(super) fn check_mpt_cover_destination_auth<V: ApplyView>(
     view: &mut V,
     destination: &AccountID,
@@ -323,7 +457,12 @@ pub(super) fn check_mpt_cover_destination_auth<V: ApplyView>(
         return Ter::TEC_NO_AUTH;
     }
 
-    ledger::mptoken_helpers::require_auth_mpt(view, issue, destination)
+    let auth_type = if require_holding {
+        ledger::mptoken_helpers::MPTAuthType::Strong
+    } else {
+        ledger::mptoken_helpers::MPTAuthType::Weak
+    };
+    ledger::mptoken_helpers::require_auth_mpt_with_type(view, issue, destination, auth_type)
         .unwrap_or(Ter::TEF_BAD_LEDGER)
 }
 

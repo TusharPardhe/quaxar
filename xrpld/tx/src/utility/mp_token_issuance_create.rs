@@ -19,6 +19,8 @@ pub const MAX_MPTOKEN_AMOUNT: u64 = 0x7fff_ffff_ffff_ffff;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MPTokenIssuanceCreatePreflightFacts {
+    pub fix_cleanup_3_2_0_enabled: bool,
+    pub reference_holding_present: bool,
     pub mutable_flags: Option<u32>,
     pub tx_flags: u32,
     pub transfer_fee: Option<u16>,
@@ -92,6 +94,10 @@ pub const fn get_mp_token_issuance_create_flags_mask() -> u32 {
 pub fn run_mp_token_issuance_create_preflight(
     facts: MPTokenIssuanceCreatePreflightFacts,
 ) -> NotTec {
+    if facts.fix_cleanup_3_2_0_enabled && facts.reference_holding_present {
+        return Ter::TEM_MALFORMED;
+    }
+
     if let Some(mutable_flags) = facts.mutable_flags
         && (mutable_flags == 0 || (mutable_flags & tmfMPTokenIssuanceCreateMutableMask) != 0)
     {

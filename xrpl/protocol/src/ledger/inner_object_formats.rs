@@ -2,7 +2,9 @@
 
 use std::sync::OnceLock;
 
-use crate::{KnownFormats, SField, SOEStyle, SOElement, SOTemplate, get_field_by_symbol};
+use crate::{
+    KnownFormatItem, KnownFormats, SField, SOEStyle, SOElement, SOTemplate, get_field_by_symbol,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InnerObjectFormats {
@@ -18,6 +20,15 @@ impl InnerObjectFormats {
     fn new() -> Self {
         let mut inner = KnownFormats::new("InnerObjectFormats");
 
+        add(
+            &mut inner,
+            "sfMemo",
+            &[
+                ("sfMemoType", SOEStyle::Optional),
+                ("sfMemoData", SOEStyle::Optional),
+                ("sfMemoFormat", SOEStyle::Optional),
+            ],
+        );
         add(
             &mut inner,
             "sfSignerEntry",
@@ -166,6 +177,19 @@ impl InnerObjectFormats {
         );
         add(
             &mut inner,
+            "sfRawTransaction",
+            &[
+                ("sfTransactionType", SOEStyle::Required),
+                ("sfAccount", SOEStyle::Required),
+                ("sfAmount", SOEStyle::Optional),
+                ("sfDestination", SOEStyle::Optional),
+                ("sfSequence", SOEStyle::Required),
+                ("sfSigningPubKey", SOEStyle::Optional),
+                ("sfTxnSignature", SOEStyle::Optional),
+            ],
+        );
+        add(
+            &mut inner,
             "sfBatchSigner",
             &[
                 ("sfAccount", SOEStyle::Required),
@@ -199,6 +223,10 @@ impl InnerObjectFormats {
         self.inner
             .find_by_type(sfield.code())
             .map(|item| item.so_template())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &KnownFormatItem<i32>> {
+        self.inner.iter()
     }
 }
 

@@ -86,6 +86,7 @@ fn make_ledger(entries: Vec<STLedgerEntry>) -> Ledger {
     // Enable vault-related amendments
     let features = vec![
         protocol::feature_id("SingleAssetVault"),
+        protocol::feature_id("MPTokensV1"),
         protocol::feature_id("PermissionedDomains"),
     ];
     ledger.set_rules(protocol::Rules::new(features.into_iter()));

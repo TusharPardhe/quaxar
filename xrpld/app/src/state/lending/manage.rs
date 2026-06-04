@@ -11,19 +11,29 @@ pub fn apply_loan_manage<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     if !view.rules().enabled(&feature_id("LendingProtocol")) {
         return Ter::TEM_DISABLED;
     }
+    if !lending_protocol_dependencies_enabled(view, sttx) {
+        return Ter::TEM_DISABLED;
+    }
 
     let account = sttx.get_account_id(sf("sfAccount"));
     let loan_id = sttx.get_field_h256(sf("sfLoanID"));
     let tx_requests_default = sttx.is_flag(tfLoanDefault);
     let tx_requests_impair = sttx.is_flag(tfLoanImpair);
     let tx_requests_unimpair = sttx.is_flag(tfLoanUnimpair);
+    let preflight = tx::run_loan_manage_preflight(tx::LoanManagePreflightFacts {
+        loan_id_is_zero: loan_id.is_zero(),
+        tx_specific_flags: sttx.get_flags() & protocol::LOAN_MANAGE_FLAGS,
+    });
+    if preflight != Ter::TES_SUCCESS {
+        return preflight;
+    }
 
     let Ok(Some(loan_sle)) = view.peek(protocol::loan_keylet_from_key(loan_id)) else {
-        return Ter::TEF_BAD_LEDGER;
+        return Ter::TEC_NO_ENTRY;
     };
     let broker_id = loan_sle.get_field_h256(sf("sfLoanBrokerID"));
     let Ok(Some(broker_sle)) = view.peek(protocol::loan_broker_keylet_from_key(broker_id)) else {
-        return Ter::TEF_BAD_LEDGER;
+        return Ter::TEC_INTERNAL;
     };
     let vault_id = broker_sle.get_field_h256(sf("sfVaultID"));
     let Ok(Some(vault_sle)) = view.peek(protocol::vault_keylet_from_key(vault_id)) else {

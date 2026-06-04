@@ -185,11 +185,22 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     {
         return Ter::TEM_DISABLED;
     }
+    if !lending_protocol_dependencies_enabled(view, sttx) {
+        return Ter::TEM_DISABLED;
+    }
 
     let loan_id = sttx.get_field_h256(sf("sfLoanID"));
     let amount = sttx.get_field_amount(sf("sfAmount"));
     let borrower = sttx.get_account_id(sf("sfAccount"));
     let flags = sttx.get_field_u32(sf("sfFlags"));
+    let preflight = tx::run_loan_pay_preflight(tx::LoanPayPreflightFacts {
+        loan_id_is_zero: loan_id.is_zero(),
+        amount_is_positive: amount.signum() > 0,
+        tx_specific_flags: flags & protocol::LOAN_PAY_FLAGS,
+    });
+    if preflight != Ter::TES_SUCCESS {
+        return preflight;
+    }
 
     let payment_type = tx::run_loan_pay_payment_type(
         flags & protocol::LOAN_LATE_PAYMENT_FLAG != 0,
@@ -201,7 +212,7 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     let loan_keylet = protocol::loan_keylet_from_key(loan_id);
     let loan_sle = match view.peek(loan_keylet) {
         Ok(Some(sle)) => sle,
-        _ => return Ter::TEF_BAD_LEDGER,
+        _ => return Ter::TEC_NO_ENTRY,
     };
 
     // Load and cache broker
