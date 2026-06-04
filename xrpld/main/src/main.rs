@@ -5148,6 +5148,50 @@ impl<D> BoundServerRuntime<D> {
                         }
                     }
 
+                    // --- Cold bootstrap: sweep + re-acquire (C++ parity) ---
+                    // C++ InboundLedger::onTimer fires every 3s. If wasProgress=false,
+                    // increments timeouts_. After 6 consecutive no-progress ticks, the
+                    // acquisition is marked failed and removed.
+                    //
+                    // During cold start we keep one-at-a-time (full state trees are
+                    // large; parallel downloads waste bandwidth on near-identical data).
+                    // The sweep ensures stale acquisitions (peers stopped responding)
+                    // die after 6 consecutive no-progress checks, freeing the slot for
+                    // the latest validated target.
+                    if validated <= 1 {
+                        const ACQUIRE_TIMEOUT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+                        const ACQUIRE_TIMEOUT_RETRIES_MAX: u32 = 6;
+
+                        // Check every 3s if in-progress entries made progress
+                        let now = Instant::now();
+                        let stale: Vec<Uint256> = inbound_ledgers.entries
+                            .iter()
+                            .filter(|(_, e)| {
+                                matches!(e.state, InboundState::InProgress)
+                                    && now.duration_since(e.last_touched) > ACQUIRE_TIMEOUT_INTERVAL * ACQUIRE_TIMEOUT_RETRIES_MAX
+                            })
+                            .map(|(k, _)| *k)
+                            .collect();
+                        for hash in stale {
+                            if let Some(entry) = inbound_ledgers.entries.remove(&hash) {
+                                let _ = entry.tx.send(AcqMsg::Stop);
+                                tracing::info!(target: "bootstrap", seq = entry.seq, "Acquisition timed out ({} timeouts × {}s interval)", ACQUIRE_TIMEOUT_RETRIES_MAX, ACQUIRE_TIMEOUT_INTERVAL.as_secs());
+                            }
+                        }
+
+                        // Re-acquire latest validated target when slot is free
+                        if let Some((target_hash, target_seq)) = last_validated_target {
+                            if target_seq > 1
+                                && inbound_ledgers.active_count() == 0
+                                && !inbound_ledgers.contains(&target_hash)
+                            {
+                                tracing::info!(target: "bootstrap", seq = target_seq, hash = %debug_hash8(&target_hash), "Acquiring validated target");
+                                inbound_ledgers.acquire(target_hash, target_seq, validated);
+                                inbound_ledgers.send_peers(&peers);
+                            }
+                        }
+                    }
+
                     // --- History planner: drive fetch-pack requests when acquisitions stall ---
                     // issues fetch-pack requests to bulk-download history.
                     // Run even during initial sync (validated==0) using target_seq
