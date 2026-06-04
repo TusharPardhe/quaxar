@@ -3373,6 +3373,12 @@ fn run_acquisition_thread(
                 // a unique partition — nodes already requested are filtered out,
                 // so each subsequent trigger call discovers fresh work.
                 if !inbound.planner_state().have_state {
+                    // Refresh tracked peers from overlay so fan-out can use all connected peers
+                    peer_set.add_peers(
+                        6,
+                        &mut |_peer| true,
+                        &mut |_peer| {},
+                    );
                     let all_peers = peer_set.get_peers();
                     let triggered: std::collections::HashSet<u32> =
                         run_result.triggered_peer_ids.iter().map(|id| *id as u32).collect();
