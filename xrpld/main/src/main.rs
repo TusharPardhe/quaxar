@@ -3366,6 +3366,40 @@ fn run_acquisition_thread(
 
                 let trigger_elapsed = trigger_start.elapsed();
                 tracing::debug!(target: "inbound_ledger", seq, trigger_count, tracked_peers = peer_set.peer_count(), outbound_requests, trigger_ms = trigger_elapsed.as_millis(), "Reply triggered");
+
+                // Cold-start parallel fan-out: after the reply trigger (which
+                // targets the responding peer), trigger additional peers with
+                // different missing nodes. `recent_nodes` ensures each peer gets
+                // a unique partition — nodes already requested are filtered out,
+                // so each subsequent trigger call discovers fresh work.
+                if !inbound.planner_state().have_state {
+                    let all_peers = peer_set.get_peers();
+                    let triggered: std::collections::HashSet<u32> =
+                        run_result.triggered_peer_ids.iter().map(|id| *id as u32).collect();
+                    let extra_peers: Vec<_> = all_peers
+                        .iter()
+                        .filter(|p| !triggered.contains(&p.id()))
+                        .take(5)
+                        .cloned()
+                        .collect();
+                    for peer in &extra_peers {
+                        let peer_ref = peer.clone();
+                        let mut fan_send = |msg: overlay::ProtocolMessage| {
+                            outbound_requests += 1;
+                            peer_set.send_request(&msg, Some(&peer_ref));
+                        };
+                        inbound.trigger_with_family(
+                            ledger::InboundLedgerRequestTrigger::Reply,
+                            &journal,
+                            &config,
+                            &mut store,
+                            &mut fetch_pack,
+                            &family,
+                            &mut fan_send,
+                        );
+                    }
+                }
+
                 last_request_at = Instant::now();
             }
         }
@@ -3445,31 +3479,17 @@ fn run_acquisition_thread(
                         break;
                     }
                 } else {
-                    // Distribute state acquisition requests across peers round-robin.
-                    // Instead of broadcasting each request to all peers (wasteful —
-                    // all respond with the same data), target a different peer per
-                    // request. This achieves parallel subtree download: each peer
-                    // serves a distinct portion of the missing nodes.
-                    let peer_list: Vec<_> = peer_set.get_peers();
-                    let peer_count = peer_list.len().max(1);
-                    let mut peer_index: usize = 0;
                     let mut send_fn = |msg: overlay::ProtocolMessage| {
                         outbound_requests += 1;
                         if acq_packet_debug_enabled() {
                             let (itype, requested, query_depth) = get_ledger_request_shape(&msg);
                             tracing::debug!(target: "inbound_ledger",
-                                seq, peer = peer_index % peer_count, itype, requested,
+                                seq, peer = "all", itype, requested,
                                 query_depth = query_depth.map(|v| v.to_string()).unwrap_or_else(|| "none".to_owned()),
                                 outbound_requests, reason = "timeout", "Request send"
                             );
                         }
-                        if peer_list.is_empty() {
-                            peer_set.send_request(&msg, None);
-                        } else {
-                            let target = &peer_list[peer_index % peer_count];
-                            peer_set.send_request(&msg, Some(target));
-                            peer_index += 1;
-                        }
+                        peer_set.send_request(&msg, None);
                     };
                     let failed = inbound.on_timer_with_family(
                         &journal,

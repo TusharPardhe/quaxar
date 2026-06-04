@@ -55,7 +55,7 @@ impl SimplePeerSet {
         peers.iter().find(|p| p.id() == id).cloned()
     }
 
-    /// Return all tracked peers for round-robin distribution.
+    /// Return tracked peers for parallel fan-out during state acquisition.
     pub fn get_peers(&self) -> Vec<Arc<dyn Peer>> {
         let peer_ids = self.peer_ids.lock().expect("peer ids lock");
         let peers = self.peers.lock().expect("peer set lock");
