@@ -446,10 +446,10 @@ fn bootstrap_acquire_budget_available(
     }
 
     if validated <= 1 {
-        // A cold node must finish one full account-state acquisition before
-        // run-ahead can help. Starting several full-state ledgers here only
-        // splits peer/disk budget and delays the first accepted ledger.
-        return active_count == 0;
+        // C++ allows multiple GENERIC acquisitions during cold start.
+        // Old ones die naturally via 18s no-progress timeout (peers stop
+        // responding to stale hashes). No artificial seq-distance kill.
+        return active_count < ledger_fetch_limit.max(1);
     }
 
     active_count < ledger_fetch_limit.max(1)
@@ -5174,42 +5174,29 @@ impl<D> BoundServerRuntime<D> {
                         }
                     }
 
-                    // C++ parity: InboundLedgers::sweep removes acquisitions with
-                    // no activity for >1 minute. checkAccept starts a NEW acquisition
-                    // for each new validated hash — multiple can run in parallel.
-                    // During cold bootstrap (validated<=1), we only allow one active
-                    // acquisition. If the current one targets a ledger that is far
-                    // behind the latest validated target, stop it and start fresh.
+                    // C++ parity: InboundLedgers::sweep removes inactive entries
+                    // (>1 min no activity). InboundLedger::onTimer abandons after
+                    // 6×3s = 18s of no progress. Peers naturally stop responding to
+                    // stale hashes, causing old acquisitions to timeout.
+                    // No seq-distance kill — let progressing acquisitions finish.
                     if validated <= 1 && last_validated_target.is_some() {
                         let (target_hash, target_seq) = last_validated_target.unwrap();
                         if target_seq > 1 {
-                            // Sweep entries inactive for >60 seconds (C++ sweep)
-                            inbound_ledgers.sweep_stale(std::time::Duration::from_secs(60));
+                            // Sweep entries with no activity for >18 seconds
+                            // (C++ onTimer: 6 timeouts × 3s interval)
+                            inbound_ledgers.sweep_stale(std::time::Duration::from_secs(18));
 
-                            // If active acquisition is >30 ledgers behind target,
-                            // it will never be accepted. Stop it.
-                            // (Testnet closes ~every 4s, so 30 ledgers ≈ 2 minutes)
-                            let dominated: Vec<Uint256> = inbound_ledgers.entries
-                                .iter()
-                                .filter(|(_, e)| {
-                                    matches!(e.state, InboundState::InProgress)
-                                        && e.seq > 0
-                                        && target_seq > e.seq + 30
-                                })
-                                .map(|(k, _)| *k)
-                                .collect();
-                            for hash in &dominated {
-                                if let Some(entry) = inbound_ledgers.entries.remove(hash) {
-                                    let _ = entry.tx.send(AcqMsg::Stop);
-                                    tracing::info!(target: "bootstrap", acq_seq = entry.seq, target_seq, "Stopped dominated acquisition (>{} ledgers behind)", 30);
-                                }
-                            }
-
-                            // Start acquisition for latest target if not tracked and slot free
+                            // Start acquisition for latest target if not already tracked
+                            // (C++ checkAccept creates new entry per unique hash)
                             if !inbound_ledgers.contains(&target_hash)
-                                && inbound_ledgers.active_count() == 0
+                                && bootstrap_acquire_budget_available(
+                                    validated,
+                                    inbound_ledgers.active_count(),
+                                    catchup_profile.ledger_fetch_limit,
+                                    false,
+                                )
                             {
-                                tracing::info!(target: "bootstrap", seq = target_seq, hash = %debug_hash8(&target_hash), "Acquiring latest validated target");
+                                tracing::debug!(target: "bootstrap", seq = target_seq, hash = %debug_hash8(&target_hash), "Acquiring latest validated target");
                                 inbound_ledgers.acquire(target_hash, target_seq, validated);
                                 inbound_ledgers.send_peers(&peers);
                             }
