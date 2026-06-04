@@ -2386,6 +2386,11 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let amount = sttx.get_field_amount(sf("sfAmount"));
             let chan_keylet = protocol::unchecked_keylet(channel_id);
             if let Ok(Some(chan)) = view.peek(chan_keylet) {
+                // C++ parity: only the channel source can fund it
+                let chan_src = chan.get_account_id(sf("sfAccount"));
+                if chan_src != account {
+                    return Ter::TEC_NO_PERMISSION;
+                }
                 // Increase channel amount
                 let cur = chan.get_field_amount(sf("sfAmount"));
                 let mut obj = chan.clone_as_object();
