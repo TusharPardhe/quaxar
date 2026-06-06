@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="assets/xrpld-icon.png" alt="quaxar" width="120">
+  <img src="assets/quaxar-icon.png" alt="quaxar" width="120">
   <br>
   quaxar
 </h1>
