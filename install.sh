@@ -558,13 +558,13 @@ fi
 if [ "$GENERATE_CONF" = true ]; then
     # Defaults
     RPC_PORT="5005"
-    RPC_IP="127.0.0.1"
+    RPC_IP="0.0.0.0"
     RPC_ADMIN="127.0.0.1"
     RPC_SECURE_GATEWAY=""
     PEER_PORT="51235"
     PEER_IP="0.0.0.0"
     WS_PORT="6006"
-    WS_IP="127.0.0.1"
+    WS_IP="0.0.0.0"
     WS_ADMIN="127.0.0.1"
     WS_SECURE_GATEWAY=""
     WS_SEND_QUEUE_LIMIT="500"
