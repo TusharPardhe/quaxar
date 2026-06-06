@@ -347,6 +347,13 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
             |app| <ApplicationRoot as RpcRuntime>::export_snapshot(app, output_path),
         )
     }
+
+    fn log_level_set(&self, partition: String, level: String) -> crate::status::Status {
+        self.app().map_or_else(
+            || crate::status::Status::new(crate::status::RpcErrorCode::NotImplemented),
+            |app| <ApplicationRoot as RpcRuntime>::log_level_set(app, partition, level),
+        )
+    }
 }
 
 #[cfg(test)]
