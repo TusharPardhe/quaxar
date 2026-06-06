@@ -1,6 +1,7 @@
 mod backends;
 mod database_runtime;
 mod format;
+pub mod snapshot;
 
 pub use backends::backend;
 pub use backends::memory_backend;
@@ -59,3 +60,5 @@ pub use types::{
     BATCH_WRITE_LIMIT_SIZE, BATCH_WRITE_PREALLOCATION_SIZE, Batch, Status, batch_write_limit_size,
     batch_write_preallocation_size,
 };
+
+pub use snapshot::{SnapshotError, SnapshotManifest, SnapshotScheduler, SnapshotSchedulerConfig, export_snapshot, load_snapshot};
