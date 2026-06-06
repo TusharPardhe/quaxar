@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
@@ -17,10 +18,19 @@ pub fn export_snapshot(
     manifest: &SnapshotManifest,
     output_path: &Path,
 ) -> Result<(), SnapshotError> {
+    let start = Instant::now();
+    tracing::info!(
+        target: "snapshot",
+        path = %output_path.display(),
+        ledger_seq = manifest.ledger_seq,
+        "Starting snapshot export"
+    );
+
     // Pass 1: collect all nodes into compressed chunks
     let mut chunks: Vec<Vec<u8>> = Vec::new();
     let mut chunk_metas: Vec<ChunkMeta> = Vec::new();
     let mut current_buf: Vec<u8> = Vec::new();
+    let mut node_count: u64 = 0;
 
     let flush_chunk = |buf: &mut Vec<u8>, chunks: &mut Vec<Vec<u8>>, metas: &mut Vec<ChunkMeta>| {
         if buf.is_empty() {
@@ -39,12 +49,27 @@ pub fn export_snapshot(
     backend.for_each(&mut |node: Arc<NodeObject>| {
         let obj_type = node.object_type() as u32 as u8;
         encode_node_record(obj_type, node.hash().data(), node.data(), &mut current_buf);
+        node_count += 1;
         if current_buf.len() >= SNAPSHOT_CHUNK_UNCOMPRESSED_TARGET {
             flush_chunk(&mut current_buf, &mut chunks, &mut chunk_metas);
+            tracing::debug!(
+                target: "snapshot",
+                chunks_written = chunks.len(),
+                nodes_so_far = node_count,
+                "Chunk flushed during export"
+            );
         }
     });
     // Flush remaining
     flush_chunk(&mut current_buf, &mut chunks, &mut chunk_metas);
+
+    tracing::info!(
+        target: "snapshot",
+        node_count,
+        chunk_count = chunks.len(),
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "Node iteration complete, writing snapshot file"
+    );
 
     // Build final manifest with computed chunks
     let mut final_manifest = manifest.clone();
@@ -84,6 +109,19 @@ pub fn export_snapshot(
 
     writer.flush()
         .map_err(|e| SnapshotError::io("flushing snapshot file", e))?;
+
+    let file_size = std::fs::metadata(output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    tracing::info!(
+        target: "snapshot",
+        path = %output_path.display(),
+        node_count,
+        chunk_count = chunks.len(),
+        file_size_mb = file_size / (1024 * 1024),
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "Snapshot export complete"
+    );
 
     Ok(())
 }

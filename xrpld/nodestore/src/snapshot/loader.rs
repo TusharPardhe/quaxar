@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
@@ -16,6 +17,13 @@ pub fn load_snapshot(
     backend: &dyn Backend,
     input_path: &Path,
 ) -> Result<SnapshotManifest, SnapshotError> {
+    let start = Instant::now();
+    tracing::info!(
+        target: "snapshot",
+        path = %input_path.display(),
+        "Starting snapshot load"
+    );
+
     let file = File::open(input_path)
         .map_err(|e| SnapshotError::io_path("opening snapshot file", input_path, e))?;
     let mut reader = BufReader::new(file);
@@ -36,6 +44,14 @@ pub fn load_snapshot(
             .unwrap(),
     ) as usize;
 
+    tracing::info!(
+        target: "snapshot",
+        ledger_seq = manifest.ledger_seq,
+        version = manifest.version,
+        chunk_count,
+        "Snapshot header parsed"
+    );
+
     // Read chunk table
     for _ in 0..chunk_count {
         let mut entry_buf = [0u8; CHUNK_META_SIZE];
@@ -46,6 +62,7 @@ pub fn load_snapshot(
     }
 
     // Read and process each chunk
+    let mut total_nodes: u64 = 0;
     for (i, meta) in manifest.chunks.iter().enumerate() {
         let mut compressed = vec![0u8; meta.compressed_len as usize];
         reader.read_exact(&mut compressed)
@@ -85,6 +102,18 @@ pub fn load_snapshot(
         }
 
         backend.store_batch(&batch);
+        total_nodes += batch.len() as u64;
+
+        if (i + 1) % 10 == 0 || i + 1 == manifest.chunks.len() {
+            tracing::info!(
+                target: "snapshot",
+                chunk = i + 1,
+                total_chunks = manifest.chunks.len(),
+                nodes_loaded = total_nodes,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "Loading snapshot chunks"
+            );
+        }
     }
 
     // Read and verify footer
@@ -99,6 +128,15 @@ pub fn load_snapshot(
             computed: computed_file_hash,
         });
     }
+
+    tracing::info!(
+        target: "snapshot",
+        ledger_seq = manifest.ledger_seq,
+        total_nodes,
+        chunks = manifest.chunks.len(),
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "Snapshot load complete, integrity verified"
+    );
 
     Ok(manifest)
 }
