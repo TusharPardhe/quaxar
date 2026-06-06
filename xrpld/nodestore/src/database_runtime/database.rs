@@ -69,6 +69,11 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
     fn get_counts_json(&self) -> JsonValue;
 
     fn fd_required(&self) -> i32;
+
+    /// Returns the primary backend for snapshot export.
+    fn export_backend(&self) -> Option<Arc<dyn Backend>> {
+        None
+    }
 }
 
 /// reference-style rotating owner extension.

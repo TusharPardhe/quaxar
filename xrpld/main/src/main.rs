@@ -785,7 +785,7 @@ fn try_cli_subcommand() -> Option<ExitCode> {
             true
         }
         xrpld_cli::Command::ExportSnapshot { output } => {
-            run_export_snapshot(&output, parsed.conf.as_deref())
+            run_export_snapshot(&url, &output)
         }
         xrpld_cli::Command::LoadSnapshot { input } => {
             run_load_snapshot(&input, parsed.conf.as_deref())
@@ -5770,84 +5770,42 @@ mod tests;
 
 // ─── Snapshot CLI handlers ───────────────────────────────────────────────────
 
-fn run_export_snapshot(output: &str, conf: Option<&str>) -> bool {
-    use nodestore::{
-        ManagerImp, Manager, NullJournal, DummyScheduler,
-        snapshot::{SnapshotManifest, manifest::SNAPSHOT_VERSION, export_snapshot},
-    };
-    use std::path::Path;
+fn run_export_snapshot(url: &str, output: &str) -> bool {
+    println!("Requesting snapshot export to {}...", output);
+    println!("Sending export_snapshot RPC to {}", url);
 
-    let config = match load_config_for_snapshot(conf) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error loading config: {e}");
-            return false;
+    let request_json = serde_json::json!({
+        "method": "export_snapshot",
+        "params": [{"output": output}]
+    });
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(3600))
+        .build()
+        .unwrap();
+
+    let body = serde_json::to_string(&request_json).unwrap();
+
+    match client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+    {
+        Ok(response) => {
+            let status = response.status();
+            let text = response.text().unwrap_or_default();
+            if status.is_success() {
+                println!("{}", text);
+                true
+            } else {
+                eprintln!("RPC error (HTTP {}): {}", status, text);
+                false
+            }
         }
-    };
-
-    let node_db = match config.section("node_db") {
-        s if s.exists("path") => s.clone(),
-        _ => {
-            eprintln!("Error: [node_db] section with 'path' not found in config");
-            return false;
-        }
-    };
-
-    // Resolve sharded NuDB layout: the config path is the parent directory,
-    // but actual NuDB files live in xrpldb.NNNN subdirectories.
-    let mut node_db = node_db;
-    if let Ok(Some(base_path)) = node_db.get::<String>("path") {
-        let writable_path = Path::new(&base_path).join("xrpldb.0000");
-        if writable_path.join("nudb.dat").exists() {
-            node_db.set("path", writable_path.to_string_lossy().into_owned());
-        }
-    }
-
-    let manager = ManagerImp::instance();
-    let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
-    let journal: Arc<dyn nodestore::NodeStoreJournal> = Arc::new(NullJournal);
-
-    let backend = match manager.make_backend(&node_db, 0, scheduler, journal) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Error creating backend: {e}");
-            return false;
-        }
-    };
-
-    if let Err(e) = backend.open(false) {
-        eprintln!("Error opening backend: {e}");
-        return false;
-    }
-
-    // Build a manifest with placeholder metadata (actual ledger info would come from the DB)
-    let manifest = SnapshotManifest {
-        version: SNAPSHOT_VERSION,
-        ledger_seq: 0,
-        ledger_hash: [0u8; 32],
-        account_hash: [0u8; 32],
-        tx_hash: [0u8; 32],
-        parent_hash: [0u8; 32],
-        drops: 0,
-        close_time: 0,
-        parent_close_time: 0,
-        close_time_res: 10,
-        close_flags: 0,
-        chunks: Vec::new(),
-    };
-
-    let output_path = Path::new(output);
-    println!("Exporting snapshot to {}...", output_path.display());
-
-    match export_snapshot(backend.as_ref(), &manifest, output_path) {
-        Ok(()) => {
-            println!("Snapshot exported successfully to {}", output_path.display());
-            let _ = backend.close();
-            true
-        }
-        Err(e) => {
-            eprintln!("Snapshot export failed: {e}");
-            let _ = backend.close();
+        Err(error) => {
+            eprintln!("Failed to connect to RPC server at {}: {}", url, error);
+            eprintln!("Make sure the node is running and the RPC port is accessible.");
             false
         }
     }

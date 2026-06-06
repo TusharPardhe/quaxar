@@ -2371,6 +2371,10 @@ pub trait RpcRuntime {
     fn peer_reservations_list(&self) -> JsonValue {
         protocol::json!({ "reservations": [] })
     }
+
+    fn export_snapshot(&self, _output_path: &str) -> Result<JsonValue, String> {
+        Err("Not implemented".to_owned())
+    }
 }
 
 impl RpcRuntime for () {}
@@ -2710,6 +2714,47 @@ impl RpcRuntime for ApplicationRoot {
         protocol::json!({
             "reservations": list.into_iter().map(|r| r.to_json()).collect::<Vec<_>>()
         })
+    }
+
+    fn export_snapshot(&self, output_path: &str) -> Result<JsonValue, String> {
+        use nodestore::snapshot::{SnapshotManifest, manifest::SNAPSHOT_VERSION, export_snapshot};
+        use std::path::Path;
+
+        let validated = self.validated_ledger()
+            .ok_or_else(|| "No validated ledger available".to_owned())?;
+        let header = validated.header();
+
+        let node_store = self.node_store().as_ref()
+            .ok_or_else(|| "NodeStore not configured".to_owned())?;
+        let backend = node_store.export_backend()
+            .ok_or_else(|| "Backend not available for export".to_owned())?;
+
+        let manifest = SnapshotManifest {
+            version: SNAPSHOT_VERSION,
+            ledger_seq: header.seq,
+            ledger_hash: *header.hash.as_uint256().data(),
+            account_hash: *header.account_hash.as_uint256().data(),
+            tx_hash: *header.tx_hash.as_uint256().data(),
+            parent_hash: *header.parent_hash.as_uint256().data(),
+            drops: header.drops,
+            close_time: header.close_time,
+            parent_close_time: header.parent_close_time,
+            close_time_res: header.close_time_resolution,
+            close_flags: header.close_flags,
+            chunks: Vec::new(),
+        };
+
+        let path = Path::new(output_path);
+        export_snapshot(backend.as_ref(), &manifest, path)
+            .map_err(|e| format!("{e}"))?;
+
+        Ok(protocol::json!({
+            "status": "success",
+            "ledger_seq": header.seq,
+            "ledger_hash": header.hash.to_string(),
+            "account_hash": header.account_hash.to_string(),
+            "output": output_path
+        }))
     }
 }
 
