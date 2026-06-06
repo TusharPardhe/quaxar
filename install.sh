@@ -303,6 +303,9 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
 elif [[ "$OSTYPE" == "darwin"* ]]; then
     OS="macOS $(sw_vers -productVersion)"
     PKG_MGR="brew"
+elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "mingw"* || "$OSTYPE" == "cygwin" ]]; then
+    OS="Windows ($(uname -s))"
+    PKG_MGR="none"
 fi
 
 echo -e "  OS              ${BOLD}$OS${RESET} (${ARCH})"

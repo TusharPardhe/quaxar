@@ -60,8 +60,14 @@ configuration may still change as parity work continues.
 
 ### Interactive Installer
 
+**macOS / Linux:**
 ```bash
 curl -sSf https://raw.githubusercontent.com/TusharPardhe/xrpld/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/TusharPardhe/xrpld/main/install.ps1 | iex
 ```
 
 The installer checks host requirements, installs build dependencies, builds
@@ -73,6 +79,10 @@ For unattended installation with defaults:
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/TusharPardhe/xrpld/main/install.sh | bash -s -- -y
+```
+
+```powershell
+irm https://raw.githubusercontent.com/TusharPardhe/xrpld/main/install.ps1 | iex -y
 ```
 
 ### Manual Build
