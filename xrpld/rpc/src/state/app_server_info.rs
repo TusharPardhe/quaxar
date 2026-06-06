@@ -340,6 +340,13 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
             |app| <ApplicationRoot as RpcRuntime>::ledger_request_by_hash(app, hash),
         )
     }
+
+    fn export_snapshot(&self, output_path: &str) -> Result<protocol::JsonValue, String> {
+        self.app().map_or_else(
+            || Err("Application not available".to_owned()),
+            |app| <ApplicationRoot as RpcRuntime>::export_snapshot(app, output_path),
+        )
+    }
 }
 
 #[cfg(test)]
