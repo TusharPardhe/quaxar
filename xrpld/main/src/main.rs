@@ -891,20 +891,16 @@ fn main() -> ExitCode {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
 
+    let subscriber = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true));
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber");
+
     app::set_log_reload_fn(move |new_filter: &str| {
         let f = tracing_subscriber::EnvFilter::try_new(new_filter)
             .map_err(|e| format!("Invalid filter: {e}"))?;
         reload_handle.reload(f).map_err(|e| format!("Reload failed: {e}"))
     });
-
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_target(true)
-                .with_thread_ids(true)
-                .with_filter(filter_layer),
-        )
-        .init();
 
     tracing::info!(target: "main", version = env!("CARGO_PKG_VERSION"), "XRPLD starting");
 
