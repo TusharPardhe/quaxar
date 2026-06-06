@@ -2681,14 +2681,33 @@ impl RpcRuntime for ApplicationRoot {
     }
 
     fn log_level_set(&self, partition: String, level: String) -> Status {
+        // Validate level
+        let valid_levels = ["trace", "debug", "info", "warn", "error", "off"];
+        let level_lower = level.to_ascii_lowercase();
+        if !valid_levels.contains(&level_lower.as_str()) {
+            return Status::new(crate::status::RpcErrorCode::InvalidParams);
+        }
+
+        // Validate partition characters (prevent filter injection)
+        if partition != "base" && !partition.is_empty()
+            && !partition.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+        {
+            return Status::new(crate::status::RpcErrorCode::InvalidParams);
+        }
+
+        // Build filter: for "base"/empty set global level, for partition set only that module
         let filter = if partition == "base" || partition.is_empty() {
-            level
+            level_lower
         } else {
-            format!("{},{}={}", level, partition, level)
+            format!("info,{}={}", partition, level_lower)
         };
+
         match app::reload_log_filter(&filter) {
             Ok(()) => Status::OK,
-            Err(_) => Status::new(crate::status::RpcErrorCode::InvalidParams),
+            Err(e) => {
+                tracing::warn!(target: "rpc", error = %e, "log_level_set failed");
+                Status::new(crate::status::RpcErrorCode::InvalidParams)
+            }
         }
     }
 
