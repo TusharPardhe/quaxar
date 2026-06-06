@@ -9,6 +9,7 @@ pub enum StartUpType {
     LoadFile = 3,
     Replay = 4,
     Network = 5,
+    Snapshot = 6,
 }
 
 impl fmt::Display for StartUpType {

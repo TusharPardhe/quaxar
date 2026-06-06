@@ -784,6 +784,12 @@ fn try_cli_subcommand() -> Option<ExitCode> {
             }
             true
         }
+        xrpld_cli::Command::ExportSnapshot { output } => {
+            run_export_snapshot(&output, parsed.conf.as_deref())
+        }
+        xrpld_cli::Command::LoadSnapshot { input } => {
+            run_load_snapshot(&input, parsed.conf.as_deref())
+        }
     };
     Some(if ok {
         ExitCode::SUCCESS
@@ -5761,3 +5767,146 @@ fn run_rpc_client(options: AppBootstrapOptions) -> ExitCode {
 #[cfg(test)]
 #[path = "main/tests.rs"]
 mod tests;
+
+// ─── Snapshot CLI handlers ───────────────────────────────────────────────────
+
+fn run_export_snapshot(output: &str, conf: Option<&str>) -> bool {
+    use nodestore::{
+        ManagerImp, Manager, NullJournal, DummyScheduler,
+        snapshot::{SnapshotManifest, manifest::SNAPSHOT_VERSION, export_snapshot},
+    };
+    use std::path::Path;
+
+    let config = match load_config_for_snapshot(conf) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error loading config: {e}");
+            return false;
+        }
+    };
+
+    let node_db = match config.section("node_db") {
+        s if s.exists("path") => s.clone(),
+        _ => {
+            eprintln!("Error: [node_db] section with 'path' not found in config");
+            return false;
+        }
+    };
+
+    let manager = ManagerImp::instance();
+    let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
+    let journal: Arc<dyn nodestore::NodeStoreJournal> = Arc::new(NullJournal);
+
+    let backend = match manager.make_backend(&node_db, 0, scheduler, journal) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Error creating backend: {e}");
+            return false;
+        }
+    };
+
+    if let Err(e) = backend.open(false) {
+        eprintln!("Error opening backend: {e}");
+        return false;
+    }
+
+    // Build a manifest with placeholder metadata (actual ledger info would come from the DB)
+    let manifest = SnapshotManifest {
+        version: SNAPSHOT_VERSION,
+        ledger_seq: 0,
+        ledger_hash: [0u8; 32],
+        account_hash: [0u8; 32],
+        tx_hash: [0u8; 32],
+        parent_hash: [0u8; 32],
+        drops: 0,
+        close_time: 0,
+        parent_close_time: 0,
+        close_time_res: 10,
+        close_flags: 0,
+        chunks: Vec::new(),
+    };
+
+    let output_path = Path::new(output);
+    println!("Exporting snapshot to {}...", output_path.display());
+
+    match export_snapshot(backend.as_ref(), &manifest, output_path) {
+        Ok(()) => {
+            println!("Snapshot exported successfully to {}", output_path.display());
+            let _ = backend.close();
+            true
+        }
+        Err(e) => {
+            eprintln!("Snapshot export failed: {e}");
+            let _ = backend.close();
+            false
+        }
+    }
+}
+
+fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
+    use nodestore::{
+        ManagerImp, Manager, NullJournal, DummyScheduler,
+        snapshot::load_snapshot,
+    };
+    use std::path::Path;
+
+    let config = match load_config_for_snapshot(conf) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error loading config: {e}");
+            return false;
+        }
+    };
+
+    let node_db = match config.section("node_db") {
+        s if s.exists("path") => s.clone(),
+        _ => {
+            eprintln!("Error: [node_db] section with 'path' not found in config");
+            return false;
+        }
+    };
+
+    let manager = ManagerImp::instance();
+    let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
+    let journal: Arc<dyn nodestore::NodeStoreJournal> = Arc::new(NullJournal);
+
+    let backend = match manager.make_backend(&node_db, 0, scheduler, journal) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Error creating backend: {e}");
+            return false;
+        }
+    };
+
+    if let Err(e) = backend.open(true) {
+        eprintln!("Error opening backend: {e}");
+        return false;
+    }
+
+    let input_path = Path::new(input);
+    println!("Loading snapshot from {}...", input_path.display());
+
+    match load_snapshot(backend.as_ref(), input_path) {
+        Ok(manifest) => {
+            println!(
+                "Snapshot loaded successfully: ledger_seq={}, chunks={}",
+                manifest.ledger_seq,
+                manifest.chunks.len()
+            );
+            backend.sync();
+            let _ = backend.close();
+            true
+        }
+        Err(e) => {
+            eprintln!("Snapshot load failed: {e}");
+            let _ = backend.close();
+            false
+        }
+    }
+}
+
+fn load_config_for_snapshot(conf: Option<&str>) -> Result<BasicConfig, String> {
+    let default_path = "/etc/opt/xrpld/xrpld.cfg";
+    let config_path = conf.unwrap_or(default_path);
+    load_basic_config_file(Path::new(config_path))
+}
