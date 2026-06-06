@@ -2680,9 +2680,16 @@ impl RpcRuntime for ApplicationRoot {
         Status::OK
     }
 
-    fn log_level_set(&self, partition: String, _level: String) -> Status {
-        self.logs().journal(&partition); // Simplified: actual level set not in AppLogs
-        Status::OK
+    fn log_level_set(&self, partition: String, level: String) -> Status {
+        let filter = if partition == "base" || partition.is_empty() {
+            level
+        } else {
+            format!("{},{}={}", level, partition, level)
+        };
+        match app::reload_log_filter(&filter) {
+            Ok(()) => Status::OK,
+            Err(_) => Status::new(crate::status::RpcErrorCode::InvalidParams),
+        }
     }
 
     fn log_level_get(&self) -> JsonValue {

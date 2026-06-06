@@ -69,3 +69,20 @@ pub use state::{
 pub use tx_queue::{transaction::*, transaction_master::*, txq::*, vote_tx_set::*};
 pub use validator::{validator_keys::*, validator_list::*, validator_site::*};
 pub use xrpl_core::{LoadMonitorJournalFactory, ServiceRegistry};
+
+// ── Dynamic log level reload ────────────────────────────────────────────────
+use std::sync::OnceLock;
+
+type LogReloadFn = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+static LOG_RELOAD_FN: OnceLock<LogReloadFn> = OnceLock::new();
+
+/// Called by main at startup to register the tracing reload handle.
+pub fn set_log_reload_fn(f: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static) {
+    LOG_RELOAD_FN.set(Box::new(f)).ok();
+}
+
+/// Reload the tracing filter at runtime. Returns Err if not initialized or invalid filter.
+pub fn reload_log_filter(filter: &str) -> Result<(), String> {
+    let f = LOG_RELOAD_FN.get().ok_or("Log reload not initialized")?;
+    f(filter)
+}
