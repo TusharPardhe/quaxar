@@ -27,7 +27,7 @@ Disk usage grows over time with ledger history. NVMe is strongly recommended for
 
 ```bash
 # Download and run the interactive installer
-curl -sSf https://raw.githubusercontent.com/TusharPardhe/xrpld/main/install.sh -o install.sh
+curl -sSf https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.sh -o install.sh
 chmod +x install.sh
 ./install.sh
 
@@ -65,7 +65,7 @@ brew install openssl rocksdb cmake
 ### Build & Install
 
 ```bash
-git clone https://github.com/TusharPardhe/xrpld.git
+git clone https://github.com/TusharPardhe/quaxar.git
 cd xrpld
 cargo install --path xrpld/main
 ```

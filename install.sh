@@ -7,7 +7,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────────────────────
 
 VERSION="0.1.0"
-REPO="https://github.com/TusharPardhe/xrpld.git"
+REPO="https://github.com/TusharPardhe/quaxar.git"
 AUTO_YES=false
 PREFIX=""
 

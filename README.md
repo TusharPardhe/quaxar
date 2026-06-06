@@ -62,12 +62,12 @@ configuration may still change as parity work continues.
 
 **macOS / Linux:**
 ```bash
-curl -sSf https://raw.githubusercontent.com/TusharPardhe/xrpld/main/install.sh | bash
+curl -sSf https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.sh | bash
 ```
 
 **Windows (PowerShell):**
 ```powershell
-irm https://raw.githubusercontent.com/TusharPardhe/xrpld/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.ps1 | iex
 ```
 
 The installer checks host requirements, installs build dependencies, builds
@@ -78,11 +78,11 @@ applies defaults when non interactive mode is requested.
 For unattended installation with defaults:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/TusharPardhe/xrpld/main/install.sh | bash -s -- -y
+curl -sSf https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.sh | bash -s -- -y
 ```
 
 ```powershell
-irm https://raw.githubusercontent.com/TusharPardhe/xrpld/main/install.ps1 | iex -y
+irm https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.ps1 | iex -y
 ```
 
 ### Manual Build
@@ -104,7 +104,7 @@ brew install openssl rocksdb cmake
 Build and install from source:
 
 ```bash
-git clone https://github.com/TusharPardhe/xrpld.git
+git clone https://github.com/TusharPardhe/quaxar.git
 cd xrpld
 cargo install --path xrpld/main
 ```

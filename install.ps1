@@ -1,6 +1,6 @@
 # install.ps1 — Quaxar installer for Windows
-# Usage: irm https://raw.githubusercontent.com/TusharPardhe/xrpld/main/install.ps1 | iex
-# Unattended: powershell -c "& { irm https://raw.githubusercontent.com/TusharPardhe/xrpld/main/install.ps1 | iex } -y"
+# Usage: irm https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.ps1 | iex
+# Unattended: powershell -c "& { irm https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.ps1 | iex } -y"
 
 param([switch]$y)
 
@@ -54,7 +54,7 @@ if (Test-Path "$cloneDir\.git") {
     Pop-Location
 } else {
     Write-Host "  Cloning repository..." -ForegroundColor Gray
-    git clone https://github.com/TusharPardhe/xrpld.git $cloneDir
+    git clone https://github.com/TusharPardhe/quaxar.git $cloneDir
 }
 
 # Build
