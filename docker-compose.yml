@@ -1,7 +1,7 @@
 services:
-  xrpld:
+  quaxar:
     build: .
-    container_name: xrpld
+    container_name: quaxar
     restart: unless-stopped
     ports:
       - "5005:5005"   # RPC
@@ -16,7 +16,7 @@ services:
         limits:
           memory: 16G
     healthcheck:
-      test: ["CMD", "xrpld", "health", "--rpc-url", "http://127.0.0.1:5005"]
+      test: ["CMD", "quaxar", "health", "--rpc-url", "http://127.0.0.1:5005"]
       interval: 30s
       timeout: 5s
       retries: 3

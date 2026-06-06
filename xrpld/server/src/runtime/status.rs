@@ -8,7 +8,7 @@ use axum::body::Body;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 
-const STATUS_PAGE_SYSTEM_NAME: &str = "xrpld";
+const STATUS_PAGE_SYSTEM_NAME: &str = "quaxar";
 
 pub trait ServerStatusSource: Send + Sync {
     fn server_okay(&self) -> Result<(), String>;

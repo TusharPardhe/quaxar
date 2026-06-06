@@ -5,10 +5,10 @@
 Start the server with an explicit config file:
 
 ```bash
-xrpld --conf /etc/xrpld/xrpld.cfg
+quaxar --conf /etc/xrpld/xrpld.cfg
 ```
 
-Running `xrpld` without a subcommand prints help. This avoids accidentally
+Running `quaxar` without a subcommand prints help. This avoids accidentally
 starting a node with an unintended default configuration.
 
 ## Interactive Mode
@@ -16,7 +16,7 @@ starting a node with an unintended default configuration.
 Launch an interactive shell with fuzzy search and inline suggestions:
 
 ```bash
-xrpld cli
+quaxar cli
 ```
 
 Features:
@@ -90,64 +90,64 @@ Override with `--rpc-url http://host:port`.
 
 ```bash
 # Check node health
-xrpld health
+quaxar health
 
 # View current sync progress
-xrpld sync-status
+quaxar sync-status
 
 # Check fee before submitting
-xrpld fee
+quaxar fee
 
 # Look up an account
-xrpld account rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh
+quaxar account rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh
 
 # See connected peers
-xrpld peers
+quaxar peers
 
 # Raw RPC call with JSON params
-xrpld rpc ledger '{"ledger_index":"validated"}'
+quaxar rpc ledger '{"ledger_index":"validated"}'
 
 # Compact JSON output for scripts
-xrpld rpc server_info --raw
+quaxar rpc server_info --raw
 
 # Show raw server information
-xrpld server-info
+quaxar server-info
 
 # Show live cache and node-store counters
-xrpld get-counts
+quaxar get-counts
 
 # Show ledger acquisition state
-xrpld fetch-info
+quaxar fetch-info
 
 # Rotate logs
-xrpld log-rotate
+quaxar log-rotate
 
 # Change log level to debug
-xrpld log-level debug
+quaxar log-level debug
 
 # View latest ledger
-xrpld ledger
+quaxar ledger
 
 # View specific ledger
-xrpld ledger 95000000
+quaxar ledger 95000000
 
 # Database statistics (NuDB path, file sizes, counters)
-xrpld db-stats
+quaxar db-stats
 
 # Database statistics using a specific config file
-xrpld db-stats --conf /etc/xrpld.cfg
+quaxar db-stats --conf /etc/xrpld.cfg
 
 # Generate validator keys
-xrpld validator-keys generate
+quaxar validator-keys generate
 
 # Diagnose issues
-xrpld doctor
+quaxar doctor
 
 # Show version
-xrpld version
+quaxar version
 
 # Graceful stop
-xrpld stop
+quaxar stop
 ```
 
 ## Exit Codes

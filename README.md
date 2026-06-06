@@ -1,7 +1,7 @@
 <h1 align="center">
-  <img src="assets/xrpld-icon.png" alt="xrpld" width="120">
+  <img src="assets/xrpld-icon.png" alt="quaxar" width="120">
   <br>
-  xrpld
+  quaxar
 </h1>
 
 <p align="center">
@@ -25,7 +25,7 @@
 
 ## Overview
 
-`xrpld` is a Rust implementation of the XRP Ledger server. It is designed to
+`quaxar` is a Rust implementation of the XRP Ledger server. It is designed to
 sync ledger data, participate in the peer overlay, serve HTTP and WebSocket
 JSON RPC requests, and provide an operator focused command line interface.
 
@@ -36,7 +36,7 @@ operation, and non validator node evaluation.
 
 ## Current Status
 
-`xrpld` is beta software. It has been validated on XRPL testnet as a synced
+`quaxar` is beta software. It has been validated on XRPL testnet as a synced
 non validator node with live submission tests for XRP payments, issued token
 payments, NFT minting, AMM creation, account queries, and expected rejection
 cases.
@@ -65,7 +65,7 @@ curl -sSf https://raw.githubusercontent.com/TusharPardhe/xrpld/main/install.sh |
 ```
 
 The installer checks host requirements, installs build dependencies, builds
-`xrpld`, generates configuration files, validates user input, and can install a
+`quaxar`, generates configuration files, validates user input, and can install a
 systemd service. It asks for available runtime settings interactively and
 applies defaults when non interactive mode is requested.
 
@@ -102,7 +102,7 @@ cargo install --path xrpld/main
 Run with an explicit configuration file:
 
 ```bash
-xrpld --conf ./xrpld.cfg
+quaxar --conf ./xrpld.cfg
 ```
 
 ### Docker
@@ -119,35 +119,35 @@ Docker Compose mounts the repository `xrpld.cfg` into the container at
 Start a node:
 
 ```bash
-xrpld --conf xrpld.cfg
+quaxar --conf xrpld.cfg
 ```
 
 Check sync and health:
 
 ```bash
-xrpld sync-status
-xrpld health
-xrpld server-info
+quaxar sync-status
+quaxar health
+quaxar server-info
 ```
 
 Call RPC directly:
 
 ```bash
-xrpld rpc account_info '{"account":"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh","ledger_index":"validated"}'
+quaxar rpc account_info '{"account":"rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh","ledger_index":"validated"}'
 ```
 
 Open the interactive shell:
 
 ```bash
-xrpld cli
+quaxar cli
 ```
 
-Running `xrpld` without a subcommand prints help instead of starting a node
+Running `quaxar` without a subcommand prints help instead of starting a node
 implicitly. This avoids accidental launches with an unintended configuration.
 
 ## Operator CLI
 
-`xrpld` includes a first class operator CLI with interactive search, command
+`quaxar` includes a first class operator CLI with interactive search, command
 suggestions, clear errors for unknown commands, and direct RPC passthrough.
 
 | Command | Purpose |
@@ -250,7 +250,7 @@ reference and [docs/RUNNING.md](docs/RUNNING.md) for operational guidance.
 | NuDB | Recommended for node store operation and used by the validated testnet deployment. |
 | RocksDB | Available where the Rust storage path exposes the matching backend. Use only when the target deployment requires it. |
 | Public endpoints | Use `verify_endpoints` for stricter advertised peer endpoint validation. |
-| RPC parameters | Pass JSON params as a single quoted JSON object, for example `xrpld rpc account_info '{"account":"...","ledger_index":"validated"}'`. |
+| RPC parameters | Pass JSON params as a single quoted JSON object, for example `quaxar rpc account_info '{"account":"...","ledger_index":"validated"}'`. |
 
 ## Architecture
 
@@ -268,7 +268,7 @@ xrpl/                            xrpld/
 ```
 
 The `xrpl` crates hold shared protocol and data structure foundations. The
-`xrpld` crates hold the node runtime, peer overlay, ledger acquisition, storage
+`quaxar` crates hold the node runtime, peer overlay, ledger acquisition, storage
 integration, RPC server, transaction engine, and operator command line.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design document.

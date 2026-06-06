@@ -39,7 +39,7 @@ The installer will:
 - Assess your hardware and warn if below requirements
 - Let you choose Docker or local build
 - Install all dependencies
-- Build and install `xrpld` to your PATH
+- Build and install `quaxar` to your PATH
 - Generate config files (all fields configurable)
 - Optionally set up a systemd service
 
@@ -213,7 +213,7 @@ Wants=network-online.target
 Type=simple
 User=xrpld
 Group=xrpld
-ExecStart=/usr/local/bin/xrpld --conf /etc/xrpld/xrpld.cfg
+ExecStart=/usr/local/bin/quaxar --conf /etc/xrpld/xrpld.cfg
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536
@@ -233,7 +233,7 @@ sudo systemctl enable --now xrpld
 ### Health Check
 
 ```bash
-xrpld health
+quaxar health
 # Exit code 0 = reachable (healthy or syncing)
 # Exit code 1 = unreachable (down)
 ```
@@ -249,7 +249,7 @@ Expected healthy states: `full`, `proposing`, `validating`.
 ### Database Usage
 
 ```bash
-xrpld db-stats --conf /etc/xrpld.cfg
+quaxar db-stats --conf /etc/xrpld.cfg
 ```
 
 Shows the configured node-store path, NuDB data/key/log file sizes, total disk
@@ -258,15 +258,15 @@ usage, and live node-store counters when the local RPC server is reachable.
 For raw counters:
 
 ```bash
-xrpld get-counts
+quaxar get-counts
 ```
 
 For one-off RPC checks:
 
 ```bash
-xrpld server-info
-xrpld server-state
-xrpld rpc ledger '{"ledger_index":"validated"}'
+quaxar server-info
+quaxar server-state
+quaxar rpc ledger '{"ledger_index":"validated"}'
 ```
 
 ## Log Management
@@ -275,17 +275,17 @@ Control log verbosity with the `RUST_LOG` environment variable:
 
 ```bash
 # Levels: error, warn, info, debug, trace
-RUST_LOG=info ./xrpld --conf xrpld.cfg
+RUST_LOG=info ./quaxar --conf xrpld.cfg
 
 # Per-module control
-RUST_LOG=info,consensus=debug,overlay=warn ./xrpld --conf xrpld.cfg
+RUST_LOG=info,consensus=debug,overlay=warn ./quaxar --conf xrpld.cfg
 ```
 
 Change at runtime:
 
 ```bash
-xrpld log-level debug
-xrpld log-rotate
+quaxar log-level debug
+quaxar log-rotate
 ```
 
 ## Common Issues

@@ -13,7 +13,7 @@ ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld"
 ENV ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu
 
 RUN cargo build --release -p xrpld-main && \
-    strip target/release/xrpld
+    strip target/release/quaxar
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y \
     && mkdir -p /var/lib/xrpld /etc/xrpld \
     && chown xrpld:xrpld /var/lib/xrpld
 
-COPY --from=builder /src/target/release/xrpld /usr/local/bin/xrpld
+COPY --from=builder /src/target/release/quaxar /usr/local/bin/quaxar
 COPY --from=builder /src/xrpld.cfg /etc/xrpld/xrpld.cfg
 COPY --from=builder /src/validators.txt /etc/xrpld/validators.txt
 
@@ -35,7 +35,7 @@ WORKDIR /var/lib/xrpld
 EXPOSE 5005 6006 51235
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD /usr/local/bin/xrpld health --rpc-url http://127.0.0.1:5005 || exit 1
+    CMD /usr/local/bin/quaxar health --rpc-url http://127.0.0.1:5005 || exit 1
 
-ENTRYPOINT ["xrpld"]
+ENTRYPOINT ["quaxar"]
 CMD ["--conf", "/etc/xrpld/xrpld.cfg"]

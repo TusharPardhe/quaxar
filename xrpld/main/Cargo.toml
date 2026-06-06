@@ -6,7 +6,7 @@ license = "Apache-2.0"
 publish = false
 
 [[bin]]
-name = "xrpld"
+name = "quaxar"
 path = "src/main.rs"
 
 [dependencies]

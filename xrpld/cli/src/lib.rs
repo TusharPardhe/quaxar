@@ -25,7 +25,7 @@ pub mod validators;
 pub mod version;
 
 #[derive(Parser)]
-#[command(name = "xrpld", about = "XRPL Rust Node", version)]
+#[command(name = "quaxar", about = "Quaxar XRPL Node", version)]
 pub struct Cli {
     /// Subcommand to run. If none, starts the node.
     #[command(subcommand)]

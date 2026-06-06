@@ -14,7 +14,7 @@ pub const AMENDMENT_MAJORITY_NUMERATOR: u32 = 80;
 pub const AMENDMENT_MAJORITY_DENOMINATOR: u32 = 100;
 
 pub fn system_name() -> &'static str {
-    "xrpld"
+    "quaxar"
 }
 
 pub fn is_legal_amount(amount: XRPAmount) -> bool {
