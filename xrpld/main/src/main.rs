@@ -898,8 +898,12 @@ fn main() -> ExitCode {
     });
 
     tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_filter(filter_layer),
+        )
         .init();
 
     tracing::info!(target: "main", version = env!("CARGO_PKG_VERSION"), "XRPLD starting");
