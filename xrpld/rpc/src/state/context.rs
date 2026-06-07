@@ -2770,15 +2770,50 @@ impl RpcRuntime for ApplicationRoot {
             chunks: Vec::new(),
         };
 
-        let path = Path::new(output_path);
-        export_snapshot(backend.as_ref(), &manifest, path)
-            .map_err(|e| format!("{e}"))?;
+        let ledger_seq = header.seq;
+        let ledger_hash = header.hash.to_string();
+        let account_hash = header.account_hash.to_string();
+        let output_owned = output_path.to_owned();
+
+        // Spawn export on a background thread to avoid blocking the RPC handler
+        // and to prevent memory pressure on the main thread pool.
+        std::thread::Builder::new()
+            .name(format!("snapshot-export-{}", ledger_seq))
+            .spawn(move || {
+                let path = Path::new(&output_owned);
+                tracing::info!(
+                    target: "snapshot",
+                    ledger_seq,
+                    path = %path.display(),
+                    "Background snapshot export started"
+                );
+                match export_snapshot(backend.as_ref(), &manifest, path) {
+                    Ok(()) => {
+                        tracing::info!(
+                            target: "snapshot",
+                            ledger_seq,
+                            path = %path.display(),
+                            "Snapshot export completed successfully"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "snapshot",
+                            error = %e,
+                            ledger_seq,
+                            "Snapshot export failed"
+                        );
+                    }
+                }
+            })
+            .map_err(|e| format!("Failed to spawn export thread: {e}"))?;
 
         Ok(protocol::json!({
-            "status": "success",
-            "ledger_seq": header.seq,
-            "ledger_hash": header.hash.to_string(),
-            "account_hash": header.account_hash.to_string(),
+            "status": "started",
+            "message": "Snapshot export running in background. Monitor progress in logs.",
+            "ledger_seq": ledger_seq,
+            "ledger_hash": ledger_hash,
+            "account_hash": account_hash,
             "output": output_path
         }))
     }

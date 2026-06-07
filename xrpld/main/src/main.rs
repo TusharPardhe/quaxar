@@ -5780,7 +5780,6 @@ mod tests;
 
 fn run_export_snapshot(url: &str, output: &str) -> bool {
     println!("Requesting snapshot export to {}...", output);
-    println!("Sending export_snapshot RPC to {}", url);
 
     let request_json = serde_json::json!({
         "method": "export_snapshot",
@@ -5788,7 +5787,7 @@ fn run_export_snapshot(url: &str, output: &str) -> bool {
     });
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(3600))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .unwrap();
 
@@ -5801,18 +5800,27 @@ fn run_export_snapshot(url: &str, output: &str) -> bool {
         .send()
     {
         Ok(response) => {
-            let status = response.status();
             let text = response.text().unwrap_or_default();
-            if status.is_success() {
-                println!("{}", text);
-                true
-            } else {
-                eprintln!("RPC error (HTTP {}): {}", status, text);
-                false
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(status) = json["result"]["status"].as_str() {
+                    if status == "started" {
+                        let seq = json["result"]["ledger_seq"].as_u64().unwrap_or(0);
+                        println!("  ✓ Export started (ledger seq: {})", seq);
+                        println!("  → Output: {}", output);
+                        println!("  → Monitor progress: grep snapshot ~/quaxar.log");
+                        return true;
+                    }
+                }
+                if let Some(error) = json["result"]["error_message"].as_str() {
+                    eprintln!("  ✗ {}", error);
+                    return false;
+                }
             }
+            eprintln!("{}", text);
+            false
         }
         Err(error) => {
-            eprintln!("Failed to connect to RPC server at {}: {}", url, error);
+            eprintln!("Failed to connect to node at {}: {}", url, error);
             eprintln!("Make sure the node is running and the RPC port is accessible.");
             false
         }
