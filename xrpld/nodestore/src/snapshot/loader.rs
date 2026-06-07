@@ -63,6 +63,10 @@ pub fn load_snapshot(
 
     // Read and process each chunk
     let mut total_nodes: u64 = 0;
+    let estimated_nodes = chunk_count as u64 * 30_000;
+    backend.bulk_import_start(estimated_nodes)
+        .map_err(|e| SnapshotError::BackendWriteFailed { reason: format!("bulk_import_start: {e}") })?;
+
     for (i, meta) in manifest.chunks.iter().enumerate() {
         let mut compressed = vec![0u8; meta.compressed_len as usize];
         reader.read_exact(&mut compressed)
@@ -116,6 +120,9 @@ pub fn load_snapshot(
         }
     }
 
+    backend.bulk_import_finish()
+        .map_err(|e| SnapshotError::BackendWriteFailed { reason: format!("bulk_import_finish: {e}") })?;
+
     // Read and verify footer
     let mut footer = [0u8; SNAPSHOT_FOOTER_SIZE];
     reader.read_exact(&mut footer)
@@ -137,6 +144,9 @@ pub fn load_snapshot(
         elapsed_ms = start.elapsed().as_millis() as u64,
         "Snapshot load complete, integrity verified"
     );
+
+    // TODO: Verify SHAMap root hash matches manifest.account_hash
+    // Requires the SHAMap crate; chunk-level SHA-256 already catches corruption.
 
     Ok(manifest)
 }

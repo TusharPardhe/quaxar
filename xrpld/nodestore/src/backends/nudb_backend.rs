@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use xxhash_rust::xxh64::xxh64;
@@ -674,6 +674,8 @@ pub struct NuDbBackend {
     /// Track data/key file sizes in memory to avoid fstat() syscalls.
     data_file_size: AtomicU64,
     key_file_size: AtomicU64,
+    /// When true, store() skips existence checks and burst checkpoints for fast bulk loading.
+    bulk_importing: AtomicBool,
 }
 
 /// Persistent file descriptors for NuDB key and data files.
@@ -742,6 +744,7 @@ impl NuDbBackend {
             bucket_cache: Mutex::new(HashMap::new()),
             data_file_size: AtomicU64::new(0),
             key_file_size: AtomicU64::new(0),
+            bulk_importing: AtomicBool::new(false),
         })
     }
 
@@ -1943,13 +1946,16 @@ impl Backend for NuDbBackend {
 
     fn store(&self, object: Arc<NodeObject>) {
         // Check existence OUTSIDE the store_mutex — pread is thread-safe.
-        match self.find_bucket_entry(object.hash().data()) {
-            Ok(Some(_)) => return,
-            Ok(None) => {}
-            Err(error) => {
-                tracing::error!(target: "nodestore", error = %error, "Node store write failed");
-                self.journal.log(JournalLevel::Error, &error);
-                return;
+        // Skip during bulk import for massive speedup (no disk reads per node).
+        if !self.bulk_importing.load(Ordering::Relaxed) {
+            match self.find_bucket_entry(object.hash().data()) {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(target: "nodestore", error = %error, "Node store write failed");
+                    self.journal.log(JournalLevel::Error, &error);
+                    return;
+                }
             }
         }
 
@@ -1977,6 +1983,8 @@ impl Backend for NuDbBackend {
             .lock()
             .expect("nudb backend store mutex must not be poisoned");
 
+        let bulk_importing = self.bulk_importing.load(Ordering::Relaxed);
+
         let key_header = {
             let mut runtime = self
                 .runtime
@@ -1991,21 +1999,25 @@ impl Backend for NuDbBackend {
                 self.journal.log(JournalLevel::Error, &error);
                 return;
             }
-            runtime.split_fraction = runtime.split_fraction.saturating_add(65_536);
-            if runtime.split_fraction >= runtime.split_threshold {
-                runtime.split_fraction -= runtime.split_threshold;
-                if let Err(error) = self.split_one_bucket(&mut runtime) {
-                    self.journal.log(JournalLevel::Error, &error);
-                    return;
+            if !bulk_importing {
+                runtime.split_fraction = runtime.split_fraction.saturating_add(65_536);
+                if runtime.split_fraction >= runtime.split_threshold {
+                    runtime.split_fraction -= runtime.split_threshold;
+                    if let Err(error) = self.split_one_bucket(&mut runtime) {
+                        self.journal.log(JournalLevel::Error, &error);
+                        return;
+                    }
                 }
             }
             runtime
                 .key_header
                 .expect("nudb runtime header must exist after ensure_primary_bucket")
         };
-        if let Err(error) = self.begin_burst_checkpoint_if_needed(&key_header) {
-            self.journal.log(JournalLevel::Error, &error);
-            return;
+        if !bulk_importing {
+            if let Err(error) = self.begin_burst_checkpoint_if_needed(&key_header) {
+                self.journal.log(JournalLevel::Error, &error);
+                return;
+            }
         }
         // Use pre-computed compressed data — no re-encoding under the lock.
         let key_size = usize::from(key_header.key_size);
@@ -2045,8 +2057,10 @@ impl Backend for NuDbBackend {
         }
         let size_bytes = compressed.len();
         tracing::debug!(target: "nodestore", hash = %object.hash(), size_bytes, "Node object stored");
-        if let Err(error) = self.finish_burst_write() {
-            self.journal.log(JournalLevel::Error, &error);
+        if !bulk_importing {
+            if let Err(error) = self.finish_burst_write() {
+                self.journal.log(JournalLevel::Error, &error);
+            }
         }
     }
 
@@ -2067,6 +2081,21 @@ impl Backend for NuDbBackend {
             let _ = fds.data_write.sync_data();
             let _ = fds.key_write.sync_data();
         }
+    }
+
+    fn bulk_import_start(&self, _estimated_nodes: u64) -> Result<(), String> {
+        tracing::info!(target: "nodestore", "NuDB bulk import mode started");
+        self.bulk_importing.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn bulk_import_finish(&self) -> Result<(), String> {
+        tracing::info!(target: "nodestore", "NuDB bulk import finishing — flushing bucket cache");
+        self.bulk_importing.store(false, Ordering::Release);
+        self.flush_bucket_cache()?;
+        self.sync();
+        tracing::info!(target: "nodestore", "NuDB bulk import complete");
+        Ok(())
     }
 
     fn for_each(&self, callback: &mut dyn FnMut(Arc<NodeObject>)) {
