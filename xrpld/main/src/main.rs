@@ -5850,6 +5850,15 @@ fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
         }
     };
 
+    // Resolve sharded NuDB layout: actual files live in xrpldb.NNNN subdirectories.
+    let mut node_db = node_db;
+    if let Ok(Some(base_path)) = node_db.get::<String>("path") {
+        let writable_path = Path::new(&base_path).join("xrpldb.0000");
+        if writable_path.join("nudb.dat").exists() {
+            node_db.set("path", writable_path.to_string_lossy().into_owned());
+        }
+    }
+
     let manager = ManagerImp::instance();
     let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
     let journal: Arc<dyn nodestore::NodeStoreJournal> = Arc::new(NullJournal);
