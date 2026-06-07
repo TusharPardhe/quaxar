@@ -528,6 +528,13 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
     let mut ip: Option<String> = None;
     let mut is_http = false;
 
+    fn rpc_host(ip: Option<&str>) -> &str {
+        match ip {
+            Some("0.0.0.0") | None => "127.0.0.1",
+            Some(h) => h,
+        }
+    }
+
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('#') || trimmed.is_empty() {
@@ -537,7 +544,7 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
             // Save previous section if it was HTTP
             if in_port_section && is_http {
                 if let Some(p) = port {
-                    let host = ip.as_deref().unwrap_or("127.0.0.1");
+                    let host = rpc_host(ip.as_deref());
                     return Some(format!("http://{}:{}", host, p));
                 }
             }
@@ -548,7 +555,7 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
         } else if trimmed.starts_with('[') {
             if in_port_section && is_http {
                 if let Some(p) = port {
-                    let host = ip.as_deref().unwrap_or("127.0.0.1");
+                    let host = rpc_host(ip.as_deref());
                     return Some(format!("http://{}:{}", host, p));
                 }
             }
@@ -573,7 +580,7 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
     // Check last section
     if in_port_section && is_http {
         if let Some(p) = port {
-            let host = ip.as_deref().unwrap_or("127.0.0.1");
+            let host = rpc_host(ip.as_deref());
             return Some(format!("http://{}:{}", host, p));
         }
     }
