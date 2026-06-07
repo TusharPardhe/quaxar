@@ -1,16 +1,18 @@
-# Stage 1: Build
-FROM rust:1.90-slim AS builder
+# Stage 1: Build (same base as runtime to avoid glibc mismatch)
+FROM debian:bookworm-slim AS builder
 
 RUN apt-get update && apt-get install -y \
-    pkg-config libssl-dev librocksdb-dev clang lld cmake \
-    && rm -rf /var/lib/apt/lists/*
+    curl build-essential pkg-config libssl-dev clang lld cmake perl \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.90.0
+
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /src
 COPY . .
 
 ENV CARGO_INCREMENTAL=0
 ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld"
-ENV ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu
 
 RUN cargo build --release -p xrpld-main && \
     strip target/release/quaxar
@@ -19,15 +21,13 @@ RUN cargo build --release -p xrpld-main && \
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
-    ca-certificates libssl3 librocksdb8.9 \
+    ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /bin/false xrpld \
     && mkdir -p /var/lib/xrpld /etc/xrpld \
     && chown xrpld:xrpld /var/lib/xrpld
 
 COPY --from=builder /src/target/release/quaxar /usr/local/bin/quaxar
-COPY --from=builder /src/xrpld.cfg /etc/xrpld/xrpld.cfg
-COPY --from=builder /src/validators.txt /etc/xrpld/validators.txt
 
 USER xrpld
 WORKDIR /var/lib/xrpld
