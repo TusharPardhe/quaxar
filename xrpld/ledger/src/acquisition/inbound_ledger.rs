@@ -2631,7 +2631,7 @@ impl InboundLedgerPeerDataCounts {
 }
 
 fn sample_peer_ids(scores: &[InboundLedgerPeerScore], max: usize) -> Vec<u64> {
-    sample_peer_ids_with(scores, max, &mut |upper| rand_int_to(upper))
+    sample_peer_ids_with(scores, max, &mut |len| rand_int_to(len - 1))
 }
 
 fn sample_peer_ids_with<PICK>(
