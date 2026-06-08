@@ -20,8 +20,9 @@ curl -s http://127.0.0.1:5005 \
 | `server_state` | Detailed server state for monitoring |
 | `fee` | Current transaction fee estimates |
 | `peers` | Connected peer list with latency and version |
-| `log_level` | Get or set log verbosity |
+| `log_level` | Get or set log verbosity at runtime |
 | `get_counts` | Internal object counts and memory usage |
+| `export_snapshot` | Export node store to LZ4 snapshot file (admin only) |
 | `stop` | Graceful server shutdown (admin only) |
 | `connect` | Connect to a specific peer (admin only) |
 
@@ -165,6 +166,58 @@ curl -s http://127.0.0.1:5005 \
     },
     "expected_ledger_size": "200",
     "ledger_current_index": 95000001,
+    "status": "success"
+  }
+}
+```
+
+### export_snapshot
+
+Trigger a snapshot export. Runs in a background thread; the node stays online.
+Output is an LZ4 compressed file with SHA-256 chunk integrity. Admin only.
+
+**Request:**
+```json
+{
+  "method": "export_snapshot",
+  "params": [{}]
+}
+```
+
+**Response:**
+```json
+{
+  "result": {
+    "message": "Snapshot export started",
+    "status": "success"
+  }
+}
+```
+
+### log_level
+
+Get or set log verbosity at runtime. Supports global level or per-partition.
+
+**Set global level:**
+```json
+{
+  "method": "log_level",
+  "params": [{"severity": "debug"}]
+}
+```
+
+**Set partition level:**
+```json
+{
+  "method": "log_level",
+  "params": [{"severity": "debug", "partition": "consensus"}]
+}
+```
+
+**Response:**
+```json
+{
+  "result": {
     "status": "success"
   }
 }

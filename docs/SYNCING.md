@@ -10,6 +10,19 @@ Sync progresses through three phases:
 2. **Parallel Acquisition** — Download the full state tree and recent ledger history
 3. **Tracking Tip** — Follow new validated ledgers in real-time
 
+## Bootstrap Options
+
+| Method | Time (NVMe) | Requirements |
+|--------|-------------|--------------|
+| Snapshot import | ~3 minutes | Snapshot file from existing node |
+| Network sync | 4–36 hours | Peers, bandwidth, RAM |
+
+**Snapshot import** is the fastest path. Load a snapshot exported from another
+node using `quaxar load-snapshot --input <file> --conf <config>`. The node must
+be stopped during import. See [RUNNING.md](RUNNING.md) for the full workflow.
+
+If no snapshot is available, the node syncs from the network as described below.
+
 ## Initial Sync
 
 On first start, the node must download the complete state tree (~50 million nodes). This is the most resource-intensive phase.

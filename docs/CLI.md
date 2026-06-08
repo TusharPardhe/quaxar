@@ -62,6 +62,8 @@ Features:
 | `log-level [level]` | Get or set log level |
 | `benchmark` | Run internal performance benchmarks |
 | `validator-keys` | Key management (see below) |
+| `export-snapshot` | Export node store to snapshot file (admin RPC) |
+| `load-snapshot` | Import snapshot into node store (offline) |
 | `doctor` | Diagnose common configuration issues |
 | `stop` | Graceful shutdown |
 | `version` | Build version, commit hash, and build time |
@@ -149,6 +151,37 @@ quaxar version
 # Graceful stop
 quaxar stop
 ```
+
+## Snapshot Commands
+
+### export-snapshot
+
+Trigger a snapshot export via the admin RPC. The node remains online while the
+export runs in a background thread.
+
+```bash
+quaxar export-snapshot
+```
+
+This calls the `export_snapshot` RPC method. The output file is written to the
+configured node store path. See [RPC.md](RPC.md) for details on the RPC method.
+
+### load-snapshot
+
+Import a snapshot file into the node store. The node must be stopped before
+running this command.
+
+```bash
+quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/xrpld/xrpld.cfg
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--input` | Yes | Path to snapshot file |
+| `--conf` | Yes | Path to config file (determines NuDB path) |
+
+The import uses bulk loading mode with pre-allocated NuDB hash tables. On NVMe,
+26.5M nodes load in approximately 3 minutes.
 
 ## Exit Codes
 

@@ -49,8 +49,8 @@ configuration may still change as parity work continues.
 | Area | Current support |
 | --- | --- |
 | Protocol | XRP Ledger serialization, field definitions, amendments, transaction models, and SHAMap support. |
-| Ledger sync | Parallel ledger acquisition, shared fetch cache, NuDB persistence, and configurable acquisition limits. |
-| Storage | NuDB node store support with RocksDB configuration surfaces where implemented. |
+| Ledger sync | Parallel ledger acquisition, shared fetch cache, NuDB persistence, snapshot export/import, and configurable acquisition limits. |
+| Storage | NuDB node store with bulk import mode, streaming export, and RocksDB configuration surfaces where implemented. |
 | RPC | HTTP and WebSocket JSON RPC with public and admin command handling. |
 | Transactions | Core payment, account, trust line, NFT, AMM, MPT, vault, lending, queue, and invariant paths under active parity coverage. |
 | Operations | Interactive CLI, health checks, sync status, peer inspection, database statistics, log controls, and validator key tools. |
@@ -195,6 +195,8 @@ suggestions, clear errors for unknown commands, and direct RPC passthrough.
 | `amendments` | Show amendment voting status. |
 | `validator-keys` | Generate, inspect, sign, and revoke validator keys. |
 | `benchmark` | Run internal performance benchmarks. |
+| `export-snapshot` | Export node store to a snapshot file (background, node stays online). |
+| `load-snapshot` | Import a snapshot file into the node store (offline). |
 | `doctor` | Diagnose common configuration and runtime issues. |
 | `stop` | Request graceful shutdown. |
 | `version` | Show build version, commit hash, and build time. |

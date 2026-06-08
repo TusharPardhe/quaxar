@@ -58,6 +58,21 @@
 - No persistent `Interval` that ties to a specific runtime
 - Prevents "runtime is being shutdown" panics across runtime boundaries
 
+## Storage Optimizations
+
+### 11. Streaming for_each (NuDB export)
+- NuDB `for_each` no longer buffers all records in memory
+- Streams one record at a time via bucket traversal
+- Enables exporting 26.5M nodes without proportional memory growth
+- Used by the `export_snapshot` RPC command
+
+### 12. Bulk Import Mode
+- `bulk_import_start/finish` on NuDB backend for snapshot loading
+- Skips existence checks (all keys are known to be unique)
+- Suppresses burst checkpoints and bucket splits during load
+- Pre-allocates NuDB hash table based on expected record count
+- Loads 26.5M nodes in ~3 minutes on NVMe
+
 ## RPC Parity Status
 
 All major RPC methods are implemented with full C++ parity:

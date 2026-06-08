@@ -288,6 +288,33 @@ quaxar log-level debug
 quaxar log-rotate
 ```
 
+## Bootstrapping from Snapshot
+
+The fastest way to bring up a new node is to load a snapshot exported from an
+existing synced node. This bypasses the multi-hour network sync entirely.
+
+**On the source node (online):**
+
+```bash
+quaxar rpc export_snapshot
+```
+
+The export runs in a background thread. On NVMe, 26.5M nodes export in ~3
+minutes. The snapshot file uses LZ4 compressed chunks with SHA-256 integrity
+verification.
+
+**On the new node (stopped):**
+
+```bash
+quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/xrpld/xrpld.cfg
+```
+
+After import completes, start the node normally. It will resume from the
+snapshot state and catch up to the network tip within minutes.
+
+See [CLI.md](CLI.md) for command details and [SYNCING.md](SYNCING.md) for
+alternative sync methods.
+
 ## Common Issues
 
 | Problem | Cause | Fix |
