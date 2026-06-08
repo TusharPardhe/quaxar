@@ -2593,6 +2593,15 @@ pub fn do_submit<Runtime: RpcRuntime>(
         _ => None,
     };
 
+    // If tx_blob is not present, fall back to deprecated sign-and-submit mode
+    // (signing with secret + tx_json, same as rippled compatibility).
+    if tx_blob.is_none() {
+        let has_secret = matches!(ctx.params, JsonValue::Object(obj) if obj.contains_key(jss::secret) || obj.contains_key(jss::key_type));
+        if has_secret {
+            return submit_with_sign(ctx);
+        }
+    }
+
     let tx_blob_hex = tx_blob.ok_or_else(|| Status::new(RpcErrorCode::InvalidParams))?;
     let bytes = hex::decode(tx_blob_hex).map_err(|_| Status::new(RpcErrorCode::InvalidParams))?;
     let st_tx = match parse_sttx_from_bytes(&bytes) {
@@ -2611,4 +2620,61 @@ pub fn do_submit<Runtime: RpcRuntime>(
         tx_blob_hex,
         parse_fail_hard(ctx.params),
     ))
+}
+
+/// Deprecated sign-and-submit mode: signs the transaction server-side using the
+/// provided secret/seed, then submits it. This matches rippled's legacy behavior
+/// for backward compatibility. Users should migrate to client-side signing.
+fn submit_with_sign<Runtime: RpcRuntime>(
+    ctx: &RpcRequestContext<'_, SubmitSource, Runtime>,
+) -> Result<JsonValue, Status> {
+    use crate::commands::rpc_helpers::transaction_sign;
+
+    // Reinterpret the context with a temporary SignSource for the sign call
+    let sign_ctx = RpcRequestContext {
+        params: ctx.params,
+        env: &crate::signing::sign::SignSource,
+        runtime: ctx.runtime,
+        role: ctx.role,
+        api_version: ctx.api_version,
+        headers: ctx.headers.clone(),
+        request_headers: ctx.request_headers.clone(),
+        unlimited: ctx.unlimited,
+        remote_ip: ctx.remote_ip,
+        load_type: ctx.load_type,
+    };
+
+    let sign_result = transaction_sign(&sign_ctx)?;
+
+    // Extract tx_blob from sign result
+    let tx_blob_hex = match &sign_result {
+        JsonValue::Object(obj) => obj
+            .get(jss::tx_blob)
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| Status::new(RpcErrorCode::Internal))?,
+        _ => return Err(Status::new(RpcErrorCode::Internal)),
+    };
+
+    let bytes =
+        hex::decode(tx_blob_hex).map_err(|_| Status::new(RpcErrorCode::InvalidParams))?;
+    let st_tx = parse_sttx_from_bytes(&bytes)
+        .map_err(|e| Status::with_message(RpcErrorCode::Internal, e))?;
+
+    let fail_hard = parse_fail_hard(ctx.params);
+    let mut result = submit_sttx(ctx, st_tx, tx_blob_hex, fail_hard);
+
+    // Mark as deprecated — users should migrate to client-side signing
+    if let JsonValue::Object(ref mut obj) = result {
+        obj.insert(
+            jss::deprecated.to_string(),
+            JsonValue::String(
+                "Signing support in the 'submit' command has been deprecated and will be \
+                 removed in a future version of the server. Please migrate to a standalone \
+                 signing tool."
+                    .to_owned(),
+            ),
+        );
+    }
+
+    Ok(result)
 }
