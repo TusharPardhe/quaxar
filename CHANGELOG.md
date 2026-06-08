@@ -7,6 +7,39 @@ and this project adheres to [Conventional Commits](https://www.conventionalcommi
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-08
+
+### Added
+
+- **Snapshot export** — Live snapshot export via `export_snapshot` admin RPC while the node continues running. Streams 26.5M nodes in ~3 minutes on NVMe (background thread, 16 MB peak memory)
+- **Snapshot import** — Bulk import mode with pre-allocated hash table, skipped existence checks, and deferred bucket splits. Loads 26.5M nodes in ~3 minutes
+- **export-snapshot CLI** — Triggers export via RPC to the running node, returns immediately with progress in logs
+- **load-snapshot CLI** — Offline import with sharded NuDB path resolution and crash recovery markers
+- **Dynamic log level** — Runtime log level changes via `log_level` RPC using tracing-subscriber reload handle. Partition-scoped and input-validated
+- **Snapshot scheduler** — Configurable automatic exports every N ledgers on a background thread
+- **Windows installer** — PowerShell installer script for cross-platform support
+- **Binary rename** — Renamed binary from `xrpld` to `quaxar`
+
+### Fixed
+
+- **Peer sampling panic** — Off-by-one in `sample_peer_ids` caused `swap_remove` panic when `rand_int_to` (inclusive) returned `len` instead of `len-1`. Reported by [@donovanihide](https://github.com/donovanihide)
+- **Inbound peer connections** — Peer listener failed to bind because TLS identity was not generated for non-secure ports. Now always generates anonymous TLS for the peer protocol
+- **CLI RPC URL resolution** — CLI connected to `0.0.0.0` instead of `127.0.0.1` when config bound to all interfaces, causing admin permission failures
+- **RPC handler delegation** — `export_snapshot` and `log_level_set` were not delegated from `ApplicationServerInfo` to `ApplicationRoot`, returning "Not implemented"
+- **Export OOM** — Snapshot export ran synchronously on RPC thread, causing OOM on 32 GB machines. Now spawns a background thread
+- **NuDB for_each memory** — `scan_indexed_records` loaded all 26.5M records into a Vec before iterating. Now streams one record at a time via bucket traversal
+
+### Performance
+
+- **Bulk import mode** — NuDB `bulk_import_start/finish` bypasses existence checks, burst checkpoints, and bucket splits during snapshot loading (100x faster)
+- **Streaming for_each** — Eliminates multi-GB memory allocation during export by processing records inline during bucket iteration
+- **Pre-allocated hash table** — Bulk import pre-creates buckets based on estimated node count, avoiding 26.5M incremental split operations
+
+### Changed
+
+- **Dockerfile** — Uses `debian:bookworm-slim` for both build and runtime stages to avoid glibc mismatch. Statically links RocksDB
+- **install.sh** — RPC and WebSocket bind to `0.0.0.0` by default with `admin = 127.0.0.1` so admin commands work out of the box
+
 ## [0.1.0] - 2025-05-25
 
 ### Added

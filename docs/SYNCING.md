@@ -1,6 +1,6 @@
 # Syncing
 
-How xrpld synchronizes with the XRP Ledger network.
+How quaxar synchronizes with the XRP Ledger network.
 
 ## Overview
 
@@ -46,7 +46,7 @@ Times vary based on network conditions and peer availability.
 ### sync-status command
 
 ```bash
-xrpld sync-status
+quaxar sync-status
 ```
 
 Output:
@@ -99,7 +99,7 @@ A node has "full" state when:
 **Fix:**
 ```bash
 # Check peer count
-xrpld peers
+quaxar peers
 
 # Add fixed peers to config
 # [ips_fixed]
@@ -132,4 +132,4 @@ xrpld peers
 - Use NVMe SSD
 - Ensure 100+ Mbps network
 - Add more `[ips_fixed]` entries for reliable peers
-- Check `xrpld peers` — need at least 5–10 connected peers
+- Check `quaxar peers` — need at least 5–10 connected peers

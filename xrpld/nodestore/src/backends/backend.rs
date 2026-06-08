@@ -38,6 +38,13 @@ pub trait Backend: Send + Sync + 'static {
 
     fn sync(&self);
 
+    /// Begin bulk import mode. Optimized for loading millions of nodes sequentially.
+    /// Skips existence checks, disables burst checkpoints, pre-allocates structures.
+    fn bulk_import_start(&self, _estimated_nodes: u64) -> Result<(), String> { Ok(()) }
+
+    /// Finish bulk import. Flushes all data to disk, builds indexes.
+    fn bulk_import_finish(&self) -> Result<(), String> { Ok(()) }
+
     fn for_each(&self, callback: &mut dyn FnMut(Arc<NodeObject>));
 
     fn get_write_load(&self) -> i32;

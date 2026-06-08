@@ -1,6 +1,6 @@
 # Configuration Reference
 
-This file explains the runtime configuration used by `xrpld`. Keep `xrpld.cfg`
+This file explains the runtime configuration used by `quaxar`. Keep `xrpld.cfg`
 focused on actual values; use this document for operational guidance.
 
 ## Loading A Config
@@ -8,7 +8,7 @@ focused on actual values; use this document for operational guidance.
 Run with an explicit config path:
 
 ```bash
-xrpld --conf /etc/xrpld/xrpld.cfg
+quaxar --conf /etc/xrpld/xrpld.cfg
 ```
 
 Docker Compose mounts the repository `xrpld.cfg` to `/etc/xrpld/xrpld.cfg`

@@ -2371,6 +2371,10 @@ pub trait RpcRuntime {
     fn peer_reservations_list(&self) -> JsonValue {
         protocol::json!({ "reservations": [] })
     }
+
+    fn export_snapshot(&self, _output_path: &str) -> Result<JsonValue, String> {
+        Err("Not implemented".to_owned())
+    }
 }
 
 impl RpcRuntime for () {}
@@ -2676,9 +2680,35 @@ impl RpcRuntime for ApplicationRoot {
         Status::OK
     }
 
-    fn log_level_set(&self, partition: String, _level: String) -> Status {
-        self.logs().journal(&partition); // Simplified: actual level set not in AppLogs
-        Status::OK
+    fn log_level_set(&self, partition: String, level: String) -> Status {
+        // Validate level
+        let valid_levels = ["trace", "debug", "info", "warn", "error", "off"];
+        let level_lower = level.to_ascii_lowercase();
+        if !valid_levels.contains(&level_lower.as_str()) {
+            return Status::new(crate::status::RpcErrorCode::InvalidParams);
+        }
+
+        // Validate partition characters (prevent filter injection)
+        if partition != "base" && !partition.is_empty()
+            && !partition.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+        {
+            return Status::new(crate::status::RpcErrorCode::InvalidParams);
+        }
+
+        // Build filter: for "base"/empty set global level, for partition set only that module
+        let filter = if partition == "base" || partition.is_empty() {
+            level_lower
+        } else {
+            format!("info,{}={}", partition, level_lower)
+        };
+
+        match app::reload_log_filter(&filter) {
+            Ok(()) => Status::OK,
+            Err(e) => {
+                tracing::warn!(target: "rpc", error = %e, "log_level_set failed");
+                Status::new(crate::status::RpcErrorCode::InvalidParams)
+            }
+        }
     }
 
     fn log_level_get(&self) -> JsonValue {
@@ -2710,6 +2740,82 @@ impl RpcRuntime for ApplicationRoot {
         protocol::json!({
             "reservations": list.into_iter().map(|r| r.to_json()).collect::<Vec<_>>()
         })
+    }
+
+    fn export_snapshot(&self, output_path: &str) -> Result<JsonValue, String> {
+        use nodestore::snapshot::{SnapshotManifest, manifest::SNAPSHOT_VERSION, export_snapshot};
+        use std::path::Path;
+
+        let validated = self.validated_ledger()
+            .ok_or_else(|| "No validated ledger available".to_owned())?;
+        let header = validated.header();
+
+        let node_store = self.node_store().as_ref()
+            .ok_or_else(|| "NodeStore not configured".to_owned())?;
+        let backend = node_store.export_backend()
+            .ok_or_else(|| "Backend not available for export".to_owned())?;
+
+        let manifest = SnapshotManifest {
+            version: SNAPSHOT_VERSION,
+            ledger_seq: header.seq,
+            ledger_hash: *header.hash.as_uint256().data(),
+            account_hash: *header.account_hash.as_uint256().data(),
+            tx_hash: *header.tx_hash.as_uint256().data(),
+            parent_hash: *header.parent_hash.as_uint256().data(),
+            drops: header.drops,
+            close_time: header.close_time,
+            parent_close_time: header.parent_close_time,
+            close_time_res: header.close_time_resolution,
+            close_flags: header.close_flags,
+            chunks: Vec::new(),
+        };
+
+        let ledger_seq = header.seq;
+        let ledger_hash = header.hash.to_string();
+        let account_hash = header.account_hash.to_string();
+        let output_owned = output_path.to_owned();
+
+        // Spawn export on a background thread to avoid blocking the RPC handler
+        // and to prevent memory pressure on the main thread pool.
+        std::thread::Builder::new()
+            .name(format!("snapshot-export-{}", ledger_seq))
+            .spawn(move || {
+                let path = Path::new(&output_owned);
+                tracing::info!(
+                    target: "snapshot",
+                    ledger_seq,
+                    path = %path.display(),
+                    "Background snapshot export started"
+                );
+                match export_snapshot(backend.as_ref(), &manifest, path) {
+                    Ok(()) => {
+                        tracing::info!(
+                            target: "snapshot",
+                            ledger_seq,
+                            path = %path.display(),
+                            "Snapshot export completed successfully"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "snapshot",
+                            error = %e,
+                            ledger_seq,
+                            "Snapshot export failed"
+                        );
+                    }
+                }
+            })
+            .map_err(|e| format!("Failed to spawn export thread: {e}"))?;
+
+        Ok(protocol::json!({
+            "status": "started",
+            "message": "Snapshot export running in background. Monitor progress in logs.",
+            "ledger_seq": ledger_seq,
+            "ledger_hash": ledger_hash,
+            "account_hash": account_hash,
+            "output": output_path
+        }))
     }
 }
 

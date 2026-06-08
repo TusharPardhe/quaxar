@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────────────────────
-# xrpld installer — interactive setup for the Rust XRPL node
+# quaxar installer — interactive setup for the Rust XRPL node
 # Usage: ./install.sh [-y] [--prefix PATH]
 # ─────────────────────────────────────────────────────────────────────────────
 
 VERSION="0.1.0"
-REPO="https://github.com/TusharPardhe/xrpld.git"
+REPO="https://github.com/TusharPardhe/quaxar.git"
 AUTO_YES=false
 PREFIX=""
 
@@ -303,6 +303,9 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
 elif [[ "$OSTYPE" == "darwin"* ]]; then
     OS="macOS $(sw_vers -productVersion)"
     PKG_MGR="brew"
+elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "mingw"* || "$OSTYPE" == "cygwin" ]]; then
+    OS="Windows ($(uname -s))"
+    PKG_MGR="none"
 fi
 
 echo -e "  OS              ${BOLD}$OS${RESET} (${ARCH})"
@@ -413,13 +416,13 @@ if [ "$INSTALL_METHOD" = "docker" ]; then
     docker compose build
     ok "Docker image built"
     
-    if ask_yn "Start xrpld container now?" "Y"; then
+    if ask_yn "Start quaxar container now?" "Y"; then
         docker compose up -d
-        ok "xrpld container started"
+        ok "quaxar container started"
         echo ""
         echo -e "  ${BOLD}Next steps:${RESET}"
-        echo -e "    docker logs -f xrpld       ${DIM}Follow logs${RESET}"
-        echo -e "    docker exec xrpld xrpld status  ${DIM}Check status${RESET}"
+        echo -e "    docker logs -f quaxar       ${DIM}Follow logs${RESET}"
+        echo -e "    docker exec quaxar quaxar status  ${DIM}Check status${RESET}"
         echo -e "    docker compose down         ${DIM}Stop${RESET}"
     fi
     exit 0
@@ -525,14 +528,14 @@ if [ "$PKG_MGR" = "apt" ] && dpkg -s librocksdb-dev &>/dev/null 2>&1; then
     export ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu
 fi
 
-info "Building xrpld (this may take a few minutes)..."
+info "Building quaxar (this may take a few minutes)..."
 if [ "$RAM_GB" -le 16 ]; then
     CARGO_BUILD_JOBS=2 cargo install --path xrpld/main --force 2>&1 | tail -1
 else
     cargo install --path xrpld/main --force 2>&1 | tail -1
 fi
 
-ok "xrpld installed to $(which xrpld || echo ~/.cargo/bin/xrpld)"
+ok "quaxar installed to $(which quaxar || echo ~/.cargo/bin/quaxar)"
 
 # ── Configuration ────────────────────────────────────────────────────────────
 header "Configuration"
@@ -555,13 +558,13 @@ fi
 if [ "$GENERATE_CONF" = true ]; then
     # Defaults
     RPC_PORT="5005"
-    RPC_IP="127.0.0.1"
+    RPC_IP="0.0.0.0"
     RPC_ADMIN="127.0.0.1"
     RPC_SECURE_GATEWAY=""
     PEER_PORT="51235"
     PEER_IP="0.0.0.0"
     WS_PORT="6006"
-    WS_IP="127.0.0.1"
+    WS_IP="0.0.0.0"
     WS_ADMIN="127.0.0.1"
     WS_SECURE_GATEWAY=""
     WS_SEND_QUEUE_LIMIT="500"
@@ -838,9 +841,9 @@ if [ "$AUTO_YES" = false ]; then
 fi
 
 if [ "$INSTALL_SERVICE" = true ] && command -v systemctl &>/dev/null && sudo -n true 2>/dev/null; then
-    XRPLD_BIN=$(which xrpld 2>/dev/null || echo "$HOME/.cargo/bin/xrpld")
+    XRPLD_BIN=$(which quaxar 2>/dev/null || echo "$HOME/.cargo/bin/quaxar")
 
-    sudo tee /etc/systemd/system/xrpld.service > /dev/null << EOF
+    sudo tee /etc/systemd/system/quaxar.service > /dev/null << EOF
 [Unit]
 Description=XRP Ledger Node (Rust)
 After=network-online.target
@@ -860,12 +863,12 @@ WantedBy=multi-user.target
 EOF
 
     sudo systemctl daemon-reload
-    sudo systemctl enable xrpld
+    sudo systemctl enable quaxar
 
-    ok "Service installed (xrpld.service)"
+    ok "Service installed (quaxar.service)"
 
-    if ask_yn "Start xrpld now?" "Y"; then
-        sudo systemctl start xrpld
+    if ask_yn "Start quaxar now?" "Y"; then
+        sudo systemctl start quaxar
         sleep 3
         ok "xrpld started"
     fi
@@ -877,7 +880,7 @@ fi
 # ── Verification ─────────────────────────────────────────────────────────────
 header "Verification"
 
-XRPLD_BIN=$(which xrpld 2>/dev/null || echo "$HOME/.cargo/bin/xrpld")
+XRPLD_BIN=$(which quaxar 2>/dev/null || echo "$HOME/.cargo/bin/quaxar")
 
 if [ -x "$XRPLD_BIN" ]; then
     VER=$("$XRPLD_BIN" version 2>/dev/null | grep -i version | head -1 || echo "installed")

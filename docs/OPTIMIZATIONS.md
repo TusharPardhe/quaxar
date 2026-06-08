@@ -1,4 +1,4 @@
-# xrpld Rust Node — Optimizations & Technical Notes
+# quaxar Rust Node — Optimizations & Technical Notes
 
 ## Memory Optimizations
 

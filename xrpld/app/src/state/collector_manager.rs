@@ -145,7 +145,7 @@ mod tests {
         let manager = CollectorManager::new(CollectorParams {
             server: "statsd".to_owned(),
             address: "127.0.0.1:8125".to_owned(),
-            prefix: "xrpld".to_owned(),
+            prefix: "quaxar".to_owned(),
         });
 
         let first = manager.group("jobq");

@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the high-level architecture of the xrpld Rust implementation.
+This document describes the high-level architecture of the quaxar Rust implementation.
 
 ## Crate Dependency Diagram
 
@@ -70,7 +70,7 @@ This document describes the high-level architecture of the xrpld Rust implementa
 
 ### Parallel Acquisition
 
-Unlike C++ rippled which acquires ledgers sequentially, xrpld uses a multi-threaded acquisition pipeline:
+Unlike C++ rippled which acquires ledgers sequentially, quaxar uses a multi-threaded acquisition pipeline:
 
 - A coordinator task dispatches ledger sequence ranges to worker threads
 - Each worker independently fetches and validates state/transaction maps

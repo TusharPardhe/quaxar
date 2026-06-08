@@ -528,6 +528,13 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
     let mut ip: Option<String> = None;
     let mut is_http = false;
 
+    fn rpc_host(ip: Option<&str>) -> &str {
+        match ip {
+            Some("0.0.0.0") | None => "127.0.0.1",
+            Some(h) => h,
+        }
+    }
+
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('#') || trimmed.is_empty() {
@@ -537,7 +544,7 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
             // Save previous section if it was HTTP
             if in_port_section && is_http {
                 if let Some(p) = port {
-                    let host = ip.as_deref().unwrap_or("127.0.0.1");
+                    let host = rpc_host(ip.as_deref());
                     return Some(format!("http://{}:{}", host, p));
                 }
             }
@@ -548,7 +555,7 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
         } else if trimmed.starts_with('[') {
             if in_port_section && is_http {
                 if let Some(p) = port {
-                    let host = ip.as_deref().unwrap_or("127.0.0.1");
+                    let host = rpc_host(ip.as_deref());
                     return Some(format!("http://{}:{}", host, p));
                 }
             }
@@ -573,7 +580,7 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
     // Check last section
     if in_port_section && is_http {
         if let Some(p) = port {
-            let host = ip.as_deref().unwrap_or("127.0.0.1");
+            let host = rpc_host(ip.as_deref());
             return Some(format!("http://{}:{}", host, p));
         }
     }
@@ -784,6 +791,12 @@ fn try_cli_subcommand() -> Option<ExitCode> {
             }
             true
         }
+        xrpld_cli::Command::ExportSnapshot { output } => {
+            run_export_snapshot(&url, &output)
+        }
+        xrpld_cli::Command::LoadSnapshot { input } => {
+            run_load_snapshot(&input, parsed.conf.as_deref())
+        }
     };
     Some(if ok {
         ExitCode::SUCCESS
@@ -879,14 +892,22 @@ fn main() -> ExitCode {
         return exit;
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(true)
-        .with_thread_ids(true)
-        .init();
+    use tracing_subscriber::prelude::*;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
+
+    let subscriber = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true));
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber");
+
+    app::set_log_reload_fn(move |new_filter: &str| {
+        let f = tracing_subscriber::EnvFilter::try_new(new_filter)
+            .map_err(|e| format!("Invalid filter: {e}"))?;
+        reload_handle.reload(f).map_err(|e| format!("Reload failed: {e}"))
+    });
 
     tracing::info!(target: "main", version = env!("CARGO_PKG_VERSION"), "XRPLD starting");
 
@@ -5761,3 +5782,131 @@ fn run_rpc_client(options: AppBootstrapOptions) -> ExitCode {
 #[cfg(test)]
 #[path = "main/tests.rs"]
 mod tests;
+
+// ─── Snapshot CLI handlers ───────────────────────────────────────────────────
+
+fn run_export_snapshot(url: &str, output: &str) -> bool {
+    println!("Requesting snapshot export to {}...", output);
+
+    let request_json = serde_json::json!({
+        "method": "export_snapshot",
+        "params": [{"output": output}]
+    });
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
+
+    let body = serde_json::to_string(&request_json).unwrap();
+
+    match client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+    {
+        Ok(response) => {
+            let text = response.text().unwrap_or_default();
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(status) = json["result"]["status"].as_str() {
+                    if status == "started" {
+                        let seq = json["result"]["ledger_seq"].as_u64().unwrap_or(0);
+                        println!("  ✓ Export started (ledger seq: {})", seq);
+                        println!("  → Output: {}", output);
+                        println!("  → Monitor progress: grep snapshot ~/quaxar.log");
+                        return true;
+                    }
+                }
+                if let Some(error) = json["result"]["error_message"].as_str() {
+                    eprintln!("  ✗ {}", error);
+                    return false;
+                }
+            }
+            eprintln!("{}", text);
+            false
+        }
+        Err(error) => {
+            eprintln!("Failed to connect to node at {}: {}", url, error);
+            eprintln!("Make sure the node is running and the RPC port is accessible.");
+            false
+        }
+    }
+}
+
+fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
+    use nodestore::{
+        ManagerImp, Manager, NullJournal, DummyScheduler,
+        snapshot::load_snapshot,
+    };
+    use std::path::Path;
+
+    let config = match load_config_for_snapshot(conf) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error loading config: {e}");
+            return false;
+        }
+    };
+
+    let node_db = match config.section("node_db") {
+        s if s.exists("path") => s.clone(),
+        _ => {
+            eprintln!("Error: [node_db] section with 'path' not found in config");
+            return false;
+        }
+    };
+
+    // Resolve sharded NuDB layout: actual files live in xrpldb.NNNN subdirectories.
+    let mut node_db = node_db;
+    if let Ok(Some(base_path)) = node_db.get::<String>("path") {
+        let writable_path = Path::new(&base_path).join("xrpldb.0000");
+        if writable_path.join("nudb.dat").exists() {
+            node_db.set("path", writable_path.to_string_lossy().into_owned());
+        }
+    }
+
+    let manager = ManagerImp::instance();
+    let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
+    let journal: Arc<dyn nodestore::NodeStoreJournal> = Arc::new(NullJournal);
+
+    let backend = match manager.make_backend(&node_db, 0, scheduler, journal) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Error creating backend: {e}");
+            return false;
+        }
+    };
+
+    if let Err(e) = backend.open(true) {
+        eprintln!("Error opening backend: {e}");
+        return false;
+    }
+
+    let input_path = Path::new(input);
+    println!("Loading snapshot from {}...", input_path.display());
+
+    match load_snapshot(backend.as_ref(), input_path) {
+        Ok(manifest) => {
+            println!(
+                "Snapshot loaded successfully: ledger_seq={}, chunks={}",
+                manifest.ledger_seq,
+                manifest.chunks.len()
+            );
+            backend.sync();
+            let _ = backend.close();
+            true
+        }
+        Err(e) => {
+            eprintln!("Snapshot load failed: {e}");
+            let _ = backend.close();
+            false
+        }
+    }
+}
+
+fn load_config_for_snapshot(conf: Option<&str>) -> Result<BasicConfig, String> {
+    let default_path = "/etc/opt/xrpld/xrpld.cfg";
+    let config_path = conf.unwrap_or(default_path);
+    load_basic_config_file(Path::new(config_path))
+}

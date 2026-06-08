@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use xxhash_rust::xxh64::xxh64;
@@ -674,6 +674,8 @@ pub struct NuDbBackend {
     /// Track data/key file sizes in memory to avoid fstat() syscalls.
     data_file_size: AtomicU64,
     key_file_size: AtomicU64,
+    /// When true, store() skips existence checks and burst checkpoints for fast bulk loading.
+    bulk_importing: AtomicBool,
 }
 
 /// Persistent file descriptors for NuDB key and data files.
@@ -742,6 +744,7 @@ impl NuDbBackend {
             bucket_cache: Mutex::new(HashMap::new()),
             data_file_size: AtomicU64::new(0),
             key_file_size: AtomicU64::new(0),
+            bulk_importing: AtomicBool::new(false),
         })
     }
 
@@ -1094,6 +1097,14 @@ impl NuDbBackend {
         create_if_missing: bool,
         open_args: NuDbOpenArgs,
     ) -> Result<(), String> {
+        // Check for incomplete bulk import (crash recovery marker)
+        let marker_path = self.config.layout.base_path.join(".bulk_import_in_progress");
+        if marker_path.exists() {
+            return Err(
+                "NuDB bulk import was interrupted. Delete NuDB files and re-import.".to_owned(),
+            );
+        }
+
         let mut runtime = self
             .runtime
             .lock()
@@ -1144,23 +1155,23 @@ impl NuDbBackend {
     /// Matches reference NuDB double-buffer flush: write all cached buckets to key file.
     fn flush_bucket_cache(&self) -> Result<(), String> {
         let key_header = self.current_key_header()?;
-        let mut buckets: Vec<(u32, NuDbBucket)> = {
-            let mut cache = self.bucket_cache.lock().unwrap();
-            cache.drain().collect()
-        };
-        if buckets.is_empty() {
+        let mut cache = self.bucket_cache.lock().unwrap();
+        if cache.is_empty() {
             return Ok(());
         }
         // Sort by bucket index for sequential I/O (better disk throughput)
-        buckets.sort_unstable_by_key(|(idx, _)| *idx);
+        let mut buckets: Vec<(&u32, &NuDbBucket)> = cache.iter().collect();
+        buckets.sort_unstable_by_key(|(idx, _)| **idx);
         for (bucket_index, bucket) in &buckets {
-            if *bucket_index >= key_header.buckets {
+            if **bucket_index >= key_header.buckets {
                 continue;
             }
-            let offset = u64::from(*bucket_index + 1) * u64::from(key_header.block_size);
+            let offset = u64::from(**bucket_index + 1) * u64::from(key_header.block_size);
             let bytes = bucket.encode_key_block()?;
             self.pwrite_key(offset, &bytes)?;
         }
+        // Only clear after ALL writes succeed
+        cache.clear();
         Ok(())
     }
 
@@ -1353,16 +1364,22 @@ impl NuDbBackend {
         }
         // Write-through: update cache AND disk. Cache accelerates reads,
         // disk ensures correctness for verification and crash recovery.
+        let bulk_importing = self.bulk_importing.load(Ordering::Acquire);
         {
             let mut cache = self.bucket_cache.lock().unwrap();
             // Cap cache size to prevent unbounded RAM growth (each bucket ~4KB).
-            if cache.len() >= MAX_BUCKET_CACHE_ENTRIES {
+            // During bulk import, keep all buckets in memory — flush handles persistence.
+            if !bulk_importing && cache.len() >= MAX_BUCKET_CACHE_ENTRIES {
                 // Evict a random entry — simple but effective for a write cache.
                 if let Some(&evict_key) = cache.keys().next() {
                     cache.remove(&evict_key);
                 }
             }
             cache.insert(bucket_index, bucket.clone());
+        }
+        // During bulk import, skip disk write — flush_bucket_cache handles it.
+        if bulk_importing {
+            return Ok(());
         }
         let offset = u64::from(bucket_index + 1) * u64::from(key_header.block_size);
         let bytes = bucket.encode_key_block()?;
@@ -1943,13 +1960,16 @@ impl Backend for NuDbBackend {
 
     fn store(&self, object: Arc<NodeObject>) {
         // Check existence OUTSIDE the store_mutex — pread is thread-safe.
-        match self.find_bucket_entry(object.hash().data()) {
-            Ok(Some(_)) => return,
-            Ok(None) => {}
-            Err(error) => {
-                tracing::error!(target: "nodestore", error = %error, "Node store write failed");
-                self.journal.log(JournalLevel::Error, &error);
-                return;
+        // Skip during bulk import for massive speedup (no disk reads per node).
+        if !self.bulk_importing.load(Ordering::Acquire) {
+            match self.find_bucket_entry(object.hash().data()) {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(target: "nodestore", error = %error, "Node store write failed");
+                    self.journal.log(JournalLevel::Error, &error);
+                    return;
+                }
             }
         }
 
@@ -1977,6 +1997,8 @@ impl Backend for NuDbBackend {
             .lock()
             .expect("nudb backend store mutex must not be poisoned");
 
+        let bulk_importing = self.bulk_importing.load(Ordering::Acquire);
+
         let key_header = {
             let mut runtime = self
                 .runtime
@@ -1991,21 +2013,25 @@ impl Backend for NuDbBackend {
                 self.journal.log(JournalLevel::Error, &error);
                 return;
             }
-            runtime.split_fraction = runtime.split_fraction.saturating_add(65_536);
-            if runtime.split_fraction >= runtime.split_threshold {
-                runtime.split_fraction -= runtime.split_threshold;
-                if let Err(error) = self.split_one_bucket(&mut runtime) {
-                    self.journal.log(JournalLevel::Error, &error);
-                    return;
+            if !bulk_importing {
+                runtime.split_fraction = runtime.split_fraction.saturating_add(65_536);
+                if runtime.split_fraction >= runtime.split_threshold {
+                    runtime.split_fraction -= runtime.split_threshold;
+                    if let Err(error) = self.split_one_bucket(&mut runtime) {
+                        self.journal.log(JournalLevel::Error, &error);
+                        return;
+                    }
                 }
             }
             runtime
                 .key_header
                 .expect("nudb runtime header must exist after ensure_primary_bucket")
         };
-        if let Err(error) = self.begin_burst_checkpoint_if_needed(&key_header) {
-            self.journal.log(JournalLevel::Error, &error);
-            return;
+        if !bulk_importing {
+            if let Err(error) = self.begin_burst_checkpoint_if_needed(&key_header) {
+                self.journal.log(JournalLevel::Error, &error);
+                return;
+            }
         }
         // Use pre-computed compressed data — no re-encoding under the lock.
         let key_size = usize::from(key_header.key_size);
@@ -2045,8 +2071,10 @@ impl Backend for NuDbBackend {
         }
         let size_bytes = compressed.len();
         tracing::debug!(target: "nodestore", hash = %object.hash(), size_bytes, "Node object stored");
-        if let Err(error) = self.finish_burst_write() {
-            self.journal.log(JournalLevel::Error, &error);
+        if !bulk_importing {
+            if let Err(error) = self.finish_burst_write() {
+                self.journal.log(JournalLevel::Error, &error);
+            }
         }
     }
 
@@ -2069,29 +2097,129 @@ impl Backend for NuDbBackend {
         }
     }
 
+    fn bulk_import_start(&self, estimated_nodes: u64) -> Result<(), String> {
+        tracing::info!(target: "nodestore", estimated_nodes, "NuDB bulk import mode started — pre-allocating buckets");
+
+        // Write crash recovery marker
+        let marker_path = self.config.layout.base_path.join(".bulk_import_in_progress");
+        fs::write(&marker_path, b"").map_err(|e| format!("Failed to write bulk import marker: {e}"))?;
+
+        self.bulk_importing.store(true, Ordering::Release);
+
+        // Pre-allocate buckets so entries distribute correctly
+        let _store_guard = self
+            .store_mutex
+            .lock()
+            .expect("nudb backend store mutex must not be poisoned");
+        let mut runtime = self
+            .runtime
+            .lock()
+            .expect("nudb backend runtime mutex must not be poisoned");
+        self.ensure_primary_bucket(&mut runtime)?;
+        let header = runtime
+            .key_header
+            .as_mut()
+            .ok_or_else(|| "NuDB key header missing after ensure_primary_bucket".to_owned())?;
+
+        let capacity = u64::from(header.capacity.max(1));
+        let needed_buckets = ((estimated_nodes + capacity - 1) / capacity).max(1) as u32;
+        if needed_buckets > header.buckets {
+            let block_size = usize::from(header.block_size);
+            let cap = usize::from(header.capacity);
+            let empty_block = NuDbBucket::empty(block_size, cap).encode_key_block()?;
+            let to_add = needed_buckets - header.buckets;
+            for _ in 0..to_add {
+                self.append_key(&empty_block)?;
+            }
+            header.buckets = needed_buckets;
+            header.modulus = nudb_ceil_pow2(needed_buckets);
+            let h = *header;
+            runtime.split_threshold = nudb_split_threshold(&h);
+            runtime.split_fraction = runtime.split_threshold / 2;
+            drop(runtime);
+
+            // Persist updated header to disk
+            let header_bytes = encode_nudb_key_file_header(&h)?;
+            self.pwrite_key(0, &header_bytes)?;
+        }
+
+        tracing::info!(target: "nodestore", needed_buckets, "NuDB bucket pre-allocation complete");
+        Ok(())
+    }
+
+    fn bulk_import_finish(&self) -> Result<(), String> {
+        tracing::info!(target: "nodestore", "NuDB bulk import finishing — flushing bucket cache");
+        self.bulk_importing.store(false, Ordering::Release);
+        self.flush_bucket_cache()?;
+        self.sync();
+
+        // Remove crash recovery marker
+        let marker_path = self.config.layout.base_path.join(".bulk_import_in_progress");
+        let _ = fs::remove_file(&marker_path);
+
+        tracing::info!(target: "nodestore", "NuDB bulk import complete");
+        Ok(())
+    }
+
     fn for_each(&self, callback: &mut dyn FnMut(Arc<NodeObject>)) {
         if let Err(error) = self.commit_active_burst_if_needed() {
             self.journal.log(JournalLevel::Error, &error);
             return;
         }
-        let records = match self.scan_indexed_records() {
-            Ok(records) => records,
+        let key_header = match self.current_key_header() {
+            Ok(h) => h,
             Err(error) => {
                 self.journal.log(JournalLevel::Error, &error);
                 return;
             }
         };
-        for (key, value) in records {
-            let decompressed = match nodeobject_decompress(&value) {
-                Ok(bytes) => bytes,
+        let key_size = usize::from(key_header.key_size);
+
+        for bucket_index in 0..key_header.buckets {
+            let bucket = match self.read_key_bucket_with_header(bucket_index, &key_header) {
+                Ok(b) => b,
                 Err(error) => {
                     self.journal.log(JournalLevel::Error, &error);
                     continue;
                 }
             };
-            let decoded = DecodedBlob::new(key.data(), &decompressed);
-            if decoded.was_ok() {
-                callback(decoded.create_object());
+            let entries = match self.collect_bucket_chain_entries_with_header(&bucket, &key_header) {
+                Ok(e) => e,
+                Err(error) => {
+                    self.journal.log(JournalLevel::Error, &error);
+                    continue;
+                }
+            };
+            for entry in entries {
+                let key_bytes = match self.read_data_record_key_with_key_size(entry.offset, key_size) {
+                    Ok(k) => k,
+                    Err(error) => {
+                        self.journal.log(JournalLevel::Error, &error);
+                        continue;
+                    }
+                };
+                let value = match self.read_data_record_value_with_key_size(entry, key_size) {
+                    Ok(v) => v,
+                    Err(error) => {
+                        self.journal.log(JournalLevel::Error, &error);
+                        continue;
+                    }
+                };
+                let decompressed = match nodeobject_decompress(&value) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.journal.log(JournalLevel::Error, &error);
+                        continue;
+                    }
+                };
+                let key = match Uint256::from_slice(&key_bytes) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                let decoded = DecodedBlob::new(key.data(), &decompressed);
+                if decoded.was_ok() {
+                    callback(decoded.create_object());
+                }
             }
         }
     }

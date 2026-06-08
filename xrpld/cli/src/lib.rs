@@ -25,7 +25,7 @@ pub mod validators;
 pub mod version;
 
 #[derive(Parser)]
-#[command(name = "xrpld", about = "XRPL Rust Node", version)]
+#[command(name = "quaxar", about = "Quaxar XRPL Node", version)]
 pub struct Cli {
     /// Subcommand to run. If none, starts the node.
     #[command(subcommand)]
@@ -145,6 +145,20 @@ pub enum Command {
     /// Interactive CLI mode
     #[command(name = "cli")]
     Cli,
+    /// Export a snapshot of the node store to a file
+    #[command(name = "export-snapshot")]
+    ExportSnapshot {
+        /// Output file path for the snapshot
+        #[arg(long, short)]
+        output: String,
+    },
+    /// Load a snapshot file into the node store
+    #[command(name = "load-snapshot")]
+    LoadSnapshot {
+        /// Input snapshot file path
+        #[arg(long, short)]
+        input: String,
+    },
 }
 
 #[derive(Subcommand)]

@@ -75,6 +75,13 @@ const HANDLERS: &[RpcHandlerSpec] = &[
         u32::MAX,
     ),
     RpcHandlerSpec::new(
+        "export_snapshot",
+        Role::Admin,
+        HandlerCondition::None,
+        1,
+        u32::MAX,
+    ),
+    RpcHandlerSpec::new(
         "channel_authorize",
         Role::User,
         HandlerCondition::None,

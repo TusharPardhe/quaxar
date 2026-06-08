@@ -312,6 +312,10 @@ impl DatabaseTrait for DatabaseNodeImp {
     fn fd_required(&self) -> i32 {
         DatabaseNodeImp::fd_required(self)
     }
+
+    fn export_backend(&self) -> Option<Arc<dyn Backend>> {
+        Some(Arc::clone(&self.backend))
+    }
 }
 
 fn panic_message(payload: &(dyn Any + Send)) -> String {

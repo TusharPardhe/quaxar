@@ -14,7 +14,7 @@ Running a validator requires:
 Generate a new validator master key pair:
 
 ```bash
-xrpld validator-keys generate
+quaxar validator-keys generate
 ```
 
 Output:
@@ -32,7 +32,7 @@ Store the master secret key securely. It cannot be recovered.
 Generate a validator token from the master key. The token contains an ephemeral key pair that the running node uses for signing:
 
 ```bash
-xrpld validator-keys create-token
+quaxar validator-keys create-token
 ```
 
 You will be prompted for the master secret key. Output:
@@ -54,7 +54,7 @@ eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9...
 Restart the node to activate. Verify with:
 
 ```bash
-xrpld validator-keys show
+quaxar validator-keys show
 ```
 
 ## Key Rotation
@@ -78,7 +78,7 @@ The master public key remains your validator's identity across rotations.
 If your master key is compromised, revoke it permanently:
 
 ```bash
-xrpld validator-keys revoke
+quaxar validator-keys revoke
 ```
 
 This publishes a maximum-sequence manifest that permanently disables the validator identity. **This action is irreversible.** You will need to generate a new master key and establish trust from scratch.

@@ -980,7 +980,7 @@ fn initialize_startup_ledger_state(
             }
             seed_startup_ledger_state(root, options)
         }
-        StartUpType::Fresh | StartUpType::Normal => seed_startup_ledger_state(root, options),
+        StartUpType::Fresh | StartUpType::Normal | StartUpType::Snapshot => seed_startup_ledger_state(root, options),
     }
 }
 
@@ -1477,6 +1477,7 @@ fn to_xrpld_startup_type(start_type: StartUpType) -> xrpld_core::StartUpType {
         StartUpType::LoadFile => xrpld_core::StartUpType::LoadFile,
         StartUpType::Replay => xrpld_core::StartUpType::Replay,
         StartUpType::Network => xrpld_core::StartUpType::Network,
+        StartUpType::Snapshot => xrpld_core::StartUpType::Snapshot,
     }
 }
 
@@ -1493,7 +1494,7 @@ fn seed_startup_ledger_state(
     let backed = root.node_store().is_some();
 
     let closed = match options.start_type {
-        StartUpType::Fresh | StartUpType::Network => {
+        StartUpType::Fresh | StartUpType::Network | StartUpType::Snapshot => {
             Ledger::create_genesis(backed, &LedgerConfig::default(), [])
                 .unwrap_or_else(|_| Ledger::from_ledger_seq_and_close_time(1, 0, backed))
         }

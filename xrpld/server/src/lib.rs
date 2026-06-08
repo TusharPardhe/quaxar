@@ -783,6 +783,7 @@ where
             | "peers"
             | "log_level"
             | "can_delete"
+            | "export_snapshot"
             | "ledger_cleaner"
             | "peer_reservations_list"
             | "peer_reservations_add"
@@ -818,6 +819,9 @@ where
                     "peers" => dispatch_ctx!(rpc::PeersSource, rpc::do_peers),
                     "log_level" => dispatch_ctx!(rpc::LogLevelSource, rpc::do_log_level),
                     "can_delete" => dispatch_ctx!(rpc::CanDeleteSource, rpc::do_can_delete),
+                    "export_snapshot" => {
+                        dispatch_ctx!(rpc::ExportSnapshotSource, rpc::do_export_snapshot)
+                    }
                     "ledger_cleaner" => {
                         dispatch_ctx!(rpc::LedgerCleanerSource, rpc::do_ledger_cleaner)
                     }

@@ -401,6 +401,11 @@ impl DatabaseTrait for DatabaseRotatingImp {
     fn fd_required(&self) -> i32 {
         DatabaseRotatingImp::fd_required(self)
     }
+
+    fn export_backend(&self) -> Option<Arc<dyn Backend>> {
+        let state = self.state.lock().expect("rotating backend mutex must not be poisoned");
+        Some(Arc::clone(&state.writable_backend))
+    }
 }
 
 impl DatabaseRotatingTrait for DatabaseRotatingImp {

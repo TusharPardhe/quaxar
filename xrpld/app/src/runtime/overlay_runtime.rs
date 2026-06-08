@@ -759,10 +759,9 @@ fn default_overlay_client_config() -> Result<Arc<rustls::ClientConfig>, String> 
 fn build_overlay_server_config(
     listener: &ServerPortOverlaySetup,
 ) -> Result<Option<Arc<rustls::ServerConfig>>, String> {
-    if !listener.secure {
-        return Ok(None);
-    }
-
+    // The XRP Ledger peer protocol always uses TLS. When no explicit certs are
+    // provided (or the port is not marked "secure"), generate an anonymous
+    // self-signed identity for the listener.
     let identity = if listener.ssl_key.is_empty()
         && listener.ssl_cert.is_empty()
         && listener.ssl_chain.is_empty()

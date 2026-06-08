@@ -27,6 +27,13 @@ impl SHAMapStoreNodeStore {
             Self::Rotating(database) => database.fd_required(),
         }
     }
+
+    pub fn export_backend(&self) -> Option<Arc<dyn Backend>> {
+        match self {
+            Self::Single(database) => database.export_backend(),
+            Self::Rotating(database) => database.export_backend(),
+        }
+    }
 }
 
 pub struct SHAMapStoreBackendBundle {
