@@ -2166,24 +2166,60 @@ impl Backend for NuDbBackend {
             self.journal.log(JournalLevel::Error, &error);
             return;
         }
-        let records = match self.scan_indexed_records() {
-            Ok(records) => records,
+        let key_header = match self.current_key_header() {
+            Ok(h) => h,
             Err(error) => {
                 self.journal.log(JournalLevel::Error, &error);
                 return;
             }
         };
-        for (key, value) in records {
-            let decompressed = match nodeobject_decompress(&value) {
-                Ok(bytes) => bytes,
+        let key_size = usize::from(key_header.key_size);
+
+        for bucket_index in 0..key_header.buckets {
+            let bucket = match self.read_key_bucket_with_header(bucket_index, &key_header) {
+                Ok(b) => b,
                 Err(error) => {
                     self.journal.log(JournalLevel::Error, &error);
                     continue;
                 }
             };
-            let decoded = DecodedBlob::new(key.data(), &decompressed);
-            if decoded.was_ok() {
-                callback(decoded.create_object());
+            let entries = match self.collect_bucket_chain_entries_with_header(&bucket, &key_header) {
+                Ok(e) => e,
+                Err(error) => {
+                    self.journal.log(JournalLevel::Error, &error);
+                    continue;
+                }
+            };
+            for entry in entries {
+                let key_bytes = match self.read_data_record_key_with_key_size(entry.offset, key_size) {
+                    Ok(k) => k,
+                    Err(error) => {
+                        self.journal.log(JournalLevel::Error, &error);
+                        continue;
+                    }
+                };
+                let value = match self.read_data_record_value_with_key_size(entry, key_size) {
+                    Ok(v) => v,
+                    Err(error) => {
+                        self.journal.log(JournalLevel::Error, &error);
+                        continue;
+                    }
+                };
+                let decompressed = match nodeobject_decompress(&value) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.journal.log(JournalLevel::Error, &error);
+                        continue;
+                    }
+                };
+                let key = match Uint256::from_slice(&key_bytes) {
+                    Some(k) => k,
+                    None => continue,
+                };
+                let decoded = DecodedBlob::new(key.data(), &decompressed);
+                if decoded.was_ok() {
+                    callback(decoded.create_object());
+                }
             }
         }
     }
