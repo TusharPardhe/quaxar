@@ -675,6 +675,12 @@ pub fn build_bootstrap_root(
             &publisher_keys,
             None,
         );
+        // When using static [validators] (no validator_list_sites), we must
+        // explicitly promote key_listings to trusted_master_keys. Without this,
+        // validations from peers are dropped as "untrusted".
+        if config.section("validator_list_sites").empty() && !config_keys.is_empty() {
+            root.validators().update_trusted(&std::collections::HashSet::new(), 0);
+        }
     }
 
     // Wire up validator list sites from config and do initial fetch,
