@@ -235,7 +235,7 @@ pub struct BootstrapOverlayHandoff;
 
 impl OverlayHandoff for BootstrapOverlayHandoff {
     fn on_handoff(&self, _request: &http::Request<()>, _remote_address: SocketAddr) -> Handoff {
-        Handoff::Ignored
+        Handoff::Accepted
     }
 }
 
