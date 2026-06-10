@@ -129,7 +129,14 @@ impl OverlayIdentity {
 
         let instance_cookie = NEXT_INSTANCE_COOKIE.fetch_add(1, Ordering::Relaxed);
         let mut secret_bytes = [0u8; 32];
-        secret_bytes[24..].copy_from_slice(&instance_cookie.to_be_bytes());
+        // Use random bytes for the identity to ensure uniqueness across
+        // containers/processes that start from the same binary image.
+        use basics::random::rand_int_full;
+        for chunk in secret_bytes.chunks_mut(8) {
+            let r: u64 = rand_int_full();
+            let len = chunk.len().min(8);
+            chunk[..len].copy_from_slice(&r.to_be_bytes()[..len]);
+        }
         if secret_bytes.iter().all(|byte| *byte == 0) {
             secret_bytes[31] = 1;
         }
@@ -1355,7 +1362,18 @@ impl OverlayImpl {
         let mut accepted_peer = None;
         let (response, response_wire) = match handoff {
             Handoff::Accepted => {
-                let peer = self.peer_from_request(&request, remote_address)?;
+                let peer = match self.peer_from_request(&request, remote_address) {
+                    Ok(peer) => peer,
+                    Err(error) => {
+                        tracing::warn!(target: "overlay", ip = %remote_address, %error, "Inbound peer rejected");
+                        let response = Response::builder()
+                            .status(403)
+                            .body(())
+                            .map_err(|e| OverlayError::InvalidRequest(e.to_string()))?;
+                        let response_wire = serialize_response(&response);
+                        return Ok(());
+                    }
+                };
                 self.apply_membership_state(&peer);
                 if !self.can_activate_peer(&peer) {
                     tracing::warn!(
