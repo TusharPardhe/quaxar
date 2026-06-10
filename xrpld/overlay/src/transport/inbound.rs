@@ -228,6 +228,11 @@ impl QueuedOverlayInboundHandler {
     pub fn take_ledger_data(&self) -> Vec<PeerMessage<TmLedgerData>> {
         std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").ledger_data)
     }
+
+    /// Drain only get_ledger requests from the queue, leaving all other messages.
+    pub fn take_get_ledgers(&self) -> Vec<PeerMessage<TmGetLedger>> {
+        std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").get_ledgers)
+    }
 }
 
 impl OverlayInboundHandler for QueuedOverlayInboundHandler {

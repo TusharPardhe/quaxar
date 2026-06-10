@@ -862,12 +862,9 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
         .and_then(|cr| cr.take_map_complete_receiver());
 
     let mut consensus_started = false;
-    let loop_start = std::time::Instant::now();
 
-    // State for consensus ledger acquisition (fetching the correct ledger
-    // from peers when handle_wrong_ledger fires).
-    let mut consensus_acq: Option<ledger::InboundLedgerLocal> = None;
-    let mut consensus_acq_requested: Option<Uint256> = None;
+    // State for consensus ledger acquisition with targeted peer requests.
+    let mut consensus_acq: Option<LedgerAcquisitionState> = None;
 
     while !stop.load(Ordering::Acquire) {
         let root = runtime.root();
@@ -881,49 +878,84 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
             continue;
         };
 
-        // Start the first consensus round after a delay to allow all
-        // implementations (including slower-starting rippled) to connect
-        // and begin proposing on genesis. Without this delay, quaxar would
-        // close its first round before rippled starts, causing a fork.
+        // Serve TmGetLedger requests from peers (PART 1).
+        serve_get_ledger_requests(root, &overlay_rt);
+
+        // Before starting consensus, acquire the network's validated ledger.
         if !consensus_started {
-            let elapsed = std::time::Instant::now()
-                .duration_since(loop_start)
-                .as_secs();
-            if elapsed >= 25 {
-                let proposals = overlay_rt.overlay().take_proposals();
-                if let Some(validated) = root.validated_ledger() {
-                    if network_ops_rt.maybe_begin_consensus_from_validated(
-                        consensus_rt.as_ref(),
-                        Arc::clone(&validated),
-                    ) {
-                        tracing::info!(target: "consensus",
-                            delay_secs = elapsed,
-                            queued_proposals = proposals.len(),
-                            "First consensus round started (--start mode)"
-                        );
+            // Process validations to sync clock and detect network state.
+            let validations = overlay_rt.overlay().take_validations();
+            for queued in &validations {
+                let mut serial = protocol::SerialIter::new(&queued.message.validation);
+                let parsed =
+                    protocol::STValidation::from_serial_iter_default_node_id(&mut serial, false);
+                let mut validation = match parsed {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                validation.set_seen(root.current_close_time_seconds());
+                let sign_time = validation.get_sign_time();
+                if sign_time > 0 {
+                    let now = root.current_close_time_seconds() as i64;
+                    let offset = sign_time as i64 - now;
+                    root.time_keeper()
+                        .adjust_close_time(time::Duration::seconds(offset));
+                }
+                let source = queued.peer_id.to_string();
+                let _ = root.receive_validation_to_network_ops(&mut validation, &source);
+
+                // If this is a trusted validation for a ledger we don't have,
+                // trigger acquisition from the peer that sent it.
+                if validation.is_trusted() {
+                    let val_hash = validation.get_ledger_hash();
+                    let val_seq = validation.get_field_u32(
+                        protocol::get_field_by_symbol("sfLedgerSequence"));
+                    if let Some(lm_rt) = root.ledger_master_runtime() {
+                        let lm = lm_rt.ledger_master();
+                        if lm.get_ledger_by_hash(
+                            basics::sha_map_hash::SHAMapHash::new(val_hash),
+                        ).is_none() && val_seq > 1 {
+                            // Store as pending for acquisition.
+                            let mut pending = lm_rt.pending_consensus_ledger
+                                .lock()
+                                .expect("pending_consensus_ledger lock");
+                            if pending.is_none() {
+                                *pending = Some(val_hash);
+                                tracing::info!(target: "consensus",
+                                    hash = %val_hash, seq = val_seq,
+                                    peer_id = queued.peer_id,
+                                    "Trusted validation for missing ledger — triggering acquisition"
+                                );
+                            }
+                        }
                     }
                 }
-                consensus_started = true;
-                // Feed queued proposals into the new round.
-                for proposal in proposals {
-                    let close_time = root.shared_time_keeper().close_time();
-                    let prop = consensus::ConsensusProposal::new(
-                        proposal.previous_ledger,
-                        0,
-                        proposal.current_tx_hash,
-                        close_time,
-                        close_time,
-                        proposal.public_key,
-                    );
-                    let _ = network_ops_rt.handle_peer_proposal(
-                        consensus_rt.as_ref(),
-                        proposal.public_key,
-                        proposal.message.signature.clone(),
-                        proposal.suppression,
-                        prop,
-                    );
+            }
+
+            // Drive ledger acquisition (targeted requests with 2s retry).
+            drive_consensus_ledger_acquisition(root, &overlay_rt, &mut consensus_acq);
+
+            // Check if we now have a network ledger to start from.
+            if let Some(lm_rt) = root.ledger_master_runtime() {
+                let lm = lm_rt.ledger_master();
+                if let Some(closed) = lm.closed_ledger() {
+                    if closed.header().seq > 1 {
+                        if network_ops_rt.maybe_begin_consensus_from_validated(
+                            consensus_rt.as_ref(),
+                            Arc::clone(&closed),
+                        ) {
+                            tracing::info!(target: "consensus",
+                                seq = closed.header().seq,
+                                "Consensus started from acquired network ledger"
+                            );
+                            consensus_started = true;
+                        }
+                    }
                 }
             }
+
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
         }
 
         // Process map-complete results (TX set acquisitions from peers).
@@ -1043,7 +1075,6 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
             root,
             &overlay_rt,
             &mut consensus_acq,
-            &mut consensus_acq_requested,
         );
 
         std::thread::sleep(Duration::from_millis(50));
@@ -1052,364 +1083,271 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
     tracing::info!(target: "consensus", "Start-mode consensus event loop stopped");
 }
 
+/// State for targeted ledger acquisition with peer rotation and 2s retry.
+struct LedgerAcquisitionState {
+    hash: Uint256,
+    last_request_time: std::time::Instant,
+    /// Peers we've already tried (for rotation).
+    tried_peers: Vec<overlay::PeerId>,
+    /// Peer we sent the current request to.
+    current_peer: Option<overlay::PeerId>,
+}
+
 /// Drives the consensus ledger acquisition state machine.
 ///
 /// When the consensus engine enters WrongLedger mode and calls
 /// `request_consensus_ledger`, the wanted hash is stored in
 /// `AppLedgerMasterRuntime.pending_consensus_ledger`. This function:
-/// 1. Detects a new request and starts acquisition
-/// 2. Sends TmGetLedger to peers for the header (+ root nodes)
-/// 3. Feeds incoming TmLedgerData into the InboundLedgerLocal
-/// 4. On completion, inserts the ledger into ledger_history so
-///    the next `acquire_ledger` call succeeds
+/// 1. Detects a new request and sends targeted TmGetLedger to a peer
+/// 2. Retries with a different peer after 2s timeout
+/// 3. Processes TmLedgerData responses
+/// 4. On completion, inserts the ledger into ledger_history
 fn drive_consensus_ledger_acquisition(
     root: &crate::ApplicationRoot,
     overlay_rt: &Arc<crate::runtime::overlay_runtime::AppOverlayRuntime>,
-    acq: &mut Option<ledger::InboundLedgerLocal>,
-    acq_hash: &mut Option<Uint256>,
+    acq: &mut Option<LedgerAcquisitionState>,
 ) {
-    use basics::sha_map_hash::SHAMapHash;
-    use overlay::{Overlay, ProtocolMessage};
-
     let Some(lm_rt) = root.ledger_master_runtime() else {
         return;
     };
 
     // Check for a new consensus ledger request.
-    if let Some(wanted) = lm_rt.pending_consensus_ledger() {
-        if acq_hash.as_ref() != Some(&wanted) {
-            // New or changed request — start fresh acquisition.
+    let wanted = lm_rt.pending_consensus_ledger();
+    if let Some(wanted) = wanted {
+        let is_new = acq.as_ref().map_or(true, |s| s.hash != wanted);
+        if is_new {
             tracing::info!(target: "consensus",
                 hash = %wanted,
-                "Starting consensus ledger acquisition from peers"
+                "Starting targeted consensus ledger acquisition"
             );
-            let inbound = ledger::InboundLedgerLocal::new_with_reason(
-                SHAMapHash::new(wanted),
-                0, // seq unknown until header arrives
-                ledger::InboundLedgerReason::Consensus,
-            );
-            *acq = Some(inbound);
-            *acq_hash = Some(wanted);
-
-            // Send initial header request to all peers.
-            let request = acq.as_ref().unwrap().make_header_request();
-            overlay_rt.overlay().broadcast(&request);
+            let mut state = LedgerAcquisitionState {
+                hash: wanted,
+                last_request_time: std::time::Instant::now(),
+                tried_peers: Vec::new(),
+                current_peer: None,
+            };
+            // Send initial request to a peer.
+            send_targeted_get_ledger(overlay_rt, &mut state);
+            *acq = Some(state);
         }
     }
 
-    let Some(inbound) = acq.as_mut() else {
+    let Some(state) = acq.as_mut() else {
         return;
     };
 
-    // If already done (shouldn't happen normally), finalize.
-    if inbound.is_complete() || inbound.is_failed() {
-        finalize_consensus_ledger_acquisition(root, acq, acq_hash, &lm_rt);
-        return;
+    // Retry with a different peer after 2s if no response.
+    let elapsed = state.last_request_time.elapsed();
+    if elapsed >= Duration::from_secs(2) {
+        tracing::debug!(target: "consensus",
+            hash = %state.hash,
+            "Retrying ledger acquisition with different peer"
+        );
+        send_targeted_get_ledger(overlay_rt, state);
     }
 
-    // Drain TmLedgerData responses from the overlay queue and feed them
-    // into the acquisition state machine.
+    // Process TmLedgerData responses — look for our hash.
     let ledger_data_msgs = overlay_rt.overlay().take_ledger_data();
-    let wanted_hash = acq_hash.unwrap();
     for msg in ledger_data_msgs {
         let data = &msg.message;
-        // Only process responses matching our requested hash.
         let resp_hash = match Uint256::from_slice(&data.ledger_hash) {
             Some(h) => h,
             None => continue,
         };
-        if resp_hash != wanted_hash {
+        if resp_hash != state.hash {
             continue;
         }
-        // Skip error responses.
-        if data.error.is_some() {
-            tracing::debug!(target: "consensus",
-                error = ?data.error,
-                "Peer returned error for consensus ledger request"
-            );
+        if data.error.is_some() || data.nodes.is_empty() {
             continue;
         }
-
-        // Convert TmLedgerData nodes into InboundLedgerPacket.
-        let packet_type = match data.r#type {
-            0 => ledger::InboundLedgerDataType::Base,
-            1 => ledger::InboundLedgerDataType::TransactionNode,
-            2 => ledger::InboundLedgerDataType::StateNode,
-            _ => continue,
+        // For itype=0 (li_BASE), first node is the serialized header.
+        if data.r#type != 0 {
+            continue;
+        }
+        let header_data = &data.nodes[0].nodedata;
+        let Ok(header) = protocol::deserialize_ledger_header(header_data, false) else {
+            tracing::warn!(target: "consensus", "Failed to deserialize ledger header from peer");
+            continue;
         };
-        let nodes: Vec<ledger::InboundLedgerNodeData> = data
-            .nodes
-            .iter()
-            .map(|n| {
-                ledger::InboundLedgerNodeData::new(
-                    n.nodeid.clone(),
-                    n.nodedata.clone(),
-                )
-            })
-            .collect();
-        let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
-        inbound.got_data(Some(msg.peer_id as u64), packet);
-    }
-
-    // Process queued packets.
-    if inbound.received_data_len() > 0 {
-        let config = LedgerConfig::default();
-        let journal = ledger::NullInboundLedgerJournal;
-        let mut store = NullConsensusLedgerStore;
-        let mut fetch_pack = NullFetchPack;
-        let family = build_consensus_acq_family(root);
-        inbound.run_data_with_family_and_config(
-            &journal,
-            &config,
-            &mut store,
-            &mut fetch_pack,
-            &family,
-        );
-    }
-
-    // Check completion.
-    if inbound.is_complete() || inbound.is_failed() {
-        finalize_consensus_ledger_acquisition(root, acq, acq_hash, &lm_rt);
-    } else if inbound.planner_state().have_header && !inbound.is_done() {
-        // We have the header but maps aren't complete yet. For the consensus
-        // ledger in --start mode (seq=2), the state map matches genesis and
-        // the tx map is empty. Check if we can shortcut by reusing the
-        // genesis state.
-        try_complete_from_genesis(root, inbound);
-        if inbound.is_complete() {
-            finalize_consensus_ledger_acquisition(root, acq, acq_hash, &lm_rt);
-        } else {
-            // Need more data — re-request from peers.
-            let family = build_consensus_acq_family(root);
-            let config = LedgerConfig::default();
-            let journal = ledger::NullInboundLedgerJournal;
-            let mut store = NullConsensusLedgerStore;
-            let mut fetch_pack = NullFetchPack;
-            let mut send_fn = |msg: ProtocolMessage| {
-                overlay_rt.overlay().broadcast(&msg);
-            };
-            inbound.trigger_with_family(
-                ledger::InboundLedgerRequestTrigger::Reply,
-                &journal,
-                &config,
-                &mut store,
-                &mut fetch_pack,
-                &family,
-                &mut send_fn,
+        // Verify hash matches.
+        let computed = protocol::calculate_ledger_hash(&header);
+        if *computed.as_uint256() != state.hash {
+            tracing::warn!(target: "consensus",
+                expected = %state.hash,
+                got = %computed,
+                "Ledger header hash mismatch"
             );
+            continue;
         }
-    }
-}
-
-/// Attempt to complete an inbound ledger by reusing the genesis state map.
-///
-/// In --start mode the consensus ledger (seq=2) has the same state as genesis
-/// (no transactions modified anything). If the header's account_hash matches
-/// the genesis ledger's state root, we can mark state as complete.
-fn try_complete_from_genesis(
-    root: &crate::ApplicationRoot,
-    inbound: &mut ledger::InboundLedgerLocal,
-) {
-    let planner = inbound.planner_state();
-    if planner.have_state && planner.have_transactions {
-        inbound.set_complete();
-        return;
-    }
-
-    let Some(lm_rt) = root.ledger_master_runtime() else {
-        return;
-    };
-    let Some(genesis) = lm_rt.ledger_master().closed_ledger() else {
-        return;
-    };
-
-    let Some(ledger) = inbound.ledger() else {
-        return;
-    };
-
-    // Check if state can be reused from genesis.
-    let can_reuse_state = !planner.have_state
-        && ledger.header().account_hash == genesis.header().account_hash
-        && genesis.state_map().is_valid()
-        && !genesis.state_map().root().get_hash().is_zero();
-
-    let seq = ledger.header().seq;
-
-    if can_reuse_state {
-        // Clone the genesis state map into the acquired ledger.
-        let genesis_state = genesis.state_map().clone();
-        let acq_ledger = inbound.ledger_mut().unwrap();
-        *acq_ledger.state_map_mut() = genesis_state;
-        acq_ledger.state_map_mut().set_ledger_seq(seq);
-    }
-
-    // Revalidate after state injection.
-    let family = build_consensus_acq_family(root);
-    inbound.revalidate_map_sync_with_family(&family);
-}
-
-/// Finalize a completed consensus ledger acquisition by inserting it into
-/// ledger_history so that the next `acquire_ledger` call succeeds.
-fn finalize_consensus_ledger_acquisition(
-    _root: &crate::ApplicationRoot,
-    acq: &mut Option<ledger::InboundLedgerLocal>,
-    acq_hash: &mut Option<Uint256>,
-    lm_rt: &crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime,
-) {
-    let Some(mut inbound) = acq.take() else {
-        return;
-    };
-    let hash = acq_hash.take();
-
-    if inbound.is_failed() {
-        tracing::warn!(target: "consensus",
-            hash = ?hash,
-            "Consensus ledger acquisition failed"
+        // Build the ledger from the header.
+        let lm = lm_rt.ledger_master();
+        let parent = lm.closed_ledger();
+        let state_map = if let Some(ref p) = parent {
+            if p.header().account_hash == header.account_hash {
+                p.state_map().share_root_snapshot()
+            } else {
+                shamap::sync::SyncTree::new_with_type(
+                    shamap::sync::SHAMapType::State,
+                    false,
+                    header.seq,
+                )
+            }
+        } else {
+            shamap::sync::SyncTree::new_with_type(
+                shamap::sync::SHAMapType::State,
+                false,
+                header.seq,
+            )
+        };
+        let mut built = ledger::Ledger::from_maps(
+            ledger::LedgerHeader {
+                hash: computed,
+                seq: header.seq,
+                drops: header.drops,
+                close_time: header.close_time,
+                parent_close_time: header.parent_close_time,
+                close_time_resolution: header.close_time_resolution,
+                close_flags: header.close_flags,
+                parent_hash: header.parent_hash,
+                tx_hash: header.tx_hash,
+                account_hash: header.account_hash,
+                validated: false,
+                accepted: true,
+            },
+            state_map,
+            shamap::sync::SyncTree::new_with_type(
+                shamap::sync::SHAMapType::Transaction,
+                false,
+                header.seq,
+            ),
         );
+        built.set_immutable(true);
+        let built = Arc::new(built);
+        lm.ledger_history().insert(Arc::clone(&built), false);
+        lm.set_closed_ledger(Arc::clone(&built));
+        let _ = lm_rt.take_pending_consensus_ledger();
+        tracing::info!(target: "consensus",
+            seq = header.seq, hash = %computed,
+            "Consensus ledger acquired from peer and stored"
+        );
+        *acq = None;
         return;
     }
+}
 
-    if !inbound.is_complete() {
+/// Send a targeted TmGetLedger request to one peer, rotating through available peers.
+fn send_targeted_get_ledger(
+    overlay_rt: &Arc<crate::runtime::overlay_runtime::AppOverlayRuntime>,
+    state: &mut LedgerAcquisitionState,
+) {
+    use overlay::Overlay;
+
+    let peers = overlay_rt.overlay().active_peers();
+    if peers.is_empty() {
         return;
     }
-
-    // Extract and finalize the ledger.
-    let Some(ledger) = inbound.ledger_mut() else {
-        tracing::warn!(target: "consensus", "Completed acquisition has no ledger");
+    // Pick a peer we haven't tried recently.
+    let candidate = peers
+        .iter()
+        .find(|p| !state.tried_peers.contains(&p.id()))
+        .or_else(|| {
+            // All tried — reset and pick the first.
+            state.tried_peers.clear();
+            peers.first()
+        });
+    let Some(peer) = candidate else {
         return;
     };
+    let peer_id = peer.id();
+    state.tried_peers.push(peer_id);
+    state.current_peer = Some(peer_id);
+    state.last_request_time = std::time::Instant::now();
 
-    ledger.set_immutable(false);
-    ledger.set_full();
-
-    let seq = ledger.header().seq;
-    let ledger_hash = ledger.header().hash;
-    let ledger_arc = Arc::new(ledger.clone());
-
-    // Insert into the ledger cache so acquire_consensus_ledger can find it.
-    let lm = lm_rt.ledger_master();
-    lm.ledger_history().insert(Arc::clone(&ledger_arc), false);
-
-    // Clear the pending request so it won't be re-requested.
-    let _ = lm_rt.take_pending_consensus_ledger();
-
-    tracing::info!(target: "consensus",
-        seq, hash = %ledger_hash,
-        "Consensus ledger acquired from peers and stored"
+    let request = overlay::ProtocolMessage::new(overlay::ProtocolPayload::GetLedger(
+        overlay::TmGetLedger {
+            itype: 0, // li_BASE — request header
+            ltype: None,
+            ledger_hash: Some(state.hash.data().to_vec()),
+            ledger_seq: None,
+            node_i_ds: Vec::new(),
+            request_cookie: None,
+            query_type: None,
+            query_depth: None,
+        },
+    ));
+    let message = overlay::Message::new(request, None);
+    peer.send(message);
+    tracing::debug!(target: "consensus",
+        hash = %state.hash, peer_id,
+        "Sent targeted TmGetLedger to peer"
     );
 }
 
-/// Build a minimal SHAMapFamily for consensus ledger acquisition.
-fn build_consensus_acq_family(
+/// Serve incoming TmGetLedger requests by responding with the ledger header.
+///
+/// When a peer asks for a ledger by hash (itype=0, li_BASE), we look it up
+/// in ledger_history and respond with a TmLedgerData containing the serialized
+/// header. This allows peers to acquire ledgers from us.
+fn serve_get_ledger_requests(
     root: &crate::ApplicationRoot,
-) -> SHAMapFamily<
-    MonotonicClock,
-    basics::hardened_hash::HardenedHashBuilder,
-    NullFullBelowCache,
-    ConsensusAcqNodeFetcher,
-    NullMissingNodeReporter,
-> {
-    let fetcher = match root.node_store().as_ref() {
-        Some(ns) => ConsensusAcqNodeFetcher {
-            node_store: Some(ns.clone()),
-        },
-        None => ConsensusAcqNodeFetcher { node_store: None },
+    overlay_rt: &Arc<crate::runtime::overlay_runtime::AppOverlayRuntime>,
+) {
+    use overlay::Overlay;
+
+    let requests = overlay_rt.overlay().take_get_ledgers();
+    if requests.is_empty() {
+        return;
+    }
+    let Some(lm_rt) = root.ledger_master_runtime() else {
+        return;
     };
-    SHAMapFamily::new(
-        Arc::new(TreeNodeCache::new(
-            "consensus-acq",
-            8,
-            time::Duration::seconds(60),
-            MonotonicClock::default(),
-        )),
-        NullFullBelowCache::new(0),
-        fetcher,
-        NullMissingNodeReporter,
-    )
-}
+    let lm = lm_rt.ledger_master();
 
-/// Node fetcher for consensus ledger acquisition — delegates to the app's
-/// node store if available.
-#[derive(Clone)]
-struct ConsensusAcqNodeFetcher {
-    node_store: Option<crate::SHAMapStoreNodeStore>,
-}
+    for req in requests {
+        // Only serve li_BASE (itype=0) requests by hash.
+        if req.message.itype != 0 {
+            continue;
+        }
+        let Some(hash_bytes) = req.message.ledger_hash.as_deref() else {
+            continue;
+        };
+        let Some(hash) = Uint256::from_slice(hash_bytes) else {
+            continue;
+        };
+        let Some(ledger) = lm.get_ledger_by_hash(
+            basics::sha_map_hash::SHAMapHash::new(hash),
+        ) else {
+            continue;
+        };
 
-impl SHAMapNodeFetcher for ConsensusAcqNodeFetcher {
-    fn fetch_node_object(
-        &mut self,
-        hash: basics::sha_map_hash::SHAMapHash,
-        ledger_seq: u32,
-    ) -> Option<SHAMapNodeObject> {
-        let ns = self.node_store.as_ref()?;
-        let fetched = match ns {
-            crate::SHAMapStoreNodeStore::Single(database) => database.fetch_node_object(
-                hash.as_uint256(),
-                ledger_seq,
-                FetchType::Synchronous,
-                false,
-            ),
-            crate::SHAMapStoreNodeStore::Rotating(database) => database.fetch_node_object(
-                hash.as_uint256(),
-                ledger_seq,
-                FetchType::Synchronous,
-                false,
-            ),
-        }?;
-        Some(SHAMapNodeObject::new(
-            match fetched.object_type() {
-                NodeStoreObjectType::Ledger => SHAMapNodeObjectType::Ledger,
-                NodeStoreObjectType::AccountNode => SHAMapNodeObjectType::AccountNode,
-                NodeStoreObjectType::TransactionNode => SHAMapNodeObjectType::TransactionNode,
-                NodeStoreObjectType::Unknown | NodeStoreObjectType::Dummy => {
-                    SHAMapNodeObjectType::Unknown
-                }
+        // Serialize header and send TmLedgerData response.
+        let header_data = protocol::serialize_ledger_header(&ledger.header(), false);
+        let response = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(
+            overlay::TmLedgerData {
+                ledger_hash: hash.data().to_vec(),
+                ledger_seq: ledger.header().seq,
+                r#type: 0, // li_BASE
+                nodes: vec![overlay::message::wire::TmLedgerNode {
+                    nodeid: None,
+                    nodedata: header_data,
+                }],
+                request_cookie: req.message.request_cookie.map(|c| c as u32),
+                error: None,
             },
-            fetched.data().to_vec(),
-            *fetched.hash(),
-        ))
+        ));
+        let message = overlay::Message::new(response, None);
+        // Send to the requesting peer.
+        if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
+            peer.send(message);
+        }
     }
 }
 
-/// Null store for consensus ledger acquisition — we don't persist to disk
-/// during this lightweight acquisition.
-struct NullConsensusLedgerStore;
 
-impl ledger::InboundLedgerStore for NullConsensusLedgerStore {
-    fn fetch_ledger_header(
-        &mut self,
-        _hash: basics::sha_map_hash::SHAMapHash,
-        _ledger_seq: u32,
-    ) -> Option<basics::blob::Blob> {
-        None
-    }
 
-    fn store_ledger_header(
-        &mut self,
-        _data: basics::blob::Blob,
-        _hash: basics::sha_map_hash::SHAMapHash,
-        _ledger_seq: u32,
-    ) {
-    }
 
-    fn store_shamap_node(
-        &mut self,
-        _object_type: shamap::storage::NodeObjectType,
-        _data: basics::blob::Blob,
-        _hash: Uint256,
-        _ledger_seq: u32,
-    ) {
-    }
-}
 
-/// Null fetch pack container for consensus ledger acquisition.
-struct NullFetchPack;
 
-impl ledger::FetchPackContainer for NullFetchPack {
-    fn get_fetch_pack(&mut self, _hash: Uint256) -> Option<basics::blob::Blob> {
-        None
-    }
-}
 
 fn ensure_descriptor_budget(required: usize) -> Result<(), String> {
     let required = required.max(1024) as u64;
@@ -2212,9 +2150,6 @@ fn seed_startup_ledger_state(
     Ok(())
 }
 
-/// Read amendment IDs from the [amendments] config section.
-/// Each line is "<64-hex-id> <Name>". If the section is absent or empty,
-/// falls back to all supported + DefaultYes features from the registry.
 fn amendments_from_config(config: &BasicConfig) -> Vec<Uint256> {
     let section = config.section("amendments");
     let values = section.values();
