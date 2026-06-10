@@ -787,6 +787,11 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
         let root = runtime.root();
         if let (Some(cr), Some(nops_rt)) = (root.consensus_runtime(), root.network_ops_runtime()) {
             if let Some(validated) = root.validated_ledger() {
+                // Store genesis as closed ledger so consensus can look it up
+                // via acquire_consensus_ledger → get_ledger_by_hash.
+                if let Some(lm) = root.ledger_master_runtime() {
+                    lm.ledger_master().set_closed_ledger(Arc::clone(&validated));
+                }
                 if nops_rt.maybe_begin_consensus_from_validated(cr.as_ref(), validated) {
                     tracing::info!(target: "consensus", "First consensus round started (--start mode)");
                 }
