@@ -7,15 +7,14 @@
 
 use crate::{
     ApplicationRoot, ApplicationRootOptions, BootstrapOverlayHandoff, DescriptorLimitProvider,
-    LedgerReplay, MainRuntime, SHAMapStoreComponent, SHAMapStoreComponentRuntime,
-    SHAMapStoreHealthRuntime, SHAMapStoreOperatingMode, SHAMapStoreRuntime,
-    adjust_descriptor_limit, bootstrap_shamap_store,
+    LedgerReplay, MainRuntime, RclConsensusValidationSource, SHAMapStoreComponent,
+    SHAMapStoreComponentRuntime, SHAMapStoreHealthRuntime, SHAMapStoreOperatingMode,
+    SHAMapStoreRuntime, adjust_descriptor_limit, bootstrap_shamap_store,
 };
 use basics::base_uint::Uint256;
 use basics::basic_config::{BasicConfig, IniFileSections};
 use basics::string_utilities::str_unhex;
 use basics::tagged_cache::MonotonicClock;
-use consensus;
 use ledger::{
     Ledger, LedgerConfig, LedgerHeader, LedgerInfoProvider, NullLedgerJournal,
     NullOrderBookDBJournal, NullOrderBookDBRuntime, load_by_hash, load_by_index,
@@ -862,87 +861,57 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
     while !stop.load(Ordering::Acquire) {
         let root = runtime.root();
 
-        let overlay_rt = match root.overlay_runtime() {
-            Some(rt) => rt,
-            None => {
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
-            }
+        let (Some(consensus_rt), Some(network_ops_rt)) =
+            (root.consensus_runtime(), root.network_ops_runtime())
+        else {
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
         };
 
-        let consensus_rt = match root.consensus_runtime() {
-            Some(rt) => rt,
-            None => {
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
-            }
-        };
-
-        let network_ops_rt = match root.network_ops_runtime() {
-            Some(rt) => rt,
-            None => {
-                std::thread::sleep(Duration::from_millis(500));
-                continue;
-            }
-        };
-
-        // --- Process map-complete results (TX set acquisitions) ---
+        // Process map-complete results (TX set acquisitions from peers).
         if let Some(ref rx) = map_complete_rx {
             while let Ok((hash, set)) = rx.try_recv() {
                 network_ops_rt.handle_map_complete(consensus_rt.as_ref(), hash, set);
             }
         }
 
-        // --- Drain and process peer proposals ---
-        let proposals = overlay_rt.overlay().take_proposals(); if !proposals.is_empty() { tracing::info!(target: "consensus", count = proposals.len(), "Drained proposals from queue"); }
-        for proposal in proposals {
-            let close_time = root.shared_time_keeper().close_time();
-            let prop = consensus::ConsensusProposal::new(
-                proposal.previous_ledger,
-                0,
-                proposal.current_tx_hash,
-                close_time,
-                close_time,
-                proposal.public_key,
-            );
-            let _ = network_ops_rt.handle_peer_proposal(
-                consensus_rt.as_ref(),
-                proposal.public_key,
-                proposal.message.signature.clone(),
-                proposal.suppression,
-                prop,
-            );
-        }
-
-        // --- Drain and process validations ---
-        let validations = overlay_rt.overlay().take_validations();
-        for queued in &validations {
-            let mut serial = SerialIter::new(&queued.message.validation);
-            let parsed =
-                protocol::STValidation::from_serial_iter_default_node_id(&mut serial, false);
-            let mut validation = match parsed {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            validation.set_seen(root.current_close_time_seconds());
-
-            // Adjust clock from validator sign_time so is_current() passes.
-            let sign_time = validation.get_sign_time();
-            if sign_time > 0 {
-                let now = root.current_close_time_seconds() as i64;
-                let offset = sign_time as i64 - now;
-                root.time_keeper()
-                    .adjust_close_time(time::Duration::seconds(offset));
+        // Promote the closed ledger to validated once it reaches quorum.
+        // The main validation processor thread handles proposals, timer ticks,
+        // and validation processing. This loop supplements it with the
+        // validated-ledger promotion that the catchup loop normally performs
+        // (which does not run when starting fresh).
+        if let Some(lm_rt) = root.ledger_master_runtime() {
+            let lm = lm_rt.ledger_master();
+            let valid_seq = lm.valid_ledger_seq();
+            let quorum = root.validators().quorum();
+            if let Some(closed) = lm.closed_ledger() {
+                let closed_seq = closed.header().seq;
+                if closed_seq > valid_seq {
+                    let closed_hash = *closed.header().hash.as_uint256();
+                    let val_count = root.validations().num_trusted_for_ledger(closed_hash);
+                    if val_count >= quorum {
+                        let mut l = (*closed).clone();
+                        l.set_validated();
+                        let validated = std::sync::Arc::new(l);
+                        lm.set_valid_ledger_no_sweep(
+                            std::sync::Arc::clone(&validated),
+                            None,
+                            None,
+                        );
+                        root.note_validated_ledger_for_sync(
+                            std::sync::Arc::clone(&validated),
+                        );
+                        root.set_need_network_ledger(false);
+                        tracing::info!(target: "consensus",
+                            seq = closed_seq, val_count, quorum,
+                            "Validated ledger advanced (--start mode)"
+                        );
+                    }
+                }
             }
-
-            let source = queued.peer_id.to_string();
-            let _ = root.receive_validation_to_network_ops(&mut validation, &source);
         }
 
-        // --- Tick the consensus timer to advance the state machine ---
-        network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
-
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     tracing::info!(target: "consensus", "Start-mode consensus event loop stopped");

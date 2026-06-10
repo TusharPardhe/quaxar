@@ -332,6 +332,8 @@ impl RclConsensusMessageSink for RecordingSinkHandle {
     fn share_transaction(&self, tx: Arc<STTx>) {
         self.0.shared.lock().expect("shared transactions").push(tx);
     }
+
+    fn broadcast_validation(&self, _validation_bytes: Vec<u8>, _validator: PublicKey) {}
 }
 
 #[derive(Debug)]
@@ -732,6 +734,8 @@ impl app::RclConsensusValidationSource for NegativeUnlValidationSource {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn add_trusted_validation(&self, _node_id: PublicKey, _validation: &protocol::STValidation) {}
 }
 
 #[test]

@@ -146,6 +146,8 @@ impl RclConsensusValidationSource for TestValidationSource {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn add_trusted_validation(&self, _node_id: PublicKey, _validation: &STValidation) {}
 }
 
 #[derive(Default)]
@@ -283,6 +285,8 @@ impl RclConsensusMessageSink for Arc<RecordingSink> {
     fn consensus_view_change(&self) {
         self.view_changes.fetch_add(1, Ordering::AcqRel);
     }
+
+    fn broadcast_validation(&self, _validation_bytes: Vec<u8>, _validator: PublicKey) {}
 }
 
 #[derive(Default, Clone)]

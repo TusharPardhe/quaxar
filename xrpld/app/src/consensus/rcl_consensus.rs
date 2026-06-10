@@ -45,10 +45,10 @@ use consensus::{
     RclValidatedLedger, RclValidations, RclValidationsAdapter, proposal_unique_id, rcl_txset_id,
 };
 use ledger::{InboundTransactions, Ledger, get_close_agree};
-use overlay::{OverlayImpl, TmProposeSet, TmTransaction};
+use overlay::{OverlayImpl, TmProposeSet, TmTransaction, TmValidation};
 use protocol::{
-    NodeID, PUBLIC_KEY_LENGTH, PublicKey, STTx, STValidation, calc_node_id, serialize_blob,
-    sha512_half, sign_digest,
+    NodeID, PUBLIC_KEY_LENGTH, PublicKey, STTx, STValidation, VF_FULL_VALIDATION, calc_node_id,
+    get_field_by_symbol, serialize_blob, sha512_half, sign_digest,
 };
 use serde_json::Value;
 use shamap::item::SHAMapItem;
@@ -149,6 +149,7 @@ pub trait RclConsensusValidationSource: Send + Sync + 'static {
     fn laggards(&self, seq: u32, trusted_keys: &mut BTreeSet<PublicKey>) -> usize;
     fn current_node_ids(&self) -> BTreeSet<PublicKey>;
     fn get_json_trie(&self) -> Value;
+    fn add_trusted_validation(&self, node_id: PublicKey, validation: &STValidation);
     fn trusted_parent_validations(&self, _ledger_id: Uint256, _seq: u32) -> Vec<STValidation> {
         Vec::new()
     }
@@ -212,6 +213,12 @@ where
         self.lock()
             .expect("validations mutex must not be poisoned")
             .trusted_for_ledger_by_sequence(ledger_id, seq)
+    }
+
+    fn add_trusted_validation(&self, node_id: PublicKey, validation: &STValidation) {
+        self.lock()
+            .expect("validations mutex must not be poisoned")
+            .add(node_id, super::rcl_validations::wrap_st_validation(validation));
     }
 }
 
@@ -278,6 +285,13 @@ where
             .expect("validations mutex must not be poisoned")
             .trusted_for_ledger_by_sequence(ledger_id, seq)
     }
+
+    fn add_trusted_validation(&self, node_id: PublicKey, validation: &STValidation) {
+        self.validations()
+            .lock()
+            .expect("validations mutex must not be poisoned")
+            .add(node_id, super::rcl_validations::wrap_st_validation(validation));
+    }
 }
 
 impl<C> RclConsensusValidationSource for SharedAppValidations<C>
@@ -320,6 +334,10 @@ where
     fn trusted_keys_for_ledger_by_sequence(&self, ledger_id: Uint256, seq: u32) -> Vec<PublicKey> {
         self.bridge()
             .trusted_keys_for_ledger_by_sequence(ledger_id, seq)
+    }
+
+    fn add_trusted_validation(&self, node_id: PublicKey, validation: &STValidation) {
+        self.bridge().add_trusted_validation(node_id, validation);
     }
 }
 
@@ -435,6 +453,7 @@ pub trait RclConsensusMessageSink: Send + Sync + 'static {
     fn propose(&self, proposal: &ConsensusProposal<PublicKey, Uint256, Uint256>);
     fn share_tx_set(&self, txset_id: Uint256, tx_count: usize);
     fn share_transaction(&self, tx: Arc<STTx>);
+    fn broadcast_validation(&self, validation_bytes: Vec<u8>, validator: PublicKey);
 
     fn consensus_view_change(&self) {}
 }
@@ -503,6 +522,8 @@ impl RclConsensusMessageSink for NullRclConsensusMessageSink {
     fn share_tx_set(&self, _txset_id: Uint256, _tx_count: usize) {}
 
     fn share_transaction(&self, _tx: Arc<STTx>) {}
+
+    fn broadcast_validation(&self, _validation_bytes: Vec<u8>, _validator: PublicKey) {}
 }
 
 #[derive(Clone)]
@@ -654,6 +675,18 @@ where
     }
 
     fn share_tx_set(&self, _txset_id: Uint256, _tx_count: usize) {}
+
+    fn broadcast_validation(&self, validation_bytes: Vec<u8>, validator: PublicKey) {
+        if let Some(overlay) = &self.overlay {
+            #[allow(deprecated)]
+            let message = TmValidation {
+                validation: validation_bytes,
+                checked_signature: None,
+                hops: None,
+            };
+            overlay.broadcast_validation(message, validator);
+        }
+    }
 
     fn share_transaction(&self, tx: Arc<STTx>) {
         let Some(to_skip) = self.hash_router.should_relay(tx.get_transaction_id()) else {
@@ -1505,6 +1538,64 @@ where
 
         // === reference doAccept equivalent ===
         let built_ledger = self.do_accept(result, prev_ledger, seq);
+
+        // === Emit our own validation for the built ledger (reference NetworkOPs::endConsensus) ===
+        if let Some(built) = &built_ledger {
+            if self.validating.load(Ordering::Acquire) {
+                if let Some(keys) = self.validator_keys.keys.as_ref() {
+                    let now = (std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                        .saturating_sub(946684800)) as u32;
+                    let ledger_hash = *built.header().hash.as_uint256();
+                    let node_id = calc_node_id(&keys.public_key);
+                    let cookie = self.consensus_cookie;
+                    let validation = STValidation::new_signed(
+                        now,
+                        &keys.public_key,
+                        node_id,
+                        &keys.secret_key,
+                        |v| {
+                            v.set_field_h256(
+                                get_field_by_symbol("sfLedgerHash"),
+                                ledger_hash,
+                            );
+                            v.set_field_u32(
+                                get_field_by_symbol("sfLedgerSequence"),
+                                seq,
+                            );
+                            v.set_field_u64(
+                                get_field_by_symbol("sfCookie"),
+                                cookie,
+                            );
+                            v.set_flag(VF_FULL_VALIDATION);
+                        },
+                    );
+                    match validation {
+                        Ok(mut val) => {
+                            let bytes = val.get_serialized();
+                            self.message_sink
+                                .broadcast_validation(bytes, keys.public_key);
+                            // Insert into our own validation store so the
+                            // ledger promotion check counts our own vote.
+                            val.set_trusted();
+                            val.set_seen(now);
+                            self.validations
+                                .add_trusted_validation(keys.public_key, &val);
+                            tracing::info!(target: "consensus",
+                                seq,
+                                hash = %format!("{:02x}{:02x}{:02x}{:02x}", ledger_hash.data()[0], ledger_hash.data()[1], ledger_hash.data()[2], ledger_hash.data()[3]),
+                                "Validation emitted"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "consensus", ?e, "Failed to sign validation");
+                        }
+                    }
+                }
+            }
+        }
 
         // === reference endConsensus equivalent ===
         self.end_consensus(built_ledger.as_ref(), prev_ledger);
