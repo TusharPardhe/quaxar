@@ -642,6 +642,13 @@ pub fn build_bootstrap_root(
     let _ = root.load_peer_reservations()?;
     let _ = root.load_cluster_nodes_from_config(config)?;
     let _ = root.attach_configured_overlay_runtime(config, Arc::new(BootstrapOverlayHandoff))?;
+
+    // Load validation seed into config BEFORE consensus runtime is created,
+    // so the consensus adaptor can read it.
+    if let Ok(seed) = config.legacy("validation_seed") {
+        root.set_validation_seed(seed);
+    }
+
     let _ = root.attach_default_consensus_runtime();
     let node_store_kind = attach_shamap_store_if_configured(
         &mut root,
@@ -662,11 +669,6 @@ pub fn build_bootstrap_root(
         use crate::state::node_identity::load_or_generate_node_identity;
         let identity = load_or_generate_node_identity(&root.wallet_db());
         root.set_node_identity(identity);
-    }
-
-    // Load validation seed into config for consensus runtime.
-    if let Ok(seed) = config.legacy("validation_seed") {
-        root.set_validation_seed(seed);
     }
 
     // Wire up validator list publisher keys from config, matching reference
