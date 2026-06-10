@@ -864,6 +864,14 @@ where
         self.validating.load(Ordering::Acquire)
     }
 
+    /// Enable validating/proposing if keys are configured. Called before
+    /// start_round so the first round can propose immediately.
+    pub fn pre_start_round_for_proposing(&self) {
+        if self.validator_keys.keys.is_some() && !self.mode_source.is_blocked() {
+            self.validating.store(true, Ordering::Release);
+        }
+    }
+
     pub const fn consensus_cookie(&self) -> u64 {
         self.consensus_cookie
     }
@@ -1421,6 +1429,10 @@ where
             .get_nodes_after(&validated, *prev_ledger_id)
     }
 
+
+    fn pre_start_round_for_proposing(&self) {
+        self.pre_start_round_for_proposing();
+    }
     fn should_propose(&self) -> bool {
         self.validating() && self.mode_source.operating_mode() == NetworkOpsOperatingMode::Full
     }

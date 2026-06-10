@@ -722,6 +722,12 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         &mut self,
         message: &crate::message::TmProposeSet,
     ) -> crate::router::RouteAction {
+        tracing::info!(target: "overlay",
+            sig_len = message.signature.len(),
+            key_len = message.node_pub_key.len(),
+            tx_hash_len = message.current_tx_hash.len(),
+            prev_ledger_len = message.previousledger.len(),
+        );
         if !(64..=72).contains(&message.signature.len()) {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid proposal signature length");
             return crate::router::RouteAction::Continue;

@@ -889,7 +889,7 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
         }
 
         // --- Drain and process peer proposals ---
-        let proposals = overlay_rt.overlay().take_proposals();
+        let proposals = overlay_rt.overlay().take_proposals(); if !proposals.is_empty() { tracing::info!(target: "consensus", count = proposals.len(), "Drained proposals from queue"); }
         for proposal in proposals {
             let close_time = root.shared_time_keeper().close_time();
             let prop = consensus::ConsensusProposal::new(
