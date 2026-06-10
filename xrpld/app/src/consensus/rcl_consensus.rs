@@ -921,7 +921,7 @@ where
             let expired = self
                 .validators
                 .expires()
-                .is_none_or(|when| when < self.clock.now().as_seconds());
+                .is_some_and(|when| when < self.clock.now().as_seconds());
             if expired {
                 self.journal.error(
                     "Voluntarily bowing out of consensus process because of an expired validator list.",
