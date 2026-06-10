@@ -2562,7 +2562,10 @@ impl ApplicationRoot {
 
         let relay = AppRclConsensusRelay::from_application_root(
             self,
-            crate::validator::validator_keys::ValidatorKeys::from_sources(None, None),
+            crate::validator::validator_keys::ValidatorKeys::from_sources(
+                self.config().validation_seed.as_deref(),
+                None,
+            ),
             NullRclConsensusJournal,
         );
 
@@ -2582,7 +2585,10 @@ impl ApplicationRoot {
             self.transaction_master.clone(),
             relay,
             NullRclConsensusJournal,
-            crate::validator::validator_keys::ValidatorKeys::from_sources(None, None),
+            crate::validator::validator_keys::ValidatorKeys::from_sources(
+                self.config().validation_seed.as_deref(),
+                None,
+            ),
             None,
             Some(self.amendment_status.clone()),
         );
@@ -3381,6 +3387,10 @@ impl ApplicationRoot {
         validation_public_key: PublicKey,
     ) -> Option<PublicKey> {
         self.validation_public_key.replace(validation_public_key)
+    }
+
+    pub fn set_validation_seed(&mut self, seed: String) {
+        self.registry.config.validation_seed = Some(seed);
     }
 
     pub fn runtime_bindings(&self) -> &RuntimeBindings {

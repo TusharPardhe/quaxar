@@ -664,6 +664,11 @@ pub fn build_bootstrap_root(
         root.set_node_identity(identity);
     }
 
+    // Load validation seed into config for consensus runtime.
+    if let Ok(seed) = config.legacy("validation_seed") {
+        root.set_validation_seed(seed);
+    }
+
     // Wire up validator list publisher keys from config, matching reference
     // Application::setup() → validators->load(...)
     {

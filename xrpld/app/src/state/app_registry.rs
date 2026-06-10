@@ -692,6 +692,7 @@ pub struct AppConfig {
     pub start_ledger: Option<String>,
     pub do_import: bool,
     pub validation_quorum: usize,
+    pub validation_seed: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -708,6 +709,7 @@ impl Default for AppConfig {
             start_ledger: None,
             do_import: false,
             validation_quorum: 1,
+            validation_seed: None,
         }
     }
 }
@@ -1062,6 +1064,7 @@ impl ApplicationRegistryOwners {
                 start_ledger: None,
                 do_import: false,
                 validation_quorum: 1,
+                validation_seed: None,
             },
         })
     }
