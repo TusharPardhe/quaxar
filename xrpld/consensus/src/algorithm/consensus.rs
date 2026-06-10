@@ -118,11 +118,16 @@ pub fn should_close_ledger(
     parms: &ConsensusParms,
 ) -> bool {
     let ten_minutes = Duration::from_secs(10 * 60);
-    if prev_round_time > ten_minutes || time_since_prev_close > ten_minutes {
-        tracing::debug!(target: "consensus", "Closing ledger: exceeded 10 minute threshold");
+    if prev_round_time > ten_minutes
+        || (time_since_prev_close > ten_minutes && time_since_prev_close < Duration::from_secs(800_000_000))
+    {
+        tracing::debug!(target: "consensus",
+            prev_round_ms = prev_round_time.as_millis() as u64,
+            since_close_ms = time_since_prev_close.as_millis() as u64,
+            "Closing ledger: exceeded 10 minute threshold");
         return true;
     }
-    if proposers_closed + proposers_validated > (prev_proposers / 2) {
+    if prev_proposers > 0 && proposers_closed > 0 && proposers_closed + proposers_validated > (prev_proposers / 2) {
         tracing::debug!(target: "consensus", proposers_closed, proposers_validated, prev_proposers, "Closing ledger: majority of proposers closed");
         return true;
     }
@@ -312,7 +317,15 @@ impl<A: ConsensusAdaptor> Consensus<A> {
         tracing::info!(target: "consensus", prev_ledger = %prev_ledger_id.to_string(), proposing, "Starting consensus round");
         if self.first_round {
             self.prev_round_time = self.parms.ledger_idle_interval;
-            self.prev_close_time = self.adaptor.close_time(&prev_ledger);
+            // Use the ledger's close_time, or 'now' if it's 0 (genesis).
+            // Without this, time_since_prev_close is enormous and the node
+            // immediately closes without waiting for peer proposals.
+            let ledger_close = self.adaptor.close_time(&prev_ledger);
+            self.prev_close_time = if ledger_close.as_seconds() == 0 {
+                self.now
+            } else {
+                ledger_close
+            };
             self.first_round = false;
         } else {
             self.prev_close_time = self.raw_close_times.self_close_time;
@@ -583,10 +596,16 @@ impl<A: ConsensusAdaptor> Consensus<A> {
 
         let previous_close_correct = self.mode != ConsensusMode::WrongLedger
             && self.adaptor.close_agree(previous_ledger)
+            && self.adaptor.close_time(previous_ledger).as_seconds() != 0
             && self.adaptor.close_time(previous_ledger)
                 != (self.adaptor.parent_close_time(previous_ledger) + TimeDuration::seconds(1));
         let last_close_time = if previous_close_correct {
             self.adaptor.close_time(previous_ledger)
+        } else if self.prev_close_time.as_seconds() == 0 {
+            // prev_close_time is uninitialized (genesis start). Initialize it
+            // to now so subsequent ticks compute time_since_prev_close correctly.
+            self.prev_close_time = self.now;
+            self.prev_close_time
         } else {
             self.prev_close_time
         };

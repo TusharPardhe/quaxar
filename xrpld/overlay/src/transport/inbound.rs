@@ -194,6 +194,17 @@ impl QueuedOverlayInboundHandler {
             .extend(validations);
     }
 
+    pub fn requeue_proposals(&self, proposals: Vec<QueuedProposal>) {
+        if proposals.is_empty() {
+            return;
+        }
+        self.inner
+            .lock()
+            .expect("overlay inbound lock")
+            .proposals
+            .extend(proposals);
+    }
+
     /// Drain only validations from the queue, leaving all other messages.
     pub fn take_validations(&self) -> Vec<QueuedValidation> {
         std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").validations)

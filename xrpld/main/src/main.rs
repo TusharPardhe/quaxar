@@ -4135,7 +4135,12 @@ impl<D> BoundServerRuntime<D> {
                                 // Re-queue validations that were in the snapshot
                                 overlay_runtime.overlay().queued_inbound().requeue_validations(snapshot.validations);
                             }
-                            process_queued_validations(&val_app, &val_accept_sink);
+                            // In --start mode (need_network_ledger=true), the
+                            // start-mode-consensus thread exclusively processes
+                            // validations and proposals.
+                            if !val_app.need_network_ledger() {
+                                process_queued_validations(&val_app, &val_accept_sink);
+                            }
 
                             if !val_app.need_network_ledger() {
                             if let Some(rx) = &map_complete_rx {

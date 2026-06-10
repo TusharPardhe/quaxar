@@ -20,7 +20,10 @@ use ledger::{
     NullOrderBookDBJournal, NullOrderBookDBRuntime, load_by_hash, load_by_index,
 };
 use nodestore::{FetchType, ManagerImp, NodeObjectType as NodeStoreObjectType};
-use protocol::{JsonValue, STLedgerEntry, STParsedJSONObject, STTx, SerialIter, TxMeta};
+use protocol::{
+    JsonValue, REGISTERED_FEATURES, RegisteredFeatureVote, STLedgerEntry, STParsedJSONObject,
+    STTx, SerialIter, TxMeta, feature_id,
+};
 use rusqlite::{OptionalExtension, params};
 use shamap::family::{
     NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
@@ -660,7 +663,7 @@ pub fn build_bootstrap_root(
     let configured_node_size = configured_node_size_from_config(config);
     root.set_status_rpc_node_size(configured_node_size.clone());
     attach_bootstrap_node_family(&mut root, configured_node_size.as_deref());
-    initialize_startup_ledger_state(&root, options)?;
+    initialize_startup_ledger_state(&root, options, config)?;
     root.bind_default_component_runtimes();
 
     // Wire up node identity (pubkey_node in server_info) from wallet DB,
@@ -780,20 +783,14 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
     runtime.start()?;
     tracing::info!(target: "app", "Node startup complete");
 
-    // For --start mode: kick off the first consensus round from the validated
-    // genesis ledger so the network begins proposing immediately.
+    // For --start mode: store genesis as closed ledger so consensus can find
+    // it as a parent. The first round is started in the event loop once peers
+    // are connected (so proposals arrive before the idle timeout closes it).
     if bootstrap.report.startup_ledger_mode == StartUpType::Fresh {
         let root = runtime.root();
-        if let (Some(cr), Some(nops_rt)) = (root.consensus_runtime(), root.network_ops_runtime()) {
+        if let Some(lm) = root.ledger_master_runtime() {
             if let Some(validated) = root.validated_ledger() {
-                // Store genesis as closed ledger so consensus can look it up
-                // via acquire_consensus_ledger → get_ledger_by_hash.
-                if let Some(lm) = root.ledger_master_runtime() {
-                    lm.ledger_master().set_closed_ledger(Arc::clone(&validated));
-                }
-                if nops_rt.maybe_begin_consensus_from_validated(cr.as_ref(), validated) {
-                    tracing::info!(target: "consensus", "First consensus round started (--start mode)");
-                }
+                lm.ledger_master().set_closed_ledger(Arc::clone(&validated));
             }
         }
     }
@@ -815,6 +812,10 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
     let consensus_thread = if bootstrap.report.startup_ledger_mode == StartUpType::Fresh
         && bootstrap.report.has_overlay_runtime
     {
+        // This thread exclusively drives consensus in --start mode.
+        // Set need_network_ledger to prevent the main validation processor
+        // thread from also driving proposals/timer (which causes divergence).
+        runtime.root().set_need_network_ledger(true);
         let stop_flag = Arc::clone(&consensus_stop);
         let rt = Arc::clone(&runtime);
         Some(std::thread::Builder::new()
@@ -850,6 +851,8 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
 /// the consensus state machine that would otherwise only run inside the
 /// catchup loop (which is never entered in --start mode).
 fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
+    use consensus;
+
     tracing::info!(target: "consensus", "Start-mode consensus event loop running");
 
     // Take the map-complete receiver once (it's a take-once resource).
@@ -858,15 +861,65 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
         .consensus_runtime()
         .and_then(|cr| cr.take_map_complete_receiver());
 
+    let mut consensus_started = false;
+    let loop_start = std::time::Instant::now();
+
     while !stop.load(Ordering::Acquire) {
         let root = runtime.root();
 
-        let (Some(consensus_rt), Some(network_ops_rt)) =
-            (root.consensus_runtime(), root.network_ops_runtime())
-        else {
+        let (Some(overlay_rt), Some(consensus_rt), Some(network_ops_rt)) = (
+            root.overlay_runtime(),
+            root.consensus_runtime(),
+            root.network_ops_runtime(),
+        ) else {
             std::thread::sleep(Duration::from_millis(500));
             continue;
         };
+
+        // Start the first consensus round after a delay to allow all
+        // implementations (including slower-starting rippled) to connect
+        // and begin proposing on genesis. Without this delay, quaxar would
+        // close its first round before rippled starts, causing a fork.
+        if !consensus_started {
+            let elapsed = std::time::Instant::now()
+                .duration_since(loop_start)
+                .as_secs();
+            if elapsed >= 25 {
+                let proposals = overlay_rt.overlay().take_proposals();
+                if let Some(validated) = root.validated_ledger() {
+                    if network_ops_rt.maybe_begin_consensus_from_validated(
+                        consensus_rt.as_ref(),
+                        Arc::clone(&validated),
+                    ) {
+                        tracing::info!(target: "consensus",
+                            delay_secs = elapsed,
+                            queued_proposals = proposals.len(),
+                            "First consensus round started (--start mode)"
+                        );
+                    }
+                }
+                consensus_started = true;
+                // Feed queued proposals into the new round.
+                for proposal in proposals {
+                    let close_time = root.shared_time_keeper().close_time();
+                    let prop = consensus::ConsensusProposal::new(
+                        proposal.previous_ledger,
+                        0,
+                        proposal.current_tx_hash,
+                        close_time,
+                        close_time,
+                        proposal.public_key,
+                    );
+                    let _ = network_ops_rt.handle_peer_proposal(
+                        consensus_rt.as_ref(),
+                        proposal.public_key,
+                        proposal.message.signature.clone(),
+                        proposal.suppression,
+                        prop,
+                    );
+                }
+            }
+        }
 
         // Process map-complete results (TX set acquisitions from peers).
         if let Some(ref rx) = map_complete_rx {
@@ -875,11 +928,55 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
             }
         }
 
+        // Drain and feed peer proposals into the consensus engine.
+        if consensus_started {
+        let proposals = overlay_rt.overlay().take_proposals();
+        for proposal in proposals {
+            let close_time = root.shared_time_keeper().close_time();
+            let prop = consensus::ConsensusProposal::new(
+                proposal.previous_ledger,
+                0,
+                proposal.current_tx_hash,
+                close_time,
+                close_time,
+                proposal.public_key,
+            );
+            let _ = network_ops_rt.handle_peer_proposal(
+                consensus_rt.as_ref(),
+                proposal.public_key,
+                proposal.message.signature.clone(),
+                proposal.suppression,
+                prop,
+            );
+        }
+        }
+
+        // Drain and process inbound validations.
+        let validations = overlay_rt.overlay().take_validations();
+        for queued in &validations {
+            let mut serial = protocol::SerialIter::new(&queued.message.validation);
+            let parsed =
+                protocol::STValidation::from_serial_iter_default_node_id(&mut serial, false);
+            let mut validation = match parsed {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            validation.set_seen(root.current_close_time_seconds());
+            let sign_time = validation.get_sign_time();
+            if sign_time > 0 {
+                let now = root.current_close_time_seconds() as i64;
+                let offset = sign_time as i64 - now;
+                root.time_keeper()
+                    .adjust_close_time(time::Duration::seconds(offset));
+            }
+            let source = queued.peer_id.to_string();
+            let _ = root.receive_validation_to_network_ops(&mut validation, &source);
+        }
+
+        // Tick the consensus state machine.
+        network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
+
         // Promote the closed ledger to validated once it reaches quorum.
-        // The main validation processor thread handles proposals, timer ticks,
-        // and validation processing. This loop supplements it with the
-        // validated-ledger promotion that the catchup loop normally performs
-        // (which does not run when starting fresh).
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let lm = lm_rt.ledger_master();
             let valid_seq = lm.valid_ledger_seq();
@@ -1111,6 +1208,7 @@ fn attach_bootstrap_node_family(root: &mut ApplicationRoot, node_size: Option<&s
 fn initialize_startup_ledger_state(
     root: &ApplicationRoot,
     options: &AppBootstrapOptions,
+    config: &BasicConfig,
 ) -> Result<(), String> {
     match options.start_type {
         StartUpType::Load => load_startup_ledger_from_storage(root, options),
@@ -1120,9 +1218,9 @@ fn initialize_startup_ledger_state(
             if !root.config().standalone {
                 root.set_need_network_ledger(true);
             }
-            seed_startup_ledger_state(root, options)
+            seed_startup_ledger_state(root, options, config)
         }
-        StartUpType::Fresh | StartUpType::Normal | StartUpType::Snapshot => seed_startup_ledger_state(root, options),
+        StartUpType::Fresh | StartUpType::Normal | StartUpType::Snapshot => seed_startup_ledger_state(root, options, config),
     }
 }
 
@@ -1626,6 +1724,7 @@ fn to_xrpld_startup_type(start_type: StartUpType) -> xrpld_core::StartUpType {
 fn seed_startup_ledger_state(
     root: &ApplicationRoot,
     options: &AppBootstrapOptions,
+    config: &BasicConfig,
 ) -> Result<(), String> {
     let seed_seq = options
         .start_ledger
@@ -1637,7 +1736,12 @@ fn seed_startup_ledger_state(
 
     let closed = match options.start_type {
         StartUpType::Fresh | StartUpType::Network | StartUpType::Snapshot => {
-            Ledger::create_genesis(backed, &LedgerConfig::default(), [])
+            // Enable amendments at genesis matching reference rippled --start.
+            // If [amendments] is configured, use those IDs (matching rippled
+            // which reads its [amendments] section to determine getDesired()).
+            // Otherwise fall back to all supported + DefaultYes features.
+            let genesis_amendments = amendments_from_config(config);
+            Ledger::create_genesis(backed, &LedgerConfig::default(), genesis_amendments)
                 .unwrap_or_else(|_| Ledger::from_ledger_seq_and_close_time(1, 0, backed))
         }
         StartUpType::Replay => {
@@ -1709,6 +1813,33 @@ fn seed_startup_ledger_state(
     });
 
     Ok(())
+}
+
+/// Read amendment IDs from the [amendments] config section.
+/// Each line is "<64-hex-id> <Name>". If the section is absent or empty,
+/// falls back to all supported + DefaultYes features from the registry.
+fn amendments_from_config(config: &BasicConfig) -> Vec<Uint256> {
+    let section = config.section("amendments");
+    let values = section.values();
+    if !values.is_empty() {
+        return values
+            .iter()
+            .filter_map(|line| {
+                let hex = line.split_whitespace().next()?;
+                if hex.len() != 64 {
+                    return None;
+                }
+                let bytes = str_unhex(hex)?;
+                Uint256::from_slice(&bytes)
+            })
+            .collect();
+    }
+    // Fallback: all supported amendments voted DefaultYes.
+    REGISTERED_FEATURES
+        .iter()
+        .filter(|f| f.supported && f.vote == RegisteredFeatureVote::DefaultYes)
+        .map(|f| feature_id(f.name))
+        .collect()
 }
 
 fn config_legacy_u32(config: &BasicConfig, section: &str) -> Option<u32> {
