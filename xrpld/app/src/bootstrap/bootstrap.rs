@@ -773,6 +773,19 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
     runtime.start()?;
     tracing::info!(target: "app", "Node startup complete");
 
+    // For --start mode: kick off the first consensus round from the validated
+    // genesis ledger so the network begins proposing immediately.
+    if bootstrap.report.startup_ledger_mode == StartUpType::Fresh {
+        let root = runtime.root();
+        if let (Some(cr), Some(nops_rt)) = (root.consensus_runtime(), root.network_ops_runtime()) {
+            if let Some(validated) = root.validated_ledger() {
+                if nops_rt.maybe_begin_consensus_from_validated(cr.as_ref(), validated) {
+                    tracing::info!(target: "consensus", "First consensus round started (--start mode)");
+                }
+            }
+        }
+    }
+
     let stop_requested = Arc::new(AtomicBool::new(false));
     let stop_thread = spawn_shutdown_watcher(Arc::clone(&runtime), Arc::clone(&stop_requested));
 
