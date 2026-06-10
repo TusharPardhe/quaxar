@@ -454,6 +454,7 @@ where
             }
             "--start" => {
                 options.start_type = StartUpType::Fresh;
+                options.start_valid = true;
             }
             "--vacuum" => {
                 options.vacuum = true;

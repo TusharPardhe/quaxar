@@ -675,8 +675,9 @@ fn try_cli_subcommand() -> Option<ExitCode> {
                 print_unknown_command(command, &subcommands);
                 return Some(ExitCode::FAILURE);
             }
-            let _ = err.print();
-            return Some(ExitCode::FAILURE);
+            // No subcommand found — likely node startup flags (--start, --valid, etc.)
+            // Fall through to the node startup path where parse_bootstrap_args handles them.
+            return None;
         }
         Err(err) => {
             let _ = err.print();
