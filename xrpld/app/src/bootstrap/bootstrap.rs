@@ -15,6 +15,7 @@ use basics::base_uint::Uint256;
 use basics::basic_config::{BasicConfig, IniFileSections};
 use basics::string_utilities::str_unhex;
 use basics::tagged_cache::MonotonicClock;
+use consensus;
 use ledger::{
     Ledger, LedgerConfig, LedgerHeader, LedgerInfoProvider, NullLedgerJournal,
     NullOrderBookDBJournal, NullOrderBookDBRuntime, load_by_hash, load_by_index,
@@ -793,13 +794,153 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
         }
     }
 
+    // Spawn a dedicated consensus event loop for --start mode (private networks).
+    //
+    // WHY: In normal operation, the catchup loop in main.rs drives consensus by
+    // draining proposals/validations from the overlay and ticking the consensus
+    // timer. However, when using --start mode (StartUpType::Fresh), the node
+    // boots directly into bootstrap without entering the catchup loop. Without
+    // this thread, proposals and validations from peers are never consumed and
+    // the consensus timer never fires, so the network stalls after genesis.
+    //
+    // This thread replicates only the consensus-driving subset of the catchup
+    // loop: proposal processing, validation processing, map-complete handling,
+    // and timer ticks. It does NOT do ledger acquisition or inbound ledger
+    // processing — those are unnecessary when starting fresh.
+    let consensus_stop = Arc::new(AtomicBool::new(false));
+    let consensus_thread = if bootstrap.report.startup_ledger_mode == StartUpType::Fresh
+        && bootstrap.report.has_overlay_runtime
+    {
+        let stop_flag = Arc::clone(&consensus_stop);
+        let rt = Arc::clone(&runtime);
+        Some(std::thread::Builder::new()
+            .name("start-mode-consensus".into())
+            .spawn(move || {
+                run_start_mode_consensus_loop(&rt, &stop_flag);
+            })
+            .expect("failed to spawn start-mode-consensus thread"))
+    } else {
+        None
+    };
+
     let stop_requested = Arc::new(AtomicBool::new(false));
     let stop_thread = spawn_shutdown_watcher(Arc::clone(&runtime), Arc::clone(&stop_requested));
 
     runtime.run();
+
+    // Signal the consensus event loop to stop, then join it.
+    consensus_stop.store(true, Ordering::Release);
+    if let Some(handle) = consensus_thread {
+        let _ = handle.join();
+    }
+
     stop_requested.store(true, Ordering::Release);
     let _ = stop_thread.join();
     Ok(())
+}
+
+/// Consensus event loop for --start mode private networks.
+///
+/// Drains proposals and validations from the overlay, processes map-complete
+/// results, and ticks the consensus timer on a ~200ms cadence. This drives
+/// the consensus state machine that would otherwise only run inside the
+/// catchup loop (which is never entered in --start mode).
+fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
+    tracing::info!(target: "consensus", "Start-mode consensus event loop running");
+
+    // Take the map-complete receiver once (it's a take-once resource).
+    let map_complete_rx = runtime
+        .root()
+        .consensus_runtime()
+        .and_then(|cr| cr.take_map_complete_receiver());
+
+    while !stop.load(Ordering::Acquire) {
+        let root = runtime.root();
+
+        let overlay_rt = match root.overlay_runtime() {
+            Some(rt) => rt,
+            None => {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+
+        let consensus_rt = match root.consensus_runtime() {
+            Some(rt) => rt,
+            None => {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+
+        let network_ops_rt = match root.network_ops_runtime() {
+            Some(rt) => rt,
+            None => {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+
+        // --- Process map-complete results (TX set acquisitions) ---
+        if let Some(ref rx) = map_complete_rx {
+            while let Ok((hash, set)) = rx.try_recv() {
+                network_ops_rt.handle_map_complete(consensus_rt.as_ref(), hash, set);
+            }
+        }
+
+        // --- Drain and process peer proposals ---
+        let proposals = overlay_rt.overlay().take_proposals();
+        for proposal in proposals {
+            let close_time = root.shared_time_keeper().close_time();
+            let prop = consensus::ConsensusProposal::new(
+                proposal.previous_ledger,
+                0,
+                proposal.current_tx_hash,
+                close_time,
+                close_time,
+                proposal.public_key,
+            );
+            let _ = network_ops_rt.handle_peer_proposal(
+                consensus_rt.as_ref(),
+                proposal.public_key,
+                proposal.message.signature.clone(),
+                proposal.suppression,
+                prop,
+            );
+        }
+
+        // --- Drain and process validations ---
+        let validations = overlay_rt.overlay().take_validations();
+        for queued in &validations {
+            let mut serial = SerialIter::new(&queued.message.validation);
+            let parsed =
+                protocol::STValidation::from_serial_iter_default_node_id(&mut serial, false);
+            let mut validation = match parsed {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            validation.set_seen(root.current_close_time_seconds());
+
+            // Adjust clock from validator sign_time so is_current() passes.
+            let sign_time = validation.get_sign_time();
+            if sign_time > 0 {
+                let now = root.current_close_time_seconds() as i64;
+                let offset = sign_time as i64 - now;
+                root.time_keeper()
+                    .adjust_close_time(time::Duration::seconds(offset));
+            }
+
+            let source = queued.peer_id.to_string();
+            let _ = root.receive_validation_to_network_ops(&mut validation, &source);
+        }
+
+        // --- Tick the consensus timer to advance the state machine ---
+        network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
+
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    tracing::info!(target: "consensus", "Start-mode consensus event loop stopped");
 }
 
 fn ensure_descriptor_budget(required: usize) -> Result<(), String> {
