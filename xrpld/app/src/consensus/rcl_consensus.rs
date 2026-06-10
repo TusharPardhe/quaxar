@@ -778,6 +778,14 @@ impl RclConsensusLedgerSource for crate::ledger::ledger_master_runtime::AppLedge
     fn have_validated(&self) -> bool {
         self.ledger_master().have_validated()
     }
+
+    fn request_consensus_ledger(&self, hash: &Uint256) {
+        let mut pending = self
+            .pending_consensus_ledger
+            .lock()
+            .expect("pending_consensus_ledger mutex must not be poisoned");
+        *pending = Some(*hash);
+    }
 }
 
 impl<CLOCK, LEDGERS, OPEN, VALIDATIONS, VALIDATORS, MODE, SINK, J>

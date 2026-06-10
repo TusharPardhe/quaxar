@@ -1748,6 +1748,10 @@ impl OverlayImpl {
         self.queued_inbound.take_proposals()
     }
 
+    pub fn take_ledger_data(&self) -> Vec<crate::PeerMessage<crate::TmLedgerData>> {
+        self.queued_inbound.take_ledger_data()
+    }
+
     pub fn relay_proposal(
         &self,
         message: TmProposeSet,

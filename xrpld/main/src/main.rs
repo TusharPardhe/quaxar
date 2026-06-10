@@ -4217,7 +4217,7 @@ impl<D> BoundServerRuntime<D> {
                     // Register direct ledger_data channel with overlay (once)
                     // and spawn a dedicated router thread that immediately
                     // dispatches TmLedgerData to acquisition threads, matching
-                    if !overlay_channel_registered {
+                    if !overlay_channel_registered && !app.need_network_ledger() {
                         let direct_registry = Arc::clone(&acq_registry);
                         let dc = Arc::clone(&direct_router_counter);
                         overlay_runtime.overlay().queued_inbound()
