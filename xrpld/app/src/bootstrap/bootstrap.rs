@@ -883,6 +883,39 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
 
         // Before starting consensus, acquire the network's validated ledger.
         if !consensus_started {
+            // Check peers' current closed ledger (from StatusChange).
+            // This is the most reliable acquisition source since peers
+            // always have their current ledger in cache.
+            if consensus_acq.is_none() {
+                use overlay::Overlay;
+                let peers = overlay_rt.overlay().active_peers();
+                for peer in &peers {
+                    let closed_hash = peer.closed_ledger_hash();
+                    if closed_hash.is_zero() {
+                        continue;
+                    }
+                    if let Some(lm_rt) = root.ledger_master_runtime() {
+                        let lm = lm_rt.ledger_master();
+                        if lm.get_ledger_by_hash(
+                            basics::sha_map_hash::SHAMapHash::new(closed_hash),
+                        ).is_none() {
+                            let mut pending = lm_rt.pending_consensus_ledger
+                                .lock()
+                                .expect("pending_consensus_ledger lock");
+                            if pending.is_none() {
+                                *pending = Some(closed_hash);
+                                tracing::info!(target: "consensus",
+                                    hash = %closed_hash,
+                                    peer_id = peer.id(),
+                                    "Requesting peer's current closed ledger"
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
             // Process validations to sync clock and detect network state.
             let validations = overlay_rt.overlay().take_validations();
             for queued in &validations {
@@ -935,20 +968,33 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
             // Drive ledger acquisition (targeted requests with 2s retry).
             drive_consensus_ledger_acquisition(root, &overlay_rt, &mut consensus_acq);
 
-            // Check if we now have a network ledger to start from.
+            // Check if we've caught up to the network. Start consensus
+            // only when our closed ledger matches a peer's closed ledger
+            // (meaning we're at the tip). Until then, keep acquiring.
             if let Some(lm_rt) = root.ledger_master_runtime() {
                 let lm = lm_rt.ledger_master();
                 if let Some(closed) = lm.closed_ledger() {
                     if closed.header().seq > 1 {
-                        if network_ops_rt.maybe_begin_consensus_from_validated(
-                            consensus_rt.as_ref(),
-                            Arc::clone(&closed),
-                        ) {
-                            tracing::info!(target: "consensus",
-                                seq = closed.header().seq,
-                                "Consensus started from acquired network ledger"
-                            );
-                            consensus_started = true;
+                        use overlay::Overlay;
+                        let closed_hash = *closed.header().hash.as_uint256();
+                        let at_tip = overlay_rt.overlay().active_peers().iter().any(|p| {
+                            p.closed_ledger_hash() == closed_hash
+                        });
+                        if at_tip {
+                            if network_ops_rt.maybe_begin_consensus_from_validated(
+                                consensus_rt.as_ref(),
+                                Arc::clone(&closed),
+                            ) {
+                                tracing::info!(target: "consensus",
+                                    seq = closed.header().seq,
+                                    "Consensus started — caught up to network tip"
+                                );
+                                consensus_started = true;
+                            }
+                        } else {
+                            // Not at tip yet — clear pending so we re-acquire
+                            // the peer's CURRENT ledger on next iteration.
+                            let _ = lm_rt.take_pending_consensus_ledger();
                         }
                     }
                 }
@@ -1271,7 +1317,7 @@ fn send_targeted_get_ledger(
             ledger_seq: None,
             node_i_ds: Vec::new(),
             request_cookie: None,
-            query_type: None,
+            query_type: Some(1), // qtINDIRECT — allows peer to relay if it doesn't have it
             query_depth: None,
         },
     ));

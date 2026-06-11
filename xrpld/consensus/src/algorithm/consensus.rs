@@ -127,7 +127,7 @@ pub fn should_close_ledger(
             "Closing ledger: exceeded 10 minute threshold");
         return true;
     }
-    if prev_proposers > 0 && proposers_closed > 0 && proposers_closed + proposers_validated > (prev_proposers / 2) {
+    if proposers_closed + proposers_validated > (prev_proposers / 2) {
         tracing::debug!(target: "consensus", proposers_closed, proposers_validated, prev_proposers, "Closing ledger: majority of proposers closed");
         return true;
     }
