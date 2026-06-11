@@ -4135,12 +4135,7 @@ impl<D> BoundServerRuntime<D> {
                                 // Re-queue validations that were in the snapshot
                                 overlay_runtime.overlay().queued_inbound().requeue_validations(snapshot.validations);
                             }
-                            // In --start mode (need_network_ledger=true), the
-                            // start-mode-consensus thread exclusively processes
-                            // validations and proposals.
-                            if !val_app.need_network_ledger() {
-                                process_queued_validations(&val_app, &val_accept_sink);
-                            }
+                            process_queued_validations(&val_app, &val_accept_sink);
 
                             if !val_app.need_network_ledger() {
                             if let Some(rx) = &map_complete_rx {
@@ -4191,39 +4186,6 @@ impl<D> BoundServerRuntime<D> {
                             // tokio::sync::Mutex was created on the main runtime which is
                             // shutting down. Skip entirely until we have a validated ledger.
                             if !val_app.need_network_ledger() {
-                                // checkLastClosedLedger equivalent: if peers report
-                                // a different LCL that we have in history, switch to it.
-                                if let Some(overlay_rt) = val_app.overlay_runtime() {
-                                    if let Some(lm_rt) = val_app.ledger_master_runtime() {
-                                        use overlay::Overlay as _;
-                                        let our_hash = lm_rt.ledger_master().closed_ledger()
-                                            .map(|l| *l.header().hash.as_uint256())
-                                            .unwrap_or_default();
-                                        let peers = overlay_rt.overlay().active_peers();
-                                        // Find majority peer LCL
-                                        let mut counts: std::collections::HashMap<basics::base_uint::Uint256, usize> = std::collections::HashMap::new();
-                                        for p in peers.iter() {
-                                            let h = p.closed_ledger_hash();
-                                            if !h.is_zero() { *counts.entry(h).or_default() += 1; }
-                                        }
-                                        if let Some((best_hash, _count)) = counts.iter().max_by_key(|(_,c)| *c) {
-                                            if *best_hash != our_hash {
-                                                // Majority is on a different ledger. Do we have it?
-                                                if let Some(target) = lm_rt.ledger_master().get_ledger_by_hash(
-                                                    basics::sha_map_hash::SHAMapHash::new(*best_hash),
-                                                ).or_else(|| lm_rt.ledger_master().ledger_history().get_cached_ledger_by_hash(
-                                                    basics::sha_map_hash::SHAMapHash::new(*best_hash),
-                                                )) {
-                                                    lm_rt.ledger_master().set_closed_ledger(std::sync::Arc::clone(&target));
-                                                    tracing::info!(target: "consensus",
-                                                        seq = target.header().seq,
-                                                        "checkLastClosedLedger: switched to peer majority LCL"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
                                 if let Some(consensus_runtime) = val_app.consensus_runtime() {
                                     let tick_start = Instant::now();
                                     if let Some(network_ops_runtime) = val_app.network_ops_runtime() {
@@ -4232,28 +4194,6 @@ impl<D> BoundServerRuntime<D> {
                                     }
                                     let latency_ms = tick_start.elapsed().as_millis() as u64;
                                     val_app.set_status_rpc_io_latency_ms(Some(latency_ms));
-                                }
-                            } else {
-                                // Check if we've caught up: our closed_ledger
-                                // matches what a peer reports via StatusChange.
-                                if let Some(overlay_rt) = val_app.overlay_runtime() {
-                                    if let Some(lm_rt) = val_app.ledger_master_runtime() {
-                                        if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
-                                            let our_hash = *closed.header().hash.as_uint256();
-                                            if closed.header().seq > 1 {
-                                                use overlay::Overlay as _;
-                                                let peers = overlay_rt.overlay().active_peers();
-                                                let match_count = peers.iter().filter(|p| p.closed_ledger_hash() == our_hash).count();
-                                                if match_count >= 1 {
-                                                    val_app.set_need_network_ledger(false);
-                                                    tracing::info!(target: "consensus",
-                                                        seq = closed.header().seq,
-                                                        "Caught up to network — enabling consensus"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
                                 }
                             }
                             })); // end catch_unwind
@@ -4272,7 +4212,7 @@ impl<D> BoundServerRuntime<D> {
                     // Register direct ledger_data channel with overlay (once)
                     // and spawn a dedicated router thread that immediately
                     // dispatches TmLedgerData to acquisition threads, matching
-                    if !overlay_channel_registered && !app.need_network_ledger() {
+                    if !overlay_channel_registered {
                         let direct_registry = Arc::clone(&acq_registry);
                         let dc = Arc::clone(&direct_router_counter);
                         overlay_runtime.overlay().queued_inbound()
@@ -4719,56 +4659,6 @@ impl<D> BoundServerRuntime<D> {
                         }
                     }
 
-                    // Poll InboundLedger completions and insert into history.
-                    // Always set the latest as closed_ledger to track the network.
-                    {
-                        let poll_results = inbound_ledgers.poll_results();
-                        for (_hash, ledger, _skip) in &poll_results {
-                            if let Some(lm_rt) = app.ledger_master_runtime() {
-                                let stored = std::sync::Arc::new(ledger.clone());
-                                lm_rt.ledger_master().ledger_history().insert(
-                                    std::sync::Arc::clone(&stored), false,
-                                );
-                                let our_seq = lm_rt.ledger_master().closed_ledger()
-                                    .map(|l| l.header().seq).unwrap_or(0);
-                                if ledger.header().seq > our_seq {
-                                    lm_rt.ledger_master().set_closed_ledger(
-                                        std::sync::Arc::clone(&stored)
-                                    );
-                                    if app.need_network_ledger() {
-                                        app.set_need_network_ledger(false);
-                                    }
-                                    tracing::info!(target: "consensus",
-                                        seq = ledger.header().seq,
-                                        "Advanced closed_ledger from InboundLedger"
-                                    );
-                                }
-                            }
-                        }
-
-                        // Continuously trigger acquisition for the peer majority
-                        // LCL so InboundLedger keeps fetching the latest.
-                        if let Some(overlay_rt) = app.overlay_runtime() {
-                            use overlay::Overlay as _;
-                            let our_closed_hash = app.ledger_master_runtime()
-                                .and_then(|lm| lm.ledger_master().closed_ledger())
-                                .map(|l| *l.header().hash.as_uint256())
-                                .unwrap_or_default();
-                            let our_closed_seq = app.ledger_master_runtime()
-                                .and_then(|lm| lm.ledger_master().closed_ledger())
-                                .map(|l| l.header().seq)
-                                .unwrap_or(2);
-                            let peers = overlay_rt.overlay().active_peers();
-                            for p in peers.iter() {
-                                let h = p.closed_ledger_hash();
-                                if !h.is_zero() && h != our_closed_hash {
-                                    inbound_ledgers.acquire(h, our_closed_seq + 1, 0);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
                     if target_seq > 1 {
                         // --- Persistent tick-based acquisition (reference InboundLedger parity) ---
                         // Maintain persistent InboundLedgerLocal owners that
@@ -4780,7 +4670,6 @@ impl<D> BoundServerRuntime<D> {
                         // Drain completed/failed entries before trying to acquire.
                         // later promotion/advance checks observe the cache.
                         let early_results = inbound_ledgers.poll_results();
-
                         if acquiring_consensus_ledger
                             .is_some_and(|hash| !inbound_ledgers.is_in_progress(&hash))
                         {
