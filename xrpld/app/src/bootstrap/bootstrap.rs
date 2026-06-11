@@ -1149,10 +1149,9 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
             let _ = root.receive_validation_to_network_ops(&mut validation, &source);
         }
 
-        // Tick the consensus state machine (only when not waiting for network ledger).
-        if !root.need_network_ledger() {
-            network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
-        }
+        // Consensus timer is driven by the main validation thread (main.rs)
+        // once need_network_ledger is cleared. The bootstrap loop only does
+        // acquisition and LCL switching.
 
         // Promote the closed ledger to validated once it reaches quorum.
         if let Some(lm_rt) = root.ledger_master_runtime() {
@@ -1245,10 +1244,9 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                             hash = %new_hash,
                             "Switched consensus to acquired network LCL"
                         );
-                        // Enable consensus timer now that we're on the
-                        // network's chain. The consensus engine will handle
-                        // staying in sync via proposals and handle_wrong_ledger.
-                        root.set_need_network_ledger(false);
+                        // Don't clear need_network_ledger here. The main
+                        // validation thread will clear it when our hash
+                        // matches a peer's StatusChange (true catch-up).
                     }
                 }
             }
@@ -1292,7 +1290,13 @@ fn drive_consensus_ledger_acquisition(
     let wanted = lm_rt.pending_consensus_ledger();
     if let Some(wanted) = wanted {
         let is_new = acq.as_ref().map_or(true, |s| s.hash != wanted);
-        if is_new {
+        // Only switch targets if no acquisition is active OR the current
+        // one has been trying for > 10s (stale).
+        let should_switch = is_new
+            && acq.as_ref().map_or(true, |s| {
+                s.last_request_time.elapsed() > Duration::from_secs(10)
+            });
+        if should_switch {
             tracing::info!(target: "consensus",
                 hash = %wanted,
                 "Starting targeted consensus ledger acquisition"

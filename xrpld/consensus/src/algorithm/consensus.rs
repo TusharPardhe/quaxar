@@ -615,6 +615,21 @@ impl<A: ConsensusAdaptor> Consensus<A> {
         if !should_close {
             return ConsensusDecision::StayOpen;
         }
+        // Don't close when we know we're on the wrong ledger — wait for
+        // acquisition to switch us to the correct one.
+        if matches!(self.mode, ConsensusMode::WrongLedger) {
+            return ConsensusDecision::StayOpen;
+        }
+        // Don't close on idle when observing and no peers are on our ledger.
+        // This prevents solo-closing while waiting to catch up to the network.
+        if self.mode == ConsensusMode::Observing
+            && self.curr_peer_positions.is_empty()
+            && self.adaptor.proposers_validated(
+                self.prev_ledger_id.as_ref().expect("prev id"),
+            ) == 0
+        {
+            return ConsensusDecision::StayOpen;
+        }
 
         self.close_ledger();
         ConsensusDecision::CloseLedger

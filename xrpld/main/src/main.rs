@@ -4200,6 +4200,27 @@ impl<D> BoundServerRuntime<D> {
                                     let latency_ms = tick_start.elapsed().as_millis() as u64;
                                     val_app.set_status_rpc_io_latency_ms(Some(latency_ms));
                                 }
+                            } else {
+                                // Check if we've caught up: our closed_ledger
+                                // matches what a peer reports via StatusChange.
+                                if let Some(overlay_rt) = val_app.overlay_runtime() {
+                                    if let Some(lm_rt) = val_app.ledger_master_runtime() {
+                                        if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
+                                            let our_hash = *closed.header().hash.as_uint256();
+                                            if closed.header().seq > 1 {
+                                                use overlay::Overlay as _;
+                                                let peers = overlay_rt.overlay().active_peers();
+                                                if peers.iter().any(|p| p.closed_ledger_hash() == our_hash) {
+                                                    val_app.set_need_network_ledger(false);
+                                                    tracing::info!(target: "consensus",
+                                                        seq = closed.header().seq,
+                                                        "Caught up to network — enabling consensus"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             })); // end catch_unwind
                             // Wait for a validation to arrive (instant wake) or
