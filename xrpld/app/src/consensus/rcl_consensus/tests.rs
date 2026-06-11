@@ -501,6 +501,7 @@ fn app_rcl_consensus_pre_start_round_matches_current_cpp_gates() {
         sample_validator_keys(),
         None,
         None,
+        None,
     );
 
     assert!(adaptor.pre_start_round(ledger.as_ref(), &HashSet::new()));
@@ -540,6 +541,7 @@ fn app_rcl_consensus_bows_out_when_validator_list_is_expired() {
         Arc::new(RecordingSink::default()),
         journal.clone(),
         sample_validator_keys(),
+        None,
         None,
         None,
     );
@@ -605,6 +607,7 @@ fn app_rcl_consensus_acquires_and_re_shares_real_sync_txsets() {
         sample_validator_keys(),
         None,
         None,
+        None,
     );
 
     let decoded = adaptor
@@ -650,6 +653,7 @@ fn app_rcl_consensus_make_txset_builds_sync_tree_and_relays_cached_disputed_tx()
         Arc::clone(&sink),
         NullRclConsensusJournal,
         sample_validator_keys(),
+        None,
         None,
         None,
     );
@@ -748,6 +752,7 @@ fn app_rcl_consensus_make_txset_injects_fee_vote_pseudotx_into_authoritative_sha
         sample_validator_keys(),
         None,
         None,
+        None,
     );
     adaptor.set_fee_vote(fee_setup);
 
@@ -813,6 +818,7 @@ fn app_rcl_consensus_get_prev_ledger_uses_validations_and_records_view_change() 
         sample_validator_keys(),
         None,
         None,
+        None,
     );
 
     let consensus_ledger = adaptor.remember_ledger(Arc::clone(&ledger));
@@ -869,6 +875,7 @@ fn app_rcl_consensus_end_consensus_uses_owner_closed_and_parent_ledgers() {
         sample_validator_keys(),
         None,
         None,
+        None,
     );
 
     adaptor.end_consensus(
@@ -920,6 +927,7 @@ fn app_rcl_consensus_end_consensus_does_not_promote_when_need_network_ledger_is_
         sample_validator_keys(),
         None,
         None,
+        None,
     );
 
     adaptor.end_consensus(Some(&built), &consensus_ledger_from_ledger(built.as_ref()));
@@ -966,6 +974,7 @@ fn app_rcl_consensus_end_consensus_does_not_promote_on_owner_ledger_change() {
         Arc::new(RecordingSink::default()),
         RecordingJournal::default(),
         sample_validator_keys(),
+        None,
         None,
         None,
     );

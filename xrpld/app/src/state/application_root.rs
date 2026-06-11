@@ -2591,6 +2591,7 @@ impl ApplicationRoot {
             ),
             None,
             Some(self.amendment_status.clone()),
+            self.overlay_runtime().map(|rt| rt.overlay().clone()),
         );
 
         let runner = Box::new(AppConsensus::new(

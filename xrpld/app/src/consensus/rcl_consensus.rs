@@ -763,6 +763,9 @@ where
     /// Pending start_round parameters queued by end_consensus.
     /// Consumed by the next timer_tick to start the next round.
     pending_start_round: Mutex<Option<(basics::chrono::NetClockTimePoint, Uint256, RclCxLedger)>>,
+    /// Overlay reference for peer LCL voting in get_prev_ledger
+    /// (matching rippled's checkLastClosedLedger peerCounts).
+    overlay: Option<Arc<OverlayImpl>>,
 }
 
 impl RclConsensusLedgerSource for crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime {
@@ -816,6 +819,7 @@ where
         validator_keys: ValidatorKeys,
         fee_setup: Option<FeeSetup>,
         amendment_table: Option<Arc<AmendmentStatus>>,
+        overlay: Option<Arc<OverlayImpl>>,
     ) -> Self {
         static NEXT_CONSENSUS_COOKIE: AtomicU64 = AtomicU64::new(1);
 
@@ -878,6 +882,7 @@ where
             prev_round_time_millis: AtomicU64::new(0),
             mode: AtomicU8::new(encode_consensus_mode(ConsensusMode::Observing)),
             pending_start_round: Mutex::new(None),
+            overlay,
         }
     }
 
@@ -1495,10 +1500,49 @@ where
         let Some(ledger) = self.lookup_ledger(&prev_ledger.id) else {
             return *prev_ledger_id;
         };
+
+        // Primary: use validation trie (rippled's getPreferredLCL trie path)
         let preferred = self.validations.get_preferred_with_min_seq(
             validated_ledger_from_ledger(ledger.as_ref(), &NullRclValidationJournal),
             self.ledgers.get_valid_ledger_index(),
         );
+
+        // Fallback: peer LCL vote counting (rippled's peerCounts in
+        // checkLastClosedLedger). When the validation trie has no useful
+        // data (returns our own ledger), check what peers report.
+        let preferred = if preferred == *prev_ledger_id {
+            if let Some(overlay) = &self.overlay {
+                use overlay::Overlay;
+                let peers = overlay.active_peers();
+                if !peers.is_empty() {
+                    let mut counts: std::collections::HashMap<Uint256, usize> =
+                        std::collections::HashMap::new();
+                    // Count ourselves if we're TRACKING or higher
+                    counts.insert(*prev_ledger_id, 0);
+                    if mode != ConsensusMode::WrongLedger {
+                        *counts.entry(*prev_ledger_id).or_default() += 1;
+                    }
+                    for p in peers.iter() {
+                        let h = p.closed_ledger_hash();
+                        if !h.is_zero() {
+                            *counts.entry(h).or_default() += 1;
+                        }
+                    }
+                    // Pick the hash with the most votes
+                    counts
+                        .into_iter()
+                        .max_by_key(|(_, count)| *count)
+                        .map(|(hash, _)| hash)
+                        .unwrap_or(preferred)
+                } else {
+                    preferred
+                }
+            } else {
+                preferred
+            }
+        } else {
+            preferred
+        };
 
         if preferred != *prev_ledger_id {
             if mode != ConsensusMode::WrongLedger {

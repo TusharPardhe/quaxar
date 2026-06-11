@@ -575,6 +575,7 @@ fn public_rcl_consensus_adaptor_injects_fee_vote_pseudotx_from_stored_parent_val
         sample_validator_keys(),
         None,
         None,
+        None,
     );
     adaptor.set_fee_vote(fee_setup);
 
@@ -663,6 +664,7 @@ fn public_rcl_consensus_adaptor_injects_amendment_pseudotx_from_stored_parent_va
         RecordingSinkHandle(Arc::clone(&sink)),
         NullRclConsensusJournal,
         sample_validator_keys(),
+        None,
         None,
         None,
     );
@@ -797,6 +799,7 @@ fn public_rcl_consensus_adaptor_injects_negative_unl_pseudotx_from_voting_ledger
         RecordingSinkHandle(Arc::clone(&sink)),
         NullRclConsensusJournal,
         validator_keys_from_secret(local_secret),
+        None,
         None,
         None,
     );
@@ -1036,6 +1039,7 @@ fn public_rcl_consensus_adaptor_logs_startup_and_deduplicates_missing_ledger_req
         RecordingSinkHandle(Arc::new(RecordingSink::default())),
         journal.clone(),
         sample_validator_keys(),
+        None,
         None,
         None,
     );
