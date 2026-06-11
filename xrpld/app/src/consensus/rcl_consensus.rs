@@ -118,6 +118,7 @@ pub trait RclConsensusLedgerSource: Send + Sync + 'static {
     fn get_valid_ledger_index(&self) -> u32;
     fn have_validated(&self) -> bool;
     fn request_consensus_ledger(&self, _hash: &Uint256) {}
+    fn set_closed_ledger(&self, _ledger: &Arc<Ledger>) {}
 }
 
 impl RclConsensusLedgerSource
@@ -134,6 +135,10 @@ impl RclConsensusLedgerSource
 
     fn have_validated(&self) -> bool {
         self.ledger_master().have_validated()
+    }
+
+    fn set_closed_ledger(&self, ledger: &Arc<Ledger>) {
+        self.ledger_master().set_closed_ledger(Arc::clone(ledger));
     }
 }
 
@@ -1439,10 +1444,20 @@ where
             .lock()
             .expect("acquiring ledger mutex must not be poisoned") = None;
 
+        // switchLastClosedLedger equivalent: update LedgerMaster's closed
+        // ledger to the acquired one so the rest of the system knows we
+        // switched. In rippled: m_ledgerMaster.switchLCL(newLCL).
+        self.ledgers.set_closed_ledger(&ledger);
+
         self.inbound_transactions
             .lock()
             .expect("inbound transactions mutex must not be poisoned")
             .new_round(ledger.header().seq);
+
+        tracing::info!(target: "consensus",
+            seq = ledger.header().seq,
+            "switchLastClosedLedger: switched to acquired consensus ledger"
+        );
 
         Some(self.remember_ledger(ledger))
     }
