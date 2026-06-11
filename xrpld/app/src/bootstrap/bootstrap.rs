@@ -881,24 +881,57 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
         // Serve TmGetLedger requests from peers (PART 1).
         serve_get_ledger_requests(root, &overlay_rt);
 
+        // Broadcast our closed ledger to peers via StatusChange so they
+        // can detect whether we're at genesis or ahead. This replaces the
+        // overlay timer StatusChange that doesn't run in --start mode.
+        if !consensus_started {
+            if let Some(lm_rt) = root.ledger_master_runtime() {
+                if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
+                    use overlay::Overlay;
+                    let hdr = closed.header();
+                    let status = overlay::ProtocolMessage::new(
+                        overlay::ProtocolPayload::StatusChange(
+                            overlay::message::wire::TmStatusChange {
+                                new_status: Some(1),
+                                new_event: Some(1),
+                                ledger_seq: Some(hdr.seq),
+                                ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
+                                ledger_hash_previous: Some(hdr.parent_hash.as_uint256().data().to_vec()),
+                                network_time: None,
+                                first_seq: Some(1),
+                                last_seq: Some(hdr.seq),
+                            },
+                        ),
+                    );
+                    overlay_rt.overlay().broadcast(&status);
+                }
+            }
+        }
+
         // Before starting consensus, acquire the network's validated ledger.
         if !consensus_started {
-            // Check peers' current closed ledger (from StatusChange).
-            // This is the most reliable acquisition source since peers
-            // always have their current ledger in cache.
+            // Check peers for a ledger we need to acquire.
             if consensus_acq.is_none() {
                 use overlay::Overlay;
                 let peers = overlay_rt.overlay().active_peers();
-                for peer in &peers {
-                    let closed_hash = peer.closed_ledger_hash();
-                    if closed_hash.is_zero() {
-                        continue;
-                    }
-                    if let Some(lm_rt) = root.ledger_master_runtime() {
-                        let lm = lm_rt.ledger_master();
-                        if lm.get_ledger_by_hash(
-                            basics::sha_map_hash::SHAMapHash::new(closed_hash),
-                        ).is_none() {
+                if !peers.is_empty() {
+                    let any_ahead = peers.iter().find(|p| {
+                        let h = p.closed_ledger_hash();
+                        if h.is_zero() {
+                            return false;
+                        }
+                        if let Some(lm_rt) = root.ledger_master_runtime() {
+                            lm_rt.ledger_master().get_ledger_by_hash(
+                                basics::sha_map_hash::SHAMapHash::new(h),
+                            ).is_none()
+                        } else {
+                            false
+                        }
+                    });
+                    if let Some(peer) = any_ahead {
+                        // Trigger acquisition for that peer's ledger.
+                        let closed_hash = peer.closed_ledger_hash();
+                        if let Some(lm_rt) = root.ledger_master_runtime() {
                             let mut pending = lm_rt.pending_consensus_ledger
                                 .lock()
                                 .expect("pending_consensus_ledger lock");
@@ -910,7 +943,32 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                                     "Requesting peer's current closed ledger"
                                 );
                             }
-                            break;
+                        }
+                    } else {
+                        // All peers are at genesis or we already have their
+                        // ledger. Only start if at least one peer has actively
+                        // reported their closed ledger (non-zero). Peers that
+                        // haven't sent StatusChange yet report zero — wait for
+                        // them to confirm before starting.
+                        if let Some(lm_rt) = root.ledger_master_runtime() {
+                            if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
+                                let closed_hash = *closed.header().hash.as_uint256();
+                                let any_confirmed = peers.iter().any(|p| {
+                                    !p.closed_ledger_hash().is_zero()
+                                });
+                                if any_confirmed {
+                                    if network_ops_rt.maybe_begin_consensus_from_validated(
+                                        consensus_rt.as_ref(),
+                                        Arc::clone(&closed),
+                                    ) {
+                                        tracing::info!(target: "consensus",
+                                            seq = closed.header().seq,
+                                            "Consensus started — peers confirmed current ledger"
+                                        );
+                                        consensus_started = true;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -951,7 +1009,6 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                         if lm.get_ledger_by_hash(
                             basics::sha_map_hash::SHAMapHash::new(val_hash),
                         ).is_none() && val_seq > 1 {
-                            // Store as pending for acquisition.
                             let mut pending = lm_rt.pending_consensus_ledger
                                 .lock()
                                 .expect("pending_consensus_ledger lock");
@@ -968,36 +1025,24 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                 }
             }
 
-            // Drive ledger acquisition (targeted requests with 2s retry).
+            // Drive acquisition
             drive_consensus_ledger_acquisition(root, &overlay_rt, &mut consensus_acq);
 
-            // Check if we've caught up to the network. Start consensus
-            // only when our closed ledger matches a peer's closed ledger
-            // (meaning we're at the tip). Until then, keep acquiring.
-            if let Some(lm_rt) = root.ledger_master_runtime() {
-                let lm = lm_rt.ledger_master();
-                if let Some(closed) = lm.closed_ledger() {
-                    if closed.header().seq > 1 {
-                        use overlay::Overlay;
-                        let closed_hash = *closed.header().hash.as_uint256();
-                        let at_tip = overlay_rt.overlay().active_peers().iter().any(|p| {
-                            p.closed_ledger_hash() == closed_hash
-                        });
-                        if at_tip {
+            // If acquisition completed, closed_ledger updated → start consensus
+            if !consensus_started {
+                if let Some(lm_rt) = root.ledger_master_runtime() {
+                    if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
+                        if closed.header().seq > 1 {
                             if network_ops_rt.maybe_begin_consensus_from_validated(
                                 consensus_rt.as_ref(),
                                 Arc::clone(&closed),
                             ) {
                                 tracing::info!(target: "consensus",
                                     seq = closed.header().seq,
-                                    "Consensus started — caught up to network tip"
+                                    "Consensus started from acquired network ledger"
                                 );
                                 consensus_started = true;
                             }
-                        } else {
-                            // Not at tip yet — clear pending so we re-acquire
-                            // the peer's CURRENT ledger on next iteration.
-                            let _ = lm_rt.take_pending_consensus_ledger();
                         }
                     }
                 }
