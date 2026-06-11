@@ -4719,28 +4719,16 @@ impl<D> BoundServerRuntime<D> {
                         }
                     }
 
-                    if target_seq > 1 {
-                        // --- Persistent tick-based acquisition (reference InboundLedger parity) ---
-                        // Maintain persistent InboundLedgerLocal owners that
-                        // accumulate state across 3s ticks, matching the reference
-                        // InboundLedgers cache shape.
-
-                        let ledger_master_runtime = app.ledger_master_runtime();
-
-                        // Drain completed/failed entries before trying to acquire.
-                        // later promotion/advance checks observe the cache.
-                        let early_results = inbound_ledgers.poll_results();
-
-                        // Insert completed ledgers into LedgerHistory so the
-                        // bootstrap consensus loop can find and switch to them.
-                        for (_hash, ledger, _skip) in &early_results {
+                    // Poll InboundLedger completions and insert into history
+                    // regardless of target_seq (needed for --net mode catch-up).
+                    {
+                        let poll_results = inbound_ledgers.poll_results();
+                        for (_hash, ledger, _skip) in &poll_results {
                             if let Some(lm_rt) = app.ledger_master_runtime() {
                                 let stored = std::sync::Arc::new(ledger.clone());
                                 lm_rt.ledger_master().ledger_history().insert(
                                     std::sync::Arc::clone(&stored), false,
                                 );
-                                // If we're waiting for network ledger and this is
-                                // ahead of our closed, switch to it immediately.
                                 if app.need_network_ledger() {
                                     let our_seq = lm_rt.ledger_master().closed_ledger()
                                         .map(|l| l.header().seq).unwrap_or(0);
@@ -4757,6 +4745,19 @@ impl<D> BoundServerRuntime<D> {
                                 }
                             }
                         }
+                    }
+
+                    if target_seq > 1 {
+                        // --- Persistent tick-based acquisition (reference InboundLedger parity) ---
+                        // Maintain persistent InboundLedgerLocal owners that
+                        // accumulate state across 3s ticks, matching the reference
+                        // InboundLedgers cache shape.
+
+                        let ledger_master_runtime = app.ledger_master_runtime();
+
+                        // Drain completed/failed entries before trying to acquire.
+                        // later promotion/advance checks observe the cache.
+                        let early_results = inbound_ledgers.poll_results();
 
                         if acquiring_consensus_ledger
                             .is_some_and(|hash| !inbound_ledgers.is_in_progress(&hash))
