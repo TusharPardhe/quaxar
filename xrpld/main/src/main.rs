@@ -4745,6 +4745,24 @@ impl<D> BoundServerRuntime<D> {
                                 }
                             }
                         }
+
+                        // Continuously trigger acquisition for the peer majority
+                        // LCL so InboundLedger keeps fetching the latest.
+                        if let Some(overlay_rt) = app.overlay_runtime() {
+                            use overlay::Overlay as _;
+                            let our_closed_hash = app.ledger_master_runtime()
+                                .and_then(|lm| lm.ledger_master().closed_ledger())
+                                .map(|l| *l.header().hash.as_uint256())
+                                .unwrap_or_default();
+                            let peers = overlay_rt.overlay().active_peers();
+                            for p in peers.iter() {
+                                let h = p.closed_ledger_hash();
+                                if !h.is_zero() && h != our_closed_hash {
+                                    inbound_ledgers.acquire(h, 0, 0);
+                                    break;
+                                }
+                            }
+                        }
                     }
 
                     if target_seq > 1 {
