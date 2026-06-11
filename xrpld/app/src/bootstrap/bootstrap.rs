@@ -2223,6 +2223,29 @@ fn seed_startup_ledger_state(
         }
         StartUpType::Normal => Ledger::from_ledger_seq_and_close_time(seed_seq.max(1), 0, backed),
     };
+    // Match rippled's startGenesisLedger(): after creating genesis (seq=1),
+    // immediately build seq=2 from it with the current wall clock close time.
+    // Rippled does: `auto const next = make_shared<Ledger>(*genesis, closeTime());`
+    // then sets `next` as LCL. This ensures all nodes start consensus from seq=2.
+    let closed = if matches!(
+        options.start_type,
+        StartUpType::Fresh | StartUpType::Network | StartUpType::Snapshot
+    ) {
+        let close_time = root.current_close_time_seconds();
+        let mut next = Ledger::from_previous(&closed, close_time);
+        let _ = next.update_skip_list();
+        next.set_immutable(true);
+        tracing::info!(target: "bootstrap",
+            genesis_seq = closed.header().seq,
+            next_seq = next.header().seq,
+            close_time = close_time,
+            "Created initial LCL from genesis (matching rippled startGenesisLedger)"
+        );
+        next
+    } else {
+        closed
+    };
+
     let closed = Arc::new(closed);
     tracing::info!(target: "bootstrap", ledger_seq = closed.header().seq, "Genesis ledger loaded");
     let hydrate_seed_as_loaded = !matches!(
