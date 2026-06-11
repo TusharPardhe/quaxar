@@ -1149,8 +1149,10 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
             let _ = root.receive_validation_to_network_ops(&mut validation, &source);
         }
 
-        // Tick the consensus state machine.
-        network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
+        // Tick the consensus state machine (only when not waiting for network ledger).
+        if !root.need_network_ledger() {
+            network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
+        }
 
         // Promote the closed ledger to validated once it reaches quorum.
         if let Some(lm_rt) = root.ledger_master_runtime() {
@@ -1209,11 +1211,48 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                 }
             }
         }
+        // Track closed_ledger before acquisition drive
+        let pre_acq_closed = root.ledger_master_runtime()
+            .and_then(|lm_rt| lm_rt.ledger_master().closed_ledger())
+            .map(|l| *l.header().hash.as_uint256())
+            .unwrap_or_default();
+
         drive_consensus_ledger_acquisition(
             root,
             &overlay_rt,
             &mut consensus_acq,
         );
+
+        // If acquisition completed and changed our closed_ledger, restart
+        // the consensus round from the new LCL (rippled's switchLastClosedLedger).
+        if consensus_started {
+            if let Some(lm_rt) = root.ledger_master_runtime() {
+                if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
+                    let new_hash = *closed.header().hash.as_uint256();
+                    if new_hash != pre_acq_closed && !pre_acq_closed.is_zero() {
+                        let now = root.shared_time_keeper().close_time();
+                        let prev_cx = crate::consensus::rcl_consensus::consensus_ledger_from_ledger(&closed);
+                        let runtime = consensus_rt.clone();
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("switch lcl runtime");
+                        rt.block_on(async {
+                            runtime.start_round(now, new_hash, prev_cx).await;
+                        });
+                        tracing::info!(target: "consensus",
+                            seq = closed.header().seq,
+                            hash = %new_hash,
+                            "Switched consensus to acquired network LCL"
+                        );
+                        // Enable consensus timer now that we're on the
+                        // network's chain. The consensus engine will handle
+                        // staying in sync via proposals and handle_wrong_ledger.
+                        root.set_need_network_ledger(false);
+                    }
+                }
+            }
+        }
 
         std::thread::sleep(Duration::from_millis(50));
     }
