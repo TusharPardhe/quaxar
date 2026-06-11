@@ -4659,6 +4659,25 @@ impl<D> BoundServerRuntime<D> {
                         }
                     }
 
+                    // --- storeLedger equivalent (rippled InboundLedger::done → storeLedger) ---
+                    // Insert completed InboundLedger results into LedgerHistory
+                    // so that acquire_consensus_ledger (get_ledger_by_hash) can
+                    // find them when the consensus engine needs to switch LCL.
+                    {
+                        let store_results = inbound_ledgers.poll_results();
+                        if !store_results.is_empty() {
+                            if let Some(lm_rt) = app.ledger_master_runtime() {
+                                for (_hash, ledger, _skip) in &store_results {
+                                    let stored = std::sync::Arc::new(ledger.clone());
+                                    lm_rt.ledger_master().ledger_history().insert(
+                                        std::sync::Arc::clone(&stored),
+                                        false,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     if target_seq > 1 {
                         // --- Persistent tick-based acquisition (reference InboundLedger parity) ---
                         // Maintain persistent InboundLedgerLocal owners that
