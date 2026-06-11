@@ -130,9 +130,12 @@ impl STObject {
                 reordered.push(field);
             } else {
                 if element.style() == SOEStyle::Required {
-                    // during deserialization (wire format omits defaults)
+                    // Required field not in wire data — create with default
+                    // value so it's always present for serialization/access.
+                    reordered.push(STVar::default_object(element.sfield()));
+                } else {
+                    reordered.push(STVar::non_present_object(element.sfield()));
                 }
-                reordered.push(STVar::non_present_object(element.sfield()));
             }
         }
 
