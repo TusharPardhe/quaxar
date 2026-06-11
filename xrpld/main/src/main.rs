@@ -4754,11 +4754,15 @@ impl<D> BoundServerRuntime<D> {
                                 .and_then(|lm| lm.ledger_master().closed_ledger())
                                 .map(|l| *l.header().hash.as_uint256())
                                 .unwrap_or_default();
+                            let our_closed_seq = app.ledger_master_runtime()
+                                .and_then(|lm| lm.ledger_master().closed_ledger())
+                                .map(|l| l.header().seq)
+                                .unwrap_or(2);
                             let peers = overlay_rt.overlay().active_peers();
                             for p in peers.iter() {
                                 let h = p.closed_ledger_hash();
                                 if !h.is_zero() && h != our_closed_hash {
-                                    inbound_ledgers.acquire(h, 0, 0);
+                                    inbound_ledgers.acquire(h, our_closed_seq + 1, 0);
                                     break;
                                 }
                             }
