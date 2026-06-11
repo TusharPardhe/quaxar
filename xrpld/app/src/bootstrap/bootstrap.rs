@@ -926,7 +926,8 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                validation.set_seen(root.current_close_time_seconds());
+                // Adjust clock from validator sign_time FIRST so that
+                // set_seen and is_current use a synchronized clock.
                 let sign_time = validation.get_sign_time();
                 if sign_time > 0 {
                     let now = root.current_close_time_seconds() as i64;
@@ -934,6 +935,8 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                     root.time_keeper()
                         .adjust_close_time(time::Duration::seconds(offset));
                 }
+                // Set seen_time AFTER clock adjustment so is_current passes.
+                validation.set_seen(root.current_close_time_seconds());
                 let source = queued.peer_id.to_string();
                 let _ = root.receive_validation_to_network_ops(&mut validation, &source);
 
@@ -1065,7 +1068,6 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            validation.set_seen(root.current_close_time_seconds());
             let sign_time = validation.get_sign_time();
             if sign_time > 0 {
                 let now = root.current_close_time_seconds() as i64;
@@ -1073,6 +1075,7 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                 root.time_keeper()
                     .adjust_close_time(time::Duration::seconds(offset));
             }
+            validation.set_seen(root.current_close_time_seconds());
             let source = queued.peer_id.to_string();
             let _ = root.receive_validation_to_network_ops(&mut validation, &source);
         }
@@ -1113,10 +1116,30 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
         }
 
         // --- Consensus ledger acquisition ---
-        // When consensus detects it's on the wrong ledger and acquire_ledger
-        // returns None, request_consensus_ledger stores the wanted hash. Here
-        // we fetch it from peers and store it so the next acquire_ledger call
-        // succeeds.
+        // Continuously check if we're behind the network. If a peer's
+        // current closed ledger differs from ours and we don't have it,
+        // acquire it. This enables continuous catch-up after forking.
+        if let Some(lm_rt) = root.ledger_master_runtime() {
+            use overlay::Overlay;
+            let our_closed = lm_rt.ledger_master().closed_ledger()
+                .map(|l| *l.header().hash.as_uint256())
+                .unwrap_or_default();
+            for peer in overlay_rt.overlay().active_peers().iter() {
+                let peer_hash = peer.closed_ledger_hash();
+                if !peer_hash.is_zero() && peer_hash != our_closed {
+                    if lm_rt.ledger_master().get_ledger_by_hash(
+                        basics::sha_map_hash::SHAMapHash::new(peer_hash),
+                    ).is_none() {
+                        let mut pending = lm_rt.pending_consensus_ledger
+                            .lock().expect("lock");
+                        if pending.as_ref() != Some(&peer_hash) {
+                            *pending = Some(peer_hash);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
         drive_consensus_ledger_acquisition(
             root,
             &overlay_rt,

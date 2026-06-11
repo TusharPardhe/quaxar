@@ -1458,7 +1458,15 @@ where
     }
 
     fn proposers_validated(&self, prev_ledger: &Uint256) -> usize {
-        self.validations.num_trusted_for_ledger(*prev_ledger)
+        let count = self.validations.num_trusted_for_ledger(*prev_ledger);
+        if count > 0 {
+            return count;
+        }
+        // When the validation store has no entries (cold start or after
+        // ledger acquisition), use the UNL size as the expected number of
+        // proposers. This ensures should_close_ledger's majority check
+        // works correctly on the first round after joining the network.
+        self.validators.count().saturating_sub(1)
     }
 
     fn proposers_finished(&self, prev_ledger: &RclCxLedger, prev_ledger_id: &Uint256) -> usize {
