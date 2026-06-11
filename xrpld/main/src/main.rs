@@ -4244,8 +4244,7 @@ impl<D> BoundServerRuntime<D> {
                                                 use overlay::Overlay as _;
                                                 let peers = overlay_rt.overlay().active_peers();
                                                 let match_count = peers.iter().filter(|p| p.closed_ledger_hash() == our_hash).count();
-                                                // Need 2+ peers matching to avoid false positive from other quaxar
-                                                if match_count >= 2 {
+                                                if match_count >= 1 {
                                                     val_app.set_need_network_ledger(false);
                                                     tracing::info!(target: "consensus",
                                                         seq = closed.header().seq,
