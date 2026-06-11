@@ -1577,11 +1577,7 @@ where
                                 get_field_by_symbol("sfCookie"),
                                 cookie,
                             );
-                            // Set sfFlags explicitly (required field in serialization).
-                            v.set_field_u32(
-                                get_field_by_symbol("sfFlags"),
-                                VF_FULL_VALIDATION,
-                            );
+                            v.set_flag(VF_FULL_VALIDATION);
                         },
                     );
                     match validation {
