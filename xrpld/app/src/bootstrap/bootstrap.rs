@@ -1187,71 +1187,78 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
 
         // --- Consensus ledger acquisition ---
         // Continuously check if we're behind the network. If a peer's
-        // current closed ledger differs from ours and we don't have it,
-        // acquire it. This enables continuous catch-up after forking.
-        if let Some(lm_rt) = root.ledger_master_runtime() {
-            use overlay::Overlay;
-            let our_closed = lm_rt.ledger_master().closed_ledger()
-                .map(|l| *l.header().hash.as_uint256())
-                .unwrap_or_default();
-            for peer in overlay_rt.overlay().active_peers().iter() {
-                let peer_hash = peer.closed_ledger_hash();
-                if !peer_hash.is_zero() && peer_hash != our_closed {
-                    if lm_rt.ledger_master().get_ledger_by_hash(
-                        basics::sha_map_hash::SHAMapHash::new(peer_hash),
-                    ).is_none() {
-                        let mut pending = lm_rt.pending_consensus_ledger
-                            .lock().expect("lock");
-                        if pending.as_ref() != Some(&peer_hash) {
-                            *pending = Some(peer_hash);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        // Track closed_ledger before acquisition drive
-        let pre_acq_closed = root.ledger_master_runtime()
-            .and_then(|lm_rt| lm_rt.ledger_master().closed_ledger())
-            .map(|l| *l.header().hash.as_uint256())
-            .unwrap_or_default();
-
-        drive_consensus_ledger_acquisition(
-            root,
-            &overlay_rt,
-            &mut consensus_acq,
-        );
-
-        // If acquisition completed and changed our closed_ledger, restart
-        // the consensus round from the new LCL (rippled's switchLastClosedLedger).
+        // Check if InboundLedger acquired a ledger ahead of us.
+        // Look for any peer's closed_ledger in our history — if found, switch.
+        // Also check the ledger referenced by incoming validations (which the
+        // InboundLedger acquires).
         if consensus_started {
             if let Some(lm_rt) = root.ledger_master_runtime() {
-                if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
-                    let new_hash = *closed.header().hash.as_uint256();
-                    if new_hash != pre_acq_closed && !pre_acq_closed.is_zero() {
-                        let now = root.shared_time_keeper().close_time();
-                        let prev_cx = crate::consensus::rcl_consensus::consensus_ledger_from_ledger(&closed);
-                        let runtime = consensus_rt.clone();
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("switch lcl runtime");
-                        rt.block_on(async {
-                            runtime.start_round(now, new_hash, prev_cx).await;
-                        });
-                        tracing::info!(target: "consensus",
-                            seq = closed.header().seq,
-                            hash = %new_hash,
-                            "Switched consensus to acquired network LCL"
-                        );
-                        // Don't clear need_network_ledger here. The main
-                        // validation thread will clear it when our hash
-                        // matches a peer's StatusChange (true catch-up).
+                use overlay::Overlay;
+                let our_closed_seq = lm_rt.ledger_master().closed_ledger()
+                    .map(|l| l.header().seq)
+                    .unwrap_or(0);
+                let our_closed_hash = lm_rt.ledger_master().closed_ledger()
+                    .map(|l| *l.header().hash.as_uint256())
+                    .unwrap_or_default();
+
+                // Check all peers' closed hashes
+                let mut switch_target: Option<Arc<ledger::Ledger>> = None;
+                for peer in overlay_rt.overlay().active_peers().iter() {
+                    let peer_hash = peer.closed_ledger_hash();
+                    if peer_hash.is_zero() || peer_hash == our_closed_hash {
+                        continue;
                     }
+                    if let Some(ledger) = lm_rt.ledger_master().get_ledger_by_hash(
+                        basics::sha_map_hash::SHAMapHash::new(peer_hash),
+                    ) {
+                        if ledger.header().seq > our_closed_seq {
+                            switch_target = Some(ledger);
+                            break;
+                        }
+                    }
+                }
+
+                // If no peer match via get_ledger_by_hash, check ledger_history cache
+                if switch_target.is_none() {
+                    let lm = lm_rt.ledger_master();
+                    for peer in overlay_rt.overlay().active_peers().iter() {
+                        let peer_hash = peer.closed_ledger_hash();
+                        if peer_hash.is_zero() || peer_hash == our_closed_hash {
+                            continue;
+                        }
+                        if let Some(l) = lm.ledger_history().get_cached_ledger_by_hash(
+                            basics::sha_map_hash::SHAMapHash::new(peer_hash),
+                        ) {
+                            if l.header().seq > our_closed_seq {
+                                switch_target = Some(l);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(target) = switch_target {
+                    let seq = target.header().seq;
+                    let hash = *target.header().hash.as_uint256();
+                    lm_rt.ledger_master().set_closed_ledger(Arc::clone(&target));
+                    let now = root.shared_time_keeper().close_time();
+                    let prev_cx = crate::consensus::rcl_consensus::consensus_ledger_from_ledger(&target);
+                    let runtime = consensus_rt.clone();
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("switch lcl runtime");
+                    rt.block_on(async {
+                        runtime.start_round(now, hash, prev_cx).await;
+                    });
+                    root.set_need_network_ledger(false);
+                    tracing::info!(target: "consensus",
+                        seq, hash = %hash,
+                        "Switched to ledger from InboundLedger"
+                    );
                 }
             }
         }
-
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -1336,6 +1343,11 @@ fn drive_consensus_ledger_acquisition(
             None => continue,
         };
         if resp_hash != state.hash {
+            tracing::debug!(target: "consensus",
+                expected = %state.hash,
+                got = %resp_hash,
+                "Ignoring ledger data for different hash"
+            );
             continue;
         }
         if data.error.is_some() || data.nodes.is_empty() {
