@@ -4719,8 +4719,8 @@ impl<D> BoundServerRuntime<D> {
                         }
                     }
 
-                    // Poll InboundLedger completions and insert into history
-                    // regardless of target_seq (needed for --net mode catch-up).
+                    // Poll InboundLedger completions and insert into history.
+                    // Always set the latest as closed_ledger to track the network.
                     {
                         let poll_results = inbound_ledgers.poll_results();
                         for (_hash, ledger, _skip) in &poll_results {
@@ -4729,19 +4729,19 @@ impl<D> BoundServerRuntime<D> {
                                 lm_rt.ledger_master().ledger_history().insert(
                                     std::sync::Arc::clone(&stored), false,
                                 );
-                                if app.need_network_ledger() {
-                                    let our_seq = lm_rt.ledger_master().closed_ledger()
-                                        .map(|l| l.header().seq).unwrap_or(0);
-                                    if ledger.header().seq > our_seq {
-                                        lm_rt.ledger_master().set_closed_ledger(
-                                            std::sync::Arc::clone(&stored)
-                                        );
+                                let our_seq = lm_rt.ledger_master().closed_ledger()
+                                    .map(|l| l.header().seq).unwrap_or(0);
+                                if ledger.header().seq > our_seq {
+                                    lm_rt.ledger_master().set_closed_ledger(
+                                        std::sync::Arc::clone(&stored)
+                                    );
+                                    if app.need_network_ledger() {
                                         app.set_need_network_ledger(false);
-                                        tracing::info!(target: "consensus",
-                                            seq = ledger.header().seq,
-                                            "InboundLedger completed — set as closed, enabling consensus"
-                                        );
                                     }
+                                    tracing::info!(target: "consensus",
+                                        seq = ledger.header().seq,
+                                        "Advanced closed_ledger from InboundLedger"
+                                    );
                                 }
                             }
                         }
