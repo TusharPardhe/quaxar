@@ -957,6 +957,28 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                                     !p.closed_ledger_hash().is_zero()
                                 });
                                 if any_confirmed {
+                                    // Drain queued proposals into the consensus
+                                    // engine BEFORE starting so that startRound's
+                                    // playback_proposals finds them (matching
+                                    // rippled where proposals arrive via JobQueue
+                                    // before startRound runs).
+                                    let proposals = overlay_rt.overlay().take_proposals();
+                                    for proposal in &proposals {
+                                        let close_time = root.shared_time_keeper().close_time();
+                                        let prop = consensus::ConsensusProposal::new(
+                                            proposal.previous_ledger, 0,
+                                            proposal.current_tx_hash,
+                                            close_time, close_time,
+                                            proposal.public_key,
+                                        );
+                                        let _ = network_ops_rt.handle_peer_proposal(
+                                            consensus_rt.as_ref(),
+                                            proposal.public_key,
+                                            proposal.message.signature.clone(),
+                                            proposal.suppression,
+                                            prop,
+                                        );
+                                    }
                                     if network_ops_rt.maybe_begin_consensus_from_validated(
                                         consensus_rt.as_ref(),
                                         Arc::clone(&closed),
