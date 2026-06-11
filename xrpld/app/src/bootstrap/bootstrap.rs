@@ -809,8 +809,10 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
     // and timer ticks. It does NOT do ledger acquisition or inbound ledger
     // processing — those are unnecessary when starting fresh.
     let consensus_stop = Arc::new(AtomicBool::new(false));
-    let consensus_thread = if bootstrap.report.startup_ledger_mode == StartUpType::Fresh
-        && bootstrap.report.has_overlay_runtime
+    let consensus_thread = if matches!(
+        bootstrap.report.startup_ledger_mode,
+        StartUpType::Fresh | StartUpType::Network
+    ) && bootstrap.report.has_overlay_runtime
     {
         // This thread exclusively drives consensus in --start mode.
         // Set need_network_ledger to prevent the main validation processor
@@ -956,7 +958,7 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                                 let any_confirmed = peers.iter().any(|p| {
                                     !p.closed_ledger_hash().is_zero()
                                 });
-                                if any_confirmed {
+                                if any_confirmed && !root.need_network_ledger() {
                                     // Drain queued proposals into the consensus
                                     // engine BEFORE starting so that startRound's
                                     // playback_proposals finds them (matching
@@ -2223,29 +2225,6 @@ fn seed_startup_ledger_state(
         }
         StartUpType::Normal => Ledger::from_ledger_seq_and_close_time(seed_seq.max(1), 0, backed),
     };
-    // Match rippled's startGenesisLedger(): after creating genesis (seq=1),
-    // immediately build seq=2 from it with the current wall clock close time.
-    // Rippled does: `auto const next = make_shared<Ledger>(*genesis, closeTime());`
-    // then sets `next` as LCL. This ensures all nodes start consensus from seq=2.
-    let closed = if matches!(
-        options.start_type,
-        StartUpType::Fresh | StartUpType::Network | StartUpType::Snapshot
-    ) {
-        let close_time = root.current_close_time_seconds();
-        let mut next = Ledger::from_previous(&closed, close_time);
-        let _ = next.update_skip_list();
-        next.set_immutable(true);
-        tracing::info!(target: "bootstrap",
-            genesis_seq = closed.header().seq,
-            next_seq = next.header().seq,
-            close_time = close_time,
-            "Created initial LCL from genesis (matching rippled startGenesisLedger)"
-        );
-        next
-    } else {
-        closed
-    };
-
     let closed = Arc::new(closed);
     tracing::info!(target: "bootstrap", ledger_seq = closed.header().seq, "Genesis ledger loaded");
     let hydrate_seed_as_loaded = !matches!(
