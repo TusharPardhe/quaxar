@@ -1204,10 +1204,6 @@ fn serve_get_ledger_requests(
     let lm = lm_rt.ledger_master();
 
     for req in requests {
-        // Only serve li_BASE (itype=0) requests by hash.
-        if req.message.itype != 0 {
-            continue;
-        }
         let Some(hash_bytes) = req.message.ledger_hash.as_deref() else {
             continue;
         };
@@ -1220,23 +1216,90 @@ fn serve_get_ledger_requests(
             continue;
         };
 
-        // Serialize header and send TmLedgerData response.
-        let header_data = protocol::serialize_ledger_header(&ledger.header(), false);
+        let itype = req.message.itype;
+        let mut nodes: Vec<overlay::message::wire::TmLedgerNode> = Vec::new();
+
+        match itype {
+            0 => {
+                // li_BASE: header + state root + tx root (matching rippled sendLedgerBase)
+                let header_data = protocol::serialize_ledger_header(&ledger.header(), false);
+                nodes.push(overlay::message::wire::TmLedgerNode {
+                    nodeid: None,
+                    nodedata: header_data,
+                });
+                // State map root
+                if !ledger.header().account_hash.is_zero() {
+                    if let Ok(root_data) = ledger.state_map().serialize_root() {
+                        nodes.push(overlay::message::wire::TmLedgerNode {
+                            nodeid: None,
+                            nodedata: root_data,
+                        });
+                    }
+                }
+                // Tx map root
+                if !ledger.header().tx_hash.is_zero() {
+                    if let Ok(root_data) = ledger.tx_map().serialize_root() {
+                        nodes.push(overlay::message::wire::TmLedgerNode {
+                            nodeid: None,
+                            nodedata: root_data,
+                        });
+                    }
+                }
+            }
+            1 | 2 => {
+                // liTX_NODE (1) or liAS_NODE (2): serve requested SHAMap nodes
+                let map = if itype == 1 {
+                    ledger.tx_map()
+                } else {
+                    ledger.state_map()
+                };
+                let fat_leaves = itype == 1; // fat for TX, not for AS
+                let depth = req.message.query_depth.unwrap_or(1);
+
+                for node_id_bytes in &req.message.node_i_ds {
+                    let Some(node_id) = shamap::nodes::node_id::deserialize_shamap_node_id(node_id_bytes) else {
+                        continue;
+                    };
+                    let mut data: Vec<(shamap::nodes::node_id::SHAMapNodeId, Vec<u8>)> = Vec::new();
+                    let mut fetch = |_h: basics::sha_map_hash::SHAMapHash| -> Option<
+                        basics::memory::intrusive_pointer::SharedIntrusive<
+                            shamap::nodes::tree_node::SHAMapTreeNode,
+                        >,
+                    > { None };
+                    if map.get_node_fat(node_id, &mut data, fat_leaves, depth, &mut fetch).is_ok() {
+                        for (nid, ndata) in &data {
+                            nodes.push(overlay::message::wire::TmLedgerNode {
+                                nodeid: Some(nid.get_raw_string()),
+                                nodedata: ndata.clone(),
+                            });
+                            if nodes.len() >= 256 {
+                                break;
+                            }
+                        }
+                    }
+                    if nodes.len() >= 256 {
+                        break;
+                    }
+                }
+            }
+            _ => continue,
+        }
+
+        if nodes.is_empty() {
+            continue;
+        }
+
         let response = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(
             overlay::TmLedgerData {
                 ledger_hash: hash.data().to_vec(),
                 ledger_seq: ledger.header().seq,
-                r#type: 0, // li_BASE
-                nodes: vec![overlay::message::wire::TmLedgerNode {
-                    nodeid: None,
-                    nodedata: header_data,
-                }],
+                r#type: itype,
+                nodes,
                 request_cookie: req.message.request_cookie.map(|c| c as u32),
                 error: None,
             },
         ));
         let message = overlay::Message::new(response, None);
-        // Send to the requesting peer.
         if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
             peer.send(message);
         }
