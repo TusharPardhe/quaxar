@@ -357,12 +357,11 @@ impl<A: RclConsensusAdapter> RclConsensus<A> {
     ) {
         tracing::info!(target: "consensus", seq = prev_ledger.seq + 1, prev_ledger = %prev_ledger_id, "RCL consensus starting round");
         self.consensus.adaptor_mut().inner.pre_start_round_for_proposing();
-        // Only propose if we should AND we're past genesis AND peers agree.
-        // Never propose on genesis (seq <= 1) to prevent sending validations
-        // for solo-closed ledgers that crash rippled.
+        // Only propose past genesis. On genesis (seq=1), always observe to
+        // prevent sending proposals/validations for ledgers peers don't have.
+        // Validation emission is additionally gated on mode==Proposing in on_accept.
         let proposing = self.consensus.adaptor().inner.should_propose()
-            && prev_ledger.seq > 1
-            && self.consensus.adaptor().inner.have_peers_on_ledger(&prev_ledger_id);
+            && prev_ledger.seq > 1;
         let _ = self
             .consensus
             .start_round(now, prev_ledger_id, prev_ledger, proposing);
