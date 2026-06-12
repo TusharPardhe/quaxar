@@ -3181,6 +3181,12 @@ impl ApplicationRoot {
             .set_need_network_ledger(need_network_ledger);
     }
 
+    pub fn set_completed_ledgers_rx(&self, rx: std::sync::mpsc::Receiver<std::sync::Arc<ledger::Ledger>>) {
+        if let Some(lm_rt) = self.ledger_master_runtime() {
+            *lm_rt.completed_ledgers_rx.lock().expect("completed_ledgers_rx") = Some(rx);
+        }
+    }
+
     pub fn need_network_ledger(&self) -> bool {
         self.network_ops_state.need_network_ledger()
     }

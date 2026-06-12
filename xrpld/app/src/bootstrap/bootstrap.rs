@@ -1145,6 +1145,19 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
             let _ = root.receive_validation_to_network_ops(&mut validation, &source);
         }
 
+        // storeLedger: drain completed InboundLedger results into LedgerHistory
+        // (matching rippled's done() → storeLedger() with 50ms latency).
+        if let Some(lm_rt) = root.ledger_master_runtime() {
+            let rx_guard = lm_rt.completed_ledgers_rx.lock().expect("completed_ledgers_rx");
+            if let Some(rx) = rx_guard.as_ref() {
+                while let Ok(ledger) = rx.try_recv() {
+                    lm_rt.ledger_master().ledger_history().insert(
+                        std::sync::Arc::clone(&ledger), false,
+                    );
+                }
+            }
+        }
+
         // Tick the consensus state machine (rippled heartbeat equivalent).
         network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
 

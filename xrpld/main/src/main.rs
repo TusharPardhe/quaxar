@@ -2448,6 +2448,9 @@ struct InboundLedgers {
     pending_writes: Option<Arc<Mutex<HashMap<Uint256, PendingNodeStoreObject>>>>,
     run_data_limiter: Arc<RunDataLimiter>,
     shared_stored: Arc<basics::tagged_cache::KeyCache<Uint256>>,
+    /// Channel for workers to immediately notify of completed ledgers
+    /// (matching rippled's done() → storeLedger() without polling delay).
+    completed_ledgers_tx: std::sync::mpsc::Sender<Arc<ledger::Ledger>>,
 }
 
 struct InboundEntry {
@@ -2498,6 +2501,7 @@ impl InboundLedgers {
         fetch_pack: Arc<ledger::FetchPackCache>,
         run_data_limiter: Arc<RunDataLimiter>,
         shared_stored: Arc<basics::tagged_cache::KeyCache<Uint256>>,
+        completed_ledgers_tx: std::sync::mpsc::Sender<Arc<ledger::Ledger>>,
     ) -> Self {
         Self {
             entries: HashMap::new(),
@@ -2511,6 +2515,7 @@ impl InboundLedgers {
             pending_writes: None,
             run_data_limiter,
             shared_stored,
+            completed_ledgers_tx,
         }
     }
 
@@ -2730,11 +2735,13 @@ impl InboundLedgers {
             }
         }
 
-        // Mark completed entries
+        // Mark completed entries and notify for immediate storeLedger
         for (hash, ledger, _) in &completed {
             if let Some(entry) = self.entries.get_mut(hash) {
                 entry.state = InboundState::Complete(ledger.clone());
                 entry.last_touched = Instant::now();
+                // Immediately notify for storeLedger (matching rippled done() → storeLedger)
+                let _ = self.completed_ledgers_tx.send(Arc::new(ledger.clone()));
                 full_sync_debug!(
                     "[full_debug][acq_poll] state_complete seq={} hash={} ledger_hash={} account_hash={} tx_hash={}",
                     entry.seq,
@@ -3918,6 +3925,8 @@ impl<D> BoundServerRuntime<D> {
 
                 // Wire InboundLedgers to shared resources.
                 // new acquisitions through a global active-ledger cap.
+                let (completed_ledgers_tx, completed_ledgers_rx) =
+                    std::sync::mpsc::channel::<Arc<ledger::Ledger>>();
                 let mut inbound_ledgers = InboundLedgers::new(
                     Arc::clone(&acq_registry),
                     Arc::clone(&shared_tree_cache),
@@ -3925,7 +3934,12 @@ impl<D> BoundServerRuntime<D> {
                     Arc::clone(&shared_fetch_pack),
                     Arc::clone(&run_data_limiter),
                     Arc::clone(&shared_stored),
+                    completed_ledgers_tx,
                 );
+                // Share the receiver with the ApplicationRoot so the bootstrap
+                // thread can poll completed ledgers every 50ms (matching
+                // rippled's done() → storeLedger() without polling delay).
+                app.set_completed_ledgers_rx(completed_ledgers_rx);
                 if let Some(ns) = app.node_store().as_ref() {
                     inbound_ledgers.set_node_store(ns.clone());
                 }
