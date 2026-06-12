@@ -97,6 +97,7 @@ pub trait RclConsensusAdapter: Send {
     fn proposers_finished(&self, prev_ledger: &RclCxLedger, prev_ledger_id: &Uint256) -> usize;
     fn pre_start_round_for_proposing(&self) {}
     fn should_propose(&self) -> bool;
+    fn have_peers_on_ledger(&self, _ledger_id: &Uint256) -> bool { true }
     fn prev_round_time(&self) -> Duration;
     fn now_close_time(&self) -> basics::chrono::NetClockTimePoint;
     fn get_prev_ledger(
@@ -355,7 +356,13 @@ impl<A: RclConsensusAdapter> RclConsensus<A> {
         prev_ledger: RclCxLedger,
     ) {
         tracing::info!(target: "consensus", seq = prev_ledger.seq + 1, prev_ledger = %prev_ledger_id, "RCL consensus starting round");
-        self.consensus.adaptor_mut().inner.pre_start_round_for_proposing(); let proposing = self.consensus.adaptor().inner.should_propose();
+        self.consensus.adaptor_mut().inner.pre_start_round_for_proposing();
+        // Only propose if we should AND we're past genesis AND peers agree.
+        // Never propose on genesis (seq <= 1) to prevent sending validations
+        // for solo-closed ledgers that crash rippled.
+        let proposing = self.consensus.adaptor().inner.should_propose()
+            && prev_ledger.seq > 1
+            && self.consensus.adaptor().inner.have_peers_on_ledger(&prev_ledger_id);
         let _ = self
             .consensus
             .start_round(now, prev_ledger_id, prev_ledger, proposing);

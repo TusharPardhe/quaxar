@@ -923,6 +923,25 @@ where
         }
     }
 
+    /// Check if any peer reports the same closed_ledger as us AND
+    /// we're past genesis. Prevents proposing on genesis when no
+    /// rippled peer agrees with us.
+    pub fn have_peers_on_ledger(&self, ledger_id: &Uint256) -> bool {
+        // Never propose on genesis — wait until we've synced with the network
+        if let Some(ledger) = self.ledgers.acquire_consensus_ledger(ledger_id) {
+            if ledger.header().seq <= 1 {
+                return false;
+            }
+        }
+        if let Some(overlay) = &self.overlay {
+            use overlay::Overlay;
+            let peers = overlay.active_peers();
+            peers.iter().any(|p| p.closed_ledger_hash() == *ledger_id)
+        } else {
+            false
+        }
+    }
+
     pub const fn consensus_cookie(&self) -> u64 {
         self.consensus_cookie
     }
