@@ -197,6 +197,10 @@ pub struct ApplicationRoot {
     /// Shared node store for ConsensusLedgerAcceptor. Populated by attach_node_store.
     shared_consensus_node_store:
         Arc<std::sync::RwLock<Option<crate::shamap::shamap_store_backend::SHAMapStoreNodeStore>>>,
+    /// Signal from bootstrap/consensus loop to InboundLedger workers that
+    /// the shared fetch-pack cache was populated. Workers should re-check
+    /// local storage immediately (matching rippled gotFetchPack).
+    fetch_pack_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for ApplicationRoot {
@@ -1693,11 +1697,25 @@ impl ApplicationRoot {
             },
             shamap_store_service: None,
             shared_consensus_node_store: Arc::new(std::sync::RwLock::new(None)),
+            fetch_pack_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
     pub fn basic_app(&self) -> &BasicApp {
         &self.basic_app
+    }
+
+    /// Signal that the shared fetch-pack cache was populated.
+    /// InboundLedger workers should re-check local storage.
+    pub fn signal_fetch_pack_ready(&self) {
+        self.fetch_pack_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Check and clear the fetch-pack-ready flag. Returns true if it was set.
+    pub fn take_fetch_pack_ready(&self) -> bool {
+        self.fetch_pack_ready
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     pub fn job_queue(&self) -> &JobQueue {

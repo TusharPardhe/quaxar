@@ -414,6 +414,7 @@ impl<A: ConsensusAdaptor> Consensus<A> {
             return false;
         };
         if proposal.prev_ledger() != prev_ledger_id {
+            tracing::trace!(target: "consensus", "Proposal filtered: prevLedger mismatch");
             return false;
         }
 

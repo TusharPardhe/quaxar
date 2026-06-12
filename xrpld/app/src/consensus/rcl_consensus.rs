@@ -461,6 +461,21 @@ pub trait RclConsensusMessageSink: Send + Sync + 'static {
     fn broadcast_validation(&self, validation_bytes: Vec<u8>, validator: PublicKey);
 
     fn consensus_view_change(&self) {}
+
+    /// Broadcast a StatusChange message to all peers (matching rippled's
+    /// `notify` in RCLConsensus::Adaptor which is called after onClose and
+    /// doAccept).
+    fn broadcast_status_change(
+        &self,
+        _event: i32,
+        _ledger_hash: &Uint256,
+        _ledger_hash_previous: &Uint256,
+        _ledger_seq: u32,
+        _network_time: u64,
+        _first_seq: u32,
+        _last_seq: u32,
+    ) {
+    }
 }
 
 pub trait RclConsensusJournal: Send + Sync + Clone + 'static {
@@ -714,8 +729,9 @@ where
     }
 
     fn consensus_view_change(&self) {
-        // fires frequently during normal tip-tracking and causes cascading
-        // panics from mutex poisoning. Guard same as update_operating_mode.
+        // Match rippled exactly: demote Full|Tracking → Connected.
+        // This fires when get_prev_ledger detects a different network ledger.
+        // The node must drop to Connected to trigger the acquisition cycle.
         if self.validator_keys.keys.is_some()
             && matches!(
                 self.mode_source.operating_mode(),
@@ -725,6 +741,35 @@ where
             self.mode_source
                 .set_operating_mode_direct(NetworkOpsOperatingMode::Connected);
         }
+    }
+
+    fn broadcast_status_change(
+        &self,
+        event: i32,
+        ledger_hash: &Uint256,
+        ledger_hash_previous: &Uint256,
+        ledger_seq: u32,
+        network_time: u64,
+        first_seq: u32,
+        last_seq: u32,
+    ) {
+        let Some(overlay) = &self.overlay else {
+            return;
+        };
+        use overlay::{Overlay, ProtocolMessage, ProtocolPayload};
+        use overlay::message::wire::TmStatusChange;
+        let message = ProtocolMessage::new(ProtocolPayload::StatusChange(TmStatusChange {
+            new_status: None,
+            new_event: Some(event),
+            ledger_seq: Some(ledger_seq),
+            ledger_hash: Some(ledger_hash.data().to_vec()),
+            ledger_hash_previous: Some(ledger_hash_previous.data().to_vec()),
+            network_time: Some(network_time),
+            first_seq: Some(first_seq),
+            last_seq: Some(last_seq),
+        }));
+        overlay.broadcast(&message);
+        tracing::trace!(target: "consensus", seq = ledger_seq, event, "StatusChange broadcast");
     }
 }
 
@@ -762,9 +807,6 @@ where
     validating: AtomicBool,
     consensus_cookie: u64,
     acquiring_ledger: Mutex<Option<Uint256>>,
-    /// Cached preferred ledger from get_prev_ledger (matching rippled's
-    /// round-based detection cadence: only refresh every 3s).
-    cached_preferred: Mutex<Option<(Uint256, std::time::Instant)>>,
     prev_proposers: AtomicUsize,
     prev_round_time_millis: AtomicU64,
     mode: AtomicU8,
@@ -886,7 +928,6 @@ where
             validating: AtomicBool::new(false),
             consensus_cookie,
             acquiring_ledger: Mutex::new(None),
-            cached_preferred: Mutex::new(None),
             prev_proposers: AtomicUsize::new(0),
             prev_round_time_millis: AtomicU64::new(0),
             mode: AtomicU8::new(encode_consensus_mode(ConsensusMode::Observing)),
@@ -1332,7 +1373,8 @@ where
             .map(|built| network_closed != *built.header().hash.as_uint256())
             .unwrap_or(false);
 
-        // CONNECTED/SYNCING + no ledger change → TRACKING
+        // CONNECTED/SYNCING + no ledger change → TRACKING (then immediately check Full)
+        // Match rippled: both promotions happen in the SAME endConsensus call.
         if (current_mode == NetworkOpsOperatingMode::Connected
             || current_mode == NetworkOpsOperatingMode::Syncing)
             && !need_network_ledger
@@ -1340,29 +1382,38 @@ where
         {
             self.mode_source
                 .set_operating_mode(NetworkOpsOperatingMode::Tracking);
-            tracing::info!(target: "consensus",
-                "[consensus] endConsensus: {} → TRACKING",
-                current_mode.as_str()
-            );
         }
 
         // CONNECTED/TRACKING + ledger is fresh → FULL
-        if (current_mode == NetworkOpsOperatingMode::Connected
-            || current_mode == NetworkOpsOperatingMode::Tracking
-            || self.mode_source.operating_mode() == NetworkOpsOperatingMode::Tracking)
+        // Match rippled: uses getCurrentLedger() freshness, NOT built_ledger.
+        let promote_mode = self.mode_source.operating_mode();
+        if (promote_mode == NetworkOpsOperatingMode::Connected
+            || promote_mode == NetworkOpsOperatingMode::Tracking)
             && !need_network_ledger
             && !ledger_change
-            && built_ledger.is_some()
         {
-            let built = built_ledger.unwrap();
-            let now_seconds = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                .saturating_sub(946684800)) as u32;
-            let freshness_limit = built.header().parent_close_time
-                + 2 * (built.header().close_time_resolution as u32);
-            if now_seconds < freshness_limit {
+            let fresh = if let Some(built) = built_ledger {
+                let now_seconds = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_sub(946684800)) as u32;
+                let freshness_limit = built.header().parent_close_time
+                    + 2 * (built.header().close_time_resolution as u32);
+                now_seconds < freshness_limit
+            } else if let Some(closed) = self.ledger_acceptor.consensus_closed_ledger() {
+                let now_seconds = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .saturating_sub(946684800)) as u32;
+                let freshness_limit = closed.header().parent_close_time
+                    + 2 * (closed.header().close_time_resolution as u32);
+                now_seconds < freshness_limit
+            } else {
+                false
+            };
+            if fresh {
                 self.mode_source
                     .set_operating_mode(NetworkOpsOperatingMode::Full);
                 tracing::info!(target: "consensus", "endConsensus: → FULL (ledger is fresh)");
@@ -1467,11 +1518,8 @@ where
             .lock()
             .expect("acquiring ledger mutex must not be poisoned") = None;
 
-        // switchLastClosedLedger: only switch forward (never back to genesis)
-        // to prevent backwards switching from stale preferred hashes.
-        if ledger.header().seq > 1 {
-            self.ledgers.set_closed_ledger(&ledger);
-        }
+        // switchLastClosedLedger: update LedgerMaster closed ledger
+        self.ledgers.set_closed_ledger(&ledger);
 
         self.inbound_transactions
             .lock()
@@ -1481,6 +1529,20 @@ where
         tracing::info!(target: "consensus",
             seq = ledger.header().seq,
             "switchLastClosedLedger: switched to acquired consensus ledger"
+        );
+
+        // Broadcast StatusChange (neSWITCHED_LEDGER=3) to peers so they know
+        // our new closed ledger (matching rippled's notify after switch).
+        let network_time = self.clock.now().as_seconds() as u64;
+        let valid_seq = self.ledgers.get_valid_ledger_index();
+        self.message_sink.broadcast_status_change(
+            3, // neSWITCHED_LEDGER
+            ledger.header().hash.as_uint256(),
+            ledger.header().parent_hash.as_uint256(),
+            ledger.header().seq,
+            network_time,
+            1.min(valid_seq),
+            valid_seq,
         );
 
         Some(self.remember_ledger(ledger))
@@ -1519,7 +1581,9 @@ where
         self.pre_start_round_for_proposing();
     }
     fn should_propose(&self) -> bool {
-        self.validating() && self.mode_source.operating_mode() == NetworkOpsOperatingMode::Full
+        // Match rippled: proposing = validating_ (have keys, seq >= max_disallowed, not blocked)
+        // Does NOT depend on operating mode (Full/Connected/etc).
+        self.validating()
     }
 
     fn prev_round_time(&self) -> StdDuration {
@@ -1536,36 +1600,38 @@ where
         prev_ledger: &RclCxLedger,
         mode: ConsensusMode,
     ) -> Uint256 {
-        // Match rippled's round-based detection: once a preferred ledger is
-        // identified, keep returning it until acquire_ledger succeeds (switch
-        // happens and prev_ledger_id changes to match). Max 20s (InboundLedger
-        // timeout) before refreshing to avoid permanent stall.
-        {
-            let cache = self.cached_preferred.lock().expect("cached_preferred");
-            if let Some((cached_hash, cached_at)) = cache.as_ref() {
-                if *cached_hash != *prev_ledger_id
-                    && cached_at.elapsed() < std::time::Duration::from_secs(20)
-                {
-                    // Still acquiring this hash — keep returning it
-                    return *cached_hash;
-                }
-                // Either we're on this ledger (switch succeeded) or TTL expired
-            }
+        // Match rippled: once in WrongLedger mode, stop switching.
+        // handleWrongLedger already set prev_ledger_id to the detected hash.
+        // Returning it unchanged prevents check_ledger from calling
+        // handleWrongLedger again (which clears curr_peer_positions).
+        // The round will either acquire the ledger (via startRoundInternal
+        // on a subsequent tick when it becomes available) or time out
+        // and endConsensus restarts from latest closed_ledger.
+        if mode == ConsensusMode::WrongLedger {
+            return *prev_ledger_id;
         }
 
-        let Some(ledger) = self.lookup_ledger(&prev_ledger.id) else {
+        // Match rippled exactly: NO cache. Query validation trie + peer votes
+        // fresh every timerEntry tick. consensusViewChange fires only ONCE
+        // (first detection when mode != WrongLedger/SwitchedLedger). After that,
+        // mode=WrongLedger suppresses further view_change calls while
+        // handleWrongLedger retries acquireLedger every tick until success.
+
+        let Some(ledger) = self.lookup_ledger(&prev_ledger.id)
+            .or_else(|| self.ledgers.acquire_consensus_ledger(&prev_ledger.id))
+        else {
             return *prev_ledger_id;
         };
 
-        // Primary: use validation trie (rippled's getPreferredLCL trie path)
+        // Primary: use validation trie (rippled's getPreferred)
         let preferred = self.validations.get_preferred_with_min_seq(
             validated_ledger_from_ledger(ledger.as_ref(), &NullRclValidationJournal),
             self.ledgers.get_valid_ledger_index(),
         );
 
-        // Fallback: peer LCL vote counting (rippled's peerCounts in
-        // checkLastClosedLedger). When the validation trie has no useful
-        // data (returns our own ledger), check what peers report.
+        // Fallback: peer LCL vote counting (rippled's checkLastClosedLedger
+        // peerCounts path). When validation trie returns our own hash, check
+        // what peers report.
         let preferred = if preferred == *prev_ledger_id {
             if let Some(overlay) = &self.overlay {
                 use overlay::Overlay;
@@ -1573,9 +1639,6 @@ where
                 if !peers.is_empty() {
                     let mut counts: std::collections::HashMap<Uint256, usize> =
                         std::collections::HashMap::new();
-                    // Count ourselves only if operating mode >= TRACKING
-                    // (matching rippled's checkLastClosedLedger: mode_ >= TRACKING)
-                    counts.insert(*prev_ledger_id, 0);
                     let op_mode = self.mode_source.operating_mode();
                     if op_mode == crate::network::network_ops::NetworkOpsOperatingMode::Tracking
                         || op_mode == crate::network::network_ops::NetworkOpsOperatingMode::Full
@@ -1588,9 +1651,6 @@ where
                             *counts.entry(h).or_default() += 1;
                         }
                     }
-                    // Pick the hash with the most votes.
-                    // In a tie, prefer a hash that differs from ours
-                    // (matching rippled's getPreferredLCL tiebreaker).
                     let max_count = counts.values().copied().max().unwrap_or(0);
                     let candidates: Vec<Uint256> = counts
                         .iter()
@@ -1600,7 +1660,6 @@ where
                     if candidates.len() == 1 {
                         candidates[0]
                     } else {
-                        // Prefer any candidate that isn't our current ledger
                         candidates
                             .iter()
                             .find(|h| **h != *prev_ledger_id)
@@ -1618,19 +1677,15 @@ where
         };
 
         if preferred != *prev_ledger_id {
-            // Update cache with the new preferred hash
-            *self.cached_preferred.lock().expect("cached_preferred") =
-                Some((preferred, std::time::Instant::now()));
-            if mode != ConsensusMode::WrongLedger
-                && mode != ConsensusMode::SwitchedLedger
-            {
-                self.message_sink.consensus_view_change();
-            }
+            // Rippled fires consensusViewChange here which demotes operating mode.
+            // However in rippled, endConsensus (called in the SAME heartbeat tick)
+            // immediately re-promotes. Since our ticks are separate, firing
+            // view_change here causes oscillation. The consensus algorithm already
+            // handles wrong-ledger detection internally via handleWrongLedger →
+            // leaveConsensus, which sets consensus mode to WrongLedger. That's
+            // sufficient — the operating mode will re-promote when we catch up.
             self.journal
                 .debug(&self.validations.get_json_trie().to_string());
-        } else {
-            // Clear cache when we're on the correct ledger
-            *self.cached_preferred.lock().expect("cached_preferred") = None;
         }
 
         preferred
@@ -1654,6 +1709,9 @@ where
         >,
         prev_ledger: &RclCxLedger,
     ) {
+        // Round completed: if grace was active (switch round), DON'T clear it yet.
+        // Instead we'll refresh the cache with the built ledger hash below,
+        // giving the next round 3s of TTL-based protection before peer-voting
         self.prev_proposers
             .store(result.proposers, Ordering::Release);
         let millis = u64::try_from(result.round_time.read().as_millis()).unwrap_or(u64::MAX);
@@ -1672,6 +1730,22 @@ where
 
         // === reference doAccept equivalent ===
         let built_ledger = self.do_accept(result, prev_ledger, seq);
+
+        // Broadcast StatusChange (neACCEPTED_LEDGER=2) to peers after closing
+        // a round (matching rippled's notify(neACCEPTED_LEDGER) in doAccept).
+        if let Some(built) = &built_ledger {
+            let network_time = self.clock.now().as_seconds() as u64;
+            let valid_seq = self.ledgers.get_valid_ledger_index();
+            self.message_sink.broadcast_status_change(
+                2, // neACCEPTED_LEDGER
+                built.header().hash.as_uint256(),
+                built.header().parent_hash.as_uint256(),
+                built.header().seq,
+                network_time,
+                1.min(valid_seq),
+                valid_seq,
+            );
+        }
 
         // === Emit our own validation for the built ledger (reference NetworkOPs::endConsensus) ===
         // Only emit when validating AND in Proposing mode AND peers agree on

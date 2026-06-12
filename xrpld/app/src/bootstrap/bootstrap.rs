@@ -915,7 +915,7 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
             if true {
                 use overlay::Overlay;
                 let peers = overlay_rt.overlay().active_peers();
-                if !peers.is_empty() {
+                if true { // Start even without peers like rippled
                     let any_ahead = peers.iter().find(|p| {
                         let h = p.closed_ledger_hash();
                         if h.is_zero() {
@@ -957,7 +957,7 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                                 let any_confirmed = peers.iter().any(|p| {
                                     !p.closed_ledger_hash().is_zero()
                                 });
-                                if any_confirmed {
+                                if true && root.need_network_ledger() { // Start immediately like rippled
                                     // Drain queued proposals into the consensus
                                     // engine BEFORE starting so that startRound's
                                     // playback_proposals finds them (matching
@@ -967,18 +967,18 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                                     for proposal in &proposals {
                                         let close_time = root.shared_time_keeper().close_time();
                                         let prop = consensus::ConsensusProposal::new(
-                                            proposal.previous_ledger, 0,
+                                            proposal.previous_ledger, proposal.message.propose_seq,
                                             proposal.current_tx_hash,
                                             close_time, close_time,
                                             proposal.public_key,
                                         );
-                                        let _ = network_ops_rt.handle_peer_proposal(
-                                            consensus_rt.as_ref(),
-                                            proposal.public_key,
-                                            proposal.message.signature.clone(),
-                                            proposal.suppression,
-                                            prop,
-                                        );
+                                        consensus_rt.push_proposal(crate::runtime::component_runtime::PendingProposal {
+                                            now: close_time,
+                                            public_key: proposal.public_key,
+                                            signature: proposal.message.signature.clone(),
+                                            suppression_id: proposal.suppression,
+                                            proposal: prop,
+                                        });
                                     }
                                     if network_ops_rt.maybe_begin_consensus_from_validated(
                                         consensus_rt.as_ref(),
@@ -1080,6 +1080,8 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
         }
 
         // Drain and feed peer proposals into the consensus engine.
+        // Always drain here — proposals go into the pending queue which
+        // timer_tick (driven by either bootstrap or main.rs) consumes.
         if consensus_started {
         let proposals = overlay_rt.overlay().take_proposals();
         for proposal in &proposals {
@@ -1107,19 +1109,19 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
             let close_time = root.shared_time_keeper().close_time();
             let prop = consensus::ConsensusProposal::new(
                 proposal.previous_ledger,
-                0,
+                proposal.message.propose_seq,
                 proposal.current_tx_hash,
                 close_time,
                 close_time,
                 proposal.public_key,
             );
-            let _ = network_ops_rt.handle_peer_proposal(
-                consensus_rt.as_ref(),
-                proposal.public_key,
-                proposal.message.signature.clone(),
-                proposal.suppression,
-                prop,
-            );
+            consensus_rt.push_proposal(crate::runtime::component_runtime::PendingProposal {
+                now: close_time,
+                public_key: proposal.public_key,
+                signature: proposal.message.signature.clone(),
+                suppression_id: proposal.suppression,
+                proposal: prop,
+            });
         }
         }
 
@@ -1145,30 +1147,78 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
             let _ = root.receive_validation_to_network_ops(&mut validation, &source);
         }
 
+        // Process fetch pack messages (responses AND requests).
+        {
+            let messages = overlay_rt.overlay().take_get_objects();
+            for msg_envelope in &messages {
+                let msg = &msg_envelope.message;
+
+                if !msg.query {
+                    // Response: store objects in FetchPackCache (matching rippled gotFetchPack).
+                    if msg.r#type != 6 {
+                        continue;
+                    }
+                    if let Some(lm_rt) = root.ledger_master_runtime() {
+                        let lm = lm_rt.ledger_master();
+                        let mut stored = 0;
+                        for obj in &msg.objects {
+                            if let (Some(hash_bytes), Some(data)) = (&obj.hash, &obj.data) {
+                                if let Some(hash) = Uint256::from_slice(hash_bytes) {
+                                    lm.fetch_pack_cache().add_fetch_pack(hash, data.clone());
+                                    stored += 1;
+                                }
+                            }
+                        }
+                        if stored > 0 {
+                            tracing::info!(target: "consensus",
+                                stored,
+                                "Fetch pack received and cached"
+                            );
+                            root.signal_fetch_pack_ready();
+                        }
+                    }
+                } else if msg.r#type == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32 {
+                    // Request: peer asks us for a fetch pack (matching rippled doFetchPack/makeFetchPack).
+                    serve_fetch_pack_request(root, &overlay_rt, msg_envelope);
+                }
+            }
+        }
+
         // storeLedger: drain completed InboundLedger results into LedgerHistory
         // (matching rippled's done() → storeLedger() with 50ms latency).
+        // Insert with validated=true so ledgers are indexed by seq for tryAdvance lookups.
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let rx_guard = lm_rt.completed_ledgers_rx.lock().expect("completed_ledgers_rx");
             if let Some(rx) = rx_guard.as_ref() {
                 while let Ok(ledger) = rx.try_recv() {
                     lm_rt.ledger_master().ledger_history().insert(
-                        std::sync::Arc::clone(&ledger), false,
+                        std::sync::Arc::clone(&ledger), true,
                     );
                 }
             }
         }
 
-        // Tick the consensus state machine (rippled heartbeat equivalent).
-        network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
+        // Tick consensus only while need_network_ledger is true.
+        // Once false, main.rs validation loop takes over as the sole consensus driver.
+        // This prevents dual-thread consensus which causes proposal clearing.
+        if root.need_network_ledger() {
+            network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
+        }
 
-        // Promote the closed ledger to validated once it reaches quorum.
+        // checkAccept + tryAdvance burst catch-up (matching rippled LedgerMaster.cpp):
+        // 1. First check if the closed ledger can be promoted to validated.
+        // 2. Then loop through consecutive ledgers in LedgerHistory, promoting
+        //    each one that has sufficient validations (burst catch-up).
+        // This allows validating N+1, N+2, ... N+50 in a single tick if all
+        // intermediate ledgers are available in history with quorum validations.
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let lm = lm_rt.ledger_master();
-            let valid_seq = lm.valid_ledger_seq();
             let quorum = root.validators().quorum();
+
+            // checkAccept: promote closed ledger if it has quorum
             if let Some(closed) = lm.closed_ledger() {
                 let closed_seq = closed.header().seq;
-                if closed_seq > valid_seq {
+                if closed_seq > lm.valid_ledger_seq() {
                     let closed_hash = *closed.header().hash.as_uint256();
                     let val_count = root.validations().num_trusted_for_ledger(closed_hash);
                     if val_count >= quorum {
@@ -1190,6 +1240,45 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                         );
                     }
                 }
+            }
+
+            // tryAdvance: burst through consecutive ledgers in history
+            // (rippled doAdvance/findNewLedgersToPublish equivalent)
+            let mut advanced = 0u32;
+            loop {
+                let next_seq = lm.valid_ledger_seq() + 1;
+                // Look up next ledger in history by sequence
+                let next_ledger = lm.ledger_history().get_cached_ledger_by_seq(next_seq);
+                let Some(candidate) = next_ledger else {
+                    break;
+                };
+                let candidate_hash = *candidate.header().hash.as_uint256();
+                let val_count = root.validations().num_trusted_for_ledger(candidate_hash);
+                if val_count < quorum {
+                    break;
+                }
+                // Promote to validated
+                let mut l = (*candidate).clone();
+                l.set_validated();
+                let validated = std::sync::Arc::new(l);
+                lm.set_valid_ledger_no_sweep(
+                    std::sync::Arc::clone(&validated),
+                    None,
+                    None,
+                );
+                root.note_validated_ledger_for_sync(
+                    std::sync::Arc::clone(&validated),
+                );
+                root.set_need_network_ledger(false);
+                advanced += 1;
+            }
+            if advanced > 0 {
+                tracing::info!(target: "consensus",
+                    advanced,
+                    new_valid_seq = lm.valid_ledger_seq(),
+                    quorum,
+                    "tryAdvance burst: validated consecutive ledgers from history"
+                );
             }
         }
 
@@ -1319,7 +1408,117 @@ fn serve_get_ledger_requests(
     }
 }
 
+/// Serve a fetch pack request from a peer (matching rippled doFetchPack/makeFetchPack).
+///
+/// Given a `TMGetObjectByHash` with `query=true, type=otFETCH_PACK`, we:
+/// 1. Look up the ledger with the requested hash (`have`).
+/// 2. Look up its parent ledger (`want`).
+/// 3. Walk the state map diff (nodes in `have` not in `want`) using `visit_differences`.
+/// 4. Serialize each differing node with its hash and send as response.
+/// Cap at 512 objects per response, matching rippled.
+fn serve_fetch_pack_request(
+    root: &crate::ApplicationRoot,
+    overlay_rt: &Arc<crate::runtime::overlay_runtime::AppOverlayRuntime>,
+    req: &overlay::PeerMessage<overlay::TmGetObjectByHash>,
+) {
+    use overlay::Overlay;
 
+    let Some(ledger_hash_bytes) = req.message.ledger_hash.as_deref() else {
+        return;
+    };
+    let Some(ledger_hash) = Uint256::from_slice(ledger_hash_bytes) else {
+        return;
+    };
+    let Some(lm_rt) = root.ledger_master_runtime() else {
+        return;
+    };
+    let lm = lm_rt.ledger_master();
+
+    // Get the ledger the peer specified ("have" in rippled terms).
+    let Some(have) = lm.get_ledger_by_hash(
+        basics::sha_map_hash::SHAMapHash::new(ledger_hash),
+    ) else {
+        return;
+    };
+
+    // Get its parent ("want" in rippled terms — the ledger the peer needs to catch up to).
+    let parent_hash = *have.header().parent_hash.as_uint256();
+    if parent_hash == Uint256::zero() {
+        return;
+    }
+    let Some(want) = lm.get_ledger_by_hash(
+        basics::sha_map_hash::SHAMapHash::new(parent_hash),
+    ) else {
+        return;
+    };
+
+    // Diff state maps: find nodes in `have` that are missing from `want`.
+    // This matches rippled's populateFetchPack(have->stateMap(), &want->stateMap(), 16384, ...).
+    let have_root = have.state_map().root();
+    let want_root = want.state_map().root();
+
+    let mut objects: Vec<overlay::message::wire::TmIndexedObject> = Vec::new();
+    let have_seq = have.header().seq;
+    let mut no_op_fetch =
+        |_h: basics::sha_map_hash::SHAMapHash| -> Option<
+            basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
+        > { None };
+    let mut no_op_fetch2 =
+        |_h: basics::sha_map_hash::SHAMapHash| -> Option<
+            basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
+        > { None };
+
+    let _ = shamap::difference::visit_differences(
+        &have_root,
+        Some(&want_root),
+        have.state_map().backed(),
+        &mut no_op_fetch,
+        want.state_map().backed(),
+        &mut no_op_fetch2,
+        &mut |node: &basics::memory::intrusive_pointer::SharedIntrusive<
+            shamap::tree_node::SHAMapTreeNode,
+        >| {
+            if objects.len() >= 512 {
+                return false; // stop iteration
+            }
+            let hash = node.get_hash();
+            if let Ok(data) = node.serialize_with_prefix() {
+                objects.push(overlay::message::wire::TmIndexedObject {
+                    hash: Some(hash.as_uint256().data().to_vec()),
+                    node_id: None,
+                    index: None,
+                    data: Some(data),
+                    ledger_seq: Some(have_seq),
+                });
+            }
+            objects.len() < 512
+        },
+    );
+
+    if objects.is_empty() {
+        return;
+    }
+
+    tracing::info!(target: "consensus",
+        objects = objects.len(),
+        seq = have_seq,
+        "Serving fetch pack to peer"
+    );
+
+    let reply = overlay::TmGetObjectByHash {
+        r#type: overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32,
+        query: false,
+        ledger_hash: Some(ledger_hash_bytes.to_vec()),
+        fat: None,
+        objects,
+    };
+
+    let response = overlay::ProtocolMessage::new(overlay::ProtocolPayload::GetObjects(reply));
+    let message = overlay::Message::new(response, None);
+    if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
+        peer.send(message);
+    }
+}
 
 
 

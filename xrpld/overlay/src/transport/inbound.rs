@@ -233,6 +233,10 @@ impl QueuedOverlayInboundHandler {
     pub fn take_get_ledgers(&self) -> Vec<PeerMessage<TmGetLedger>> {
         std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").get_ledgers)
     }
+
+    pub fn take_get_objects(&self) -> Vec<PeerMessage<TmGetObjectByHash>> {
+        std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").get_objects)
+    }
 }
 
 impl OverlayInboundHandler for QueuedOverlayInboundHandler {
