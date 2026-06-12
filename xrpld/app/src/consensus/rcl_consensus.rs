@@ -1607,8 +1607,13 @@ where
         let built_ledger = self.do_accept(result, prev_ledger, seq);
 
         // === Emit our own validation for the built ledger (reference NetworkOPs::endConsensus) ===
+        // Only emit when validating AND in Proposing mode (matching rippled
+        // which only validates when proposing on the correct ledger).
+        let current_mode = decode_consensus_mode(self.mode.load(Ordering::Acquire));
         if let Some(built) = &built_ledger {
-            if self.validating.load(Ordering::Acquire) {
+            if self.validating.load(Ordering::Acquire)
+                && current_mode == ConsensusMode::Proposing
+            {
                 if let Some(keys) = self.validator_keys.keys.as_ref() {
                     let now = (std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
