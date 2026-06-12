@@ -1635,7 +1635,8 @@ where
         }
         tracing::info!(target: "consensus", round = prev_ledger.seq + 1, duration_ms = millis, proposers, "Consensus round complete");
 
-        self.update_operating_mode(result.proposers);
+        // Mode demotion is handled by consensus_view_change in get_prev_ledger
+        // (matching rippled's consensusViewChange called from checkLastClosedLedger).
 
         let seq = prev_ledger.seq + 1;
 
