@@ -4682,16 +4682,45 @@ impl<D> BoundServerRuntime<D> {
                         }
                     }
 
-                    // Trigger InboundLedger for consensus-requested ledgers
-                    // (from handle_wrong_ledger → request_consensus_ledger).
+                    // Trigger InboundLedger for consensus-requested ledgers.
+                    // Use the CURRENT peer majority hash (freshest from StatusChange)
+                    // rather than pending_consensus_ledger (which may be stale).
                     if let Some(lm_rt) = app.ledger_master_runtime() {
-                        if let Some(wanted) = lm_rt.pending_consensus_ledger() {
-                            if !inbound_ledgers.contains(&wanted) {
-                                // Use closed_seq + 1 as seq hint (must be > 1)
-                                let seq_hint = lm_rt.ledger_master().closed_ledger()
-                                    .map(|l| l.header().seq.saturating_add(1).max(2))
-                                    .unwrap_or(2);
-                                inbound_ledgers.acquire(wanted, seq_hint, 0);
+                        if let Some(overlay_rt) = app.overlay_runtime() {
+                            use overlay::Overlay as _;
+                            let our_hash = lm_rt.ledger_master().closed_ledger()
+                                .map(|l| *l.header().hash.as_uint256())
+                                .unwrap_or_default();
+                            let our_seq = lm_rt.ledger_master().closed_ledger()
+                                .map(|l| l.header().seq)
+                                .unwrap_or(1);
+                            // Find the peer majority hash that differs from ours
+                            let peers = overlay_rt.overlay().active_peers();
+                            let mut best_hash = None;
+                            let mut best_count = 0usize;
+                            let mut counts: std::collections::HashMap<basics::base_uint::Uint256, usize> =
+                                std::collections::HashMap::new();
+                            for p in peers.iter() {
+                                let h = p.closed_ledger_hash();
+                                if !h.is_zero() && h != our_hash {
+                                    let c = counts.entry(h).or_default();
+                                    *c += 1;
+                                    if *c > best_count {
+                                        best_count = *c;
+                                        best_hash = Some(h);
+                                    }
+                                }
+                            }
+                            if let Some(wanted) = best_hash {
+                                if !inbound_ledgers.contains(&wanted) {
+                                    let seq_hint = our_seq.saturating_add(1).max(2);
+                                    tracing::info!(target: "consensus",
+                                        hash = %wanted, seq_hint,
+                                        "Triggering InboundLedger for peer majority hash"
+                                    );
+                                    inbound_ledgers.acquire(wanted, seq_hint, 0);
+                                    inbound_ledgers.send_peers(&peers);
+                                }
                             }
                         }
                     }
