@@ -1106,7 +1106,7 @@ async fn public_consensus_runtime_only_ticks_when_called_by_the_owner() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(ticks.load(Ordering::Acquire), 0);
 
-    runtime.timer_tick(NetClockTimePoint::new(123)).await;
+    runtime.timer_tick(NetClockTimePoint::new(123), true).await;
     assert_eq!(ticks.load(Ordering::Acquire), 1);
 
     app::ManagedComponent::stop(&runtime);

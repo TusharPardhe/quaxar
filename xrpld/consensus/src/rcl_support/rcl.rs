@@ -98,6 +98,7 @@ pub trait RclConsensusAdapter: Send {
     fn pre_start_round_for_proposing(&self) {}
     fn should_propose(&self) -> bool;
     fn have_peers_on_ledger(&self, _ledger_id: &Uint256) -> bool { true }
+    fn adjust_close_time(&mut self, _offset_seconds: i64) {}
     fn prev_round_time(&self) -> Duration;
     fn now_close_time(&self) -> basics::chrono::NetClockTimePoint;
     fn get_prev_ledger(
@@ -315,11 +316,8 @@ impl RclRoundTimer {
         let next = self
             .next_tick
             .get_or_insert_with(|| Instant::now() + self.period);
-        let now = Instant::now();
-        if now < *next {
-            tokio::time::sleep(*next - now).await;
-        }
-        *next += self.period;
+        // No sleep — timing is gated externally by the caller.
+        *next = Instant::now() + self.period;
     }
 }
 

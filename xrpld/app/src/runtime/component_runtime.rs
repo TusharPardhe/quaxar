@@ -155,6 +155,10 @@ pub struct AppConsensusRuntime {
     stopped: Arc<AtomicBool>,
     runner:
         Arc<tokio::sync::Mutex<Option<Box<dyn crate::consensus::rcl_consensus::ConsensusRunner>>>>,
+    /// Pending proposals queued by the bootstrap/main loop for processing
+    /// INSIDE timer_tick (before timer_entry runs). This ensures proposals
+    /// are in curr_peer_positions when shouldCloseLedger evaluates.
+    pending_proposals: Arc<std::sync::Mutex<Vec<PendingProposal>>>,
     /// are acquired from peers. The validation thread consumes this and calls
     /// got_tx_set on the consensus engine.
     map_complete_rx: Arc<
@@ -166,6 +170,19 @@ pub struct AppConsensusRuntime {
                 )>,
             >,
         >,
+    >,
+}
+
+/// A proposal queued for processing inside timer_tick.
+pub struct PendingProposal {
+    pub now: basics::chrono::NetClockTimePoint,
+    pub public_key: protocol::PublicKey,
+    pub signature: Vec<u8>,
+    pub suppression_id: basics::base_uint::Uint256,
+    pub proposal: consensus::ConsensusProposal<
+        protocol::PublicKey,
+        basics::base_uint::Uint256,
+        basics::base_uint::Uint256,
     >,
 }
 
@@ -189,6 +206,7 @@ impl AppConsensusRuntime {
             started: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
             runner: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_proposals: Arc::new(std::sync::Mutex::new(Vec::new())),
             map_complete_rx: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -226,11 +244,42 @@ impl AppConsensusRuntime {
             .expect("set_runner called during init without contention") = Some(runner);
     }
 
-    pub async fn timer_tick(&self, now: basics::chrono::NetClockTimePoint) {
+    pub async fn timer_tick(&self, now: basics::chrono::NetClockTimePoint, run_timer: bool) {
         let runner_guard = self.runner.lock().await;
         if let Some(runner) = runner_guard.as_ref() {
-            runner.timer_tick(now).await;
+            // Always drain pending proposals so they reach consensus within 50ms.
+            let proposals: Vec<PendingProposal> = {
+                let mut queue = self.pending_proposals.lock().expect("pending_proposals");
+                std::mem::take(&mut *queue)
+            };
+            if !proposals.is_empty() {
+                tracing::info!(target: "consensus", count = proposals.len(), "timer_tick: draining pending proposals");
+            }
+            for p in proposals {
+                runner.peer_proposal(p.now, p.public_key, p.signature, p.suppression_id, p.proposal).await;
+            }
+
+            // Only run the state machine on the 1s boundary.
+            if run_timer {
+                runner.timer_tick(now).await;
+
+                // Drain again after timer_tick in case a new round started
+                // (via pending_start_round) and proposals arrived during the tick.
+                let proposals2: Vec<PendingProposal> = {
+                    let mut queue = self.pending_proposals.lock().expect("pending_proposals");
+                    std::mem::take(&mut *queue)
+                };
+                for p in proposals2 {
+                    runner.peer_proposal(p.now, p.public_key, p.signature, p.suppression_id, p.proposal).await;
+                }
+            }
         }
+    }
+
+    /// Queue a proposal for processing inside the next timer_tick.
+    /// This is thread-safe and non-blocking.
+    pub fn push_proposal(&self, proposal: PendingProposal) {
+        self.pending_proposals.lock().expect("pending_proposals").push(proposal);
     }
 
     /// Start a consensus round with the given previous ledger.

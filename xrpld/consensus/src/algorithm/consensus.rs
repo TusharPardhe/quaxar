@@ -52,6 +52,8 @@ pub trait ConsensusAdaptor {
     fn parent_close_time(&self, ledger: &Self::Ledger) -> NetClockTimePoint;
     fn seq(&self, ledger: &Self::Ledger) -> u32;
     fn id(&self, ledger: &Self::Ledger) -> Self::LedgerId;
+    /// Adjust the close time offset based on peer close times (rippled TimeKeeper::adjustCloseTime)
+    fn adjust_close_time(&mut self, _offset_seconds: i64) {}
     fn on_accept(
         &mut self,
         result: &ConsensusResult<
@@ -122,7 +124,7 @@ pub fn should_close_ledger(
         tracing::debug!(target: "consensus", "Closing ledger: exceeded 10 minute threshold");
         return true;
     }
-    if proposers_closed + proposers_validated > (prev_proposers / 2) {
+    if proposers_closed > 0 && proposers_closed + proposers_validated > (prev_proposers / 2) {
         tracing::debug!(target: "consensus", proposers_closed, proposers_validated, prev_proposers, "Closing ledger: majority of proposers closed");
         return true;
     }
@@ -219,6 +221,7 @@ pub struct Consensus<A: ConsensusAdaptor> {
     mode: ConsensusMode,
     first_round: bool,
     have_close_time_consensus: bool,
+    skip_check_ledger: u8,
     converge_percent: i32,
     open_time: ConsensusTimer,
     close_resolution: TimeDuration,
@@ -249,6 +252,7 @@ impl<A: ConsensusAdaptor> Consensus<A> {
             mode: ConsensusMode::Observing,
             first_round: true,
             have_close_time_consensus: false,
+            skip_check_ledger: 0,
             converge_percent: 0,
             open_time: ConsensusTimer::default(),
             close_resolution: crate::timing::LEDGER_DEFAULT_TIME_RESOLUTION,
@@ -324,9 +328,8 @@ impl<A: ConsensusAdaptor> Consensus<A> {
             self.prev_close_time = self.raw_close_times.self_close_time;
         }
 
-        if self.prev_proposers == 0 {
-            self.prev_proposers = self.adaptor.proposers_validated(&prev_ledger_id);
-        }
+        // prev_proposers carries over from last round's actual proposer count.
+        // Do NOT reset from proposers_validated — rippled doesn't do this.
 
         let mut start_mode = if proposing {
             ConsensusMode::Proposing
@@ -367,6 +370,7 @@ impl<A: ConsensusAdaptor> Consensus<A> {
         self.close_time_avalanche_state = AvalancheState::Init;
         self.have_close_time_consensus = false;
         self.open_time.reset();
+        self.skip_check_ledger = 6;
         self.curr_peer_positions.clear();
         self.raw_close_times.peers.clear();
         self.raw_close_times.self_close_time = NetClockTimePoint::default();
@@ -414,6 +418,7 @@ impl<A: ConsensusAdaptor> Consensus<A> {
             return false;
         };
         if proposal.prev_ledger() != prev_ledger_id {
+            tracing::trace!(target: "consensus", "Proposal filtered: prevLedger mismatch");
             return false;
         }
 
@@ -495,7 +500,13 @@ impl<A: ConsensusAdaptor> Consensus<A> {
             );
         }
         self.now = now;
-        self.check_ledger();
+        if self.skip_check_ledger > 0 {
+            self.skip_check_ledger -= 1;
+        } else if self.phase != ConsensusPhase::Establish {
+            // Don't check during Establish — we're converging with peers
+            // and clearing curr_peer_positions would kill the round.
+            self.check_ledger();
+        }
         match self.phase {
             ConsensusPhase::Open => self.phase_open(),
             ConsensusPhase::Establish => self.phase_establish(),
@@ -517,7 +528,7 @@ impl<A: ConsensusAdaptor> Consensus<A> {
         let network_ledger =
             self.adaptor
                 .get_prev_ledger(&prev_ledger_id, &previous_ledger, self.mode);
-        if network_ledger != prev_ledger_id || self.adaptor.id(&previous_ledger) != prev_ledger_id {
+        if network_ledger != prev_ledger_id {
             self.handle_wrong_ledger(network_ledger);
         }
     }
@@ -535,13 +546,14 @@ impl<A: ConsensusAdaptor> Consensus<A> {
             self.curr_peer_positions.clear();
             self.raw_close_times.peers.clear();
             self.dead_nodes.clear();
-            self.playback_proposals();
         }
 
         let Some(previous_ledger) = self.previous_ledger.clone() else {
+            self.playback_proposals();
             return;
         };
         if self.adaptor.id(&previous_ledger) == ledger_id {
+            self.playback_proposals();
             return;
         }
 
@@ -552,8 +564,10 @@ impl<A: ConsensusAdaptor> Consensus<A> {
                 new_ledger,
                 ConsensusMode::SwitchedLedger,
             );
+            self.playback_proposals();
         } else {
             self.set_mode(ConsensusMode::WrongLedger);
+            self.playback_proposals();
         }
     }
 
@@ -641,7 +655,10 @@ impl<A: ConsensusAdaptor> Consensus<A> {
 
         self.update_our_positions();
         let state = self.have_consensus();
-        if state == ConsensusState::No || !self.have_close_time_consensus {
+        if state == ConsensusState::No {
+            return ConsensusDecision::StayOpen;
+        }
+        if state == ConsensusState::Yes && !self.have_close_time_consensus {
             return ConsensusDecision::StayOpen;
         }
 
@@ -660,6 +677,20 @@ impl<A: ConsensusAdaptor> Consensus<A> {
             .expect("consensus must have previous ledger");
 
         if let Some(result) = &self.result {
+            // Adjust close time offset based on peer votes (matching rippled
+            // RCLConsensus.cpp:690-712 adjustCloseTime after consensus).
+            let close_time = result.position.close_time();
+            if close_time.as_seconds() != 0 && !self.raw_close_times.peers.is_empty() {
+                let mut close_total: i64 = close_time.as_seconds() as i64;
+                let mut close_count: i64 = 1;
+                for (t, v) in &self.raw_close_times.peers {
+                    close_count += *v as i64;
+                    close_total += t.as_seconds() as i64 * *v as i64;
+                }
+                close_total = (close_total + close_count / 2) / close_count;
+                let offset = close_total - close_time.as_seconds() as i64;
+                self.adaptor.adjust_close_time(offset);
+            }
             tracing::info!(target: "consensus", state = ?state, proposers = result.proposers, round_time_ms = result.round_time.read().as_millis() as u64, "Consensus accepted, calling on_accept");
             self.adaptor.on_accept(result, previous_ledger);
         }

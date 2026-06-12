@@ -1531,7 +1531,7 @@ pub fn handle_real_dispatch<V: ledger::ApplyView>(
     if protocol::is_tes_success(result) || protocol::is_tec_claim(result) {
         tracing::debug!(target: "tx", tx_type = %format!("{:?}", txn_type), hash = %tx_hash, result = %format!("{:?}", result), "Transaction applied");
     } else {
-        tracing::warn!(target: "tx", tx_type = %format!("{:?}", txn_type), hash = %tx_hash, result = %format!("{:?}", result), "Transaction rejected");
+        tracing::debug!(target: "tx", tx_type = %format!("{:?}", txn_type), hash = %tx_hash, result = %format!("{:?}", result), "Transaction not applied");
     }
 
     // Comprehensive per-tx debug log — logs every tx with key fields and result.

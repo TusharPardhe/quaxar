@@ -501,6 +501,18 @@ impl crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource for SharedApp
     fn has_open_transactions(&self) -> bool {
         self.current().tx_count() > 0
     }
+
+    fn accept_consensus_ledger(
+        &self,
+        next_seq: u32,
+        base_fee: u64,
+        parent_hash: &basics::base_uint::Uint256,
+    ) {
+        self.modify(|view| {
+            *view = AppOpenLedgerView::with_parent_hash(next_seq, base_fee, *parent_hash);
+            true
+        });
+    }
 }
 
 impl std::fmt::Debug for SharedAppOpenLedger {

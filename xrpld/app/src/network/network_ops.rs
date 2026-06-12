@@ -168,6 +168,7 @@ impl StateAccounting {
 #[derive(Debug)]
 pub struct SharedNetworkOpsState {
     operating_mode: AtomicU8,
+    consensus_mode: AtomicU8,
     need_network_ledger: AtomicBool,
     amendment_blocked: AtomicBool,
     unl_blocked: AtomicBool,
@@ -184,11 +185,20 @@ impl SharedNetworkOpsState {
     pub fn new(operating_mode: NetworkOpsOperatingMode) -> Self {
         Self {
             operating_mode: AtomicU8::new(encode_operating_mode(operating_mode)),
+            consensus_mode: AtomicU8::new(0),
             need_network_ledger: AtomicBool::new(false),
             amendment_blocked: AtomicBool::new(false),
             unl_blocked: AtomicBool::new(false),
             state_accounting: Mutex::new(StateAccounting::new(operating_mode)),
         }
+    }
+
+    pub fn consensus_mode(&self) -> u8 {
+        self.consensus_mode.load(Ordering::Acquire)
+    }
+
+    pub fn set_consensus_mode(&self, mode: u8) {
+        self.consensus_mode.store(mode, Ordering::Release);
     }
 
     pub fn set_operating_mode(&self, operating_mode: NetworkOpsOperatingMode) {
@@ -311,6 +321,10 @@ impl AppNetworkOpsModeOwner {
 
     pub fn is_blocked(&self) -> bool {
         self.state.is_blocked()
+    }
+
+    pub fn set_consensus_mode(&self, mode: u8) {
+        self.state.set_consensus_mode(mode);
     }
 
     pub fn need_network_ledger(&self) -> bool {

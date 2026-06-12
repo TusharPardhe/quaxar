@@ -1756,6 +1756,10 @@ impl OverlayImpl {
         self.queued_inbound.take_get_ledgers()
     }
 
+    pub fn take_get_objects(&self) -> Vec<crate::PeerMessage<crate::TmGetObjectByHash>> {
+        self.queued_inbound.take_get_objects()
+    }
+
     pub fn relay_proposal(
         &self,
         message: TmProposeSet,
@@ -1816,6 +1820,7 @@ impl OverlayImpl {
             return;
         }
 
+        tracing::info!(target: "overlay", %hash, "relay_transaction: sending tx to peers");
         let message = Message::new(
             ProtocolMessage::new(ProtocolPayload::Transaction(
                 transaction.expect("transaction present"),

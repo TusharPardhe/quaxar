@@ -20,7 +20,11 @@ pub fn proposal_unique_id(
 }
 
 pub fn rcl_txset_id(tx_ids: &[Uint256]) -> Uint256 {
-    let mut serializer = Serializer::new(64 * tx_ids.len().max(1));
+    // Empty tx set uses zero hash (matching rippled's empty SHAMap::getHash())
+    if tx_ids.is_empty() {
+        return Uint256::zero();
+    }
+    let mut serializer = Serializer::new(64 * tx_ids.len());
     for tx_id in tx_ids {
         serializer.add_bit_string(*tx_id);
     }

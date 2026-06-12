@@ -22,6 +22,12 @@ COPY xrpld/consensus/Cargo.toml xrpld/consensus/Cargo.toml
 COPY xrpld/ledger/Cargo.toml xrpld/ledger/Cargo.toml
 COPY xrpld/main/Cargo.toml xrpld/main/Cargo.toml
 COPY xrpld/overlay/Cargo.toml xrpld/overlay/Cargo.toml
+COPY xrpld/metrics/Cargo.toml xrpld/metrics/Cargo.toml
+COPY xrpld/rpc/Cargo.toml xrpld/rpc/Cargo.toml
+COPY xrpld/tx/Cargo.toml xrpld/tx/Cargo.toml
+
+# Copy proto files needed for build.rs
+COPY xrpl/protocol/proto xrpl/protocol/proto
 
 # Create dummy lib.rs files so cargo can resolve the workspace
 RUN find . -name "Cargo.toml" -path "*/xrpl/*" -exec sh -c 'mkdir -p $(dirname {})/src && touch $(dirname {})/src/lib.rs' \; && \
@@ -40,23 +46,24 @@ COPY . .
 # Touch all lib.rs/main.rs to ensure they rebuild (not the dummy ones)
 RUN find . -name "*.rs" -path "*/src/*" -newer Cargo.lock -exec touch {} +
 
-RUN cargo build --release -p xrpld-main && \
+# Build with max parallelism
+RUN cargo build --release -p xrpld-main -j $(nproc) && \
     strip target/release/quaxar
 
-# Stage 3: Runtime
+# Stage 3: Runtime (minimal)
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /bin/false xrpld \
-    && mkdir -p /var/lib/xrpld /etc/xrpld \
-    && chown xrpld:xrpld /var/lib/xrpld
+    && mkdir -p /var/lib/rippled/db /etc/xrpld \
+    && chown -R xrpld:xrpld /var/lib/rippled /etc/xrpld
 
 COPY --from=builder /src/target/release/quaxar /usr/local/bin/quaxar
 
 USER xrpld
-WORKDIR /var/lib/xrpld
+WORKDIR /var/lib/rippled
 
 EXPOSE 5005 6006 51235
 

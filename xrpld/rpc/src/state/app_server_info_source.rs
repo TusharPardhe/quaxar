@@ -550,6 +550,12 @@ impl AppServerInfoView for OwnedApplicationServerInfo {
     }
 
     fn network_ops_operating_mode_string(&self) -> &'static str {
+        // Match rippled: Full + active validator = "proposing"
+        if self.network_ops_state.operating_mode()
+            == app::network::network_ops::NetworkOpsOperatingMode::Full
+        {
+            return "proposing";
+        }
         self.network_ops_state.str_operating_mode()
     }
 
