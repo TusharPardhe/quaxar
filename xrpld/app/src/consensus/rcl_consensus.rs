@@ -1596,7 +1596,9 @@ where
         };
 
         if preferred != *prev_ledger_id {
-            if mode != ConsensusMode::WrongLedger {
+            if mode != ConsensusMode::WrongLedger
+                && mode != ConsensusMode::SwitchedLedger
+            {
                 self.message_sink.consensus_view_change();
             }
             self.journal
