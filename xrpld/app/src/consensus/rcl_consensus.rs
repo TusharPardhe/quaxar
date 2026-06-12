@@ -119,8 +119,6 @@ pub trait RclConsensusLedgerSource: Send + Sync + 'static {
     fn have_validated(&self) -> bool;
     fn request_consensus_ledger(&self, _hash: &Uint256) {}
     fn set_closed_ledger(&self, _ledger: &Arc<Ledger>) {}
-    fn get_closed_seq(&self) -> u32 { 0 }
-    fn find_ledger_ahead_of(&self, _seq: u32) -> Option<Arc<Ledger>> { None }
 }
 
 impl RclConsensusLedgerSource
@@ -141,24 +139,6 @@ impl RclConsensusLedgerSource
 
     fn set_closed_ledger(&self, ledger: &Arc<Ledger>) {
         self.ledger_master().set_closed_ledger(Arc::clone(ledger));
-    }
-
-    fn get_closed_seq(&self) -> u32 {
-        self.ledger_master().closed_ledger()
-            .map(|l| l.header().seq)
-            .unwrap_or(0)
-    }
-
-    fn find_ledger_ahead_of(&self, seq: u32) -> Option<Arc<Ledger>> {
-        // Search LedgerHistory cache for any ledger ahead of the given seq
-        let lm = self.ledger_master();
-        let lh = lm.ledger_history();
-        for check_seq in (seq + 1)..=(seq + 100) {
-            if let Some(l) = lh.get_cached_ledger_by_seq(check_seq) {
-                return Some(l);
-            }
-        }
-        None
     }
 }
 
@@ -1459,19 +1439,7 @@ where
     }
 
     fn acquire_ledger(&mut self, ledger_id: &Uint256) -> Option<RclCxLedger> {
-        // Try exact hash first (normal path)
-        let ledger = self.ledgers.acquire_consensus_ledger(ledger_id);
-
-        // If exact hash not found, check if we have ANY ledger ahead of our
-        // current closed (from InboundLedger completions stored in LedgerHistory).
-        // This handles the case where we acquired a ledger but peers have since
-        // moved past it — we should still switch to what we have.
-        let ledger = ledger.or_else(|| {
-            let our_seq = self.ledgers.get_closed_seq();
-            self.ledgers.find_ledger_ahead_of(our_seq)
-        });
-
-        let Some(ledger) = ledger else {
+        let Some(ledger) = self.ledgers.acquire_consensus_ledger(ledger_id) else {
             let mut acquiring = self
                 .acquiring_ledger
                 .lock()
