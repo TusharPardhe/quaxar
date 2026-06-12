@@ -1221,7 +1221,7 @@ fn serve_get_ledger_requests(
         };
 
         // Serialize header and send TmLedgerData response.
-        let header_data = protocol::serialize_ledger_header(&ledger.header(), false);
+        let header_data = protocol::serialize_prefixed_ledger_header(&ledger.header(), true);
         let response = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(
             overlay::TmLedgerData {
                 ledger_hash: hash.data().to_vec(),
