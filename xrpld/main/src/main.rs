@@ -2531,7 +2531,7 @@ impl InboundLedgers {
 
     /// Returns Some(ledger) if already complete, None if in-progress or newly started.
     fn acquire(&mut self, hash: Uint256, seq: u32, validated: u32) -> Option<&ledger::Ledger> {
-        if hash.is_zero() || seq <= 1 {
+        if hash.is_zero() {
             full_sync_debug!(
                 "[full_debug][acq_request] reject seq={} hash={} reason=zero_or_genesis validated={}",
                 seq,
@@ -4713,12 +4713,9 @@ impl<D> BoundServerRuntime<D> {
                             }
                             if let Some(wanted) = best_hash {
                                 if !inbound_ledgers.contains(&wanted) {
-                                    let seq_hint = our_seq.saturating_add(1).max(2);
-                                    tracing::info!(target: "consensus",
-                                        hash = %wanted, seq_hint,
-                                        "Triggering InboundLedger for peer majority hash"
-                                    );
-                                    inbound_ledgers.acquire(wanted, seq_hint, 0);
+                                    // seq=0 means "unknown seq" - matching rippled's
+                                    // acquireAsync(hash, 0, CONSENSUS)
+                                    inbound_ledgers.acquire(wanted, 0, 0);
                                     inbound_ledgers.send_peers(&peers);
                                 }
                             }
