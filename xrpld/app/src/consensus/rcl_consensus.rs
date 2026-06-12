@@ -1551,9 +1551,13 @@ where
                 if !peers.is_empty() {
                     let mut counts: std::collections::HashMap<Uint256, usize> =
                         std::collections::HashMap::new();
-                    // Count ourselves if we're TRACKING or higher
+                    // Count ourselves only if operating mode >= TRACKING
+                    // (matching rippled's checkLastClosedLedger: mode_ >= TRACKING)
                     counts.insert(*prev_ledger_id, 0);
-                    if mode != ConsensusMode::WrongLedger {
+                    let op_mode = self.mode_source.operating_mode();
+                    if op_mode == crate::network::network_ops::NetworkOpsOperatingMode::Tracking
+                        || op_mode == crate::network::network_ops::NetworkOpsOperatingMode::Full
+                    {
                         *counts.entry(*prev_ledger_id).or_default() += 1;
                     }
                     for p in peers.iter() {
@@ -1562,12 +1566,25 @@ where
                             *counts.entry(h).or_default() += 1;
                         }
                     }
-                    // Pick the hash with the most votes
-                    counts
-                        .into_iter()
-                        .max_by_key(|(_, count)| *count)
-                        .map(|(hash, _)| hash)
-                        .unwrap_or(preferred)
+                    // Pick the hash with the most votes.
+                    // In a tie, prefer a hash that differs from ours
+                    // (matching rippled's getPreferredLCL tiebreaker).
+                    let max_count = counts.values().copied().max().unwrap_or(0);
+                    let candidates: Vec<Uint256> = counts
+                        .iter()
+                        .filter(|(_, c)| **c == max_count)
+                        .map(|(h, _)| *h)
+                        .collect();
+                    if candidates.len() == 1 {
+                        candidates[0]
+                    } else {
+                        // Prefer any candidate that isn't our current ledger
+                        candidates
+                            .iter()
+                            .find(|h| **h != *prev_ledger_id)
+                            .copied()
+                            .unwrap_or(preferred)
+                    }
                 } else {
                     preferred
                 }
@@ -1626,12 +1643,27 @@ where
         let built_ledger = self.do_accept(result, prev_ledger, seq);
 
         // === Emit our own validation for the built ledger (reference NetworkOPs::endConsensus) ===
-        // Only emit when validating AND in Proposing mode (matching rippled
-        // which only validates when proposing on the correct ledger).
+        // Only emit when validating AND in Proposing mode AND peers agree on
+        // our ledger (matching rippled which only validates when on the
+        // network's consensus ledger).
         let current_mode = decode_consensus_mode(self.mode.load(Ordering::Acquire));
+        let peers_agree = if let Some(overlay) = &self.overlay {
+            use overlay::Overlay;
+            let built_hash = built_ledger.as_ref().map(|l| *l.header().hash.as_uint256());
+            let prev_hash = *prev_ledger.id.data();
+            let peers = overlay.active_peers();
+            // At least one peer must be on the SAME prev_ledger (same round)
+            peers.iter().any(|p| {
+                let h = p.closed_ledger_hash();
+                h == Uint256::from_array(prev_hash)
+            })
+        } else {
+            false
+        };
         if let Some(built) = &built_ledger {
             if self.validating.load(Ordering::Acquire)
                 && current_mode == ConsensusMode::Proposing
+                && peers_agree
             {
                 if let Some(keys) = self.validator_keys.keys.as_ref() {
                     let now = (std::time::SystemTime::now()
