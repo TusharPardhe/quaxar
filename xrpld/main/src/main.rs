@@ -4696,42 +4696,30 @@ impl<D> BoundServerRuntime<D> {
                         }
                     }
 
-                    // Trigger InboundLedger for consensus-requested ledgers.
-                    // Use the CURRENT peer majority hash (freshest from StatusChange)
-                    // rather than pending_consensus_ledger (which may be stale).
+                    // Trigger parallel InboundLedger acquisitions for ALL unique
+                    // peer hashes we don't have (matching rippled which manages
+                    // many concurrent InboundLedgers). This enables catching up
+                    // at the rate peers advance rather than one-at-a-time.
                     if let Some(lm_rt) = app.ledger_master_runtime() {
                         if let Some(overlay_rt) = app.overlay_runtime() {
                             use overlay::Overlay as _;
                             let our_hash = lm_rt.ledger_master().closed_ledger()
                                 .map(|l| *l.header().hash.as_uint256())
                                 .unwrap_or_default();
-                            let our_seq = lm_rt.ledger_master().closed_ledger()
-                                .map(|l| l.header().seq)
-                                .unwrap_or(1);
-                            // Find the peer majority hash that differs from ours
                             let peers = overlay_rt.overlay().active_peers();
-                            let mut best_hash = None;
-                            let mut best_count = 0usize;
-                            let mut counts: std::collections::HashMap<basics::base_uint::Uint256, usize> =
-                                std::collections::HashMap::new();
+                            // Acquire ALL unique peer hashes we don't already have
+                            let mut triggered = 0usize;
                             for p in peers.iter() {
                                 let h = p.closed_ledger_hash();
-                                if !h.is_zero() && h != our_hash {
-                                    let c = counts.entry(h).or_default();
-                                    *c += 1;
-                                    if *c > best_count {
-                                        best_count = *c;
-                                        best_hash = Some(h);
-                                    }
+                                if !h.is_zero() && h != our_hash
+                                    && !inbound_ledgers.contains(&h)
+                                {
+                                    inbound_ledgers.acquire(h, 0, 0);
+                                    triggered += 1;
                                 }
                             }
-                            if let Some(wanted) = best_hash {
-                                if !inbound_ledgers.contains(&wanted) {
-                                    // seq=0 means "unknown seq" - matching rippled's
-                                    // acquireAsync(hash, 0, CONSENSUS)
-                                    inbound_ledgers.acquire(wanted, 0, 0);
-                                    inbound_ledgers.send_peers(&peers);
-                                }
+                            if triggered > 0 {
+                                inbound_ledgers.send_peers(&peers);
                             }
                         }
                     }
