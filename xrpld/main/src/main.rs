@@ -4682,6 +4682,20 @@ impl<D> BoundServerRuntime<D> {
                         }
                     }
 
+                    // Trigger InboundLedger for consensus-requested ledgers
+                    // (from handle_wrong_ledger → request_consensus_ledger).
+                    if let Some(lm_rt) = app.ledger_master_runtime() {
+                        if let Some(wanted) = lm_rt.pending_consensus_ledger() {
+                            if !inbound_ledgers.contains(&wanted) {
+                                // Use closed_seq + 1 as seq hint (must be > 1)
+                                let seq_hint = lm_rt.ledger_master().closed_ledger()
+                                    .map(|l| l.header().seq.saturating_add(1).max(2))
+                                    .unwrap_or(2);
+                                inbound_ledgers.acquire(wanted, seq_hint, 0);
+                            }
+                        }
+                    }
+
                     if target_seq > 1 {
                         // --- Persistent tick-based acquisition (reference InboundLedger parity) ---
                         // Maintain persistent InboundLedgerLocal owners that
