@@ -762,6 +762,9 @@ where
     validating: AtomicBool,
     consensus_cookie: u64,
     acquiring_ledger: Mutex<Option<Uint256>>,
+    /// Cached preferred ledger from get_prev_ledger (matching rippled's
+    /// round-based detection cadence: only refresh every 3s).
+    cached_preferred: Mutex<Option<(Uint256, std::time::Instant)>>,
     prev_proposers: AtomicUsize,
     prev_round_time_millis: AtomicU64,
     mode: AtomicU8,
@@ -883,6 +886,7 @@ where
             validating: AtomicBool::new(false),
             consensus_cookie,
             acquiring_ledger: Mutex::new(None),
+            cached_preferred: Mutex::new(None),
             prev_proposers: AtomicUsize::new(0),
             prev_round_time_millis: AtomicU64::new(0),
             mode: AtomicU8::new(encode_consensus_mode(ConsensusMode::Observing)),
@@ -1463,10 +1467,11 @@ where
             .lock()
             .expect("acquiring ledger mutex must not be poisoned") = None;
 
-        // switchLastClosedLedger equivalent: update LedgerMaster's closed
-        // ledger to the acquired one so the rest of the system knows we
-        // switched. In rippled: m_ledgerMaster.switchLCL(newLCL).
-        self.ledgers.set_closed_ledger(&ledger);
+        // switchLastClosedLedger: only switch forward (never back to genesis)
+        // to prevent backwards switching from stale preferred hashes.
+        if ledger.header().seq > 1 {
+            self.ledgers.set_closed_ledger(&ledger);
+        }
 
         self.inbound_transactions
             .lock()
@@ -1531,6 +1536,23 @@ where
         prev_ledger: &RclCxLedger,
         mode: ConsensusMode,
     ) -> Uint256 {
+        // Match rippled's round-based detection: once a preferred ledger is
+        // identified, keep returning it until acquire_ledger succeeds (switch
+        // happens and prev_ledger_id changes to match). Max 20s (InboundLedger
+        // timeout) before refreshing to avoid permanent stall.
+        {
+            let cache = self.cached_preferred.lock().expect("cached_preferred");
+            if let Some((cached_hash, cached_at)) = cache.as_ref() {
+                if *cached_hash != *prev_ledger_id
+                    && cached_at.elapsed() < std::time::Duration::from_secs(20)
+                {
+                    // Still acquiring this hash — keep returning it
+                    return *cached_hash;
+                }
+                // Either we're on this ledger (switch succeeded) or TTL expired
+            }
+        }
+
         let Some(ledger) = self.lookup_ledger(&prev_ledger.id) else {
             return *prev_ledger_id;
         };
@@ -1596,6 +1618,9 @@ where
         };
 
         if preferred != *prev_ledger_id {
+            // Update cache with the new preferred hash
+            *self.cached_preferred.lock().expect("cached_preferred") =
+                Some((preferred, std::time::Instant::now()));
             if mode != ConsensusMode::WrongLedger
                 && mode != ConsensusMode::SwitchedLedger
             {
@@ -1603,6 +1628,9 @@ where
             }
             self.journal
                 .debug(&self.validations.get_json_trie().to_string());
+        } else {
+            // Clear cache when we're on the correct ledger
+            *self.cached_preferred.lock().expect("cached_preferred") = None;
         }
 
         preferred
