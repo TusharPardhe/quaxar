@@ -19,7 +19,6 @@ members = [
     "xrpld/tx",
     "xrpld/cli",
     "xrpld/main",
-    "xrpld/replay-test",
     "xrpld/metrics",
 ]
 resolver = "2"

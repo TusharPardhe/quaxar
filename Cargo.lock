@@ -4030,10 +4030,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "xrpld-replay-test"
-version = "0.1.0"
-
-[[package]]
 name = "xrpld_core"
 version = "0.1.0"
 dependencies = [
