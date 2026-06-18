@@ -1357,7 +1357,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             }
 
             // Gap-fill: only request fetch packs when we're actually BEHIND
-            // the network. Don't request when our closed ledger matches peers.
+            // the network by more than a few ledgers. Don't spam peers.
             if advanced == 0 {
                 use overlay::Overlay;
                 let our_closed_hash = lm.closed_ledger()
@@ -1365,6 +1365,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                     .unwrap_or(basics::base_uint::Uint256::zero());
                 let peers = overlay_rt.overlay().active_peers();
                 let in_sync = peers.iter().any(|p| p.closed_ledger_hash() == our_closed_hash);
+                // Only request when out of sync, throttled to once per 30 seconds
                 if !in_sync && !peers.is_empty() {
                     static LAST_GAP_FILL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                     let now_ms = std::time::SystemTime::now()
@@ -1372,7 +1373,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                         .unwrap_or_default()
                         .as_millis() as u64;
                     let last = LAST_GAP_FILL.load(std::sync::atomic::Ordering::Relaxed);
-                    if now_ms.saturating_sub(last) >= 3000 {
+                    if now_ms.saturating_sub(last) >= 30_000 {
                         LAST_GAP_FILL.store(now_ms, std::sync::atomic::Ordering::Relaxed);
                         for p in &peers {
                             let peer_hash = p.closed_ledger_hash();
