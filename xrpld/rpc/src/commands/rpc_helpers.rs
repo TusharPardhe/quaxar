@@ -103,6 +103,13 @@ pub fn transaction_sign<Runtime: RpcRuntime, Source>(
         )
     })?;
     let mut st_tx = parse_sttx_from_json_value(&tx_json)?;
+    // Match rippled's autofill: always set tfFullyCanonicalSig
+    st_tx.set_flag(0x8000_0000);
+    // Auto-fill NetworkID for private networks (ID > 1024)
+    let app_network_id = ctx.runtime.app().map(|app| app.network_id()).unwrap_or(0);
+    if app_network_id > 1024 && !st_tx.is_field_present(get_field_by_symbol("sfNetworkID")) {
+        st_tx.set_field_u32(get_field_by_symbol("sfNetworkID"), app_network_id);
+    }
     let (public_key, secret_key) = keypair_for_signature(params)?;
     let signature_target = parse_signature_target(params)?;
     signer_target_object(&mut st_tx, signature_target).set_field_vl(
@@ -160,6 +167,13 @@ pub fn transaction_sign_for<Runtime: RpcRuntime, Source>(
         ));
     };
     let app_network_id = ctx.runtime.app().map(|app| app.network_id()).unwrap_or(0);
+    // Auto-fill NetworkID for private networks (ID > 1024), matching rippled's autofill
+    if app_network_id > 1024 && !tx_object.contains_key(jss::NetworkID) {
+        tx_object.insert(
+            jss::NetworkID.to_owned(),
+            JsonValue::Unsigned(u64::from(app_network_id)),
+        );
+    }
     check_transaction_sign_for_network_id(tx_object, app_network_id)?;
 
     tx_object

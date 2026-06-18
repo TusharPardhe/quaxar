@@ -722,6 +722,12 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         &mut self,
         message: &crate::message::TmProposeSet,
     ) -> crate::router::RouteAction {
+        tracing::info!(target: "overlay",
+            sig_len = message.signature.len(),
+            key_len = message.node_pub_key.len(),
+            tx_hash_len = message.current_tx_hash.len(),
+            prev_ledger_len = message.previousledger.len(),
+        );
         if !(64..=72).contains(&message.signature.len()) {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid proposal signature length");
             return crate::router::RouteAction::Continue;
@@ -1742,6 +1748,18 @@ impl OverlayImpl {
         self.queued_inbound.take_proposals()
     }
 
+    pub fn take_ledger_data(&self) -> Vec<crate::PeerMessage<crate::TmLedgerData>> {
+        self.queued_inbound.take_ledger_data()
+    }
+
+    pub fn take_get_ledgers(&self) -> Vec<crate::PeerMessage<crate::TmGetLedger>> {
+        self.queued_inbound.take_get_ledgers()
+    }
+
+    pub fn take_get_objects(&self) -> Vec<crate::PeerMessage<crate::TmGetObjectByHash>> {
+        self.queued_inbound.take_get_objects()
+    }
+
     pub fn relay_proposal(
         &self,
         message: TmProposeSet,
@@ -1802,6 +1820,7 @@ impl OverlayImpl {
             return;
         }
 
+        tracing::debug!(target: "overlay", %hash, "relay_transaction: sending tx to peers");
         let message = Message::new(
             ProtocolMessage::new(ProtocolPayload::Transaction(
                 transaction.expect("transaction present"),

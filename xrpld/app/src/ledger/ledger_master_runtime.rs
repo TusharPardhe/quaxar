@@ -19,13 +19,19 @@ use basics::tagged_cache::MonotonicClock;
 use ledger::{CanonicalTXSet, Ledger, LedgerMaster, LedgerMasterConfig, NullLedgerJournal};
 use protocol::STTx;
 use shamap::traversal::TraversalError;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub type AppLedgerMaster = LedgerMaster<MonotonicClock, HardenedHashBuilder>;
 
 #[derive(Debug, Clone)]
 pub struct AppLedgerMasterRuntime {
     ledger_master: Arc<AppLedgerMaster>,
+    /// Hash of the consensus ledger being requested from peers.
+    /// Set by `request_consensus_ledger`; consumed by the bootstrap event loop.
+    pub(crate) pending_consensus_ledger: Arc<Mutex<Option<Uint256>>>,
+    /// Receiver for completed InboundLedger results.
+    /// Polled by the bootstrap thread (50ms) for immediate storeLedger.
+    pub(crate) completed_ledgers_rx: Arc<Mutex<Option<std::sync::mpsc::Receiver<Arc<ledger::Ledger>>>>>,
 }
 
 const APP_LEDGER_MASTER_MAX_PUBLISH_GAP: u32 = 100;
@@ -66,11 +72,32 @@ impl AppLedgerMasterRuntime {
     }
 
     pub fn with_ledger_master(ledger_master: Arc<AppLedgerMaster>) -> Self {
-        Self { ledger_master }
+        Self {
+            ledger_master,
+            pending_consensus_ledger: Arc::new(Mutex::new(None)),
+            completed_ledgers_rx: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn ledger_master(&self) -> Arc<AppLedgerMaster> {
         Arc::clone(&self.ledger_master)
+    }
+
+    /// Returns the hash of the consensus ledger currently being requested,
+    /// if any. The bootstrap event loop polls this to drive acquisition.
+    pub fn take_pending_consensus_ledger(&self) -> Option<Uint256> {
+        self.pending_consensus_ledger
+            .lock()
+            .expect("pending_consensus_ledger mutex must not be poisoned")
+            .take()
+    }
+
+    /// Returns the hash without consuming it (for polling without clearing).
+    pub fn pending_consensus_ledger(&self) -> Option<Uint256> {
+        *self
+            .pending_consensus_ledger
+            .lock()
+            .expect("pending_consensus_ledger mutex must not be poisoned")
     }
 
     pub fn update_local_tx(&self, view: &Ledger) -> Result<(), TraversalError> {

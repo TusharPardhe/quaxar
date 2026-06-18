@@ -358,7 +358,7 @@ pub use rules::{
     make_rules_given_current, make_rules_given_ledger, set_current_transaction_rules,
 };
 pub use secret_key::{
-    SECRET_KEY_LENGTH, SecretKey, SecretKeyError, derive_public_key, generate_secret_key,
+    SECRET_KEY_LENGTH, SecretKey, SecretKeyError, derive_public_key, generate_secret_key, generate_root_secret_key,
 };
 pub use seed::{
     Seed, generate_seed, parse_base58_seed, parse_generic_seed, random_seed, seed_as_1751,

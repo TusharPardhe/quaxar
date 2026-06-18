@@ -150,7 +150,11 @@ impl QueuedOverlayInboundHandler {
 
     pub fn take_snapshot(&self) -> OverlayInboundSnapshot {
         let mut guard = self.inner.lock().expect("overlay inbound lock");
-        std::mem::take(&mut *guard)
+        // Take everything EXCEPT get_objects (handled by bootstrap loop separately)
+        let get_objects = std::mem::take(&mut guard.get_objects);
+        let snapshot = std::mem::take(&mut *guard);
+        guard.get_objects = get_objects;
+        snapshot
     }
 
     pub fn clear(&self) {
@@ -194,6 +198,17 @@ impl QueuedOverlayInboundHandler {
             .extend(validations);
     }
 
+    pub fn requeue_proposals(&self, proposals: Vec<QueuedProposal>) {
+        if proposals.is_empty() {
+            return;
+        }
+        self.inner
+            .lock()
+            .expect("overlay inbound lock")
+            .proposals
+            .extend(proposals);
+    }
+
     /// Drain only validations from the queue, leaving all other messages.
     pub fn take_validations(&self) -> Vec<QueuedValidation> {
         std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").validations)
@@ -211,6 +226,20 @@ impl QueuedOverlayInboundHandler {
 
     pub fn take_proposals(&self) -> Vec<QueuedProposal> {
         std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").proposals)
+    }
+
+    /// Drain only ledger_data from the queue, leaving all other messages.
+    pub fn take_ledger_data(&self) -> Vec<PeerMessage<TmLedgerData>> {
+        std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").ledger_data)
+    }
+
+    /// Drain only get_ledger requests from the queue, leaving all other messages.
+    pub fn take_get_ledgers(&self) -> Vec<PeerMessage<TmGetLedger>> {
+        std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").get_ledgers)
+    }
+
+    pub fn take_get_objects(&self) -> Vec<PeerMessage<TmGetObjectByHash>> {
+        std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").get_objects)
     }
 }
 

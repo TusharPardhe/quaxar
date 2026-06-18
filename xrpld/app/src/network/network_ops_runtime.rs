@@ -233,6 +233,16 @@ impl AppNetworkOpsRuntime {
         self.snapshot().pending_transactions
     }
 
+    /// Clear all pending transactions (called after consensus to prevent
+    /// re-applying already-validated txs to the new open ledger).
+    pub fn clear_pending_transactions(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("network ops runtime state mutex must not be poisoned");
+        state.pending_transactions_mut().clear();
+    }
+
     pub fn submit_held_count(&self) -> usize {
         self.snapshot().submit_held
     }
@@ -337,7 +347,21 @@ impl AppNetworkOpsRuntime {
             .build()
             .expect("network ops consensus timer runtime");
         rt.block_on(async {
-            runtime.timer_tick(now).await;
+            runtime.timer_tick(now, true).await;
+        });
+    }
+
+    /// Drain pending proposals without running timer_entry.
+    /// Called on every 50ms bootstrap iteration for low-latency proposal feeding.
+    pub fn drain_proposals(&self, consensus_runtime: &AppConsensusRuntime) {
+        let now = current_net_time();
+        let runtime = consensus_runtime.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("network ops drain proposals runtime");
+        rt.block_on(async {
+            runtime.timer_tick(now, false).await;
         });
     }
 

@@ -336,6 +336,7 @@ pub fn encode_amendments_entry(amendments: &[Uint256]) -> Vec<u8> {
 pub fn encode_ledger_hashes_entry(entry: &DecodedLedgerHashesEntry) -> Vec<u8> {
     let mut bytes = Vec::new();
     append_u16_field(&mut bytes, SF_LEDGER_ENTRY_TYPE, LT_LEDGER_HASHES);
+    append_u32_field(&mut bytes, SF_FLAGS, 0);
     if let Some(last_ledger_sequence) = entry.last_ledger_sequence {
         append_u32_field(&mut bytes, SF_LAST_LEDGER_SEQUENCE, last_ledger_sequence);
     }
@@ -347,6 +348,7 @@ pub fn encode_ledger_hashes_entry(entry: &DecodedLedgerHashesEntry) -> Vec<u8> {
 pub fn encode_negative_unl_entry(entry: &DecodedNegativeUnlEntry) -> Vec<u8> {
     let mut bytes = Vec::new();
     append_u16_field(&mut bytes, SF_LEDGER_ENTRY_TYPE, LT_NEGATIVE_UNL);
+    append_u32_field(&mut bytes, SF_FLAGS, 0);
 
     if !entry.disabled_validators.is_empty() {
         append_field_id(&mut bytes, STI_ARRAY, SF_DISABLED_VALIDATORS);
@@ -387,6 +389,7 @@ pub fn encode_constructor_amendments_entry(entry: &ConstructorAmendmentsEntry) -
 pub fn encode_constructor_fee_settings_entry(entry: ConstructorFeeSettingsEntry) -> Vec<u8> {
     let mut bytes = Vec::new();
     append_u16_field(&mut bytes, SF_LEDGER_ENTRY_TYPE, LT_FEE_SETTINGS);
+    append_u32_field(&mut bytes, SF_FLAGS, 0);
 
     match entry {
         ConstructorFeeSettingsEntry::Legacy {

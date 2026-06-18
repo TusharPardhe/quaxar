@@ -76,8 +76,51 @@ pub fn derive_public_key(
 pub fn generate_secret_key(key_type: KeyType, seed: &Seed) -> Result<SecretKey, SecretKeyError> {
     match key_type {
         KeyType::Ed25519 => SecretKey::from_slice(sha512_half_secure(seed.as_slice()).data()),
+        KeyType::Secp256k1 => derive_deterministic_account_key(seed),
+    }
+}
+
+/// Generate a ROOT secret key (no account tweak). Used for VALIDATOR keys
+/// where rippled uses the root key directly (matching rippled's validator identity).
+pub fn generate_root_secret_key(key_type: KeyType, seed: &Seed) -> Result<SecretKey, SecretKeyError> {
+    match key_type {
+        KeyType::Ed25519 => SecretKey::from_slice(sha512_half_secure(seed.as_slice()).data()),
         KeyType::Secp256k1 => derive_deterministic_root_key(seed),
     }
+}
+
+fn derive_deterministic_account_key(seed: &Seed) -> Result<SecretKey, SecretKeyError> {
+    let root = derive_deterministic_root_key(seed)?;
+    // Derive account keypair: root → generator → account (matching rippled's
+    // generateKeyPair which calls deriveKeypair → root + tweak(generator, 0))
+    let root_sk = secp256k1::SecretKey::from_byte_array(*root.as_bytes())
+        .map_err(|_| SecretKeyError::KeyGenerationFailed)?;
+    let secp = secp256k1::Secp256k1::new();
+    let generator = secp256k1::PublicKey::from_secret_key(&secp, &root_sk).serialize();
+    let tweak = calculate_account_tweak(generator, 0)
+        .ok_or(SecretKeyError::KeyGenerationFailed)?;
+    let scalar = secp256k1::scalar::Scalar::from_be_bytes(tweak)
+        .map_err(|_| SecretKeyError::KeyGenerationFailed)?;
+    let account_sk = root_sk.add_tweak(&scalar)
+        .map_err(|_| SecretKeyError::KeyGenerationFailed)?;
+    SecretKey::from_slice(&account_sk.secret_bytes())
+}
+
+fn calculate_account_tweak(generator: [u8; 33], ordinal: u32) -> Option<[u8; 32]> {
+    let mut buffer = [0u8; 41];
+    buffer[..33].copy_from_slice(&generator);
+    buffer[33..37].copy_from_slice(&ordinal.to_be_bytes());
+
+    for subseq in 0u32..128 {
+        buffer[37..41].copy_from_slice(&subseq.to_be_bytes());
+        let candidate = sha512_half_secure(&buffer);
+        if *candidate.data() != [0u8; 32]
+            && secp256k1::SecretKey::from_byte_array(*candidate.data()).is_ok()
+        {
+            return Some(*candidate.data());
+        }
+    }
+    None
 }
 
 fn derive_deterministic_root_key(seed: &Seed) -> Result<SecretKey, SecretKeyError> {
@@ -113,19 +156,15 @@ mod tests {
         let public =
             derive_public_key(KeyType::Secp256k1, &secret).expect("public key should derive");
 
-        assert_eq!(
-            public.to_node_public_base58(),
-            "n94a1u4jAz288pZLtw6yFWVbi89YamiC6JBXPVUj5zmExe5fTVg9"
-        );
-        assert_eq!(
-            secret.to_hex(),
-            parse_base58_with_type::<crate::SecretKey>(
-                TokenType::NodePrivate,
-                "pnen77YEeUd4fFKG7iycBWcwKpTaeFRkW2WFostaATy1DSupwXe"
-            )
-            .expect("node private vector should parse")
-            .to_hex()
-        );
+        // Verified against rippled wallet_propose for seed snoPBrXtMeMyMHUVTgbuqAfg1SUTb:
+        // public_key_hex = 0330E7FC9D56BB25D6893BA3F317AE5BCF33B3291BD63DB32654A313222F7FD020
+        // account_id = rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh
+        let expected: [u8; 33] = [
+            0x03, 0x30, 0xE7, 0xFC, 0x9D, 0x56, 0xBB, 0x25, 0xD6, 0x89, 0x3B,
+            0xA3, 0xF3, 0x17, 0xAE, 0x5B, 0xCF, 0x33, 0xB3, 0x29, 0x1B, 0xD6,
+            0x3D, 0xB3, 0x26, 0x54, 0xA3, 0x13, 0x22, 0x2F, 0x7F, 0xD0, 0x20,
+        ];
+        assert_eq!(public.as_bytes(), &expected);
     }
 
     #[test]

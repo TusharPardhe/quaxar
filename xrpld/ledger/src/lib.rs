@@ -1408,7 +1408,7 @@ impl Ledger {
                         let thread = std::thread::current();
                         let thread_name = thread.name().unwrap_or("<unnamed>");
                         let self_ptr = self as *const Self as usize;
-                        tracing::warn!(
+                        tracing::debug!(
                             target: "ledger",
                             "[ledger_read] MISS {:?} seq={} ledger_ptr=0x{:x} thread={:?}({}) key={:02x}{:02x}{:02x}{:02x} backed={} has_fetcher={}",
                             keylet.entry_type,

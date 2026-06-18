@@ -197,6 +197,10 @@ pub struct ApplicationRoot {
     /// Shared node store for ConsensusLedgerAcceptor. Populated by attach_node_store.
     shared_consensus_node_store:
         Arc<std::sync::RwLock<Option<crate::shamap::shamap_store_backend::SHAMapStoreNodeStore>>>,
+    /// Signal from bootstrap/consensus loop to InboundLedger workers that
+    /// the shared fetch-pack cache was populated. Workers should re-check
+    /// local storage immediately (matching rippled gotFetchPack).
+    fetch_pack_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for ApplicationRoot {
@@ -1693,11 +1697,25 @@ impl ApplicationRoot {
             },
             shamap_store_service: None,
             shared_consensus_node_store: Arc::new(std::sync::RwLock::new(None)),
+            fetch_pack_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
     pub fn basic_app(&self) -> &BasicApp {
         &self.basic_app
+    }
+
+    /// Signal that the shared fetch-pack cache was populated.
+    /// InboundLedger workers should re-check local storage.
+    pub fn signal_fetch_pack_ready(&self) {
+        self.fetch_pack_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Check and clear the fetch-pack-ready flag. Returns true if it was set.
+    pub fn take_fetch_pack_ready(&self) -> bool {
+        self.fetch_pack_ready
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     pub fn job_queue(&self) -> &JobQueue {
@@ -1904,6 +1922,10 @@ impl ApplicationRoot {
     pub fn on_consensus_built_ledger(&self, ledger: Arc<Ledger>) {
         let ledger = self.ledger_with_node_fetcher(ledger);
         let _ = self.process_closed_ledger_txq(ledger.as_ref(), false);
+
+        // Sweep local_txs: remove any TX already included in the built ledger
+        // (matching rippled's localTxs_.sweep after consensus).
+        let _ = self.update_local_tx(ledger.as_ref());
 
         let next_open_index = ledger.header().seq.saturating_add(1);
         let next_open_parent_hash = *ledger.header().hash.as_uint256();
@@ -2591,6 +2613,7 @@ impl ApplicationRoot {
             ),
             None,
             Some(self.amendment_status.clone()),
+            self.overlay_runtime().map(|rt| rt.overlay().clone()),
         );
 
         let runner = Box::new(AppConsensus::new(
@@ -2851,7 +2874,7 @@ impl ApplicationRoot {
                     tx_id,
                     Some(overlay::TmTransaction {
                         raw_transaction: raw_bytes,
-                        status: 1, // tsCURRENT
+                        status: 2, // tsCURRENT
                         receive_timestamp: Some(now),
                         deferred: Some(deferred),
                     }),
@@ -3172,12 +3195,22 @@ impl ApplicationRoot {
     }
 
     pub fn network_ops_operating_mode_string(&self) -> &'static str {
+        let op_mode = self.network_ops_state.operating_mode();
+        if op_mode == crate::network::network_ops::NetworkOpsOperatingMode::Full {
+            return "proposing";
+        }
         self.network_ops_state.str_operating_mode()
     }
 
     pub fn set_need_network_ledger(&self, need_network_ledger: bool) {
         self.network_ops_state
             .set_need_network_ledger(need_network_ledger);
+    }
+
+    pub fn set_completed_ledgers_rx(&self, rx: std::sync::mpsc::Receiver<std::sync::Arc<ledger::Ledger>>) {
+        if let Some(lm_rt) = self.ledger_master_runtime() {
+            *lm_rt.completed_ledgers_rx.lock().expect("completed_ledgers_rx") = Some(rx);
+        }
     }
 
     pub fn need_network_ledger(&self) -> bool {

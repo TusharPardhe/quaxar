@@ -53,7 +53,7 @@ impl Default for ConsensusParms {
             min_consensus_pct: 80,
             ledger_idle_interval: Duration::from_secs(15),
             ledger_min_consensus: Duration::from_millis(1950),
-            ledger_max_consensus: Duration::from_secs(15),
+            ledger_max_consensus: Duration::from_secs(2),
             ledger_min_close: Duration::from_secs(2),
             ledger_granularity: Duration::from_secs(1),
             ledger_abandon_consensus_factor: 10,

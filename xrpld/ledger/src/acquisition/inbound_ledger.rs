@@ -1706,7 +1706,7 @@ impl InboundLedgerLocal {
                     journal.trace("Had full AS map locally");
                     self.planner_state.have_state = true;
                 } else if let Some(first_missing) = needed.first() {
-                    journal.warn(&format!(
+                    journal.debug(&format!(
                         "AS map still missing hashes after local fetch needed_count={} first_missing={}",
                         needed.len(),
                         first_missing

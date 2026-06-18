@@ -1327,6 +1327,50 @@ fn advance_published_ledgers_after_validation(
         l.finalize_immutable_no_setup();
     }
     ledger_master.set_valid_ledger_no_sweep(std::sync::Arc::clone(&vl), None, None);
+
+    // tryAdvance burst: promote consecutive ledgers in history that have
+    // sufficient validations (matching rippled LedgerMaster::doAdvance loop).
+    // This allows advancing N+1, N+2, ... N+50 in one tick when history
+    // ledgers arrived before their validations were counted.
+    {
+        let needed = if app.standalone() { 0 } else { app.validators().quorum() };
+        let mut burst_count = 0u32;
+        loop {
+            let next_seq = ledger_master.valid_ledger_seq() + 1;
+            let Some(candidate) = ledger_master.ledger_history().get_cached_ledger_by_seq(next_seq) else {
+                break;
+            };
+            let candidate_hash = *candidate.header().hash.as_uint256();
+            let validations = app.validations().store()
+                .trusted_for_ledger_by_sequence(candidate_hash, next_seq);
+            let val_count = app.validators()
+                .negative_unl_filter_validations(validations).len();
+            if val_count < needed {
+                break;
+            }
+            // Promote to validated
+            let mut next_vl = app.ledger_with_node_fetcher(std::sync::Arc::clone(&candidate));
+            {
+                let l = std::sync::Arc::make_mut(&mut next_vl);
+                l.set_validated();
+                l.set_full();
+                l.finalize_immutable_no_setup();
+            }
+            ledger_master.ledger_history().insert(std::sync::Arc::clone(&next_vl), true);
+            ledger_master.mark_ledger_complete(next_seq);
+            ledger_master.set_valid_ledger_no_sweep(std::sync::Arc::clone(&next_vl), None, None);
+            app.note_validated_ledger_for_sync(std::sync::Arc::clone(&next_vl));
+            burst_count += 1;
+        }
+        if burst_count > 0 {
+            tracing::info!(target: "ledger_master",
+                burst_count,
+                new_valid_seq = ledger_master.valid_ledger_seq(),
+                "tryAdvance burst: validated consecutive ledgers from history"
+            );
+        }
+    }
+
     let report = lm_rt.plan_advance_publication();
 
     tracing::debug!(target: "ledger_master",
@@ -1391,10 +1435,35 @@ fn try_advance_catchup(
         return;
     };
     let ledger_master = lm_rt.ledger_master();
-    let report = lm_rt.plan_advance_publication();
 
+    // Match rippled findNewLedgersToPublish: acquire up to LEDGER_FETCH_SIZE
+    // sequential missing ledgers, not just one.
+    const LEDGER_FETCH_SIZE: u32 = 4;
+
+    let report = lm_rt.plan_advance_publication();
     if let Some(missing) = report.missing {
         inbound_ledgers.acquire(missing.hash, missing.seq, ledger_master.valid_ledger_seq());
+
+        // Acquire additional sequential ledgers beyond the first missing one
+        // (matching rippled's acqCount < ledgerFetchSize_ loop)
+        if let Some(validated) = ledger_master.validated_ledger() {
+            let valid_seq = validated.header().seq;
+            let mut acquired = 1u32;
+            let mut seq = missing.seq + 1;
+            while acquired < LEDGER_FETCH_SIZE && seq <= valid_seq {
+                if let Some(hash) = validated.hash_of_seq(seq, &ledger::NullLedgerJournal) {
+                    if !hash.is_zero() {
+                        inbound_ledgers.acquire(
+                            *hash.as_uint256(),
+                            seq,
+                            ledger_master.valid_ledger_seq(),
+                        );
+                        acquired += 1;
+                    }
+                }
+                seq += 1;
+            }
+        }
     }
 
     for publish_ledger in report.published {
@@ -2448,6 +2517,11 @@ struct InboundLedgers {
     pending_writes: Option<Arc<Mutex<HashMap<Uint256, PendingNodeStoreObject>>>>,
     run_data_limiter: Arc<RunDataLimiter>,
     shared_stored: Arc<basics::tagged_cache::KeyCache<Uint256>>,
+    /// Channel for workers to immediately notify of completed ledgers
+    /// (matching rippled's done() → storeLedger() without polling delay).
+    completed_ledgers_tx: std::sync::mpsc::Sender<Arc<ledger::Ledger>>,
+    /// Overlay for sending initial peers to worker threads
+    overlay_rt: Option<Arc<app::runtime::overlay_runtime::AppOverlayRuntime>>,
 }
 
 struct InboundEntry {
@@ -2456,7 +2530,9 @@ struct InboundEntry {
     result_rx: std::sync::mpsc::Receiver<AcqResult>,
     #[allow(dead_code)]
     handle: thread::JoinHandle<()>,
+    started_at: Instant,
     last_touched: Instant,
+    completed_at: Option<Instant>,
     state: InboundState,
     skip_state: bool,
 }
@@ -2480,8 +2556,10 @@ impl InboundState {
 
 /// Reacquire interval for failed ledgers (reference kREACQUIRE_INTERVAL = 5 min)
 const INBOUND_REACQUIRE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-/// Sweep timeout for inactive entries (reference 1 minute)
+/// Sweep timeout for completed entries (reference 1 minute after last action)
 const INBOUND_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Timeout for stuck InProgress entries (reference ~180s with no progress)
+const INBOUND_STUCK_TIMEOUT: Duration = Duration::from_secs(180);
 
 impl InboundLedgers {
     fn new(
@@ -2498,6 +2576,7 @@ impl InboundLedgers {
         fetch_pack: Arc<ledger::FetchPackCache>,
         run_data_limiter: Arc<RunDataLimiter>,
         shared_stored: Arc<basics::tagged_cache::KeyCache<Uint256>>,
+        completed_ledgers_tx: std::sync::mpsc::Sender<Arc<ledger::Ledger>>,
     ) -> Self {
         Self {
             entries: HashMap::new(),
@@ -2511,7 +2590,13 @@ impl InboundLedgers {
             pending_writes: None,
             run_data_limiter,
             shared_stored,
+            completed_ledgers_tx,
+            overlay_rt: None,
         }
+    }
+
+    fn set_overlay_rt(&mut self, rt: Arc<app::runtime::overlay_runtime::AppOverlayRuntime>) {
+        self.overlay_rt = Some(rt);
     }
 
     fn set_node_store(&mut self, ns: app::SHAMapStoreNodeStore) {
@@ -2531,7 +2616,7 @@ impl InboundLedgers {
 
     /// Returns Some(ledger) if already complete, None if in-progress or newly started.
     fn acquire(&mut self, hash: Uint256, seq: u32, validated: u32) -> Option<&ledger::Ledger> {
-        if hash.is_zero() || seq <= 1 {
+        if hash.is_zero() {
             full_sync_debug!(
                 "[full_debug][acq_request] reject seq={} hash={} reason=zero_or_genesis validated={}",
                 seq,
@@ -2613,6 +2698,7 @@ impl InboundLedgers {
         // skip_state optimization is not compatibility and causes tip ledgers
         // to appear done without being useful for the publish stream.
         let skip_state = false;
+        let store_tx = self.completed_ledgers_tx.clone();
 
         let acq_handle = thread::Builder::new()
             .name("xrpld-acq-process".to_owned())
@@ -2631,6 +2717,7 @@ impl InboundLedgers {
                     rl,
                     ss,
                     skip_state,
+                    store_tx,
                 );
             })
             .expect("acquisition thread should spawn");
@@ -2642,6 +2729,15 @@ impl InboundLedgers {
             .insert(hash, acq_tx.clone());
 
         let now = Instant::now();
+
+        // Send initial peers immediately so the worker has them on first trigger
+        // (matching rippled InboundLedger::init → addPeers before first timer)
+        if let Some(overlay_rt) = &self.overlay_rt {
+            use overlay::Overlay as _;
+            let peers = overlay_rt.overlay().active_peers();
+            let _ = acq_tx.send(AcqMsg::Peers(peers));
+        }
+
         self.entries.insert(
             hash,
             InboundEntry {
@@ -2649,7 +2745,9 @@ impl InboundLedgers {
                 tx: acq_tx,
                 result_rx: acq_result_rx,
                 handle: acq_handle,
+                started_at: now,
                 last_touched: now,
+                completed_at: None,
                 state: InboundState::InProgress,
                 skip_state,
             },
@@ -2730,11 +2828,13 @@ impl InboundLedgers {
             }
         }
 
-        // Mark completed entries
+        // Mark completed entries and notify for immediate storeLedger
         for (hash, ledger, _) in &completed {
             if let Some(entry) = self.entries.get_mut(hash) {
                 entry.state = InboundState::Complete(ledger.clone());
                 entry.last_touched = Instant::now();
+                entry.completed_at = Some(Instant::now());
+                // Immediately notify for storeLedger (matching rippled done() → storeLedger)
                 full_sync_debug!(
                     "[full_debug][acq_poll] state_complete seq={} hash={} ledger_hash={} account_hash={} tx_hash={}",
                     entry.seq,
@@ -2791,14 +2891,22 @@ impl InboundLedgers {
         let mut to_remove = Vec::new();
 
         for (hash, entry) in &self.entries {
-            // Don't sweep entries with active workers — they'll complete
-            // or timeout on their own. Only sweep completed/failed entries
-            // that haven't been consumed.
-            if matches!(entry.state, InboundState::InProgress) {
-                continue;
-            }
-            if now.duration_since(entry.last_touched) > INBOUND_SWEEP_INTERVAL {
-                to_remove.push(*hash);
+            match entry.state {
+                InboundState::InProgress => {
+                    // Remove stuck InProgress entries (reference 180s timeout)
+                    if now.duration_since(entry.started_at) > INBOUND_STUCK_TIMEOUT
+                        && now.duration_since(entry.last_touched) > INBOUND_SWEEP_INTERVAL
+                    {
+                        to_remove.push(*hash);
+                    }
+                }
+                InboundState::Complete(_) | InboundState::Failed => {
+                    // Remove completed/failed entries after 60s (reference sweep)
+                    let sweep_since = entry.completed_at.unwrap_or(entry.last_touched);
+                    if now.duration_since(sweep_since) > INBOUND_SWEEP_INTERVAL {
+                        to_remove.push(*hash);
+                    }
+                }
             }
         }
 
@@ -2964,6 +3072,7 @@ fn run_acquisition_thread(
     run_data_limiter: Arc<RunDataLimiter>,
     shared_stored: Arc<basics::tagged_cache::KeyCache<Uint256>>,
     skip_state: bool,
+    store_tx: std::sync::mpsc::Sender<Arc<ledger::Ledger>>,
 ) {
     use shamap::family::{NullMissingNodeReporter, SHAMapFamily};
 
@@ -3056,6 +3165,10 @@ fn run_acquisition_thread(
         shared_stored,
     };
 
+    // NOTE: Initial tryDB (check_local) removed — it produces false completions
+    // with seq=0 for hashes that share state roots with genesis. The normal
+    // InboundLedger flow correctly downloads headers and builds proper ledgers.
+
     // Processor loop (reference runData role): processes queue, triggers peers
     loop {
         // Wait for data or timer — like reference job queue waiting for dispatch.
@@ -3065,13 +3178,13 @@ fn run_acquisition_thread(
             loop_iterations += 1;
             let mut queue = shared_queue.lock().expect("acq queue");
             if queue.is_empty() {
-                let timeout = if last_timer.elapsed() >= Duration::from_secs(3) {
+                let timeout = if last_timer.elapsed() >= Duration::from_secs(1) {
                     Duration::from_millis(0)
                 } else if just_processed {
                     // Pipeline hot: check again quickly for responses
                     Duration::from_millis(1)
                 } else {
-                    Duration::from_secs(3)
+                    Duration::from_secs(1)
                         .saturating_sub(last_timer.elapsed())
                         .min(Duration::from_millis(50))
                 };
@@ -3141,7 +3254,7 @@ fn run_acquisition_thread(
         // addPeers and timer. The old code skipped everything when no data
         // was queued, which prevented addPeers from triggering requests.
         let has_queued_data = inbound.received_data_len() > 0;
-        let timer_due = last_timer.elapsed() >= Duration::from_secs(3);
+        let timer_due = last_timer.elapsed() >= Duration::from_secs(1);
         if !should_process_acquisition_tick(
             has_queued_data,
             timer_due,
@@ -3666,6 +3779,7 @@ fn run_acquisition_thread(
                 ledger.state_map().is_full(),
                 ledger.tx_map().is_full()
             );
+            let _ = store_tx.send(Arc::new(ledger.clone()));
             if result_tx.send(AcqResult::Complete(ledger)).is_err() {
                 tracing::warn!(target: "inbound_ledger", seq, "Completion receiver dropped before catchup consumed result");
                 full_sync_debug!(
@@ -3684,6 +3798,7 @@ fn run_acquisition_thread(
             let _ = flush_nodestore_writes(&store.write_tx);
             tracing::info!(target: "inbound_ledger", seq, "LEDGER ACQUIRED");
             counters.log_status(seq, inbound.stats(), true);
+            let _ = store_tx.send(Arc::new(ledger.clone()));
             if result_tx.send(AcqResult::Complete(ledger)).is_err() {
                 tracing::warn!(target: "inbound_ledger", seq, "Completion receiver dropped before catchup consumed result");
             }
@@ -3918,6 +4033,8 @@ impl<D> BoundServerRuntime<D> {
 
                 // Wire InboundLedgers to shared resources.
                 // new acquisitions through a global active-ledger cap.
+                let (completed_ledgers_tx, completed_ledgers_rx) =
+                    std::sync::mpsc::channel::<Arc<ledger::Ledger>>();
                 let mut inbound_ledgers = InboundLedgers::new(
                     Arc::clone(&acq_registry),
                     Arc::clone(&shared_tree_cache),
@@ -3925,13 +4042,21 @@ impl<D> BoundServerRuntime<D> {
                     Arc::clone(&shared_fetch_pack),
                     Arc::clone(&run_data_limiter),
                     Arc::clone(&shared_stored),
+                    completed_ledgers_tx,
                 );
+                // Share the receiver with the ApplicationRoot so the bootstrap
+                // thread can poll completed ledgers every 50ms (matching
+                // rippled's done() → storeLedger() without polling delay).
+                app.set_completed_ledgers_rx(completed_ledgers_rx);
                 if let Some(ns) = app.node_store().as_ref() {
                     inbound_ledgers.set_node_store(ns.clone());
                 }
                 if let Some(ref tx) = shared_write_tx {
                     inbound_ledgers.set_write_tx(tx.clone());
                     inbound_ledgers.set_pending_writes(Arc::clone(&shared_pending_writes));
+                if let Some(ort) = app.overlay_runtime() {
+                    inbound_ledgers.set_overlay_rt(ort);
+                }
                 }
 
                 let mut last_diag_at = Instant::now()
@@ -4135,7 +4260,11 @@ impl<D> BoundServerRuntime<D> {
                                 // Re-queue validations that were in the snapshot
                                 overlay_runtime.overlay().queued_inbound().requeue_validations(snapshot.validations);
                             }
-                            process_queued_validations(&val_app, &val_accept_sink);
+                            // In --start mode, the bootstrap thread exclusively
+                            // processes validations. Skip here to avoid races.
+                            if !val_app.need_network_ledger() {
+                                process_queued_validations(&val_app, &val_accept_sink);
+                            }
 
                             if !val_app.need_network_ledger() {
                             if let Some(rx) = &map_complete_rx {
@@ -4158,25 +4287,26 @@ impl<D> BoundServerRuntime<D> {
                             if let Some(overlay_runtime) = val_app.overlay_runtime() {
                                 let proposals = overlay_runtime.overlay().take_proposals();
                                 if !proposals.is_empty()
-                                    && let (Some(consensus_runtime), Some(network_ops_runtime)) =
+                                    && let (Some(consensus_runtime), Some(_network_ops_runtime)) =
                                         (val_app.consensus_runtime(), val_app.network_ops_runtime())
                                     {
                                         for proposal in proposals {
+                                            let close_time = val_app.shared_time_keeper().close_time();
                                             let prop = consensus::ConsensusProposal::new(
                                                 proposal.previous_ledger,
-                                                0,
+                                                proposal.message.propose_seq,
                                                 proposal.current_tx_hash,
-                                                val_app.shared_time_keeper().close_time(),
-                                                val_app.shared_time_keeper().close_time(),
+                                                close_time,
+                                                close_time,
                                                 proposal.public_key,
                                             );
-                                            let _ = network_ops_runtime.handle_peer_proposal(
-                                                consensus_runtime.as_ref(),
-                                                proposal.public_key,
-                                                proposal.message.signature.clone(),
-                                                proposal.suppression,
-                                                prop,
-                                            );
+                                            consensus_runtime.push_proposal(app::runtime::component_runtime::PendingProposal {
+                                                now: close_time,
+                                                public_key: proposal.public_key,
+                                                signature: proposal.message.signature.clone(),
+                                                suppression_id: proposal.suppression,
+                                                proposal: prop,
+                                            });
                                         }
                                     }
                             }
@@ -4184,14 +4314,10 @@ impl<D> BoundServerRuntime<D> {
                             // Drive consensus state machine — but only after initial sync.
                             // During cold bootstrap, timer_tick panics because the consensus
                             // tokio::sync::Mutex was created on the main runtime which is
-                            // shutting down. Skip entirely until we have a validated ledger.
+                            // Consensus timer is driven exclusively by the bootstrap loop.
                             if !val_app.need_network_ledger() {
-                                if let Some(consensus_runtime) = val_app.consensus_runtime() {
+                                if let Some(_consensus_runtime) = val_app.consensus_runtime() {
                                     let tick_start = Instant::now();
-                                    if let Some(network_ops_runtime) = val_app.network_ops_runtime() {
-                                        network_ops_runtime
-                                            .handle_consensus_timer(consensus_runtime.as_ref());
-                                    }
                                     let latency_ms = tick_start.elapsed().as_millis() as u64;
                                     val_app.set_status_rpc_io_latency_ms(Some(latency_ms));
                                 }
@@ -4218,9 +4344,6 @@ impl<D> BoundServerRuntime<D> {
                         overlay_runtime.overlay().queued_inbound()
                             .set_ledger_data_router(Box::new(move |peer_id, message| {
                                 dc.fetch_add(1, Ordering::Relaxed);
-                                if message.request_cookie.is_some() {
-                                    return;
-                                }
                                 if let Some((hash, packet)) = parse_ledger_data_packet(&message) {
                                     let hash = *hash.as_uint256();
                                     route_ledger_data_to_acq(
@@ -4416,6 +4539,17 @@ impl<D> BoundServerRuntime<D> {
                         continue;
                     }
 
+                    // gotFetchPack: if the bootstrap/consensus loop stored
+                    // fetch-pack data, signal ALL active InboundLedger workers
+                    // to re-check local storage immediately (matching rippled
+                    // InboundLedgers::gotFetchPack → trigger checkLocal on all).
+                    if app.take_fetch_pack_ready() {
+                        let registry_guard = acq_registry.lock().expect("acq registry");
+                        for tx in registry_guard.values() {
+                            let _ = tx.send(AcqMsg::FetchPackReady);
+                        }
+                    }
+
                     let validated = app.ledger_master_runtime()
                         .map(|lm| lm.ledger_master().valid_ledger_seq())
                         .unwrap_or(0);
@@ -4468,7 +4602,7 @@ impl<D> BoundServerRuntime<D> {
                             .unwrap_or(0);
                         tracing::debug!(target: "catchup", elapsed, node_db_mib = node_store_mb, acqs = inbound_ledgers.active_count(), first_ledger = milestone_first_ledger.map(|d| format!("{:.1}s", d.as_secs_f64())).unwrap_or_else(|| "pending".to_owned()), inbound_info = inbound_ledgers.info_summary(), "Milestone");
                         if validated > 1 && target_seq > validated.saturating_add(1) && inbound_ledgers.active_count() == 0 {
-                            tracing::warn!(target: "main", "Ledger sync stalled — no progress");
+                            tracing::info!(target: "main", "Ledger sync stalled — no progress");
                         }
                     }
 
@@ -4655,6 +4789,79 @@ impl<D> BoundServerRuntime<D> {
                             } else {
                                 // Already accepted — clear target.
                                 last_validated_target = None;
+                            }
+                        }
+                    }
+
+                    // --- storeLedger equivalent (rippled InboundLedger::done → storeLedger) ---
+                    // Insert completed InboundLedger results into LedgerHistory
+                    // so that acquire_consensus_ledger (get_ledger_by_hash) can
+                    // find them when the consensus engine needs to switch LCL.
+                    {
+                        let store_results = inbound_ledgers.poll_results();
+                        if !store_results.is_empty() {
+                            if let Some(lm_rt) = app.ledger_master_runtime() {
+                                for (_hash, ledger, _skip) in &store_results {
+                                    let stored = std::sync::Arc::new(ledger.clone());
+                                    lm_rt.ledger_master().ledger_history().insert(
+                                        std::sync::Arc::clone(&stored),
+                                        false,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Trigger parallel InboundLedger acquisitions for ALL unique
+                    // peer hashes we don't have (matching rippled which manages
+                    // many concurrent InboundLedgers). This enables catching up
+                    // at the rate peers advance rather than one-at-a-time.
+                    if let Some(lm_rt) = app.ledger_master_runtime() {
+                        if let Some(overlay_rt) = app.overlay_runtime() {
+                            use overlay::Overlay as _;
+                            let our_hash = lm_rt.ledger_master().closed_ledger()
+                                .map(|l| *l.header().hash.as_uint256())
+                                .unwrap_or_default();
+                            let peers = overlay_rt.overlay().active_peers();
+                            // Acquire ALL unique peer hashes we don't already have
+                            let mut triggered = 0usize;
+                            for p in peers.iter() {
+                                let h = p.closed_ledger_hash();
+                                if !h.is_zero() && h != our_hash
+                                    && !inbound_ledgers.contains(&h)
+                                {
+                                    inbound_ledgers.acquire(h, 0, 0);
+                                    triggered += 1;
+                                }
+                            }
+                            if triggered > 0 {
+                                inbound_ledgers.send_peers(&peers);
+
+                                // Send fetch pack request for instant state delta.
+                                // Per rippled's protocol: send the hash of a ledger the
+                                // PEER has. They diff it against its parent and send back
+                                // the state delta nodes we need.
+                                if let Some(lm_rt) = app.ledger_master_runtime() {
+                                    if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
+                                        let our_hash = closed.header().hash;
+                                        // Use the peer's closed_ledger_hash (they have it)
+                                        for p in peers.iter() {
+                                            let peer_hash = p.closed_ledger_hash();
+                                            if !peer_hash.is_zero() && peer_hash != *our_hash.as_uint256() {
+                                                let fp_msg = ledger::make_fetch_pack_request(
+                                                    basics::sha_map_hash::SHAMapHash::new(peer_hash)
+                                                );
+                                                let wire = overlay::Message::new(fp_msg, None);
+                                                p.send(wire);
+                                                tracing::info!(target: "consensus",
+                                                    our_seq = closed.header().seq,
+                                                    "Fetch pack request sent (peer hash)"
+                                                );
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -4990,7 +5197,7 @@ impl<D> BoundServerRuntime<D> {
 
                         // --- Check acquisition results (reference InboundLedgers parity) ---
                         // Sweep stale entries on timer
-                        if last_inbound_sweep_at.elapsed() >= Duration::from_secs(15) {
+                        if last_inbound_sweep_at.elapsed() >= Duration::from_secs(10) {
                             last_inbound_sweep_at = Instant::now();
                             inbound_ledgers.sweep();
                         }

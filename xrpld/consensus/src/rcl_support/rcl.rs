@@ -95,7 +95,10 @@ pub trait RclConsensusAdapter: Send {
     fn has_open_transactions(&self) -> bool;
     fn proposers_validated(&self, prev_ledger: &Uint256) -> usize;
     fn proposers_finished(&self, prev_ledger: &RclCxLedger, prev_ledger_id: &Uint256) -> usize;
+    fn pre_start_round_for_proposing(&self) {}
     fn should_propose(&self) -> bool;
+    fn have_peers_on_ledger(&self, _ledger_id: &Uint256) -> bool { true }
+    fn adjust_close_time(&mut self, _offset_seconds: i64) {}
     fn prev_round_time(&self) -> Duration;
     fn now_close_time(&self) -> basics::chrono::NetClockTimePoint;
     fn get_prev_ledger(
@@ -313,11 +316,8 @@ impl RclRoundTimer {
         let next = self
             .next_tick
             .get_or_insert_with(|| Instant::now() + self.period);
-        let now = Instant::now();
-        if now < *next {
-            tokio::time::sleep(*next - now).await;
-        }
-        *next += self.period;
+        // No sleep — timing is gated externally by the caller.
+        *next = Instant::now() + self.period;
     }
 }
 
@@ -354,7 +354,12 @@ impl<A: RclConsensusAdapter> RclConsensus<A> {
         prev_ledger: RclCxLedger,
     ) {
         tracing::info!(target: "consensus", seq = prev_ledger.seq + 1, prev_ledger = %prev_ledger_id, "RCL consensus starting round");
-        let proposing = self.consensus.adaptor().inner.should_propose();
+        self.consensus.adaptor_mut().inner.pre_start_round_for_proposing();
+        // Only propose past genesis. On genesis (seq=1), always observe to
+        // prevent sending proposals/validations for ledgers peers don't have.
+        // Validation emission is additionally gated on mode==Proposing in on_accept.
+        let proposing = self.consensus.adaptor().inner.should_propose()
+            && prev_ledger.seq > 1;
         let _ = self
             .consensus
             .start_round(now, prev_ledger_id, prev_ledger, proposing);

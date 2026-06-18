@@ -332,6 +332,8 @@ impl RclConsensusMessageSink for RecordingSinkHandle {
     fn share_transaction(&self, tx: Arc<STTx>) {
         self.0.shared.lock().expect("shared transactions").push(tx);
     }
+
+    fn broadcast_validation(&self, _validation_bytes: Vec<u8>, _validator: PublicKey) {}
 }
 
 #[derive(Debug)]
@@ -573,6 +575,7 @@ fn public_rcl_consensus_adaptor_injects_fee_vote_pseudotx_from_stored_parent_val
         sample_validator_keys(),
         None,
         None,
+        None,
     );
     adaptor.set_fee_vote(fee_setup);
 
@@ -663,6 +666,7 @@ fn public_rcl_consensus_adaptor_injects_amendment_pseudotx_from_stored_parent_va
         sample_validator_keys(),
         None,
         None,
+        None,
     );
     adaptor.set_amendment_table(Arc::clone(&amendment_table));
 
@@ -732,6 +736,8 @@ impl app::RclConsensusValidationSource for NegativeUnlValidationSource {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn add_trusted_validation(&self, _node_id: PublicKey, _validation: &protocol::STValidation) {}
 }
 
 #[test]
@@ -793,6 +799,7 @@ fn public_rcl_consensus_adaptor_injects_negative_unl_pseudotx_from_voting_ledger
         RecordingSinkHandle(Arc::clone(&sink)),
         NullRclConsensusJournal,
         validator_keys_from_secret(local_secret),
+        None,
         None,
         None,
     );
@@ -1034,6 +1041,7 @@ fn public_rcl_consensus_adaptor_logs_startup_and_deduplicates_missing_ledger_req
         sample_validator_keys(),
         None,
         None,
+        None,
     );
 
     let missing = Uint256::from_u64(404);
@@ -1098,7 +1106,7 @@ async fn public_consensus_runtime_only_ticks_when_called_by_the_owner() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(ticks.load(Ordering::Acquire), 0);
 
-    runtime.timer_tick(NetClockTimePoint::new(123)).await;
+    runtime.timer_tick(NetClockTimePoint::new(123), true).await;
     assert_eq!(ticks.load(Ordering::Acquire), 1);
 
     app::ManagedComponent::stop(&runtime);
