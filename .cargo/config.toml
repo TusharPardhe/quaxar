@@ -1,7 +1,15 @@
-# Fast linking with lld (optional but recommended)
-# Install: sudo apt install lld clang (Linux) or brew install llvm (macOS)
-# If lld is not installed, remove this file and cargo will use the default linker.
-
-[target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+# Linker optimizations (optional).
+#
+# For faster link times, install lld and clang:
+#   Linux:  sudo apt install clang lld
+#   macOS:  brew install llvm
+#
+# Then uncomment the section below for your platform:
+#
+# [target.x86_64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+#
+# [target.aarch64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]

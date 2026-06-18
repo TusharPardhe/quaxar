@@ -1,6 +1,6 @@
 use protocol::{
     AccountID, KeyType, PublicKey, SecretKey, TokenType, calc_account_id, derive_public_key,
-    generate_secret_key, parse_base58_seed, parse_base58_with_type,
+    generate_root_secret_key, parse_base58_seed, parse_base58_with_type,
 };
 
 use crate::state::manifest::{deserialize_manifest, load_validator_token};
@@ -84,7 +84,7 @@ impl ValidatorKeys {
                 return result;
             };
 
-            let Ok(secret_key) = generate_secret_key(KeyType::Secp256k1, &seed) else {
+            let Ok(secret_key) = generate_root_secret_key(KeyType::Secp256k1, &seed) else {
                 result.config_invalid = true;
                 return result;
             };

@@ -905,8 +905,21 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
             continue;
         };
 
+        // Helper: fire consensus tick if ≥1s elapsed since last tick.
+        // Called after each heavy I/O operation to prevent timer starvation.
+        macro_rules! maybe_tick_consensus {
+            () => {
+                if last_consensus_tick.elapsed() >= Duration::from_secs(1) {
+                    network_ops_rt.drain_proposals(consensus_rt.as_ref());
+                    network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
+                    last_consensus_tick = std::time::Instant::now();
+                }
+            };
+        }
+
         // Serve TmGetLedger requests from peers (PART 1).
         serve_get_ledger_requests(root, &overlay_rt);
+        maybe_tick_consensus!();
 
         // Broadcast our closed ledger to peers via StatusChange so they
         // can detect whether we're at genesis or ahead. This replaces the
@@ -991,15 +1004,16 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                                     // before startRound runs).
                                     let proposals = overlay_rt.overlay().take_proposals();
                                     for proposal in &proposals {
-                                        let close_time = root.shared_time_keeper().close_time();
+                                        let now = root.shared_time_keeper().close_time();
+                                        let peer_close_time = basics::chrono::NetClockTimePoint::new(proposal.message.close_time);
                                         let prop = consensus::ConsensusProposal::new(
                                             proposal.previous_ledger, proposal.message.propose_seq,
                                             proposal.current_tx_hash,
-                                            close_time, close_time,
+                                            peer_close_time, now,
                                             proposal.public_key,
                                         );
                                         consensus_rt.push_proposal(crate::runtime::component_runtime::PendingProposal {
-                                            now: close_time,
+                                            now,
                                             public_key: proposal.public_key,
                                             signature: proposal.message.signature.clone(),
                                             suppression_id: proposal.suppression,
@@ -1132,17 +1146,18 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
             }
         }
         for proposal in proposals {
-            let close_time = root.shared_time_keeper().close_time();
+            let now = root.shared_time_keeper().close_time();
+            let peer_close_time = basics::chrono::NetClockTimePoint::new(proposal.message.close_time);
             let prop = consensus::ConsensusProposal::new(
                 proposal.previous_ledger,
                 proposal.message.propose_seq,
                 proposal.current_tx_hash,
-                close_time,
-                close_time,
+                peer_close_time,
+                now,
                 proposal.public_key,
             );
             consensus_rt.push_proposal(crate::runtime::component_runtime::PendingProposal {
-                now: close_time,
+                now,
                 public_key: proposal.public_key,
                 signature: proposal.message.signature.clone(),
                 suppression_id: proposal.suppression,
@@ -1172,6 +1187,7 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
             let source = queued.peer_id.to_string();
             let _ = root.receive_validation_to_network_ops(&mut validation, &source);
         }
+        maybe_tick_consensus!();
 
         // Process fetch pack messages (responses AND requests).
         {
@@ -1209,6 +1225,7 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                 }
             }
         }
+        maybe_tick_consensus!();
 
         // storeLedger: drain completed InboundLedger results into LedgerHistory
         // (matching rippled's done() → storeLedger() with 50ms latency).
@@ -1313,29 +1330,34 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
                 );
             }
 
-            // Gap-fill: if tryAdvance stalled (next ledger not in history),
-            // send fetch pack request so InboundLedger worker can complete
-            // instantly via cached nodes. Throttled to once per 3s.
+            // Gap-fill: only request fetch packs when we're actually BEHIND
+            // the network. Don't request when our closed ledger matches peers.
             if advanced == 0 {
                 use overlay::Overlay;
-                static LAST_GAP_FILL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                let last = LAST_GAP_FILL.load(std::sync::atomic::Ordering::Relaxed);
-                if now_ms.saturating_sub(last) >= 3000 {
-                    LAST_GAP_FILL.store(now_ms, std::sync::atomic::Ordering::Relaxed);
-                    let peers = overlay_rt.overlay().active_peers();
-                    for p in &peers {
-                        let peer_hash = p.closed_ledger_hash();
-                        if !peer_hash.is_zero() {
-                            let fp_msg = ledger::make_fetch_pack_request(
-                                basics::sha_map_hash::SHAMapHash::new(peer_hash)
-                            );
-                            let wire = overlay::Message::new(fp_msg, None);
-                            p.send(wire);
-                            break;
+                let our_closed_hash = lm.closed_ledger()
+                    .map(|l| *l.header().hash.as_uint256())
+                    .unwrap_or(basics::base_uint::Uint256::zero());
+                let peers = overlay_rt.overlay().active_peers();
+                let in_sync = peers.iter().any(|p| p.closed_ledger_hash() == our_closed_hash);
+                if !in_sync && !peers.is_empty() {
+                    static LAST_GAP_FILL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let last = LAST_GAP_FILL.load(std::sync::atomic::Ordering::Relaxed);
+                    if now_ms.saturating_sub(last) >= 3000 {
+                        LAST_GAP_FILL.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                        for p in &peers {
+                            let peer_hash = p.closed_ledger_hash();
+                            if !peer_hash.is_zero() {
+                                let fp_msg = ledger::make_fetch_pack_request(
+                                    basics::sha_map_hash::SHAMapHash::new(peer_hash)
+                                );
+                                let wire = overlay::Message::new(fp_msg, None);
+                                p.send(wire);
+                                break;
+                            }
                         }
                     }
                 }

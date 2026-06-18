@@ -80,6 +80,15 @@ pub fn generate_secret_key(key_type: KeyType, seed: &Seed) -> Result<SecretKey, 
     }
 }
 
+/// Generate a ROOT secret key (no account tweak). Used for VALIDATOR keys
+/// where rippled uses the root key directly (matching rippled's validator identity).
+pub fn generate_root_secret_key(key_type: KeyType, seed: &Seed) -> Result<SecretKey, SecretKeyError> {
+    match key_type {
+        KeyType::Ed25519 => SecretKey::from_slice(sha512_half_secure(seed.as_slice()).data()),
+        KeyType::Secp256k1 => derive_deterministic_root_key(seed),
+    }
+}
+
 fn derive_deterministic_account_key(seed: &Seed) -> Result<SecretKey, SecretKeyError> {
     let root = derive_deterministic_root_key(seed)?;
     // Derive account keypair: root → generator → account (matching rippled's

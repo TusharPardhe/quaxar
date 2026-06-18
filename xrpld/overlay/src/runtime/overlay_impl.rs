@@ -1820,7 +1820,7 @@ impl OverlayImpl {
             return;
         }
 
-        tracing::info!(target: "overlay", %hash, "relay_transaction: sending tx to peers");
+        tracing::debug!(target: "overlay", %hash, "relay_transaction: sending tx to peers");
         let message = Message::new(
             ProtocolMessage::new(ProtocolPayload::Transaction(
                 transaction.expect("transaction present"),
