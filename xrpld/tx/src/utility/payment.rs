@@ -200,12 +200,24 @@ pub struct PaymentPreflightFacts {
     pub deliver_min: Option<STAmount>,
     pub destination: AccountID,
     pub flags: u32,
+    pub domain_id: Option<basics::base_uint::Uint256>,
+    pub fix_cleanup_3_2_0: bool,
 }
 
 pub fn run_payment_preflight<Registry, Tx, Journal, ParentBatchId>(
     ctx: &PreflightContext<Registry, Tx, Journal, ParentBatchId>,
     facts: PaymentPreflightFacts,
 ) -> NotTec {
+    // A zero DomainID is invalid for a PermissionedDomain ledger entry because
+    // keylet::permissionedDomain(uint256) uses the DomainID as the ledger key.
+    if facts.fix_cleanup_3_2_0 {
+        if let Some(ref domain_id) = facts.domain_id {
+            if domain_id.is_zero() {
+                return Ter::TEM_MALFORMED;
+            }
+        }
+    }
+
     let deliver_min = facts.deliver_min;
     let eval_facts = PaymentPreflightEvalFacts {
         tx_flags: facts.flags,

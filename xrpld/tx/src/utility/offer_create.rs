@@ -32,6 +32,8 @@ pub struct OfferCreatePreflightFacts {
     pub taker_gets: STAmount,
     pub expiration: Option<u32>,
     pub flags: u32,
+    pub domain_id: Option<basics::base_uint::Uint256>,
+    pub fix_cleanup_3_2_0: bool,
 }
 
 pub fn run_offer_create_preflight<Registry, Tx, Journal, ParentBatchId>(
@@ -58,6 +60,16 @@ pub fn run_offer_create_preflight<Registry, Tx, Journal, ParentBatchId>(
 
     if !is_tes_success(ret) {
         return ret;
+    }
+
+    // A zero DomainID is invalid for a PermissionedDomain ledger entry because
+    // keylet::permissionedDomain(uint256) uses the DomainID as the ledger key.
+    if facts.fix_cleanup_3_2_0 {
+        if let Some(ref domain_id) = facts.domain_id {
+            if domain_id.is_zero() {
+                return Ter::TEM_MALFORMED;
+            }
+        }
     }
 
     if !facts.taker_pays.is_legal_net() || !facts.taker_gets.is_legal_net() {

@@ -6,3 +6,4 @@
 target/
 rust/target/
 ops/*
+dist/

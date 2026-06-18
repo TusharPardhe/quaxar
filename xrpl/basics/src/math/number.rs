@@ -676,40 +676,62 @@ impl NumberParts {
         let scale = get_mantissa_scale();
         let min_mantissa = mantissa_range_min(scale);
         let max_mantissa = mantissa_range_max(scale);
-        let small = scale == MantissaScale::Small;
+        let cusp_fix = scale == MantissaScale::Large;
 
-        let factor = if small {
-            100_000_000_000_000_000u128
-        } else {
-            10_000_000_000_000_000_000u128
-        };
+        // Stage 1: initial division with factor of 10^17
+        const FACTOR_EXPONENT: i32 = 17;
+        let factor: u128 = 100_000_000_000_000_000; // 10^17
         let numerator = u128::from(self.mantissa)
             .checked_mul(factor)
             .ok_or(NumberArithmeticError::Overflow)?;
-        let denominator = u128::from(other.mantissa);
+        let dm = u128::from(other.mantissa);
 
-        let mut zm = numerator / denominator;
+        let mut zm = numerator / dm;
         let mut ze = self
             .exponent
             .checked_sub(other.exponent)
-            .and_then(|value| value.checked_sub(if small { 17 } else { 19 }))
+            .and_then(|v| v.checked_sub(FACTOR_EXPONENT))
             .ok_or(NumberArithmeticError::Overflow)?;
         let zn = self.negative ^ other.negative;
+        let mut dropped = false;
 
-        if !small {
-            let remainder = numerator % denominator;
+        if scale != MantissaScale::Small {
+            // Stage 2: if there's a remainder, use correctionFactor = 10^5
+            const CORRECTION_EXPONENT: i32 = 5;
+            let correction_factor: u128 = 100_000; // 10^5
+            let remainder = numerator % dm;
             if remainder != 0 {
-                zm = zm
-                    .checked_mul(1_000)
-                    .ok_or(NumberArithmeticError::Overflow)?;
-                zm = zm
-                    .checked_add(remainder * 1_000 / denominator)
-                    .ok_or(NumberArithmeticError::Overflow)?;
-                ze = ze.checked_sub(3).ok_or(NumberArithmeticError::Overflow)?;
+                let partial_numerator = remainder * correction_factor;
+                let correction = partial_numerator / dm;
+
+                if correction != 0 {
+                    zm = zm
+                        .checked_mul(correction_factor)
+                        .ok_or(NumberArithmeticError::Overflow)?;
+                    ze = ze
+                        .checked_sub(CORRECTION_EXPONENT)
+                        .ok_or(NumberArithmeticError::Overflow)?;
+                    zm = zm
+                        .checked_add(correction)
+                        .ok_or(NumberArithmeticError::Overflow)?;
+                }
+
+                // Stage 3: flag trailing remainder for cusp rounding
+                if cusp_fix {
+                    dropped = partial_numerator % dm != 0;
+                }
             }
         }
 
-        *self = Self::normalize_arithmetic_parts(zn, zm, ze, min_mantissa, max_mantissa, scale)?;
+        *self = Self::normalize_arithmetic_parts_with_dropped(
+            zn,
+            zm,
+            ze,
+            min_mantissa,
+            max_mantissa,
+            scale,
+            dropped,
+        )?;
         Ok(())
     }
 
@@ -746,12 +768,26 @@ impl NumberParts {
     }
 
     fn normalize_arithmetic_parts(
+        negative: bool,
+        mantissa: u128,
+        exponent: i32,
+        min_mantissa: u64,
+        max_mantissa: u64,
+        scale: MantissaScale,
+    ) -> Result<Self, NumberArithmeticError> {
+        Self::normalize_arithmetic_parts_with_dropped(
+            negative, mantissa, exponent, min_mantissa, max_mantissa, scale, false,
+        )
+    }
+
+    fn normalize_arithmetic_parts_with_dropped(
         mut negative: bool,
         mut mantissa: u128,
         mut exponent: i32,
         min_mantissa: u64,
         max_mantissa: u64,
         scale: MantissaScale,
+        dropped: bool,
     ) -> Result<Self, NumberArithmeticError> {
         if mantissa == 0 {
             return Ok(Self::zero());
@@ -767,6 +803,9 @@ impl NumberParts {
         let mut guard = ArithmeticGuard::default();
         if negative {
             guard.set_negative();
+        }
+        if dropped {
+            guard.has_extra = true;
         }
 
         while mantissa > u128::from(max_mantissa) {

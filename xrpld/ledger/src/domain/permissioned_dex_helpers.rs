@@ -30,6 +30,11 @@ pub fn account_in_domain(
     account: &AccountID,
     domain_id: &Domain,
 ) -> Result<bool, ViewError> {
+    // Avoid constructing a zero-key PermissionedDomain keylet.
+    if domain_id.is_zero() {
+        return Ok(false);
+    }
+
     let Some(sle_domain) = view.read(permissioned_domain_keylet_from_id(*domain_id))? else {
         return Ok(false);
     };
