@@ -265,8 +265,8 @@ pub const XRP_LEDGER_EARLIEST_FEES: u32 = 562_177;
 pub const INITIAL_XRP_DROPS: u64 = 100_000_000_000_000_000;
 pub const CURRENT_DEFAULT_FEES: Fees = Fees {
     base: 10,
-    reserve: 1_000_000, // 1 XRP — matches default account_reserve
-    increment: 200_000, // 0.2 XRP — matches default owner_reserve
+    reserve: 10_000_000,  // 10 XRP — matches rippled FeeSetup::accountReserve
+    increment: 2_000_000, // 2 XRP — matches rippled FeeSetup::ownerReserve
 };
 
 pub type LedgerTxRead = (Arc<STTx>, TxMeta);

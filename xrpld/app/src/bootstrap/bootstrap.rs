@@ -829,7 +829,7 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
         Some(std::thread::Builder::new()
             .name("start-mode-consensus".into())
             .spawn(move || {
-                run_start_mode_consensus_loop(&rt, &stop_flag);
+                run_start_mode_consensus_loop(rt.clone(), stop_flag.clone());
             })
             .expect("failed to spawn start-mode-consensus thread"))
     } else {
@@ -858,7 +858,7 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
 /// results, and ticks the consensus timer on a ~200ms cadence. This drives
 /// the consensus state machine that would otherwise only run inside the
 /// catchup loop (which is never entered in --start mode).
-fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
+fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool>) {
     use consensus;
 
     tracing::info!(target: "consensus", "Start-mode consensus event loop running");
@@ -892,6 +892,32 @@ fn run_start_mode_consensus_loop(runtime: &MainRuntime, stop: &AtomicBool) {
     // State for consensus ledger acquisition with targeted peer requests.
 
     let mut last_consensus_tick = std::time::Instant::now();
+
+    // Spawn a dedicated consensus timer thread that fires every 950ms regardless
+    // of I/O load. This prevents timer starvation when the main loop is busy
+    // serving peer requests (the root cause of 20s rounds under load).
+    let consensus_timer_stop = Arc::clone(&stop);
+    let consensus_timer_runtime = Arc::clone(&runtime);
+    std::thread::Builder::new()
+        .name("consensus-timer".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(950));
+                if consensus_timer_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                let root = consensus_timer_runtime.root();
+                let (Some(consensus_rt), Some(network_ops_rt)) = (
+                    root.consensus_runtime(),
+                    root.network_ops_runtime(),
+                ) else {
+                    continue;
+                };
+                network_ops_rt.drain_proposals(consensus_rt.as_ref());
+                network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
+            }
+        })
+        .expect("spawn consensus-timer thread");
 
     while !stop.load(Ordering::Acquire) {
         let root = runtime.root();
