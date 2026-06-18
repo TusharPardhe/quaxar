@@ -1356,9 +1356,10 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 );
             }
 
-            // Gap-fill: only request fetch packs when we're actually BEHIND
-            // the network by more than a few ledgers. Don't spam peers.
-            if advanced == 0 {
+            // Gap-fill: only request fetch packs during initial catchup.
+            // Once we have a validated ledger, consensus builds new ledgers
+            // directly — no need to fetch from peers.
+            if advanced == 0 && lm.valid_ledger_seq() == 0 {
                 use overlay::Overlay;
                 let our_closed_hash = lm.closed_ledger()
                     .map(|l| *l.header().hash.as_uint256())
