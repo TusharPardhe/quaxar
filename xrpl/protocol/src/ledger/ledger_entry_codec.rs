@@ -290,7 +290,7 @@ pub fn encode_account_root_entry(
     append_u256_field(&mut bytes, SF_PREVIOUS_TXN_ID, Uint256::zero());
     append_native_amount_field(&mut bytes, SF_BALANCE, balance_drops);
     append_account_field(&mut bytes, SF_ACCOUNT, account_id);
-    bytes.push(0xE1); // end-of-object marker (reference STObject serialization parity)
+    bytes.push(0xE1); // end-of-object marker
     bytes
 }
 
@@ -398,7 +398,7 @@ pub fn encode_constructor_fee_settings_entry(entry: ConstructorFeeSettingsEntry)
             reserve_base,
             reserve_increment,
         } => {
-            append_u64_field(&mut bytes, SF_BASE_FEE, base_fee);
+            // Canonical order: UINT32 fields (type 2) before UINT64 fields (type 6)
             append_u32_field(&mut bytes, SF_REFERENCE_FEE_UNITS, reference_fee_units);
             if let Some(reserve_base) = reserve_base {
                 append_u32_field(&mut bytes, SF_RESERVE_BASE, reserve_base);
@@ -406,6 +406,7 @@ pub fn encode_constructor_fee_settings_entry(entry: ConstructorFeeSettingsEntry)
             if let Some(reserve_increment) = reserve_increment {
                 append_u32_field(&mut bytes, SF_RESERVE_INCREMENT, reserve_increment);
             }
+            append_u64_field(&mut bytes, SF_BASE_FEE, base_fee);
         }
         ConstructorFeeSettingsEntry::XrpDrops {
             base_fee_drops,
