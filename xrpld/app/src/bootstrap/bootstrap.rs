@@ -916,6 +916,20 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                     continue;
                 };
                 network_ops_rt.drain_proposals(consensus_rt.as_ref());
+                // Tick consensus to prevent starvation, but only if we haven't
+                // raced ahead of validated (prevents drift).
+                let should_tick = if let Some(lm) = root.ledger_master_runtime() {
+                    let valid_seq = lm.ledger_master().valid_ledger_seq();
+                    let closed_seq = lm.ledger_master().closed_ledger()
+                        .map(|l| l.header().seq).unwrap_or(0);
+                    // Tick if: still in startup (valid=0) or not too far ahead
+                    valid_seq == 0 || closed_seq <= valid_seq + 2
+                } else {
+                    true
+                };
+                if should_tick {
+                    network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
+                }
             }
         })
         .expect("spawn consensus-timer thread");
