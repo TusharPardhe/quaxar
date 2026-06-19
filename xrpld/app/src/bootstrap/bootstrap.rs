@@ -2377,7 +2377,11 @@ fn seed_startup_ledger_state(
             // which reads its [amendments] section to determine getDesired()).
             // Otherwise fall back to all supported + DefaultYes features.
             let genesis_amendments = amendments_from_config(config);
-            Ledger::create_genesis(backed, &LedgerConfig::default(), genesis_amendments)
+            let genesis_config = LedgerConfig {
+                fees: ledger::CURRENT_DEFAULT_FEES,
+                ..LedgerConfig::default()
+            };
+            Ledger::create_genesis(backed, &genesis_config, genesis_amendments)
                 .unwrap_or_else(|_| Ledger::from_ledger_seq_and_close_time(1, 0, backed))
         }
         StartUpType::Replay => {
