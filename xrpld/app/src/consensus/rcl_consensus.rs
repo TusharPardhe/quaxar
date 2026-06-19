@@ -1746,11 +1746,16 @@ where
         );
 
         // Fallback: peer LCL vote counting (rippled's checkLastClosedLedger
-        // peerCounts path). Only use when NOT in Proposing mode — if we're
-        // proposing, we just had a good round and the validation trie is
-        // authoritative. Peers reporting 1 round ahead is normal async timing.
+        // peerCounts path). Use when NOT in Proposing mode, OR when in Proposing
+        // mode but our ledger has zero trusted validations (meaning we're on the
+        // wrong chain and need to recover).
         let need_network = self.mode_source.need_network_ledger();
-        let preferred = if preferred == *prev_ledger_id && mode != ConsensusMode::Proposing && need_network {
+        let our_val_count = self.validations.num_trusted_for_ledger(*prev_ledger_id);
+        let lost_in_proposing = mode == ConsensusMode::Proposing && our_val_count == 0;
+        let use_peer_fallback = preferred == *prev_ledger_id
+            && (mode != ConsensusMode::Proposing || lost_in_proposing)
+            && (need_network || lost_in_proposing);
+        let preferred = if use_peer_fallback {
             if let Some(overlay) = &self.overlay {
                 use overlay::Overlay;
                 let peers = overlay.active_peers();
