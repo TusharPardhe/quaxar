@@ -87,11 +87,11 @@ fn build_genesis_setup_items_uses_legacy_fee_object_without_xrp_fees_amendment()
     let config = sample_ledger_config([sample_uint256(0xD2)]);
     let mut expected_fee_bytes = Vec::new();
     expected_fee_bytes.extend_from_slice(&encode_u16_field(1, 0x0073));
-    expected_fee_bytes.extend_from_slice(&encode_u64_field(5, 10));
+    expected_fee_bytes.extend_from_slice(&encode_u32_field(2, 0)); // Flags
     expected_fee_bytes.extend_from_slice(&encode_u32_field(30, 10));
     expected_fee_bytes.extend_from_slice(&encode_u32_field(31, 20));
     expected_fee_bytes.extend_from_slice(&encode_u32_field(32, 30));
-    expected_fee_bytes.push(OBJECT_END);
+    expected_fee_bytes.extend_from_slice(&encode_u64_field(5, 10));
 
     let items = build_genesis_setup_items(&config, [amendment]);
 

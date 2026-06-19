@@ -135,10 +135,8 @@ fn amendments_entry_bytes(amendments: &[Uint256], include_majorities: bool) -> V
         bytes.extend_from_slice(&encode_field_id(14, 18));
         bytes.extend_from_slice(&encode_uint256_field(19, sample_uint256(0xA6)));
         bytes.extend_from_slice(&encode_u32_field(7, 999));
-        bytes.push(OBJECT_END);
         bytes.push(ARRAY_END);
     }
-    bytes.push(OBJECT_END);
     bytes
 }
 
@@ -216,18 +214,18 @@ fn fee_settings_entry_bytes(
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&encode_u16_field(1, 0x0073));
+    bytes.extend_from_slice(&encode_u32_field(2, 0)); // Flags
     if let Some((base, reserve, increment)) = legacy {
-        bytes.extend_from_slice(&encode_u64_field(5, base));
         bytes.extend_from_slice(&encode_u32_field(30, 256));
         bytes.extend_from_slice(&encode_u32_field(31, reserve));
         bytes.extend_from_slice(&encode_u32_field(32, increment));
+        bytes.extend_from_slice(&encode_u64_field(5, base));
     }
     if let Some((base, reserve, increment)) = xrp {
         bytes.extend_from_slice(&base);
         bytes.extend_from_slice(&reserve);
         bytes.extend_from_slice(&increment);
     }
-    bytes.push(OBJECT_END);
     bytes
 }
 
@@ -3535,11 +3533,11 @@ fn build_genesis_setup_items_uses_legacy_fee_object_without_xrp_fees_amendment()
     let config = sample_ledger_config([sample_uint256(0xD2)]);
     let mut expected_fee_bytes = Vec::new();
     expected_fee_bytes.extend_from_slice(&encode_u16_field(1, 0x0073));
-    expected_fee_bytes.extend_from_slice(&encode_u64_field(5, 10));
+    expected_fee_bytes.extend_from_slice(&encode_u32_field(2, 0)); // Flags
     expected_fee_bytes.extend_from_slice(&encode_u32_field(30, 10));
     expected_fee_bytes.extend_from_slice(&encode_u32_field(31, 20));
     expected_fee_bytes.extend_from_slice(&encode_u32_field(32, 30));
-    expected_fee_bytes.push(OBJECT_END);
+    expected_fee_bytes.extend_from_slice(&encode_u64_field(5, 10));
 
     let items = build_genesis_setup_items(&config, [amendment]);
 
@@ -3810,7 +3808,6 @@ fn amendment_helpers_return_empty_when_amendments_entry_is_missing_or_empty() {
     empty_amendments_payload.extend_from_slice(&encode_u32_field(4, 1));
     empty_amendments_payload.extend_from_slice(&encode_u32_field(5, 2));
     empty_amendments_payload.extend_from_slice(&encode_u32_field(6, 3));
-    empty_amendments_payload.push(OBJECT_END);
     let empty_entry = Ledger::from_maps(
         LedgerHeader {
             seq: 1,
@@ -4052,7 +4049,6 @@ fn build_genesis_master_account_root_item_matches_current_cpp_constants() {
     expected_payload.extend_from_slice(&encode_u256_field(5, Uint256::zero())); // PreviousTxnID=0 (soeREQUIRED)
     expected_payload.extend_from_slice(&encode_native_amount_field(2, INITIAL_XRP_DROPS));
     expected_payload.extend_from_slice(&encode_account_field(1, account_id));
-    expected_payload.push(OBJECT_END);
 
     let (key, payload) = build_genesis_master_account_root_item(INITIAL_XRP_DROPS);
 

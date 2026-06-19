@@ -290,7 +290,6 @@ pub fn encode_account_root_entry(
     append_u256_field(&mut bytes, SF_PREVIOUS_TXN_ID, Uint256::zero());
     append_native_amount_field(&mut bytes, SF_BALANCE, balance_drops);
     append_account_field(&mut bytes, SF_ACCOUNT, account_id);
-    bytes.push(0xE1); // end-of-object marker
     bytes
 }
 
@@ -341,7 +340,6 @@ pub fn encode_ledger_hashes_entry(entry: &DecodedLedgerHashesEntry) -> Vec<u8> {
         append_u32_field(&mut bytes, SF_LAST_LEDGER_SEQUENCE, last_ledger_sequence);
     }
     append_vector256_field(&mut bytes, SF_HASHES, &entry.hashes);
-    bytes.push(0xE1);
     bytes
 }
 
@@ -378,7 +376,6 @@ pub fn encode_negative_unl_entry(entry: &DecodedNegativeUnlEntry) -> Vec<u8> {
         append_u32_field(&mut bytes, SF_PREVIOUS_TXN_LGR_SEQ, previous_txn_lgr_seq);
     }
 
-    bytes.push(0xE1);
     bytes
 }
 
@@ -423,7 +420,6 @@ pub fn encode_constructor_fee_settings_entry(entry: ConstructorFeeSettingsEntry)
         }
     }
 
-    bytes.push(0xE1); // end-of-object marker (reference STObject serialization parity)
     bytes
 }
 
@@ -1510,7 +1506,7 @@ mod tests {
                 1,
                 100_000_000_000_000_000,
             )),
-            "1100612200000000240000000125000000002D0000000055000000000000000000000000000000000000000000000000000000000000000062416345785D8A00008114B5F762798A53D543A014CAF8B297CFF8F2F937E8E1"
+            "1100612200000000240000000125000000002D0000000055000000000000000000000000000000000000000000000000000000000000000062416345785D8A00008114B5F762798A53D543A014CAF8B297CFF8F2F937E8"
         );
     }
 
