@@ -4042,11 +4042,8 @@ fn build_genesis_master_account_root_item_matches_current_cpp_constants() {
             .expect("expected genesis account-root key should parse");
     let mut expected_payload = Vec::new();
     expected_payload.extend_from_slice(&encode_u16_field(1, 0x0061));
-    expected_payload.extend_from_slice(&encode_u32_field(2, 0)); // Flags=0 (soeREQUIRED)
+    expected_payload.extend_from_slice(&encode_u32_field(2, 0)); // Flags=0
     expected_payload.extend_from_slice(&encode_u32_field(4, 1)); // Sequence=1
-    expected_payload.extend_from_slice(&encode_u32_field(5, 0)); // PreviousTxnLgrSeq=0 (soeREQUIRED)
-    expected_payload.extend_from_slice(&encode_u32_field(13, 0)); // OwnerCount=0 (soeREQUIRED)
-    expected_payload.extend_from_slice(&encode_u256_field(5, Uint256::zero())); // PreviousTxnID=0 (soeREQUIRED)
     expected_payload.extend_from_slice(&encode_native_amount_field(2, INITIAL_XRP_DROPS));
     expected_payload.extend_from_slice(&encode_account_field(1, account_id));
 

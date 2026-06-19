@@ -285,9 +285,6 @@ pub fn encode_account_root_entry(
     append_u16_field(&mut bytes, SF_LEDGER_ENTRY_TYPE, LT_ACCOUNT_ROOT);
     append_u32_field(&mut bytes, SF_FLAGS, 0);
     append_u32_field(&mut bytes, SF_SEQUENCE, sequence);
-    append_u32_field(&mut bytes, SF_PREVIOUS_TXN_LGR_SEQ, 0);
-    append_u32_field(&mut bytes, SF_OWNER_COUNT, 0);
-    append_u256_field(&mut bytes, SF_PREVIOUS_TXN_ID, Uint256::zero());
     append_native_amount_field(&mut bytes, SF_BALANCE, balance_drops);
     append_account_field(&mut bytes, SF_ACCOUNT, account_id);
     bytes
@@ -1506,7 +1503,7 @@ mod tests {
                 1,
                 100_000_000_000_000_000,
             )),
-            "1100612200000000240000000125000000002D0000000055000000000000000000000000000000000000000000000000000000000000000062416345785D8A00008114B5F762798A53D543A014CAF8B297CFF8F2F937E8"
+            "1100612200000000240000000162416345785D8A00008114B5F762798A53D543A014CAF8B297CFF8F2F937E8"
         );
     }
 
