@@ -894,8 +894,6 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
     let mut last_consensus_tick = std::time::Instant::now();
 
     // Shared timestamp so the timer thread knows when the main loop last ticked.
-    let last_tick_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let last_tick_ms_clone = Arc::clone(&last_tick_ms);
 
     // Spawn a dedicated thread that drains proposals and ONLY ticks consensus
     // when the main loop is stalled (>2s since last tick). This prevents both
@@ -918,15 +916,6 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                     continue;
                 };
                 network_ops_rt.drain_proposals(consensus_rt.as_ref());
-                // Only tick if main loop hasn't ticked in >2 seconds (stalled)
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
-                let last = last_tick_ms_clone.load(Ordering::Relaxed);
-                if now_ms.saturating_sub(last) > 2000 {
-                    network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
-                }
             }
         })
         .expect("spawn consensus-timer thread");
@@ -951,11 +940,6 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                     network_ops_rt.drain_proposals(consensus_rt.as_ref());
                     network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
                     last_consensus_tick = std::time::Instant::now();
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    last_tick_ms.store(now_ms, Ordering::Relaxed);
                 }
             };
         }
