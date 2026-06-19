@@ -1430,7 +1430,8 @@ fn serve_get_ledger_requests(
     };
     let lm = lm_rt.ledger_master();
 
-    for req in requests {
+    // Limit to 2 requests per loop iteration to prevent I/O starvation
+    for req in requests.into_iter().take(2) {
         let Some(hash_bytes) = req.message.ledger_hash.as_deref() else {
             continue;
         };
