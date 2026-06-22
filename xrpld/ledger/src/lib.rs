@@ -1327,6 +1327,31 @@ impl Ledger {
         Ok(Some(item.key()))
     }
 
+    pub fn succ_with_family<CLOCK, S, C, F, MR, NS>(
+        &self,
+        key: Uint256,
+        last: Option<Uint256>,
+        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
+    ) -> Result<Option<Uint256>, TraversalError>
+    where
+        CLOCK: CacheClock,
+        S: BuildHasher + Clone,
+        C: FullBelowCache,
+        F: SHAMapNodeFetcher,
+        MR: MissingNodeReporter,
+    {
+        let Some(leaf) = self.state_map.upper_bound_with_family(key, family)? else {
+            return Ok(None);
+        };
+        let Some(item) = leaf.peek_item() else {
+            return Ok(None);
+        };
+        if last.is_some_and(|last| item.key() >= last) {
+            return Ok(None);
+        }
+        Ok(Some(item.key()))
+    }
+
     pub fn read(&self, keylet: Keylet) -> Result<Option<STLedgerEntry>, TraversalError> {
         if keylet.key == Uint256::zero() {
             return Ok(None);

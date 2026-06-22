@@ -58,15 +58,45 @@ impl LedgerDataSource for FakeLedgerDataSource {
         &self,
         ledger: &ledger_lookup::LedgerLookupLedger,
         binary: bool,
+        marker: Option<Uint256>,
+        limit: i64,
+        type_filter: LedgerEntryType,
     ) -> Result<LedgerDataResolved, ledger_lookup::RpcStatus> {
         if *ledger != self.ledger {
             return Err(ledger_lookup::RpcStatus::new(
                 ledger_lookup::RpcErrorCode::LedgerNotFound,
             ));
         }
-        self.responses.get(&binary).cloned().ok_or_else(|| {
+        let mut resolved = self.responses.get(&binary).cloned().ok_or_else(|| {
             ledger_lookup::RpcStatus::new(ledger_lookup::RpcErrorCode::LedgerNotFound)
-        })
+        })?;
+
+        let mut entries = resolved.entries;
+        entries.sort_by(|left, right| left.key.cmp(&right.key));
+
+        let start_key = marker.unwrap_or_default();
+        let mut remaining = limit;
+        let mut page = Vec::new();
+        let mut page_marker = None;
+
+        for entry in entries.into_iter().filter(|entry| entry.key > start_key) {
+            if remaining <= 0 {
+                let mut marker_key = entry.key;
+                marker_key.decrement();
+                page_marker = Some(marker_key);
+                break;
+            }
+
+            remaining -= 1;
+
+            if type_filter == LedgerEntryType::Any || type_filter == entry.entry_type {
+                page.push(entry);
+            }
+        }
+
+        resolved.entries = page;
+        resolved.marker = page_marker;
+        Ok(resolved)
     }
 }
 
@@ -93,6 +123,7 @@ fn resolved_for_errors() -> LedgerDataResolved {
             JsonValue::String("payload".to_owned()),
         )])),
         entries: vec![fake_entry(0x10, LedgerEntryType::AccountRoot)],
+        marker: None,
     }
 }
 
@@ -126,6 +157,7 @@ fn ledger_data_filters_limits_and_emits_marker() {
                     fake_entry(0x20, LedgerEntryType::Offer),
                     fake_entry(0x30, LedgerEntryType::Offer),
                 ],
+                marker: None,
             },
         )]),
     };
@@ -204,6 +236,7 @@ fn ledger_data_binary_uses_hex_and_skips_ledger_on_marker() {
                     JsonValue::String("binary".to_owned()),
                 )])),
                 entries: vec![fake_entry(0x40, LedgerEntryType::AccountRoot)],
+                marker: None,
             },
         )]),
     };
@@ -363,6 +396,7 @@ fn ledger_data_response_structure_fields() {
                     fake_entry(0x10, LedgerEntryType::AccountRoot),
                     fake_entry(0x20, LedgerEntryType::Offer),
                 ],
+                marker: None,
             },
         )]),
     };
@@ -441,6 +475,7 @@ fn ledger_data_type_filter_account_root_only() {
                     fake_entry(0x30, LedgerEntryType::AccountRoot),
                     fake_entry(0x40, LedgerEntryType::Check),
                 ],
+                marker: None,
             },
         )]),
     };
@@ -498,6 +533,7 @@ fn ledger_data_limit_zero_returns_all() {
                     fake_entry(0x20, LedgerEntryType::Offer),
                     fake_entry(0x30, LedgerEntryType::Check),
                 ],
+                marker: None,
             },
         )]),
     };

@@ -688,27 +688,8 @@ fn succ_lookup_ledger_key_with_family(
     last: Option<Uint256>,
 ) -> Option<Uint256> {
     with_lookup_ledger_family(app, resolved, |hydrated, family| {
-        let _ = family;
-        hydrated.succ(key, last).ok().flatten()
+        hydrated.succ_with_family(key, last, family).ok().flatten()
     })
-}
-
-fn visit_lookup_ledger_state_sles_with_family<VISIT>(
-    app: &ApplicationRoot,
-    resolved: &ledger::Ledger,
-    visit: &mut VISIT,
-) -> Result<(), TraversalError>
-where
-    VISIT: FnMut(&STLedgerEntry),
-{
-    with_lookup_ledger_family(app, resolved, |hydrated, family| {
-        hydrated
-            .visit_state_sles_with_family(family, visit)
-            .map(Some)
-            .unwrap_or(None)
-    })
-    .ok_or(TraversalError::MissingNode(SHAMapHash::default()))?;
-    Ok(())
 }
 
 fn read_lookup_ledger_entry<V: AppServerInfoView>(
@@ -737,27 +718,6 @@ fn succ_lookup_ledger_key<V: AppServerInfoView>(
         Ok(None) | Err(_) => view
             .app()
             .and_then(|app| succ_lookup_ledger_key_with_family(app, resolved.as_ref(), key, last)),
-    }
-}
-
-fn visit_lookup_ledger_state_sles<V: AppServerInfoView, VISIT>(
-    view: &V,
-    ledger: &LedgerLookupLedger,
-    visit: &mut VISIT,
-) -> Result<(), TraversalError>
-where
-    VISIT: FnMut(&STLedgerEntry),
-{
-    let resolved = resolve_lookup_ledger(view, ledger)
-        .ok_or(TraversalError::MissingNode(SHAMapHash::default()))?;
-    match resolved.visit_state_sles(visit) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let Some(app) = view.app() else {
-                return Err(error);
-            };
-            visit_lookup_ledger_state_sles_with_family(app, resolved.as_ref(), visit)
-        }
     }
 }
 
@@ -2294,31 +2254,66 @@ impl<V: AppServerInfoView> crate::handlers::ledger_data::LedgerDataSource
         &self,
         ledger: &LedgerLookupLedger,
         binary: bool,
+        marker: Option<Uint256>,
+        limit: i64,
+        type_filter: LedgerEntryType,
     ) -> Result<crate::handlers::ledger_data::LedgerDataResolved, crate::status::RpcStatus> {
         let mut options = ledger::LedgerFillOptions::new(0);
         if binary {
             options |= ledger::LedgerFillOptions::BINARY;
         }
         let ledger_json = self.render_selected_ledger(*ledger, options)?;
+        let mut page_marker = None;
         let mut entries = Vec::new();
-        visit_lookup_ledger_state_sles(&self.view, ledger, &mut |sle| {
-            let mut serializer = Serializer::new(256);
-            sle.add(&mut serializer);
-            entries.push(crate::handlers::ledger_data::LedgerDataEntry {
-                key: *sle.key(),
-                entry_type: sle.get_type(),
-                json: sle.json(JsonOptions::NONE),
-                binary: serializer.data().to_vec(),
-            });
-        })
-        .map_err(|_| {
-            crate::status::RpcStatus::new(crate::status::RpcErrorCode::DbDeserialization)
-        })?;
+        let mut key = marker.unwrap_or_default();
+        let mut remaining = limit;
+
+        while let Some(next_key) = succ_lookup_ledger_key(&self.view, ledger, key, None) {
+            let Some(sle) =
+                read_lookup_ledger_entry(&self.view, ledger, unchecked_keylet(next_key))
+            else {
+                return Err(crate::status::RpcStatus::new(
+                    crate::status::RpcErrorCode::DbDeserialization,
+                ));
+            };
+
+            if remaining <= 0 {
+                let mut marker_key = *sle.key();
+                marker_key.decrement();
+                page_marker = Some(marker_key);
+                break;
+            }
+            remaining -= 1;
+
+            if type_filter == LedgerEntryType::Any || type_filter == sle.get_type() {
+                let binary_data = if binary {
+                    let mut serializer = Serializer::new(256);
+                    sle.add(&mut serializer);
+                    serializer.data().to_vec()
+                } else {
+                    Vec::new()
+                };
+                let json = if binary {
+                    JsonValue::Null
+                } else {
+                    sle.json(JsonOptions::NONE)
+                };
+                entries.push(crate::handlers::ledger_data::LedgerDataEntry {
+                    key: *sle.key(),
+                    entry_type: sle.get_type(),
+                    json,
+                    binary: binary_data,
+                });
+            }
+
+            key = next_key;
+        }
 
         Ok(crate::handlers::ledger_data::LedgerDataResolved {
             base_json: JsonValue::Object(BTreeMap::new()),
             ledger_json,
             entries,
+            marker: page_marker,
         })
     }
 }
