@@ -32,7 +32,7 @@ pub use app_server_info_warnings::{
 };
 pub use context::{JsonContext, JsonContextHeaders, RpcLoadType, RpcRequestContext, RpcRuntime};
 pub use role::*;
-pub use server_definitions::do_server_definitions;
+pub use server_definitions::{do_server_definitions, do_server_definitions_cached};
 pub use server_info::*;
 pub use server_state::*;
 pub use tx_support::*;

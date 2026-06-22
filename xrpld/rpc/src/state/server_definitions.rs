@@ -7,7 +7,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use basics::base_uint::Uint256;
@@ -18,6 +18,53 @@ use protocol::{
 };
 
 use crate::commands::rpc_helpers::invalid_field_error;
+
+// Pre-serialized JSON bytes for the full server_definitions response (no hash
+// filter). Built once on first request via `OnceLock`; subsequent calls return
+// the same `Arc` with zero allocation.
+//
+// Uses `json_to_compact_string` (defined below in this file) so there is no
+// external-crate dependency required for serialisation.
+static SERVER_DEFS_BYTES: OnceLock<std::sync::Arc<str>> = OnceLock::new();
+
+fn server_defs_compact_str() -> &'static std::sync::Arc<str> {
+    SERVER_DEFS_BYTES.get_or_init(|| {
+        // server_definitions() is itself OnceLock-cached, so this only
+        // computes the JsonValue tree once.  We then serialise it once here.
+        json_to_compact_string(server_definitions().get()).into()
+    })
+}
+
+/// Returns the full `server_definitions` response pre-serialised as a compact
+/// JSON `Arc<str>`.  Callers in the HTTP/WS transport can return this directly
+/// as a response body with no further allocations.
+///
+/// Returns `None` when the caller supplied a `hash` parameter that matches the
+/// current definitions hash (short-circuit "not changed" path).
+pub fn do_server_definitions_cached(params: &JsonValue) -> Option<std::sync::Arc<str>> {
+    let requested_hash = match params {
+        JsonValue::Object(object) => match object.get("hash") {
+            Some(JsonValue::String(hash)) => {
+                let Ok(hash) = Uint256::from_hex(hash) else {
+                    // Invalid hash param — let do_server_definitions handle the error.
+                    return None;
+                };
+                Some(hash)
+            }
+            Some(_) => return None, // invalid type — fall through to error path
+            None => None,
+        },
+        _ => None,
+    };
+
+    let defs = server_definitions();
+    if requested_hash.is_some_and(|hash| defs.hash_matches(hash)) {
+        // Client already has current definitions; skip the full response.
+        return None;
+    }
+
+    Some(Arc::clone(server_defs_compact_str()))
+}
 
 struct ServerDefinitions {
     defs_hash: Uint256,
