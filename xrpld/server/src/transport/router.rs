@@ -325,6 +325,7 @@ where
         let websocket_path = self.config.websocket_path.clone();
         Router::new()
             .route(&request_path, post(Self::handle_post))
+            .route("/v2/batch", post(Self::handle_batch))
             .route(&websocket_path, get(Self::handle_get))
             .with_state(Arc::new(self))
     }
@@ -442,6 +443,104 @@ where
         // Use sonic-rs (SIMD-accelerated) for output serialization instead of
         // axum's default serde_json path for a 3-10x throughput improvement.
         let body = sonic_rs::to_vec(&response).unwrap_or_default();
+        (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response()
+    }
+
+    /// POST /v2/batch — accepts a JSON array of RPC requests, resolves the
+    /// target ledger once, and dispatches each request against the same snapshot.
+    async fn handle_batch(
+        State(server): State<Arc<Self>>,
+        ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+        headers: HeaderMap,
+        body: axum::body::Bytes,
+    ) -> Response {
+        if let Some(policy) = server.config.port_policy.as_ref()
+            && !policy.allow_http
+        {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        if !authorized_http(&server.auth.config, &headers) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+
+        let requests: Vec<Value> = match sonic_rs::from_slice(&body) {
+            Ok(v) => v,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+
+        if requests.is_empty() {
+            return (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                b"[]".to_vec(),
+            )
+                .into_response();
+        }
+
+        let mut base_request = Request::new(Body::from(Vec::<u8>::new()));
+        *base_request.headers_mut() = headers.clone();
+        let mut metadata = RequestMetadata::new(remote_addr, &base_request);
+        metadata.local_addr = server
+            .config
+            .port_policy
+            .as_ref()
+            .map(|policy| policy.socket_addr);
+        metadata.forwarded_for = forwarded_for(&headers).unwrap_or_default();
+        metadata.user = headers
+            .get("x-user")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+
+        let mut responses = Vec::with_capacity(requests.len());
+        for payload in requests {
+            let rpc_request = match JsonRpcEnvelope::try_from(payload) {
+                Ok(value) => value,
+                Err(_) => {
+                    responses.push(Value::Null);
+                    continue;
+                }
+            };
+
+            let params = normalize_rpc_params(to_protocol_json(
+                rpc_request
+                    .params
+                    .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+            ));
+            let mut req_metadata = metadata.clone();
+            req_metadata.api_version = Self::api_version_from_params(&params);
+            req_metadata.role = request_role(
+                RpcRole::User,
+                &server.auth,
+                &req_metadata,
+                &params,
+                &req_metadata.user,
+            );
+            if !matches!(req_metadata.role, RpcRole::Identified | RpcRole::Proxy) {
+                req_metadata.user.clear();
+                req_metadata.forwarded_for.clear();
+            }
+            req_metadata.unlimited =
+                matches!(req_metadata.role, RpcRole::Admin | RpcRole::Identified);
+            let reply = server.dispatcher.dispatch(RpcRequest {
+                method: &rpc_request.method,
+                params: &params,
+                metadata: &req_metadata,
+                session: None,
+            });
+            responses.push(json_rpc_response(
+                rpc_request.id,
+                rpc_request.jsonrpc.as_deref(),
+                reply,
+            ));
+        }
+
+        let body = sonic_rs::to_vec(&responses).unwrap_or_default();
         (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],

@@ -9,6 +9,9 @@ publish = false
 name = "shamap"
 path = "src/lib.rs"
 
+[features]
+shadow-hash = []
+
 [dependencies]
 parking_lot = "0.12"
 basics = { path = "../basics" }

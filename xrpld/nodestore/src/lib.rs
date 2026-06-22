@@ -1,6 +1,9 @@
 mod backends;
+pub mod columnar;
 mod database_runtime;
 mod format;
+#[cfg(feature = "gpu-hash")]
+pub mod gpu_hasher;
 pub mod snapshot;
 
 pub use backends::backend;

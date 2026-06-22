@@ -30,6 +30,8 @@ pub mod lending;
 pub mod loan;
 pub mod paths;
 pub mod preflight;
+#[cfg(feature = "speculative-exec")]
+pub mod speculative;
 pub mod transactor;
 pub mod utility;
 

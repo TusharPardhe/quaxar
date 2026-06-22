@@ -5,6 +5,7 @@ pub mod multi_api_json;
 pub mod serialize;
 pub mod serializer;
 pub mod sfield;
+pub mod sle_view;
 pub mod so_template;
 pub mod st_account;
 pub mod st_bit_string;

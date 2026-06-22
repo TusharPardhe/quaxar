@@ -16,4 +16,9 @@ ledger = { path = "../ledger" }
 tracing = "0.1"
 xrpl_core = { path = "../../xrpl/core" }
 
+rayon = { version = "1", optional = true }
+
+[features]
+speculative-exec = ["rayon"]
+
 [dev-dependencies]

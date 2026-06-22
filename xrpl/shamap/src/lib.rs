@@ -11,8 +11,12 @@ pub mod nodes;
 pub mod operations;
 pub mod owners;
 pub mod traverse;
+pub mod cow_shamap;
+pub mod delta_tracker;
 
 pub use nodes::*;
 pub use operations::*;
 pub use owners::*;
 pub use traverse::*;
+pub use cow_shamap::CowSHAMap;
+pub use delta_tracker::DeltaTracker;
