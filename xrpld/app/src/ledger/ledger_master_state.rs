@@ -1,7 +1,7 @@
 use crate::state::time_keeper::{TimeKeeper, TimeKeeperClock};
+use arc_swap::ArcSwapOption;
 use ledger::{Ledger, LedgerMasterCaughtUp};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -20,9 +20,9 @@ where
 
 pub struct SharedLedgerMasterState {
     close_time_provider: Arc<dyn LedgerMasterCloseTimeProvider>,
-    closed_ledger: Mutex<Option<Arc<Ledger>>>,
-    validated_ledger: Mutex<Option<Arc<Ledger>>>,
-    published_ledger: Mutex<Option<Arc<Ledger>>>,
+    closed_ledger: ArcSwapOption<Ledger>,
+    validated_ledger: ArcSwapOption<Ledger>,
+    published_ledger: ArcSwapOption<Ledger>,
     validated_close_time: AtomicU32,
     published_close_time: AtomicU32,
 }
@@ -43,35 +43,26 @@ impl SharedLedgerMasterState {
     pub fn new(close_time_provider: Arc<dyn LedgerMasterCloseTimeProvider>) -> Self {
         Self {
             close_time_provider,
-            closed_ledger: Mutex::new(None),
-            validated_ledger: Mutex::new(None),
-            published_ledger: Mutex::new(None),
+            closed_ledger: ArcSwapOption::empty(),
+            validated_ledger: ArcSwapOption::empty(),
+            published_ledger: ArcSwapOption::empty(),
             validated_close_time: AtomicU32::new(0),
             published_close_time: AtomicU32::new(0),
         }
     }
 
     pub fn note_closed_ledger(&self, ledger: Arc<Ledger>) {
-        *self
-            .closed_ledger
-            .lock()
-            .expect("closed ledger mutex must not be poisoned") = Some(ledger);
+        self.closed_ledger.store(Some(ledger));
     }
 
     pub fn note_validated_ledger(&self, ledger: Arc<Ledger>) {
         self.set_validated_close_time(ledger.header().close_time);
-        *self
-            .validated_ledger
-            .lock()
-            .expect("validated ledger mutex must not be poisoned") = Some(ledger);
+        self.validated_ledger.store(Some(ledger));
     }
 
     pub fn note_published_ledger(&self, ledger: Arc<Ledger>) {
         self.set_published_close_time(ledger.header().close_time);
-        *self
-            .published_ledger
-            .lock()
-            .expect("published ledger mutex must not be poisoned") = Some(ledger);
+        self.published_ledger.store(Some(ledger));
     }
 
     pub fn set_validated_close_time(&self, close_time: u32) {
@@ -85,32 +76,20 @@ impl SharedLedgerMasterState {
     }
 
     pub fn clear_validated_ledger(&self) {
-        *self
-            .validated_ledger
-            .lock()
-            .expect("validated ledger mutex must not be poisoned") = None;
+        self.validated_ledger.store(None);
         self.validated_close_time.store(0, Ordering::Release);
     }
 
     pub fn closed_ledger(&self) -> Option<Arc<Ledger>> {
-        self.closed_ledger
-            .lock()
-            .expect("closed ledger mutex must not be poisoned")
-            .clone()
+        self.closed_ledger.load_full()
     }
 
     pub fn validated_ledger(&self) -> Option<Arc<Ledger>> {
-        self.validated_ledger
-            .lock()
-            .expect("validated ledger mutex must not be poisoned")
-            .clone()
+        self.validated_ledger.load_full()
     }
 
     pub fn published_ledger(&self) -> Option<Arc<Ledger>> {
-        self.published_ledger
-            .lock()
-            .expect("published ledger mutex must not be poisoned")
-            .clone()
+        self.published_ledger.load_full()
     }
 
     pub fn closed_ledger_seq(&self) -> Option<u32> {

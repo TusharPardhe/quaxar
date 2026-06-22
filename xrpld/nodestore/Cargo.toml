@@ -16,7 +16,7 @@ protocol = { path = "../../xrpl/protocol" }
 librocksdb-sys = "0.16.0"
 lz4_flex = "0.11"
 rocksdb = { version = "0.22", default-features = false, features = ["snappy"] }
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 tracing = "0.1"
 xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 

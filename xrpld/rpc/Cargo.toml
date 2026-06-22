@@ -22,7 +22,7 @@ ipnet = "2"
 protocol = { path = "../../xrpl/protocol" }
 rand = "0.8"
 serde_json = "1"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 hex = "0.4"
 shamap = { path = "../../xrpl/shamap" }
 time = "0.3"

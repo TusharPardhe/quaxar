@@ -472,10 +472,7 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
                     jss::engine_result.to_string(),
                     JsonValue::String("telLOCAL_ERROR".to_string()),
                 );
-                ret.insert(
-                    jss::engine_result_code.to_string(),
-                    JsonValue::Signed(-399),
-                );
+                ret.insert(jss::engine_result_code.to_string(), JsonValue::Signed(-399));
                 return Ok(JsonValue::Object(ret));
             }
         };

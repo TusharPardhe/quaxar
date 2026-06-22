@@ -1731,9 +1731,7 @@ fn nftoken_modify_nonexistent() {
     });
     let result = handle_real_dispatch(&mut view, &tx, TxType::NFTOKEN_MODIFY, None);
     assert!(
-        result == Ter::TEC_NO_ENTRY
-            || result == Ter::TES_SUCCESS
-            || result == Ter::TEM_DISABLED,
+        result == Ter::TEC_NO_ENTRY || result == Ter::TES_SUCCESS || result == Ter::TEM_DISABLED,
         "Got {:?}",
         result
     );

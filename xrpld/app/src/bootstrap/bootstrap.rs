@@ -21,8 +21,8 @@ use ledger::{
 };
 use nodestore::{FetchType, ManagerImp, NodeObjectType as NodeStoreObjectType};
 use protocol::{
-    JsonValue, REGISTERED_FEATURES, RegisteredFeatureVote, STLedgerEntry, STParsedJSONObject,
-    STTx, SerialIter, TxMeta, feature_id,
+    JsonValue, REGISTERED_FEATURES, RegisteredFeatureVote, STLedgerEntry, STParsedJSONObject, STTx,
+    SerialIter, TxMeta, feature_id,
 };
 use rusqlite::{OptionalExtension, params};
 use shamap::family::{
@@ -690,7 +690,8 @@ pub fn build_bootstrap_root(
         // explicitly promote key_listings to trusted_master_keys. Without this,
         // validations from peers are dropped as "untrusted".
         if config.section("validator_list_sites").empty() && !config_keys.is_empty() {
-            root.validators().update_trusted(&std::collections::HashSet::new(), 0);
+            root.validators()
+                .update_trusted(&std::collections::HashSet::new(), 0);
         }
     }
 
@@ -817,7 +818,9 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
         // This thread exclusively drives consensus in --start mode.
         // For genesis (seq=1), start immediately like rippled (no waiting).
         // For joining an existing network (seq>1), wait for peer confirmation.
-        let is_genesis = runtime.root().ledger_master_runtime()
+        let is_genesis = runtime
+            .root()
+            .ledger_master_runtime()
             .and_then(|lm| lm.ledger_master().closed_ledger())
             .map(|l| l.header().seq <= 1)
             .unwrap_or(false);
@@ -826,12 +829,14 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
         }
         let stop_flag = Arc::clone(&consensus_stop);
         let rt = Arc::clone(&runtime);
-        Some(std::thread::Builder::new()
-            .name("start-mode-consensus".into())
-            .spawn(move || {
-                run_start_mode_consensus_loop(rt.clone(), stop_flag.clone());
-            })
-            .expect("failed to spawn start-mode-consensus thread"))
+        Some(
+            std::thread::Builder::new()
+                .name("start-mode-consensus".into())
+                .spawn(move || {
+                    run_start_mode_consensus_loop(rt.clone(), stop_flag.clone());
+                })
+                .expect("failed to spawn start-mode-consensus thread"),
+        )
     } else {
         None
     };
@@ -909,10 +914,9 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                     break;
                 }
                 let root = consensus_timer_runtime.root();
-                let (Some(consensus_rt), Some(network_ops_rt)) = (
-                    root.consensus_runtime(),
-                    root.network_ops_runtime(),
-                ) else {
+                let (Some(consensus_rt), Some(network_ops_rt)) =
+                    (root.consensus_runtime(), root.network_ops_runtime())
+                else {
                     continue;
                 };
                 network_ops_rt.drain_proposals(consensus_rt.as_ref());
@@ -920,8 +924,11 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 // raced ahead of validated (prevents drift).
                 let should_tick = if let Some(lm) = root.ledger_master_runtime() {
                     let valid_seq = lm.ledger_master().valid_ledger_seq();
-                    let closed_seq = lm.ledger_master().closed_ledger()
-                        .map(|l| l.header().seq).unwrap_or(0);
+                    let closed_seq = lm
+                        .ledger_master()
+                        .closed_ledger()
+                        .map(|l| l.header().seq)
+                        .unwrap_or(0);
                     // Tick if: still in startup (valid=0) or not too far ahead
                     valid_seq == 0 || closed_seq <= valid_seq + 2
                 } else {
@@ -970,20 +977,21 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
                     use overlay::Overlay;
                     let hdr = closed.header();
-                    let status = overlay::ProtocolMessage::new(
-                        overlay::ProtocolPayload::StatusChange(
+                    let status =
+                        overlay::ProtocolMessage::new(overlay::ProtocolPayload::StatusChange(
                             overlay::message::wire::TmStatusChange {
                                 new_status: Some(1),
                                 new_event: Some(1),
                                 ledger_seq: Some(hdr.seq),
                                 ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
-                                ledger_hash_previous: Some(hdr.parent_hash.as_uint256().data().to_vec()),
+                                ledger_hash_previous: Some(
+                                    hdr.parent_hash.as_uint256().data().to_vec(),
+                                ),
                                 network_time: None,
                                 first_seq: Some(1),
                                 last_seq: Some(hdr.seq),
                             },
-                        ),
-                    );
+                        ));
                     overlay_rt.overlay().broadcast(&status);
                 }
             }
@@ -995,16 +1003,18 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             if true {
                 use overlay::Overlay;
                 let peers = overlay_rt.overlay().active_peers();
-                if true { // Start even without peers like rippled
+                if true {
+                    // Start even without peers like rippled
                     let any_ahead = peers.iter().find(|p| {
                         let h = p.closed_ledger_hash();
                         if h.is_zero() {
                             return false;
                         }
                         if let Some(lm_rt) = root.ledger_master_runtime() {
-                            lm_rt.ledger_master().get_ledger_by_hash(
-                                basics::sha_map_hash::SHAMapHash::new(h),
-                            ).is_none()
+                            lm_rt
+                                .ledger_master()
+                                .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(h))
+                                .is_none()
                         } else {
                             false
                         }
@@ -1013,7 +1023,8 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                         // Trigger acquisition for that peer's ledger.
                         let closed_hash = peer.closed_ledger_hash();
                         if let Some(lm_rt) = root.ledger_master_runtime() {
-                            let mut pending = lm_rt.pending_consensus_ledger
+                            let mut pending = lm_rt
+                                .pending_consensus_ledger
                                 .lock()
                                 .expect("pending_consensus_ledger lock");
                             if pending.is_none() {
@@ -1034,10 +1045,10 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                         if let Some(lm_rt) = root.ledger_master_runtime() {
                             if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
                                 let closed_hash = *closed.header().hash.as_uint256();
-                                let any_confirmed = peers.iter().any(|p| {
-                                    !p.closed_ledger_hash().is_zero()
-                                });
-                                if true && root.need_network_ledger() { // Start immediately like rippled
+                                let any_confirmed =
+                                    peers.iter().any(|p| !p.closed_ledger_hash().is_zero());
+                                if true && root.need_network_ledger() {
+                                    // Start immediately like rippled
                                     // Drain queued proposals into the consensus
                                     // engine BEFORE starting so that startRound's
                                     // playback_proposals finds them (matching
@@ -1046,20 +1057,27 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                                     let proposals = overlay_rt.overlay().take_proposals();
                                     for proposal in &proposals {
                                         let now = root.shared_time_keeper().close_time();
-                                        let peer_close_time = basics::chrono::NetClockTimePoint::new(proposal.message.close_time);
+                                        let peer_close_time =
+                                            basics::chrono::NetClockTimePoint::new(
+                                                proposal.message.close_time,
+                                            );
                                         let prop = consensus::ConsensusProposal::new(
-                                            proposal.previous_ledger, proposal.message.propose_seq,
+                                            proposal.previous_ledger,
+                                            proposal.message.propose_seq,
                                             proposal.current_tx_hash,
-                                            peer_close_time, now,
+                                            peer_close_time,
+                                            now,
                                             proposal.public_key,
                                         );
-                                        consensus_rt.push_proposal(crate::runtime::component_runtime::PendingProposal {
-                                            now,
-                                            public_key: proposal.public_key,
-                                            signature: proposal.message.signature.clone(),
-                                            suppression_id: proposal.suppression,
-                                            proposal: prop,
-                                        });
+                                        consensus_rt.push_proposal(
+                                            crate::runtime::component_runtime::PendingProposal {
+                                                now,
+                                                public_key: proposal.public_key,
+                                                signature: proposal.message.signature.clone(),
+                                                suppression_id: proposal.suppression,
+                                                proposal: prop,
+                                            },
+                                        );
                                     }
                                     if network_ops_rt.maybe_begin_consensus_from_validated(
                                         consensus_rt.as_ref(),
@@ -1106,14 +1124,17 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 // trigger acquisition from the peer that sent it.
                 if validation.is_trusted() {
                     let val_hash = validation.get_ledger_hash();
-                    let val_seq = validation.get_field_u32(
-                        protocol::get_field_by_symbol("sfLedgerSequence"));
+                    let val_seq =
+                        validation.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence"));
                     if let Some(lm_rt) = root.ledger_master_runtime() {
                         let lm = lm_rt.ledger_master();
-                        if lm.get_ledger_by_hash(
-                            basics::sha_map_hash::SHAMapHash::new(val_hash),
-                        ).is_none() && val_seq > 1 {
-                            let mut pending = lm_rt.pending_consensus_ledger
+                        if lm
+                            .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(val_hash))
+                            .is_none()
+                            && val_seq > 1
+                        {
+                            let mut pending = lm_rt
+                                .pending_consensus_ledger
                                 .lock()
                                 .expect("pending_consensus_ledger lock");
                             if pending.is_none() {
@@ -1164,47 +1185,52 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         // Always drain here — proposals go into the pending queue which
         // timer_tick (driven by either bootstrap or main.rs) consumes.
         if consensus_started {
-        let proposals = overlay_rt.overlay().take_proposals();
-        for proposal in &proposals {
-            // If peers are proposing on a ledger we don't have, trigger
-            // acquisition so we can switch to their chain.
-            if let Some(lm_rt) = root.ledger_master_runtime() {
-                let lm = lm_rt.ledger_master();
-                if lm.get_ledger_by_hash(
-                    basics::sha_map_hash::SHAMapHash::new(proposal.previous_ledger),
-                ).is_none() {
-                    let mut pending = lm_rt.pending_consensus_ledger
-                        .lock()
-                        .expect("pending_consensus_ledger lock");
-                    if pending.is_none() {
-                        *pending = Some(proposal.previous_ledger);
-                        tracing::info!(target: "consensus",
-                            hash = %proposal.previous_ledger,
-                            "Triggering acquisition for peer's previous_ledger"
-                        );
+            let proposals = overlay_rt.overlay().take_proposals();
+            for proposal in &proposals {
+                // If peers are proposing on a ledger we don't have, trigger
+                // acquisition so we can switch to their chain.
+                if let Some(lm_rt) = root.ledger_master_runtime() {
+                    let lm = lm_rt.ledger_master();
+                    if lm
+                        .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(
+                            proposal.previous_ledger,
+                        ))
+                        .is_none()
+                    {
+                        let mut pending = lm_rt
+                            .pending_consensus_ledger
+                            .lock()
+                            .expect("pending_consensus_ledger lock");
+                        if pending.is_none() {
+                            *pending = Some(proposal.previous_ledger);
+                            tracing::info!(target: "consensus",
+                                hash = %proposal.previous_ledger,
+                                "Triggering acquisition for peer's previous_ledger"
+                            );
+                        }
                     }
                 }
             }
-        }
-        for proposal in proposals {
-            let now = root.shared_time_keeper().close_time();
-            let peer_close_time = basics::chrono::NetClockTimePoint::new(proposal.message.close_time);
-            let prop = consensus::ConsensusProposal::new(
-                proposal.previous_ledger,
-                proposal.message.propose_seq,
-                proposal.current_tx_hash,
-                peer_close_time,
-                now,
-                proposal.public_key,
-            );
-            consensus_rt.push_proposal(crate::runtime::component_runtime::PendingProposal {
-                now,
-                public_key: proposal.public_key,
-                signature: proposal.message.signature.clone(),
-                suppression_id: proposal.suppression,
-                proposal: prop,
-            });
-        }
+            for proposal in proposals {
+                let now = root.shared_time_keeper().close_time();
+                let peer_close_time =
+                    basics::chrono::NetClockTimePoint::new(proposal.message.close_time);
+                let prop = consensus::ConsensusProposal::new(
+                    proposal.previous_ledger,
+                    proposal.message.propose_seq,
+                    proposal.current_tx_hash,
+                    peer_close_time,
+                    now,
+                    proposal.public_key,
+                );
+                consensus_rt.push_proposal(crate::runtime::component_runtime::PendingProposal {
+                    now,
+                    public_key: proposal.public_key,
+                    signature: proposal.message.signature.clone(),
+                    suppression_id: proposal.suppression,
+                    proposal: prop,
+                });
+            }
         }
 
         // Drain and process inbound validations.
@@ -1260,7 +1286,9 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                             root.signal_fetch_pack_ready();
                         }
                     }
-                } else if msg.r#type == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32 {
+                } else if msg.r#type
+                    == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32
+                {
                     // Request: peer asks us for a fetch pack (matching rippled doFetchPack/makeFetchPack).
                     serve_fetch_pack_request(root, &overlay_rt, msg_envelope);
                 }
@@ -1272,12 +1300,16 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         // (matching rippled's done() → storeLedger() with 50ms latency).
         // Insert with validated=true so ledgers are indexed by seq for tryAdvance lookups.
         if let Some(lm_rt) = root.ledger_master_runtime() {
-            let rx_guard = lm_rt.completed_ledgers_rx.lock().expect("completed_ledgers_rx");
+            let rx_guard = lm_rt
+                .completed_ledgers_rx
+                .lock()
+                .expect("completed_ledgers_rx");
             if let Some(rx) = rx_guard.as_ref() {
                 while let Ok(ledger) = rx.try_recv() {
-                    lm_rt.ledger_master().ledger_history().insert(
-                        std::sync::Arc::clone(&ledger), true,
-                    );
+                    lm_rt
+                        .ledger_master()
+                        .ledger_history()
+                        .insert(std::sync::Arc::clone(&ledger), true);
                 }
             }
         }
@@ -1315,14 +1347,8 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                         let mut l = (*closed).clone();
                         l.set_validated();
                         let validated = std::sync::Arc::new(l);
-                        lm.set_valid_ledger_no_sweep(
-                            std::sync::Arc::clone(&validated),
-                            None,
-                            None,
-                        );
-                        root.note_validated_ledger_for_sync(
-                            std::sync::Arc::clone(&validated),
-                        );
+                        lm.set_valid_ledger_no_sweep(std::sync::Arc::clone(&validated), None, None);
+                        root.note_validated_ledger_for_sync(std::sync::Arc::clone(&validated));
                         root.set_need_network_ledger(false);
                         tracing::info!(target: "consensus",
                             seq = closed_seq, val_count, quorum,
@@ -1351,14 +1377,8 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 let mut l = (*candidate).clone();
                 l.set_validated();
                 let validated = std::sync::Arc::new(l);
-                lm.set_valid_ledger_no_sweep(
-                    std::sync::Arc::clone(&validated),
-                    None,
-                    None,
-                );
-                root.note_validated_ledger_for_sync(
-                    std::sync::Arc::clone(&validated),
-                );
+                lm.set_valid_ledger_no_sweep(std::sync::Arc::clone(&validated), None, None);
+                root.note_validated_ledger_for_sync(std::sync::Arc::clone(&validated));
                 root.set_need_network_ledger(false);
                 advanced += 1;
             }
@@ -1376,14 +1396,18 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             // directly — no need to fetch from peers.
             if advanced == 0 && lm.valid_ledger_seq() == 0 {
                 use overlay::Overlay;
-                let our_closed_hash = lm.closed_ledger()
+                let our_closed_hash = lm
+                    .closed_ledger()
                     .map(|l| *l.header().hash.as_uint256())
                     .unwrap_or(basics::base_uint::Uint256::zero());
                 let peers = overlay_rt.overlay().active_peers();
-                let in_sync = peers.iter().any(|p| p.closed_ledger_hash() == our_closed_hash);
+                let in_sync = peers
+                    .iter()
+                    .any(|p| p.closed_ledger_hash() == our_closed_hash);
                 // Only request when out of sync, throttled to once per 30 seconds
                 if !in_sync && !peers.is_empty() {
-                    static LAST_GAP_FILL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static LAST_GAP_FILL: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -1395,7 +1419,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                             let peer_hash = p.closed_ledger_hash();
                             if !peer_hash.is_zero() {
                                 let fp_msg = ledger::make_fetch_pack_request(
-                                    basics::sha_map_hash::SHAMapHash::new(peer_hash)
+                                    basics::sha_map_hash::SHAMapHash::new(peer_hash),
                                 );
                                 let wire = overlay::Message::new(fp_msg, None);
                                 p.send(wire);
@@ -1438,9 +1462,8 @@ fn serve_get_ledger_requests(
         let Some(hash) = Uint256::from_slice(hash_bytes) else {
             continue;
         };
-        let Some(ledger) = lm.get_ledger_by_hash(
-            basics::sha_map_hash::SHAMapHash::new(hash),
-        ) else {
+        let Some(ledger) = lm.get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(hash))
+        else {
             continue;
         };
 
@@ -1485,7 +1508,9 @@ fn serve_get_ledger_requests(
                 let depth = req.message.query_depth.unwrap_or(1);
 
                 for node_id_bytes in &req.message.node_i_ds {
-                    let Some(node_id) = shamap::nodes::node_id::deserialize_shamap_node_id(node_id_bytes) else {
+                    let Some(node_id) =
+                        shamap::nodes::node_id::deserialize_shamap_node_id(node_id_bytes)
+                    else {
                         continue;
                     };
                     let mut data: Vec<(shamap::nodes::node_id::SHAMapNodeId, Vec<u8>)> = Vec::new();
@@ -1494,7 +1519,10 @@ fn serve_get_ledger_requests(
                             shamap::nodes::tree_node::SHAMapTreeNode,
                         >,
                     > { None };
-                    if map.get_node_fat(node_id, &mut data, fat_leaves, depth, &mut fetch).is_ok() {
+                    if map
+                        .get_node_fat(node_id, &mut data, fat_leaves, depth, &mut fetch)
+                        .is_ok()
+                    {
                         for (nid, ndata) in &data {
                             nodes.push(overlay::message::wire::TmLedgerNode {
                                 nodeid: Some(nid.get_raw_string()),
@@ -1561,9 +1589,8 @@ fn serve_fetch_pack_request(
     let lm = lm_rt.ledger_master();
 
     // Get the ledger the peer specified ("have" in rippled terms).
-    let Some(have) = lm.get_ledger_by_hash(
-        basics::sha_map_hash::SHAMapHash::new(ledger_hash),
-    ) else {
+    let Some(have) = lm.get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(ledger_hash))
+    else {
         return;
     };
 
@@ -1572,9 +1599,8 @@ fn serve_fetch_pack_request(
     if parent_hash == Uint256::zero() {
         return;
     }
-    let Some(want) = lm.get_ledger_by_hash(
-        basics::sha_map_hash::SHAMapHash::new(parent_hash),
-    ) else {
+    let Some(want) = lm.get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(parent_hash))
+    else {
         return;
     };
 
@@ -1585,14 +1611,12 @@ fn serve_fetch_pack_request(
 
     let mut objects: Vec<overlay::message::wire::TmIndexedObject> = Vec::new();
     let have_seq = have.header().seq;
-    let mut no_op_fetch =
-        |_h: basics::sha_map_hash::SHAMapHash| -> Option<
-            basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
-        > { None };
-    let mut no_op_fetch2 =
-        |_h: basics::sha_map_hash::SHAMapHash| -> Option<
-            basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
-        > { None };
+    let mut no_op_fetch = |_h: basics::sha_map_hash::SHAMapHash| -> Option<
+        basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
+    > { None };
+    let mut no_op_fetch2 = |_h: basics::sha_map_hash::SHAMapHash| -> Option<
+        basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
+    > { None };
 
     let _ = shamap::difference::visit_differences(
         &have_root,
@@ -1645,10 +1669,6 @@ fn serve_fetch_pack_request(
         peer.send(message);
     }
 }
-
-
-
-
 
 fn ensure_descriptor_budget(required: usize) -> Result<(), String> {
     let required = required.max(1024) as u64;
@@ -1856,7 +1876,9 @@ fn initialize_startup_ledger_state(
             }
             seed_startup_ledger_state(root, options, config)
         }
-        StartUpType::Fresh | StartUpType::Normal | StartUpType::Snapshot => seed_startup_ledger_state(root, options, config),
+        StartUpType::Fresh | StartUpType::Normal | StartUpType::Snapshot => {
+            seed_startup_ledger_state(root, options, config)
+        }
     }
 }
 

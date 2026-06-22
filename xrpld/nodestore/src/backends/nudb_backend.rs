@@ -1098,7 +1098,11 @@ impl NuDbBackend {
         open_args: NuDbOpenArgs,
     ) -> Result<(), String> {
         // Check for incomplete bulk import (crash recovery marker)
-        let marker_path = self.config.layout.base_path.join(".bulk_import_in_progress");
+        let marker_path = self
+            .config
+            .layout
+            .base_path
+            .join(".bulk_import_in_progress");
         if marker_path.exists() {
             return Err(
                 "NuDB bulk import was interrupted. Delete NuDB files and re-import.".to_owned(),
@@ -2101,8 +2105,13 @@ impl Backend for NuDbBackend {
         tracing::info!(target: "nodestore", estimated_nodes, "NuDB bulk import mode started — pre-allocating buckets");
 
         // Write crash recovery marker
-        let marker_path = self.config.layout.base_path.join(".bulk_import_in_progress");
-        fs::write(&marker_path, b"").map_err(|e| format!("Failed to write bulk import marker: {e}"))?;
+        let marker_path = self
+            .config
+            .layout
+            .base_path
+            .join(".bulk_import_in_progress");
+        fs::write(&marker_path, b"")
+            .map_err(|e| format!("Failed to write bulk import marker: {e}"))?;
 
         self.bulk_importing.store(true, Ordering::Release);
 
@@ -2154,7 +2163,11 @@ impl Backend for NuDbBackend {
         self.sync();
 
         // Remove crash recovery marker
-        let marker_path = self.config.layout.base_path.join(".bulk_import_in_progress");
+        let marker_path = self
+            .config
+            .layout
+            .base_path
+            .join(".bulk_import_in_progress");
         let _ = fs::remove_file(&marker_path);
 
         tracing::info!(target: "nodestore", "NuDB bulk import complete");
@@ -2183,7 +2196,8 @@ impl Backend for NuDbBackend {
                     continue;
                 }
             };
-            let entries = match self.collect_bucket_chain_entries_with_header(&bucket, &key_header) {
+            let entries = match self.collect_bucket_chain_entries_with_header(&bucket, &key_header)
+            {
                 Ok(e) => e,
                 Err(error) => {
                     self.journal.log(JournalLevel::Error, &error);
@@ -2191,13 +2205,14 @@ impl Backend for NuDbBackend {
                 }
             };
             for entry in entries {
-                let key_bytes = match self.read_data_record_key_with_key_size(entry.offset, key_size) {
-                    Ok(k) => k,
-                    Err(error) => {
-                        self.journal.log(JournalLevel::Error, &error);
-                        continue;
-                    }
-                };
+                let key_bytes =
+                    match self.read_data_record_key_with_key_size(entry.offset, key_size) {
+                        Ok(k) => k,
+                        Err(error) => {
+                            self.journal.log(JournalLevel::Error, &error);
+                            continue;
+                        }
+                    };
                 let value = match self.read_data_record_value_with_key_size(entry, key_size) {
                     Ok(v) => v,
                     Err(error) => {

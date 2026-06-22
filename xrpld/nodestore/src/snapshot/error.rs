@@ -18,21 +18,13 @@ pub enum SnapshotError {
     },
 
     /// The file did not begin with the expected magic bytes.
-    BadMagic {
-        got: Vec<u8>,
-    },
+    BadMagic { got: Vec<u8> },
 
     /// The snapshot format version is not supported by this binary.
-    UnsupportedVersion {
-        found: u16,
-        max_supported: u16,
-    },
+    UnsupportedVersion { found: u16, max_supported: u16 },
 
     /// A compressed chunk failed LZ4 decompression.
-    DecompressionFailed {
-        chunk_index: usize,
-        reason: String,
-    },
+    DecompressionFailed { chunk_index: usize, reason: String },
 
     /// A chunk's SHA-256 hash did not match the value recorded in the manifest.
     ChunkHashMismatch {
@@ -62,9 +54,7 @@ pub enum SnapshotError {
     },
 
     /// The backend refused a write.
-    BackendWriteFailed {
-        reason: String,
-    },
+    BackendWriteFailed { reason: String },
 
     /// Nodestore is not available (no backend attached).
     NoNodeStore,
@@ -82,9 +72,17 @@ pub enum SnapshotError {
 impl fmt::Display for SnapshotError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io { context, path, source } => {
+            Self::Io {
+                context,
+                path,
+                source,
+            } => {
                 if let Some(p) = path {
-                    write!(f, "snapshot I/O error ({context}) at {}: {source}", p.display())
+                    write!(
+                        f,
+                        "snapshot I/O error ({context}) at {}: {source}",
+                        p.display()
+                    )
                 } else {
                     write!(f, "snapshot I/O error ({context}): {source}")
                 }
@@ -92,16 +90,29 @@ impl fmt::Display for SnapshotError {
             Self::BadMagic { got } => {
                 write!(f, "snapshot file has wrong magic bytes: got {:02x?}", got)
             }
-            Self::UnsupportedVersion { found, max_supported } => {
+            Self::UnsupportedVersion {
+                found,
+                max_supported,
+            } => {
                 write!(
                     f,
                     "snapshot version {found} is not supported (max supported: {max_supported})"
                 )
             }
-            Self::DecompressionFailed { chunk_index, reason } => {
-                write!(f, "snapshot chunk {chunk_index} decompression failed: {reason}")
+            Self::DecompressionFailed {
+                chunk_index,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "snapshot chunk {chunk_index} decompression failed: {reason}"
+                )
             }
-            Self::ChunkHashMismatch { chunk_index, expected, computed } => {
+            Self::ChunkHashMismatch {
+                chunk_index,
+                expected,
+                computed,
+            } => {
                 write!(
                     f,
                     "snapshot chunk {chunk_index} integrity check failed: expected {:02x?}, got {:02x?}",
@@ -117,13 +128,20 @@ impl fmt::Display for SnapshotError {
                     &computed[..8]
                 )
             }
-            Self::AccountRootMismatch { expected_hex, computed_hex } => {
+            Self::AccountRootMismatch {
+                expected_hex,
+                computed_hex,
+            } => {
                 write!(
                     f,
                     "snapshot post-load account root mismatch: expected {expected_hex}, got {computed_hex}"
                 )
             }
-            Self::MalformedNodeRecord { chunk_index, offset, reason } => {
+            Self::MalformedNodeRecord {
+                chunk_index,
+                offset,
+                reason,
+            } => {
                 write!(
                     f,
                     "snapshot chunk {chunk_index} contains malformed node record at offset {offset}: {reason}"
@@ -159,7 +177,11 @@ impl std::error::Error for SnapshotError {
 impl SnapshotError {
     /// Construct an I/O error with contextual labels.
     pub(crate) fn io(context: &'static str, source: std::io::Error) -> Self {
-        Self::Io { context, path: None, source }
+        Self::Io {
+            context,
+            path: None,
+            source,
+        }
     }
 
     /// Construct an I/O error with contextual labels and a file path.

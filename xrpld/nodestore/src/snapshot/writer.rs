@@ -19,8 +19,8 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
-use crate::{Backend, NodeObject};
 use super::{SnapshotError, manifest::*};
+use crate::{Backend, NodeObject};
 
 /// Maximum `NodeObjectType` discriminant value that fits in a u8.
 /// The snapshot format stores node type as a single byte.
@@ -75,15 +75,20 @@ pub fn export_snapshot(
     let flush_chunk = |buf: &mut Vec<u8>,
                        metas: &mut Vec<ChunkMeta>,
                        writer: &mut BufWriter<File>,
-                       total: &mut u64| -> Result<(), SnapshotError> {
+                       total: &mut u64|
+     -> Result<(), SnapshotError> {
         if buf.is_empty() {
             return Ok(());
         }
         let compressed = lz4_flex::block::compress_prepend_size(buf);
         let hash: [u8; 32] = Sha256::digest(&compressed).into();
         let compressed_len = compressed.len() as u32;
-        metas.push(ChunkMeta { compressed_len, sha256: hash });
-        writer.write_all(&compressed)
+        metas.push(ChunkMeta {
+            compressed_len,
+            sha256: hash,
+        });
+        writer
+            .write_all(&compressed)
             .map_err(|e| SnapshotError::io("writing chunk to temp file", e))?;
         *total += compressed.len() as u64;
         buf.clear();
@@ -112,7 +117,12 @@ pub fn export_snapshot(
             return;
         }
 
-        encode_node_record(obj_type_u32 as u8, node.hash().data(), node.data(), &mut current_buf);
+        encode_node_record(
+            obj_type_u32 as u8,
+            node.hash().data(),
+            node.data(),
+            &mut current_buf,
+        );
         node_count += 1;
 
         if current_buf.len() >= SNAPSHOT_CHUNK_UNCOMPRESSED_TARGET {
@@ -148,9 +158,12 @@ pub fn export_snapshot(
         &mut total_compressed,
     )?;
 
-    chunks_writer.flush()
+    chunks_writer
+        .flush()
         .map_err(|e| SnapshotError::io("flushing temp chunks file", e))?;
-    chunks_writer.get_ref().sync_all()
+    chunks_writer
+        .get_ref()
+        .sync_all()
         .map_err(|e| SnapshotError::io("syncing temp chunks file", e))?;
 
     tracing::info!(
@@ -174,14 +187,16 @@ pub fn export_snapshot(
 
     // Write header
     let header = final_manifest.serialize_header();
-    writer.write_all(&header)
+    writer
+        .write_all(&header)
         .map_err(|e| SnapshotError::io("writing header", e))?;
     file_hasher.update(&header);
 
     // Write chunk table
     for meta in &final_manifest.chunks {
         let entry = SnapshotManifest::serialize_chunk_meta(meta);
-        writer.write_all(&entry)
+        writer
+            .write_all(&entry)
             .map_err(|e| SnapshotError::io("writing chunk table", e))?;
         file_hasher.update(&entry);
     }
@@ -192,24 +207,30 @@ pub fn export_snapshot(
     let mut reader = BufReader::new(chunks_read_file);
     let mut copy_buf = vec![0u8; 64 * 1024]; // 64KB copy buffer
     loop {
-        let n = reader.read(&mut copy_buf)
+        let n = reader
+            .read(&mut copy_buf)
             .map_err(|e| SnapshotError::io("reading temp chunks file", e))?;
         if n == 0 {
             break;
         }
-        writer.write_all(&copy_buf[..n])
+        writer
+            .write_all(&copy_buf[..n])
             .map_err(|e| SnapshotError::io("writing chunk data", e))?;
         file_hasher.update(&copy_buf[..n]);
     }
 
     // Write footer (file SHA-256)
     let file_hash: [u8; 32] = file_hasher.finalize().into();
-    writer.write_all(&file_hash)
+    writer
+        .write_all(&file_hash)
         .map_err(|e| SnapshotError::io("writing footer", e))?;
 
-    writer.flush()
+    writer
+        .flush()
         .map_err(|e| SnapshotError::io("flushing snapshot file", e))?;
-    writer.get_ref().sync_all()
+    writer
+        .get_ref()
+        .sync_all()
         .map_err(|e| SnapshotError::io("syncing snapshot file to disk", e))?;
 
     // ─── Atomic rename into place ────────────────────────────────────────────

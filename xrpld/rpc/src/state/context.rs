@@ -2689,8 +2689,11 @@ impl RpcRuntime for ApplicationRoot {
         }
 
         // Validate partition characters (prevent filter injection)
-        if partition != "base" && !partition.is_empty()
-            && !partition.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+        if partition != "base"
+            && !partition.is_empty()
+            && !partition
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
         {
             return Status::new(crate::status::RpcErrorCode::InvalidParams);
         }
@@ -2743,16 +2746,20 @@ impl RpcRuntime for ApplicationRoot {
     }
 
     fn export_snapshot(&self, output_path: &str) -> Result<JsonValue, String> {
-        use nodestore::snapshot::{SnapshotManifest, manifest::SNAPSHOT_VERSION, export_snapshot};
+        use nodestore::snapshot::{SnapshotManifest, export_snapshot, manifest::SNAPSHOT_VERSION};
         use std::path::Path;
 
-        let validated = self.validated_ledger()
+        let validated = self
+            .validated_ledger()
             .ok_or_else(|| "No validated ledger available".to_owned())?;
         let header = validated.header();
 
-        let node_store = self.node_store().as_ref()
+        let node_store = self
+            .node_store()
+            .as_ref()
             .ok_or_else(|| "NodeStore not configured".to_owned())?;
-        let backend = node_store.export_backend()
+        let backend = node_store
+            .export_backend()
             .ok_or_else(|| "Backend not available for export".to_owned())?;
 
         let manifest = SnapshotManifest {

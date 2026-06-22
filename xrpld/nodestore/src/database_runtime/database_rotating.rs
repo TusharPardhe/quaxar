@@ -403,7 +403,10 @@ impl DatabaseTrait for DatabaseRotatingImp {
     }
 
     fn export_backend(&self) -> Option<Arc<dyn Backend>> {
-        let state = self.state.lock().expect("rotating backend mutex must not be poisoned");
+        let state = self
+            .state
+            .lock()
+            .expect("rotating backend mutex must not be poisoned");
         Some(Arc::clone(&state.writable_backend))
     }
 }

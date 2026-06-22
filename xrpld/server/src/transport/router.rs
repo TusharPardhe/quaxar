@@ -439,7 +439,15 @@ where
                 echo
             });
         }
-        (StatusCode::OK, Json(response)).into_response()
+        // Use sonic-rs (SIMD-accelerated) for output serialization instead of
+        // axum's default serde_json path for a 3-10x throughput improvement.
+        let body = sonic_rs::to_vec(&response).unwrap_or_default();
+        (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response()
     }
 
     async fn handle_get(
@@ -525,22 +533,26 @@ where
                                 Ok(v) => v,
                                 Err(_) => {
                                     let response = websocket_error_response(
-                                        None, None, None,
+                                        None,
+                                        None,
+                                        None,
                                         rpc::RpcErrorCode::BadSyntax,
                                         rpc::RpcErrorCode::BadSyntax.message(),
                                     );
-                                    let _ = session.send_text(response.to_string());
+                                    let _ = session.send_text(sonic_rs::to_string(&response).unwrap_or_default());
                                     continue;
                                 }
                             }
                         }
                         Err(_) => {
                             let response = websocket_error_response(
-                                None, None, None,
+                                None,
+                                None,
+                                None,
                                 rpc::RpcErrorCode::BadSyntax,
                                 rpc::RpcErrorCode::BadSyntax.message(),
                             );
-                            let _ = session.send_text(response.to_string());
+                            let _ = session.send_text(sonic_rs::to_string(&response).unwrap_or_default());
                             continue;
                         }
                     };
@@ -582,7 +594,7 @@ where
                         metadata.api_version,
                         has_explicit_api_version(&params),
                     );
-                    let _ = session.send_text(response.to_string());
+                    let _ = session.send_text(sonic_rs::to_string(&response).unwrap_or_default());
                 }
                 Message::Close(_) => break,
                 Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => {}

@@ -776,7 +776,13 @@ impl NumberParts {
         scale: MantissaScale,
     ) -> Result<Self, NumberArithmeticError> {
         Self::normalize_arithmetic_parts_with_dropped(
-            negative, mantissa, exponent, min_mantissa, max_mantissa, scale, false,
+            negative,
+            mantissa,
+            exponent,
+            min_mantissa,
+            max_mantissa,
+            scale,
+            false,
         )
     }
 

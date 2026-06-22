@@ -10,6 +10,37 @@ use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::CacheClock;
 use std::hash::BuildHasher;
 
+/// Issue a memory prefetch hint for the next SHAMap tree level.
+///
+/// After descending to a child inner node, we already know which branch
+/// we'll take next (from the key bits). Prefetching that child's memory
+/// hides one level of pointer-chasing latency (~50-80 cycles on L2 miss).
+#[inline(always)]
+fn prefetch_next_child(node: &SHAMapTreeNode, node_id: SHAMapNodeId, key: Uint256) {
+    if !node.is_inner() {
+        return;
+    }
+    let branch = select_branch(node_id, key);
+    if node.is_empty_branch(branch) {
+        return;
+    }
+    // SAFETY: get_child_ptr returns a raw pointer to the child node if loaded.
+    // We only use it for a non-temporal prefetch hint — no dereference occurs.
+    unsafe {
+        if let Some(ptr) = node.get_child_ptr(branch) {
+            #[cfg(target_arch = "x86_64")]
+            std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            #[cfg(target_arch = "x86")]
+            std::arch::x86::_mm_prefetch(ptr as *const i8, std::arch::x86::_MM_HINT_T0);
+            #[cfg(target_arch = "aarch64")]
+            {
+                // Use inline asm for stable aarch64 prefetch (PRFM PLDL1KEEP)
+                std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr, options(nostack, preserves_flags));
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NodePathEntry {
     pub node: SharedIntrusive<SHAMapTreeNode>,
@@ -162,10 +193,11 @@ where
 
         let next = descend_throw(&node, branch, backed, fetch)?
             .expect("non-empty branches should resolve to a child or error");
-        node = next;
         node_id = node_id
             .get_child_node_id(branch)
             .expect("branch selection must stay within SHAMap depth bounds");
+        prefetch_next_child(&next, node_id, id);
+        node = next;
     }
 
     visit(&node, node_id);
@@ -199,10 +231,11 @@ where
 
         let next = descend_throw_with_family(&node, branch, backed, ledger_seq, family)?
             .expect("non-empty branches should resolve to a child or error");
-        node = next;
         node_id = node_id
             .get_child_node_id(branch)
             .expect("branch selection must stay within SHAMap depth bounds");
+        prefetch_next_child(&next, node_id, id);
+        node = next;
     }
 
     visit(&node, node_id);

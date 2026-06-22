@@ -33,7 +33,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 secp256k1 = "0.31"
 serde_json = "1"
 shamap = { path = "../../xrpl/shamap" }
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 ripemd = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "time", "fs"] }
 tokio-util = "0.7"
@@ -42,6 +42,7 @@ tx = { path = "../tx" }
 webpki-roots = "1"
 xrpl_core = { path = "../../xrpl/core" }
 xrpld_core = { path = "../core" }
+arc-swap = "1"
 
 [dev-dependencies]
 tempfile = "3"

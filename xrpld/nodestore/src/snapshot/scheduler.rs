@@ -31,13 +31,13 @@
 //! store but are not reachable from the verified root).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 
-use crate::Backend;
-use super::manifest::{SnapshotManifest, SNAPSHOT_VERSION};
+use super::manifest::{SNAPSHOT_VERSION, SnapshotManifest};
 use super::writer::export_snapshot;
+use crate::Backend;
 
 /// Configuration for automatic snapshot production.
 #[derive(Debug, Clone)]

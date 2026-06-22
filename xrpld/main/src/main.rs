@@ -792,9 +792,7 @@ fn try_cli_subcommand() -> Option<ExitCode> {
             }
             true
         }
-        xrpld_cli::Command::ExportSnapshot { output } => {
-            run_export_snapshot(&url, &output)
-        }
+        xrpld_cli::Command::ExportSnapshot { output } => run_export_snapshot(&url, &output),
         xrpld_cli::Command::LoadSnapshot { input } => {
             run_load_snapshot(&input, parsed.conf.as_deref())
         }
@@ -899,15 +897,19 @@ fn main() -> ExitCode {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
 
-    let subscriber = tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true));
+    let subscriber = tracing_subscriber::registry().with(filter_layer).with(
+        tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_thread_ids(true),
+    );
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber");
 
     app::set_log_reload_fn(move |new_filter: &str| {
         let f = tracing_subscriber::EnvFilter::try_new(new_filter)
             .map_err(|e| format!("Invalid filter: {e}"))?;
-        reload_handle.reload(f).map_err(|e| format!("Reload failed: {e}"))
+        reload_handle
+            .reload(f)
+            .map_err(|e| format!("Reload failed: {e}"))
     });
 
     tracing::info!(target: "main", version = env!("CARGO_PKG_VERSION"), "XRPLD starting");
@@ -1333,18 +1335,29 @@ fn advance_published_ledgers_after_validation(
     // This allows advancing N+1, N+2, ... N+50 in one tick when history
     // ledgers arrived before their validations were counted.
     {
-        let needed = if app.standalone() { 0 } else { app.validators().quorum() };
+        let needed = if app.standalone() {
+            0
+        } else {
+            app.validators().quorum()
+        };
         let mut burst_count = 0u32;
         loop {
             let next_seq = ledger_master.valid_ledger_seq() + 1;
-            let Some(candidate) = ledger_master.ledger_history().get_cached_ledger_by_seq(next_seq) else {
+            let Some(candidate) = ledger_master
+                .ledger_history()
+                .get_cached_ledger_by_seq(next_seq)
+            else {
                 break;
             };
             let candidate_hash = *candidate.header().hash.as_uint256();
-            let validations = app.validations().store()
+            let validations = app
+                .validations()
+                .store()
                 .trusted_for_ledger_by_sequence(candidate_hash, next_seq);
-            let val_count = app.validators()
-                .negative_unl_filter_validations(validations).len();
+            let val_count = app
+                .validators()
+                .negative_unl_filter_validations(validations)
+                .len();
             if val_count < needed {
                 break;
             }
@@ -1356,7 +1369,9 @@ fn advance_published_ledgers_after_validation(
                 l.set_full();
                 l.finalize_immutable_no_setup();
             }
-            ledger_master.ledger_history().insert(std::sync::Arc::clone(&next_vl), true);
+            ledger_master
+                .ledger_history()
+                .insert(std::sync::Arc::clone(&next_vl), true);
             ledger_master.mark_ledger_complete(next_seq);
             ledger_master.set_valid_ledger_no_sweep(std::sync::Arc::clone(&next_vl), None, None);
             app.note_validated_ledger_for_sync(std::sync::Arc::clone(&next_vl));
@@ -3509,14 +3524,13 @@ fn run_acquisition_thread(
                 // so each subsequent trigger call discovers fresh work.
                 if !inbound.planner_state().have_state {
                     // Refresh tracked peers from overlay so fan-out can use all connected peers
-                    peer_set.add_peers(
-                        6,
-                        &mut |_peer| true,
-                        &mut |_peer| {},
-                    );
+                    peer_set.add_peers(6, &mut |_peer| true, &mut |_peer| {});
                     let all_peers = peer_set.get_peers();
-                    let triggered: std::collections::HashSet<u32> =
-                        run_result.triggered_peer_ids.iter().map(|id| *id as u32).collect();
+                    let triggered: std::collections::HashSet<u32> = run_result
+                        .triggered_peer_ids
+                        .iter()
+                        .map(|id| *id as u32)
+                        .collect();
                     let extra_peers: Vec<_> = all_peers
                         .iter()
                         .filter(|p| !triggered.contains(&p.id()))
@@ -6043,10 +6057,7 @@ fn run_export_snapshot(url: &str, output: &str) -> bool {
 }
 
 fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
-    use nodestore::{
-        ManagerImp, Manager, NullJournal, DummyScheduler,
-        snapshot::load_snapshot,
-    };
+    use nodestore::{DummyScheduler, Manager, ManagerImp, NullJournal, snapshot::load_snapshot};
     use std::path::Path;
 
     let config = match load_config_for_snapshot(conf) {

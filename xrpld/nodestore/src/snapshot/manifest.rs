@@ -213,7 +213,9 @@ impl SnapshotManifest {
         // Magic
         let magic = &buf[pos..pos + 8];
         if magic != SNAPSHOT_MAGIC {
-            return Err(SnapshotError::BadMagic { got: magic.to_vec() });
+            return Err(SnapshotError::BadMagic {
+                got: magic.to_vec(),
+            });
         }
         pos += 8;
 
@@ -292,7 +294,10 @@ impl SnapshotManifest {
         debug_assert!(buf.len() >= CHUNK_META_SIZE);
         let compressed_len = u32::from_be_bytes(buf[..4].try_into().unwrap());
         let sha256: [u8; 32] = buf[4..36].try_into().unwrap();
-        ChunkMeta { compressed_len, sha256 }
+        ChunkMeta {
+            compressed_len,
+            sha256,
+        }
     }
 }
 
@@ -303,12 +308,7 @@ impl SnapshotManifest {
 /// Layout: `[type: u8][hash: 32][data_len: varint][data: N]`
 ///
 /// Returns the number of bytes written.
-pub fn encode_node_record(
-    node_type: u8,
-    hash: &[u8; 32],
-    data: &[u8],
-    out: &mut Vec<u8>,
-) -> usize {
+pub fn encode_node_record(node_type: u8, hash: &[u8; 32], data: &[u8], out: &mut Vec<u8>) -> usize {
     let before = out.len();
     out.push(node_type);
     out.extend_from_slice(hash);

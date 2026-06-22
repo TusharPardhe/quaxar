@@ -6,9 +6,9 @@ use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
-use basics::base_uint::Uint256;
-use crate::{Backend, Batch, NodeObject, NodeObjectType};
 use super::{SnapshotError, manifest::*};
+use crate::{Backend, Batch, NodeObject, NodeObjectType};
+use basics::base_uint::Uint256;
 
 /// Load a snapshot file from `input_path` into `backend`.
 ///
@@ -31,7 +31,8 @@ pub fn load_snapshot(
 
     // Read header
     let mut header_buf = [0u8; SNAPSHOT_HEADER_SIZE];
-    reader.read_exact(&mut header_buf)
+    reader
+        .read_exact(&mut header_buf)
         .map_err(|e| SnapshotError::io("reading header", e))?;
     file_hasher.update(&header_buf);
 
@@ -55,21 +56,28 @@ pub fn load_snapshot(
     // Read chunk table
     for _ in 0..chunk_count {
         let mut entry_buf = [0u8; CHUNK_META_SIZE];
-        reader.read_exact(&mut entry_buf)
+        reader
+            .read_exact(&mut entry_buf)
             .map_err(|e| SnapshotError::io("reading chunk table", e))?;
         file_hasher.update(&entry_buf);
-        manifest.chunks.push(SnapshotManifest::deserialize_chunk_meta(&entry_buf));
+        manifest
+            .chunks
+            .push(SnapshotManifest::deserialize_chunk_meta(&entry_buf));
     }
 
     // Read and process each chunk
     let mut total_nodes: u64 = 0;
     let estimated_nodes = chunk_count as u64 * 30_000;
-    backend.bulk_import_start(estimated_nodes)
-        .map_err(|e| SnapshotError::BackendWriteFailed { reason: format!("bulk_import_start: {e}") })?;
+    backend
+        .bulk_import_start(estimated_nodes)
+        .map_err(|e| SnapshotError::BackendWriteFailed {
+            reason: format!("bulk_import_start: {e}"),
+        })?;
 
     for (i, meta) in manifest.chunks.iter().enumerate() {
         let mut compressed = vec![0u8; meta.compressed_len as usize];
-        reader.read_exact(&mut compressed)
+        reader
+            .read_exact(&mut compressed)
             .map_err(|e| SnapshotError::io("reading chunk data", e))?;
         file_hasher.update(&compressed);
 
@@ -84,10 +92,12 @@ pub fn load_snapshot(
         }
 
         // Decompress
-        let decompressed = lz4_flex::block::decompress_size_prepended(&compressed)
-            .map_err(|e| SnapshotError::DecompressionFailed {
-                chunk_index: i,
-                reason: e.to_string(),
+        let decompressed =
+            lz4_flex::block::decompress_size_prepended(&compressed).map_err(|e| {
+                SnapshotError::DecompressionFailed {
+                    chunk_index: i,
+                    reason: e.to_string(),
+                }
             })?;
 
         // Decode node records and build batch
@@ -97,7 +107,8 @@ pub fn load_snapshot(
             let (node_type_byte, hash, data_range, consumed) =
                 decode_node_record(&decompressed, offset, i)?;
 
-            let obj_type = NodeObjectType::try_from(node_type_byte).unwrap_or(NodeObjectType::Unknown);
+            let obj_type =
+                NodeObjectType::try_from(node_type_byte).unwrap_or(NodeObjectType::Unknown);
             let data = decompressed[data_range].to_vec();
             let uint_hash = Uint256::from_array(hash);
             let node = Arc::new(NodeObject::new(obj_type, data, uint_hash));
@@ -120,12 +131,16 @@ pub fn load_snapshot(
         }
     }
 
-    backend.bulk_import_finish()
-        .map_err(|e| SnapshotError::BackendWriteFailed { reason: format!("bulk_import_finish: {e}") })?;
+    backend
+        .bulk_import_finish()
+        .map_err(|e| SnapshotError::BackendWriteFailed {
+            reason: format!("bulk_import_finish: {e}"),
+        })?;
 
     // Read and verify footer
     let mut footer = [0u8; SNAPSHOT_FOOTER_SIZE];
-    reader.read_exact(&mut footer)
+    reader
+        .read_exact(&mut footer)
         .map_err(|e| SnapshotError::io("reading footer", e))?;
 
     let computed_file_hash: [u8; 32] = file_hasher.finalize().into();
