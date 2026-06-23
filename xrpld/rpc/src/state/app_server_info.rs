@@ -2267,6 +2267,7 @@ impl<V: AppServerInfoView> crate::handlers::ledger_data::LedgerDataSource
         let mut entries = Vec::new();
         let mut key = marker.unwrap_or_default();
         let mut remaining = limit;
+        let mut last_key = key;
 
         while let Some(next_key) = succ_lookup_ledger_key(&self.view, ledger, key, None) {
             let Some(sle) =
@@ -2278,12 +2279,12 @@ impl<V: AppServerInfoView> crate::handlers::ledger_data::LedgerDataSource
             };
 
             if remaining <= 0 {
-                let mut marker_key = *sle.key();
-                marker_key.decrement();
-                page_marker = Some(marker_key);
+                // Marker is the last key we included — next page resumes after it
+                page_marker = Some(last_key);
                 break;
             }
             remaining -= 1;
+            last_key = next_key;
 
             if type_filter == LedgerEntryType::Any || type_filter == sle.get_type() {
                 let binary_data = if binary {

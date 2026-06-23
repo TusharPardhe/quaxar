@@ -56,13 +56,15 @@ impl SharedLedgerMasterState {
     }
 
     pub fn note_validated_ledger(&self, ledger: Arc<Ledger>) {
-        self.set_validated_close_time(ledger.header().close_time);
+        let close_time = ledger.header().close_time;
         self.validated_ledger.store(Some(ledger));
+        self.set_validated_close_time(close_time);
     }
 
     pub fn note_published_ledger(&self, ledger: Arc<Ledger>) {
-        self.set_published_close_time(ledger.header().close_time);
+        let close_time = ledger.header().close_time;
         self.published_ledger.store(Some(ledger));
+        self.set_published_close_time(close_time);
     }
 
     pub fn set_validated_close_time(&self, close_time: u32) {

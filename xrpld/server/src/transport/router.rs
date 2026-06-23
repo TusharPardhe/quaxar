@@ -20,10 +20,8 @@ use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::Deserialize;
 use serde_json::Value;
-// sonic-rs provides SIMD-accelerated JSON parsing (3-5x vs serde_json on
-// typical XRPL request payloads).  The Value type is compatible with
-// serde_json::Value for all operations we perform on inbound requests.
-use sonic_rs::Value as SonicValue;
+// sonic-rs provides SIMD-accelerated JSON serialization for outbound
+// RPC responses (3-10x faster than serde_json on large payloads).
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
@@ -348,16 +346,10 @@ where
         tracing::debug!(target: "server", client_ip = %remote_addr.ip(), "HTTP POST request");
         // axum's Json extractor rejects with 415 if Content-Type is missing.
         // Parse the body manually to match reference behavior.
-        // Parse the body with sonic-rs (SIMD-accelerated) instead of
-        // serde_json for a 3-5x throughput improvement on the inbound path.
-        let payload: SonicValue = match sonic_rs::from_slice(&body) {
-            Ok(v) => v,
-            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-        };
-        // sonic-rs Value is not the same type as serde_json Value; convert once
-        // via round-trip through bytes so we keep the rest of the pipeline
-        // (JsonRpcEnvelope, to_protocol_json) unchanged.
-        let payload: Value = match serde_json::from_str(&payload.to_string()) {
+        // Use serde_json for inbound parsing (preserves key ordering, small
+        // payloads). sonic-rs is used for outbound serialization where the
+        // large response payloads benefit from SIMD acceleration.
+        let payload: Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
             Err(_) => return StatusCode::BAD_REQUEST.into_response(),
         };
@@ -442,7 +434,10 @@ where
         }
         // Use sonic-rs (SIMD-accelerated) for output serialization instead of
         // axum's default serde_json path for a 3-10x throughput improvement.
-        let body = sonic_rs::to_vec(&response).unwrap_or_default();
+        let body = match sonic_rs::to_vec(&response) {
+            Ok(b) => b,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
         (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -622,27 +617,10 @@ where
 
             match message {
                 Message::Text(text) => {
-                    // Parse text frames with sonic-rs (SIMD-accelerated, 3-5x
-                    // faster than serde_json on typical XRPL message sizes).
-                    let parsed: Value = match sonic_rs::from_str::<SonicValue>(&text) {
-                        Ok(v) => {
-                            // Convert SonicValue → serde_json::Value once via
-                            // to_string so the rest of the pipeline is unchanged.
-                            match serde_json::from_str(&v.to_string()) {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    let response = websocket_error_response(
-                                        None,
-                                        None,
-                                        None,
-                                        rpc::RpcErrorCode::BadSyntax,
-                                        rpc::RpcErrorCode::BadSyntax.message(),
-                                    );
-                                    let _ = session.send_text(sonic_rs::to_string(&response).unwrap_or_default());
-                                    continue;
-                                }
-                            }
-                        }
+                    // Parse text frames with serde_json for inbound (preserves key
+                    // ordering). sonic-rs used only for outbound serialization.
+                    let parsed: Value = match serde_json::from_str(&text) {
+                        Ok(v) => v,
                         Err(_) => {
                             let response = websocket_error_response(
                                 None,

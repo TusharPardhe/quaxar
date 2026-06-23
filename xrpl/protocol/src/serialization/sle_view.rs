@@ -112,9 +112,24 @@ impl<'a> SleView<'a> {
             4 => Some(16),  // UInt128
             5 => Some(32),  // UInt256
             6 => {
-                // Amount: 8 bytes for XRP/IOU, or 1-byte header check for MPT (9+)
-                // Standard Amount is always 8 bytes on the wire.
-                Some(8)
+                // Amount type: discriminate by top bit of first byte.
+                // - Native XRP: bit 62 clear (top byte & 0x80 == 0x40 pattern) → 8 bytes
+                // - IOU: bit 62 set → 48 bytes (8 amount + 20 currency + 20 issuer)
+                // - MPT: first byte == 0x03 → 41 bytes (1 + 8 + 32)
+                if pos >= data.len() {
+                    return None;
+                }
+                let first = data[pos];
+                if first == 0x03 {
+                    // MPT amount
+                    Some(41)
+                } else if first & 0x80 != 0 {
+                    // IOU amount (bit 63 set = non-native)
+                    Some(48)
+                } else {
+                    // Native XRP amount
+                    Some(8)
+                }
             }
             17 => Some(20), // UInt160
             20 => Some(12), // UInt96
