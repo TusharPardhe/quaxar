@@ -120,7 +120,7 @@ mod tests {
             .await
             .expect("body should read");
         let ok_body = std::str::from_utf8(&ok_body).expect("utf8");
-        assert!(ok_body.contains("Test page for xrpld"));
+        assert!(ok_body.contains("Test page for quaxar"));
         assert!(ok_body.contains("connectivity is working"));
 
         let error_response =
