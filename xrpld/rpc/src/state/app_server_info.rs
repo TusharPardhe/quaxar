@@ -286,6 +286,7 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
         if mode == NetworkOpsOperatingMode::Syncing.as_str()
             || mode == NetworkOpsOperatingMode::Tracking.as_str()
             || mode == NetworkOpsOperatingMode::Full.as_str()
+            || mode == "proposing"
         {
             return true;
         }
@@ -383,7 +384,17 @@ mod tests {
     fn owned_application_server_info_network_synced_mode_gate_without_caught_up_ledgers() {
         let app = ApplicationRoot::with_options(ApplicationRootOptions::default())
             .expect("app should build");
+            
+        let close_time = app.current_close_time_seconds();
+        let ledger = std::sync::Arc::new(ledger::Ledger::from_ledger_seq_and_close_time(
+            512,
+            close_time.saturating_sub(1),
+            false,
+        ));
+        app.on_validated_ledger(ledger);
+        
         app.set_network_ops_operating_mode(app::NetworkOpsOperatingMode::Full);
+        app.set_need_network_ledger(false);
         let source =
             ApplicationServerInfo::new(OwnedApplicationServerInfo::from_application_root(&app));
 
@@ -2267,7 +2278,6 @@ impl<V: AppServerInfoView> crate::handlers::ledger_data::LedgerDataSource
         let mut entries = Vec::new();
         let mut key = marker.unwrap_or_default();
         let mut remaining = limit;
-        let mut last_key = key;
 
         while let Some(next_key) = succ_lookup_ledger_key(&self.view, ledger, key, None) {
             let Some(sle) =
@@ -2279,12 +2289,14 @@ impl<V: AppServerInfoView> crate::handlers::ledger_data::LedgerDataSource
             };
 
             if remaining <= 0 {
-                // Marker is the last key we included — next page resumes after it
-                page_marker = Some(last_key);
+                // Marker is the first unread key minus 1, to match C++ rippled exactly.
+                // Next page will resume at `next_key` since succ(next_key - 1) == next_key.
+                let mut marker_key = next_key;
+                marker_key.decrement();
+                page_marker = Some(marker_key);
                 break;
             }
             remaining -= 1;
-            last_key = next_key;
 
             if type_filter == LedgerEntryType::Any || type_filter == sle.get_type() {
                 let binary_data = if binary {
