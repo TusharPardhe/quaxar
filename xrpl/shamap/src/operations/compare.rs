@@ -508,7 +508,8 @@ mod tests {
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::ManualClock;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use parking_lot::Mutex;
     use time::Duration;
 
     #[derive(Debug, Default)]
@@ -518,10 +519,7 @@ mod tests {
 
     impl RecordingJournal {
         fn entries(&self) -> Vec<(JournalLevel, String)> {
-            self.entries
-                .lock()
-                .expect("journal entries mutex must not be poisoned")
-                .clone()
+            self.entries.lock().clone()
         }
     }
 
@@ -529,7 +527,6 @@ mod tests {
         fn log(&self, level: JournalLevel, message: &str) {
             self.entries
                 .lock()
-                .expect("journal entries mutex must not be poisoned")
                 .push((level, message.to_owned()));
         }
     }
@@ -961,12 +958,12 @@ mod tests {
     #[derive(Debug, Default)]
     struct MappingFetcher {
         nodes: HashMap<SHAMapHash, SharedIntrusive<SHAMapTreeNode>>,
-        fetches: Vec<SHAMapHash>,
+        fetches: Mutex<Vec<SHAMapHash>>,
     }
 
     impl SHAMapNodeFetcher for MappingFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-            self.fetches.push(hash);
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            self.fetches.lock().push(hash);
             self.nodes.get(&hash).cloned()
         }
     }
@@ -1010,7 +1007,7 @@ mod tests {
             NullFullBelowCache::new(0),
             MappingFetcher {
                 nodes: compare_nodes,
-                fetches: Vec::new(),
+                fetches: Mutex::new(Vec::new()),
             },
             NullMissingNodeReporter,
         );
@@ -1073,7 +1070,7 @@ mod tests {
             NullFullBelowCache::new(0),
             MappingFetcher {
                 nodes: deep_nodes,
-                fetches: Vec::new(),
+                fetches: Mutex::new(Vec::new()),
             },
             NullMissingNodeReporter,
         );

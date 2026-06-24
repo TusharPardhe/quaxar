@@ -49,6 +49,19 @@ pub trait AccountNFTsSource: LedgerLookupSource {
         start: Uint256,
         last_exclusive: Uint256,
     ) -> Option<Uint256>;
+
+    /// Prefetch the next NFT page key while processing current page.
+    /// Default implementation eagerly resolves the next key.
+    fn prefetch_next_nft_page(
+        &self,
+        ledger: &LedgerLookupLedger,
+        current_key: Uint256,
+        last_exclusive: Uint256,
+    ) -> Option<(Uint256, Option<STLedgerEntry>)> {
+        let next_key = self.succ_nft_page(ledger, current_key, last_exclusive)?;
+        let page = self.read_nft_page(ledger, next_key);
+        Some((next_key, page))
+    }
 }
 
 fn ensure_object(value: &mut JsonValue) -> &mut BTreeMap<String, JsonValue> {
@@ -189,6 +202,10 @@ fn collect_nft_pages<S: AccountNFTsSource>(
             break;
         };
 
+        // Prefetch next page while we process this one — the SHAMap succ()
+        // and page read happen eagerly so tree nodes are warm in cache.
+        let prefetched_next = source.prefetch_next_nft_page(ledger, page_key, last.key.next());
+
         let nftokens = page.get_field_array(get_field_by_symbol("sfNFTokens"));
         for nft in nftokens.iter() {
             let nft_id = nft.get_field_h256(get_field_by_symbol("sfNFTokenID"));
@@ -219,7 +236,8 @@ fn collect_nft_pages<S: AccountNFTsSource>(
             }
         }
 
-        current_key = source.succ_nft_page(ledger, page_key, last.key.next());
+        // Use prefetched next page (already resolved)
+        current_key = prefetched_next.map(|(k, _)| k);
     }
 
     if !marker.is_zero() && !marker_found {

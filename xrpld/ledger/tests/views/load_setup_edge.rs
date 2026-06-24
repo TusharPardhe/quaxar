@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 use basics::base_uint::Uint256;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
@@ -12,7 +13,7 @@ use shamap::item::SHAMapItem;
 use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::Duration;
 
 fn sample_hash(fill: u8) -> SHAMapHash {
@@ -61,12 +62,12 @@ fn typed_xrp_fee_settings_entry_bytes(base: u64, reserve: u64, increment: u64) -
 #[derive(Debug, Default)]
 struct RecordingFetcher {
     expected: HashMap<SHAMapHash, SharedIntrusive<SHAMapTreeNode>>,
-    fetches: Vec<SHAMapHash>,
+    fetches: Mutex<Vec<SHAMapHash>>,
 }
 
 impl SHAMapNodeFetcher for RecordingFetcher {
-    fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-        self.fetches.push(hash);
+    fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+        self.fetches.lock().push(hash);
         self.expected.get(&hash).cloned()
     }
 }
@@ -84,7 +85,6 @@ impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_seq(&self, ref_num: u32, node_hash: Uint256) {
         self.0
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_seq
             .push((ref_num, node_hash));
     }
@@ -92,7 +92,6 @@ impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_hash(&self, ref_hash: Uint256, ref_num: u32) {
         self.0
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_hash
             .push((ref_hash, ref_num));
     }
@@ -108,7 +107,6 @@ impl RecordingLedgerJournal {
     fn warns(&self) -> Vec<String> {
         self.warns
             .lock()
-            .expect("ledger journal mutex must not be poisoned")
             .clone()
     }
 }
@@ -117,14 +115,12 @@ impl LedgerJournal for RecordingLedgerJournal {
     fn info(&self, message: &str) {
         self.infos
             .lock()
-            .expect("ledger journal mutex must not be poisoned")
             .push(message.to_owned());
     }
 
     fn warn(&self, message: &str) {
         self.warns
             .lock()
-            .expect("ledger journal mutex must not be poisoned")
             .push(message.to_owned());
     }
 }
@@ -169,7 +165,7 @@ fn ledger_load_immutable_with_family_and_setup_marks_failed_setup_ctor() {
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(reporter.clone()),
     );
@@ -214,14 +210,13 @@ fn ledger_load_immutable_with_family_and_setup_marks_failed_setup_ctor() {
     );
     family.with_fetcher(|fetcher| {
         assert_eq!(
-            fetcher.fetches,
+            fetcher.fetches.lock().clone(),
             vec![root.get_hash(), missing_amendments_hash]
         );
     });
     assert!(journal.warns().is_empty());
     let reporter = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert_eq!(reporter.by_seq, Vec::<(u32, Uint256)>::new());
     assert_eq!(
         reporter.by_hash,
@@ -267,7 +262,7 @@ fn ledger_load_immutable_with_family_and_setup_decodes_typed_singleton_payloads(
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(reporter.clone()),
     );
@@ -311,15 +306,15 @@ fn ledger_load_immutable_with_family_and_setup_decodes_typed_singleton_payloads(
     assert!(ledger.rules().enabled(&feature_xrp_fees()));
     assert!(ledger.rules().enabled(&Uint256::from_array([0xB3; 32])));
     family.with_fetcher(|fetcher| {
-        assert_eq!(fetcher.fetches.first(), Some(&root.get_hash()));
-        assert_eq!(fetcher.fetches.len(), 3);
-        assert!(fetcher.fetches.contains(&amendment_leaf.get_hash()));
-        assert!(fetcher.fetches.contains(&fee_leaf.get_hash()));
+        let fetches = fetcher.fetches.lock();
+        assert_eq!(fetches.first(), Some(&root.get_hash()));
+        assert_eq!(fetches.len(), 3);
+        assert!(fetches.contains(&amendment_leaf.get_hash()));
+        assert!(fetches.contains(&fee_leaf.get_hash()));
     });
     assert!(journal.warns().is_empty());
     let reporter = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert!(reporter.by_seq.is_empty());
     assert!(reporter.by_hash.is_empty());
 }

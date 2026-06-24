@@ -319,7 +319,7 @@ impl RpcNodeStoreFetcher {
 }
 
 impl SHAMapNodeFetcher for RpcNodeStoreFetcher {
-    fn fetch_node_object(&mut self, hash: SHAMapHash, ledger_seq: u32) -> Option<SHAMapNodeObject> {
+    fn fetch_node_object(&self, hash: SHAMapHash, ledger_seq: u32) -> Option<SHAMapNodeObject> {
         let fetched = match &self.node_store {
             app::SHAMapStoreNodeStore::Single(database) => database.fetch_node_object(
                 hash.as_uint256(),

@@ -8,6 +8,7 @@ use protocol::JsonValue;
 use crate::{JsonContext, RpcRole};
 
 pub static SERVER_INFO_CACHE: RwLock<Option<Arc<[u8]>>> = RwLock::new(None);
+pub static SERVER_INFO_ADMIN_CACHE: RwLock<Option<Arc<[u8]>>> = RwLock::new(None);
 
 pub enum ServerInfoResponse {
     Json(JsonValue),
@@ -29,6 +30,22 @@ pub fn update_validated_snapshot_cache_server_info<S: ServerInfoSource>(source: 
     let json = build_response(&context, true, "info");
     if let Ok(bytes) = serde_json::to_vec(&json) {
         *SERVER_INFO_CACHE.write().unwrap() = Some(Arc::from(bytes));
+    }
+    // Also cache the admin response
+    let admin_context = crate::JsonContext {
+        params: &JsonValue::Object(BTreeMap::new()),
+        env: source,
+        role: RpcRole::Admin,
+        api_version: 1,
+        headers: crate::JsonContextHeaders {
+            user: "",
+            forwarded_for: "",
+        },
+        unlimited: false,
+    };
+    let admin_json = build_response(&admin_context, true, "info");
+    if let Ok(bytes) = serde_json::to_vec(&admin_json) {
+        *SERVER_INFO_ADMIN_CACHE.write().unwrap() = Some(Arc::from(bytes));
     }
 }
 
@@ -79,8 +96,9 @@ pub fn do_server_info_prerendered<S: ServerInfoSource>(
     let admin = context.role == RpcRole::Admin;
     let counters = want_counters(context.params);
 
-    if !admin && !counters {
-        if let Some(cached) = SERVER_INFO_CACHE.read().unwrap().clone() {
+    if !counters {
+        let cache = if admin { &SERVER_INFO_ADMIN_CACHE } else { &SERVER_INFO_CACHE };
+        if let Some(cached) = cache.read().unwrap().clone() {
             return ServerInfoResponse::PreRendered(cached);
         }
     }

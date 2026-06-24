@@ -17,12 +17,13 @@ use crate::intrusive_pointer::{
 use crate::mutex::RecursiveMutex;
 use crate::partitioned_unordered_map::{PartitionKey, PartitionedUnorderedMap};
 use crate::shared_weak_cache_pointer::SharedWeakCachePointer;
+use dashmap::DashMap;
 use std::borrow::Borrow;
 use std::collections::HashMap as StdHashMap;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use time::Duration;
@@ -361,7 +362,6 @@ struct KeyCacheState<K, S> {
     cache: PartitionedUnorderedMap<K, KeyOnlyEntry, S>,
 }
 
-#[derive(Debug)]
 pub struct TaggedCache<
     K,
     T,
@@ -375,15 +375,31 @@ pub struct TaggedCache<
     target_age: Duration,
     clock: C,
     instrumentation: TaggedCacheInstrumentation,
+    fast_map: DashMap<K, SP, S>,
+    fast_hits: AtomicU64,
     state: RecursiveMutex<TaggedCacheState<K, T, P, SP, S>>,
+}
+
+impl<K, T, C, S, P, SP> fmt::Debug for TaggedCache<K, T, C, S, P, SP>
+where
+    C: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaggedCache")
+            .field("name", &self.name)
+            .field("target_size", &self.target_size)
+            .field("target_age", &self.target_age)
+            .field("clock", &self.clock)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<K, T, C, P, SP> TaggedCache<K, T, C, HardenedHashBuilder, P, SP>
 where
-    K: Eq + Hash + PartitionKey + Clone,
+    K: Eq + Hash + PartitionKey + Clone + Send + Sync,
     C: CacheClock,
     P: CachePointer<T, SP>,
-    SP: Clone,
+    SP: Clone + Send + Sync,
 {
     pub fn new(name: impl Into<String>, size: usize, expiration: Duration, clock: C) -> Self {
         Self::with_hasher(
@@ -398,10 +414,10 @@ where
 
 impl<K, T, C, S, P, SP> TaggedCache<K, T, C, S, P, SP>
 where
-    K: Eq + Hash + PartitionKey + Clone,
+    K: Eq + Hash + PartitionKey + Clone + Send + Sync,
     C: CacheClock,
     P: CachePointer<T, SP>,
-    SP: Clone,
+    SP: Clone + Send + Sync,
     S: BuildHasher + Clone,
 {
     pub fn with_hasher(
@@ -417,6 +433,8 @@ where
             target_age: expiration,
             clock,
             instrumentation: TaggedCacheInstrumentation::default(),
+            fast_map: DashMap::with_hasher(hasher.clone()),
+            fast_hits: AtomicU64::new(0),
             state: RecursiveMutex::new(TaggedCacheState {
                 cache_count: 0,
                 cache: PartitionedUnorderedMap::with_hasher(None, hasher),
@@ -441,6 +459,8 @@ where
             target_age: expiration,
             clock,
             instrumentation: TaggedCacheInstrumentation { metrics, logger },
+            fast_map: DashMap::with_hasher(hasher.clone()),
+            fast_hits: AtomicU64::new(0),
             state: RecursiveMutex::new(TaggedCacheState {
                 cache_count: 0,
                 cache: PartitionedUnorderedMap::with_hasher(None, hasher),
@@ -488,8 +508,9 @@ where
             .state
             .lock()
             .expect("TaggedCache mutex must not be poisoned");
-        let total = (state.hits + state.misses) as f32;
-        state.hits as f32 * (100.0 / total.max(1.0))
+        let hits = state.hits + self.fast_hits.load(Ordering::Relaxed);
+        let total = (hits + state.misses) as f32;
+        hits as f32 * (100.0 / total.max(1.0))
     }
 
     pub fn rate(&self) -> f64 {
@@ -497,11 +518,12 @@ where
             .state
             .lock()
             .expect("TaggedCache mutex must not be poisoned");
-        let total = state.hits + state.misses;
+        let hits = state.hits + self.fast_hits.load(Ordering::Relaxed);
+        let total = hits + state.misses;
         if total == 0 {
             0.0
         } else {
-            state.hits as f64 / total as f64
+            hits as f64 / total as f64
         }
     }
 
@@ -510,17 +532,18 @@ where
             .state
             .lock()
             .expect("TaggedCache mutex must not be poisoned");
-        let total = state.hits + state.misses;
+        let hits = state.hits + self.fast_hits.load(Ordering::Relaxed);
+        let total = hits + state.misses;
         let hit_rate = if total == 0 {
             0
         } else {
-            (state.hits * 100) / total
+            (hits * 100) / total
         };
         TaggedCacheMetricsSnapshot {
             size: state.cache_count,
             track_size: state.cache.len(),
             hit_rate,
-            hits: state.hits,
+            hits,
             misses: state.misses,
         }
     }
@@ -531,6 +554,7 @@ where
     }
 
     pub fn clear(&self) {
+        self.fast_map.clear();
         let mut state = self
             .state
             .lock()
@@ -540,6 +564,8 @@ where
     }
 
     pub fn reset(&self) {
+        self.fast_map.clear();
+        self.fast_hits.store(0, Ordering::Relaxed);
         let mut state = self
             .state
             .lock()
@@ -572,6 +598,8 @@ where
     pub fn sweep(&self) {
         let now = self.clock.now();
         let start = Instant::now();
+        // Clear the fast_map before sweep so use_count checks are accurate
+        self.fast_map.clear();
         let mut swept_pointers = Vec::new();
         {
             let mut state = self
@@ -594,7 +622,8 @@ where
 
             let mut all_removals = 0usize;
             for partition in state.cache.map_mut() {
-                let (counts, mut removed) = sweep_value_partition(partition, when_expire);
+                let (counts, mut removed, _keys) =
+                    sweep_value_partition(partition, when_expire);
                 if counts.cache_removals != 0 || counts.map_removals != 0 {
                     self.instrumentation.logger.debug(&format!(
                         "TaggedCache partition sweep {}: cache = {}-{}, map-={}",
@@ -652,6 +681,11 @@ where
             state.cache.remove(key);
         }
 
+        // Remove from fast_map when entry is no longer strongly cached
+        if removed_from_cache || remove_entry {
+            self.fast_map.remove(key);
+        }
+
         removed_from_cache
     }
 
@@ -660,6 +694,12 @@ where
         K: Borrow<Q>,
         Q: Eq + Hash + PartitionKey + ?Sized,
     {
+        // Fast path: lock-free DashMap lookup
+        if let Some(entry) = self.fast_map.get(key) {
+            self.fast_hits.fetch_add(1, Ordering::Relaxed);
+            return Some(entry.value().clone());
+        }
+        // Slow path: fall through to locked state
         let mut state = self
             .state
             .lock()
@@ -672,12 +712,18 @@ where
     }
 
     pub fn fetch_with(&self, key: &K, handler: impl FnOnce() -> Option<SP>) -> Option<SP> {
+        // Fast path: lock-free DashMap lookup
+        if let Some(entry) = self.fast_map.get(key) {
+            self.fast_hits.fetch_add(1, Ordering::Relaxed);
+            return Some(entry.value().clone());
+        }
         {
             let mut state = self
                 .state
                 .lock()
                 .expect("TaggedCache mutex must not be poisoned");
             if let Some(found) = state.initial_fetch(key, self.clock.now()) {
+                self.fast_map.insert(key.clone(), found.clone());
                 return Some(found);
             }
         }
@@ -691,13 +737,18 @@ where
         state.misses += 1;
         if let Some(entry) = state.cache.get_mut(key) {
             entry.touch(now);
-            return entry.ptr.strong_clone();
+            let result = entry.ptr.strong_clone();
+            if let Some(ref value) = result {
+                self.fast_map.insert(key.clone(), value.clone());
+            }
+            return result;
         }
 
         state
             .cache
             .insert(key.clone(), ValueEntry::new(now, created.clone()));
         state.cache_count += 1;
+        self.fast_map.insert(key.clone(), created.clone());
         Some(created)
     }
 
@@ -734,8 +785,10 @@ where
                     cached.clone(),
                 )) {
                     entry.ptr.set_strong(data.clone());
+                    self.fast_map.insert(key.clone(), data.clone());
                 } else {
-                    *data = cached;
+                    *data = cached.clone();
+                    self.fast_map.insert(key.clone(), cached);
                 }
                 return true;
             }
@@ -747,9 +800,11 @@ where
                     cached.clone(),
                 )) {
                     entry.ptr.set_strong(data.clone());
+                    self.fast_map.insert(key.clone(), data.clone());
                 } else {
                     entry.ptr.set_strong(cached.clone());
-                    *data = cached;
+                    *data = cached.clone();
+                    self.fast_map.insert(key.clone(), cached);
                 }
 
                 state.cache_count += 1;
@@ -758,6 +813,7 @@ where
 
             entry.ptr.set_strong(data.clone());
             state.cache_count += 1;
+            self.fast_map.insert(key.clone(), data.clone());
             return false;
         }
 
@@ -765,6 +821,7 @@ where
             .cache
             .insert(key.clone(), ValueEntry::new(self.clock.now(), data.clone()));
         state.cache_count += 1;
+        self.fast_map.insert(key.clone(), data.clone());
         false
     }
 
@@ -977,7 +1034,7 @@ struct SweepCounts {
 fn sweep_value_partition<K, T, P, SP, S>(
     partition: &mut StdHashMap<K, ValueEntry<T, P, SP>, S>,
     when_expire: Duration,
-) -> (SweepCounts, Vec<P>)
+) -> (SweepCounts, Vec<P>, Vec<K>)
 where
     K: Clone + Eq + Hash,
     P: CachePointer<T, SP>,
@@ -1004,13 +1061,13 @@ where
         }
     }
 
-    for key in keys_to_remove {
-        if let Some(entry) = partition.remove(&key) {
+    for key in &keys_to_remove {
+        if let Some(entry) = partition.remove(key) {
             swept.push(entry.ptr);
         }
     }
 
-    (counts, swept)
+    (counts, swept, Vec::new())
 }
 
 fn sweep_key_partition<K, S>(
@@ -1508,40 +1565,45 @@ mod tests {
 
     #[test]
     fn sweep_drops_removed_values_after_releasing_the_cache_lock() {
-        struct DropProbe<'a> {
-            on_drop: Box<dyn Fn() + 'a>,
+        struct DropProbe {
+            on_drop: Box<dyn Fn() + Send + Sync>,
         }
 
-        impl Drop for DropProbe<'_> {
+        impl Drop for DropProbe {
             fn drop(&mut self) {
                 (self.on_drop)();
             }
         }
 
-        type DropProbeState<'a> = super::TaggedCacheState<
+        type DropProbeState = super::TaggedCacheState<
             u32,
-            DropProbe<'a>,
-            crate::shared_weak_cache_pointer::SharedWeakCachePointer<DropProbe<'a>>,
-            Arc<DropProbe<'a>>,
+            DropProbe,
+            crate::shared_weak_cache_pointer::SharedWeakCachePointer<DropProbe>,
+            Arc<DropProbe>,
             crate::hardened_hash::HardenedHashBuilder,
         >;
 
         let clock = ManualClock::new(0);
-        let cache = Box::pin(TaggedCache::<u32, DropProbe<'_>, _>::new(
+        let cache = Box::pin(TaggedCache::<u32, DropProbe, _>::new(
             "test",
             1,
             Duration::seconds(1),
             clock,
         ));
         let lock_was_available = Arc::new(AtomicBool::new(false));
-        let mutex_ptr: *const RecursiveMutex<DropProbeState<'_>> =
-            cache.as_ref().get_ref().peek_mutex();
+        let mutex_addr: usize =
+            cache.as_ref().get_ref().peek_mutex() as *const RecursiveMutex<DropProbeState>
+                as usize;
 
         let probe = DropProbe {
             on_drop: Box::new({
                 let lock_was_available = Arc::clone(&lock_was_available);
                 move || {
-                    let lock_result = unsafe { (&*mutex_ptr).try_lock().is_ok() };
+                    let lock_result = unsafe {
+                        (&*(mutex_addr as *const RecursiveMutex<DropProbeState>))
+                            .try_lock()
+                            .is_ok()
+                    };
                     lock_was_available.store(lock_result, Ordering::SeqCst);
                 }
             }),

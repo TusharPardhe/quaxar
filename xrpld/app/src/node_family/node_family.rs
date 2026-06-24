@@ -116,7 +116,7 @@ impl<C, S, FB, F, MR, NS> NodeFamily<C, S, FB, F, MR, NS> {
         self.family.with_full_below_cache(callback)
     }
 
-    pub fn with_sync_resources<T>(&self, callback: impl FnOnce(&FB, &mut F) -> T) -> T {
+    pub fn with_sync_resources<T>(&self, callback: impl FnOnce(&FB, &F) -> T) -> T {
         self.family.with_sync_resources(callback)
     }
 

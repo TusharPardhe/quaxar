@@ -298,7 +298,9 @@ where
                 }
 
                 let _guard = ListenerGuard(Arc::clone(&state));
-                let runtime = match tokio::runtime::Builder::new_current_thread()
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .max_blocking_threads(128)
                     .enable_all()
                     .build()
                 {

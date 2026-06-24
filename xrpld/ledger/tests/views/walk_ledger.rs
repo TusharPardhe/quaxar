@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 use basics::base_uint::Uint256;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
@@ -9,7 +10,7 @@ use shamap::sync::{SHAMapType, SyncState, SyncTree};
 use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::Duration;
 
 fn sample_hash(fill: u8) -> SHAMapHash {
@@ -23,12 +24,12 @@ fn sample_uint256(fill: u8) -> Uint256 {
 #[derive(Debug, Default)]
 struct RecordingFetcher {
     expected: HashMap<SHAMapHash, SharedIntrusive<SHAMapTreeNode>>,
-    fetches: Vec<SHAMapHash>,
+    fetches: Mutex<Vec<SHAMapHash>>,
 }
 
 impl SHAMapNodeFetcher for RecordingFetcher {
-    fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-        self.fetches.push(hash);
+    fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+        self.fetches.lock().push(hash);
         self.expected.get(&hash).cloned()
     }
 }
@@ -45,7 +46,6 @@ impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_seq(&self, ref_num: u32, node_hash: Uint256) {
         self.0
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_seq
             .push((ref_num, node_hash));
     }
@@ -63,14 +63,12 @@ impl RecordingLedgerJournal {
     fn infos(&self) -> Vec<String> {
         self.infos
             .lock()
-            .expect("ledger journal mutex must not be poisoned")
             .clone()
     }
 
     fn warns(&self) -> Vec<String> {
         self.warns
             .lock()
-            .expect("ledger journal mutex must not be poisoned")
             .clone()
     }
 }
@@ -79,14 +77,12 @@ impl LedgerJournal for RecordingLedgerJournal {
     fn info(&self, message: &str) {
         self.infos
             .lock()
-            .expect("ledger journal mutex must not be poisoned")
             .push(message.to_owned());
     }
 
     fn warn(&self, message: &str) {
         self.warns
             .lock()
-            .expect("ledger journal mutex must not be poisoned")
             .push(message.to_owned());
     }
 }
@@ -122,11 +118,10 @@ fn ledger_walk_ledger_serial_reports_missing_account_and_tx_roots() {
     ledger.set_full();
 
     assert!(!ledger.walk_ledger_with_family(&journal, false, &family));
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches, vec![account_hash, tx_hash]));
+    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![account_hash, tx_hash]));
     assert_eq!(
         reporter
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_seq,
         vec![
             (600, *account_hash.as_uint256()),
@@ -191,7 +186,7 @@ fn ledger_walk_ledger_parallel_returns_state_walk_result_and_skips_tx_tree() {
     let journal = RecordingLedgerJournal::default();
 
     assert!(ledger.walk_ledger_with_family(&journal, true, &family));
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches, vec![state_missing_hash]));
+    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![state_missing_hash]));
     assert!(journal.infos().is_empty());
     assert!(journal.warns().is_empty());
 }
@@ -218,7 +213,7 @@ fn ledger_walk_ledger_serial_checks_tx_tree_after_missing_account_root() {
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(Arc::new(
             Mutex::new(RecordingMissingNodeReporter::default()),
@@ -236,7 +231,7 @@ fn ledger_walk_ledger_serial_checks_tx_tree_after_missing_account_root() {
     let journal = RecordingLedgerJournal::default();
 
     assert!(!ledger.walk_ledger_with_family(&journal, false, &family));
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches, vec![account_hash, tx_hash]));
+    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![account_hash, tx_hash]));
     assert_eq!(
         journal.infos(),
         vec![format!(

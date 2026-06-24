@@ -228,9 +228,9 @@ impl Default for RpcServerState {
     fn default() -> Self {
         Self {
             in_flight: dashmap::DashMap::new(),
-            p0_pool: tokio::sync::Semaphore::new(32),
-            p1_pool: tokio::sync::Semaphore::new(16),
-            p2_pool: tokio::sync::Semaphore::new(4),
+            p0_pool: tokio::sync::Semaphore::new(128),
+            p1_pool: tokio::sync::Semaphore::new(64),
+            p2_pool: tokio::sync::Semaphore::new(16),
         }
     }
 }

@@ -91,7 +91,7 @@ struct RecordingFetcher {
 }
 
 impl SHAMapNodeFetcher for RecordingFetcher {
-    fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+    fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
         self.expected.get(&hash).cloned()
     }
 }

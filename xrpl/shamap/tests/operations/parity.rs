@@ -1,5 +1,6 @@
 //! Integration tests for the narrowed `xrpl/shamap` migration slice.
 
+use parking_lot::Mutex;
 use basics::base_uint::Uint256;
 use basics::blob::Blob;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
@@ -35,7 +36,7 @@ use shamap::tree_node::{
 use shamap::tree_node_cache::TreeNodeCache;
 use shamap::visitor::{visit_leaves, visit_nodes};
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::Duration;
 
 fn sample_uint256(fill: u8) -> Uint256 {
@@ -62,7 +63,6 @@ impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_seq(&self, ref_num: u32, node_hash: Uint256) {
         self.0
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_seq
             .push((ref_num, node_hash));
     }
@@ -79,7 +79,6 @@ impl RecordingJournal {
     fn entries(&self) -> Vec<(JournalLevel, String)> {
         self.entries
             .lock()
-            .expect("journal entries mutex must not be poisoned")
             .clone()
     }
 }
@@ -88,7 +87,6 @@ impl SHAMapJournal for RecordingJournal {
     fn log(&self, level: JournalLevel, message: &str) {
         self.entries
             .lock()
-            .expect("journal entries mutex must not be poisoned")
             .push((level, message.to_owned()));
     }
 }
@@ -1281,12 +1279,12 @@ fn shamap_sync_tree_family_missing_node_wrapper_matches_narrow_cpp_restart_role(
     #[derive(Debug, Default)]
     struct RecordingFetcher {
         nodes: HashMap<SHAMapHash, SharedIntrusive<SHAMapTreeNode>>,
-        fetches: Vec<SHAMapHash>,
+        fetches: Mutex<Vec<SHAMapHash>>,
     }
 
     impl SHAMapNodeFetcher for RecordingFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-            self.fetches.push(hash);
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            self.fetches.lock().push(hash);
             self.nodes.get(&hash).cloned()
         }
     }
@@ -1312,7 +1310,7 @@ fn shamap_sync_tree_family_missing_node_wrapper_matches_narrow_cpp_restart_role(
         NullFullBelowCache::new(18),
         RecordingFetcher {
             nodes,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         NullMissingNodeReporter,
     );
@@ -1335,7 +1333,7 @@ fn shamap_sync_tree_family_missing_node_wrapper_matches_narrow_cpp_restart_role(
     assert!(tree.is_synching());
     family.with_fetcher(|fetcher| {
         assert_eq!(
-            fetcher.fetches,
+            fetcher.fetches.lock().clone(),
             vec![fetched_inner.get_hash(), missing_leaf_hash]
         );
     });
@@ -1349,7 +1347,7 @@ fn shamap_sync_tree_has_inner_node_matches_narrow_cpp_roles() {
     }
 
     impl SHAMapNodeFetcher for RecordingFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
             self.nodes.get(&hash).cloned()
         }
     }
@@ -1399,7 +1397,7 @@ fn shamap_sync_tree_has_leaf_node_matches_narrow_cpp_roles() {
     }
 
     impl SHAMapNodeFetcher for RecordingFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
             self.nodes.get(&hash).cloned()
         }
     }
@@ -1454,7 +1452,7 @@ fn shamap_sync_tree_get_proof_path_matches_narrow_cpp_roles() {
     }
 
     impl SHAMapNodeFetcher for RecordingFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
             self.nodes.get(&hash).cloned()
         }
     }
@@ -1583,12 +1581,12 @@ fn shamap_sync_tree_walk_map_with_family_matches_owner_fetch_roles() {
     #[derive(Debug, Default)]
     struct RecordingObjectFetcher {
         objects: HashMap<SHAMapHash, NodeObject>,
-        fetches: Vec<(SHAMapHash, u32)>,
+        fetches: Mutex<Vec<(SHAMapHash, u32)>>,
     }
 
     impl SHAMapNodeFetcher for RecordingObjectFetcher {
-        fn fetch_node_object(&mut self, hash: SHAMapHash, ledger_seq: u32) -> Option<NodeObject> {
-            self.fetches.push((hash, ledger_seq));
+        fn fetch_node_object(&self, hash: SHAMapHash, ledger_seq: u32) -> Option<NodeObject> {
+            self.fetches.lock().push((hash, ledger_seq));
             self.objects.get(&hash).cloned()
         }
     }
@@ -1625,7 +1623,7 @@ fn shamap_sync_tree_walk_map_with_family_matches_owner_fetch_roles() {
         NullFullBelowCache::new(0),
         RecordingObjectFetcher {
             objects,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(reporter.clone()),
     );
@@ -1655,8 +1653,7 @@ fn shamap_sync_tree_walk_map_with_family_matches_owner_fetch_roles() {
     assert!(root.get_child(2).is_none());
     assert!(!tree.is_full());
     let reporter_state = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(209, *missing_hash.as_uint256())]
@@ -1665,7 +1662,7 @@ fn shamap_sync_tree_walk_map_with_family_matches_owner_fetch_roles() {
 
     family.with_fetcher(|fetcher| {
         assert_eq!(
-            fetcher.fetches,
+            fetcher.fetches.lock().clone(),
             vec![
                 (fetched_inner.get_hash(), 209),
                 (missing_hash, 209),
@@ -1680,12 +1677,12 @@ fn shamap_sync_tree_walk_map_parallel_with_family_matches_owner_fetch_roles() {
     #[derive(Debug, Default)]
     struct RecordingObjectFetcher {
         objects: HashMap<SHAMapHash, NodeObject>,
-        fetches: Vec<(SHAMapHash, u32)>,
+        fetches: Mutex<Vec<(SHAMapHash, u32)>>,
     }
 
     impl SHAMapNodeFetcher for RecordingObjectFetcher {
-        fn fetch_node_object(&mut self, hash: SHAMapHash, ledger_seq: u32) -> Option<NodeObject> {
-            self.fetches.push((hash, ledger_seq));
+        fn fetch_node_object(&self, hash: SHAMapHash, ledger_seq: u32) -> Option<NodeObject> {
+            self.fetches.lock().push((hash, ledger_seq));
             self.objects.get(&hash).cloned()
         }
     }
@@ -1722,7 +1719,7 @@ fn shamap_sync_tree_walk_map_parallel_with_family_matches_owner_fetch_roles() {
         NullFullBelowCache::new(0),
         RecordingObjectFetcher {
             objects,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(reporter.clone()),
     );
@@ -1754,8 +1751,7 @@ fn shamap_sync_tree_walk_map_parallel_with_family_matches_owner_fetch_roles() {
     assert!(root.get_child(2).is_none());
     assert!(!tree.is_full());
     let reporter_state = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(210, *missing_hash.as_uint256())]
@@ -1764,7 +1760,7 @@ fn shamap_sync_tree_walk_map_parallel_with_family_matches_owner_fetch_roles() {
 
     family.with_fetcher(|fetcher| {
         assert_eq!(
-            fetcher.fetches,
+            fetcher.fetches.lock().clone(),
             vec![
                 (fetched_inner.get_hash(), 210),
                 (missing_hash, 210),
@@ -1783,7 +1779,7 @@ fn shamap_sync_tree_walk_map_parallel_with_family_logs_worker_failures() {
     }
 
     impl SHAMapNodeFetcher for PanicObjectFetcher {
-        fn fetch_node_object(&mut self, hash: SHAMapHash, _ledger_seq: u32) -> Option<NodeObject> {
+        fn fetch_node_object(&self, hash: SHAMapHash, _ledger_seq: u32) -> Option<NodeObject> {
             if self.panic_hash == Some(hash) {
                 panic!("parallel fetch panic");
             }
@@ -1911,12 +1907,12 @@ fn shamap_sync_tree_node_object_fetch_matches_narrow_cpp_roles() {
     #[derive(Debug, Default)]
     struct RecordingObjectFetcher {
         object: Option<NodeObject>,
-        fetches: Vec<(SHAMapHash, u32)>,
+        fetches: Mutex<Vec<(SHAMapHash, u32)>>,
     }
 
     impl SHAMapNodeFetcher for RecordingObjectFetcher {
-        fn fetch_node_object(&mut self, hash: SHAMapHash, ledger_seq: u32) -> Option<NodeObject> {
-            self.fetches.push((hash, ledger_seq));
+        fn fetch_node_object(&self, hash: SHAMapHash, ledger_seq: u32) -> Option<NodeObject> {
+            self.fetches.lock().push((hash, ledger_seq));
             self.object.clone()
         }
     }
@@ -1941,7 +1937,7 @@ fn shamap_sync_tree_node_object_fetch_matches_narrow_cpp_roles() {
                     .expect("leaf should serialize with prefix"),
                 *leaf.get_hash().as_uint256(),
             )),
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         NullMissingNodeReporter,
     );
@@ -1951,7 +1947,7 @@ fn shamap_sync_tree_node_object_fetch_matches_narrow_cpp_roles() {
     assert!(tree.fetch_root_with_family(leaf.get_hash(), &mut no_filter, &family));
     assert_eq!(tree.root().get_hash(), leaf.get_hash());
     family.with_fetcher(|fetcher| {
-        assert_eq!(fetcher.fetches, vec![(leaf.get_hash(), 206)]);
+        assert_eq!(fetcher.fetches.lock().clone(), vec![(leaf.get_hash(), 206)]);
     });
 }
 
@@ -1967,11 +1963,10 @@ fn shamap_sync_tree_owner_full_gate_matches_narrow_cpp_fetch_roles() {
     struct SharedBlobFetcher(Arc<Mutex<BlobFetchMode>>);
 
     impl SHAMapNodeFetcher for SharedBlobFetcher {
-        fn fetch_node_blob(&mut self, _hash: SHAMapHash) -> Option<Blob> {
+        fn fetch_node_blob(&self, _hash: SHAMapHash) -> Option<Blob> {
             match *self
                 .0
                 .lock()
-                .expect("shared blob fetcher mutex must not be poisoned")
             {
                 BlobFetchMode::InvalidBlob => Some(vec![0x00, 0xAB, 0xCD]),
                 BlobFetchMode::Missing => None,
@@ -2004,7 +1999,6 @@ fn shamap_sync_tree_owner_full_gate_matches_narrow_cpp_fetch_roles() {
     assert!(
         reporter
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_seq
             .is_empty()
     );
@@ -2017,15 +2011,13 @@ fn shamap_sync_tree_owner_full_gate_matches_narrow_cpp_fetch_roles() {
     assert!(journal.entries()[1].1.contains("invalid fetched node blob"));
 
     *mode
-        .lock()
-        .expect("shared blob fetcher mutex must not be poisoned") = BlobFetchMode::Missing;
+        .lock() = BlobFetchMode::Missing;
 
     assert!(!tree.fetch_root_with_family(requested, &mut no_filter, &family));
     assert!(!tree.fetch_root_with_family(requested, &mut no_filter, &family));
     assert!(!tree.is_full());
     let reporter = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert_eq!(reporter.by_seq, vec![(95, *requested.as_uint256())]);
 }
 
@@ -2033,12 +2025,12 @@ fn shamap_sync_tree_owner_full_gate_matches_narrow_cpp_fetch_roles() {
 fn shamap_sync_tree_owner_config_matches_narrow_cpp_roles() {
     #[derive(Debug, Default)]
     struct RecordingFetcher {
-        fetches: Vec<SHAMapHash>,
+        fetches: Mutex<Vec<SHAMapHash>>,
     }
 
     impl SHAMapNodeFetcher for RecordingFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-            self.fetches.push(hash);
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            self.fetches.lock().push(hash);
             None
         }
     }
@@ -2063,22 +2055,20 @@ fn shamap_sync_tree_owner_config_matches_narrow_cpp_roles() {
 
     assert!(!tree.fetch_root_with_family(requested, &mut no_filter, &family));
     family.with_fetcher(|fetcher| {
-        assert_eq!(fetcher.fetches, vec![requested]);
+        assert_eq!(fetcher.fetches.lock().clone(), vec![requested]);
     });
     let reporter_state = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert_eq!(reporter_state.by_seq, vec![(205, *requested.as_uint256())]);
     drop(reporter_state);
 
     tree.set_unbacked();
     assert!(!tree.fetch_root_with_family(requested, &mut no_filter, &family));
     family.with_fetcher(|fetcher| {
-        assert_eq!(fetcher.fetches, vec![requested]);
+        assert_eq!(fetcher.fetches.lock().clone(), vec![requested]);
     });
     let reporter_state = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert_eq!(reporter_state.by_seq, vec![(205, *requested.as_uint256())]);
 }
 
@@ -2294,12 +2284,12 @@ fn shamap_sync_tree_owner_read_traversal_wrappers_match_narrow_cpp_roles() {
     #[derive(Debug, Default)]
     struct RecordingFetcher {
         expected: Vec<(SHAMapHash, SharedIntrusive<SHAMapTreeNode>)>,
-        fetches: Vec<SHAMapHash>,
+        fetches: Mutex<Vec<SHAMapHash>>,
     }
 
     impl SHAMapNodeFetcher for RecordingFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-            self.fetches.push(hash);
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            self.fetches.lock().push(hash);
             self.expected
                 .iter()
                 .find(|(expected_hash, _)| *expected_hash == hash)
@@ -2341,7 +2331,7 @@ fn shamap_sync_tree_owner_read_traversal_wrappers_match_narrow_cpp_roles() {
                 (first_leaf.get_hash(), first_leaf.clone_with_cowid(0)),
                 (second_leaf.get_hash(), second_leaf.clone_with_cowid(0)),
             ],
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         NullMissingNodeReporter,
     );
@@ -2419,7 +2409,7 @@ fn shamap_sync_tree_visit_differences_with_families_matches_narrow_cpp_roles() {
     }
 
     impl SHAMapNodeFetcher for RecordingFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
             self.expected
                 .iter()
                 .find(|(expected_hash, _)| *expected_hash == hash)
@@ -3050,12 +3040,12 @@ fn shamap_storage_tree_direct_reads_use_owner_backed_policy() {
     #[derive(Debug, Default)]
     struct RecordingFetcher {
         node: Option<SharedIntrusive<SHAMapTreeNode>>,
-        fetches: Vec<SHAMapHash>,
+        fetches: Mutex<Vec<SHAMapHash>>,
     }
 
     impl SHAMapNodeFetcher for RecordingFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-            self.fetches.push(hash);
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            self.fetches.lock().push(hash);
             self.node.clone()
         }
     }
@@ -3082,7 +3072,7 @@ fn shamap_storage_tree_direct_reads_use_owner_backed_policy() {
         NullFullBelowCache::new(22),
         RecordingFetcher {
             node: Some(leaf.clone()),
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         NullMissingNodeReporter,
     );
@@ -3105,7 +3095,7 @@ fn shamap_storage_tree_direct_reads_use_owner_backed_policy() {
     assert_eq!(resolved.1, leaf.get_hash());
     assert!(root.get_child(2).is_some());
     family.with_fetcher(|fetcher| {
-        assert_eq!(fetcher.fetches, vec![leaf.get_hash()]);
+        assert_eq!(fetcher.fetches.lock().clone(), vec![leaf.get_hash()]);
     });
 }
 
@@ -3114,12 +3104,12 @@ fn shamap_storage_tree_walk_map_with_family_matches_owner_fetch_roles() {
     #[derive(Debug, Default)]
     struct RecordingObjectFetcher {
         objects: HashMap<SHAMapHash, NodeObject>,
-        fetches: Vec<(SHAMapHash, u32)>,
+        fetches: Mutex<Vec<(SHAMapHash, u32)>>,
     }
 
     impl SHAMapNodeFetcher for RecordingObjectFetcher {
-        fn fetch_node_object(&mut self, hash: SHAMapHash, ledger_seq: u32) -> Option<NodeObject> {
-            self.fetches.push((hash, ledger_seq));
+        fn fetch_node_object(&self, hash: SHAMapHash, ledger_seq: u32) -> Option<NodeObject> {
+            self.fetches.lock().push((hash, ledger_seq));
             self.objects.get(&hash).cloned()
         }
     }
@@ -3156,7 +3146,7 @@ fn shamap_storage_tree_walk_map_with_family_matches_owner_fetch_roles() {
         NullFullBelowCache::new(0),
         RecordingObjectFetcher {
             objects,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(reporter.clone()),
     );
@@ -3185,8 +3175,7 @@ fn shamap_storage_tree_walk_map_with_family_matches_owner_fetch_roles() {
     assert!(root.get_child(2).is_none());
     assert!(!tree.is_full());
     let reporter_state = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(207, *missing_hash.as_uint256())]
@@ -3195,7 +3184,7 @@ fn shamap_storage_tree_walk_map_with_family_matches_owner_fetch_roles() {
 
     family.with_fetcher(|fetcher| {
         assert_eq!(
-            fetcher.fetches,
+            fetcher.fetches.lock().clone(),
             vec![
                 (fetched_inner.get_hash(), 207),
                 (missing_hash, 207),
@@ -3214,7 +3203,7 @@ fn shamap_storage_tree_walk_map_parallel_with_family_logs_worker_failures() {
     }
 
     impl SHAMapNodeFetcher for PanicObjectFetcher {
-        fn fetch_node_object(&mut self, hash: SHAMapHash, _ledger_seq: u32) -> Option<NodeObject> {
+        fn fetch_node_object(&self, hash: SHAMapHash, _ledger_seq: u32) -> Option<NodeObject> {
             if self.panic_hash == Some(hash) {
                 panic!("parallel fetch panic");
             }
@@ -3312,8 +3301,7 @@ fn shamap_storage_tree_owner_full_gate_matches_narrow_cpp_fetch_roles() {
     assert_eq!(second, TraversalError::MissingNode(missing_hash));
     assert!(!tree.is_full());
     let reporter = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert_eq!(reporter.by_seq, vec![(106, *missing_hash.as_uint256())]);
 }
 
@@ -3321,12 +3309,12 @@ fn shamap_storage_tree_owner_full_gate_matches_narrow_cpp_fetch_roles() {
 fn shamap_storage_tree_owner_config_matches_narrow_cpp_roles() {
     #[derive(Debug, Default)]
     struct RecordingFetcher {
-        fetches: Vec<SHAMapHash>,
+        fetches: Mutex<Vec<SHAMapHash>>,
     }
 
     impl SHAMapNodeFetcher for RecordingFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-            self.fetches.push(hash);
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            self.fetches.lock().push(hash);
             None
         }
     }
@@ -3359,11 +3347,10 @@ fn shamap_storage_tree_owner_config_matches_narrow_cpp_roles() {
         .expect_err("backed owner should still surface missing branches");
     assert_eq!(first, TraversalError::MissingNode(missing_hash));
     family.with_fetcher(|fetcher| {
-        assert_eq!(fetcher.fetches, vec![missing_hash]);
+        assert_eq!(fetcher.fetches.lock().clone(), vec![missing_hash]);
     });
     let reporter_state = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(206, *missing_hash.as_uint256())]
@@ -3376,11 +3363,10 @@ fn shamap_storage_tree_owner_config_matches_narrow_cpp_roles() {
         .expect_err("unbacked owner should not fetch missing branches");
     assert_eq!(second, TraversalError::MissingNode(missing_hash));
     family.with_fetcher(|fetcher| {
-        assert_eq!(fetcher.fetches, vec![missing_hash]);
+        assert_eq!(fetcher.fetches.lock().clone(), vec![missing_hash]);
     });
     let reporter_state = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(206, *missing_hash.as_uint256())]
@@ -3566,12 +3552,12 @@ fn shamap_storage_tree_lookup_wrappers_use_owner_backed_policy() {
     #[derive(Debug, Default)]
     struct RecordingFetcher {
         node: Option<SharedIntrusive<SHAMapTreeNode>>,
-        fetches: Vec<SHAMapHash>,
+        fetches: Mutex<Vec<SHAMapHash>>,
     }
 
     impl SHAMapNodeFetcher for RecordingFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-            self.fetches.push(hash);
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            self.fetches.lock().push(hash);
             self.node.clone()
         }
     }
@@ -3603,7 +3589,7 @@ fn shamap_storage_tree_lookup_wrappers_use_owner_backed_policy() {
         NullFullBelowCache::new(23),
         RecordingFetcher {
             node: Some(inner.clone()),
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         NullMissingNodeReporter,
     );
@@ -3637,7 +3623,7 @@ fn shamap_storage_tree_lookup_wrappers_use_owner_backed_policy() {
         ]
     );
     family.with_fetcher(|fetcher| {
-        assert_eq!(fetcher.fetches, vec![inner.get_hash()]);
+        assert_eq!(fetcher.fetches.lock().clone(), vec![inner.get_hash()]);
     });
 }
 
@@ -3646,12 +3632,12 @@ fn shamap_storage_tree_search_and_iteration_wrappers_use_owner_backed_policy() {
     #[derive(Debug, Default)]
     struct RecordingFetcher {
         nodes: HashMap<SHAMapHash, SharedIntrusive<SHAMapTreeNode>>,
-        fetches: Vec<SHAMapHash>,
+        fetches: Mutex<Vec<SHAMapHash>>,
     }
 
     impl SHAMapNodeFetcher for RecordingFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-            self.fetches.push(hash);
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            self.fetches.lock().push(hash);
             self.nodes.get(&hash).cloned()
         }
     }
@@ -3692,7 +3678,7 @@ fn shamap_storage_tree_search_and_iteration_wrappers_use_owner_backed_policy() {
         NullFullBelowCache::new(24),
         RecordingFetcher {
             nodes,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         NullMissingNodeReporter,
     );
@@ -3728,7 +3714,7 @@ fn shamap_storage_tree_search_and_iteration_wrappers_use_owner_backed_policy() {
 
     family.with_fetcher(|fetcher| {
         assert_eq!(
-            fetcher.fetches,
+            fetcher.fetches.lock().clone(),
             vec![low_leaf.get_hash(), high_leaf.get_hash()]
         );
     });

@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 use basics::base_uint::{Uint160, Uint256};
 use basics::chrono::NetClockTimePoint;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
@@ -28,7 +29,7 @@ use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::Duration;
 
 fn sample_hash(fill: u8) -> SHAMapHash {
@@ -440,12 +441,12 @@ fn ledger_succ_upper_bound_and_last_limit() {
 #[derive(Debug, Default)]
 struct RecordingFetcher {
     expected: HashMap<SHAMapHash, SharedIntrusive<SHAMapTreeNode>>,
-    fetches: Vec<SHAMapHash>,
+    fetches: Mutex<Vec<SHAMapHash>>,
 }
 
 impl SHAMapNodeFetcher for RecordingFetcher {
-    fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-        self.fetches.push(hash);
+    fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+        self.fetches.lock().push(hash);
         self.expected.get(&hash).cloned()
     }
 }
@@ -463,7 +464,6 @@ impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_seq(&self, ref_num: u32, node_hash: Uint256) {
         self.0
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_seq
             .push((ref_num, node_hash));
     }
@@ -471,7 +471,6 @@ impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_hash(&self, ref_hash: Uint256, ref_num: u32) {
         self.0
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_hash
             .push((ref_hash, ref_num));
     }
@@ -487,14 +486,12 @@ impl RecordingLedgerJournal {
     fn infos(&self) -> Vec<String> {
         self.infos
             .lock()
-            .expect("ledger journal mutex must not be poisoned")
             .clone()
     }
 
     fn warns(&self) -> Vec<String> {
         self.warns
             .lock()
-            .expect("ledger journal mutex must not be poisoned")
             .clone()
     }
 }
@@ -503,14 +500,12 @@ impl LedgerJournal for RecordingLedgerJournal {
     fn info(&self, message: &str) {
         self.infos
             .lock()
-            .expect("ledger journal mutex must not be poisoned")
             .push(message.to_owned());
     }
 
     fn warn(&self, message: &str) {
         self.warns
             .lock()
-            .expect("ledger journal mutex must not be poisoned")
             .push(message.to_owned());
     }
 }
@@ -689,11 +684,10 @@ fn ledger_walk_ledger_serial_matches_current_cpp_root_fetch_and_logging_roles() 
     ledger.set_full();
 
     assert!(!ledger.walk_ledger_with_family(&journal, false, &family));
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches, vec![account_hash, tx_hash]));
+    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![account_hash, tx_hash]));
     assert_eq!(
         reporter
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_seq,
         vec![
             (600, *account_hash.as_uint256()),
@@ -758,7 +752,7 @@ fn ledger_walk_ledger_parallel_returns_state_walk_result_and_skips_tx_tree() {
     let journal = RecordingLedgerJournal::default();
 
     assert!(ledger.walk_ledger_with_family(&journal, true, &family));
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches, vec![state_missing_hash]));
+    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![state_missing_hash]));
     assert!(journal.infos().is_empty());
     assert!(journal.warns().is_empty());
 }
@@ -785,7 +779,7 @@ fn ledger_walk_ledger_serial_checks_tx_tree_after_missing_account_root() {
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(Arc::new(
             Mutex::new(RecordingMissingNodeReporter::default()),
@@ -803,7 +797,7 @@ fn ledger_walk_ledger_serial_checks_tx_tree_after_missing_account_root() {
     let journal = RecordingLedgerJournal::default();
 
     assert!(!ledger.walk_ledger_with_family(&journal, false, &family));
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches, vec![account_hash, tx_hash]));
+    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![account_hash, tx_hash]));
     assert_eq!(
         journal.infos(),
         vec![format!(
@@ -1517,7 +1511,7 @@ fn ledger_load_immutable_with_family_fetches_roots_in_and_marks_immutable() {
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(Arc::new(
             Mutex::new(RecordingMissingNodeReporter::default()),
@@ -1546,7 +1540,7 @@ fn ledger_load_immutable_with_family_fetches_roots_in_and_marks_immutable() {
     assert_eq!(ledger.state_map().root().get_hash(), state_root.get_hash());
     family.with_fetcher(|fetcher| {
         assert_eq!(
-            fetcher.fetches,
+            fetcher.fetches.lock().clone(),
             vec![tx_root.get_hash(), state_root.get_hash()]
         );
     });
@@ -1592,7 +1586,7 @@ fn ledger_load_immutable_with_family_warns_and_acquires_by_hash_only_after_faile
     assert_eq!(ledger.tx_map().state(), SyncState::Immutable);
     assert_eq!(ledger.state_map().state(), SyncState::Immutable);
     assert_eq!(ledger.header().hash, expected_header_hash);
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches, vec![tx_hash, account_hash]));
+    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![tx_hash, account_hash]));
     assert_eq!(
         journal.warns(),
         vec![
@@ -1601,8 +1595,7 @@ fn ledger_load_immutable_with_family_warns_and_acquires_by_hash_only_after_faile
         ]
     );
     let reporter = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert_eq!(reporter.by_seq, Vec::<(u32, Uint256)>::new());
     assert_eq!(
         reporter.by_hash,
@@ -1658,7 +1651,7 @@ fn ledger_load_immutable_with_family_and_setup_decodes_loaded_state_entries_ctor
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(Arc::new(
             Mutex::new(RecordingMissingNodeReporter::default()),
@@ -1700,7 +1693,7 @@ fn ledger_load_immutable_with_family_and_setup_decodes_loaded_state_entries_ctor
     assert_eq!(ledger.rules().digest(), Some(*expected_digest.as_uint256()));
     family.with_fetcher(|fetcher| {
         assert_eq!(
-            fetcher.fetches,
+            fetcher.fetches.lock().clone(),
             vec![tx_root.get_hash(), state_root.get_hash()]
         );
     });
@@ -1749,7 +1742,7 @@ fn ledger_load_immutable_with_family_and_config_seeds_rules_and_fees_from_config
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(Arc::new(
             Mutex::new(RecordingMissingNodeReporter::default()),
@@ -1788,7 +1781,7 @@ fn ledger_load_immutable_with_family_and_config_seeds_rules_and_fees_from_config
     assert_eq!(ledger.rules().digest(), Some(*expected_digest.as_uint256()));
     family.with_fetcher(|fetcher| {
         assert_eq!(
-            fetcher.fetches,
+            fetcher.fetches.lock().clone(),
             vec![tx_root.get_hash(), state_root.get_hash()]
         );
     });
@@ -1830,7 +1823,7 @@ fn ledger_load_immutable_with_family_and_config_or_none_returns_some_for_complet
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(Arc::new(
             Mutex::new(RecordingMissingNodeReporter::default()),
@@ -1905,8 +1898,7 @@ fn ledger_load_immutable_with_family_and_config_or_none_returns_none_for_failed_
 
     assert!(ledger.is_none());
     let reporter = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert_eq!(
         reporter.by_hash,
         vec![(*expected_header_hash.as_uint256(), 806)]
@@ -1948,7 +1940,7 @@ fn ledger_load_finished_with_family_and_config_or_none_returns_full_ledger() {
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(Arc::new(
             Mutex::new(RecordingMissingNodeReporter::default()),
@@ -2021,7 +2013,7 @@ fn ledger_load_finished_by_hash_with_family_and_config_or_none_matches_requested
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(Arc::new(
             Mutex::new(RecordingMissingNodeReporter::default()),
@@ -2094,7 +2086,7 @@ fn ledger_load_finished_by_hash_with_family_and_config_or_none_panics_on_hash_mi
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(Arc::new(
             Mutex::new(RecordingMissingNodeReporter::default()),
@@ -2159,7 +2151,7 @@ fn ledger_load_by_index_with_provider_and_config_or_none_returns_finished_ledger
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(Arc::new(
             Mutex::new(RecordingMissingNodeReporter::default()),
@@ -2258,7 +2250,7 @@ fn ledger_load_by_hash_with_provider_and_config_or_none_returns_finished_ledger(
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(Arc::new(
             Mutex::new(RecordingMissingNodeReporter::default()),
@@ -2394,7 +2386,7 @@ fn get_latest_ledger_with_provider_and_config_returns_loaded_ledger_and_original
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(Arc::new(
             Mutex::new(RecordingMissingNodeReporter::default()),
@@ -2643,7 +2635,7 @@ fn ledger_load_immutable_with_family_and_setup_marks_failed_setup_ctor() {
         NullFullBelowCache::new(0),
         RecordingFetcher {
             expected,
-            fetches: Vec::new(),
+            fetches: Mutex::new(Vec::new()),
         },
         SharedReporter(reporter.clone()),
     );
@@ -2688,14 +2680,13 @@ fn ledger_load_immutable_with_family_and_setup_marks_failed_setup_ctor() {
     );
     family.with_fetcher(|fetcher| {
         assert_eq!(
-            fetcher.fetches,
+            fetcher.fetches.lock().clone(),
             vec![root.get_hash(), missing_amendments_hash]
         );
     });
     assert!(journal.warns().is_empty());
     let reporter = reporter
-        .lock()
-        .expect("shared reporter mutex must not be poisoned");
+        .lock();
     assert_eq!(reporter.by_seq, Vec::<(u32, Uint256)>::new());
     assert_eq!(
         reporter.by_hash,

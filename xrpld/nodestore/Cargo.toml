@@ -19,18 +19,21 @@ rocksdb = { version = "0.22", default-features = false, features = ["snappy"] }
 sha2 = { version = "0.10", features = ["asm"] }
 tracing = "0.1"
 xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
+rayon = "1.12.0"
+arc-swap = "1.9.1"
+dashmap = "6.2.1"
 
 [features]
 gpu-hash = []
-io-uring = ["dep:tokio-uring"]
-mmap-store = ["dep:memmap2"]
+
+mmap-store = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tokio-uring = { version = "0.4", optional = true }
+libc = "0.2.186"
+
 
 [dependencies.memmap2]
 version = "0.9"
-optional = true
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

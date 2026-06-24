@@ -617,7 +617,7 @@ impl RpcStateNodeStoreFetcher {
 }
 
 impl SHAMapNodeFetcher for RpcStateNodeStoreFetcher {
-    fn fetch_node_object(&mut self, hash: SHAMapHash, ledger_seq: u32) -> Option<SHAMapNodeObject> {
+    fn fetch_node_object(&self, hash: SHAMapHash, ledger_seq: u32) -> Option<SHAMapNodeObject> {
         let fetched = match &self.node_store {
             app::SHAMapStoreNodeStore::Single(database) => database.fetch_node_object(
                 hash.as_uint256(),
@@ -1472,6 +1472,22 @@ impl<V: AppServerInfoView> LedgerSource for ApplicationServerInfo<V> {
         }
         let ledger = get_ledger_obj(&self.view, ledger_lookup.seq, ledger_lookup.hash)
             .ok_or_else(|| RpcStatus::new(RpcErrorCode::LedgerNotFound))?;
+
+        // For full/state dumps, use the family-aware path so visit_leaves
+        // can fetch tree nodes from the nodestore (not just in-memory nodes).
+        if options.contains(LedgerFillOptions::FULL)
+            || options.contains(LedgerFillOptions::DUMP_STATE)
+        {
+            if let Some(app) = self.view.app()
+                && let Some(family) = build_rpc_state_family(app)
+            {
+                let core_fill = ledger::LedgerFill::new(&ledger, options)
+                    .with_closed(ledger.is_immutable());
+                return ledger::get_json_with_family(&core_fill, &family)
+                    .map_err(|_| RpcStatus::new(RpcErrorCode::Internal));
+            }
+        }
+
         let fill = AppLedgerFill::new(&ledger, options);
         app_get_json(&fill).map_err(|_| RpcStatus::new(RpcErrorCode::Internal))
     }

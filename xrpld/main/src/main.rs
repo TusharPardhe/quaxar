@@ -1926,7 +1926,7 @@ struct NodeStoreFetcher {
 
 impl shamap::family::SHAMapNodeFetcher for NodeStoreFetcher {
     fn fetch_node_object(
-        &mut self,
+        &self,
         hash: basics::sha_map_hash::SHAMapHash,
         ledger_seq: u32,
     ) -> Option<shamap::node_object::NodeObject> {

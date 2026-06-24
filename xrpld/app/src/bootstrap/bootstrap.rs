@@ -305,7 +305,7 @@ impl BootstrapNodeStoreFetcher {
 
 impl SHAMapNodeFetcher for BootstrapNodeStoreFetcher {
     fn fetch_node_object(
-        &mut self,
+        &self,
         hash: basics::sha_map_hash::SHAMapHash,
         ledger_seq: u32,
     ) -> Option<SHAMapNodeObject> {
