@@ -286,6 +286,7 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
         if mode == NetworkOpsOperatingMode::Syncing.as_str()
             || mode == NetworkOpsOperatingMode::Tracking.as_str()
             || mode == NetworkOpsOperatingMode::Full.as_str()
+            || mode == "proposing"
         {
             return true;
         }
@@ -383,7 +384,17 @@ mod tests {
     fn owned_application_server_info_network_synced_mode_gate_without_caught_up_ledgers() {
         let app = ApplicationRoot::with_options(ApplicationRootOptions::default())
             .expect("app should build");
+            
+        let close_time = app.current_close_time_seconds();
+        let ledger = std::sync::Arc::new(ledger::Ledger::from_ledger_seq_and_close_time(
+            512,
+            close_time.saturating_sub(1),
+            false,
+        ));
+        app.on_validated_ledger(ledger);
+        
         app.set_network_ops_operating_mode(app::NetworkOpsOperatingMode::Full);
+        app.set_need_network_ledger(false);
         let source =
             ApplicationServerInfo::new(OwnedApplicationServerInfo::from_application_root(&app));
 
@@ -606,7 +617,7 @@ impl RpcStateNodeStoreFetcher {
 }
 
 impl SHAMapNodeFetcher for RpcStateNodeStoreFetcher {
-    fn fetch_node_object(&mut self, hash: SHAMapHash, ledger_seq: u32) -> Option<SHAMapNodeObject> {
+    fn fetch_node_object(&self, hash: SHAMapHash, ledger_seq: u32) -> Option<SHAMapNodeObject> {
         let fetched = match &self.node_store {
             app::SHAMapStoreNodeStore::Single(database) => database.fetch_node_object(
                 hash.as_uint256(),
@@ -688,27 +699,8 @@ fn succ_lookup_ledger_key_with_family(
     last: Option<Uint256>,
 ) -> Option<Uint256> {
     with_lookup_ledger_family(app, resolved, |hydrated, family| {
-        let _ = family;
-        hydrated.succ(key, last).ok().flatten()
+        hydrated.succ_with_family(key, last, family).ok().flatten()
     })
-}
-
-fn visit_lookup_ledger_state_sles_with_family<VISIT>(
-    app: &ApplicationRoot,
-    resolved: &ledger::Ledger,
-    visit: &mut VISIT,
-) -> Result<(), TraversalError>
-where
-    VISIT: FnMut(&STLedgerEntry),
-{
-    with_lookup_ledger_family(app, resolved, |hydrated, family| {
-        hydrated
-            .visit_state_sles_with_family(family, visit)
-            .map(Some)
-            .unwrap_or(None)
-    })
-    .ok_or(TraversalError::MissingNode(SHAMapHash::default()))?;
-    Ok(())
 }
 
 fn read_lookup_ledger_entry<V: AppServerInfoView>(
@@ -737,27 +729,6 @@ fn succ_lookup_ledger_key<V: AppServerInfoView>(
         Ok(None) | Err(_) => view
             .app()
             .and_then(|app| succ_lookup_ledger_key_with_family(app, resolved.as_ref(), key, last)),
-    }
-}
-
-fn visit_lookup_ledger_state_sles<V: AppServerInfoView, VISIT>(
-    view: &V,
-    ledger: &LedgerLookupLedger,
-    visit: &mut VISIT,
-) -> Result<(), TraversalError>
-where
-    VISIT: FnMut(&STLedgerEntry),
-{
-    let resolved = resolve_lookup_ledger(view, ledger)
-        .ok_or(TraversalError::MissingNode(SHAMapHash::default()))?;
-    match resolved.visit_state_sles(visit) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let Some(app) = view.app() else {
-                return Err(error);
-            };
-            visit_lookup_ledger_state_sles_with_family(app, resolved.as_ref(), visit)
-        }
     }
 }
 
@@ -1501,6 +1472,22 @@ impl<V: AppServerInfoView> LedgerSource for ApplicationServerInfo<V> {
         }
         let ledger = get_ledger_obj(&self.view, ledger_lookup.seq, ledger_lookup.hash)
             .ok_or_else(|| RpcStatus::new(RpcErrorCode::LedgerNotFound))?;
+
+        // For full/state dumps, use the family-aware path so visit_leaves
+        // can fetch tree nodes from the nodestore (not just in-memory nodes).
+        if options.contains(LedgerFillOptions::FULL)
+            || options.contains(LedgerFillOptions::DUMP_STATE)
+        {
+            if let Some(app) = self.view.app()
+                && let Some(family) = build_rpc_state_family(app)
+            {
+                let core_fill = ledger::LedgerFill::new(&ledger, options)
+                    .with_closed(ledger.is_immutable());
+                return ledger::get_json_with_family(&core_fill, &family)
+                    .map_err(|_| RpcStatus::new(RpcErrorCode::Internal));
+            }
+        }
+
         let fill = AppLedgerFill::new(&ledger, options);
         app_get_json(&fill).map_err(|_| RpcStatus::new(RpcErrorCode::Internal))
     }
@@ -2287,13 +2274,16 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
     }
 }
 
-impl<V: AppServerInfoView> crate::handlers::ledger_data::LedgerDataSource
+impl<V: AppServerInfoView + Sync> crate::handlers::ledger_data::LedgerDataSource
     for ApplicationServerInfo<V>
 {
     fn resolve_ledger_data(
         &self,
         ledger: &LedgerLookupLedger,
         binary: bool,
+        marker: Option<Uint256>,
+        limit: i64,
+        type_filter: LedgerEntryType,
     ) -> Result<crate::handlers::ledger_data::LedgerDataResolved, crate::status::RpcStatus> {
         let mut options = ledger::LedgerFillOptions::new(0);
         if binary {
@@ -2301,24 +2291,127 @@ impl<V: AppServerInfoView> crate::handlers::ledger_data::LedgerDataSource
         }
         let ledger_json = self.render_selected_ledger(*ledger, options)?;
         let mut entries = Vec::new();
-        visit_lookup_ledger_state_sles(&self.view, ledger, &mut |sle| {
-            let mut serializer = Serializer::new(256);
-            sle.add(&mut serializer);
+        let remaining = limit;
+
+        let resolved_ledger = match resolve_lookup_ledger(&self.view, ledger) {
+            Some(l) => l,
+            None => {
+                return Err(crate::status::RpcStatus::new(
+                    crate::status::RpcErrorCode::LedgerNotFound,
+                ))
+            }
+        };
+        let ledger_seq = resolved_ledger.header().seq;
+        let ledger_hash = *resolved_ledger.header().hash.as_uint256();
+
+        let cache = crate::state::ledger_state_index::get_global_state_index_cache();
+        let index_arc = cache.get_or_build(ledger_seq, || {
+            use rayon::prelude::*;
+            
+            let keys = std::iter::successors(
+                succ_lookup_ledger_key(&self.view, ledger, Uint256::default(), None),
+                |&k| succ_lookup_ledger_key(&self.view, ledger, k, None)
+            );
+
+            let build_entries: Vec<_> = keys
+                .par_bridge()
+                .filter_map(|next_key| {
+                    if let Some(sle) = read_lookup_ledger_entry(&self.view, ledger, unchecked_keylet(next_key)) {
+                        let mut serializer = Serializer::new(256);
+                        sle.add(&mut serializer);
+                        Some(crate::state::ledger_state_index::StateIndexEntry {
+                            key: next_key,
+                            raw_data: Arc::from(serializer.data().to_vec()),
+                            entry_type: sle.get_type(),
+                            json_cache: std::sync::OnceLock::new(),
+                            binary_hex_cache: std::sync::OnceLock::new(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let index = Arc::new(crate::state::ledger_state_index::LedgerStateIndex::build_from_iter(
+                ledger_seq,
+                ledger_hash,
+                build_entries.iter().cloned(),
+            ));
+            
+            let page_cache = crate::state::ledger_data_page_cache::LedgerDataPageCache::build(
+                ledger_seq,
+                ledger_hash,
+                build_entries.into_iter().map(|e| {
+                    let mut sit = protocol::SerialIter::new(e.raw_data.as_ref());
+                    let sle = protocol::STLedgerEntry::from_serial_iter(&mut sit, e.key);
+                    (e.key, e.raw_data.to_vec(), sle.json(protocol::JsonOptions::NONE))
+                }),
+                crate::state::ledger_data_page_cache::DEFAULT_PAGE_SIZE,
+            );
+            crate::state::ledger_data_page_cache::get_global_page_cache().insert(Arc::new(page_cache));
+            index
+        });
+
+        // Try to hit the page cache first
+        let limit = if remaining < 0 { usize::MAX } else { remaining as usize };
+        if type_filter == LedgerEntryType::Any {
+            if let Some(cache) = crate::state::ledger_data_page_cache::get_global_page_cache().get(ledger_seq) {
+                if let Some(page) = cache.find_page_for_marker(marker) {
+                    // Only use cache if the requested marker is EXACTLY the page start
+                    // AND the user's limit is large enough to consume the whole page
+                    // AND this is not the first page (since first page needs ledger_json which we aren't caching inside the page bytes yet, wait, we DO need to handle it)
+                    let matches_start = marker.is_none() || marker.unwrap() == page.start_key;
+                    if matches_start && limit >= page.entry_count && marker.is_some() {
+                        return Ok(crate::handlers::ledger_data::LedgerDataResolved {
+                            base_json: JsonValue::Object(BTreeMap::new()),
+                            ledger_json: JsonValue::Null,
+                            entries: vec![],
+                            marker: page.next_marker,
+                            pre_rendered: Some(if binary {
+                                page.binary_state_bytes.clone()
+                            } else {
+                                page.json_state_bytes.clone()
+                            }),
+                        });
+                    }
+                }
+            }
+        }
+
+        let query = index_arc.query(marker, limit, type_filter);
+        let (page_entries, next_marker) = query.collect_entries();
+        let page_marker = next_marker;
+
+        for entry in page_entries {
+            let mut sit = protocol::SerialIter::new(entry.raw_data.as_ref());
+            let sle = STLedgerEntry::from_serial_iter(&mut sit, entry.key);
+
+            let binary_data = if binary {
+                entry.raw_data.clone()
+            } else {
+                std::sync::Arc::new([])
+            };
+            
+            let json = if binary {
+                JsonValue::Null
+            } else {
+                sle.json(JsonOptions::NONE)
+            };
+            
             entries.push(crate::handlers::ledger_data::LedgerDataEntry {
-                key: *sle.key(),
-                entry_type: sle.get_type(),
-                json: sle.json(JsonOptions::NONE),
-                binary: serializer.data().to_vec(),
+                key: entry.key,
+                entry_type: entry.entry_type,
+                json,
+                binary: binary_data,
             });
-        })
-        .map_err(|_| {
-            crate::status::RpcStatus::new(crate::status::RpcErrorCode::DbDeserialization)
-        })?;
+        }
 
         Ok(crate::handlers::ledger_data::LedgerDataResolved {
             base_json: JsonValue::Object(BTreeMap::new()),
             ledger_json,
             entries,
+            marker: page_marker,
+            pre_rendered: None,
         })
     }
 }

@@ -1,4 +1,9 @@
 //! RPC handler registry and request-shaping helpers aligned with
+//!
+//! # Performance note
+//! [`fill_handler`] is on the hot path (called for every inbound RPC request).
+//! Handler lookup uses a compile-time [`phf`] perfect-hash map so dispatch is
+//! O(1) with zero heap allocation, rather than O(n) linear scan.
 //! `xrpld/rpc/detail/the reference source`.
 
 use protocol::JsonValue;
@@ -44,6 +49,90 @@ impl RpcHandlerSpec {
         api_version >= self.min_api_version && api_version <= self.max_api_version
     }
 }
+
+// ---------------------------------------------------------------------------
+// PHF perfect-hash map: command name → &'static RpcHandlerSpec
+// Built at compile time; lookup is O(1) with no heap allocation.
+//
+// IMPORTANT: every entry in HANDLERS below *must* also appear here.
+// The macro will fail at compile time if duplicate keys are present.
+// ---------------------------------------------------------------------------
+static HANDLER_MAP: phf::Map<&'static str, RpcHandlerSpec> = phf::phf_map! {
+    "account_info"          => RpcHandlerSpec::new("account_info",          Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "account_lines"         => RpcHandlerSpec::new("account_lines",         Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "account_tx"            => RpcHandlerSpec::new("account_tx",            Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "can_delete"            => RpcHandlerSpec::new("can_delete",            Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "export_snapshot"       => RpcHandlerSpec::new("export_snapshot",       Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "channel_authorize"     => RpcHandlerSpec::new("channel_authorize",     Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "connect"               => RpcHandlerSpec::new("connect",               Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "fee"                   => RpcHandlerSpec::new("fee",                   Role::User,  HandlerCondition::NeedsCurrentLedger,  1, u32::MAX),
+    "ledger"                => RpcHandlerSpec::new("ledger",                Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "ledger_accept"         => RpcHandlerSpec::new("ledger_accept",         Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "ledger_cleaner"        => RpcHandlerSpec::new("ledger_cleaner",        Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "ledger_closed"         => RpcHandlerSpec::new("ledger_closed",         Role::User,  HandlerCondition::NeedsClosedLedger,   1, u32::MAX),
+    "ledger_current"        => RpcHandlerSpec::new("ledger_current",        Role::User,  HandlerCondition::NeedsCurrentLedger,  1, u32::MAX),
+    "ledger_entry"          => RpcHandlerSpec::new("ledger_entry",          Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "ledger_request"        => RpcHandlerSpec::new("ledger_request",        Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "log_level"             => RpcHandlerSpec::new("log_level",             Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "log_rotate"            => RpcHandlerSpec::new("log_rotate",            Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "manifest"              => RpcHandlerSpec::new("manifest",              Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "path_find"             => RpcHandlerSpec::new("path_find",             Role::User,  HandlerCondition::NeedsCurrentLedger,  1, u32::MAX),
+    "peers"                 => RpcHandlerSpec::new("peers",                 Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "peer_reservations_add" => RpcHandlerSpec::new("peer_reservations_add", Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "peer_reservations_del" => RpcHandlerSpec::new("peer_reservations_del", Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "peer_reservations_list"=> RpcHandlerSpec::new("peer_reservations_list",Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "ripple_path_find"      => RpcHandlerSpec::new("ripple_path_find",      Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "ping"                  => RpcHandlerSpec::new("ping",                  Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "server_definitions"    => RpcHandlerSpec::new("server_definitions",    Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "server_info"           => RpcHandlerSpec::new("server_info",           Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "server_state"          => RpcHandlerSpec::new("server_state",          Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "sign_for"              => RpcHandlerSpec::new("sign_for",              Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "simulate"              => RpcHandlerSpec::new("simulate",              Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "stop"                  => RpcHandlerSpec::new("stop",                  Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "submit"                => RpcHandlerSpec::new("submit",                Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "subscribe"             => RpcHandlerSpec::new("subscribe",             Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "transaction_entry"     => RpcHandlerSpec::new("transaction_entry",     Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "tx"                    => RpcHandlerSpec::new("tx",                    Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "submit_multisigned"    => RpcHandlerSpec::new("submit_multisigned",    Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "unsubscribe"           => RpcHandlerSpec::new("unsubscribe",           Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "validation_create"     => RpcHandlerSpec::new("validation_create",     Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "wallet_propose"        => RpcHandlerSpec::new("wallet_propose",        Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "account_channels"      => RpcHandlerSpec::new("account_channels",      Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "account_currencies"    => RpcHandlerSpec::new("account_currencies",    Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "account_nfts"          => RpcHandlerSpec::new("account_nfts",          Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "account_objects"       => RpcHandlerSpec::new("account_objects",       Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "account_offers"        => RpcHandlerSpec::new("account_offers",        Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "book_changes"          => RpcHandlerSpec::new("book_changes",          Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "book_offers"           => RpcHandlerSpec::new("book_offers",           Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "consensus_info"        => RpcHandlerSpec::new("consensus_info",        Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "deposit_authorized"    => RpcHandlerSpec::new("deposit_authorized",    Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "gateway_balances"      => RpcHandlerSpec::new("gateway_balances",      Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "get_counts"            => RpcHandlerSpec::new("get_counts",            Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "ledger_data"           => RpcHandlerSpec::new("ledger_data",           Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "ledger_header"         => RpcHandlerSpec::new("ledger_header",         Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "no_ripple_check"       => RpcHandlerSpec::new("no_ripple_check",       Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "nft_buy_offers"        => RpcHandlerSpec::new("nft_buy_offers",        Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "nft_sell_offers"       => RpcHandlerSpec::new("nft_sell_offers",       Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "owner_info"            => RpcHandlerSpec::new("owner_info",            Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "print"                 => RpcHandlerSpec::new("print",                 Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "random"                => RpcHandlerSpec::new("random",                Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "sign"                  => RpcHandlerSpec::new("sign",                  Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "tx_history"            => RpcHandlerSpec::new("tx_history",            Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "unl_list"              => RpcHandlerSpec::new("unl_list",              Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "validator_info"        => RpcHandlerSpec::new("validator_info",        Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "validator_list_sites"  => RpcHandlerSpec::new("validator_list_sites",  Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "validators"            => RpcHandlerSpec::new("validators",            Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "feature"               => RpcHandlerSpec::new("feature",               Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "fetch_info"            => RpcHandlerSpec::new("fetch_info",            Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "amm_info"              => RpcHandlerSpec::new("amm_info",              Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "blacklist"             => RpcHandlerSpec::new("blacklist",             Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "channel_verify"        => RpcHandlerSpec::new("channel_verify",        Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "get_aggregate_price"   => RpcHandlerSpec::new("get_aggregate_price",   Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "logrotate"             => RpcHandlerSpec::new("logrotate",             Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "noripple_check"        => RpcHandlerSpec::new("noripple_check",        Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "tx_reduce_relay"       => RpcHandlerSpec::new("tx_reduce_relay",       Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "vault_info"            => RpcHandlerSpec::new("vault_info",            Role::User,  HandlerCondition::None,                1, u32::MAX),
+};
 
 const HANDLERS: &[RpcHandlerSpec] = &[
     RpcHandlerSpec::new(
@@ -531,12 +620,15 @@ pub fn fill_handler<Runtime: RpcRuntime>(
     }
 
     let command = command_field(params)?;
-    let Some(handler) = HANDLERS
-        .iter()
-        .find(|handler| handler.name == command && handler.supports_api(api_version))
-    else {
+
+    // O(1) PHF lookup — replaces the former O(n) linear scan over HANDLERS.
+    let Some(handler) = HANDLER_MAP.get(command) else {
         return Err(Status::new(RpcErrorCode::UnknownCommand));
     };
+
+    if !handler.supports_api(api_version) {
+        return Err(Status::new(RpcErrorCode::UnknownCommand));
+    }
 
     if handler.required_role == Role::Admin && role != Role::Admin {
         tracing::warn!(target: "rpc", method = handler.name, "RPC permission denied - admin required");
@@ -552,9 +644,10 @@ pub fn fill_handler<Runtime: RpcRuntime>(
 }
 
 pub fn role_required(api_version: u32, _beta_enabled: bool, method: &str) -> Role {
-    HANDLERS
-        .iter()
-        .find(|handler| handler.name == method && handler.supports_api(api_version))
+    // O(1) PHF lookup — replaces the former O(n) linear scan over HANDLERS.
+    HANDLER_MAP
+        .get(method)
+        .filter(|handler| handler.supports_api(api_version))
         .map(|handler| handler.required_role)
         .unwrap_or(Role::Forbid)
 }

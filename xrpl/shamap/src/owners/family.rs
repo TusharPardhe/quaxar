@@ -208,16 +208,16 @@ where
     }
 }
 
-pub trait SHAMapNodeFetcher: Send + 'static {
-    fn fetch_node(&mut self, _hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+pub trait SHAMapNodeFetcher: Send + Sync + 'static {
+    fn fetch_node(&self, _hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
         None
     }
 
-    fn fetch_node_object(&mut self, _hash: SHAMapHash, _ledger_seq: u32) -> Option<NodeObject> {
+    fn fetch_node_object(&self, _hash: SHAMapHash, _ledger_seq: u32) -> Option<NodeObject> {
         None
     }
 
-    fn fetch_node_blob(&mut self, _hash: SHAMapHash) -> Option<Blob> {
+    fn fetch_node_blob(&self, _hash: SHAMapHash) -> Option<Blob> {
         None
     }
 }
@@ -430,7 +430,7 @@ pub(crate) enum CachedFetchResult {
 pub struct SHAMapFamily<C, S, FB, F, MR = NullMissingNodeReporter, NS = ()> {
     tree_node_cache: Arc<TreeNodeCache<C, S>>,
     full_below_cache: FB,
-    fetcher: Mutex<F>,
+    fetcher: F,
     missing_node_reporter: MR,
     node_store: Option<Mutex<NS>>,
     journal: Arc<dyn SHAMapJournal>,
@@ -462,7 +462,7 @@ impl<C, S, FB, F, MR> SHAMapFamily<C, S, FB, F, MR, ()> {
         Self {
             tree_node_cache,
             full_below_cache,
-            fetcher: Mutex::new(fetcher),
+            fetcher,
             missing_node_reporter,
             node_store: None,
             journal,
@@ -499,7 +499,7 @@ impl<C, S, FB, F, MR, NS> SHAMapFamily<C, S, FB, F, MR, NS> {
         Self {
             tree_node_cache,
             full_below_cache,
-            fetcher: Mutex::new(fetcher),
+            fetcher,
             missing_node_reporter,
             node_store: Some(Mutex::new(node_store)),
             journal,
@@ -662,14 +662,12 @@ impl<C, S, FB, F, MR, NS> SHAMapFamily<C, S, FB, F, MR, NS> {
         callback(&self.full_below_cache)
     }
 
-    pub fn with_fetcher<T>(&self, callback: impl FnOnce(&mut F) -> T) -> T {
-        let mut fetcher = self.fetcher.lock();
-        callback(&mut *fetcher)
+    pub fn with_fetcher<T>(&self, callback: impl FnOnce(&F) -> T) -> T {
+        callback(&self.fetcher)
     }
 
-    pub fn with_sync_resources<T>(&self, callback: impl FnOnce(&FB, &mut F) -> T) -> T {
-        let mut fetcher = self.fetcher.lock();
-        callback(&self.full_below_cache, &mut *fetcher)
+    pub fn with_sync_resources<T>(&self, callback: impl FnOnce(&FB, &F) -> T) -> T {
+        callback(&self.full_below_cache, &self.fetcher)
     }
 
     pub fn with_node_store<T>(&self, callback: impl FnOnce(&mut NS) -> T) -> T {
@@ -868,7 +866,7 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingNodeFetcher {
         nodes: HashMap<SHAMapHash, SharedIntrusive<SHAMapTreeNode>>,
-        fetches: Vec<SHAMapHash>,
+        fetches: Mutex<Vec<SHAMapHash>>,
     }
 
     impl RecordingNodeFetcher {
@@ -877,14 +875,14 @@ mod tests {
             nodes.insert(hash, node);
             Self {
                 nodes,
-                fetches: Vec::new(),
+                fetches: Mutex::new(Vec::new()),
             }
         }
     }
 
     impl SHAMapNodeFetcher for RecordingNodeFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-            self.fetches.push(hash);
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            self.fetches.lock().push(hash);
             self.nodes.get(&hash).cloned()
         }
     }
@@ -892,12 +890,12 @@ mod tests {
     #[derive(Debug, Default)]
     struct BlobOnlyFetcher {
         blobs: HashMap<SHAMapHash, Blob>,
-        fetches: Vec<SHAMapHash>,
+        fetches: Mutex<Vec<SHAMapHash>>,
     }
 
     impl SHAMapNodeFetcher for BlobOnlyFetcher {
-        fn fetch_node_blob(&mut self, hash: SHAMapHash) -> Option<Blob> {
-            self.fetches.push(hash);
+        fn fetch_node_blob(&self, hash: SHAMapHash) -> Option<Blob> {
+            self.fetches.lock().push(hash);
             self.blobs.get(&hash).cloned()
         }
     }
@@ -905,12 +903,12 @@ mod tests {
     #[derive(Debug, Default)]
     struct ObjectOnlyFetcher {
         objects: HashMap<SHAMapHash, NodeObject>,
-        fetches: Vec<(SHAMapHash, u32)>,
+        fetches: Mutex<Vec<(SHAMapHash, u32)>>,
     }
 
     impl SHAMapNodeFetcher for ObjectOnlyFetcher {
-        fn fetch_node_object(&mut self, hash: SHAMapHash, ledger_seq: u32) -> Option<NodeObject> {
-            self.fetches.push((hash, ledger_seq));
+        fn fetch_node_object(&self, hash: SHAMapHash, ledger_seq: u32) -> Option<NodeObject> {
+            self.fetches.lock().push((hash, ledger_seq));
             self.objects.get(&hash).cloned()
         }
     }
@@ -1064,7 +1062,7 @@ mod tests {
             );
         });
         family.with_fetcher(|fetcher| {
-            assert_eq!(fetcher.fetches, vec![leaf.get_hash()]);
+            assert_eq!(fetcher.fetches.lock().clone(), vec![leaf.get_hash()]);
         });
     }
 
@@ -1091,7 +1089,7 @@ mod tests {
             RecordingFullBelowCache::new(8),
             RecordingNodeFetcher {
                 nodes,
-                fetches: Vec::new(),
+                fetches: Mutex::new(Vec::new()),
             },
             NullMissingNodeReporter,
         );
@@ -1113,7 +1111,7 @@ mod tests {
         assert!(tree.is_synching());
         family.with_fetcher(|fetcher| {
             assert_eq!(
-                fetcher.fetches,
+                fetcher.fetches.lock().clone(),
                 vec![fetched_inner.get_hash(), missing_leaf_hash]
             );
         });
@@ -1234,7 +1232,7 @@ mod tests {
             .expect("cached family node should be returned");
 
         assert!(std::ptr::eq(&*resolved, &*canonical));
-        family.with_fetcher(|fetcher| assert!(fetcher.fetches.is_empty()));
+        family.with_fetcher(|fetcher| assert!(fetcher.fetches.lock().is_empty()));
     }
 
     #[test]
@@ -1259,7 +1257,7 @@ mod tests {
             RecordingFullBelowCache::new(1),
             BlobOnlyFetcher {
                 blobs,
-                fetches: Vec::new(),
+                fetches: Mutex::new(Vec::new()),
             },
             NullMissingNodeReporter,
         );
@@ -1273,7 +1271,7 @@ mod tests {
 
         assert_eq!(first.get_hash(), fetched.get_hash());
         assert!(std::ptr::eq(&*first, &*second));
-        family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches, vec![fetched.get_hash()]));
+        family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![fetched.get_hash()]));
         let cached = cache
             .fetch(fetched.get_hash().as_uint256())
             .expect("decoded node should be present in the cache");
@@ -1306,7 +1304,7 @@ mod tests {
             RecordingFullBelowCache::new(1),
             ObjectOnlyFetcher {
                 objects,
-                fetches: Vec::new(),
+                fetches: Mutex::new(Vec::new()),
             },
             NullMissingNodeReporter,
         );
@@ -1320,7 +1318,7 @@ mod tests {
 
         assert_eq!(first.get_hash(), fetched.get_hash());
         assert!(std::ptr::eq(&*first, &*second));
-        family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches, vec![(fetched.get_hash(), 0)]));
+        family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![(fetched.get_hash(), 0)]));
         let cached = cache
             .fetch(fetched.get_hash().as_uint256())
             .expect("decoded node should be present in the cache");
@@ -1395,7 +1393,7 @@ mod tests {
             RecordingFullBelowCache::new(1),
             ObjectOnlyFetcher {
                 objects,
-                fetches: Vec::new(),
+                fetches: Mutex::new(Vec::new()),
             },
             NullMissingNodeReporter,
         );
@@ -1404,7 +1402,7 @@ mod tests {
             .fetch_cached_node_or_acquire_by_seq(fetched.get_hash(), 601)
             .expect("node object should decode through the ledger-seq path");
         assert_eq!(resolved.get_hash(), fetched.get_hash());
-        family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches, vec![(fetched.get_hash(), 601)]));
+        family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![(fetched.get_hash(), 601)]));
     }
 
     #[test]
@@ -1443,7 +1441,7 @@ mod tests {
             RecordingFullBelowCache::new(1),
             BlobOnlyFetcher {
                 blobs,
-                fetches: Vec::new(),
+                fetches: Mutex::new(Vec::new()),
             },
             SharedReporter(reporter.clone()),
             journal.clone(),

@@ -27,6 +27,7 @@ use protocol::{
     skip_keylet,
 };
 use shamap::{mutation::MutationError, traversal::TraversalError};
+use rayon::prelude::*;
 use tx::{ApplyFlags, ApplyTransactionResult};
 
 use crate::{LEDGER_RETRY_PASSES, LEDGER_TOTAL_PASSES};
@@ -468,6 +469,21 @@ pub fn decode_acquired_tx_set(
     txns.drain_ordered()
 }
 
+/// Parallel signature pre-validation using rayon.
+/// Returns the set of transaction IDs with invalid signatures so the
+/// sequential apply loop can skip them without calling check_sign again.
+fn parallel_sig_precheck(txs: &[Arc<STTx>], rules: &protocol::Rules) -> std::collections::HashSet<Uint256> {
+    txs.par_iter()
+        .filter_map(|tx| {
+            if tx.check_sign(rules).is_err() {
+                Some(tx.get_transaction_id())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 pub fn build_ledger_from_acquired_tx(
     parent: &ledger::Ledger,
     acquired_header: protocol::LedgerHeader,
@@ -516,6 +532,16 @@ pub fn build_ledger_from_acquired_tx(
     // Apply transactions from the acquired TX map in the reference CanonicalTXSet order.
     let ordered_txs = decode_acquired_tx_set(tx_items, *acquired_header.tx_hash.as_uint256());
     let tx_count = ordered_txs.len();
+
+    // Parallel signature pre-validation: reject bad sigs early using rayon
+    let bad_sigs = parallel_sig_precheck(&ordered_txs, built.rules());
+    if !bad_sigs.is_empty() {
+        tracing::debug!(target: "ledger",
+            "[build] parallel sig precheck rejected {} of {} txs in seq={}",
+            bad_sigs.len(), tx_count, acquired_header.seq
+        );
+    }
+
     let mut tx_type_counts: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
 
@@ -540,6 +566,16 @@ pub fn build_ledger_from_acquired_tx(
     for (tx_index, sttx) in ordered_txs.iter().enumerate() {
         let txn_type = sttx.get_txn_type();
         let tx_id = sttx.get_transaction_id();
+
+        // Skip transactions with bad signatures (already rejected in parallel)
+        if bad_sigs.contains(&tx_id) {
+            tracing::debug!(target: "ledger",
+                "[build] SKIP bad sig tx_index={} txid={} seq={}",
+                tx_index, tx_id, acquired_header.seq
+            );
+            continue;
+        }
+
         let tx_flags = sttx.get_flags();
         let tx_fee_drops = if sttx.is_field_present(protocol::get_field_by_symbol("sfFee")) {
             sttx.get_field_amount(protocol::get_field_by_symbol("sfFee"))
@@ -905,8 +941,18 @@ pub fn build_ledger_from_consensus(
     let mut accum = OpenView::new_closed(Arc::new(built.clone()));
 
     let ordered_txs = decode_acquired_tx_set(tx_items, *header.tx_hash.as_uint256());
+
+    // Parallel signature pre-validation: reject bad sigs early using rayon
+    let bad_sigs = parallel_sig_precheck(&ordered_txs, built.rules());
+
     for sttx in ordered_txs {
         let tx_id = sttx.get_transaction_id();
+
+        // Skip transactions with bad signatures (already rejected in parallel)
+        if bad_sigs.contains(&tx_id) {
+            continue;
+        }
+
         let txn_type = sttx.get_txn_type();
 
         let base = Arc::new(accum.clone());

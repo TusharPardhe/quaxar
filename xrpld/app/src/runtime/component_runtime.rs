@@ -256,7 +256,15 @@ impl AppConsensusRuntime {
                 tracing::info!(target: "consensus", count = proposals.len(), "timer_tick: draining pending proposals");
             }
             for p in proposals {
-                runner.peer_proposal(p.now, p.public_key, p.signature, p.suppression_id, p.proposal).await;
+                runner
+                    .peer_proposal(
+                        p.now,
+                        p.public_key,
+                        p.signature,
+                        p.suppression_id,
+                        p.proposal,
+                    )
+                    .await;
             }
 
             // Only run the state machine on the 1s boundary.
@@ -270,7 +278,15 @@ impl AppConsensusRuntime {
                     std::mem::take(&mut *queue)
                 };
                 for p in proposals2 {
-                    runner.peer_proposal(p.now, p.public_key, p.signature, p.suppression_id, p.proposal).await;
+                    runner
+                        .peer_proposal(
+                            p.now,
+                            p.public_key,
+                            p.signature,
+                            p.suppression_id,
+                            p.proposal,
+                        )
+                        .await;
                 }
             }
         }
@@ -279,7 +295,10 @@ impl AppConsensusRuntime {
     /// Queue a proposal for processing inside the next timer_tick.
     /// This is thread-safe and non-blocking.
     pub fn push_proposal(&self, proposal: PendingProposal) {
-        self.pending_proposals.lock().expect("pending_proposals").push(proposal);
+        self.pending_proposals
+            .lock()
+            .expect("pending_proposals")
+            .push(proposal);
     }
 
     /// Start a consensus round with the given previous ledger.

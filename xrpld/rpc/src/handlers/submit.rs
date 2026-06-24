@@ -2655,8 +2655,7 @@ fn submit_with_sign<Runtime: RpcRuntime>(
         _ => return Err(Status::new(RpcErrorCode::Internal)),
     };
 
-    let bytes =
-        hex::decode(tx_blob_hex).map_err(|_| Status::new(RpcErrorCode::InvalidParams))?;
+    let bytes = hex::decode(tx_blob_hex).map_err(|_| Status::new(RpcErrorCode::InvalidParams))?;
     let st_tx = parse_sttx_from_bytes(&bytes)
         .map_err(|e| Status::with_message(RpcErrorCode::Internal, e))?;
 

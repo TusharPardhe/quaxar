@@ -413,6 +413,7 @@ fn poll_results_keeps_completed_entry_when_sender_disconnects_after_completion()
         time::Duration::seconds(1),
         basics::tagged_cache::MonotonicClock::default(),
     ));
+    let (completed_ledgers_tx, _completed_ledgers_rx) = std::sync::mpsc::channel();
     let mut inbound_ledgers = InboundLedgers::new(
         registry,
         tree_cache,
@@ -420,6 +421,7 @@ fn poll_results_keeps_completed_entry_when_sender_disconnects_after_completion()
         fetch_pack,
         run_data_limiter,
         shared_stored,
+        completed_ledgers_tx,
     );
 
     let ledger = Ledger::from_ledger_seq_and_close_time(99, 777, false);
@@ -431,6 +433,7 @@ fn poll_results_keeps_completed_entry_when_sender_disconnects_after_completion()
         .expect("result channel should accept completion");
     drop(result_tx);
 
+    let now = Instant::now();
     inbound_ledgers.entries.insert(
         hash,
         InboundEntry {
@@ -438,7 +441,9 @@ fn poll_results_keeps_completed_entry_when_sender_disconnects_after_completion()
             tx,
             result_rx,
             handle: std::thread::spawn(|| {}),
-            last_touched: Instant::now(),
+            last_touched: now,
+            started_at: now,
+            completed_at: None,
             state: InboundState::InProgress,
             skip_state: false,
         },

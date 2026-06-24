@@ -466,25 +466,24 @@ fn create_genesis_omits_amendments_entry_when_none_are_supplied() {
 #[test]
 fn genesis_shamap_root_hash_matches_rippled_320() {
     // AccountRoot: key=2B6AC232..., 44 bytes (only constructor-set fields)
-    let acct_key = Uint256::from_hex(
-        "2B6AC232AA4C4BE41BF49D2459FA4A0347E1B543A4C92FCEE0821C0201E2E9A8",
-    ).unwrap();
+    let acct_key =
+        Uint256::from_hex("2B6AC232AA4C4BE41BF49D2459FA4A0347E1B543A4C92FCEE0821C0201E2E9A8")
+            .unwrap();
     let acct_data = hex_decode(
-        "1100612200000000240000000162416345785D8A00008114B5F762798A53D543A014CAF8B297CFF8F2F937E8"
+        "1100612200000000240000000162416345785D8A00008114B5F762798A53D543A014CAF8B297CFF8F2F937E8",
     );
 
     // FeeSettings: key=4BC50C9B..., 35 bytes (canonical order: UINT32s before UINT64)
-    let fee_key = Uint256::from_hex(
-        "4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB854A6A651",
-    ).unwrap();
-    let fee_data = hex_decode(
-        "1100732200000000201E0000000A201F009896802020001E848035000000000000000A"
-    );
+    let fee_key =
+        Uint256::from_hex("4BC50C9B0D8515D3EAAE1E74B29A95804346C491EE1A95BF25E4AAB854A6A651")
+            .unwrap();
+    let fee_data =
+        hex_decode("1100732200000000201E0000000A201F009896802020001E848035000000000000000A");
 
     // Amendments: key=7DB0788C..., 1164 bytes (36 amendments for rippled 3.2.0)
-    let amend_key = Uint256::from_hex(
-        "7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4",
-    ).unwrap();
+    let amend_key =
+        Uint256::from_hex("7DB0788C020F02780A673DC74757F23823FA3014C1866E72CC4CD8B226CD6EF4")
+            .unwrap();
     // Build amendments data: type(3) + flags(5) + field_prefix(2) + VL(2) + 36*32 bytes
     let amendments_hex: Vec<&str> = vec![
         "03BDC0099C4E14163ADA272C1B6F6FABB448CC3E51F522F978041E4B57D9158C",
@@ -532,9 +531,21 @@ fn genesis_shamap_root_hash_matches_rippled_320() {
 
     // Build SHAMap from these 3 items
     let mut tree = MutableTree::new(1);
-    tree.add_item(SHAMapNodeType::AccountState, SHAMapItem::new(acct_key, acct_data)).unwrap();
-    tree.add_item(SHAMapNodeType::AccountState, SHAMapItem::new(amend_key, amend_data)).unwrap();
-    tree.add_item(SHAMapNodeType::AccountState, SHAMapItem::new(fee_key, fee_data)).unwrap();
+    tree.add_item(
+        SHAMapNodeType::AccountState,
+        SHAMapItem::new(acct_key, acct_data),
+    )
+    .unwrap();
+    tree.add_item(
+        SHAMapNodeType::AccountState,
+        SHAMapItem::new(amend_key, amend_data),
+    )
+    .unwrap();
+    tree.add_item(
+        SHAMapNodeType::AccountState,
+        SHAMapItem::new(fee_key, fee_data),
+    )
+    .unwrap();
 
     let root_hash = tree.root().get_hash();
 

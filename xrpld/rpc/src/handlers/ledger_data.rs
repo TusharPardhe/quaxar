@@ -17,7 +17,7 @@ pub struct LedgerDataEntry {
     pub key: Uint256,
     pub entry_type: LedgerEntryType,
     pub json: JsonValue,
-    pub binary: Vec<u8>,
+    pub binary: std::sync::Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +25,13 @@ pub struct LedgerDataResolved {
     pub base_json: JsonValue,
     pub ledger_json: JsonValue,
     pub entries: Vec<LedgerDataEntry>,
+    pub marker: Option<Uint256>,
+    pub pre_rendered: Option<std::sync::Arc<[u8]>>,
+}
+
+pub enum LedgerDataResponse {
+    Json(JsonValue),
+    PreRendered(std::sync::Arc<[u8]>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +46,9 @@ pub trait LedgerDataSource: LedgerLookupSource {
         &self,
         ledger: &LedgerLookupLedger,
         binary: bool,
+        marker: Option<Uint256>,
+        limit: i64,
+        type_filter: LedgerEntryType,
     ) -> Result<LedgerDataResolved, RpcStatus>;
 }
 
@@ -183,7 +193,7 @@ fn merge_object_fields(target: &mut BTreeMap<String, JsonValue>, source: JsonVal
 pub fn do_ledger_data<S: LedgerDataSource>(
     request: &LedgerDataRequest<'_>,
     source: &S,
-) -> JsonValue {
+) -> LedgerDataResponse {
     tracing::trace!(target: "rpc", method = "ledger_data", "ledger_data query");
     let context = LedgerLookupContext {
         params: request.params,
@@ -196,17 +206,7 @@ pub fn do_ledger_data<S: LedgerDataSource>(
         Err(status) => {
             let mut error = JsonValue::Object(BTreeMap::new());
             status.inject(&mut error);
-            return error;
-        }
-    };
-
-    let binary = parse_binary(request.params);
-    let resolved = match source.resolve_ledger_data(&ledger, binary) {
-        Ok(resolved) => resolved,
-        Err(status) => {
-            let mut error = JsonValue::Object(BTreeMap::new());
-            status.inject(&mut error);
-            return error;
+            return LedgerDataResponse::Json(error);
         }
     };
 
@@ -215,16 +215,26 @@ pub fn do_ledger_data<S: LedgerDataSource>(
         Err(status) => {
             let mut error = JsonValue::Object(BTreeMap::new());
             status.inject(&mut error);
-            return error;
+            return LedgerDataResponse::Json(error);
         }
     };
 
+    let binary = parse_binary(request.params);
     let mut limit = match parse_limit(request.params) {
         Ok(limit) => limit.unwrap_or(-1),
         Err(status) => {
             let mut error = JsonValue::Object(BTreeMap::new());
             status.inject(&mut error);
-            return error;
+            return LedgerDataResponse::Json(error);
+        }
+    };
+
+    let type_filter = match choose_ledger_entry_type(request.params) {
+        Ok(type_filter) => type_filter,
+        Err(status) => {
+            let mut error = JsonValue::Object(BTreeMap::new());
+            status.inject(&mut error);
+            return LedgerDataResponse::Json(error);
         }
     };
 
@@ -233,14 +243,18 @@ pub fn do_ledger_data<S: LedgerDataSource>(
         limit = max_limit;
     }
 
-    let type_filter = match choose_ledger_entry_type(request.params) {
-        Ok(type_filter) => type_filter,
+    let resolved = match source.resolve_ledger_data(&ledger, binary, marker, limit, type_filter) {
+        Ok(resolved) => resolved,
         Err(status) => {
             let mut error = JsonValue::Object(BTreeMap::new());
             status.inject(&mut error);
-            return error;
+            return LedgerDataResponse::Json(error);
         }
     };
+
+    if let Some(pre_rendered) = resolved.pre_rendered {
+        return LedgerDataResponse::PreRendered(pre_rendered);
+    }
 
     let object = ensure_object(&mut result);
     merge_object_fields(object, resolved.base_json);
@@ -250,29 +264,7 @@ pub fn do_ledger_data<S: LedgerDataSource>(
     }
 
     let mut nodes = Vec::new();
-    let mut entries = resolved.entries;
-    entries.sort_by(|left, right| left.key.cmp(&right.key));
-
-    let start_key = marker.unwrap_or_default();
-    let mut remaining = limit;
-
-    for entry in entries.into_iter().filter(|entry| entry.key > start_key) {
-        if remaining <= 0 {
-            let mut marker_key = entry.key;
-            marker_key.decrement();
-            object.insert(
-                "marker".to_owned(),
-                JsonValue::String(marker_key.to_string()),
-            );
-            break;
-        }
-
-        remaining -= 1;
-
-        if type_filter != LedgerEntryType::Any && type_filter != entry.entry_type {
-            continue;
-        }
-
+    for entry in resolved.entries {
         if binary {
             let mut node = BTreeMap::new();
             node.insert("data".to_owned(), JsonValue::String(str_hex(entry.binary)));
@@ -286,6 +278,9 @@ pub fn do_ledger_data<S: LedgerDataSource>(
         }
     }
 
+    if let Some(marker) = resolved.marker {
+        object.insert("marker".to_owned(), JsonValue::String(marker.to_string()));
+    }
     object.insert("state".to_owned(), JsonValue::Array(nodes));
-    result
+    LedgerDataResponse::Json(result)
 }

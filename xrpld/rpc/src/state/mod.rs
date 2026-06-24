@@ -21,6 +21,8 @@ pub mod server_definitions;
 pub mod server_info;
 pub mod server_state;
 pub mod tuning;
+pub mod ledger_state_index;
+pub mod ledger_data_page_cache;
 pub mod tx_reduce_relay;
 pub mod tx_support;
 
@@ -32,7 +34,7 @@ pub use app_server_info_warnings::{
 };
 pub use context::{JsonContext, JsonContextHeaders, RpcLoadType, RpcRequestContext, RpcRuntime};
 pub use role::*;
-pub use server_definitions::do_server_definitions;
+pub use server_definitions::{do_server_definitions, do_server_definitions_cached};
 pub use server_info::*;
 pub use server_state::*;
 pub use tx_support::*;

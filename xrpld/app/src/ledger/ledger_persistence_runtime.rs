@@ -41,7 +41,7 @@ impl PersistenceNodeStoreFetcher {
 }
 
 impl SHAMapNodeFetcher for PersistenceNodeStoreFetcher {
-    fn fetch_node_object(&mut self, hash: SHAMapHash, ledger_seq: u32) -> Option<SHAMapNodeObject> {
+    fn fetch_node_object(&self, hash: SHAMapHash, ledger_seq: u32) -> Option<SHAMapNodeObject> {
         let fetched = match &self.node_store {
             crate::SHAMapStoreNodeStore::Single(database) => database.fetch_node_object(
                 hash.as_uint256(),

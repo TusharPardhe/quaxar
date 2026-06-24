@@ -43,6 +43,15 @@ pub trait AccountLinesSource: LedgerLookupSource {
         ledger: &LedgerLookupLedger,
         entry_index: Uint256,
     ) -> Option<STLedgerEntry>;
+
+    /// Batch-read multiple child entries from a directory page.
+    fn read_child_entries_batch(
+        &self,
+        ledger: &LedgerLookupLedger,
+        entries: &[Uint256],
+    ) -> Vec<Option<STLedgerEntry>> {
+        entries.iter().map(|e| self.read_child_entry(ledger, *e)).collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -351,20 +360,22 @@ where
                 return found;
             };
 
-            for entry in owner_dir
+            let entries: Vec<Uint256> = owner_dir
                 .get_field_v256(get_field_by_symbol("sfIndexes"))
                 .value()
-                .iter()
-                .copied()
-            {
+                .to_vec();
+
+            let sles = source.read_child_entries_batch(ledger, &entries);
+
+            for (entry, sle_opt) in entries.iter().zip(sles.into_iter()) {
                 if !found {
-                    if entry == after {
+                    if *entry == after {
                         found = true;
                     }
                     continue;
                 }
 
-                let Some(sle) = source.read_child_entry(ledger, entry) else {
+                let Some(sle) = sle_opt else {
                     return false;
                 };
 
@@ -390,13 +401,15 @@ where
             return true;
         };
 
-        for entry in owner_dir
+        let entries: Vec<Uint256> = owner_dir
             .get_field_v256(get_field_by_symbol("sfIndexes"))
             .value()
-            .iter()
-            .copied()
-        {
-            let Some(sle) = source.read_child_entry(ledger, entry) else {
+            .to_vec();
+
+        let sles = source.read_child_entries_batch(ledger, &entries);
+
+        for sle_opt in sles {
+            let Some(sle) = sle_opt else {
                 return false;
             };
 

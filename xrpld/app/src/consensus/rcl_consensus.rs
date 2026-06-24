@@ -87,7 +87,9 @@ impl Default for AppRclConsensusOptions {
 pub trait RclConsensusClock: Send + Sync + 'static {
     fn now(&self) -> basics::chrono::NetClockTimePoint;
     fn close_time(&self) -> basics::chrono::NetClockTimePoint;
-    fn adjust_close_time(&self, _by: time::Duration) -> time::Duration { time::Duration::seconds(0) }
+    fn adjust_close_time(&self, _by: time::Duration) -> time::Duration {
+        time::Duration::seconds(0)
+    }
 }
 
 impl<C> RclConsensusClock for Arc<TimeKeeper<C>>
@@ -237,7 +239,10 @@ where
     fn add_trusted_validation(&self, node_id: PublicKey, validation: &STValidation) {
         self.lock()
             .expect("validations mutex must not be poisoned")
-            .add(node_id, super::rcl_validations::wrap_st_validation(validation));
+            .add(
+                node_id,
+                super::rcl_validations::wrap_st_validation(validation),
+            );
     }
 }
 
@@ -309,7 +314,10 @@ where
         self.validations()
             .lock()
             .expect("validations mutex must not be poisoned")
-            .add(node_id, super::rcl_validations::wrap_st_validation(validation));
+            .add(
+                node_id,
+                super::rcl_validations::wrap_st_validation(validation),
+            );
     }
 }
 
@@ -779,8 +787,8 @@ where
         let Some(overlay) = &self.overlay else {
             return;
         };
-        use overlay::{Overlay, ProtocolMessage, ProtocolPayload};
         use overlay::message::wire::TmStatusChange;
+        use overlay::{Overlay, ProtocolMessage, ProtocolPayload};
         let message = ProtocolMessage::new(ProtocolPayload::StatusChange(TmStatusChange {
             new_status: None,
             new_event: Some(event),
@@ -1356,12 +1364,14 @@ where
 
         // When no proposers matched (solo round), use parent+1s with close_flags=1
         // matching rippled's behavior when close_time consensus wasn't reached.
-        let (consensus_close_time, close_flags) = if result.proposers == 0 || raw_close_time.as_seconds() == 0 {
-            (parent_close_time.as_seconds() + 1, 1u8)
-        } else {
-            let eff = effective_close_time(raw_close_time, close_time_resolution, parent_close_time);
-            (eff.as_seconds(), 0u8)
-        };
+        let (consensus_close_time, close_flags) =
+            if result.proposers == 0 || raw_close_time.as_seconds() == 0 {
+                (parent_close_time.as_seconds() + 1, 1u8)
+            } else {
+                let eff =
+                    effective_close_time(raw_close_time, close_time_resolution, parent_close_time);
+                (eff.as_seconds(), 0u8)
+            };
 
         let mut acquired_header = parent.header();
         acquired_header.seq = seq;
@@ -1442,23 +1452,21 @@ where
             .unwrap_or(prev_ledger.id);
 
         // Use validation trie to find what the network prefers
-        let network_closed = if let Some(closed_ledger) = self.ledger_acceptor.consensus_closed_ledger() {
-            let validated = validated_ledger_from_ledger(
-                closed_ledger.as_ref(),
-                &NullRclValidationJournal,
-            );
-            let preferred = self.validations.get_preferred_with_min_seq(
-                validated,
-                self.ledgers.get_valid_ledger_index(),
-            );
-            if preferred != Uint256::zero() {
-                preferred
+        let network_closed =
+            if let Some(closed_ledger) = self.ledger_acceptor.consensus_closed_ledger() {
+                let validated =
+                    validated_ledger_from_ledger(closed_ledger.as_ref(), &NullRclValidationJournal);
+                let preferred = self
+                    .validations
+                    .get_preferred_with_min_seq(validated, self.ledgers.get_valid_ledger_index());
+                if preferred != Uint256::zero() {
+                    preferred
+                } else {
+                    our_closed
+                }
             } else {
                 our_closed
-            }
-        } else {
-            our_closed
-        };
+            };
 
         if network_closed == Uint256::zero() {
             tracing::info!(target: "consensus", "endConsensus: network closed is zero, skipping");
@@ -1692,7 +1700,6 @@ where
             .get_nodes_after(&validated, *prev_ledger_id)
     }
 
-
     fn pre_start_round_for_proposing(&self) {
         self.pre_start_round_for_proposing();
     }
@@ -1733,7 +1740,8 @@ where
         // mode=WrongLedger suppresses further view_change calls while
         // handleWrongLedger retries acquireLedger every tick until success.
 
-        let Some(ledger) = self.lookup_ledger(&prev_ledger.id)
+        let Some(ledger) = self
+            .lookup_ledger(&prev_ledger.id)
             .or_else(|| self.ledgers.acquire_consensus_ledger(&prev_ledger.id))
         else {
             return *prev_ledger_id;
@@ -1818,11 +1826,13 @@ where
         let _ = before;
         self.mode
             .store(encode_consensus_mode(after), Ordering::Release);
-        self.mode_source.set_consensus_mode(encode_consensus_mode(after));
+        self.mode_source
+            .set_consensus_mode(encode_consensus_mode(after));
     }
 
     fn adjust_close_time(&mut self, offset_seconds: i64) {
-        self.clock.adjust_close_time(time::Duration::seconds(offset_seconds));
+        self.clock
+            .adjust_close_time(time::Duration::seconds(offset_seconds));
     }
 
     fn on_accept(
@@ -1913,18 +1923,9 @@ where
                         node_id,
                         &keys.secret_key,
                         |v| {
-                            v.set_field_h256(
-                                get_field_by_symbol("sfLedgerHash"),
-                                ledger_hash,
-                            );
-                            v.set_field_u32(
-                                get_field_by_symbol("sfLedgerSequence"),
-                                seq,
-                            );
-                            v.set_field_u64(
-                                get_field_by_symbol("sfCookie"),
-                                cookie,
-                            );
+                            v.set_field_h256(get_field_by_symbol("sfLedgerHash"), ledger_hash);
+                            v.set_field_u32(get_field_by_symbol("sfLedgerSequence"), seq);
+                            v.set_field_u64(get_field_by_symbol("sfCookie"), cookie);
                             v.set_flag(VF_FULL_VALIDATION);
                         },
                     );

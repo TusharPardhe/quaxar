@@ -1,10 +1,53 @@
 //! Narrow `server_info` RPC handler port.
 
+use std::sync::{Arc, RwLock};
 use std::collections::BTreeMap;
 
 use protocol::JsonValue;
 
 use crate::{JsonContext, RpcRole};
+
+pub static SERVER_INFO_CACHE: RwLock<Option<Arc<[u8]>>> = RwLock::new(None);
+pub static SERVER_INFO_ADMIN_CACHE: RwLock<Option<Arc<[u8]>>> = RwLock::new(None);
+
+pub enum ServerInfoResponse {
+    Json(JsonValue),
+    PreRendered(Arc<[u8]>),
+}
+
+pub fn update_validated_snapshot_cache_server_info<S: ServerInfoSource>(source: &S) {
+    let context = crate::JsonContext {
+        params: &JsonValue::Object(BTreeMap::new()),
+        env: source,
+        role: RpcRole::User,
+        api_version: 1,
+        headers: crate::JsonContextHeaders {
+            user: "",
+            forwarded_for: "",
+        },
+        unlimited: false,
+    };
+    let json = build_response(&context, true, "info");
+    if let Ok(bytes) = serde_json::to_vec(&json) {
+        *SERVER_INFO_CACHE.write().unwrap() = Some(Arc::from(bytes));
+    }
+    // Also cache the admin response
+    let admin_context = crate::JsonContext {
+        params: &JsonValue::Object(BTreeMap::new()),
+        env: source,
+        role: RpcRole::Admin,
+        api_version: 1,
+        headers: crate::JsonContextHeaders {
+            user: "",
+            forwarded_for: "",
+        },
+        unlimited: false,
+    };
+    let admin_json = build_response(&admin_context, true, "info");
+    if let Ok(bytes) = serde_json::to_vec(&admin_json) {
+        *SERVER_INFO_ADMIN_CACHE.write().unwrap() = Some(Arc::from(bytes));
+    }
+}
 
 pub trait ServerInfoSource {
     fn get_server_info(&self, human: bool, admin: bool, counters: bool) -> JsonValue;
@@ -45,6 +88,22 @@ pub(crate) fn build_response<S: ServerInfoSource>(
 
 pub fn do_server_info<S: ServerInfoSource>(context: &JsonContext<'_, S>) -> JsonValue {
     build_response(context, true, "info")
+}
+
+pub fn do_server_info_prerendered<S: ServerInfoSource>(
+    context: &JsonContext<'_, S>,
+) -> ServerInfoResponse {
+    let admin = context.role == RpcRole::Admin;
+    let counters = want_counters(context.params);
+
+    if !counters {
+        let cache = if admin { &SERVER_INFO_ADMIN_CACHE } else { &SERVER_INFO_CACHE };
+        if let Some(cached) = cache.read().unwrap().clone() {
+            return ServerInfoResponse::PreRendered(cached);
+        }
+    }
+
+    ServerInfoResponse::Json(do_server_info(context))
 }
 
 #[cfg(test)]

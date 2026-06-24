@@ -1,3 +1,4 @@
+use parking_lot::Mutex;
 use basics::base_uint::Uint256;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
@@ -12,7 +13,7 @@ use shamap::sync::{SHAMapType, SyncState, SyncTree};
 use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use time::Duration;
 
 fn sample_hash(fill: u8) -> SHAMapHash {
@@ -26,12 +27,12 @@ fn sample_uint256(fill: u8) -> Uint256 {
 #[derive(Debug, Default)]
 struct RecordingFetcher {
     expected: HashMap<SHAMapHash, SharedIntrusive<SHAMapTreeNode>>,
-    fetches: Vec<SHAMapHash>,
+    fetches: Mutex<Vec<SHAMapHash>>,
 }
 
 impl SHAMapNodeFetcher for RecordingFetcher {
-    fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-        self.fetches.push(hash);
+    fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+        self.fetches.lock().push(hash);
         self.expected.get(&hash).cloned()
     }
 }
@@ -48,7 +49,6 @@ impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_seq(&self, ref_num: u32, node_hash: Uint256) {
         self.0
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_seq
             .push((ref_num, node_hash));
     }
@@ -77,11 +77,10 @@ fn needed_hashes_returns_root_when_loaded_map_hash_is_zero() {
     let needed = needed_hashes_with_family(root, &mut map, 8, &mut no_filter, &family);
 
     assert_eq!(needed, vec![*root.as_uint256()]);
-    family.with_fetcher(|fetcher| assert!(fetcher.fetches.is_empty()));
+    family.with_fetcher(|fetcher| assert!(fetcher.fetches.lock().is_empty()));
     assert!(
         reporter
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_seq
             .is_empty()
     );
@@ -115,11 +114,10 @@ fn needed_state_hashes_returns_empty_for_zero_root() {
     let needed = ledger.needed_state_hashes_with_family(8, &mut no_filter, &family);
 
     assert!(needed.is_empty());
-    family.with_fetcher(|fetcher| assert!(fetcher.fetches.is_empty()));
+    family.with_fetcher(|fetcher| assert!(fetcher.fetches.lock().is_empty()));
     assert!(
         reporter
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_seq
             .is_empty()
     );
@@ -176,11 +174,10 @@ fn needed_state_hashes_returns_missing_child_hashes_in_scan_order() {
         needed,
         vec![*missing_b.as_uint256(), *missing_a.as_uint256()]
     );
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches, vec![missing_b, missing_a]));
+    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![missing_b, missing_a]));
     assert!(
         reporter
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_seq
             .is_empty()
     );
@@ -226,11 +223,10 @@ fn needed_tx_hashes_clears_synching_when_tree_is_complete() {
 
     assert!(needed.is_empty());
     assert_eq!(ledger.tx_map().state(), SyncState::Modifying);
-    family.with_fetcher(|fetcher| assert!(fetcher.fetches.is_empty()));
+    family.with_fetcher(|fetcher| assert!(fetcher.fetches.lock().is_empty()));
     assert!(
         reporter
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_seq
             .is_empty()
     );
@@ -291,11 +287,10 @@ fn needed_state_hashes_stays_empty_when_complete_subtree_is_only_in_backed_fetch
     assert!(first.is_empty());
     assert!(second.is_empty());
     assert_eq!(ledger.state_map().state(), SyncState::Modifying);
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches, vec![root.get_child_hash(7)]));
+    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![root.get_child_hash(7)]));
     assert!(
         reporter
             .lock()
-            .expect("shared reporter mutex must not be poisoned")
             .by_seq
             .is_empty()
     );

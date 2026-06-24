@@ -178,6 +178,7 @@ pub struct ApplicationRoot {
     server_ports_setup: Option<Arc<ServerPortsSetup>>,
     published_server_ports: Option<Arc<dyn PublishedServerPortsSource>>,
     status_metrics: Option<Arc<dyn StatusMetricsSource>>,
+    ledger_delta_publisher: Option<Arc<dyn Fn(protocol::JsonValue) + Send + Sync + 'static>>,
     network_ops_state: Arc<SharedNetworkOpsState>,
     network_ops_runtime: Option<Arc<AppNetworkOpsRuntime>>,
     network_ops_validation_runtime: Option<Arc<AppNetworkOpsValidationRuntime>>,
@@ -1677,6 +1678,7 @@ impl ApplicationRoot {
             server_ports_setup: None,
             published_server_ports: None,
             status_metrics: Some(Arc::clone(&perf_log) as Arc<dyn StatusMetricsSource>),
+            ledger_delta_publisher: None,
             network_ops_state,
             network_ops_runtime: None,
             network_ops_validation_runtime: None,
@@ -2440,6 +2442,10 @@ impl ApplicationRoot {
 
     pub fn ledger_master_runtime(&self) -> Option<Arc<AppLedgerMasterRuntime>> {
         self.ledger_master_runtime.as_ref().map(Arc::clone)
+    }
+
+    pub fn set_ledger_delta_publisher(&mut self, publisher: impl Fn(protocol::JsonValue) + Send + Sync + 'static) {
+        self.ledger_delta_publisher = Some(Arc::new(publisher));
     }
 
     pub fn validations(&self) -> &SharedAppValidations<SystemTimeKeeperClock> {
@@ -3207,9 +3213,15 @@ impl ApplicationRoot {
             .set_need_network_ledger(need_network_ledger);
     }
 
-    pub fn set_completed_ledgers_rx(&self, rx: std::sync::mpsc::Receiver<std::sync::Arc<ledger::Ledger>>) {
+    pub fn set_completed_ledgers_rx(
+        &self,
+        rx: std::sync::mpsc::Receiver<std::sync::Arc<ledger::Ledger>>,
+    ) {
         if let Some(lm_rt) = self.ledger_master_runtime() {
-            *lm_rt.completed_ledgers_rx.lock().expect("completed_ledgers_rx") = Some(rx);
+            *lm_rt
+                .completed_ledgers_rx
+                .lock()
+                .expect("completed_ledgers_rx") = Some(rx);
         }
     }
 
@@ -3679,6 +3691,23 @@ impl ApplicationRoot {
                             let mut meta = protocol::TxMeta::new(entry.transaction_id, closed_seq);
                             let mut serializer = protocol::Serializer::default();
                             meta.add_raw(&mut serializer, entry.result, index as u32);
+                            
+                            use protocol::StBase;
+                            if let Some(publisher) = &self.ledger_delta_publisher {
+                                let mut tx_json = protocol::JsonValue::Object(std::collections::BTreeMap::new());
+                                if let protocol::JsonValue::Object(map) = &mut tx_json {
+                                    map.insert("transaction".to_string(), protocol::JsonValue::String(entry.transaction_id.to_string()));
+                                    map.insert("meta".to_string(), meta.get_nodes().json(protocol::JsonOptions::NONE));
+                                }
+                                let mut delta_msg = protocol::JsonValue::Object(std::collections::BTreeMap::new());
+                                if let protocol::JsonValue::Object(map) = &mut delta_msg {
+                                    map.insert("type".to_string(), protocol::JsonValue::String("ledgerDelta".to_string()));
+                                    map.insert("ledger_index".to_string(), protocol::JsonValue::Unsigned(closed_seq as u64));
+                                    map.insert("transaction".to_string(), tx_json);
+                                }
+                                publisher(delta_msg);
+                            }
+
                             accepted_entries.push(StandaloneAcceptedTx {
                                 transaction_id: entry.transaction_id,
                                 txn: Arc::new(protocol::Serializer::from_bytes(

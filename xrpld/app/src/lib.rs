@@ -23,6 +23,7 @@ pub mod load;
 pub mod network;
 pub mod node_family;
 pub mod paging;
+pub mod preflight;
 pub mod runtime;
 pub mod server;
 pub mod shamap;

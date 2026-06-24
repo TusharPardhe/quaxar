@@ -473,7 +473,7 @@ mod tests {
     struct FixedFetcher(Option<SharedIntrusive<SHAMapTreeNode>>);
 
     impl SHAMapNodeFetcher for FixedFetcher {
-        fn fetch_node(&mut self, _hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+        fn fetch_node(&self, _hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
             self.0.clone()
         }
     }

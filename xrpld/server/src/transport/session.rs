@@ -148,8 +148,9 @@ impl WSSession {
     }
 
     pub fn send_json(&self, value: &JsonValue) -> Result<(), mpsc::error::SendError<Message>> {
-        self.sender
-            .send(Message::Text(from_protocol_json(value).to_string().into()))
+        let json = from_protocol_json(value);
+        let text = sonic_rs::to_string(&json).unwrap_or_default();
+        self.sender.send(Message::Text(text.into()))
     }
 
     pub fn close(&self) -> Result<(), mpsc::error::SendError<Message>> {
@@ -174,8 +175,8 @@ impl WSSession {
             loop {
                 match rx.recv().await {
                     Ok(SubscriptionEvent { payload, .. }) => {
-                        let text = from_protocol_json(&payload).to_string();
-                        if sender.send(Message::Text(text.into())).is_err() {
+                        let text: axum::extract::ws::Utf8Bytes = payload.try_into().unwrap();
+                        if sender.send(Message::Text(text)).is_err() {
                             break;
                         }
                     }

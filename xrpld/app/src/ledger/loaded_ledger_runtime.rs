@@ -133,7 +133,7 @@ impl LoadedLedgerNodeFetcher {
 }
 
 impl SHAMapNodeFetcher for LoadedLedgerNodeFetcher {
-    fn fetch_node_object(&mut self, hash: SHAMapHash, ledger_seq: u32) -> Option<SHAMapNodeObject> {
+    fn fetch_node_object(&self, hash: SHAMapHash, ledger_seq: u32) -> Option<SHAMapNodeObject> {
         let node_store = self.node_store.as_ref()?;
         let fetched = match node_store {
             SHAMapStoreNodeStore::Single(database) => database.fetch_node_object(

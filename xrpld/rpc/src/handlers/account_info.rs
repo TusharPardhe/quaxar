@@ -1,6 +1,6 @@
 //! Narrow `account_info` RPC handler slice.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 
 use app::ApplicationRoot;
 use basics::base_uint::Uint160;
@@ -94,6 +94,7 @@ pub trait AccountInfoSource: LedgerLookupSource {
 pub struct ApplicationAccountInfoSource<'a> {
     app: &'a ApplicationRoot,
     current_ledger: Option<Arc<Ledger>>,
+    resolved_ledgers: RefCell<Vec<(LedgerLookupLedger, Option<Arc<Ledger>>)>>,
 }
 
 impl<'a> ApplicationAccountInfoSource<'a> {
@@ -101,6 +102,7 @@ impl<'a> ApplicationAccountInfoSource<'a> {
         Self {
             app,
             current_ledger: None,
+            resolved_ledgers: RefCell::new(Vec::new()),
         }
     }
 
@@ -108,6 +110,7 @@ impl<'a> ApplicationAccountInfoSource<'a> {
         Self {
             app,
             current_ledger: Some(current_ledger),
+            resolved_ledgers: RefCell::new(Vec::new()),
         }
     }
 
@@ -118,22 +121,39 @@ impl<'a> ApplicationAccountInfoSource<'a> {
     }
 
     fn lookup_resolved_ledger(&self, ledger: &LedgerLookupLedger) -> Option<Arc<Ledger>> {
+        if let Some((_, cached)) = self
+            .resolved_ledgers
+            .borrow()
+            .iter()
+            .find(|(candidate, _)| candidate == ledger)
+        {
+            return cached.clone();
+        }
+
         if ledger.open {
-            return self
+            let resolved = self
                 .current_ledger
                 .as_ref()
                 .filter(|candidate| ledger_lookup_ledger(candidate.as_ref(), true) == *ledger)
                 .cloned();
+            self.resolved_ledgers
+                .borrow_mut()
+                .push((*ledger, resolved.clone()));
+            return resolved;
         }
 
-        [
+        let resolved = [
             self.app.validated_ledger(),
             self.app.published_ledger(),
             self.app.closed_ledger(),
         ]
         .into_iter()
         .flatten()
-        .find(|candidate| ledger_lookup_ledger(candidate.as_ref(), false) == *ledger)
+        .find(|candidate| ledger_lookup_ledger(candidate.as_ref(), false) == *ledger);
+        self.resolved_ledgers
+            .borrow_mut()
+            .push((*ledger, resolved.clone()));
+        resolved
     }
 
     fn read_entry(

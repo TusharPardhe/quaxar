@@ -31,6 +31,7 @@ impl From<rpc::RpcErrorCode> for RpcError {
 pub enum RpcReply {
     Result(JsonValue),
     Error(RpcError),
+    PreRendered(std::sync::Arc<[u8]>),
 }
 
 impl RpcReply {

@@ -63,6 +63,9 @@ impl RpcDispatcher for RecordingDispatcher {
 struct FixedStatusSource(Result<(), String>);
 
 impl ServerStatusSource for FixedStatusSource {
+    fn validated_ledger_hash(&self) -> Option<String> {
+        None
+    }
     fn server_okay(&self) -> Result<(), String> {
         self.0.clone()
     }
@@ -416,7 +419,7 @@ async fn websocket_get_status_page_reports_server_health() {
         .await
         .expect("body should read");
     let body = std::str::from_utf8(&body).expect("body should be utf-8");
-    assert!(body.contains("Test page for xrpld"));
+    assert!(body.contains("Test page for quaxar"));
     assert!(body.contains("connectivity is working"));
 }
 

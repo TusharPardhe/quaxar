@@ -247,6 +247,155 @@ where
     Ok(None)
 }
 
+/// Collect up to `limit` leaves whose keys are strictly greater than `start`,
+/// returned in ascending key order.
+///
+/// ## Algorithm
+///
+/// 1. **Seek** — `walk_towards_key_with_path` descends from `root` toward
+///    `start`, recording every node visited (root → … → closest leaf or dead
+///    end) into a `Vec<NodePathEntry>` walk stack.
+///
+/// 2. **Upper-bound** — the same logic as [`upper_bound`] is applied to that
+///    stack to reach the first leaf `> start`.  The critical difference from
+///    [`upper_bound`] is that the **stack is kept live**: when `first_below`
+///    is called it receives the shared stack, so by the time it returns the
+///    stack ends with that first leaf — exactly the invariant expected by
+///    `peek_next_item`.
+///
+/// 3. **Collect** — `peek_next_item` is called repeatedly to advance forward
+///    through the tree in O(1) amortised time per step, accumulating nodes
+///    until `limit` is reached or the tree is exhausted.
+///
+/// ## Errors
+///
+/// Returns [`TraversalError::MissingNode`] if a hash-addressed child is
+/// referenced but cannot be resolved (only possible when `backed = true`).
+pub fn iterate_from<F>(
+    root: &SharedIntrusive<SHAMapTreeNode>,
+    start: Uint256,
+    limit: usize,
+    backed: bool,
+    fetch: &mut F,
+) -> Result<Vec<SharedIntrusive<SHAMapTreeNode>>, TraversalError>
+where
+    F: FnMut(SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>>,
+{
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    iterate_from_inner(root, start, limit, backed, fetch)
+}
+
+// Two-phase implementation: upper-bound seek (stack-preserving), then
+// limit-capped forward collection via peek_next_item.
+fn iterate_from_inner<F>(
+    root: &SharedIntrusive<SHAMapTreeNode>,
+    start: Uint256,
+    limit: usize,
+    backed: bool,
+    fetch: &mut F,
+) -> Result<Vec<SharedIntrusive<SHAMapTreeNode>>, TraversalError>
+where
+    F: FnMut(SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>>,
+{
+    // ── Step 1: Walk toward `start`, collecting the path from root. ──────────
+    let (_, mut stack) = walk_towards_key_with_path(root, start, backed, fetch)?;
+
+    // ── Step 2: Upper-bound seek ─────────────────────────────────────────────
+    //
+    // We find the first leaf strictly > start using the same traversal logic
+    // as `upper_bound`, but critically we pass `&mut stack` to `first_below`
+    // so the stack remains valid for `peek_next_item` afterwards.
+    //
+    // The tricky case is the inner-node branch: once we find a child branch
+    // to descend, we call `first_below` with our stack. After that call the
+    // stack ends with the first leaf under that subtree, and we are done
+    // seeking. We use an `Option` sentinel (`seek_done`) to break out of the
+    // manual "while let" loop without needing a labelled break-with-value.
+    enum SeekResult {
+        Found(SharedIntrusive<SHAMapTreeNode>),
+        Exhausted,
+    }
+
+    let seek_result: SeekResult = {
+        let mut result = SeekResult::Exhausted;
+        'seek: loop {
+            let Some(entry) = stack.last().cloned() else {
+                break 'seek;
+            };
+
+            if entry.node.is_leaf() {
+                if entry.node.peek_item().is_some_and(|item| item.key() > start) {
+                    // Stack already ends with this leaf.
+                    result = SeekResult::Found(entry.node);
+                    break 'seek;
+                }
+                stack.pop();
+            } else {
+                let start_branch = select_branch(entry.node_id, start) + 1;
+                let mut descended = false;
+                for branch in start_branch..BRANCH_FACTOR {
+                    if entry.node.is_empty_branch(branch) {
+                        continue;
+                    }
+
+                    let child = descend_throw(&entry.node, branch, backed, fetch)?
+                        .expect("non-empty branches should resolve to a child or error");
+                    let child_id = entry
+                        .node_id
+                        .get_child_node_id(branch)
+                        .expect("branch selection must stay within SHAMap depth bounds");
+
+                    // Descend into the first leaf under this subtree.
+                    // `first_below` appends to `stack`, leaving it with the leaf on top.
+                    if let Some(leaf) = first_below(&child, child_id, &mut stack, backed, fetch)? {
+                        result = SeekResult::Found(leaf);
+                        break 'seek;
+                    }
+                    descended = true;
+                    break;
+                }
+                if !descended {
+                    stack.pop();
+                }
+            }
+        }
+        result
+    };
+
+    // ── Step 3: Collect up to `limit` leaves via peek_next_item ─────────────
+    let first_leaf = match seek_result {
+        SeekResult::Exhausted => return Ok(Vec::new()),
+        SeekResult::Found(leaf) => leaf,
+    };
+
+    let mut results = Vec::with_capacity(limit);
+    results.push(first_leaf.clone());
+
+    // The key of the leaf currently on top of the stack, used by peek_next_item
+    // to figure out which sibling branch to advance past.
+    let mut current_key = first_leaf
+        .peek_item()
+        .expect("a leaf node must always carry an item")
+        .key();
+
+    while results.len() < limit {
+        match peek_next_item(current_key, &mut stack, backed, fetch)? {
+            None => break,
+            Some(leaf) => {
+                current_key = leaf
+                    .peek_item()
+                    .expect("a leaf node must always carry an item")
+                    .key();
+                results.push(leaf);
+            }
+        }
+    }
+
+    Ok(results)
+}
+
 pub fn lower_bound<F>(
     root: &SharedIntrusive<SHAMapTreeNode>,
     id: Uint256,
@@ -584,7 +733,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{lower_bound, peek_first_item, peek_next_item, upper_bound};
+    use super::{iterate_from, lower_bound, peek_first_item, peek_next_item, upper_bound};
     use crate::item::SHAMapItem;
     use crate::search::NodePathEntry;
     use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
@@ -739,5 +888,105 @@ mod tests {
         assert!(same_node(&first, &leaf));
         assert_eq!(fetch_calls, 1);
         assert!(root.get_child(2).is_some());
+    }
+
+    // ── iterate_from tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn iterate_from_returns_all_leaves_after_key_below_all() {
+        // start key is below all leaves → should return all three in order
+        let (root, low_leaf, mid_leaf, high_leaf, _, _, _) = build_three_leaf_root();
+        let below_all =
+            key("0000000000000000000000000000000000000000000000000000000000000001");
+
+        let results = iterate_from(&root, below_all, 10, false, &mut |_| None)
+            .expect("iterate_from below all leaves should succeed");
+
+        assert_eq!(results.len(), 3);
+        assert!(same_node(&results[0], &low_leaf));
+        assert!(same_node(&results[1], &mid_leaf));
+        assert!(same_node(&results[2], &high_leaf));
+    }
+
+    #[test]
+    fn iterate_from_respects_limit() {
+        let (root, low_leaf, mid_leaf, _, _, _, _) = build_three_leaf_root();
+        let below_all =
+            key("0000000000000000000000000000000000000000000000000000000000000001");
+
+        let results = iterate_from(&root, below_all, 2, false, &mut |_| None)
+            .expect("iterate_from with limit 2 should succeed");
+
+        assert_eq!(results.len(), 2);
+        assert!(same_node(&results[0], &low_leaf));
+        assert!(same_node(&results[1], &mid_leaf));
+    }
+
+    #[test]
+    fn iterate_from_skips_exact_start_key() {
+        // start == low_key: low_leaf must NOT be included (strictly greater)
+        let (root, _low_leaf, mid_leaf, high_leaf, low_key, _, _) =
+            build_three_leaf_root();
+
+        let results = iterate_from(&root, low_key, 10, false, &mut |_| None)
+            .expect("iterate_from from exact low_key should succeed");
+
+        assert_eq!(results.len(), 2);
+        assert!(same_node(&results[0], &mid_leaf));
+        assert!(same_node(&results[1], &high_leaf));
+    }
+
+    #[test]
+    fn iterate_from_between_keys_finds_upper_bound_first() {
+        // start between mid_key and high_key → only high_leaf is returned
+        let (root, _, _, high_leaf, _, _, _) = build_three_leaf_root();
+        let between_mid_and_high =
+            key("7000000000000000000000000000000000000000000000000000000000000000");
+
+        let results = iterate_from(&root, between_mid_and_high, 10, false, &mut |_| None)
+            .expect("iterate_from between mid and high should succeed");
+
+        assert_eq!(results.len(), 1);
+        assert!(same_node(&results[0], &high_leaf));
+    }
+
+    #[test]
+    fn iterate_from_at_or_past_last_key_returns_empty() {
+        let (root, _, _, _, _, _, high_key) = build_three_leaf_root();
+
+        // start == high_key (exact last): nothing strictly greater
+        let at_last = iterate_from(&root, high_key, 10, false, &mut |_| None)
+            .expect("iterate_from at last key should succeed");
+        assert!(at_last.is_empty(), "no leaves are strictly > high_key");
+
+        // start past everything
+        let beyond_all =
+            key("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+        let past_all = iterate_from(&root, beyond_all, 10, false, &mut |_| None)
+            .expect("iterate_from past all leaves should succeed");
+        assert!(past_all.is_empty(), "no leaves exist past max key");
+    }
+
+    #[test]
+    fn iterate_from_limit_zero_returns_empty_without_traversal() {
+        let (root, _, _, _, _, _, _) = build_three_leaf_root();
+        let below_all =
+            key("0000000000000000000000000000000000000000000000000000000000000001");
+
+        let results = iterate_from(&root, below_all, 0, false, &mut |_| None)
+            .expect("iterate_from with limit 0 should succeed");
+        assert!(results.is_empty(), "limit=0 must return an empty vec");
+    }
+
+    #[test]
+    fn iterate_from_limit_one_returns_single_leaf() {
+        let (root, low_leaf, _, _, _, _, _) = build_three_leaf_root();
+        let below_all =
+            key("0000000000000000000000000000000000000000000000000000000000000001");
+
+        let results = iterate_from(&root, below_all, 1, false, &mut |_| None)
+            .expect("iterate_from with limit 1 should succeed");
+        assert_eq!(results.len(), 1);
+        assert!(same_node(&results[0], &low_leaf));
     }
 }

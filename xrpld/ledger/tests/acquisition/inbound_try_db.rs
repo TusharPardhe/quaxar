@@ -16,6 +16,7 @@ use shamap::tree_node_cache::TreeNodeCache;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use time::Duration;
 
@@ -119,16 +120,16 @@ fn family(
 #[derive(Debug, Default)]
 struct DelayedNodeFetcher {
     nodes: HashMap<SHAMapHash, SharedIntrusive<SHAMapTreeNode>>,
-    delayed_once: HashMap<SHAMapHash, usize>,
+    delayed_once: Mutex<HashMap<SHAMapHash, usize>>,
 }
 
 impl SHAMapNodeFetcher for DelayedNodeFetcher {
-    fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-        if let Some(remaining_misses) = self.delayed_once.get_mut(&hash)
-            && *remaining_misses > 0
-        {
-            *remaining_misses -= 1;
-            return None;
+    fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+        if let Some(remaining_misses) = self.delayed_once.lock().get_mut(&hash) {
+            if *remaining_misses > 0 {
+                *remaining_misses -= 1;
+                return None;
+            }
         }
         self.nodes.get(&hash).cloned()
     }
@@ -410,7 +411,7 @@ fn inbound_try_db_keeps_synching_when_get_missing_nodes_reports_missing_hash() {
                 (state_root.get_hash(), state_root),
                 (state_leaf.get_hash(), state_leaf.clone()),
             ]),
-            delayed_once: HashMap::from([(state_leaf.get_hash(), 1)]),
+            delayed_once: Mutex::new(HashMap::from([(state_leaf.get_hash(), 1)])),
         },
         NullMissingNodeReporter,
     );

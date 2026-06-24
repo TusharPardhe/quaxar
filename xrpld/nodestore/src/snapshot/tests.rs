@@ -3,10 +3,10 @@ use std::sync::Arc;
 use basics::base_uint::Uint256;
 use basics::basic_config::Section;
 
-use crate::{Backend, Factory, MemoryFactory, NodeObject, NodeObjectType, NullJournal};
 use crate::database_runtime::scheduler::DummyScheduler;
-use crate::snapshot::{SnapshotError, SnapshotManifest, export_snapshot, load_snapshot};
 use crate::snapshot::manifest::*;
+use crate::snapshot::{SnapshotError, SnapshotManifest, export_snapshot, load_snapshot};
+use crate::{Backend, Factory, MemoryFactory, NodeObject, NodeObjectType, NullJournal};
 
 fn config(path: &str) -> Section {
     let mut section = Section::new("node_db");
@@ -118,7 +118,10 @@ fn corrupt_chunk_hash_detected() {
 
     let dst = make_backend("dst-corrupt");
     let result = load_snapshot(dst.as_ref(), &snap_path);
-    assert!(matches!(result, Err(SnapshotError::ChunkHashMismatch { .. })));
+    assert!(matches!(
+        result,
+        Err(SnapshotError::ChunkHashMismatch { .. })
+    ));
 }
 
 #[test]

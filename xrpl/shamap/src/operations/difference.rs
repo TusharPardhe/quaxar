@@ -244,6 +244,7 @@ mod tests {
     use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::ManualClock;
+    use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::Arc;
     use time::Duration;
@@ -442,12 +443,12 @@ mod tests {
     #[derive(Debug, Default)]
     struct MappingFetcher {
         nodes: HashMap<SHAMapHash, SharedIntrusive<SHAMapTreeNode>>,
-        fetches: Vec<SHAMapHash>,
+        fetches: Mutex<Vec<SHAMapHash>>,
     }
 
     impl SHAMapNodeFetcher for MappingFetcher {
-        fn fetch_node(&mut self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
-            self.fetches.push(hash);
+        fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            self.fetches.lock().push(hash);
             self.nodes.get(&hash).cloned()
         }
     }
@@ -478,7 +479,7 @@ mod tests {
             NullFullBelowCache::new(0),
             MappingFetcher {
                 nodes,
-                fetches: Vec::new(),
+                fetches: Mutex::new(Vec::new()),
             },
             NullMissingNodeReporter,
         );
@@ -511,7 +512,7 @@ mod tests {
 
         assert_eq!(visited, 2);
         assert!(root.get_child(5).is_some());
-        family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches, vec![expected_hash]));
+        family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![expected_hash]));
     }
 
     #[test]
@@ -568,7 +569,7 @@ mod tests {
             NullFullBelowCache::new(0),
             MappingFetcher {
                 nodes: HashMap::new(),
-                fetches: Vec::new(),
+                fetches: Mutex::new(Vec::new()),
             },
             NullMissingNodeReporter,
         );
