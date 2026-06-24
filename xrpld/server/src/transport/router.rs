@@ -130,7 +130,7 @@ fn build_tls_config(port: &ServerPortSetup) -> Result<Arc<ServerConfig>, String>
         .with_single_cert(certs, key)
         .map_err(|e| format!("failed to build TLS config: {}", e))?;
 
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
 
@@ -214,6 +214,25 @@ pub struct RpcServer<D> {
     subscriptions: Arc<SubscriptionManager>,
     auth: ServerAuth,
     config: RpcServerConfig,
+    state: Arc<RpcServerState>,
+}
+
+pub struct RpcServerState {
+    pub in_flight: dashmap::DashMap<String, tokio::sync::watch::Receiver<Option<RpcReply>>>,
+    pub p0_pool: tokio::sync::Semaphore,
+    pub p1_pool: tokio::sync::Semaphore,
+    pub p2_pool: tokio::sync::Semaphore,
+}
+
+impl Default for RpcServerState {
+    fn default() -> Self {
+        Self {
+            in_flight: dashmap::DashMap::new(),
+            p0_pool: tokio::sync::Semaphore::new(32),
+            p1_pool: tokio::sync::Semaphore::new(16),
+            p2_pool: tokio::sync::Semaphore::new(4),
+        }
+    }
 }
 
 impl<D> RpcServer<D>
@@ -240,6 +259,7 @@ where
             subscriptions: Arc::new(SubscriptionManager::default()),
             auth: ServerAuth::default(),
             config: RpcServerConfig::default(),
+            state: Arc::new(RpcServerState::default()),
         }
     }
 
@@ -249,6 +269,7 @@ where
             subscriptions: Arc::new(SubscriptionManager::default()),
             auth,
             config: RpcServerConfig::default(),
+            state: Arc::new(RpcServerState::default()),
         }
     }
 
@@ -258,6 +279,7 @@ where
             subscriptions,
             auth: ServerAuth::default(),
             config: RpcServerConfig::default(),
+            state: Arc::new(RpcServerState::default()),
         }
     }
 
@@ -271,6 +293,7 @@ where
             subscriptions,
             auth,
             config: RpcServerConfig::default(),
+            state: Arc::new(RpcServerState::default()),
         }
     }
 
@@ -283,6 +306,7 @@ where
                 port_policy: Some(policy),
                 ..RpcServerConfig::default()
             },
+            state: Arc::new(RpcServerState::default()),
         }
     }
 
@@ -316,6 +340,60 @@ where
 
     pub fn subscriptions(&self) -> Arc<SubscriptionManager> {
         self.subscriptions.clone()
+    }
+
+    async fn dispatch_async(
+        &self,
+        method: String,
+        params: JsonValue,
+        metadata: RequestMetadata,
+    ) -> RpcReply {
+        let hash_key = format!("{}:{}", method, sonic_rs::to_string(&params).unwrap_or_default());
+
+        // Atomically check-or-insert to prevent the race where two threads
+        // both see an empty slot and both start computing.
+        use dashmap::mapref::entry::Entry;
+        let rx_opt = match self.state.in_flight.entry(hash_key.clone()) {
+            Entry::Occupied(e) => Some(e.get().clone()),
+            Entry::Vacant(_) => None,
+        };
+
+        if let Some(mut rx) = rx_opt {
+            if rx.changed().await.is_ok() {
+                if let Some(reply) = rx.borrow().clone() {
+                    return reply;
+                }
+            }
+        }
+
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        self.state.in_flight.insert(hash_key.clone(), rx);
+
+        let permit = match method.as_str() {
+            "submit" | "fee" => self.state.p0_pool.acquire().await.unwrap(),
+            "ledger_data" => self.state.p2_pool.acquire().await.unwrap(),
+            _ => self.state.p1_pool.acquire().await.unwrap(),
+        };
+
+        let dispatcher = self.dispatcher.clone();
+        let method_owned = method.clone();
+        let reply = tokio::task::spawn_blocking(move || {
+            dispatcher.dispatch(RpcRequest {
+                method: &method_owned,
+                params: &params,
+                metadata: &metadata,
+                session: None,
+            })
+        })
+        .await
+        .expect("dispatcher::dispatch panicked");
+
+        drop(permit);
+        
+        let _ = tx.send(Some(reply.clone()));
+        self.state.in_flight.remove(&hash_key);
+
+        reply
     }
 
     pub fn router(self) -> Router {
@@ -362,6 +440,13 @@ where
             return StatusCode::FORBIDDEN.into_response();
         }
 
+        // ETag derived from validated ledger hash — applied post-dispatch
+        // only when the response is for the validated ledger.
+        let validated_etag = server.config.status_source.as_ref()
+            .and_then(|s| s.validated_ledger_hash())
+            .map(|h| format!("\"{}\"", h));
+        let mut etag_val = None;
+
         let mut request = Request::new(Body::from(Vec::<u8>::new()));
         *request.headers_mut() = headers.clone();
         let mut metadata = RequestMetadata::new(remote_addr, &request);
@@ -401,57 +486,104 @@ where
             metadata.forwarded_for.clear();
         }
         metadata.unlimited = matches!(metadata.role, RpcRole::Admin | RpcRole::Identified);
-        let dispatcher = server.dispatcher.clone();
+
+        // Apply ETag/304 only for requests targeting the validated ledger.
+        // If ledger_index is absent or "validated", the response is cacheable.
+        if let Some(ref etag) = validated_etag {
+            let targets_validated = match &params {
+                JsonValue::Array(arr) => arr.first()
+                    .and_then(|p| if let JsonValue::Object(o) = p { o.get("ledger_index") } else { None })
+                    .map_or(true, |v| matches!(v, JsonValue::String(s) if s == "validated")),
+                JsonValue::Object(o) => o.get("ledger_index")
+                    .map_or(true, |v| matches!(v, JsonValue::String(s) if s == "validated")),
+                _ => true,
+            };
+            if targets_validated {
+                etag_val = Some(etag.clone());
+                if let Some(if_none_match) = headers.get(axum::http::header::IF_NONE_MATCH) {
+                    if if_none_match.as_bytes() == etag.as_bytes() {
+                        return StatusCode::NOT_MODIFIED.into_response();
+                    }
+                }
+            }
+        }
+
         let method_owned = rpc_request.method.clone();
         let params_owned = params.clone();
         let metadata_owned = metadata.clone();
-        let reply = tokio::task::spawn_blocking(move || {
-            dispatcher.dispatch(RpcRequest {
-                method: &method_owned,
-                params: &params_owned,
-                metadata: &metadata_owned,
-                session: None,
-            })
-        })
-        .await
-        .expect("dispatcher::dispatch panicked");
-        let mut response = json_rpc_response(rpc_request.id, rpc_request.jsonrpc.as_deref(), reply);
-        // name included, matching the reference implementation behavior.
-        if let Value::Object(resp) = &mut response
-            && let Some(Value::Object(result)) = resp.get_mut("result")
-            && (result.get("status") == Some(&Value::String("error".to_owned()))
-                || result.contains_key("error"))
-        {
-            result.entry("request".to_owned()).or_insert_with(|| {
-                // The raw params is [{"key":"val"}] — unwrap the array.
-                let raw = from_protocol_json(&params);
-                let mut echo = match raw {
-                    Value::Array(arr) if !arr.is_empty() => arr
-                        .into_iter()
-                        .next()
-                        .unwrap_or(Value::Object(serde_json::Map::new())),
-                    Value::Object(_) => raw,
-                    _ => Value::Object(serde_json::Map::new()),
-                };
-                if let Value::Object(obj) = &mut echo {
-                    obj.entry("command".to_owned())
-                        .or_insert_with(|| Value::String(rpc_request.method.clone()));
+        let reply = server.dispatch_async(method_owned, params_owned, metadata_owned).await;
+        let body = match reply {
+            RpcReply::PreRendered(bytes) => {
+                let mut prefix = Vec::new();
+                prefix.extend_from_slice(b"{");
+                if let Some(ver) = rpc_request.jsonrpc.as_deref() {
+                    prefix.extend_from_slice(b"\"jsonrpc\":\"");
+                    prefix.extend_from_slice(ver.as_bytes());
+                    prefix.extend_from_slice(b"\",");
                 }
-                echo
-            });
-        }
-        // Use sonic-rs (SIMD-accelerated) for output serialization instead of
-        // axum's default serde_json path for a 3-10x throughput improvement.
-        let body = match sonic_rs::to_vec(&response) {
-            Ok(b) => b,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                if let Some(id_val) = rpc_request.id {
+                    prefix.extend_from_slice(b"\"id\":");
+                    prefix.extend_from_slice(&sonic_rs::to_vec(&id_val).unwrap_or_default());
+                    prefix.extend_from_slice(b",");
+                } else {
+                    prefix.extend_from_slice(b"\"id\":null,");
+                }
+                prefix.extend_from_slice(b"\"result\":");
+                
+                let mut out = Vec::with_capacity(prefix.len() + bytes.len() + 1);
+                out.extend_from_slice(&prefix);
+                out.extend_from_slice(&bytes);
+                out.extend_from_slice(b"}");
+                out
+            }
+            _ => {
+                let mut response = json_rpc_response(rpc_request.id, rpc_request.jsonrpc.as_deref(), reply);
+                // name included, matching the reference implementation behavior.
+                if let Value::Object(resp) = &mut response
+                    && let Some(Value::Object(result)) = resp.get_mut("result")
+                    && (result.get("status") == Some(&Value::String("error".to_owned()))
+                        || result.contains_key("error"))
+                {
+                    result.entry("request".to_owned()).or_insert_with(|| {
+                        // The raw params is [{"key":"val"}] — unwrap the array.
+                        let raw = from_protocol_json(&params);
+                        let mut echo = match raw {
+                            Value::Array(arr) if !arr.is_empty() => arr
+                                .into_iter()
+                                .next()
+                                .unwrap_or(Value::Object(serde_json::Map::new())),
+                            Value::Object(_) => raw,
+                            _ => Value::Object(serde_json::Map::new()),
+                        };
+                        if let Value::Object(obj) = &mut echo {
+                            obj.entry("command".to_owned())
+                                .or_insert_with(|| Value::String(rpc_request.method.clone()));
+                        }
+                        echo
+                    });
+                }
+                // Use sonic-rs (SIMD-accelerated) for output serialization instead of
+                // axum's default serde_json path for a 3-10x throughput improvement.
+                match sonic_rs::to_vec(&response) {
+                    Ok(b) => b,
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }
         };
-        (
+        let mut res = (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             body,
         )
-            .into_response()
+            .into_response();
+
+        if let Some(etag) = etag_val {
+            if let Ok(etag_header) = axum::http::HeaderValue::from_str(&etag) {
+                res.headers_mut().insert(axum::http::header::ETAG, etag_header);
+            }
+        }
+
+        res
     }
 
     /// POST /v2/batch — accepts a JSON array of RPC requests, resolves the
@@ -469,6 +601,20 @@ where
         }
         if !authorized_http(&server.auth.config, &headers) {
             return StatusCode::FORBIDDEN.into_response();
+        }
+
+        // ETag derived from validated ledger hash — applied post-dispatch
+        // only when the response is for the validated ledger.
+        let validated_etag = server.config.status_source.as_ref()
+            .and_then(|s| s.validated_ledger_hash())
+            .map(|h| format!("\"{}\"", h));
+        let etag_val = validated_etag.clone();
+        if let Some(ref etag) = validated_etag {
+            if let Some(if_none_match) = headers.get(axum::http::header::IF_NONE_MATCH) {
+                if if_none_match.as_bytes() == etag.as_bytes() {
+                    return StatusCode::NOT_MODIFIED.into_response();
+                }
+            }
         }
 
         let requests: Vec<Value> = match sonic_rs::from_slice(&body) {
@@ -530,20 +676,10 @@ where
             }
             req_metadata.unlimited =
                 matches!(req_metadata.role, RpcRole::Admin | RpcRole::Identified);
-            let dispatcher = server.dispatcher.clone();
             let method_owned = rpc_request.method.clone();
             let params_owned = params.clone();
             let req_metadata_owned = req_metadata.clone();
-            let reply = tokio::task::spawn_blocking(move || {
-                dispatcher.dispatch(RpcRequest {
-                    method: &method_owned,
-                    params: &params_owned,
-                    metadata: &req_metadata_owned,
-                    session: None,
-                })
-            })
-            .await
-            .expect("dispatcher::dispatch panicked");
+            let reply = server.dispatch_async(method_owned, params_owned, req_metadata_owned).await;
             responses.push(json_rpc_response(
                 rpc_request.id,
                 rpc_request.jsonrpc.as_deref(),
@@ -552,12 +688,20 @@ where
         }
 
         let body = sonic_rs::to_vec(&responses).unwrap_or_default();
-        (
+        let mut res = (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
             body,
         )
-            .into_response()
+            .into_response();
+
+        if let Some(etag) = etag_val {
+            if let Ok(etag_header) = axum::http::HeaderValue::from_str(&etag) {
+                res.headers_mut().insert(axum::http::header::ETAG, etag_header);
+            }
+        }
+
+        res
     }
 
     async fn handle_get(
@@ -694,25 +838,51 @@ where
                         // session are handled by the dispatcher synchronously before
                         // returning; passing session: None here is intentional for the
                         // blocking offload — the session ref is used post-dispatch.
-                        tokio::task::spawn_blocking(move || {
-                            dispatcher.dispatch(RpcRequest {
-                                method: &method_owned,
-                                params: &params_owned,
-                                metadata: &metadata_owned,
-                                session: None,
-                            })
-                        })
-                        .await
-                        .expect("dispatcher::dispatch panicked")
+                        self.dispatch_async(method_owned, params_owned, metadata_owned).await
                     };
-                    let response = websocket_response(
-                        &envelope,
-                        &params,
-                        reply,
-                        metadata.api_version,
-                        has_explicit_api_version(&params),
-                    );
-                    let _ = session.send_text(sonic_rs::to_string(&response).unwrap_or_default());
+                    let reply_msg = match reply {
+                        RpcReply::PreRendered(bytes) => {
+                            let mut prefix = Vec::new();
+                            prefix.extend_from_slice(b"{");
+                            prefix.extend_from_slice(b"\"type\":\"response\",");
+                            prefix.extend_from_slice(b"\"status\":\"success\",");
+                            if let Some(ver) = envelope.jsonrpc.as_deref() {
+                                prefix.extend_from_slice(b"\"jsonrpc\":\"");
+                                prefix.extend_from_slice(ver.as_bytes());
+                                prefix.extend_from_slice(b"\",");
+                            }
+                            if let Some(id_val) = &envelope.id {
+                                prefix.extend_from_slice(b"\"id\":");
+                                prefix.extend_from_slice(&sonic_rs::to_vec(id_val).unwrap_or_default());
+                                prefix.extend_from_slice(b",");
+                            } else {
+                                prefix.extend_from_slice(b"\"id\":null,");
+                            }
+                            if has_explicit_api_version(&params) {
+                                prefix.extend_from_slice(b"\"api_version\":");
+                                prefix.extend_from_slice(metadata.api_version.to_string().as_bytes());
+                                prefix.extend_from_slice(b",");
+                            }
+                            prefix.extend_from_slice(b"\"result\":");
+                            
+                            let mut out = Vec::with_capacity(prefix.len() + bytes.len() + 1);
+                            out.extend_from_slice(&prefix);
+                            out.extend_from_slice(&bytes);
+                            out.extend_from_slice(b"}");
+                            String::from_utf8(out).unwrap_or_default()
+                        }
+                        _ => {
+                            let response = websocket_response(
+                                &envelope,
+                                &params,
+                                reply,
+                                metadata.api_version,
+                                has_explicit_api_version(&params),
+                            );
+                            sonic_rs::to_string(&response).unwrap_or_default()
+                        }
+                    };
+                    let _ = session.send_text(reply_msg);
                 }
                 Message::Close(_) => break,
                 Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => {}
@@ -801,6 +971,12 @@ fn json_rpc_response(id: Option<Value>, jsonrpc: Option<&str>, reply: RpcReply) 
             error_object.insert("token".to_owned(), Value::String(error.token));
             error_object.insert("message".to_owned(), Value::String(error.message));
             response.insert("error".to_owned(), Value::Object(error_object));
+        }
+        RpcReply::PreRendered(bytes) => {
+            // Fallback for batch arrays or json_rpc_response usages where we MUST return a Value
+            if let Ok(val) = serde_json::from_slice(&bytes) {
+                response.insert("result".to_owned(), val);
+            }
         }
     }
     Value::Object(response)
@@ -955,6 +1131,21 @@ fn websocket_response(
             rpc::RpcErrorCode::Internal,
             error.message,
         ),
+        RpcReply::PreRendered(bytes) => {
+            match sonic_rs::from_slice::<Value>(&bytes) {
+                Ok(mut v) => {
+                    if let Value::Object(obj) = &mut v {
+                        obj.insert("type".to_owned(), Value::String("response".to_owned()));
+                        obj.insert("status".to_owned(), Value::String("success".to_owned()));
+                        if let Some(id) = envelope.id.clone() {
+                            obj.insert("id".to_owned(), id);
+                        }
+                    }
+                    v
+                }
+                Err(_) => Value::Null
+            }
+        }
     }
 }
 

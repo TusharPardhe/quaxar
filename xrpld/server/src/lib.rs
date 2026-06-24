@@ -325,7 +325,10 @@ where
                 request.metadata.api_version,
                 &self.source,
             )),
-            "fee" => RpcReply::result(rpc::do_fee(&self.source)),
+            "fee" => match rpc::do_fee_prerendered(&self.source) {
+                rpc::FeeResponse::Json(j) => RpcReply::result(j),
+                rpc::FeeResponse::PreRendered(p) => RpcReply::PreRendered(p),
+            },
             "ledger" => RpcReply::result(rpc::do_ledger(
                 &params,
                 request.metadata.role,
@@ -426,7 +429,10 @@ where
                     },
                     unlimited: request.metadata.unlimited,
                 };
-                RpcReply::result(rpc::do_server_info(&context))
+                match rpc::do_server_info_prerendered(&context) {
+                    rpc::ServerInfoResponse::Json(j) => RpcReply::result(j),
+                    rpc::ServerInfoResponse::PreRendered(p) => RpcReply::PreRendered(p),
+                }
             }
             "server_state" => {
                 let context = JsonContext {
@@ -654,14 +660,17 @@ where
                 },
                 &self.source,
             )),
-            "ledger_data" => RpcReply::result(rpc::do_ledger_data(
+            "ledger_data" => match rpc::do_ledger_data(
                 &rpc::LedgerDataRequest {
                     params: &params,
                     api_version: request.metadata.api_version,
                     role: request.metadata.role,
                 },
                 &self.source,
-            )),
+            ) {
+                rpc::LedgerDataResponse::Json(j) => RpcReply::Result(j),
+                rpc::LedgerDataResponse::PreRendered(p) => RpcReply::PreRendered(p),
+            },
             "feature" => RpcReply::result(rpc::state::feature::do_feature(
                 &rpc::state::feature::FeatureRequest {
                     params: &params,

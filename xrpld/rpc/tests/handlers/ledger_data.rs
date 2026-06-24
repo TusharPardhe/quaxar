@@ -8,7 +8,7 @@ use basics::base_uint::Uint256;
 use protocol::{JsonValue, LedgerEntryType};
 use rpc::RpcRole;
 use rpc::{
-    LedgerDataEntry, LedgerDataRequest, LedgerDataResolved, LedgerDataSource, do_ledger_data,
+    LedgerDataEntry, LedgerDataRequest, LedgerDataResolved, LedgerDataResponse, LedgerDataSource, do_ledger_data,
     ledger_data::choose_ledger_entry_type,
 };
 use std::collections::BTreeMap;
@@ -124,6 +124,7 @@ fn resolved_for_errors() -> LedgerDataResolved {
         )])),
         entries: vec![fake_entry(0x10, LedgerEntryType::AccountRoot)],
         marker: None,
+        pre_rendered: None,
     }
 }
 
@@ -158,6 +159,7 @@ fn ledger_data_filters_limits_and_emits_marker() {
                     fake_entry(0x30, LedgerEntryType::Offer),
                 ],
                 marker: None,
+                pre_rendered: None,
             },
         )]),
     };
@@ -171,14 +173,14 @@ fn ledger_data_filters_limits_and_emits_marker() {
         ("type".to_owned(), JsonValue::String("offer".to_owned())),
     ]));
 
-    let result = do_ledger_data(
+    let result = match do_ledger_data(
         &LedgerDataRequest {
             params: &params,
             api_version: 1,
             role: RpcRole::User,
         },
         &source,
-    );
+    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -237,6 +239,7 @@ fn ledger_data_binary_uses_hex_and_skips_ledger_on_marker() {
                 )])),
                 entries: vec![fake_entry(0x40, LedgerEntryType::AccountRoot)],
                 marker: None,
+                pre_rendered: None,
             },
         )]),
     };
@@ -253,14 +256,14 @@ fn ledger_data_binary_uses_hex_and_skips_ledger_on_marker() {
         ),
     ]));
 
-    let result = do_ledger_data(
+    let result = match do_ledger_data(
         &LedgerDataRequest {
             params: &params,
             api_version: 1,
             role: RpcRole::Admin,
         },
         &source,
-    );
+    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -287,14 +290,14 @@ fn ledger_data_reports_input_errors() {
         "type".to_owned(),
         JsonValue::String("misspelling".to_owned()),
     )]));
-    let result = do_ledger_data(
+    let result = match do_ledger_data(
         &LedgerDataRequest {
             params: &invalid_type,
             api_version: 1,
             role: RpcRole::User,
         },
         &source,
-    );
+    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -307,14 +310,14 @@ fn ledger_data_reports_input_errors() {
         "marker".to_owned(),
         JsonValue::String("NOT_A_MARKER".to_owned()),
     )]));
-    let result = do_ledger_data(
+    let result = match do_ledger_data(
         &LedgerDataRequest {
             params: &invalid_marker,
             api_version: 1,
             role: RpcRole::User,
         },
         &source,
-    );
+    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -329,14 +332,14 @@ fn ledger_data_reports_input_errors() {
         "limit".to_owned(),
         JsonValue::String("0".to_owned()),
     )]));
-    let result = do_ledger_data(
+    let result = match do_ledger_data(
         &LedgerDataRequest {
             params: &invalid_limit,
             api_version: 1,
             role: RpcRole::User,
         },
         &source,
-    );
+    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -397,6 +400,7 @@ fn ledger_data_response_structure_fields() {
                     fake_entry(0x20, LedgerEntryType::Offer),
                 ],
                 marker: None,
+                pre_rendered: None,
             },
         )]),
     };
@@ -406,14 +410,14 @@ fn ledger_data_response_structure_fields() {
         JsonValue::String("current".to_owned()),
     )]));
 
-    let result = do_ledger_data(
+    let result = match do_ledger_data(
         &LedgerDataRequest {
             params: &params,
             api_version: 1,
             role: RpcRole::User,
         },
         &source,
-    );
+    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -476,6 +480,7 @@ fn ledger_data_type_filter_account_root_only() {
                     fake_entry(0x40, LedgerEntryType::Check),
                 ],
                 marker: None,
+                pre_rendered: None,
             },
         )]),
     };
@@ -488,14 +493,14 @@ fn ledger_data_type_filter_account_root_only() {
         ),
     ]));
 
-    let result = do_ledger_data(
+    let result = match do_ledger_data(
         &LedgerDataRequest {
             params: &params,
             api_version: 1,
             role: RpcRole::User,
         },
         &source,
-    );
+    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -534,6 +539,7 @@ fn ledger_data_limit_zero_returns_all() {
                     fake_entry(0x30, LedgerEntryType::Check),
                 ],
                 marker: None,
+                pre_rendered: None,
             },
         )]),
     };
@@ -544,14 +550,14 @@ fn ledger_data_limit_zero_returns_all() {
         JsonValue::String("current".to_owned()),
     )]));
 
-    let result = do_ledger_data(
+    let result = match do_ledger_data(
         &LedgerDataRequest {
             params: &params,
             api_version: 1,
             role: RpcRole::Admin,
         },
         &source,
-    );
+    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };

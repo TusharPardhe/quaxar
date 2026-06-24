@@ -175,8 +175,8 @@ impl WSSession {
             loop {
                 match rx.recv().await {
                     Ok(SubscriptionEvent { payload, .. }) => {
-                        let text = from_protocol_json(&payload).to_string();
-                        if sender.send(Message::Text(text.into())).is_err() {
+                        let text: axum::extract::ws::Utf8Bytes = payload.try_into().unwrap();
+                        if sender.send(Message::Text(text)).is_err() {
                             break;
                         }
                     }

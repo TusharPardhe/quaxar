@@ -63,6 +63,9 @@ impl RpcDispatcher for RecordingDispatcher {
 struct FixedStatusSource(Result<(), String>);
 
 impl ServerStatusSource for FixedStatusSource {
+    fn validated_ledger_hash(&self) -> Option<String> {
+        None
+    }
     fn server_okay(&self) -> Result<(), String> {
         self.0.clone()
     }

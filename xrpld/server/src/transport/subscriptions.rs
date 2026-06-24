@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StreamKind {
     Ledger,
+    LedgerDelta,
     Transactions,
     BookChanges,
     Server,
@@ -19,6 +20,7 @@ impl StreamKind {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "ledger" => Some(Self::Ledger),
+            "ledger_delta" => Some(Self::LedgerDelta),
             "transactions" | "rt_transactions" | "transactions_proposed" => {
                 Some(Self::Transactions)
             }
@@ -35,6 +37,7 @@ impl StreamKind {
     pub fn as_name(self) -> &'static str {
         match self {
             Self::Ledger => "ledger",
+            Self::LedgerDelta => "ledger_delta",
             Self::Transactions => "transactions",
             Self::BookChanges => "book_changes",
             Self::Server => "server",
@@ -49,12 +52,13 @@ impl StreamKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubscriptionEvent {
     pub stream: StreamKind,
-    pub payload: JsonValue,
+    pub payload: bytes::Bytes,
 }
 
 #[derive(Debug, Clone)]
 pub struct SubscriptionManager {
     ledger: Arc<broadcast::Sender<SubscriptionEvent>>,
+    ledger_delta: Arc<broadcast::Sender<SubscriptionEvent>>,
     transactions: Arc<broadcast::Sender<SubscriptionEvent>>,
     book_changes: Arc<broadcast::Sender<SubscriptionEvent>>,
     server: Arc<broadcast::Sender<SubscriptionEvent>>,
@@ -78,6 +82,7 @@ impl SubscriptionManager {
 
         Self {
             ledger: channel(capacity),
+            ledger_delta: channel(capacity),
             transactions: channel(capacity),
             book_changes: channel(capacity),
             server: channel(capacity),
@@ -92,6 +97,7 @@ impl SubscriptionManager {
         tracing::debug!(target: "server", stream = stream.as_name(), "Client subscribed");
         match stream {
             StreamKind::Ledger => self.ledger.subscribe(),
+            StreamKind::LedgerDelta => self.ledger_delta.subscribe(),
             StreamKind::Transactions => self.transactions.subscribe(),
             StreamKind::BookChanges => self.book_changes.subscribe(),
             StreamKind::Server => self.server.subscribe(),
@@ -106,6 +112,7 @@ impl SubscriptionManager {
         let stream = event.stream;
         let subscriber_count = match stream {
             StreamKind::Ledger => self.ledger.send(event),
+            StreamKind::LedgerDelta => self.ledger_delta.send(event),
             StreamKind::Transactions => self.transactions.send(event),
             StreamKind::BookChanges => self.book_changes.send(event),
             StreamKind::Server => self.server.send(event),
@@ -120,7 +127,9 @@ impl SubscriptionManager {
     }
 
     pub fn publish_json(&self, stream: StreamKind, payload: JsonValue) -> usize {
-        self.publish(SubscriptionEvent { stream, payload })
+        let json = crate::json::from_protocol_json(&payload);
+        let text = sonic_rs::to_string(&json).unwrap_or_default();
+        self.publish(SubscriptionEvent { stream, payload: bytes::Bytes::from(text) })
     }
 
     pub fn unsubscribe(&self, stream: StreamKind) {

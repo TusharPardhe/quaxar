@@ -2258,7 +2258,7 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersRuntime
     }
 }
 
-impl<V: AppServerInfoView> crate::handlers::ledger_data::LedgerDataSource
+impl<V: AppServerInfoView + Sync> crate::handlers::ledger_data::LedgerDataSource
     for ApplicationServerInfo<V>
 {
     fn resolve_ledger_data(
@@ -2290,30 +2290,79 @@ impl<V: AppServerInfoView> crate::handlers::ledger_data::LedgerDataSource
 
         let cache = crate::state::ledger_state_index::get_global_state_index_cache();
         let index_arc = cache.get_or_build(ledger_seq, || {
-            let mut build_entries = Vec::new();
-            let mut build_key = Uint256::default();
-            while let Some(next_key) = succ_lookup_ledger_key(&self.view, ledger, build_key, None) {
-                if let Some(sle) = read_lookup_ledger_entry(&self.view, ledger, unchecked_keylet(next_key)) {
-                    let mut serializer = Serializer::new(256);
-                    sle.add(&mut serializer);
-                    build_entries.push(crate::state::ledger_state_index::StateIndexEntry {
-                        key: next_key,
-                        raw_data: Arc::from(serializer.data().to_vec()),
-                        entry_type: sle.get_type(),
-                        json_cache: std::sync::OnceLock::new(),
-                        binary_hex_cache: std::sync::OnceLock::new(),
-                    });
-                }
-                build_key = next_key;
-            }
-            Arc::new(crate::state::ledger_state_index::LedgerStateIndex::build_from_iter(
+            use rayon::prelude::*;
+            
+            let keys = std::iter::successors(
+                succ_lookup_ledger_key(&self.view, ledger, Uint256::default(), None),
+                |&k| succ_lookup_ledger_key(&self.view, ledger, k, None)
+            );
+
+            let build_entries: Vec<_> = keys
+                .par_bridge()
+                .filter_map(|next_key| {
+                    if let Some(sle) = read_lookup_ledger_entry(&self.view, ledger, unchecked_keylet(next_key)) {
+                        let mut serializer = Serializer::new(256);
+                        sle.add(&mut serializer);
+                        Some(crate::state::ledger_state_index::StateIndexEntry {
+                            key: next_key,
+                            raw_data: Arc::from(serializer.data().to_vec()),
+                            entry_type: sle.get_type(),
+                            json_cache: std::sync::OnceLock::new(),
+                            binary_hex_cache: std::sync::OnceLock::new(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let index = Arc::new(crate::state::ledger_state_index::LedgerStateIndex::build_from_iter(
                 ledger_seq,
                 ledger_hash,
-                build_entries.into_iter(),
-            ))
+                build_entries.iter().cloned(),
+            ));
+            
+            let page_cache = crate::state::ledger_data_page_cache::LedgerDataPageCache::build(
+                ledger_seq,
+                ledger_hash,
+                build_entries.into_iter().map(|e| {
+                    let mut sit = protocol::SerialIter::new(e.raw_data.as_ref());
+                    let sle = protocol::STLedgerEntry::from_serial_iter(&mut sit, e.key);
+                    (e.key, e.raw_data.to_vec(), sle.json(protocol::JsonOptions::NONE))
+                }),
+                crate::state::ledger_data_page_cache::DEFAULT_PAGE_SIZE,
+            );
+            crate::state::ledger_data_page_cache::get_global_page_cache().insert(Arc::new(page_cache));
+            index
         });
 
-        let query = index_arc.query(marker, if remaining < 0 { usize::MAX } else { remaining as usize }, type_filter);
+        // Try to hit the page cache first
+        let limit = if remaining < 0 { usize::MAX } else { remaining as usize };
+        if type_filter == LedgerEntryType::Any {
+            if let Some(cache) = crate::state::ledger_data_page_cache::get_global_page_cache().get(ledger_seq) {
+                if let Some(page) = cache.find_page_for_marker(marker) {
+                    // Only use cache if the requested marker is EXACTLY the page start
+                    // AND the user's limit is large enough to consume the whole page
+                    // AND this is not the first page (since first page needs ledger_json which we aren't caching inside the page bytes yet, wait, we DO need to handle it)
+                    let matches_start = marker.is_none() || marker.unwrap() == page.start_key;
+                    if matches_start && limit >= page.entry_count && marker.is_some() {
+                        return Ok(crate::handlers::ledger_data::LedgerDataResolved {
+                            base_json: JsonValue::Object(BTreeMap::new()),
+                            ledger_json: JsonValue::Null,
+                            entries: vec![],
+                            marker: page.next_marker,
+                            pre_rendered: Some(if binary {
+                                page.binary_state_bytes.clone()
+                            } else {
+                                page.json_state_bytes.clone()
+                            }),
+                        });
+                    }
+                }
+            }
+        }
+
+        let query = index_arc.query(marker, limit, type_filter);
         let (page_entries, next_marker) = query.collect_entries();
         let page_marker = next_marker;
 
@@ -2346,6 +2395,7 @@ impl<V: AppServerInfoView> crate::handlers::ledger_data::LedgerDataSource
             ledger_json,
             entries,
             marker: page_marker,
+            pre_rendered: None,
         })
     }
 }

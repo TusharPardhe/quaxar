@@ -119,7 +119,8 @@ impl LedgerStateIndex {
         I: Iterator<Item = StateIndexEntry>,
     {
         let mut entries: Vec<StateIndexEntry> = iter.collect();
-        entries.sort_unstable_by_key(|e| e.key);
+        use rayon::prelude::*;
+        entries.par_sort_unstable_by_key(|e| e.key);
         let mut type_indices = std::collections::HashMap::new();
         for (i, e) in entries.iter().enumerate() {
             type_indices

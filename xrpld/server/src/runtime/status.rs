@@ -12,6 +12,7 @@ const STATUS_PAGE_SYSTEM_NAME: &str = "quaxar";
 
 pub trait ServerStatusSource: Send + Sync {
     fn server_okay(&self) -> Result<(), String>;
+    fn validated_ledger_hash(&self) -> Option<String>;
 }
 
 #[derive(Clone)]
@@ -45,6 +46,12 @@ impl ServerStatusSource for OwnedServerStatusSource {
             self.load_fee_track.is_loaded_local(),
         )
         .map_err(str::to_owned)
+    }
+
+    fn validated_ledger_hash(&self) -> Option<String> {
+        self.ledger_master_state
+            .validated_ledger()
+            .map(|l| l.header().hash.as_uint256().to_string())
     }
 }
 
@@ -96,6 +103,9 @@ mod tests {
     impl ServerStatusSource for FixedStatusSource {
         fn server_okay(&self) -> Result<(), String> {
             self.0.clone()
+        }
+        fn validated_ledger_hash(&self) -> Option<String> {
+            None
         }
     }
 

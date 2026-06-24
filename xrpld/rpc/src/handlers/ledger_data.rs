@@ -26,6 +26,12 @@ pub struct LedgerDataResolved {
     pub ledger_json: JsonValue,
     pub entries: Vec<LedgerDataEntry>,
     pub marker: Option<Uint256>,
+    pub pre_rendered: Option<std::sync::Arc<[u8]>>,
+}
+
+pub enum LedgerDataResponse {
+    Json(JsonValue),
+    PreRendered(std::sync::Arc<[u8]>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,7 +193,7 @@ fn merge_object_fields(target: &mut BTreeMap<String, JsonValue>, source: JsonVal
 pub fn do_ledger_data<S: LedgerDataSource>(
     request: &LedgerDataRequest<'_>,
     source: &S,
-) -> JsonValue {
+) -> LedgerDataResponse {
     tracing::trace!(target: "rpc", method = "ledger_data", "ledger_data query");
     let context = LedgerLookupContext {
         params: request.params,
@@ -200,7 +206,7 @@ pub fn do_ledger_data<S: LedgerDataSource>(
         Err(status) => {
             let mut error = JsonValue::Object(BTreeMap::new());
             status.inject(&mut error);
-            return error;
+            return LedgerDataResponse::Json(error);
         }
     };
 
@@ -209,7 +215,7 @@ pub fn do_ledger_data<S: LedgerDataSource>(
         Err(status) => {
             let mut error = JsonValue::Object(BTreeMap::new());
             status.inject(&mut error);
-            return error;
+            return LedgerDataResponse::Json(error);
         }
     };
 
@@ -219,7 +225,7 @@ pub fn do_ledger_data<S: LedgerDataSource>(
         Err(status) => {
             let mut error = JsonValue::Object(BTreeMap::new());
             status.inject(&mut error);
-            return error;
+            return LedgerDataResponse::Json(error);
         }
     };
 
@@ -228,7 +234,7 @@ pub fn do_ledger_data<S: LedgerDataSource>(
         Err(status) => {
             let mut error = JsonValue::Object(BTreeMap::new());
             status.inject(&mut error);
-            return error;
+            return LedgerDataResponse::Json(error);
         }
     };
 
@@ -242,9 +248,13 @@ pub fn do_ledger_data<S: LedgerDataSource>(
         Err(status) => {
             let mut error = JsonValue::Object(BTreeMap::new());
             status.inject(&mut error);
-            return error;
+            return LedgerDataResponse::Json(error);
         }
     };
+
+    if let Some(pre_rendered) = resolved.pre_rendered {
+        return LedgerDataResponse::PreRendered(pre_rendered);
+    }
 
     let object = ensure_object(&mut result);
     merge_object_fields(object, resolved.base_json);
@@ -272,5 +282,5 @@ pub fn do_ledger_data<S: LedgerDataSource>(
         object.insert("marker".to_owned(), JsonValue::String(marker.to_string()));
     }
     object.insert("state".to_owned(), JsonValue::Array(nodes));
-    result
+    LedgerDataResponse::Json(result)
 }

@@ -35,6 +35,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tokio-rustls = "0.26"
 tokio-util = { version = "0.7.18", features = ["full"] }
 tower = { version = "0.5", features = ["full"] }
+dashmap = "6.2.1"
 
 [dev-dependencies]
 ledger = { path = "../ledger" }

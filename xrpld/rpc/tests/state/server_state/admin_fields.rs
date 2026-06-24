@@ -38,7 +38,7 @@ fn server_state_prefers_validated_ledger_and_omits_human_age_and_offset() {
 
     assert_eq!(
         state.get("server_state"),
-        Some(&JsonValue::String("full".to_owned()))
+        Some(&JsonValue::String("proposing".to_owned()))
     );
     assert_eq!(
         state.get("network_ledger"),

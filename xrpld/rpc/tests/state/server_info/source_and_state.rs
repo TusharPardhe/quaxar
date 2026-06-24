@@ -164,7 +164,7 @@ fn server_info_reads_application_owner_state_boundary() {
 
     assert_eq!(
         info.get("server_state"),
-        Some(&JsonValue::String("full".to_owned()))
+        Some(&JsonValue::String("proposing".to_owned()))
     );
     assert_eq!(
         info.get("network_ledger"),

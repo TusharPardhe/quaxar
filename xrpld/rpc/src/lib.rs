@@ -61,3 +61,11 @@ pub use app::paths::{
     PathRequestManager, make_path_find_status, parse_path_finder_request,
 };
 pub use protocol::TxSearched;
+
+pub fn update_validated_snapshot_cache(app: &app::ApplicationRoot) {
+    let source = crate::state::ApplicationServerInfo::new(
+        crate::state::OwnedApplicationServerInfo::from_application_root(app),
+    );
+    crate::state::server_info::update_validated_snapshot_cache_server_info(&source);
+    crate::handlers::fee::update_validated_snapshot_cache_fee(&source);
+}

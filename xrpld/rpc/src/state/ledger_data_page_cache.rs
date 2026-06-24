@@ -65,12 +65,6 @@ impl LedgerDataPageCache {
                 from_protocol_json(&JsonValue::Object(node))
             }).collect();
             
-            // Serialize to bytes (we use serde_json::to_vec, which could be upgraded to sonic_rs)
-            let json_bytes = serde_json::to_vec(&serde_json::Value::Array(json_state))
-                .unwrap_or_default();
-            let binary_bytes = serde_json::to_vec(&serde_json::Value::Array(binary_state))
-                .unwrap_or_default();
-            
             // Compute marker for this page
             let next_marker = if end < all_entries.len() {
                 let mut marker = all_entries[end].0;
@@ -79,6 +73,29 @@ impl LedgerDataPageCache {
             } else {
                 None
             };
+            
+            // Build json result envelope
+            let mut json_obj = serde_json::Map::new();
+            json_obj.insert("ledger_hash".to_owned(), serde_json::Value::String(ledger_hash.to_string()));
+            json_obj.insert("ledger_index".to_owned(), serde_json::Value::Number(serde_json::Number::from(ledger_seq)));
+            if let Some(m) = next_marker {
+                json_obj.insert("marker".to_owned(), serde_json::Value::String(m.to_string()));
+            }
+            json_obj.insert("state".to_owned(), serde_json::Value::Array(json_state));
+            
+            // Build binary result envelope
+            let mut binary_obj = serde_json::Map::new();
+            binary_obj.insert("ledger_hash".to_owned(), serde_json::Value::String(ledger_hash.to_string()));
+            binary_obj.insert("ledger_index".to_owned(), serde_json::Value::Number(serde_json::Number::from(ledger_seq)));
+            if let Some(m) = next_marker {
+                binary_obj.insert("marker".to_owned(), serde_json::Value::String(m.to_string()));
+            }
+            binary_obj.insert("state".to_owned(), serde_json::Value::Array(binary_state));
+
+            let json_bytes = serde_json::to_vec(&serde_json::Value::Object(json_obj))
+                .unwrap_or_default();
+            let binary_bytes = serde_json::to_vec(&serde_json::Value::Object(binary_obj))
+                .unwrap_or_default();
             
             pages.push(LedgerDataPage {
                 start_key: page_entries[0].0,
@@ -129,6 +146,12 @@ impl LedgerDataPageCacheStore {
 
 impl Default for LedgerDataPageCacheStore {
     fn default() -> Self { Self::new() }
+}
+
+static GLOBAL_PAGE_CACHE: std::sync::OnceLock<LedgerDataPageCacheStore> = std::sync::OnceLock::new();
+
+pub fn get_global_page_cache() -> &'static LedgerDataPageCacheStore {
+    GLOBAL_PAGE_CACHE.get_or_init(LedgerDataPageCacheStore::new)
 }
 
 /// Convert protocol::JsonValue to serde_json::Value

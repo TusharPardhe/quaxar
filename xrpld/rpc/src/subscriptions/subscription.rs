@@ -16,6 +16,7 @@ use crate::status::{RpcErrorCode, Status};
 pub enum SubscriptionStream {
     Server,
     Ledger,
+    LedgerDelta,
     BookChanges,
     Manifests,
     Transactions,
@@ -26,9 +27,10 @@ pub enum SubscriptionStream {
 }
 
 impl SubscriptionStream {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Server,
         Self::Ledger,
+        Self::LedgerDelta,
         Self::BookChanges,
         Self::Manifests,
         Self::Transactions,
@@ -42,6 +44,7 @@ impl SubscriptionStream {
         match self {
             Self::Server => "server",
             Self::Ledger => "ledger",
+            Self::LedgerDelta => "ledger_delta",
             Self::BookChanges => "book_changes",
             Self::Manifests => "manifests",
             Self::Transactions => "transactions",
@@ -79,6 +82,7 @@ pub fn normalize_stream_name(name: &str) -> Option<SubscriptionStream> {
     match name {
         "server" => Some(SubscriptionStream::Server),
         "ledger" => Some(SubscriptionStream::Ledger),
+        "ledger_delta" => Some(SubscriptionStream::LedgerDelta),
         "book_changes" => Some(SubscriptionStream::BookChanges),
         "manifests" => Some(SubscriptionStream::Manifests),
         "transactions" => Some(SubscriptionStream::Transactions),

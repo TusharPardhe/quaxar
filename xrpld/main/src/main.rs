@@ -1426,6 +1426,8 @@ fn advance_published_ledgers_after_validation(
         promote_current_ledger(app, peers, vl);
     }
 
+    rpc::update_validated_snapshot_cache(app);
+
     published.max(1)
 }
 
@@ -5853,6 +5855,10 @@ fn build_composed_runtime_from_path(
     if let Ok(server_build) = ServerRuntime::from_application_root_with_report(&root) {
         if let Some(overlay_runtime) = root.overlay_runtime() {
             let subscriptions = server_build.runtime.subscriptions();
+            let subs_clone = subscriptions.clone();
+            root.set_ledger_delta_publisher(move |payload| {
+                subs_clone.publish_json(server::StreamKind::LedgerDelta, payload);
+            });
             overlay_runtime
                 .overlay()
                 .set_peer_status_publisher(move |payload| {
