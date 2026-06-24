@@ -2274,52 +2274,71 @@ impl<V: AppServerInfoView> crate::handlers::ledger_data::LedgerDataSource
             options |= ledger::LedgerFillOptions::BINARY;
         }
         let ledger_json = self.render_selected_ledger(*ledger, options)?;
-        let mut page_marker = None;
         let mut entries = Vec::new();
-        let mut key = marker.unwrap_or_default();
-        let mut remaining = limit;
+        let remaining = limit;
 
-        while let Some(next_key) = succ_lookup_ledger_key(&self.view, ledger, key, None) {
-            let Some(sle) =
-                read_lookup_ledger_entry(&self.view, ledger, unchecked_keylet(next_key))
-            else {
+        let resolved_ledger = match resolve_lookup_ledger(&self.view, ledger) {
+            Some(l) => l,
+            None => {
                 return Err(crate::status::RpcStatus::new(
-                    crate::status::RpcErrorCode::DbDeserialization,
-                ));
-            };
-
-            if remaining <= 0 {
-                // Marker is the first unread key minus 1, to match C++ rippled exactly.
-                // Next page will resume at `next_key` since succ(next_key - 1) == next_key.
-                let mut marker_key = next_key;
-                marker_key.decrement();
-                page_marker = Some(marker_key);
-                break;
+                    crate::status::RpcErrorCode::LedgerNotFound,
+                ))
             }
-            remaining -= 1;
+        };
+        let ledger_seq = resolved_ledger.header().seq;
+        let ledger_hash = *resolved_ledger.header().hash.as_uint256();
 
-            if type_filter == LedgerEntryType::Any || type_filter == sle.get_type() {
-                let binary_data = if binary {
+        let cache = crate::state::ledger_state_index::get_global_state_index_cache();
+        let index_arc = cache.get_or_build(ledger_seq, || {
+            let mut build_entries = Vec::new();
+            let mut build_key = Uint256::default();
+            while let Some(next_key) = succ_lookup_ledger_key(&self.view, ledger, build_key, None) {
+                if let Some(sle) = read_lookup_ledger_entry(&self.view, ledger, unchecked_keylet(next_key)) {
                     let mut serializer = Serializer::new(256);
                     sle.add(&mut serializer);
-                    serializer.data().to_vec()
-                } else {
-                    Vec::new()
-                };
-                let json = if binary {
-                    JsonValue::Null
-                } else {
-                    sle.json(JsonOptions::NONE)
-                };
-                entries.push(crate::handlers::ledger_data::LedgerDataEntry {
-                    key: *sle.key(),
-                    entry_type: sle.get_type(),
-                    json,
-                    binary: binary_data,
-                });
+                    build_entries.push(crate::state::ledger_state_index::StateIndexEntry {
+                        key: next_key,
+                        raw_data: Arc::from(serializer.data().to_vec()),
+                        entry_type: sle.get_type(),
+                        json_cache: std::sync::OnceLock::new(),
+                        binary_hex_cache: std::sync::OnceLock::new(),
+                    });
+                }
+                build_key = next_key;
             }
+            Arc::new(crate::state::ledger_state_index::LedgerStateIndex::build_from_iter(
+                ledger_seq,
+                ledger_hash,
+                build_entries.into_iter(),
+            ))
+        });
 
-            key = next_key;
+        let query = index_arc.query(marker, if remaining < 0 { usize::MAX } else { remaining as usize }, type_filter);
+        let (page_entries, next_marker) = query.collect_entries();
+        let page_marker = next_marker;
+
+        for entry in page_entries {
+            let mut sit = protocol::SerialIter::new(entry.raw_data.as_ref());
+            let sle = STLedgerEntry::from_serial_iter(&mut sit, entry.key);
+
+            let binary_data = if binary {
+                entry.raw_data.clone()
+            } else {
+                std::sync::Arc::new([])
+            };
+            
+            let json = if binary {
+                JsonValue::Null
+            } else {
+                sle.json(JsonOptions::NONE)
+            };
+            
+            entries.push(crate::handlers::ledger_data::LedgerDataEntry {
+                key: entry.key,
+                entry_type: entry.entry_type,
+                json,
+                binary: binary_data,
+            });
         }
 
         Ok(crate::handlers::ledger_data::LedgerDataResolved {

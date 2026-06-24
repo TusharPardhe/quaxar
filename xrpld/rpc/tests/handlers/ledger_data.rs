@@ -108,7 +108,7 @@ fn fake_entry(key: u8, entry_type: LedgerEntryType) -> LedgerDataEntry {
             "LedgerEntryType".to_owned(),
             JsonValue::String(entry_type.as_str().to_owned()),
         )])),
-        binary: vec![key, key + 1],
+        binary: vec![key, key + 1].into(),
     }
 }
 

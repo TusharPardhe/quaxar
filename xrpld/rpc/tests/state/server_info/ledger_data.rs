@@ -1,7 +1,7 @@
 use app::{ApplicationRoot, ApplicationRootOptions};
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{Ledger, StateBatchOp};
-use protocol::{account_keylet, AccountID, LedgerEntryType, STLedgerEntry, STObject, Serializer, StBase, get_field_by_symbol};
+use protocol::{account_keylet, AccountID, LedgerEntryType, STLedgerEntry, Serializer, StBase, get_field_by_symbol};
 use rpc::{ledger_lookup, ApplicationServerInfo, LedgerDataSource};
 use std::sync::Arc;
 

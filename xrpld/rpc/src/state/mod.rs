@@ -21,6 +21,8 @@ pub mod server_definitions;
 pub mod server_info;
 pub mod server_state;
 pub mod tuning;
+pub mod ledger_state_index;
+pub mod ledger_data_page_cache;
 pub mod tx_reduce_relay;
 pub mod tx_support;
 

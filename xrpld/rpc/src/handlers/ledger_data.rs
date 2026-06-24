@@ -17,7 +17,7 @@ pub struct LedgerDataEntry {
     pub key: Uint256,
     pub entry_type: LedgerEntryType,
     pub json: JsonValue,
-    pub binary: Vec<u8>,
+    pub binary: std::sync::Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

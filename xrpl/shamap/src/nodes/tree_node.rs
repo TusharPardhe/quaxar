@@ -479,22 +479,48 @@ impl SHAMapTreeNode {
     }
 
     pub fn get_type(&self) -> SHAMapNodeType {
+        // Phase 3 optimization: the Inner arm never needs the lock — inner_arrays
+        // is Some for every inner node and None for every leaf, set once at
+        // construction and never mutated thereafter.  Only leaf nodes must enter
+        // the lock to read the concrete SHAMapNodeType variant.
+        if self.inner_arrays.is_some() {
+            return SHAMapNodeType::Inner;
+        }
         let kind = self.kind.read();
         match &*kind {
-            SHAMapTreeNodeKind::Inner(_) => SHAMapNodeType::Inner,
             SHAMapTreeNodeKind::Leaf(leaf) => leaf.node_type,
+            // inner_arrays.is_some() already handled above; this branch is
+            // unreachable in practice but keeps the match exhaustive.
+            SHAMapTreeNodeKind::Inner(_) => SHAMapNodeType::Inner,
         }
     }
 
+    /// Returns `true` if this node is a leaf node.
+    ///
+    /// # Lock-free
+    /// `inner_arrays` is `None` for every leaf and `Some` for every inner node.
+    /// It is set once at construction (`new_leaf` / `new_inner_with_capacity`)
+    /// and never changed afterward, so no lock is required.
+    #[inline]
     pub fn is_leaf(&self) -> bool {
-        !self.is_inner()
+        self.inner_arrays.is_none()
     }
 
+    /// Returns `true` if this node is an inner node.
+    ///
+    /// # Lock-free
+    /// `inner_arrays` is `Some` for every inner node and `None` for every leaf.
+    /// It is set once at construction (`new_inner_with_capacity`) and never
+    /// changed afterward, so no lock is required.
+    ///
+    /// # Note: `peek_item_unchecked` not added
+    /// A zero-copy `peek_item_unchecked()` that bypasses the `kind` RwLock
+    /// entirely would require a raw `UnsafeCell<SHAMapLeafNodeData>` field,
+    /// because `parking_lot::RwLock` does not expose a `data_ptr()` accessor.
+    /// Restructuring the layout to enable that is left for a future phase.
+    #[inline]
     pub fn is_inner(&self) -> bool {
-        // Lock-free: check if this is an inner node by examining the kind.
-        // Leaf nodes always have is_branch == 0, but so do empty inner nodes.
-        // Use the kind RwLock only for the type check.
-        matches!(&*self.kind.read(), SHAMapTreeNodeKind::Inner(_))
+        self.inner_arrays.is_some()
     }
 
     pub fn clone_with_cowid(&self, cowid: u32) -> SharedIntrusive<Self> {
@@ -960,8 +986,9 @@ impl IntrusiveObject for SHAMapTreeNode {
     }
 
     fn partial_destructor(&self) {
-        let kind = self.kind.read();
-        if matches!(&*kind, SHAMapTreeNodeKind::Inner(_)) {
+        // Phase 3 optimization: use the lock-free inner_arrays check instead of
+        // acquiring the kind RwLock just to distinguish node type.
+        if self.inner_arrays.is_some() {
             let is_branch = self.is_branch.load(Ordering::Relaxed);
             let arrays = self.arrays();
             arrays
@@ -1533,7 +1560,6 @@ mod tests {
         assert_eq!(clone.get_child_hash(3), sample_hash(6));
         assert!(clone.get_child(3).is_some());
         assert!(clone.is_full_below(22));
-
         let kind = clone.kind.write();
         assert!(matches!(&*kind, SHAMapTreeNodeKind::Inner(_)));
     }

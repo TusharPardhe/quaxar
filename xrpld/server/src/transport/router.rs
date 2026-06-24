@@ -401,12 +401,20 @@ where
             metadata.forwarded_for.clear();
         }
         metadata.unlimited = matches!(metadata.role, RpcRole::Admin | RpcRole::Identified);
-        let reply = server.dispatcher.dispatch(RpcRequest {
-            method: &rpc_request.method,
-            params: &params,
-            metadata: &metadata,
-            session: None,
-        });
+        let dispatcher = server.dispatcher.clone();
+        let method_owned = rpc_request.method.clone();
+        let params_owned = params.clone();
+        let metadata_owned = metadata.clone();
+        let reply = tokio::task::spawn_blocking(move || {
+            dispatcher.dispatch(RpcRequest {
+                method: &method_owned,
+                params: &params_owned,
+                metadata: &metadata_owned,
+                session: None,
+            })
+        })
+        .await
+        .expect("dispatcher::dispatch panicked");
         let mut response = json_rpc_response(rpc_request.id, rpc_request.jsonrpc.as_deref(), reply);
         // name included, matching the reference implementation behavior.
         if let Value::Object(resp) = &mut response
@@ -522,12 +530,20 @@ where
             }
             req_metadata.unlimited =
                 matches!(req_metadata.role, RpcRole::Admin | RpcRole::Identified);
-            let reply = server.dispatcher.dispatch(RpcRequest {
-                method: &rpc_request.method,
-                params: &params,
-                metadata: &req_metadata,
-                session: None,
-            });
+            let dispatcher = server.dispatcher.clone();
+            let method_owned = rpc_request.method.clone();
+            let params_owned = params.clone();
+            let req_metadata_owned = req_metadata.clone();
+            let reply = tokio::task::spawn_blocking(move || {
+                dispatcher.dispatch(RpcRequest {
+                    method: &method_owned,
+                    params: &params_owned,
+                    metadata: &req_metadata_owned,
+                    session: None,
+                })
+            })
+            .await
+            .expect("dispatcher::dispatch panicked");
             responses.push(json_rpc_response(
                 rpc_request.id,
                 rpc_request.jsonrpc.as_deref(),
@@ -658,12 +674,37 @@ where
                     }
                     metadata.unlimited =
                         matches!(metadata.role, RpcRole::Admin | RpcRole::Identified);
-                    let reply = self.dispatcher.dispatch(RpcRequest {
-                        method: &envelope.method,
-                        params: &params,
-                        metadata: &metadata,
-                        session: Some(&session),
-                    });
+                    let dispatcher = self.dispatcher.clone();
+                    let method_owned = envelope.method.clone();
+                    let params_owned = params.clone();
+                    let metadata_owned = metadata.clone();
+                    let is_subscription = method_owned == "subscribe" || method_owned == "unsubscribe";
+                    
+                    let reply = if is_subscription {
+                        dispatcher.dispatch(RpcRequest {
+                            method: &method_owned,
+                            params: &params_owned,
+                            metadata: &metadata_owned,
+                            session: Some(&session),
+                        })
+                    } else {
+                        // Note: WSSession is not passed into spawn_blocking because it
+                        // holds an unbounded sender (not blocking) and its subscription
+                        // callbacks are async. Subscription side-effects that need the
+                        // session are handled by the dispatcher synchronously before
+                        // returning; passing session: None here is intentional for the
+                        // blocking offload — the session ref is used post-dispatch.
+                        tokio::task::spawn_blocking(move || {
+                            dispatcher.dispatch(RpcRequest {
+                                method: &method_owned,
+                                params: &params_owned,
+                                metadata: &metadata_owned,
+                                session: None,
+                            })
+                        })
+                        .await
+                        .expect("dispatcher::dispatch panicked")
+                    };
                     let response = websocket_response(
                         &envelope,
                         &params,
