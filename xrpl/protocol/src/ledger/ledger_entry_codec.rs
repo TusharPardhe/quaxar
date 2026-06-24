@@ -285,6 +285,9 @@ pub fn encode_account_root_entry(
     append_u16_field(&mut bytes, SF_LEDGER_ENTRY_TYPE, LT_ACCOUNT_ROOT);
     append_u32_field(&mut bytes, SF_FLAGS, 0);
     append_u32_field(&mut bytes, SF_SEQUENCE, sequence);
+    append_u32_field(&mut bytes, SF_PREVIOUS_TXN_LGR_SEQ, 0);
+    append_u32_field(&mut bytes, SF_OWNER_COUNT, 0);
+    append_u256_field(&mut bytes, SF_PREVIOUS_TXN_ID, Uint256::default());
     append_native_amount_field(&mut bytes, SF_BALANCE, balance_drops);
     append_account_field(&mut bytes, SF_ACCOUNT, account_id);
     bytes
@@ -424,19 +427,12 @@ pub fn make_constructor_fee_settings_entry(
     base_drops: u64,
     reserve_drops: u64,
     increment_drops: u64,
-    amendments: &[Uint256],
+    _amendments: &[Uint256],
 ) -> ConstructorFeeSettingsEntry {
-    if amendments
-        .iter()
-        .any(|amendment| amendment == &feature_xrp_fees())
-    {
-        return ConstructorFeeSettingsEntry::XrpDrops {
-            base_fee_drops: base_drops,
-            reserve_base_drops: reserve_drops,
-            reserve_increment_drops: increment_drops,
-        };
-    }
-
+    // Rippled quirk: Rippled ALWAYS builds the genesis FeeSettings entry in the
+    // Legacy format, even if the XRPFees amendment is enabled at genesis!
+    // It only upgrades to XrpDrops format later when the amendment is processed.
+    // To ensure byte-for-byte genesis ledger parity, we must do the same.
     ConstructorFeeSettingsEntry::Legacy {
         base_fee: base_drops,
         reference_fee_units: REFERENCE_FEE_UNITS_DEPRECATED,
@@ -499,20 +495,19 @@ pub fn encode_fee_settings_entry(
     xrp_fees_enabled: bool,
 ) -> Vec<u8> {
     if xrp_fees_enabled {
-        return encode_constructor_fee_settings_entry(make_constructor_fee_settings_entry(
-            base_drops,
-            reserve_drops,
-            increment_drops,
-            &[feature_xrp_fees()],
-        ));
+        return encode_constructor_fee_settings_entry(ConstructorFeeSettingsEntry::XrpDrops {
+            base_fee_drops: base_drops,
+            reserve_base_drops: reserve_drops,
+            reserve_increment_drops: increment_drops,
+        });
     }
 
-    encode_constructor_fee_settings_entry(make_constructor_fee_settings_entry(
-        base_drops,
-        reserve_drops,
-        increment_drops,
-        &[],
-    ))
+    encode_constructor_fee_settings_entry(ConstructorFeeSettingsEntry::Legacy {
+        base_fee: base_drops,
+        reference_fee_units: REFERENCE_FEE_UNITS_DEPRECATED,
+        reserve_base: u32::try_from(reserve_drops).ok(),
+        reserve_increment: u32::try_from(increment_drops).ok(),
+    })
 }
 
 pub fn decode_amendments_entry(

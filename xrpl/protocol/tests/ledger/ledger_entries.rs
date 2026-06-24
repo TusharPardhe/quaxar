@@ -161,10 +161,11 @@ fn typed_constructor_item_builds_current_genesis_fee_singleton() {
     assert_eq!(key, fees_key());
     assert_eq!(
         decode_constructor_fee_settings_entry(&payload),
-        Ok(ConstructorFeeSettingsEntry::XrpDrops {
-            base_fee_drops: 10,
-            reserve_base_drops: 20,
-            reserve_increment_drops: 30,
+        Ok(ConstructorFeeSettingsEntry::Legacy {
+            base_fee: 10,
+            reference_fee_units: REFERENCE_FEE_UNITS_DEPRECATED,
+            reserve_base: Some(20),
+            reserve_increment: Some(30),
         })
     );
 }
