@@ -920,7 +920,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         .name("consensus-timer".into())
         .spawn(move || {
             loop {
-                std::thread::sleep(Duration::from_millis(950));
+                std::thread::sleep(Duration::from_millis(200));
                 if consensus_timer_stop.load(Ordering::Acquire) {
                     break;
                 }
@@ -968,7 +968,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         // Called after each heavy I/O operation to prevent timer starvation.
         macro_rules! maybe_tick_consensus {
             () => {
-                if last_consensus_tick.elapsed() >= Duration::from_secs(1) {
+                if last_consensus_tick.elapsed() >= Duration::from_millis(200) {
                     network_ops_rt.drain_proposals(consensus_rt.as_ref());
                     network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
                     last_consensus_tick = std::time::Instant::now();
