@@ -1390,6 +1390,25 @@ where
         acquired_header.hash = SHAMapHash::default();
 
         // Build the ledger
+        // ZERO-I/O CONSENSUS: Pin all parent state map nodes in memory before
+        // building. This collects strong SharedIntrusive refs for every node
+        // reachable from the state_map root using the parent's own node_fetcher.
+        // While _pinned_nodes is alive, TreeNodeCache cannot evict these nodes,
+        // guaranteeing build_ledger_from_consensus does zero disk I/O.
+        let _pinned_nodes: Vec<basics::memory::intrusive_pointer::SharedIntrusive<shamap::nodes::tree_node::SHAMapTreeNode>> = {
+            use shamap::traverse::visitor::visit_nodes;
+            let mut nodes = Vec::new();
+            let fetcher = parent.node_fetcher_closure();
+            let root = parent.state_map().root();
+            let _ = visit_nodes(
+                &root,
+                parent.state_map().backed(),
+                &mut |hash| fetcher.as_ref().and_then(|f| f(hash)),
+                &mut |node| { nodes.push(node.clone()); true },
+            );
+            nodes
+        };
+
         let consensus_fetcher = self.ledger_acceptor.node_fetcher();
         let build_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::build_ledger_from_consensus(
