@@ -1153,6 +1153,14 @@ impl Ledger {
         self.node_fetcher.is_some()
     }
 
+    /// Returns a clone of the node fetcher closure (if attached).
+    /// Used by consensus to pin state map nodes in memory before building.
+    pub fn node_fetcher_closure(
+        &self,
+    ) -> Option<Arc<dyn Fn(basics::sha_map_hash::SHAMapHash) -> Option<basics::memory::intrusive_pointer::SharedIntrusive<shamap::nodes::tree_node::SHAMapTreeNode>> + Send + Sync>> {
+        self.node_fetcher.clone()
+    }
+
     pub fn has_node_writer(&self) -> bool {
         self.node_writer.is_some()
     }

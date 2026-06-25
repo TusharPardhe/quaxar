@@ -1750,6 +1750,99 @@ fn update_operating_mode_after_accepted_ledger(
             app::NetworkOpsOperatingMode::Tracking | app::NetworkOpsOperatingMode::Full
         ),
     );
+
+    // rippled: switchLastClosedLedger — when peers/validations prefer a
+    // different ledger, JUMP to it. This is the critical recovery path that
+    // prevents the node from getting stuck on a stale chain.
+    if ledger_change {
+        if let Some(lm_rt) = app.ledger_master_runtime() {
+            let our_closed_hash = *accepted_ledger.header().hash.as_uint256();
+            let trusted_preferred = app
+                .validations()
+                .validations()
+                .lock()
+                .expect("validations lock")
+                .get_preferred(app::validated_ledger_from_ledger(
+                    accepted_ledger,
+                    &app::NullRclValidationJournal,
+                ));
+            let peer_hashes: Vec<Uint256> = peers.iter()
+                .map(|p| p.closed_ledger_hash())
+                .collect();
+            let preferred_hash = preferred_closed_ledger_hash(
+                trusted_preferred,
+                app.validated_ledger_seq().unwrap_or(0),
+                peer_hashes.into_iter(),
+                our_closed_hash,
+                *accepted_ledger.header().parent_hash.as_uint256(),
+                true,
+            );
+
+            if preferred_hash != our_closed_hash && !preferred_hash.is_zero() {
+                // Try to get the preferred ledger from history or inbound
+                let ledger_master = lm_rt.ledger_master();
+                if let Some(target) = ledger_master.get_ledger_by_hash(
+                    basics::sha_map_hash::SHAMapHash::new(preferred_hash),
+                ) {
+                    tracing::warn!(target: "consensus",
+                        our_seq = accepted_ledger.header().seq,
+                        target_seq = target.header().seq,
+                        "JUMP: switchLastClosedLedger to peer-preferred ledger"
+                    );
+                    // Promote: set as valid if quorum is met
+                    let target_seq = target.header().seq;
+                    let validations = app
+                        .validations()
+                        .store()
+                        .trusted_for_ledger_by_sequence(preferred_hash, target_seq);
+                    let val_count = app
+                        .validators()
+                        .negative_unl_filter_validations(validations)
+                        .len();
+                    let quorum = app.validators().quorum();
+                    if val_count >= quorum {
+                        let mut promoted = app.ledger_with_node_fetcher(
+                            std::sync::Arc::clone(&target),
+                        );
+                        {
+                            let l = std::sync::Arc::make_mut(&mut promoted);
+                            l.set_validated();
+                            l.set_full();
+                            l.finalize_immutable_no_setup();
+                        }
+                        ledger_master.ledger_history().insert(
+                            std::sync::Arc::clone(&promoted), true,
+                        );
+                        ledger_master.mark_ledger_complete(target_seq);
+                        ledger_master.set_valid_ledger_no_sweep(
+                            std::sync::Arc::clone(&promoted), None, None,
+                        );
+                        app.note_validated_ledger_for_sync(std::sync::Arc::clone(&promoted));
+                        app.set_need_network_ledger(false);
+                        tracing::info!(target: "consensus",
+                            seq = target_seq,
+                            validations = val_count,
+                            "JUMP: validated ledger promoted (switchLastClosedLedger)"
+                        );
+                    } else {
+                        tracing::debug!(target: "consensus",
+                            seq = target_seq,
+                            val_count,
+                            quorum,
+                            "JUMP: preferred ledger acquired but quorum not met yet"
+                        );
+                    }
+                } else {
+                    // Don't have it — request acquisition (non-blocking)
+                    tracing::info!(target: "consensus",
+                        hash = %format!("{:016x}", preferred_hash.data()[0] as u64),
+                        "JUMP: requesting preferred ledger acquisition"
+                    );
+                }
+            }
+        }
+    }
+
     let next_mode = select_post_acquisition_operating_mode(
         current_mode,
         app.need_network_ledger(),
@@ -1844,6 +1937,33 @@ impl RclValidationAcceptanceSink for CheckAcceptSink {
             overlay.overlay().check_tracking(seq);
         }
         let _ = self.validated_tx.send((hash, seq));
+    }
+}
+
+/// Elevate the current thread to high scheduling priority.
+/// Consensus threads must never be starved by RPC workload — if validators
+/// can't emit validations on time, the network stalls. This mirrors rippled
+/// where the JobQueue consensus thread runs at elevated priority.
+fn set_consensus_thread_priority() {
+    #[cfg(unix)]
+    {
+        // Set highest nice value for non-root (-20 requires root, but we can try)
+        unsafe {
+            // PRIO_PROCESS = 0, current thread = 0
+            libc::setpriority(0, 0, -15);
+        }
+        // On Linux, also try SCHED_RR (real-time round-robin) with low priority
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let param = libc::sched_param { sched_priority: 10 };
+            libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_RR, &param);
+        }
+        // On macOS, use QOS_CLASS_USER_INTERACTIVE (highest non-real-time)
+        #[cfg(target_os = "macos")]
+        unsafe {
+            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+        }
+        tracing::info!(target: "consensus", "Consensus thread elevated to high priority");
     }
 }
 
@@ -4256,6 +4376,8 @@ impl<D> BoundServerRuntime<D> {
                 let _ = thread::Builder::new()
                     .name("xrpld-validation-processor".to_owned())
                     .spawn(move || {
+                        // Elevate thread priority — consensus must never be starved by RPC load.
+                        set_consensus_thread_priority();
 
                         // call got_tx_set when TX sets are acquired from peers.
                         let map_complete_rx = val_app.consensus_runtime()

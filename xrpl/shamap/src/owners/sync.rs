@@ -1685,6 +1685,62 @@ impl SyncTree {
         )
     }
 
+
+    /// Collect strong references to ALL nodes in this tree, loading from the
+    /// family's fetcher if needed. Returns a Vec of SharedIntrusive refs that
+    /// pin every node in memory — as long as the Vec is alive, no node can be
+    /// evicted by the TreeNodeCache sweep.
+    ///
+    /// Used by consensus to guarantee zero-I/O traversal of the validated
+    /// ledger's state map. Cost: O(N) where N = total nodes in tree.
+    pub fn collect_strong_refs_with_family<CLOCK, S, C, F, MR, NS>(
+        &self,
+        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
+    ) -> Vec<SharedIntrusive<SHAMapTreeNode>>
+    where
+        CLOCK: basics::tagged_cache::CacheClock,
+        S: std::hash::BuildHasher + Clone,
+        C: crate::family::FullBelowCache,
+        F: crate::family::SHAMapNodeFetcher,
+        MR: crate::family::MissingNodeReporter,
+    {
+        let mut refs = Vec::new();
+        refs.push(self.root.clone());
+
+        if !self.root.is_inner() {
+            return refs;
+        }
+
+        let mut stack: Vec<SharedIntrusive<SHAMapTreeNode>> = vec![self.root.clone()];
+
+        while let Some(node) = stack.pop() {
+            for branch in 0..16 {
+                if node.is_empty_branch(branch) {
+                    continue;
+                }
+                let child = if let Some(c) = node.get_child(branch) {
+                    c
+                } else if self.backed {
+                    let hash = node.get_child_hash(branch);
+                    if let Some(c) = self.load_node_with_owner_family(hash, family) {
+                        c
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+
+                refs.push(child.clone());
+                if child.is_inner() {
+                    stack.push(child);
+                }
+            }
+        }
+
+        refs
+    }
+
     pub fn get_node_fat<F>(
         &self,
         wanted: SHAMapNodeId,

@@ -866,7 +866,18 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
 fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool>) {
     use consensus;
 
-    tracing::info!(target: "consensus", "Start-mode consensus event loop running");
+    // Elevate thread priority — consensus must never be starved by RPC load.
+    #[cfg(unix)]
+    unsafe {
+        libc::setpriority(0, 0, -15);
+        #[cfg(target_os = "linux")]
+        {
+            let param = libc::sched_param { sched_priority: 10 };
+            libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_RR, &param);
+        }
+    }
+
+    tracing::info!(target: "consensus", "Start-mode consensus event loop running (elevated priority)");
 
     // Take the map-complete receiver once (it's a take-once resource).
     let map_complete_rx = runtime
