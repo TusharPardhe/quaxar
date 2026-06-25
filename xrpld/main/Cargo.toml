@@ -27,6 +27,7 @@ nodestore = { path = "../nodestore" }
 ledger = { path = "../ledger" }
 consensus = { path = "../consensus" }
 rdb = { path = "../rdb" }
+libc = "0.2"
 time = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "time"] }
 serde_json = "1"

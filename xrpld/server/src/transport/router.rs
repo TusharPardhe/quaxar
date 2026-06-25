@@ -369,6 +369,33 @@ where
         let (tx, rx) = tokio::sync::watch::channel(None);
         self.state.in_flight.insert(hash_key.clone(), rx);
 
+        // rippled: ALL requests are rejected with tooBusy when the server is
+        // overloaded AND the client is not unlimited (admin). This prevents
+        // DDoS from starving consensus. rippled checks:
+        // 1. consumer.disconnect() — per-IP budget exceeded → drop connection
+        // 2. getFeeTrack().isLoadedLocal() — global server load too high
+        // 3. isUnlimited(role) — admin/unlimited clients bypass
+        //
+        // We check: semaphore pool exhausted + server health failing.
+        // Admin requests still go through (matching rippled's isUnlimited).
+        if metadata.role != crate::RpcRole::Admin {
+            let saturated = self.state.p1_pool.available_permits() == 0
+                || self.state.p2_pool.available_permits() == 0;
+            if saturated {
+                if let Some(status) = &self.config.status_source {
+                    if status.server_okay().is_err() {
+                        let reply = RpcReply::error(
+                            rpc::RpcErrorCode::TooBusy,
+                            "Server is too busy. Try again later.",
+                        );
+                        let _ = tx.send(Some(reply.clone()));
+                        self.state.in_flight.remove(&hash_key);
+                        return reply;
+                    }
+                }
+            }
+        }
+
         let permit = match method.as_str() {
             "submit" | "fee" => self.state.p0_pool.acquire().await.unwrap(),
             "ledger_data" => self.state.p2_pool.acquire().await.unwrap(),
