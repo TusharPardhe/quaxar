@@ -370,7 +370,7 @@ impl<A: ConsensusAdaptor> Consensus<A> {
         self.close_time_avalanche_state = AvalancheState::Init;
         self.have_close_time_consensus = false;
         self.open_time.reset();
-        self.skip_check_ledger = 20;
+        self.skip_check_ledger = 6;
         self.curr_peer_positions.clear();
         self.raw_close_times.peers.clear();
         self.raw_close_times.self_close_time = NetClockTimePoint::default();

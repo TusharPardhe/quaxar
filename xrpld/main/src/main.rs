@@ -4463,7 +4463,7 @@ impl<D> BoundServerRuntime<D> {
                             })); // end catch_unwind
                             // Wait for a validation to arrive (instant wake) or
                             // fall through after 500ms for proposal/timer work.
-                            let _ = val_notify_rx.recv_timeout(Duration::from_millis(200));
+                            let _ = val_notify_rx.recv_timeout(Duration::from_millis(500));
                         }
                     });
 
