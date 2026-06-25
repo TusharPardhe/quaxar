@@ -502,9 +502,12 @@ impl<A: ConsensusAdaptor> Consensus<A> {
         self.now = now;
         if self.skip_check_ledger > 0 {
             self.skip_check_ledger -= 1;
-        } else if self.phase != ConsensusPhase::Establish {
-            // Don't check during Establish — we're converging with peers
-            // and clearing curr_peer_positions would kill the round.
+        } else if self.phase == ConsensusPhase::Open
+            && self.open_time.read() > std::time::Duration::from_secs(5)
+        {
+            // Only check during Open if we've been open for too long (stale).
+            // Normally we close within 2-4s. If we've been open >5s it means
+            // we're not seeing peer proposals and should detect wrong ledger.
             self.check_ledger();
         }
         match self.phase {
