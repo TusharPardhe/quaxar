@@ -1905,27 +1905,13 @@ where
         }
 
         // === Emit our own validation for the built ledger (reference NetworkOPs::endConsensus) ===
-        // Only emit when validating AND in Proposing mode AND peers agree on
-        // our ledger (matching rippled which only validates when on the
-        // network's consensus ledger).
+        // rippled emits unconditionally when validating_ && !consensusFail && canValidateSeq.
+        // There is NO peer-agreement check in rippled — validation is emitted immediately
+        // after building, allowing other validators to see it and reach quorum.
         let current_mode = decode_consensus_mode(self.mode.load(Ordering::Acquire));
-        let peers_agree = if let Some(overlay) = &self.overlay {
-            use overlay::Overlay;
-            let built_hash = built_ledger.as_ref().map(|l| *l.header().hash.as_uint256());
-            let prev_hash = *prev_ledger.id.data();
-            let peers = overlay.active_peers();
-            // At least one peer must be on the SAME prev_ledger (same round)
-            peers.iter().any(|p| {
-                let h = p.closed_ledger_hash();
-                h == Uint256::from_array(prev_hash)
-            })
-        } else {
-            false
-        };
         if let Some(built) = &built_ledger {
             if self.validating.load(Ordering::Acquire)
                 && current_mode == ConsensusMode::Proposing
-                && peers_agree
             {
                 if let Some(keys) = self.validator_keys.keys.as_ref() {
                     let now = (std::time::SystemTime::now()
