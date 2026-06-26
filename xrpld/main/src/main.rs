@@ -5590,15 +5590,17 @@ impl<D> BoundServerRuntime<D> {
                             }
                         }
 
-                        // Re-acquire latest validated target when slot is free
+                        // Re-acquire latest validated target when slot is free (throttled)
                         if let Some((target_hash, target_seq)) = last_validated_target {
                             if target_seq > 1
                                 && inbound_ledgers.active_count() == 0
                                 && !inbound_ledgers.contains(&target_hash)
                             {
-                                tracing::info!(target: "bootstrap", seq = target_seq, hash = %debug_hash8(&target_hash), "Acquiring validated target");
                                 inbound_ledgers.acquire(target_hash, target_seq, validated);
                                 inbound_ledgers.send_peers(&peers);
+                                // Sleep briefly to prevent tight-loop when acquisition
+                                // completes/fails immediately (matching rippled's 3s tick).
+                                thread::sleep(Duration::from_secs(3));
                             }
                         }
                     }
