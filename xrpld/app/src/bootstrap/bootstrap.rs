@@ -907,7 +907,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
 
     // State for consensus ledger acquisition with targeted peer requests.
 
-    let mut last_consensus_tick = std::time::Instant::now();
+    // Consensus is driven exclusively by the dedicated 1s heartbeat thread.
 
     // Spawn the consensus heartbeat thread (1s interval, matching rippled's
     // ledgerGRANULARITY). This single thread drives all consensus timing:
@@ -973,11 +973,9 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         // Called after each heavy I/O operation to prevent timer starvation.
         macro_rules! maybe_tick_consensus {
             () => {
-                if last_consensus_tick.elapsed() >= Duration::from_millis(200) {
-                    network_ops_rt.drain_proposals(consensus_rt.as_ref());
-                    network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
-                    last_consensus_tick = std::time::Instant::now();
-                }
+                // Only drain proposals here — timer_entry is driven exclusively
+                // by the 1s heartbeat thread. This prevents double-ticking.
+                network_ops_rt.drain_proposals(consensus_rt.as_ref());
             };
         }
 
@@ -1328,6 +1326,39 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                         .insert(std::sync::Arc::clone(&ledger), true);
                 }
             }
+
+            // Consensus wrong-ledger recovery: when the consensus adapter
+            // requests a ledger via request_consensus_ledger, trigger an
+            // inbound fetch for that hash. This matches rippled's
+            // acquireAsync(hash, 0, InboundLedger::Reason::CONSENSUS).
+            // The fetched ledger will be deposited into LedgerHistory via the
+            // store_tx channel above, and consensus will find it on the next tick.
+            if let Some(consensus_hash) = lm_rt.take_pending_consensus_ledger() {
+                if !consensus_hash.is_zero()
+                    && lm_rt
+                        .ledger_master()
+                        .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(
+                            consensus_hash,
+                        ))
+                        .is_none()
+                {
+                    // Send TmGetLedger to peers for this specific hash
+                    use overlay::Overlay;
+                    let msg = ledger::make_fetch_pack_request(
+                        basics::sha_map_hash::SHAMapHash::new(consensus_hash),
+                    );
+                    let wire = overlay::Message::new(msg, None);
+                    if let Some(overlay_rt) = root.overlay_runtime() {
+                        for p in overlay_rt.overlay().active_peers().iter().take(3) {
+                            p.send(wire.clone());
+                        }
+                    }
+                    tracing::debug!(target: "consensus",
+                        hash = %consensus_hash,
+                        "Triggered ledger fetch for consensus recovery"
+                    );
+                }
+            }
         }
 
         // Feed proposals to consensus every 50ms (every loop iteration).
@@ -1337,11 +1368,9 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
 
         // Tick the consensus state machine (sole consensus driver).
         // Time-gated: only fire once per second to avoid blocking the loop.
-        // Tick consensus at 1s intervals (matching rippled's ledgerGRANULARITY).
-        if last_consensus_tick.elapsed() >= Duration::from_secs(1) {
-            network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
-            last_consensus_tick = std::time::Instant::now();
-        }
+        // Consensus timer_entry is driven by the dedicated heartbeat thread (1s).
+        // Just drain proposals here for responsiveness.
+        network_ops_rt.drain_proposals(consensus_rt.as_ref());
 
         // checkAccept + tryAdvance burst catch-up (matching rippled LedgerMaster.cpp):
         // 1. First check if the closed ledger can be promoted to validated.

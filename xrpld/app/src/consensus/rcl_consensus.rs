@@ -1767,21 +1767,22 @@ where
         };
 
         // Primary: use validation trie (rippled's getPreferred)
+        let valid_ledger_index = self.ledgers.get_valid_ledger_index();
         let preferred = self.validations.get_preferred_with_min_seq(
             validated_ledger_from_ledger(ledger.as_ref(), &NullRclValidationJournal),
-            self.ledgers.get_valid_ledger_index(),
+            valid_ledger_index,
         );
 
         // Fallback: peer LCL vote counting (rippled's checkLastClosedLedger
-        // peerCounts path). Use when NOT in Proposing mode, OR when in Proposing
-        // mode but our ledger has zero trusted validations (meaning we're on the
-        // wrong chain and need to recover).
-        let need_network = self.mode_source.need_network_ledger();
+        // peerCounts path). Always active during bootstrap (valid_ledger_index==0)
+        // since the validation trie is empty and can't guide us. Also active
+        // when not proposing or when we're lost on the wrong chain.
         let our_val_count = self.validations.num_trusted_for_ledger(*prev_ledger_id);
         let lost_in_proposing = mode == ConsensusMode::Proposing && our_val_count == 0;
         let use_peer_fallback = preferred == *prev_ledger_id
-            && (mode != ConsensusMode::Proposing || lost_in_proposing)
-            && (need_network || lost_in_proposing);
+            && (valid_ledger_index == 0
+                || mode != ConsensusMode::Proposing
+                || lost_in_proposing);
         let preferred = if use_peer_fallback {
             if let Some(overlay) = &self.overlay {
                 use overlay::Overlay;
