@@ -5,7 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
 
-## [Unreleased]
+## [0.3.1] - 2026-06-26
+
+### Added
+
+- **Consensus engine redesign** — Complete rewrite of the consensus participation lifecycle matching rippled's architecture. Single 1s heartbeat thread, channel-driven validation processor, immediate ledger promotion, parking_lot::Mutex-based ConsensusDriver
+- **Channel-driven validation processing** — Dedicated thread blocks on mpsc channel, wakes instantly when validations arrive from peers. Zero-latency ledger promotion matching rippled's jtVALIDATION job dispatch
+- **ConsensusDriver** — New unified consensus entry point with peer count gate, canValidateSeq monotonicity enforcement, and spawn_heartbeat API
+
+### Changed
+
+- **Timer architecture** — Replaced 200ms polling timer with single 1s heartbeat thread (ledgerGRANULARITY). Removed maybe_tick_consensus macro and inline ticks that caused 5x speed bug
+- **get_prev_ledger** — Simplified to pure validation trie query (no peer voting). Peer voting moved to endConsensus/checkLastClosedLedger where it belongs
+- **Validation emission** — Added canValidateSeq (strictly increasing), !consensusFail, and proposers>0 guards. Prevents stale fork validations from polluting the trie
+- **acquire_ledger** — Relaxed immutability check, added store_consensus_ledger for immediate LedgerHistory availability
+
+### Fixed
+
+- **Consensus convergence** — Nodes now converge reliably across all configurations (5q, 3r+2q, 4r+1q, 2r+3q)
+- **5x timer speed bug** — tick_fixed(1s) was called every 200ms, causing consensus timers to run at 5x real speed
+- **Validation trie pollution** — Solo-built ledger validations no longer enter the trie, preventing spurious wrong-ledger detection
+- **Ledger promotion lag** — Validated ledger counter now advances in lockstep with rippled (0-1 ledger gap vs previous 20-80)
+
+### Performance
+
+- **RAM**: 27-41 MB vs rippled 503-627 MB (15-23x less memory)
+- **RPC**: 21/24 methods faster, 2.29x geometric mean, 4.0x average speedup
+- **Consensus drift**: Zero under stress test load
 
 ### Added
 
