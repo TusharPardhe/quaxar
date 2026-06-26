@@ -909,18 +909,22 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
 
     let mut last_consensus_tick = std::time::Instant::now();
 
-    // Shared timestamp so the timer thread knows when the main loop last ticked.
-
-    // Spawn a dedicated thread that drains proposals and ONLY ticks consensus
-    // when the main loop is stalled (>2s since last tick). This prevents both
-    // timer starvation (original bug) and racing ahead (new bug from always ticking).
+    // Spawn the consensus heartbeat thread (1s interval, matching rippled's
+    // ledgerGRANULARITY). This single thread drives all consensus timing:
+    // - Drains pending proposals (delivered by peer I/O threads)
+    // - Calls timer_entry once per second
+    // - Handles pending start_round from async onAccept
+    //
+    // Proposals arrive via push_proposal() from peer threads and are drained
+    // here. timer_entry uses tick_fixed(1s) internally, so calling it every
+    // 1s keeps consensus timers at real-time speed (no 5x bug).
     let consensus_timer_stop = Arc::clone(&stop);
     let consensus_timer_runtime = Arc::clone(&runtime);
     std::thread::Builder::new()
-        .name("consensus-timer".into())
+        .name("consensus-heartbeat".into())
         .spawn(move || {
             loop {
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_secs(1));
                 if consensus_timer_stop.load(Ordering::Acquire) {
                     break;
                 }
@@ -930,9 +934,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 else {
                     continue;
                 };
-                network_ops_rt.drain_proposals(consensus_rt.as_ref());
-                // Tick consensus to prevent starvation, but only if we haven't
-                // raced ahead of validated (prevents drift).
+                // Guard: don't race ahead of validated (prevents drift during catchup).
                 let should_tick = if let Some(lm) = root.ledger_master_runtime() {
                     let valid_seq = lm.ledger_master().valid_ledger_seq();
                     let closed_seq = lm
@@ -940,17 +942,20 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                         .closed_ledger()
                         .map(|l| l.header().seq)
                         .unwrap_or(0);
-                    // Tick if: still in startup (valid=0) or not too far ahead
                     valid_seq == 0 || closed_seq <= valid_seq + 2
                 } else {
                     true
                 };
                 if should_tick {
                     network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
+                } else {
+                    // Still drain proposals even when not ticking, so they're
+                    // ready for the next tick.
+                    network_ops_rt.drain_proposals(consensus_rt.as_ref());
                 }
             }
         })
-        .expect("spawn consensus-timer thread");
+        .expect("spawn consensus-heartbeat thread");
 
     while !stop.load(Ordering::Acquire) {
         let root = runtime.root();
