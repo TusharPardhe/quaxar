@@ -841,6 +841,9 @@ where
     prev_proposers: AtomicUsize,
     prev_round_time_millis: AtomicU64,
     mode: AtomicU8,
+    /// Last sequence number for which we emitted a validation (monotonicity
+    /// enforcement matching rippled's canValidateSeq / localSeqEnforcer).
+    last_validated_seq: AtomicU32,
     /// Pending start_round parameters queued by end_consensus.
     /// Consumed by the next timer_tick to start the next round.
     pending_start_round: Mutex<Option<(basics::chrono::NetClockTimePoint, Uint256, RclCxLedger)>>,
@@ -965,6 +968,7 @@ where
             prev_proposers: AtomicUsize::new(0),
             prev_round_time_millis: AtomicU64::new(0),
             mode: AtomicU8::new(encode_consensus_mode(ConsensusMode::Observing)),
+            last_validated_seq: AtomicU32::new(0),
             pending_start_round: Mutex::new(None),
             round_parent_ledger: Mutex::new(None),
             overlay,
@@ -1906,14 +1910,21 @@ where
         }
 
         // === Emit our own validation for the built ledger (reference NetworkOPs::endConsensus) ===
-        // rippled emits unconditionally when validating_ && !consensusFail && canValidateSeq.
-        // There is NO peer-agreement check in rippled — validation is emitted immediately
-        // after building, allowing other validators to see it and reach quorum.
+        // Match rippled: emit validation only when:
+        // 1. validating_ (have keys, not blocked)
+        // 2. !consensusFail (result.state != MovedOn)
+        // 3. canValidateSeq (strictly increasing sequence — prevents stale fork
+        //    validations from polluting the validation trie)
+        let consensus_fail = result.state == consensus::ConsensusState::MovedOn;
         let current_mode = decode_consensus_mode(self.mode.load(Ordering::Acquire));
         if let Some(built) = &built_ledger {
+            let seq = built.header().seq;
             if self.validating.load(Ordering::Acquire)
+                && !consensus_fail
                 && current_mode == ConsensusMode::Proposing
+                && seq > self.last_validated_seq.load(Ordering::Acquire)
             {
+                self.last_validated_seq.store(seq, Ordering::Release);
                 if let Some(keys) = self.validator_keys.keys.as_ref() {
                     let now = (std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
