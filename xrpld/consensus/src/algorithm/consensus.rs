@@ -221,7 +221,6 @@ pub struct Consensus<A: ConsensusAdaptor> {
     mode: ConsensusMode,
     first_round: bool,
     have_close_time_consensus: bool,
-    skip_check_ledger: u8,
     converge_percent: i32,
     open_time: ConsensusTimer,
     close_resolution: TimeDuration,
@@ -252,7 +251,6 @@ impl<A: ConsensusAdaptor> Consensus<A> {
             mode: ConsensusMode::Observing,
             first_round: true,
             have_close_time_consensus: false,
-            skip_check_ledger: 0,
             converge_percent: 0,
             open_time: ConsensusTimer::default(),
             close_resolution: crate::timing::LEDGER_DEFAULT_TIME_RESOLUTION,
@@ -370,7 +368,6 @@ impl<A: ConsensusAdaptor> Consensus<A> {
         self.close_time_avalanche_state = AvalancheState::Init;
         self.have_close_time_consensus = false;
         self.open_time.reset();
-        self.skip_check_ledger = 6;
         self.curr_peer_positions.clear();
         self.raw_close_times.peers.clear();
         self.raw_close_times.self_close_time = NetClockTimePoint::default();
@@ -500,16 +497,10 @@ impl<A: ConsensusAdaptor> Consensus<A> {
             );
         }
         self.now = now;
-        if self.skip_check_ledger > 0 {
-            self.skip_check_ledger -= 1;
-        } else if self.phase == ConsensusPhase::Open
-            && self.open_time.read() > std::time::Duration::from_secs(5)
-        {
-            // Only check during Open if we've been open for too long (stale).
-            // Normally we close within 2-4s. If we've been open >5s it means
-            // we're not seeing peer proposals and should detect wrong ledger.
-            self.check_ledger();
-        }
+
+        // Match rippled: call checkLedger unconditionally every tick.
+        self.check_ledger();
+
         match self.phase {
             ConsensusPhase::Open => self.phase_open(),
             ConsensusPhase::Establish => self.phase_establish(),
@@ -532,6 +523,10 @@ impl<A: ConsensusAdaptor> Consensus<A> {
             self.adaptor
                 .get_prev_ledger(&prev_ledger_id, &previous_ledger, self.mode);
         if network_ledger != prev_ledger_id {
+            self.handle_wrong_ledger(network_ledger);
+        } else if self.adaptor.id(&previous_ledger) != prev_ledger_id {
+            // Match rippled: data/hash mismatch (ledger object doesn't match
+            // the ID we're working from). Trigger wrong-ledger recovery.
             self.handle_wrong_ledger(network_ledger);
         }
     }
