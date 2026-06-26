@@ -1641,9 +1641,9 @@ where
             }
             return None;
         };
-        if !ledger.is_immutable() || *ledger.header().hash.as_uint256() != *ledger_id {
+        if *ledger.header().hash.as_uint256() != *ledger_id {
             self.journal.warn(&format!(
-                "rejected consensus ledger {ledger_id} because it was not immutable or its hash mismatched"
+                "rejected consensus ledger {ledger_id} because hash mismatched"
             ));
             return None;
         }
