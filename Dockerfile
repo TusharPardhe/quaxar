@@ -1,59 +1,40 @@
-# Stage 1: Dependency cache (only rebuilds when Cargo.toml/Cargo.lock change)
-FROM debian:bookworm-slim AS deps
+# syntax=docker/dockerfile:1.4
 
-RUN apt-get update && apt-get install -y \
-    curl build-essential pkg-config libssl-dev clang lld cmake perl \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.90.0
+# ─── Stage 0: Base ────────────────────────────────────────────────────────────
+FROM lukemathwalker/cargo-chef:latest-rust-1.90-slim-bookworm AS chef
 
-ENV PATH="/root/.cargo/bin:${PATH}"
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev clang mold cmake perl build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV CARGO_INCREMENTAL=0
-ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld"
-
+ENV RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold"
+ENV OPENSSL_NO_VENDOR=1
 WORKDIR /src
 
-# Copy only manifests first for dependency caching
-COPY Cargo.toml Cargo.lock ./
-COPY xrpl/basics/Cargo.toml xrpl/basics/Cargo.toml
-COPY xrpl/protocol/Cargo.toml xrpl/protocol/Cargo.toml
-COPY xrpl/shamap/Cargo.toml xrpl/shamap/Cargo.toml
-COPY xrpld/app/Cargo.toml xrpld/app/Cargo.toml
-COPY xrpld/consensus/Cargo.toml xrpld/consensus/Cargo.toml
-COPY xrpld/ledger/Cargo.toml xrpld/ledger/Cargo.toml
-COPY xrpld/main/Cargo.toml xrpld/main/Cargo.toml
-COPY xrpld/overlay/Cargo.toml xrpld/overlay/Cargo.toml
-COPY xrpld/metrics/Cargo.toml xrpld/metrics/Cargo.toml
-COPY xrpld/rpc/Cargo.toml xrpld/rpc/Cargo.toml
-COPY xrpld/tx/Cargo.toml xrpld/tx/Cargo.toml
-
-# Copy proto files needed for build.rs
-COPY xrpl/protocol/proto xrpl/protocol/proto
-
-# Create dummy lib.rs files so cargo can resolve the workspace
-RUN find . -name "Cargo.toml" -path "*/xrpl/*" -exec sh -c 'mkdir -p $(dirname {})/src && touch $(dirname {})/src/lib.rs' \; && \
-    find . -name "Cargo.toml" -path "*/xrpld/*" ! -path "*/main/*" -exec sh -c 'mkdir -p $(dirname {})/src && touch $(dirname {})/src/lib.rs' \; && \
-    mkdir -p xrpld/main/src && echo 'fn main() {}' > xrpld/main/src/main.rs
-
-# Build dependencies only (cached unless Cargo.toml/lock changes)
-RUN cargo build --release -p xrpld-main 2>/dev/null || true
-
-# Stage 2: Build with source (fast - only recompiles our crates)
-FROM deps AS builder
-
-# Copy actual source (invalidates cache only for source changes)
+# ─── Stage 1: Planner ─────────────────────────────────────────────────────────
+FROM chef AS planner
 COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
-# Touch all lib.rs/main.rs to ensure they rebuild (not the dummy ones)
-RUN find . -name "*.rs" -path "*/src/*" -newer Cargo.lock -exec touch {} +
+# ─── Stage 2: Builder ─────────────────────────────────────────────────────────
+FROM chef AS builder
 
-# Build with max parallelism
-RUN cargo build --release -p xrpld-main -j $(nproc) && \
+COPY --from=planner /src/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo chef cook --release --recipe-path recipe.json
+
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --release -p xrpld-main && \
     strip target/release/quaxar
 
-# Stage 3: Runtime (minimal)
+# ─── Stage 3: Runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /bin/false xrpld \
