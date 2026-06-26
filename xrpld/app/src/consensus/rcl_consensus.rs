@@ -841,6 +841,8 @@ where
     prev_proposers: AtomicUsize,
     prev_round_time_millis: AtomicU64,
     mode: AtomicU8,
+    /// canValidateSeq: last sequence we emitted a validation for (monotonicity)
+    last_validated_seq: AtomicU32,
     /// Pending start_round parameters queued by end_consensus.
     /// Consumed by the next timer_tick to start the next round.
     pending_start_round: Mutex<Option<(basics::chrono::NetClockTimePoint, Uint256, RclCxLedger)>>,
@@ -965,6 +967,7 @@ where
             prev_proposers: AtomicUsize::new(0),
             prev_round_time_millis: AtomicU64::new(0),
             mode: AtomicU8::new(encode_consensus_mode(ConsensusMode::Observing)),
+            last_validated_seq: AtomicU32::new(0),
             pending_start_round: Mutex::new(None),
             round_parent_ledger: Mutex::new(None),
             overlay,
@@ -1641,10 +1644,7 @@ where
             }
             return None;
         };
-        if !ledger.is_immutable() || *ledger.header().hash.as_uint256() != *ledger_id {
-            self.journal.warn(&format!(
-                "rejected consensus ledger {ledger_id} because it was not immutable or its hash mismatched"
-            ));
+        if *ledger.header().hash.as_uint256() != *ledger_id {
             return None;
         }
         *self
@@ -1742,23 +1742,6 @@ where
         prev_ledger: &RclCxLedger,
         mode: ConsensusMode,
     ) -> Uint256 {
-        // Match rippled: once in WrongLedger mode, stop switching.
-        // handleWrongLedger already set prev_ledger_id to the detected hash.
-        // Returning it unchanged prevents check_ledger from calling
-        // handleWrongLedger again (which clears curr_peer_positions).
-        // The round will either acquire the ledger (via startRoundInternal
-        // on a subsequent tick when it becomes available) or time out
-        // and endConsensus restarts from latest closed_ledger.
-        if mode == ConsensusMode::WrongLedger {
-            return *prev_ledger_id;
-        }
-
-        // Match rippled exactly: NO cache. Query validation trie + peer votes
-        // fresh every timerEntry tick. consensusViewChange fires only ONCE
-        // (first detection when mode != WrongLedger/SwitchedLedger). After that,
-        // mode=WrongLedger suppresses further view_change calls while
-        // handleWrongLedger retries acquireLedger every tick until success.
-
         let Some(ledger) = self
             .lookup_ledger(&prev_ledger.id)
             .or_else(|| self.ledgers.acquire_consensus_ledger(&prev_ledger.id))
@@ -1766,76 +1749,23 @@ where
             return *prev_ledger_id;
         };
 
-        // Primary: use validation trie (rippled's getPreferred)
+        let valid_ledger_index = self.ledgers.get_valid_ledger_index();
+
+        // During early bootstrap (no validated ledger yet), don't switch.
+        // The node must complete its first consensus round with proposers,
+        // emit a validation, and advance valid_ledger_index before the trie
+        // can reliably guide ledger switching.
+        if valid_ledger_index == 0 {
+            return *prev_ledger_id;
+        }
+
         let preferred = self.validations.get_preferred_with_min_seq(
             validated_ledger_from_ledger(ledger.as_ref(), &NullRclValidationJournal),
-            self.ledgers.get_valid_ledger_index(),
+            valid_ledger_index,
         );
 
-        // Fallback: peer LCL vote counting (rippled's checkLastClosedLedger
-        // peerCounts path). Use when NOT in Proposing mode, OR when in Proposing
-        // mode but our ledger has zero trusted validations (meaning we're on the
-        // wrong chain and need to recover).
-        let need_network = self.mode_source.need_network_ledger();
-        let our_val_count = self.validations.num_trusted_for_ledger(*prev_ledger_id);
-        let lost_in_proposing = mode == ConsensusMode::Proposing && our_val_count == 0;
-        let use_peer_fallback = preferred == *prev_ledger_id
-            && (mode != ConsensusMode::Proposing || lost_in_proposing)
-            && (need_network || lost_in_proposing);
-        let preferred = if use_peer_fallback {
-            if let Some(overlay) = &self.overlay {
-                use overlay::Overlay;
-                let peers = overlay.active_peers();
-                if !peers.is_empty() {
-                    let mut counts: std::collections::HashMap<Uint256, usize> =
-                        std::collections::HashMap::new();
-                    let op_mode = self.mode_source.operating_mode();
-                    if op_mode == crate::network::network_ops::NetworkOpsOperatingMode::Tracking
-                        || op_mode == crate::network::network_ops::NetworkOpsOperatingMode::Full
-                    {
-                        *counts.entry(*prev_ledger_id).or_default() += 1;
-                    }
-                    for p in peers.iter() {
-                        let h = p.closed_ledger_hash();
-                        if !h.is_zero() {
-                            *counts.entry(h).or_default() += 1;
-                        }
-                    }
-                    let max_count = counts.values().copied().max().unwrap_or(0);
-                    let candidates: Vec<Uint256> = counts
-                        .iter()
-                        .filter(|(_, c)| **c == max_count)
-                        .map(|(h, _)| *h)
-                        .collect();
-                    if candidates.len() == 1 {
-                        candidates[0]
-                    } else {
-                        candidates
-                            .iter()
-                            .find(|h| **h != *prev_ledger_id)
-                            .copied()
-                            .unwrap_or(preferred)
-                    }
-                } else {
-                    preferred
-                }
-            } else {
-                preferred
-            }
-        } else {
-            preferred
-        };
-
-        if preferred != *prev_ledger_id {
-            // Rippled fires consensusViewChange here which demotes operating mode.
-            // However in rippled, endConsensus (called in the SAME heartbeat tick)
-            // immediately re-promotes. Since our ticks are separate, firing
-            // view_change here causes oscillation. The consensus algorithm already
-            // handles wrong-ledger detection internally via handleWrongLedger →
-            // leaveConsensus, which sets consensus mode to WrongLedger. That's
-            // sufficient — the operating mode will re-promote when we catch up.
-            self.journal
-                .debug(&self.validations.get_json_trie().to_string());
+        if preferred != *prev_ledger_id && mode != ConsensusMode::WrongLedger {
+            self.message_sink.consensus_view_change();
         }
 
         preferred
@@ -1905,14 +1835,18 @@ where
         }
 
         // === Emit our own validation for the built ledger (reference NetworkOPs::endConsensus) ===
-        // rippled emits unconditionally when validating_ && !consensusFail && canValidateSeq.
-        // There is NO peer-agreement check in rippled — validation is emitted immediately
-        // after building, allowing other validators to see it and reach quorum.
+        // Match rippled: validate only when validating_ && !consensusFail && canValidateSeq
+        let consensus_fail = result.state == consensus::ConsensusState::MovedOn;
         let current_mode = decode_consensus_mode(self.mode.load(Ordering::Acquire));
         if let Some(built) = &built_ledger {
+            let seq = built.header().seq;
             if self.validating.load(Ordering::Acquire)
+                && !consensus_fail
                 && current_mode == ConsensusMode::Proposing
+                && result.proposers > 0  // don't validate solo rounds
+                && seq > self.last_validated_seq.load(Ordering::Acquire)
             {
+                self.last_validated_seq.store(seq, Ordering::Release);
                 if let Some(keys) = self.validator_keys.keys.as_ref() {
                     let now = (std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)

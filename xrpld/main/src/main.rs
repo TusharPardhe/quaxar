@@ -1914,10 +1914,7 @@ struct CheckAcceptSink {
 impl RclValidationAcceptanceSink for CheckAcceptSink {
     fn check_accept(&self, hash: Uint256, seq: u32) {
         let valid_ledger_seq = self.app.validated_ledger_seq().unwrap_or(0);
-        if seq != 0 && seq < valid_ledger_seq {
-            return;
-        }
-        if seq != 0 && seq == valid_ledger_seq {
+        if seq != 0 && seq <= valid_ledger_seq {
             return;
         }
         let has_local = self
@@ -1927,9 +1924,39 @@ impl RclValidationAcceptanceSink for CheckAcceptSink {
         if has_local {
             return;
         }
-        // Note: do NOT return early if the ledger is in history — it may be
-        // in history but not yet accepted as validated. We need to send the
-        // hash so the catchup loop can accept it.
+
+        // Immediate promotion: if we have the ledger in history AND enough
+        // validations, promote to validated RIGHT NOW (matching rippled's
+        // event-driven checkAccept that fires on each validation receipt).
+        if let Some(lm_rt) = self.app.ledger_master_runtime() {
+            let lm = lm_rt.ledger_master();
+            if let Some(ledger) = lm.get_ledger_by_hash(
+                basics::sha_map_hash::SHAMapHash::new(hash)
+            ) {
+                let validations = self.app.validations().store()
+                    .trusted_for_ledger_by_sequence(hash, seq);
+                let val_count = self.app.validators()
+                    .negative_unl_filter_validations(validations).len();
+                let needed = if self.app.standalone() { 0 } else { self.app.validators().quorum() };
+                if val_count >= needed {
+                    let mut promoted = self.app.ledger_with_node_fetcher(ledger);
+                    {
+                        let l = std::sync::Arc::make_mut(&mut promoted);
+                        l.set_validated();
+                        l.set_full();
+                        l.finalize_immutable_no_setup();
+                    }
+                    lm.ledger_history().insert(std::sync::Arc::clone(&promoted), true);
+                    lm.mark_ledger_complete(promoted.header().seq);
+                    lm.set_valid_ledger_no_sweep(std::sync::Arc::clone(&promoted), None, None);
+                    if lm.published_ledger().is_none() {
+                        lm.set_pub_ledger(std::sync::Arc::clone(&promoted));
+                    }
+                }
+            }
+        }
+
+        // Also send to the catchup loop for acquisition if we don't have it
         if seq != 0
             && valid_ledger_seq == 0
             && let Some(overlay) = self.app.overlay_runtime()
@@ -4370,9 +4397,8 @@ impl<D> BoundServerRuntime<D> {
                 // Buffer of 1: multiple arrivals between wakes collapse into
                 // one signal, which is fine — we drain the full queue each wake.
                 let (val_notify_tx, val_notify_rx) = std::sync::mpsc::sync_channel::<()>(1);
-                if let Some(overlay_runtime) = val_app.overlay_runtime() {
-                    overlay_runtime.overlay().queued_inbound().set_validation_notify(val_notify_tx);
-                }
+                // validation_notify is set by the bootstrap validation-processor thread.
+                // Don't override it here.
                 let _ = thread::Builder::new()
                     .name("xrpld-validation-processor".to_owned())
                     .spawn(move || {

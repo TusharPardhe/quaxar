@@ -907,20 +907,19 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
 
     // State for consensus ledger acquisition with targeted peer requests.
 
-    let mut last_consensus_tick = std::time::Instant::now();
+    // Consensus timing is handled by the dedicated heartbeat thread above.
 
-    // Shared timestamp so the timer thread knows when the main loop last ticked.
-
-    // Spawn a dedicated thread that drains proposals and ONLY ticks consensus
-    // when the main loop is stalled (>2s since last tick). This prevents both
-    // timer starvation (original bug) and racing ahead (new bug from always ticking).
+    // Consensus heartbeat thread (1s interval, matching rippled ledgerGRANULARITY).
+    // This is the SOLE driver of consensus timing. No other thread calls timer_entry.
+    // Proposals are processed directly by peer I/O threads via push_proposal →
+    // drained inside timer_tick. The 1s cadence ensures tick_fixed(1s) runs at real speed.
     let consensus_timer_stop = Arc::clone(&stop);
     let consensus_timer_runtime = Arc::clone(&runtime);
     std::thread::Builder::new()
-        .name("consensus-timer".into())
+        .name("consensus-heartbeat".into())
         .spawn(move || {
             loop {
-                std::thread::sleep(Duration::from_millis(200));
+                std::thread::sleep(Duration::from_secs(1));
                 if consensus_timer_stop.load(Ordering::Acquire) {
                     break;
                 }
@@ -930,27 +929,131 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 else {
                     continue;
                 };
-                network_ops_rt.drain_proposals(consensus_rt.as_ref());
-                // Tick consensus to prevent starvation, but only if we haven't
-                // raced ahead of validated (prevents drift).
-                let should_tick = if let Some(lm) = root.ledger_master_runtime() {
-                    let valid_seq = lm.ledger_master().valid_ledger_seq();
-                    let closed_seq = lm
-                        .ledger_master()
-                        .closed_ledger()
-                        .map(|l| l.header().seq)
-                        .unwrap_or(0);
-                    // Tick if: still in startup (valid=0) or not too far ahead
-                    valid_seq == 0 || closed_seq <= valid_seq + 2
-                } else {
-                    true
+
+                // Peer count gate: don't tick consensus without peers
+                // (matches rippled's processHeartbeatTimer peer count check)
+                let peer_count = root
+                    .overlay_runtime()
+                    .map(|ort| {
+                        use overlay::Overlay;
+                        ort.overlay().active_peers().len()
+                    })
+                    .unwrap_or(0);
+                // Match rippled processHeartbeatTimer: skip timerEntry when
+                // insufficient peers are connected. Requires a majority of
+                // the configured UNL to be present before consensus ticks,
+                // preventing solo ledger closes during network formation.
+                let min_peers = {
+                    let unl_size = root.validators().count();
+                    if unl_size <= 1 { 1 } else { (unl_size - 1) / 2 }
                 };
-                if should_tick {
-                    network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
+                if peer_count < min_peers {
+                    continue;
                 }
+
+                // Drain proposals + tick consensus (1s cadence = real-time tick_fixed)
+                network_ops_rt.drain_proposals(consensus_rt.as_ref());
+                network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
             }
         })
-        .expect("spawn consensus-timer thread");
+        .expect("spawn consensus-heartbeat thread");
+
+    // Validation processing thread (channel-driven, matching rippled's jtVALIDATION).
+    // Blocks on recv() — wakes INSTANTLY when overlay receives a validation.
+    // No polling, no sleep. This ensures ledger promotion never competes with
+    // peer I/O in the bootstrap loop.
+    let validation_stop = Arc::clone(&stop);
+    let validation_runtime = Arc::clone(&runtime);
+    {
+        let (val_notify_tx, val_notify_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        // Wire the notify channel into the overlay so on_validation signals us
+        if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+            use overlay::Overlay;
+            overlay_rt
+                .overlay()
+                .queued_inbound()
+                .set_validation_notify(val_notify_tx);
+        }
+        std::thread::Builder::new()
+            .name("validation-processor".into())
+            .spawn(move || {
+                loop {
+                    // Block until signaled by overlay (instant wake, zero CPU)
+                    let _ = val_notify_rx.recv();
+                    if validation_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let root = validation_runtime.root();
+                    let Some(overlay_rt) = root.overlay_runtime() else { continue; };
+                    use overlay::Overlay;
+                    let validations = overlay_rt.overlay().take_validations();
+                    for queued in &validations {
+                        let mut serial =
+                            protocol::SerialIter::new(&queued.message.validation);
+                        let Ok(mut validation) =
+                            protocol::STValidation::from_serial_iter_default_node_id(
+                                &mut serial, false,
+                            )
+                        else { continue; };
+                        let now_wall = root.current_close_time_seconds();
+                        validation.set_seen(now_wall);
+                        let sign_time = validation.get_sign_time();
+                        if sign_time > 0 {
+                            let offset = sign_time as i64 - now_wall as i64;
+                            root.time_keeper()
+                                .adjust_close_time(time::Duration::seconds(offset));
+                        }
+                        let source = queued.peer_id.to_string();
+                        let _ = root.receive_validation_to_network_ops(
+                            &mut validation, &source,
+                        );
+                        // Immediate checkAccept: promote if quorum met
+                        if let Some(lm_rt) = root.ledger_master_runtime() {
+                            let hash = validation.get_ledger_hash();
+                            let seq = validation.get_field_u32(
+                                protocol::get_field_by_symbol("sfLedgerSequence"),
+                            );
+                            if seq > lm_rt.ledger_master().valid_ledger_seq() {
+                                if let Some(ledger) = lm_rt.ledger_master().get_ledger_by_hash(
+                                    basics::sha_map_hash::SHAMapHash::new(hash),
+                                ) {
+                                    let vals = root.validations().store()
+                                        .trusted_for_ledger_by_sequence(hash, seq);
+                                    let val_count = root.validators()
+                                        .negative_unl_filter_validations(vals).len();
+                                    let needed = root.validators().quorum();
+                                    if val_count >= needed {
+                                        let mut promoted =
+                                            root.ledger_with_node_fetcher(ledger);
+                                        {
+                                            let l = std::sync::Arc::make_mut(&mut promoted);
+                                            l.set_validated();
+                                            l.set_full();
+                                            l.finalize_immutable_no_setup();
+                                        }
+                                        let lm = lm_rt.ledger_master();
+                                        lm.ledger_history().insert(
+                                            std::sync::Arc::clone(&promoted), true,
+                                        );
+                                        lm.mark_ledger_complete(seq);
+                                        lm.set_valid_ledger_no_sweep(promoted, None, None);
+                                    }
+                                }
+                            }
+                        }
+                        // Relay trusted validations
+                        if validation.is_trusted() {
+                            overlay_rt.overlay().relay_validation(
+                                queued.message.clone(),
+                                queued.suppression,
+                                *validation.get_signer_public(),
+                            );
+                        }
+                    }
+                }
+            })
+            .expect("spawn validation-processor thread");
+    }
 
     while !stop.load(Ordering::Acquire) {
         let root = runtime.root();
@@ -966,14 +1069,10 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
 
         // Helper: fire consensus tick if ≥1s elapsed since last tick.
         // Called after each heavy I/O operation to prevent timer starvation.
+        // Consensus is driven exclusively by the 1s heartbeat thread.
+        // No timer_entry calls from the main loop.
         macro_rules! maybe_tick_consensus {
-            () => {
-                if last_consensus_tick.elapsed() >= Duration::from_millis(200) {
-                    network_ops_rt.drain_proposals(consensus_rt.as_ref());
-                    network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
-                    last_consensus_tick = std::time::Instant::now();
-                }
-            };
+            () => {};
         }
 
         // Serve TmGetLedger requests from peers (PART 1).
@@ -1325,18 +1424,38 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             }
         }
 
+        // Consensus wrong-ledger recovery: trigger fetch for requested ledger.
+        // The consensus adapter stores the hash in pending_consensus_ledger when
+        // acquire_ledger fails. We pick it up here and send a TmGetLedger to
+        // peers. When the response arrives (via fetch pack / ledger data), it
+        // lands in LedgerHistory where acquire_ledger will find it next tick.
+        if let Some(lm_rt) = root.ledger_master_runtime() {
+            if let Some(hash) = lm_rt.take_pending_consensus_ledger() {
+                if !hash.is_zero()
+                    && lm_rt
+                        .ledger_master()
+                        .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(hash))
+                        .is_none()
+                {
+                    use overlay::Overlay;
+                    let msg = ledger::make_fetch_pack_request(
+                        basics::sha_map_hash::SHAMapHash::new(hash),
+                    );
+                    let wire = overlay::Message::new(msg, None);
+                    for p in overlay_rt.overlay().active_peers().iter().take(2) {
+                        p.send(wire.clone());
+                    }
+                }
+            }
+        }
+
         // Feed proposals to consensus every 50ms (every loop iteration).
-        // This ensures proposals reach the consensus engine within one loop tick,
         // matching rippled where proposals are processed immediately via JobQueue.
         network_ops_rt.drain_proposals(consensus_rt.as_ref());
 
         // Tick the consensus state machine (sole consensus driver).
         // Time-gated: only fire once per second to avoid blocking the loop.
-        // Tick consensus at 1s intervals (matching rippled's ledgerGRANULARITY).
-        if last_consensus_tick.elapsed() >= Duration::from_secs(1) {
-            network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
-            last_consensus_tick = std::time::Instant::now();
-        }
+        // Consensus timer_entry is driven exclusively by the heartbeat thread.
 
         // checkAccept + tryAdvance burst catch-up (matching rippled LedgerMaster.cpp):
         // 1. First check if the closed ledger can be promoted to validated.
