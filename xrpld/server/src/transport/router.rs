@@ -358,13 +358,11 @@ where
             Entry::Vacant(_) => None,
         };
 
-        if let Some(mut rx) = rx_opt {
-            if rx.changed().await.is_ok() {
-                if let Some(reply) = rx.borrow().clone() {
+        if let Some(mut rx) = rx_opt
+            && rx.changed().await.is_ok()
+                && let Some(reply) = rx.borrow().clone() {
                     return reply;
                 }
-            }
-        }
 
         let (tx, rx) = tokio::sync::watch::channel(None);
         self.state.in_flight.insert(hash_key.clone(), rx);
@@ -381,9 +379,9 @@ where
         if metadata.role != crate::RpcRole::Admin {
             let saturated = self.state.p1_pool.available_permits() == 0
                 || self.state.p2_pool.available_permits() == 0;
-            if saturated {
-                if let Some(status) = &self.config.status_source {
-                    if status.server_okay().is_err() {
+            if saturated
+                && let Some(status) = &self.config.status_source
+                    && status.server_okay().is_err() {
                         let reply = RpcReply::error(
                             rpc::RpcErrorCode::TooBusy,
                             "Server is too busy. Try again later.",
@@ -392,8 +390,6 @@ where
                         self.state.in_flight.remove(&hash_key);
                         return reply;
                     }
-                }
-            }
         }
 
         let permit = match method.as_str() {
@@ -520,18 +516,17 @@ where
             let targets_validated = match &params {
                 JsonValue::Array(arr) => arr.first()
                     .and_then(|p| if let JsonValue::Object(o) = p { o.get("ledger_index") } else { None })
-                    .map_or(true, |v| matches!(v, JsonValue::String(s) if s == "validated")),
+                    .is_none_or(|v| matches!(v, JsonValue::String(s) if s == "validated")),
                 JsonValue::Object(o) => o.get("ledger_index")
-                    .map_or(true, |v| matches!(v, JsonValue::String(s) if s == "validated")),
+                    .is_none_or(|v| matches!(v, JsonValue::String(s) if s == "validated")),
                 _ => true,
             };
             if targets_validated {
                 etag_val = Some(etag.clone());
-                if let Some(if_none_match) = headers.get(axum::http::header::IF_NONE_MATCH) {
-                    if if_none_match.as_bytes() == etag.as_bytes() {
+                if let Some(if_none_match) = headers.get(axum::http::header::IF_NONE_MATCH)
+                    && if_none_match.as_bytes() == etag.as_bytes() {
                         return StatusCode::NOT_MODIFIED.into_response();
                     }
-                }
             }
         }
 
@@ -604,11 +599,10 @@ where
         )
             .into_response();
 
-        if let Some(etag) = etag_val {
-            if let Ok(etag_header) = axum::http::HeaderValue::from_str(&etag) {
+        if let Some(etag) = etag_val
+            && let Ok(etag_header) = axum::http::HeaderValue::from_str(&etag) {
                 res.headers_mut().insert(axum::http::header::ETAG, etag_header);
             }
-        }
 
         res
     }
@@ -636,13 +630,11 @@ where
             .and_then(|s| s.validated_ledger_hash())
             .map(|h| format!("\"{}\"", h));
         let etag_val = validated_etag.clone();
-        if let Some(ref etag) = validated_etag {
-            if let Some(if_none_match) = headers.get(axum::http::header::IF_NONE_MATCH) {
-                if if_none_match.as_bytes() == etag.as_bytes() {
+        if let Some(ref etag) = validated_etag
+            && let Some(if_none_match) = headers.get(axum::http::header::IF_NONE_MATCH)
+                && if_none_match.as_bytes() == etag.as_bytes() {
                     return StatusCode::NOT_MODIFIED.into_response();
                 }
-            }
-        }
 
         let requests: Vec<Value> = match sonic_rs::from_slice(&body) {
             Ok(v) => v,
@@ -722,11 +714,10 @@ where
         )
             .into_response();
 
-        if let Some(etag) = etag_val {
-            if let Ok(etag_header) = axum::http::HeaderValue::from_str(&etag) {
+        if let Some(etag) = etag_val
+            && let Ok(etag_header) = axum::http::HeaderValue::from_str(&etag) {
                 res.headers_mut().insert(axum::http::header::ETAG, etag_header);
             }
-        }
 
         res
     }

@@ -718,7 +718,7 @@ impl NumberParts {
 
                 // Stage 3: flag trailing remainder for cusp rounding
                 if cusp_fix {
-                    dropped = partial_numerator % dm != 0;
+                    dropped = !partial_numerator.is_multiple_of(dm);
                 }
             }
         }

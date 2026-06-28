@@ -2074,10 +2074,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                             return Ter::TEC_LIMIT_EXCEEDED;
                         }
                         protocol::Asset::MPTIssue(_) => {
-                            let locked_rate = escrow_sle
-                                .is_field_present(sf("sfTransferRate"))
-                                .then(|| escrow_sle.get_field_u32(sf("sfTransferRate")))
-                                .unwrap_or(protocol::PARITY_RATE.value);
+                            let locked_rate = if escrow_sle
+                                .is_field_present(sf("sfTransferRate")) { escrow_sle.get_field_u32(sf("sfTransferRate")) } else { protocol::PARITY_RATE.value };
                             let (net_amount, gross_amount) = escrow_mpt_unlock_amounts(
                                 view,
                                 &amount,
@@ -2676,9 +2674,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     account_holds_amm_asset(view, &amm_account, pool_asset2, sf("sfAmount2"))
                         .unwrap_or_else(|| zero_amount_for_asset(sf("sfAmount2"), pool_asset2));
                 let trading_fee = if lp_tokens.signum() == 0 {
-                    sttx.is_field_present(sf("sfTradingFee"))
-                        .then(|| sttx.get_field_u16(sf("sfTradingFee")))
-                        .unwrap_or(0)
+                    if sttx.is_field_present(sf("sfTradingFee")) { sttx.get_field_u16(sf("sfTradingFee")) } else { 0 }
                 } else {
                     amm_sle.get_field_u16(sf("sfTradingFee"))
                 };
@@ -3671,10 +3667,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 return Ter::TEC_NO_PERMISSION;
             }
             let outstanding = iss_sle.get_field_u64(sf("sfOutstandingAmount"));
-            let locked = iss_sle
-                .is_field_present(sf("sfLockedAmount"))
-                .then(|| iss_sle.get_field_u64(sf("sfLockedAmount")))
-                .unwrap_or(0);
+            let locked = if iss_sle
+                .is_field_present(sf("sfLockedAmount")) { iss_sle.get_field_u64(sf("sfLockedAmount")) } else { 0 };
             if outstanding > 0 || locked != 0 {
                 return Ter::TEC_HAS_OBLIGATIONS;
             }
@@ -3968,10 +3962,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     return Ter::TEC_OBJECT_NOT_FOUND;
                 };
                 if token.get_field_u64(sf("sfMPTAmount")) != 0
-                    || token
-                        .is_field_present(sf("sfLockedAmount"))
-                        .then(|| token.get_field_u64(sf("sfLockedAmount")))
-                        .unwrap_or(0)
+                    || (if token
+                        .is_field_present(sf("sfLockedAmount")) { token.get_field_u64(sf("sfLockedAmount")) } else { 0 })
                         != 0
                 {
                     if view.peek(issuance_keylet).ok().flatten().is_none() {

@@ -116,7 +116,7 @@ fn calculate_account_tweak(generator: [u8; 33], ordinal: u32) -> Option<[u8; 32]
 
     for subseq in 0u32..128 {
         buffer[37..41].copy_from_slice(&subseq.to_be_bytes());
-        let candidate = sha512_half_secure(&buffer);
+        let candidate = sha512_half_secure(buffer);
         if *candidate.data() != [0u8; 32]
             && secp256k1::SecretKey::from_byte_array(*candidate.data()).is_ok()
         {

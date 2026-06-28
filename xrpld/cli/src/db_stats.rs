@@ -61,7 +61,7 @@ pub fn run(url: &str, conf: Option<&str>) -> bool {
                     .as_i64()
                     .and_then(|v| v.try_into().ok())
             })
-            .map(|v| super::format_number(v))
+            .map(super::format_number)
             .unwrap_or_else(|| "—".to_string()),
     );
     kv_json_number_or_string("AL Size", &result["AL_size"]);
@@ -88,13 +88,11 @@ fn find_nudb_path(conf: Option<&str>) -> Option<String> {
             in_node_db = false;
             continue;
         }
-        if in_node_db {
-            if let Some(val) = trimmed.strip_prefix("path") {
-                if let Some(val) = val.trim().strip_prefix('=') {
+        if in_node_db
+            && let Some(val) = trimmed.strip_prefix("path")
+                && let Some(val) = val.trim().strip_prefix('=') {
                     return Some(val.trim().to_string());
                 }
-            }
-        }
     }
     None
 }

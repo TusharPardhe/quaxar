@@ -1401,13 +1401,12 @@ impl NuDbBackend {
         let bulk_importing = self.bulk_importing.load(Ordering::Acquire);
         // Cap cache size to prevent unbounded RAM growth (each bucket ~4KB).
         // During bulk import, keep all buckets in memory — flush handles persistence.
-        if !bulk_importing && self.bucket_cache.len() >= MAX_BUCKET_CACHE_ENTRIES {
-            if let Some(entry) = self.bucket_cache.iter().next() {
+        if !bulk_importing && self.bucket_cache.len() >= MAX_BUCKET_CACHE_ENTRIES
+            && let Some(entry) = self.bucket_cache.iter().next() {
                 let evict_key = *entry.key();
                 drop(entry);
                 self.bucket_cache.remove(&evict_key);
             }
-        }
         self.bucket_cache.insert(bucket_index, bucket.clone());
         // During bulk import, skip disk write — flush_bucket_cache handles it.
         if bulk_importing {
@@ -1615,7 +1614,7 @@ impl NuDbBackend {
         let mut full_buf = vec![0u8; total_size];
         // Fused read: if it fails (e.g. corrupted size causes read past EOF),
         // fall back to reading just the header to produce the correct error.
-        if let Err(_) = self.pread_data(entry.offset, &mut full_buf) {
+        if self.pread_data(entry.offset, &mut full_buf).is_err() {
             let mut hdr = [0u8; 6];
             self.pread_data(entry.offset, &mut hdr)?;
             let mut off = 0usize;
@@ -1745,6 +1744,7 @@ impl NuDbBackend {
         Ok(records)
     }
 
+    #[allow(dead_code)]
     fn scan_indexed_records(&self) -> Result<Vec<(Uint256, Vec<u8>)>, String> {
         let key_header = self.current_key_header()?;
         let key_size = usize::from(key_header.key_size);
@@ -2079,12 +2079,11 @@ impl Backend for NuDbBackend {
                             if entry.hash_prefix != prefix {
                                 break;
                             }
-                            if let Ok(stored_key) = self.read_data_record_key(entry.offset) {
-                                if stored_key == hash.data() {
+                            if let Ok(stored_key) = self.read_data_record_key(entry.offset)
+                                && stored_key == hash.data() {
                                     found_entry = Some(*entry);
                                     break 'search;
                                 }
-                            }
                         }
                     }
 
@@ -2198,12 +2197,11 @@ impl Backend for NuDbBackend {
                 .key_header
                 .expect("nudb runtime header must exist after ensure_primary_bucket")
         };
-        if !bulk_importing {
-            if let Err(error) = self.begin_burst_checkpoint_if_needed(&key_header) {
+        if !bulk_importing
+            && let Err(error) = self.begin_burst_checkpoint_if_needed(&key_header) {
                 self.journal.log(JournalLevel::Error, &error);
                 return;
             }
-        }
         // Use pre-computed compressed data — no re-encoding under the lock.
         let key_size = usize::from(key_header.key_size);
         if encoded.get_key().len() != key_size {
@@ -2242,11 +2240,10 @@ impl Backend for NuDbBackend {
         }
         let size_bytes = compressed.len();
         tracing::debug!(target: "nodestore", hash = %object.hash(), size_bytes, "Node object stored");
-        if !bulk_importing {
-            if let Err(error) = self.finish_burst_write() {
+        if !bulk_importing
+            && let Err(error) = self.finish_burst_write() {
                 self.journal.log(JournalLevel::Error, &error);
             }
-        }
     }
 
     fn store_batch(&self, batch: &Batch) {
@@ -2356,12 +2353,11 @@ impl Backend for NuDbBackend {
             runtime.key_header.expect("header must be present")
         };
 
-        if !bulk_importing {
-            if let Err(error) = self.begin_burst_checkpoint_if_needed(&key_header) {
+        if !bulk_importing
+            && let Err(error) = self.begin_burst_checkpoint_if_needed(&key_header) {
                 self.journal.log(JournalLevel::Error, &error);
                 return;
             }
-        }
 
         for (hash_prefix, size, relative_offset) in entries {
             let entry = NuDbBucketEntry {
@@ -2419,7 +2415,7 @@ impl Backend for NuDbBackend {
             .ok_or_else(|| "NuDB key header missing after ensure_primary_bucket".to_owned())?;
 
         let capacity = u64::from(header.capacity.max(1));
-        let needed_buckets = ((estimated_nodes + capacity - 1) / capacity).max(1) as u32;
+        let needed_buckets = estimated_nodes.div_ceil(capacity).max(1) as u32;
         if needed_buckets > header.buckets {
             let block_size = usize::from(header.block_size);
             let cap = usize::from(header.capacity);

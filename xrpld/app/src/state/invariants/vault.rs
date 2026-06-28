@@ -286,10 +286,10 @@ pub(super) fn vault_may_modify(txn_type: protocol::TxType) -> bool {
     txn_type == protocol::TxType::LOAN_MANAGE
 }
 
-pub(super) fn find_vault_share<'a>(
-    shares: &'a [VaultSharesSnapshot],
+pub(super) fn find_vault_share(
+    shares: &[VaultSharesSnapshot],
     share_mpt_id: MPTID,
-) -> Option<&'a VaultSharesSnapshot> {
+) -> Option<&VaultSharesSnapshot> {
     shares
         .iter()
         .find(|candidate| candidate.share_mpt_id == share_mpt_id)

@@ -128,14 +128,12 @@ impl STObject {
                     // them from wire serialization. Include in reordered.
                 }
                 reordered.push(field);
+            } else if element.style() == SOEStyle::Required {
+                // Required field not in wire data — create with default
+                // value so it's always present for serialization/access.
+                reordered.push(STVar::default_object(element.sfield()));
             } else {
-                if element.style() == SOEStyle::Required {
-                    // Required field not in wire data — create with default
-                    // value so it's always present for serialization/access.
-                    reordered.push(STVar::default_object(element.sfield()));
-                } else {
-                    reordered.push(STVar::non_present_object(element.sfield()));
-                }
+                reordered.push(STVar::non_present_object(element.sfield()));
             }
         }
 

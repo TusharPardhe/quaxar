@@ -968,7 +968,6 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         let (val_notify_tx, val_notify_rx) = std::sync::mpsc::sync_channel::<()>(1);
         // Wire the notify channel into the overlay so on_validation signals us
         if let Some(overlay_rt) = runtime.root().overlay_runtime() {
-            use overlay::Overlay;
             overlay_rt
                 .overlay()
                 .queued_inbound()
@@ -985,7 +984,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                     }
                     let root = validation_runtime.root();
                     let Some(overlay_rt) = root.overlay_runtime() else { continue; };
-                    use overlay::Overlay;
+                    
                     let validations = overlay_rt.overlay().take_validations();
                     for queued in &validations {
                         let mut serial =

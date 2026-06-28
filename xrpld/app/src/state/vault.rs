@@ -940,7 +940,7 @@ pub fn apply_vault_set<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         } else {
             issuance.entry.set_field_h256(sf("sfDomainID"), domain);
         }
-        let ter = persist_issuance(view, &issuance);
+        let ter = persist_issuance(view, issuance);
         if ter != Ter::TES_SUCCESS {
             return ter;
         }

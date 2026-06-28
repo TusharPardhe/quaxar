@@ -190,7 +190,7 @@ pub fn export_snapshot(
     writer
         .write_all(&header)
         .map_err(|e| SnapshotError::io("writing header", e))?;
-    file_hasher.update(&header);
+    file_hasher.update(header);
 
     // Write chunk table
     for meta in &final_manifest.chunks {
@@ -198,7 +198,7 @@ pub fn export_snapshot(
         writer
             .write_all(&entry)
             .map_err(|e| SnapshotError::io("writing chunk table", e))?;
-        file_hasher.update(&entry);
+        file_hasher.update(entry);
     }
 
     // Copy chunk data from temp file into final file

@@ -34,7 +34,7 @@ pub fn load_snapshot(
     reader
         .read_exact(&mut header_buf)
         .map_err(|e| SnapshotError::io("reading header", e))?;
-    file_hasher.update(&header_buf);
+    file_hasher.update(header_buf);
 
     let mut manifest = SnapshotManifest::deserialize_header(&header_buf)?;
 
@@ -59,7 +59,7 @@ pub fn load_snapshot(
         reader
             .read_exact(&mut entry_buf)
             .map_err(|e| SnapshotError::io("reading chunk table", e))?;
-        file_hasher.update(&entry_buf);
+        file_hasher.update(entry_buf);
         manifest
             .chunks
             .push(SnapshotManifest::deserialize_chunk_meta(&entry_buf));

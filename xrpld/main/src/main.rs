@@ -510,13 +510,11 @@ fn resolve_rpc_url(parsed: &xrpld_cli::Cli) -> String {
         }
     });
 
-    if !conf_path.is_empty() {
-        if let Ok(content) = std::fs::read_to_string(conf_path) {
-            if let Some(url) = parse_rpc_url_from_config(&content) {
+    if !conf_path.is_empty()
+        && let Ok(content) = std::fs::read_to_string(conf_path)
+            && let Some(url) = parse_rpc_url_from_config(&content) {
                 return url;
             }
-        }
-    }
 
     parsed.rpc_url.clone()
 }
@@ -542,23 +540,21 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
         }
         if trimmed.starts_with("[port_") {
             // Save previous section if it was HTTP
-            if in_port_section && is_http {
-                if let Some(p) = port {
+            if in_port_section && is_http
+                && let Some(p) = port {
                     let host = rpc_host(ip.as_deref());
                     return Some(format!("http://{}:{}", host, p));
                 }
-            }
             in_port_section = true;
             port = None;
             ip = None;
             is_http = false;
         } else if trimmed.starts_with('[') {
-            if in_port_section && is_http {
-                if let Some(p) = port {
+            if in_port_section && is_http
+                && let Some(p) = port {
                     let host = rpc_host(ip.as_deref());
                     return Some(format!("http://{}:{}", host, p));
                 }
-            }
             in_port_section = false;
         } else if in_port_section {
             if let Some(val) = trimmed.strip_prefix("port") {
@@ -569,21 +565,19 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
                 if let Some(val) = val.trim().strip_prefix('=') {
                     ip = Some(val.trim().to_string());
                 }
-            } else if let Some(val) = trimmed.strip_prefix("protocol") {
-                if let Some(val) = val.trim().strip_prefix('=') {
+            } else if let Some(val) = trimmed.strip_prefix("protocol")
+                && let Some(val) = val.trim().strip_prefix('=') {
                     is_http = val.trim().contains("http");
                 }
-            }
         }
     }
 
     // Check last section
-    if in_port_section && is_http {
-        if let Some(p) = port {
+    if in_port_section && is_http
+        && let Some(p) = port {
             let host = rpc_host(ip.as_deref());
             return Some(format!("http://{}:{}", host, p));
         }
-    }
 
     None
 }
@@ -792,7 +786,7 @@ fn try_cli_subcommand() -> Option<ExitCode> {
             }
             true
         }
-        xrpld_cli::Command::ExportSnapshot { output } => run_export_snapshot(&url, &output),
+        xrpld_cli::Command::ExportSnapshot { output } => run_export_snapshot(url, &output),
         xrpld_cli::Command::LoadSnapshot { input } => {
             run_load_snapshot(&input, parsed.conf.as_deref())
         }
@@ -1468,8 +1462,8 @@ fn try_advance_catchup(
             let mut acquired = 1u32;
             let mut seq = missing.seq + 1;
             while acquired < LEDGER_FETCH_SIZE && seq <= valid_seq {
-                if let Some(hash) = validated.hash_of_seq(seq, &ledger::NullLedgerJournal) {
-                    if !hash.is_zero() {
+                if let Some(hash) = validated.hash_of_seq(seq, &ledger::NullLedgerJournal)
+                    && !hash.is_zero() {
                         inbound_ledgers.acquire(
                             *hash.as_uint256(),
                             seq,
@@ -1477,7 +1471,6 @@ fn try_advance_catchup(
                         );
                         acquired += 1;
                     }
-                }
                 seq += 1;
             }
         }
@@ -1754,8 +1747,8 @@ fn update_operating_mode_after_accepted_ledger(
     // rippled: switchLastClosedLedger — when peers/validations prefer a
     // different ledger, JUMP to it. This is the critical recovery path that
     // prevents the node from getting stuck on a stale chain.
-    if ledger_change {
-        if let Some(lm_rt) = app.ledger_master_runtime() {
+    if ledger_change
+        && let Some(lm_rt) = app.ledger_master_runtime() {
             let our_closed_hash = *accepted_ledger.header().hash.as_uint256();
             let trusted_preferred = app
                 .validations()
@@ -1772,7 +1765,7 @@ fn update_operating_mode_after_accepted_ledger(
             let preferred_hash = preferred_closed_ledger_hash(
                 trusted_preferred,
                 app.validated_ledger_seq().unwrap_or(0),
-                peer_hashes.into_iter(),
+                peer_hashes,
                 our_closed_hash,
                 *accepted_ledger.header().parent_hash.as_uint256(),
                 true,
@@ -1841,7 +1834,6 @@ fn update_operating_mode_after_accepted_ledger(
                 }
             }
         }
-    }
 
     let next_mode = select_post_acquisition_operating_mode(
         current_mode,
@@ -4430,8 +4422,8 @@ impl<D> BoundServerRuntime<D> {
                                 process_queued_validations(&val_app, &val_accept_sink);
                             }
 
-                            if !val_app.need_network_ledger() {
-                            if let Some(rx) = &map_complete_rx {
+                            if !val_app.need_network_ledger()
+                            && let Some(rx) = &map_complete_rx {
                                 while let Ok((hash, set)) = rx.try_recv() {
                                     if let (Some(consensus_runtime), Some(network_ops_runtime)) =
                                         (val_app.consensus_runtime(), val_app.network_ops_runtime())
@@ -4444,11 +4436,10 @@ impl<D> BoundServerRuntime<D> {
                                     }
                                 }
                             }
-                            }
 
                             // Process peer proposals — feed to consensus engine (only after sync)
-                            if !val_app.need_network_ledger() {
-                            if let Some(overlay_runtime) = val_app.overlay_runtime() {
+                            if !val_app.need_network_ledger()
+                            && let Some(overlay_runtime) = val_app.overlay_runtime() {
                                 let proposals = overlay_runtime.overlay().take_proposals();
                                 if !proposals.is_empty()
                                     && let (Some(consensus_runtime), Some(_network_ops_runtime)) =
@@ -4474,18 +4465,16 @@ impl<D> BoundServerRuntime<D> {
                                         }
                                     }
                             }
-                            }
                             // Drive consensus state machine — but only after initial sync.
                             // During cold bootstrap, timer_tick panics because the consensus
                             // tokio::sync::Mutex was created on the main runtime which is
                             // Consensus timer is driven exclusively by the bootstrap loop.
-                            if !val_app.need_network_ledger() {
-                                if let Some(_consensus_runtime) = val_app.consensus_runtime() {
+                            if !val_app.need_network_ledger()
+                                && let Some(_consensus_runtime) = val_app.consensus_runtime() {
                                     let tick_start = Instant::now();
                                     let latency_ms = tick_start.elapsed().as_millis() as u64;
                                     val_app.set_status_rpc_io_latency_ms(Some(latency_ms));
                                 }
-                            }
                             })); // end catch_unwind
                             // Wait for a validation to arrive (instant wake) or
                             // fall through after 500ms for proposal/timer work.
@@ -4963,8 +4952,8 @@ impl<D> BoundServerRuntime<D> {
                     // find them when the consensus engine needs to switch LCL.
                     {
                         let store_results = inbound_ledgers.poll_results();
-                        if !store_results.is_empty() {
-                            if let Some(lm_rt) = app.ledger_master_runtime() {
+                        if !store_results.is_empty()
+                            && let Some(lm_rt) = app.ledger_master_runtime() {
                                 for (_hash, ledger, _skip) in &store_results {
                                     let stored = std::sync::Arc::new(ledger.clone());
                                     lm_rt.ledger_master().ledger_history().insert(
@@ -4973,15 +4962,14 @@ impl<D> BoundServerRuntime<D> {
                                     );
                                 }
                             }
-                        }
                     }
 
                     // Trigger parallel InboundLedger acquisitions for ALL unique
                     // peer hashes we don't have (matching rippled which manages
                     // many concurrent InboundLedgers). This enables catching up
                     // at the rate peers advance rather than one-at-a-time.
-                    if let Some(lm_rt) = app.ledger_master_runtime() {
-                        if let Some(overlay_rt) = app.overlay_runtime() {
+                    if let Some(lm_rt) = app.ledger_master_runtime()
+                        && let Some(overlay_rt) = app.overlay_runtime() {
                             use overlay::Overlay as _;
                             let our_hash = lm_rt.ledger_master().closed_ledger()
                                 .map(|l| *l.header().hash.as_uint256())
@@ -5005,8 +4993,8 @@ impl<D> BoundServerRuntime<D> {
                                 // Per rippled's protocol: send the hash of a ledger the
                                 // PEER has. They diff it against its parent and send back
                                 // the state delta nodes we need.
-                                if let Some(lm_rt) = app.ledger_master_runtime() {
-                                    if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
+                                if let Some(lm_rt) = app.ledger_master_runtime()
+                                    && let Some(closed) = lm_rt.ledger_master().closed_ledger() {
                                         let our_hash = closed.header().hash;
                                         // Use the peer's closed_ledger_hash (they have it)
                                         for p in peers.iter() {
@@ -5025,10 +5013,8 @@ impl<D> BoundServerRuntime<D> {
                                             }
                                         }
                                     }
-                                }
                             }
                         }
-                    }
 
                     if target_seq > 1 {
                         // --- Persistent tick-based acquisition (reference InboundLedger parity) ---
@@ -5617,8 +5603,8 @@ impl<D> BoundServerRuntime<D> {
                         }
 
                         // Re-acquire latest validated target when slot is free
-                        if let Some((target_hash, target_seq)) = last_validated_target {
-                            if target_seq > 1
+                        if let Some((target_hash, target_seq)) = last_validated_target
+                            && target_seq > 1
                                 && inbound_ledgers.active_count() == 0
                                 && !inbound_ledgers.contains(&target_hash)
                             {
@@ -5626,7 +5612,6 @@ impl<D> BoundServerRuntime<D> {
                                 inbound_ledgers.acquire(target_hash, target_seq, validated);
                                 inbound_ledgers.send_peers(&peers);
                             }
-                        }
                     }
 
                     // --- History planner: drive fetch-pack requests when acquisitions stall ---
@@ -6185,15 +6170,14 @@ fn run_export_snapshot(url: &str, output: &str) -> bool {
         Ok(response) => {
             let text = response.text().unwrap_or_default();
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(status) = json["result"]["status"].as_str() {
-                    if status == "started" {
+                if let Some(status) = json["result"]["status"].as_str()
+                    && status == "started" {
                         let seq = json["result"]["ledger_seq"].as_u64().unwrap_or(0);
                         println!("  ✓ Export started (ledger seq: {})", seq);
                         println!("  → Output: {}", output);
                         println!("  → Monitor progress: grep snapshot ~/quaxar.log");
                         return true;
                     }
-                }
                 if let Some(error) = json["result"]["error_message"].as_str() {
                     eprintln!("  ✗ {}", error);
                     return false;

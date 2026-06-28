@@ -1376,7 +1376,7 @@ impl OverlayImpl {
                             .status(403)
                             .body(())
                             .map_err(|e| OverlayError::InvalidRequest(e.to_string()))?;
-                        let response_wire = serialize_response(&response);
+                        let _response_wire = serialize_response(&response);
                         return Ok(());
                     }
                 };

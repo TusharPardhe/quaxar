@@ -94,7 +94,7 @@ impl SnapshotScheduler {
             return false;
         }
 
-        if ledger_seq % self.config.interval != 0 {
+        if !ledger_seq.is_multiple_of(self.config.interval) {
             return false;
         }
 
