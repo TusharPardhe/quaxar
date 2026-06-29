@@ -2268,6 +2268,7 @@ dependencies = [
  "bs58",
  "ed25519-dalek",
  "getrandom 0.3.4",
+ "hex",
  "prost",
  "prost-build",
  "protoc-bin-vendored",
@@ -3085,7 +3086,11 @@ name = "shamap"
 version = "0.1.0"
 dependencies = [
  "basics",
+ "hex",
  "parking_lot",
+ "protocol",
+ "serde",
+ "serde_json",
  "sha2",
  "time",
  "tracing",
