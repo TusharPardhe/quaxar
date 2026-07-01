@@ -338,6 +338,8 @@ pub struct PaymentPreclaimFacts {
     pub domain_id_present: bool,
     pub source_in_domain: bool,
     pub destination_in_domain: bool,
+    pub is_batch_inner: bool,
+    pub batch_v1_1_enabled: bool,
 }
 
 impl PaymentPreclaimFacts {
@@ -358,6 +360,8 @@ impl PaymentPreclaimFacts {
             domain_id_present: false,
             source_in_domain: true,
             destination_in_domain: true,
+            is_batch_inner: false,
+            batch_v1_1_enabled: false,
         }
     }
 }
@@ -371,6 +375,9 @@ pub fn run_payment_preclaim_with_facts(facts: PaymentPreclaimFacts) -> Ter {
         if facts.view_open && partial_payment_allowed {
             return Ter::TEL_NO_DST_PARTIAL;
         }
+        if facts.is_batch_inner && facts.batch_v1_1_enabled && partial_payment_allowed {
+            return Ter::TEF_NO_DST_PARTIAL;
+        }
         if !facts.destination_can_create_with_amount {
             return Ter::TEC_NO_DST_INSUF_XRP;
         }
@@ -378,9 +385,14 @@ pub fn run_payment_preclaim_with_facts(facts: PaymentPreclaimFacts) -> Ter {
         return Ter::TEC_DST_TAG_NEEDED;
     }
 
-    if (facts.has_paths || facts.send_max_present || !facts.dst_amount_native) && facts.view_open {
+    if facts.has_paths || facts.send_max_present || !facts.dst_amount_native {
         if facts.path_count > MAX_PATH_SIZE || facts.path_has_too_long_segment {
-            return Ter::TEL_BAD_PATH_COUNT;
+            if facts.view_open {
+                return Ter::TEL_BAD_PATH_COUNT;
+            }
+            if facts.is_batch_inner && facts.batch_v1_1_enabled {
+                return Ter::TEF_BAD_PATH_COUNT;
+            }
         }
     }
 

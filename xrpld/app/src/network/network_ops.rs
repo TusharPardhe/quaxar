@@ -772,11 +772,11 @@ pub fn networkops_apply_flags(admin: bool, fail_hard: bool) -> ApplyFlags {
 
 pub fn run_networkops_submit_transaction_gate(
     inner_batch_flag_set: bool,
-    feature_batch_enabled: bool,
+    _feature_batch_enabled: bool,
     get_flags: impl FnOnce() -> HashRouterFlags,
     check_validity: impl FnOnce() -> Result<CheckValidityResult, String>,
 ) -> NetworkOpsSubmitDecision {
-    if inner_batch_flag_set && feature_batch_enabled {
+    if inner_batch_flag_set {
         return NetworkOpsSubmitDecision::RejectInnerBatch;
     }
 
@@ -793,7 +793,7 @@ pub fn run_networkops_submit_transaction_gate(
 
 pub fn run_networkops_preprocess_transaction_gate(
     inner_batch_flag_set: bool,
-    feature_batch_enabled: bool,
+    _feature_batch_enabled: bool,
     get_flags: impl FnOnce() -> HashRouterFlags,
     check_validity: impl FnOnce() -> CheckValidityResult,
 ) -> NetworkOpsPreprocessDecision {
@@ -801,7 +801,7 @@ pub fn run_networkops_preprocess_transaction_gate(
         return NetworkOpsPreprocessDecision::RejectCachedBad;
     }
 
-    if inner_batch_flag_set && feature_batch_enabled {
+    if inner_batch_flag_set {
         return NetworkOpsPreprocessDecision::RejectInnerBatch;
     }
 

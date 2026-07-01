@@ -93,6 +93,8 @@ fn preclaim_facts() -> PaymentPreclaimFacts {
         domain_id_present: false,
         source_in_domain: true,
         destination_in_domain: true,
+        is_batch_inner: false,
+        batch_v1_1_enabled: false,
     }
 }
 
