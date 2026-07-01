@@ -643,6 +643,8 @@ fn txq_owner_apply_matches_landed_apply_facade() {
         has_account_txn_id: false,
         last_valid_ledger: Some(250),
         flags: ApplyFlags::FAIL_HARD,
+        has_delegate: false,
+        has_fee_sponsor: false,
     };
     let consequences = TxConsequences::new(1, SeqProxy::sequence(5));
     let mut app_runtime = build_apply_runtime();
