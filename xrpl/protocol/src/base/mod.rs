@@ -3,6 +3,7 @@ pub mod api_version;
 pub mod apply_flags;
 pub mod build_info;
 pub mod concepts;
+pub mod confidential_transfer;
 pub mod feature;
 pub mod hash_prefix;
 pub mod jss;

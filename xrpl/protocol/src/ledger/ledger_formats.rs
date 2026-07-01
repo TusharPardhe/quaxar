@@ -55,6 +55,7 @@ pub const MPT_CAN_ESCROW_LEDGER_FLAG: LedgerFlagValue = 0x0000_0008;
 pub const MPT_CAN_TRADE_LEDGER_FLAG: LedgerFlagValue = 0x0000_0010;
 pub const MPT_CAN_TRANSFER_LEDGER_FLAG: LedgerFlagValue = 0x0000_0020;
 pub const MPT_CAN_CLAWBACK_LEDGER_FLAG: LedgerFlagValue = 0x0000_0040;
+pub const MPT_CAN_HOLD_CONFIDENTIAL_BALANCE_LEDGER_FLAG: LedgerFlagValue = 0x0000_0080;
 
 pub const MPT_CAN_MUTATE_CAN_LOCK_LEDGER_FLAG: LedgerFlagValue = 0x0000_0002;
 pub const MPT_CAN_MUTATE_REQUIRE_AUTH_LEDGER_FLAG: LedgerFlagValue = 0x0000_0004;
@@ -123,6 +124,7 @@ alias_consts!(
     (MPT_CAN_TRADE_LEDGER_FLAG => lsfMPTCanTrade),
     (MPT_CAN_TRANSFER_LEDGER_FLAG => lsfMPTCanTransfer),
     (MPT_CAN_CLAWBACK_LEDGER_FLAG => lsfMPTCanClawback),
+    (MPT_CAN_HOLD_CONFIDENTIAL_BALANCE_LEDGER_FLAG => lsfMPTCanHoldConfidentialBalance),
     (MPT_CAN_MUTATE_CAN_LOCK_LEDGER_FLAG => lsmfMPTCanMutateCanLock),
     (MPT_CAN_MUTATE_REQUIRE_AUTH_LEDGER_FLAG => lsmfMPTCanMutateRequireAuth),
     (MPT_CAN_MUTATE_CAN_ESCROW_LEDGER_FLAG => lsmfMPTCanMutateCanEscrow),

@@ -3566,6 +3566,9 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     fix_cleanup_3_2_0_enabled: view
                         .rules()
                         .enabled(&protocol::feature_id("fixCleanup3_2_0")),
+                    confidential_transfer_enabled: view
+                        .rules()
+                        .enabled(&protocol::feature_id("ConfidentialTransfer")),
                     reference_holding_present: sttx.is_field_present(sf("sfReferenceHolding")),
                     mutable_flags: sttx
                         .is_field_present(sf("sfMutableFlags"))

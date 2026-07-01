@@ -10,20 +10,25 @@ use std::collections::HashSet;
 
 pub const FEATURE_XRP_FEES_NAME: &str = "XRPFees";
 pub const FEATURE_BATCH_NAME: &str = "Batch";
+pub const FEATURE_BATCH_V1_1_NAME: &str = "BatchV1_1";
 pub const FEATURE_AMM_NAME: &str = "AMM";
 pub const FEATURE_XCHAIN_BRIDGE_NAME: &str = "XChainBridge";
 pub const FEATURE_CLAWBACK_NAME: &str = "Clawback";
 pub const FEATURE_TOKEN_ESCROW_NAME: &str = "TokenEscrow";
+pub const FEATURE_CONFIDENTIAL_TRANSFER_NAME: &str = "ConfidentialTransfer";
 pub const FIX_BATCH_INNER_SIGS_NAME: &str = "fixBatchInnerSigs";
 pub const FIX_INNER_OBJ_TEMPLATE_NAME: &str = "fixInnerObjTemplate";
 pub const FIX_INNER_OBJ_TEMPLATE2_NAME: &str = "fixInnerObjTemplate2";
 pub const FIX_PREVIOUS_TXN_ID_NAME: &str = "fixPreviousTxnID";
 pub const FEATURE_LENDING_PROTOCOL_NAME: &str = "LendingProtocol";
+pub const FEATURE_LENDING_PROTOCOL_V1_1_NAME: &str = "LendingProtocolV1_1";
 pub const FEATURE_SINGLE_ASSET_VAULT_NAME: &str = "SingleAssetVault";
 pub const FEATURE_UNIVERSAL_NUMBER_NAME: &str = "fixUniversalNumber";
 pub const FIX_AMMV1_1_NAME: &str = "fixAMMv1_1";
 pub const FIX_AMMV1_3_NAME: &str = "fixAMMv1_3";
 pub const FIX_CLEANUP_3_2_0_NAME: &str = "fixCleanup3_2_0";
+pub const FIX_CLEANUP_3_3_0_NAME: &str = "fixCleanup3_3_0";
+pub const FEATURE_SPONSOR_NAME: &str = "Sponsor";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisteredFeatureVote {
@@ -50,6 +55,16 @@ impl RegisteredFeature {
 }
 
 pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
+    RegisteredFeature::new(
+        FEATURE_BATCH_V1_1_NAME,
+        false,
+        RegisteredFeatureVote::DefaultNo,
+    ),
+    RegisteredFeature::new(
+        "ConfidentialTransfer",
+        false,
+        RegisteredFeatureVote::DefaultNo,
+    ),
     // release-3.1: cleanup for expired NFT offers, MPToken locked amount,
     // credential deletion errors, PermissionedDEX hybrid validation.
     // Enabled on testnet; mark supported so node is not amendment-blocked.
@@ -58,6 +73,11 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
         FIX_CLEANUP_3_2_0_NAME,
         true,
         RegisteredFeatureVote::DefaultYes,
+    ),
+    RegisteredFeature::new(
+        FIX_CLEANUP_3_3_0_NAME,
+        false,
+        RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new("MPTokensV2", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("fixSecurity3_1_3", false, RegisteredFeatureVote::DefaultNo),
@@ -68,6 +88,7 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     ),
     RegisteredFeature::new("fixBatchInnerSigs", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("LendingProtocol", true, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("LendingProtocolV1_1", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "PermissionDelegationV1_1",
         false,
@@ -183,6 +204,7 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
         true,
         RegisteredFeatureVote::DefaultYes,
     ),
+    RegisteredFeature::new("Sponsor", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("fix1201", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("fix1368", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("fix1373", true, RegisteredFeatureVote::Obsolete),
@@ -304,6 +326,10 @@ pub fn feature_batch() -> Uint256 {
     feature_id(FEATURE_BATCH_NAME)
 }
 
+pub fn feature_batch_v1_1() -> Uint256 {
+    feature_id(FEATURE_BATCH_V1_1_NAME)
+}
+
 pub fn feature_amm() -> Uint256 {
     feature_id(FEATURE_AMM_NAME)
 }
@@ -318,6 +344,10 @@ pub fn feature_clawback() -> Uint256 {
 
 pub fn feature_token_escrow() -> Uint256 {
     feature_id(FEATURE_TOKEN_ESCROW_NAME)
+}
+
+pub fn feature_confidential_transfer() -> Uint256 {
+    feature_id(FEATURE_CONFIDENTIAL_TRANSFER_NAME)
 }
 
 pub fn fix_batch_inner_sigs() -> Uint256 {
@@ -338,6 +368,10 @@ pub fn fix_previous_txn_id() -> Uint256 {
 
 pub fn feature_lending_protocol() -> Uint256 {
     feature_id(FEATURE_LENDING_PROTOCOL_NAME)
+}
+
+pub fn feature_lending_protocol_v1_1() -> Uint256 {
+    feature_id(FEATURE_LENDING_PROTOCOL_V1_1_NAME)
 }
 
 pub fn feature_single_asset_vault() -> Uint256 {
@@ -380,6 +414,10 @@ pub fn fix_cleanup_3_2_0() -> Uint256 {
     feature_id(FIX_CLEANUP_3_2_0_NAME)
 }
 
+pub fn fix_cleanup_3_3_0() -> Uint256 {
+    feature_id(FIX_CLEANUP_3_3_0_NAME)
+}
+
 pub fn fix_token_escrow_v1() -> Uint256 {
     feature_id("fixTokenEscrowV1")
 }
@@ -390,6 +428,10 @@ pub fn fix_ammv1_1() -> Uint256 {
 
 pub fn fix_ammv1_3() -> Uint256 {
     feature_id(FIX_AMMV1_3_NAME)
+}
+
+pub fn feature_sponsor() -> Uint256 {
+    feature_id(FEATURE_SPONSOR_NAME)
 }
 
 pub fn registered_feature(feature: &Uint256) -> Option<&'static RegisteredFeature> {

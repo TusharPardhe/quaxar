@@ -9,8 +9,8 @@
 //!   `doApply()`.
 
 use protocol::{
-    NotTec, Ter, tfMPTCanTransfer, tfMPTRequireAuth, tfMPTokenIssuanceCreateMask, tfUniversal,
-    tmfMPTokenIssuanceCreateMutableMask,
+    NotTec, Ter, tfMPTCanHoldConfidentialBalance, tfMPTCanTransfer, tfMPTRequireAuth,
+    tfMPTokenIssuanceCreateMask, tfUniversal, tmfMPTokenIssuanceCreateMutableMask,
 };
 
 pub const MAX_TRANSFER_FEE: u16 = 50_000;
@@ -20,6 +20,7 @@ pub const MAX_MPTOKEN_AMOUNT: u64 = 0x7fff_ffff_ffff_ffff;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MPTokenIssuanceCreatePreflightFacts {
     pub fix_cleanup_3_2_0_enabled: bool,
+    pub confidential_transfer_enabled: bool,
     pub reference_holding_present: bool,
     pub mutable_flags: Option<u32>,
     pub tx_flags: u32,
@@ -110,6 +111,13 @@ pub fn run_mp_token_issuance_create_preflight(
         }
 
         if fee > 0 && (facts.tx_flags & tfMPTCanTransfer) == 0 {
+            return Ter::TEM_MALFORMED;
+        }
+
+        if fee > 0
+            && facts.confidential_transfer_enabled
+            && (facts.tx_flags & tfMPTCanHoldConfidentialBalance) != 0
+        {
             return Ter::TEM_MALFORMED;
         }
     }
