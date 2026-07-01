@@ -960,7 +960,7 @@ mod tests {
         let mpt_id = Uint192::from_slice(&mpt_bytes).expect("mpt id");
         let issue = MPTIssue::new(mpt_id);
 
-        let mut inner = STObject::make_inner_object(get_field_by_symbol("sfMemo"));
+        let mut inner = STObject::new(get_field_by_symbol("sfMemo"));
         inner.set_field_amount(
             get_field_by_symbol("sfAmount"),
             STAmount::from_mpt_amount(

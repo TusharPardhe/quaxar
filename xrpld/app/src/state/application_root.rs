@@ -934,7 +934,7 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
     let sequence_field = get_field_by_symbol("sfSequence");
     let balance_field = get_field_by_symbol("sfBalance");
     let account = tx.get_account_id(account_field);
-    let fee_payer = tx.get_fee_payer();
+    let fee_payer = tx.get_initiator();
     let account_uint160 =
         Uint160::from_slice(account.data()).expect("account width should match Uint160");
     let account_key = account_keylet(account_uint160);
@@ -3202,7 +3202,9 @@ impl ApplicationRoot {
 
     pub fn network_ops_operating_mode_string(&self) -> &'static str {
         let op_mode = self.network_ops_state.operating_mode();
-        if op_mode == crate::network::network_ops::NetworkOpsOperatingMode::Full {
+        if op_mode == crate::network::network_ops::NetworkOpsOperatingMode::Full
+            && self.validation_public_key.is_some()
+        {
             return "proposing";
         }
         self.network_ops_state.str_operating_mode()

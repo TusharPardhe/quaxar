@@ -93,6 +93,8 @@ fn preclaim_facts() -> PaymentPreclaimFacts {
         domain_id_present: false,
         source_in_domain: true,
         destination_in_domain: true,
+        is_batch_inner: false,
+        batch_v1_1_enabled: false,
     }
 }
 
@@ -200,8 +202,12 @@ fn payment_check_permission_follows_delegate_and_granular_rules() {
         payment_mint_permission: false,
         payment_burn_permission: false,
         amount_is_xrp: false,
+        is_mpt: true,
         amount_issuer_is_source: false,
         amount_issuer_is_destination: false,
+        trustline_exists: false,
+        account_is_holder: None,
+        dest_limit_positive: None,
     });
     let mint = run_payment_check_permission(PaymentCheckPermissionFacts {
         delegate_present: true,
@@ -213,8 +219,12 @@ fn payment_check_permission_follows_delegate_and_granular_rules() {
         payment_mint_permission: true,
         payment_burn_permission: false,
         amount_is_xrp: false,
+        is_mpt: true,
         amount_issuer_is_source: true,
         amount_issuer_is_destination: false,
+        trustline_exists: false,
+        account_is_holder: None,
+        dest_limit_positive: None,
     });
     let denied = run_payment_check_permission(PaymentCheckPermissionFacts {
         delegate_present: true,
@@ -226,8 +236,12 @@ fn payment_check_permission_follows_delegate_and_granular_rules() {
         payment_mint_permission: true,
         payment_burn_permission: true,
         amount_is_xrp: false,
+        is_mpt: true,
         amount_issuer_is_source: true,
         amount_issuer_is_destination: true,
+        trustline_exists: false,
+        account_is_holder: None,
+        dest_limit_positive: None,
     });
 
     assert_eq!(missing_delegate, Ter::TER_NO_DELEGATE_PERMISSION);

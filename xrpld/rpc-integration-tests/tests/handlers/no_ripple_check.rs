@@ -102,7 +102,7 @@ fn ledger_data_returns_state_entries() {
         },
         &source,
     );
-    let JsonValue::Object(result) = result else {
+    let rpc::LedgerDataResponse::Json(JsonValue::Object(result)) = result else {
         panic!("object")
     };
 
@@ -133,7 +133,7 @@ fn ledger_data_binary_mode() {
         },
         &source,
     );
-    let JsonValue::Object(result) = result else {
+    let rpc::LedgerDataResponse::Json(JsonValue::Object(result)) = result else {
         panic!("object")
     };
 

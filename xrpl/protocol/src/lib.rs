@@ -33,6 +33,7 @@ pub use base::api_version;
 pub use base::apply_flags;
 pub use base::build_info;
 pub use base::concepts;
+pub use base::confidential_transfer;
 pub use base::feature;
 pub use base::hash_prefix;
 pub use base::jss;
@@ -205,18 +206,23 @@ pub use error_codes::{
     warnRPC_FIELDS_DEPRECATED, warnRPC_UNSUPPORTED_MAJORITY,
 };
 pub use feature::{
-    FEATURE_AMM_NAME, FEATURE_BATCH_NAME, FEATURE_CLAWBACK_NAME, FEATURE_LENDING_PROTOCOL_NAME,
-    FEATURE_SINGLE_ASSET_VAULT_NAME, FEATURE_TOKEN_ESCROW_NAME, FEATURE_UNIVERSAL_NUMBER_NAME,
-    FEATURE_XCHAIN_BRIDGE_NAME, FEATURE_XRP_FEES_NAME, FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME,
-    FIX_BATCH_INNER_SIGS_NAME, FIX_CLEANUP_3_2_0_NAME, FIX_INNER_OBJ_TEMPLATE_NAME,
+    FEATURE_AMM_NAME, FEATURE_BATCH_NAME, FEATURE_BATCH_V1_1_NAME, FEATURE_CLAWBACK_NAME,
+    FEATURE_CONFIDENTIAL_TRANSFER_NAME, FEATURE_LENDING_PROTOCOL_NAME,
+    FEATURE_LENDING_PROTOCOL_V1_1_NAME, FEATURE_SINGLE_ASSET_VAULT_NAME,
+    FEATURE_SPONSOR_NAME, FEATURE_TOKEN_ESCROW_NAME, FEATURE_UNIVERSAL_NUMBER_NAME, FEATURE_XCHAIN_BRIDGE_NAME,
+    FEATURE_XRP_FEES_NAME, FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME, FIX_BATCH_INNER_SIGS_NAME,
+    FIX_CLEANUP_3_2_0_NAME, FIX_CLEANUP_3_3_0_NAME, FIX_INNER_OBJ_TEMPLATE_NAME,
     FIX_INNER_OBJ_TEMPLATE2_NAME, FIX_PREVIOUS_TXN_ID_NAME, FeatureSet, REGISTERED_FEATURES,
-    RegisteredFeature, RegisteredFeatureVote, feature_amm, feature_batch, feature_clawback,
-    feature_deep_freeze, feature_id, feature_lending_protocol, feature_mp_tokens_v1, feature_name,
+    RegisteredFeature, RegisteredFeatureVote, feature_amm, feature_batch, feature_batch_v1_1,
+    feature_clawback, feature_confidential_transfer, feature_deep_freeze, feature_id,
+    feature_lending_protocol, feature_lending_protocol_v1_1, feature_mp_tokens_v1, feature_name,
     feature_nftoken_mint_offer, feature_permissioned_domains, feature_single_asset_vault,
-    feature_token_escrow, feature_universal_number, feature_xchain_bridge, feature_xrp_fees,
+    feature_sponsor, feature_token_escrow, feature_universal_number, feature_xchain_bridge,
+    feature_xrp_fees,
     fix_ammv1_1, fix_ammv1_3, fix_batch_inner_sigs, fix_cleanup_3_1_3, fix_cleanup_3_2_0,
-    fix_enforce_nftoken_trustline_v2, fix_inner_obj_template, fix_inner_obj_template2,
-    fix_nftoken_page_links, fix_previous_txn_id, fix_token_escrow_v1, registered_feature,
+    fix_cleanup_3_3_0, fix_enforce_nftoken_trustline_v2, fix_inner_obj_template,
+    fix_inner_obj_template2, fix_nftoken_page_links, fix_previous_txn_id, fix_token_escrow_v1,
+    registered_feature,
 };
 pub use fees::{calculate_base_fee, calculate_reserve};
 pub use genesis_identity::{
@@ -256,7 +262,8 @@ pub use keylet::{
     nft_sell_offers_keylet, offer_keylet, offer_keylet_from_key, oracle_keylet, owner_dir_keylet,
     page_keylet, pay_channel_keylet, pay_channel_keylet_from_key, permissioned_domain_keylet,
     permissioned_domain_keylet_from_id, quality_from_key, quality_keylet, signers_keylet,
-    signers_keylet_for_page, skip_keylet, skip_keylet_for_ledger, ticket_index,
+    signers_keylet_for_page, skip_keylet, skip_keylet_for_ledger, sponsorship_keylet,
+    sponsorship_keylet_from_key, ticket_index,
     ticket_index_from_seq_proxy, ticket_keylet, ticket_keylet_from_key,
     ticket_keylet_from_seq_proxy, unchecked_keylet, vault_keylet, vault_keylet_from_key,
     xchain_owned_claim_id_keylet, xchain_owned_claim_id_keylet_from_bridge,

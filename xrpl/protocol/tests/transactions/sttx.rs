@@ -83,7 +83,7 @@ fn protocol_sttx_from_stobject_applies_transaction_template() {
     assert_eq!(rebuilt.get_txn_type(), TxType::PAYMENT);
     assert!(rebuilt.is_field_present(get_field_by_symbol("sfAmount")));
     assert_eq!(rebuilt.get_seq_value(), 3);
-    assert_eq!(rebuilt.get_fee_payer(), source);
+    assert_eq!(rebuilt.get_initiator(), source);
 }
 
 #[test]
@@ -160,7 +160,7 @@ fn protocol_sttx_fee_payer_uses_delegate_when_present() {
         tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
     });
 
-    assert_eq!(tx.get_fee_payer(), delegated);
+    assert_eq!(tx.get_initiator(), delegated);
 }
 
 #[test]

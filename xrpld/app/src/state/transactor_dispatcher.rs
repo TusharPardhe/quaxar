@@ -3566,6 +3566,9 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     fix_cleanup_3_2_0_enabled: view
                         .rules()
                         .enabled(&protocol::feature_id("fixCleanup3_2_0")),
+                    confidential_transfer_enabled: view
+                        .rules()
+                        .enabled(&protocol::feature_id("ConfidentialTransfer")),
                     reference_holding_present: sttx.is_field_present(sf("sfReferenceHolding")),
                     mutable_flags: sttx
                         .is_field_present(sf("sfMutableFlags"))
@@ -4650,6 +4653,53 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             }
             let sle = Arc::new(protocol::STLedgerEntry::from_stobject(obj, k.key));
             let _ = view.update(sle);
+            Ter::TES_SUCCESS
+        }
+
+        // --- Confidential MPT ---
+        TxType::CONFIDENTIAL_MPT_CONVERT => {
+            if !view
+                .rules()
+                .enabled(&protocol::feature_id("ConfidentialTransfer"))
+            {
+                return Ter::TEM_DISABLED;
+            }
+            Ter::TES_SUCCESS
+        }
+        TxType::CONFIDENTIAL_MPT_MERGE_INBOX => {
+            if !view
+                .rules()
+                .enabled(&protocol::feature_id("ConfidentialTransfer"))
+            {
+                return Ter::TEM_DISABLED;
+            }
+            Ter::TES_SUCCESS
+        }
+        TxType::CONFIDENTIAL_MPT_CONVERT_BACK => {
+            if !view
+                .rules()
+                .enabled(&protocol::feature_id("ConfidentialTransfer"))
+            {
+                return Ter::TEM_DISABLED;
+            }
+            Ter::TES_SUCCESS
+        }
+        TxType::CONFIDENTIAL_MPT_SEND => {
+            if !view
+                .rules()
+                .enabled(&protocol::feature_id("ConfidentialTransfer"))
+            {
+                return Ter::TEM_DISABLED;
+            }
+            Ter::TES_SUCCESS
+        }
+        TxType::CONFIDENTIAL_MPT_CLAWBACK => {
+            if !view
+                .rules()
+                .enabled(&protocol::feature_id("ConfidentialTransfer"))
+            {
+                return Ter::TEM_DISABLED;
+            }
             Ter::TES_SUCCESS
         }
 

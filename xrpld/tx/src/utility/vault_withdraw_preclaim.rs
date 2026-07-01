@@ -22,6 +22,7 @@ pub fn run_vault_withdraw_preclaim<
     RequireAuth,
     CheckDestinationFrozen,
     CheckSubmitterFrozen,
+    CheckWithdrawFreeze,
 >(
     front_facts: VaultWithdrawPreclaimFrontFacts,
     tail_facts: VaultWithdrawPreclaimTailFacts,
@@ -31,6 +32,7 @@ pub fn run_vault_withdraw_preclaim<
     require_auth: RequireAuth,
     check_destination_frozen: CheckDestinationFrozen,
     check_submitter_share_frozen: CheckSubmitterFrozen,
+    check_withdraw_freeze: CheckWithdrawFreeze,
 ) -> Ter
 where
     CanTransfer: FnOnce() -> Ter,
@@ -39,6 +41,7 @@ where
     RequireAuth: FnOnce(VaultWithdrawRequireAuthType) -> Ter,
     CheckDestinationFrozen: FnOnce() -> Ter,
     CheckSubmitterFrozen: FnOnce() -> Ter,
+    CheckWithdrawFreeze: FnOnce() -> Ter,
 {
     let front = run_vault_withdraw_preclaim_front(
         front_facts,
@@ -55,6 +58,7 @@ where
         require_auth,
         check_destination_frozen,
         check_submitter_share_frozen,
+        check_withdraw_freeze,
     )
 }
 
@@ -86,6 +90,7 @@ mod tests {
             },
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
+            || Ter::TES_SUCCESS,
         );
 
         assert_eq!(result, Ter::TEC_NO_ENTRY);
@@ -109,6 +114,7 @@ mod tests {
             |_| Ter::TEC_NO_AUTH,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
+            || Ter::TES_SUCCESS,
         );
 
         assert_eq!(result, Ter::TEC_NO_AUTH);
@@ -130,6 +136,7 @@ mod tests {
             },
             VaultWithdrawPreclaimTailFacts {
                 destination_is_submitter: false,
+                ..VaultWithdrawPreclaimTailFacts::default()
             },
             {
                 let seen = Rc::clone(&seen);
@@ -176,6 +183,7 @@ mod tests {
                     Ter::TES_SUCCESS
                 }
             },
+            || Ter::TES_SUCCESS,
         );
 
         assert_eq!(result, Ter::TES_SUCCESS);

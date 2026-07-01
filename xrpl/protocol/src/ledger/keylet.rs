@@ -43,6 +43,7 @@ const LEDGER_NAMESPACE_XCHAIN_CREATE_ACCOUNT_CLAIM_ID: u16 = b'K' as u16;
 const LEDGER_NAMESPACE_VAULT: u16 = b'V' as u16;
 const LEDGER_NAMESPACE_LOAN_BROKER: u16 = b'l' as u16;
 const LEDGER_NAMESPACE_LOAN: u16 = b'L' as u16;
+const LEDGER_NAMESPACE_SPONSORSHIP: u16 = b'>' as u16;
 const BOOK_BASE_ISSUE_MPT_TAG: [u8; 1] = [0x01];
 const BOOK_BASE_MPT_ISSUE_TAG: [u8; 1] = [0x02];
 const BOOK_BASE_MPT_MPT_TAG: [u8; 1] = [0x03];
@@ -84,6 +85,7 @@ pub enum LedgerEntryType {
     Vault = 0x0084,
     LoanBroker = 0x0088,
     Loan = 0x0089,
+    Sponsorship = 0x0090,
     Child = 0x1CD2,
 }
 
@@ -177,6 +179,7 @@ impl LedgerEntryType {
             LedgerEntryType::Vault => "Vault",
             LedgerEntryType::LoanBroker => "LoanBroker",
             LedgerEntryType::Loan => "Loan",
+            LedgerEntryType::Sponsorship => "Sponsorship",
             LedgerEntryType::Child => "Child",
         }
     }
@@ -222,6 +225,7 @@ pub fn ledger_entry_type_from_code(code: u16) -> Option<LedgerEntryType> {
         0x0084 => Some(LedgerEntryType::Vault),
         0x0088 => Some(LedgerEntryType::LoanBroker),
         0x0089 => Some(LedgerEntryType::Loan),
+        0x0090 => Some(LedgerEntryType::Sponsorship),
         0x1CD2 => Some(LedgerEntryType::Child),
         _ => None,
     }
@@ -263,6 +267,7 @@ pub fn ledger_entry_type_from_name(name: &str) -> Option<LedgerEntryType> {
         "Vault" => Some(LedgerEntryType::Vault),
         "LoanBroker" => Some(LedgerEntryType::LoanBroker),
         "Loan" => Some(LedgerEntryType::Loan),
+        "Sponsorship" => Some(LedgerEntryType::Sponsorship),
         "Child" => Some(LedgerEntryType::Child),
         _ => None,
     }
@@ -438,6 +443,11 @@ const LEDGER_ENTRY_TYPE_CATALOG: &[LedgerEntryTypeInfo] = &[
         entry_type: LedgerEntryType::Loan,
         code: 0x0089,
         name: "Loan",
+    },
+    LedgerEntryTypeInfo {
+        entry_type: LedgerEntryType::Sponsorship,
+        code: 0x0090,
+        name: "Sponsorship",
     },
     LedgerEntryTypeInfo {
         entry_type: LedgerEntryType::Child,
@@ -948,6 +958,20 @@ pub fn delegate_keylet(account: Uint160, authorized_account: Uint160) -> Keylet 
             &[account.data(), authorized_account.data()],
         ),
     )
+}
+
+pub fn sponsorship_keylet(sponsor: Uint160, sponsee: Uint160) -> Keylet {
+    Keylet::new(
+        LedgerEntryType::Sponsorship,
+        index_hash_with_slices(
+            LEDGER_NAMESPACE_SPONSORSHIP,
+            &[sponsor.data(), sponsee.data()],
+        ),
+    )
+}
+
+pub fn sponsorship_keylet_from_key(key: Uint256) -> Keylet {
+    Keylet::new(LedgerEntryType::Sponsorship, key)
 }
 
 pub fn get_quality_next(index: Uint256) -> Uint256 {

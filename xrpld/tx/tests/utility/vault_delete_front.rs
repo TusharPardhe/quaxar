@@ -23,6 +23,9 @@ fn base_preclaim() -> VaultDeletePreclaimFacts {
 fn vault_delete_preflight_rejects_zero_vault_id() {
     let result = run_vault_delete_preflight(VaultDeletePreflightFacts {
         vault_id_is_zero: true,
+        has_memo_data: false,
+        lending_protocol_v1_1_enabled: false,
+        memo_data_length_valid: true,
     });
 
     assert_eq!(result, Ter::TEM_MALFORMED);

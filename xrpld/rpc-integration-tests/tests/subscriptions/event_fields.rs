@@ -78,7 +78,8 @@ fn subscribe_ledger_stream_receives_close_event() {
     publish_ledger_closed(&subs, 42, &"AB".repeat(32), 5, 777);
 
     let event = rx.try_recv().expect("should receive ledger event");
-    let JsonValue::Object(payload) = event.payload else {
+    let payload_json: JsonValue = serde_json::from_slice(&event.payload).unwrap();
+    let JsonValue::Object(payload) = payload_json else {
         panic!("object")
     };
 
@@ -106,7 +107,8 @@ fn subscribe_transaction_stream_receives_tx_event() {
     );
 
     let event = rx.try_recv().expect("should receive tx event");
-    let JsonValue::Object(payload) = event.payload else {
+    let payload_json: JsonValue = serde_json::from_slice(&event.payload).unwrap();
+    let JsonValue::Object(payload) = payload_json else {
         panic!("object")
     };
 
@@ -146,7 +148,8 @@ fn subscribe_server_stream_receives_fee_change() {
     );
 
     let event = rx.try_recv().expect("should receive server event");
-    let JsonValue::Object(payload) = event.payload else {
+    let payload_json: JsonValue = serde_json::from_slice(&event.payload).unwrap();
+    let JsonValue::Object(payload) = payload_json else {
         panic!("object")
     };
 
@@ -244,7 +247,8 @@ fn subscribe_ledger_close_after_real_accept() {
 
     // Verify event received
     let event = rx.try_recv().expect("should receive ledger close event");
-    let JsonValue::Object(payload) = event.payload else {
+    let payload_json: JsonValue = serde_json::from_slice(&event.payload).unwrap();
+    let JsonValue::Object(payload) = payload_json else {
         panic!("object")
     };
     assert_eq!(
@@ -353,7 +357,8 @@ fn subscribe_transaction_event_has_full_structure() {
     );
 
     let event = rx.try_recv().expect("should receive");
-    let JsonValue::Object(payload) = event.payload else {
+    let payload_json: JsonValue = serde_json::from_slice(&event.payload).unwrap();
+    let JsonValue::Object(payload) = payload_json else {
         panic!("object")
     };
 
@@ -426,7 +431,8 @@ fn subscribe_ledger_event_has_full_structure() {
     );
 
     let event = rx.try_recv().expect("should receive");
-    let JsonValue::Object(payload) = event.payload else {
+    let payload_json: JsonValue = serde_json::from_slice(&event.payload).unwrap();
+    let JsonValue::Object(payload) = payload_json else {
         panic!("object")
     };
 

@@ -383,7 +383,6 @@ pub fn encode_constructor_amendments_entry(entry: &ConstructorAmendmentsEntry) -
 pub fn encode_constructor_fee_settings_entry(entry: ConstructorFeeSettingsEntry) -> Vec<u8> {
     let mut bytes = Vec::new();
     append_u16_field(&mut bytes, SF_LEDGER_ENTRY_TYPE, LT_FEE_SETTINGS);
-    append_u32_field(&mut bytes, SF_FLAGS, 0);
 
     match entry {
         ConstructorFeeSettingsEntry::Legacy {
@@ -392,7 +391,9 @@ pub fn encode_constructor_fee_settings_entry(entry: ConstructorFeeSettingsEntry)
             reserve_base,
             reserve_increment,
         } => {
-            // Canonical order: UINT32 fields (type 2) before UINT64 fields (type 6)
+            // Canonical order: UINT64 fields (type 3) before UINT32 fields (type 2 with
+            // field codes >= 16 which use two-byte encoding sorted after single-byte ids)
+            append_u64_field(&mut bytes, SF_BASE_FEE, base_fee);
             append_u32_field(&mut bytes, SF_REFERENCE_FEE_UNITS, reference_fee_units);
             if let Some(reserve_base) = reserve_base {
                 append_u32_field(&mut bytes, SF_RESERVE_BASE, reserve_base);
@@ -400,7 +401,6 @@ pub fn encode_constructor_fee_settings_entry(entry: ConstructorFeeSettingsEntry)
             if let Some(reserve_increment) = reserve_increment {
                 append_u32_field(&mut bytes, SF_RESERVE_INCREMENT, reserve_increment);
             }
-            append_u64_field(&mut bytes, SF_BASE_FEE, base_fee);
         }
         ConstructorFeeSettingsEntry::XrpDrops {
             base_fee_drops,
@@ -417,6 +417,7 @@ pub fn encode_constructor_fee_settings_entry(entry: ConstructorFeeSettingsEntry)
         }
     }
 
+    bytes.push(OBJECT_END);
     bytes
 }
 
@@ -1741,10 +1742,10 @@ mod tests {
         );
         assert_eq!(decoded.account_id, Some(account_id));
         assert_eq!(decoded.flags, Some(0));
-        assert_eq!(decoded.owner_count, Some(0));
+        assert_eq!(decoded.owner_count, None);
         assert_eq!(decoded.account_txn_id, None);
-        assert_eq!(decoded.previous_txn_id, Some(Uint256::zero()));
-        assert_eq!(decoded.previous_txn_lgr_seq, Some(0));
+        assert_eq!(decoded.previous_txn_id, None);
+        assert_eq!(decoded.previous_txn_lgr_seq, None);
         assert_eq!(decoded.transfer_rate, None);
         assert_eq!(decoded.tick_size, None);
     }

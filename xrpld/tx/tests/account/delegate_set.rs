@@ -1,6 +1,3 @@
-//! Integration tests that pin the narrowed Rust `DelegateSet.cpp` shell to the
-//! current C++ behavior.
-
 use protocol::{Ter, trans_token};
 use tx::{
     DelegateSetApplySink, DelegateSetDeleteSink, DelegateSetPreclaimFacts, PERMISSION_MAX_SIZE,
@@ -11,7 +8,8 @@ use tx::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TestDeleteSink {
     delegate_exists: bool,
-    dir_remove: bool,
+    dir_remove_owner_ok: bool,
+    dir_remove_destination_result: Option<bool>,
     owner_exists: bool,
     events: Vec<String>,
     owner_count_deltas: Vec<i32>,
@@ -22,7 +20,8 @@ impl TestDeleteSink {
     fn new() -> Self {
         Self {
             delegate_exists: true,
-            dir_remove: true,
+            dir_remove_owner_ok: true,
+            dir_remove_destination_result: Some(true),
             owner_exists: true,
             events: Vec::new(),
             owner_count_deltas: Vec::new(),
@@ -37,9 +36,14 @@ impl DelegateSetDeleteSink for TestDeleteSink {
         self.delegate_exists
     }
 
-    fn dir_remove(&mut self) -> bool {
-        self.events.push("dir_remove".to_string());
-        self.dir_remove
+    fn dir_remove_owner(&mut self) -> bool {
+        self.events.push("dir_remove_owner".to_string());
+        self.dir_remove_owner_ok
+    }
+
+    fn dir_remove_destination(&mut self) -> Option<bool> {
+        self.events.push("dir_remove_destination".to_string());
+        self.dir_remove_destination_result
     }
 
     fn owner_exists(&mut self) -> bool {
@@ -63,11 +67,13 @@ struct TestApplySink {
     owner_exists: bool,
     delegate_exists: bool,
     has_reserve: bool,
-    dir_page: Option<u64>,
+    dir_owner_page: Option<u64>,
+    dir_dest_page: Option<u64>,
     events: Vec<String>,
     updated_permissions: Vec<Vec<u32>>,
     staged_permissions: Vec<Vec<u32>>,
     owner_node: Option<u64>,
+    destination_node: Option<u64>,
     inserted: bool,
     owner_count_deltas: Vec<i32>,
 }
@@ -78,11 +84,13 @@ impl TestApplySink {
             owner_exists: true,
             delegate_exists: true,
             has_reserve: true,
-            dir_page: Some(9),
+            dir_owner_page: Some(9),
+            dir_dest_page: Some(11),
             events: Vec::new(),
             updated_permissions: Vec::new(),
             staged_permissions: Vec::new(),
             owner_node: None,
+            destination_node: None,
             inserted: false,
             owner_count_deltas: Vec::new(),
         }
@@ -95,9 +103,14 @@ impl DelegateSetDeleteSink for TestApplySink {
         self.delegate_exists
     }
 
-    fn dir_remove(&mut self) -> bool {
-        self.events.push("dir_remove".to_string());
-        self.dir_page.is_some()
+    fn dir_remove_owner(&mut self) -> bool {
+        self.events.push("dir_remove_owner".to_string());
+        self.dir_owner_page.is_some()
+    }
+
+    fn dir_remove_destination(&mut self) -> Option<bool> {
+        self.events.push("dir_remove_destination".to_string());
+        self.dir_dest_page.map(|_| true)
     }
 
     fn owner_exists(&mut self) -> bool {
@@ -143,14 +156,24 @@ impl DelegateSetApplySink<u32> for TestApplySink {
         self.staged_permissions.push(permissions);
     }
 
-    fn dir_insert_new_delegate(&mut self) -> Option<Self::OwnerNode> {
-        self.events.push("dir_insert".to_string());
-        self.dir_page
+    fn dir_insert_owner(&mut self) -> Option<Self::OwnerNode> {
+        self.events.push("dir_insert_owner".to_string());
+        self.dir_owner_page
     }
 
-    fn set_new_delegate_owner_node(&mut self, page: Self::OwnerNode) {
+    fn set_owner_node(&mut self, page: Self::OwnerNode) {
         self.events.push(format!("owner_node:{page}"));
         self.owner_node = Some(page);
+    }
+
+    fn dir_insert_destination(&mut self) -> Option<Self::OwnerNode> {
+        self.events.push("dir_insert_destination".to_string());
+        self.dir_dest_page
+    }
+
+    fn set_destination_node(&mut self, page: Self::OwnerNode) {
+        self.events.push(format!("destination_node:{page}"));
+        self.destination_node = Some(page);
     }
 
     fn insert_new_delegate(&mut self) {
@@ -184,24 +207,35 @@ fn delegate_set_preclaim_account_target_and_delete_checks() {
     let missing_account = run_delegate_set_preclaim(DelegateSetPreclaimFacts {
         account_exists: false,
         authorize_exists: true,
+        authorize_is_pseudo_account: false,
         permissions_empty: false,
         delegate_exists: true,
     });
     let missing_target = run_delegate_set_preclaim(DelegateSetPreclaimFacts {
         account_exists: true,
         authorize_exists: false,
+        authorize_is_pseudo_account: false,
+        permissions_empty: false,
+        delegate_exists: true,
+    });
+    let pseudo_target = run_delegate_set_preclaim(DelegateSetPreclaimFacts {
+        account_exists: true,
+        authorize_exists: true,
+        authorize_is_pseudo_account: true,
         permissions_empty: false,
         delegate_exists: true,
     });
     let missing_delete_entry = run_delegate_set_preclaim(DelegateSetPreclaimFacts {
         account_exists: true,
         authorize_exists: true,
+        authorize_is_pseudo_account: false,
         permissions_empty: true,
         delegate_exists: false,
     });
 
     assert_eq!(missing_account, Ter::TER_NO_ACCOUNT);
     assert_eq!(missing_target, Ter::TEC_NO_TARGET);
+    assert_eq!(pseudo_target, Ter::TEC_NO_PERMISSION);
     assert_eq!(missing_delete_entry, Ter::TEC_NO_ENTRY);
 }
 
@@ -216,7 +250,8 @@ fn delegate_set_delete_delegate_preserves_cpp_remove_order() {
         sink.events,
         [
             "delegate_exists",
-            "dir_remove",
+            "dir_remove_owner",
+            "dir_remove_destination",
             "owner_exists",
             "adjust:-1",
             "erase"
@@ -236,10 +271,17 @@ fn delegate_set_delete_delegate_maps_current_cpp_failures() {
     );
 
     let mut dir_fail = TestDeleteSink::new();
-    dir_fail.dir_remove = false;
+    dir_fail.dir_remove_owner_ok = false;
     let dir_result = run_delegate_set_delete_delegate(&mut dir_fail);
     assert_eq!(dir_result, Ter::TEF_BAD_LEDGER);
     assert_eq!(trans_token(dir_result), "tefBAD_LEDGER");
+
+    let mut dest_dir_fail = TestDeleteSink::new();
+    dest_dir_fail.dir_remove_destination_result = Some(false);
+    assert_eq!(
+        run_delegate_set_delete_delegate(&mut dest_dir_fail),
+        Ter::TEF_BAD_LEDGER
+    );
 
     let mut missing_owner = TestDeleteSink::new();
     missing_owner.owner_exists = false;
@@ -250,7 +292,7 @@ fn delegate_set_delete_delegate_maps_current_cpp_failures() {
 }
 
 #[test]
-fn delegate_set_do_apply_updates_deletes_and_creates_in() {
+fn delegate_set_do_apply_updates_deletes_and_creates() {
     let mut update_sink = TestApplySink::new();
     let update = run_delegate_set_do_apply(&[5_u32, 7_u32], &mut update_sink);
     assert_eq!(update, Ter::TES_SUCCESS);
@@ -273,7 +315,8 @@ fn delegate_set_do_apply_updates_deletes_and_creates_in() {
             "owner_exists_apply",
             "delegate_exists_apply",
             "delegate_exists_delete",
-            "dir_remove",
+            "dir_remove_owner",
+            "dir_remove_destination",
             "owner_exists_delete",
             "adjust:-1",
             "erase",
@@ -291,8 +334,10 @@ fn delegate_set_do_apply_updates_deletes_and_creates_in() {
             "delegate_exists_apply",
             "has_reserve",
             "stage_new",
-            "dir_insert",
+            "dir_insert_owner",
             "owner_node:9",
+            "dir_insert_destination",
+            "destination_node:11",
             "insert",
             "adjust:1",
         ]
@@ -327,9 +372,17 @@ fn delegate_set_do_apply_maps_current_cpp_create_failures() {
 
     let mut dir_full = TestApplySink::new();
     dir_full.delegate_exists = false;
-    dir_full.dir_page = None;
+    dir_full.dir_owner_page = None;
     assert_eq!(
         run_delegate_set_do_apply(&[1_u32], &mut dir_full),
+        Ter::TEC_DIR_FULL
+    );
+
+    let mut dest_dir_full = TestApplySink::new();
+    dest_dir_full.delegate_exists = false;
+    dest_dir_full.dir_dest_page = None;
+    assert_eq!(
+        run_delegate_set_do_apply(&[1_u32], &mut dest_dir_full),
         Ter::TEC_DIR_FULL
     );
 }

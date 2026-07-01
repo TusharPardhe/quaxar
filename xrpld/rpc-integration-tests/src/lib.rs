@@ -3,3 +3,4 @@
 pub mod env;
 pub mod helpers;
 pub use helpers::*;
+pub use serde_json;

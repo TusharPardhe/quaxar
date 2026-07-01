@@ -206,7 +206,7 @@ pub fn transaction_sign_for<Runtime: RpcRuntime, Source>(
     let signature = sign(&public_key, &secret_key, signing_data.data())
         .map_err(|_| Status::new(RpcErrorCode::Internal))?;
 
-    let signing_for_id = st_tx.get_fee_payer();
+    let signing_for_id = st_tx.get_initiator();
     let mut signers = signer_target_object(&mut st_tx, signature_target)
         .get_field_array(get_field_by_symbol("sfSigners"))
         .iter()

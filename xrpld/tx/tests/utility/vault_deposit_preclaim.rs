@@ -18,6 +18,7 @@ fn vault_deposit_preclaim_rejects_missing_vault() {
         },
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
+        || Ter::TES_SUCCESS,
     );
 
     assert_eq!(result, Ter::TEC_NO_ENTRY);
@@ -38,6 +39,7 @@ fn vault_deposit_preclaim_rejects_asset_mismatch_before_helper_calls() {
             can_transfer_called.set(true);
             Ter::TES_SUCCESS
         },
+        || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
     );
@@ -62,6 +64,7 @@ fn vault_deposit_preclaim_returns_transfer_failure_first() {
             Ter::TES_SUCCESS
         },
         || Ter::TES_SUCCESS,
+        || Ter::TES_SUCCESS,
     );
 
     assert_eq!(result, Ter::TER_NO_RIPPLE);
@@ -78,6 +81,7 @@ fn vault_deposit_preclaim_rejects_vault_share_asset_overlap() {
             vault_share_matches_vault_asset: true,
             ..VaultDepositPreclaimFacts::default()
         },
+        || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
@@ -100,6 +104,7 @@ fn vault_deposit_preclaim_maps_frozen_asset_to_tecfrozen_or_teclocked() {
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
+        || Ter::TES_SUCCESS,
     );
     let non_issue = run_vault_deposit_preclaim(
         VaultDepositPreclaimFacts {
@@ -109,6 +114,7 @@ fn vault_deposit_preclaim_maps_frozen_asset_to_tecfrozen_or_teclocked() {
             vault_asset_frozen_for_account: true,
             ..VaultDepositPreclaimFacts::default()
         },
+        || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
@@ -128,6 +134,7 @@ fn vault_deposit_preclaim_rejects_frozen_shares() {
             vault_share_frozen_for_account: true,
             ..VaultDepositPreclaimFacts::default()
         },
+        || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
@@ -153,6 +160,7 @@ fn vault_deposit_preclaim_requires_domain_for_private_non_owner_vaults() {
             valid_domain_called.set(true);
             Ter::TES_SUCCESS
         },
+        || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
     );
 
@@ -180,6 +188,7 @@ fn vault_deposit_preclaim_suppresses_tecexpired_from_domain_check() {
             require_auth_called.set(true);
             Ter::TES_SUCCESS
         },
+        || Ter::TES_SUCCESS,
     );
 
     assert_eq!(result, Ter::TES_SUCCESS);
@@ -200,6 +209,7 @@ fn vault_deposit_preclaim_returns_domain_or_auth_or_balance_failures() {
         || Ter::TES_SUCCESS,
         || Ter::TEC_OBJECT_NOT_FOUND,
         || Ter::TES_SUCCESS,
+        || Ter::TES_SUCCESS,
     );
     let auth_failure = run_vault_deposit_preclaim(
         VaultDepositPreclaimFacts {
@@ -212,6 +222,7 @@ fn vault_deposit_preclaim_returns_domain_or_auth_or_balance_failures() {
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
         || Ter::TER_NO_ACCOUNT,
+        || Ter::TES_SUCCESS,
     );
     let insufficient_funds = run_vault_deposit_preclaim(
         VaultDepositPreclaimFacts {
@@ -220,6 +231,7 @@ fn vault_deposit_preclaim_returns_domain_or_auth_or_balance_failures() {
             issuance_exists: true,
             ..VaultDepositPreclaimFacts::default()
         },
+        || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
@@ -265,6 +277,7 @@ fn vault_deposit_preclaim_runs_helpers_in_current_on_success() {
                 Ter::TES_SUCCESS
             }
         },
+        || Ter::TES_SUCCESS,
     );
 
     assert_eq!(result, Ter::TES_SUCCESS);

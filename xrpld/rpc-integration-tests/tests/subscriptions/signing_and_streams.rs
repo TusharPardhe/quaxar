@@ -145,7 +145,8 @@ fn sub_sign_2() {
         ])),
     );
     let e = r.try_recv().unwrap();
-    let JsonValue::Object(p) = e.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+    let JsonValue::Object(p) = _payload_json else {
         panic!("")
     };
     assert_eq!(p.get("type"), Some(&sv("ledgerClosed")));
@@ -177,7 +178,8 @@ fn sub_sign_3() {
         ])),
     );
     let e = r.try_recv().unwrap();
-    let JsonValue::Object(p) = e.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+    let JsonValue::Object(p) = _payload_json else {
         panic!("")
     };
     assert_eq!(p.get("type"), Some(&sv("transaction")));
@@ -208,7 +210,8 @@ fn sub_sign_4() {
         ])),
     );
     let e = r.try_recv().unwrap();
-    let JsonValue::Object(p) = e.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+    let JsonValue::Object(p) = _payload_json else {
         panic!("")
     };
     assert_eq!(p.get("type"), Some(&sv("serverStatus")));

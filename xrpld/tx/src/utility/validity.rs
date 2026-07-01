@@ -3,7 +3,7 @@
 //! This ports the deterministic control flow around `checkValidity(...)` and
 //! the flag-promotion logic used by `forceValidity(...)`.
 
-use protocol::{Rules, feature_batch, fix_batch_inner_sigs};
+use protocol::{Rules, feature_batch, feature_batch_v1_1, fix_batch_inner_sigs};
 use xrpl_core::{HashRouterFlags, any, merge_set_flags};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +55,9 @@ pub fn run_check_validity(
     check_sign: impl FnOnce() -> Result<(), String>,
     passes_local_checks: impl FnOnce() -> Result<(), String>,
 ) -> CheckValidityResult {
-    if facts.inner_batch_flag_set && rules.enabled(&feature_batch()) {
+    if facts.inner_batch_flag_set
+        && (rules.enabled(&feature_batch()) || rules.enabled(&feature_batch_v1_1()))
+    {
         if facts.txn_signature_present || !facts.signing_pub_key_empty || facts.signers_present {
             return CheckValidityResult::new(
                 Validity::SigBad,

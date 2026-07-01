@@ -244,7 +244,8 @@ fn subscribe_consensus_stream() {
     );
 
     let event = rx.try_recv().expect("should receive consensus event");
-    let JsonValue::Object(payload) = event.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&event.payload).unwrap();
+    let JsonValue::Object(payload) = _payload_json else {
         panic!("object")
     };
     assert_eq!(
@@ -279,7 +280,8 @@ fn subscribe_manifest_stream() {
     );
 
     let event = rx.try_recv().expect("should receive manifest event");
-    let JsonValue::Object(payload) = event.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&event.payload).unwrap();
+    let JsonValue::Object(payload) = _payload_json else {
         panic!("object")
     };
     assert_eq!(

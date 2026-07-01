@@ -95,7 +95,7 @@ where
     TxSignerAccountFromPublicKey: FnMut(&SignatureObject::TxSigner) -> AccountId,
 {
     let sle = read_account(id_account);
-    if lending_protocol_enabled && is_pseudo_account(sle.as_ref()) {
+    if (lending_protocol_enabled || feature_batch_enabled) && is_pseudo_account(sle.as_ref()) {
         return Ter::TEF_BAD_AUTH;
     }
 

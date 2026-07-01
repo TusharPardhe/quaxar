@@ -109,7 +109,7 @@ fn ledger_entry_type_3() {
     ]));
     m.publish_json(StreamKind::Ledger, payload.clone());
     let e = r.try_recv().unwrap();
-    assert_eq!(e.payload, payload);
+    { let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap(); assert_eq!(parsed, payload); }
 }
 #[test]
 fn ledger_entry_type_4() {
@@ -130,7 +130,7 @@ fn ledger_entry_type_4() {
     ]));
     m.publish_json(StreamKind::Transactions, payload.clone());
     let e = r.try_recv().unwrap();
-    assert_eq!(e.payload, payload);
+    { let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap(); assert_eq!(parsed, payload); }
 }
 #[test]
 fn ledger_entry_type_5() {
@@ -148,7 +148,7 @@ fn ledger_entry_type_5() {
     ]));
     m.publish_json(StreamKind::Server, payload.clone());
     let e = r.try_recv().unwrap();
-    assert_eq!(e.payload, payload);
+    { let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap(); assert_eq!(parsed, payload); }
 }
 #[test]
 fn ledger_entry_type_6() {

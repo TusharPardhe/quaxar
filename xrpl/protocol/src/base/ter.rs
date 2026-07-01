@@ -385,6 +385,12 @@ macro_rules! ter_catalog {
             "temINVALID_INNER_BATCH",
             "Malformed: Invalid inner batch transaction."
         );
+        $macro!(
+            TEM_BAD_CIPHERTEXT,
+            -249,
+            "temBAD_CIPHERTEXT",
+            "Malformed: Invalid ciphertext format."
+        );
 
         $macro!(TEF_FAILURE, -199, "tefFAILURE", "Failed to apply.");
         $macro!(
@@ -508,6 +514,18 @@ macro_rules! ter_catalog {
             "tefINVALID_LEDGER_FIX_TYPE",
             "The LedgerFixType field has an invalid value."
         );
+        $macro!(
+            TEF_NO_DST_PARTIAL,
+            -177,
+            "tefNO_DST_PARTIAL",
+            "Partial payment not allowed to create account."
+        );
+        $macro!(
+            TEF_BAD_PATH_COUNT,
+            -176,
+            "tefBAD_PATH_COUNT",
+            "Too many paths or too long a path."
+        );
 
         $macro!(TER_RETRY, -99, "terRETRY", "Retry transaction.");
         $macro!(TER_FUNDS_SPENT, -98, "terFUNDS_SPENT", "DEPRECATED.");
@@ -573,6 +591,12 @@ macro_rules! ter_catalog {
             -85,
             "terNO_DELEGATE_PERMISSION",
             "Delegated account lacks permission to perform this transaction."
+        );
+        $macro!(
+            TER_NO_SPONSORSHIP,
+            -84,
+            "terNO_SPONSORSHIP",
+            "No sponsorship found."
         );
 
         $macro!(
@@ -1042,6 +1066,18 @@ macro_rules! ter_catalog {
             199,
             "tecNO_ISSUANCE",
             "The specified MPT issuance does not exist."
+        );
+        $macro!(
+            TEC_BAD_PROOF,
+            200,
+            "tecBAD_PROOF",
+            "Zero-knowledge proof verification failed."
+        );
+        $macro!(
+            TEC_NO_SPONSOR_PERMISSION,
+            201,
+            "tecNO_SPONSOR_PERMISSION",
+            "Sponsor does not permit this operation."
         );
     };
 }

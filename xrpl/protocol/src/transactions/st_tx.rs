@@ -222,12 +222,17 @@ impl STTx {
         self.get_seq_proxy().value()
     }
 
-    pub fn get_fee_payer(&self) -> AccountID {
+    pub fn get_initiator(&self) -> AccountID {
         let delegate = get_field_by_symbol("sfDelegate");
         if self.is_field_present(delegate) {
             return self.get_account_id(delegate);
         }
         self.get_account_id(get_field_by_symbol("sfAccount"))
+    }
+
+    #[deprecated(note = "renamed to get_initiator per rippled PR #7603")]
+    pub fn get_fee_payer(&self) -> AccountID {
+        self.get_initiator()
     }
 
     pub fn get_mentioned_accounts(&self) -> BTreeSet<AccountID> {
@@ -436,7 +441,7 @@ impl STTx {
             sig_object as *const STObject,
             &self.object as *const STObject,
         )
-        .then(|| self.get_fee_payer());
+        .then(|| self.get_initiator());
 
         check_signature(
             sig_object,

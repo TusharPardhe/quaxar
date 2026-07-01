@@ -2759,6 +2759,7 @@ dependencies = [
  "ledger",
  "protocol",
  "rpc",
+ "serde_json",
  "server",
  "shamap",
  "tokio",

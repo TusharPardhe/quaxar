@@ -106,12 +106,14 @@ pub const MPT_CAN_ESCROW_FLAG: FlagValue = 0x0000_0008;
 pub const MPT_CAN_TRADE_FLAG: FlagValue = 0x0000_0010;
 pub const MPT_CAN_TRANSFER_FLAG: FlagValue = 0x0000_0020;
 pub const MPT_CAN_CLAWBACK_FLAG: FlagValue = 0x0000_0040;
+pub const MPT_CAN_HOLD_CONFIDENTIAL_BALANCE_FLAG: FlagValue = 0x0000_0080;
 pub const MPT_ISSUANCE_CREATE_FLAGS: FlagValue = MPT_CAN_LOCK_FLAG
     | MPT_REQUIRE_AUTH_FLAG
     | MPT_CAN_ESCROW_FLAG
     | MPT_CAN_TRADE_FLAG
     | MPT_CAN_TRANSFER_FLAG
-    | MPT_CAN_CLAWBACK_FLAG;
+    | MPT_CAN_CLAWBACK_FLAG
+    | MPT_CAN_HOLD_CONFIDENTIAL_BALANCE_FLAG;
 pub const MPT_ISSUANCE_CREATE_FLAGS_MASK: FlagValue =
     transaction_flags_mask(MPT_ISSUANCE_CREATE_FLAGS);
 
@@ -321,6 +323,7 @@ alias_consts!(
     (MPT_CAN_TRADE_FLAG => tfMPTCanTrade),
     (MPT_CAN_TRANSFER_FLAG => tfMPTCanTransfer),
     (MPT_CAN_CLAWBACK_FLAG => tfMPTCanClawback),
+    (MPT_CAN_HOLD_CONFIDENTIAL_BALANCE_FLAG => tfMPTCanHoldConfidentialBalance),
     (MPT_ISSUANCE_CREATE_FLAGS_MASK => tfMPTokenIssuanceCreateMask),
     (MPT_UNAUTHORIZE_FLAG => tfMPTUnauthorize),
     (MPT_UNAUTHORIZE_FLAGS_MASK => tfMPTUnauthorizeMask),
@@ -510,6 +513,7 @@ pub fn get_mpt_issuance_create_flags() -> &'static FlagMap {
             ("tfMPTCanTrade", tfMPTCanTrade),
             ("tfMPTCanTransfer", tfMPTCanTransfer),
             ("tfMPTCanClawback", tfMPTCanClawback),
+            ("tfMPTCanHoldConfidentialBalance", tfMPTCanHoldConfidentialBalance),
         ])
     })
 }
@@ -830,8 +834,8 @@ mod tests {
         assert_eq!(tfTrustLine, NF_TOKEN_TRUST_LINE_FLAG);
         assert_eq!(tfNFTokenMintOldMask, NF_TOKEN_MINT_OLD_FLAGS);
 
-        assert_eq!(MPT_ISSUANCE_CREATE_FLAGS, 0x0000_007e);
-        assert_eq!(MPT_ISSUANCE_CREATE_FLAGS_MASK, 0x3fff_ff81);
+        assert_eq!(MPT_ISSUANCE_CREATE_FLAGS, 0x0000_00fe);
+        assert_eq!(MPT_ISSUANCE_CREATE_FLAGS_MASK, 0x3fff_ff01);
         assert_eq!(tfMPTokenIssuanceCreateMask, MPT_ISSUANCE_CREATE_FLAGS_MASK);
         assert_eq!(MPT_ISSUANCE_SET_FLAGS, 0x0000_0003);
         assert_eq!(MPT_ISSUANCE_SET_FLAGS_MASK, 0x3fff_fffc);

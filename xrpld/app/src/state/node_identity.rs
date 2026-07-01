@@ -2,8 +2,8 @@
 
 use protocol::{
     KeyType, PublicKey, SecretKey, Seed, TokenType, derive_public_key, encode_base58_token,
-    generate_secret_key, parse_base58_node_public, parse_base58_seed, parse_base58_with_type,
-    parse_generic_seed, random_seed,
+    generate_root_secret_key, parse_base58_node_public, parse_base58_seed,
+    parse_base58_with_type, parse_generic_seed, random_seed,
 };
 use rusqlite::OptionalExtension;
 use std::fmt;
@@ -64,7 +64,7 @@ fn derive_identity_from_command_line_seed(seed_text: &str) -> Option<(PublicKey,
 }
 
 fn derive_identity_from_seed(seed: Seed) -> Option<(PublicKey, SecretKey)> {
-    let secret_key = generate_secret_key(KeyType::Secp256k1, &seed).ok()?;
+    let secret_key = generate_root_secret_key(KeyType::Secp256k1, &seed).ok()?;
     let public_key = derive_public_key(KeyType::Secp256k1, &secret_key).ok()?;
     Some((public_key, secret_key))
 }
@@ -101,7 +101,7 @@ pub fn load_or_generate_node_identity(wallet_db: &DatabaseCon) -> (PublicKey, Se
 
     // Generate a new random identity and persist it.
     let seed = random_seed();
-    let sk = generate_secret_key(KeyType::Secp256k1, &seed)
+    let sk = generate_root_secret_key(KeyType::Secp256k1, &seed)
         .expect("secp256k1 key generation must succeed");
     let pk = derive_public_key(KeyType::Secp256k1, &sk)
         .expect("secp256k1 public key derivation must succeed");
@@ -120,7 +120,8 @@ pub fn load_or_generate_node_identity(wallet_db: &DatabaseCon) -> (PublicKey, Se
 mod tests {
     use super::{NodeIdentityOptions, NodeIdentityStore, get_node_identity};
     use protocol::{
-        KeyType, PublicKey, SecretKey, Seed, derive_public_key, generate_secret_key, generate_seed,
+        KeyType, PublicKey, SecretKey, Seed, derive_public_key, generate_root_secret_key,
+        generate_seed,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -187,7 +188,7 @@ mod tests {
 
         let seed = *generate_seed(passphrase).data();
         let expected_seed = Seed::from_slice(&seed).expect("generated seed should keep width");
-        let expected_secret = generate_secret_key(KeyType::Secp256k1, &expected_seed)
+        let expected_secret = generate_root_secret_key(KeyType::Secp256k1, &expected_seed)
             .expect("hashed seed should derive a secret");
         let expected_public =
             derive_public_key(KeyType::Secp256k1, &expected_secret).expect("public key");

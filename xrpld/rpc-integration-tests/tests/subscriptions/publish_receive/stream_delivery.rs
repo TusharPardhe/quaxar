@@ -129,7 +129,8 @@ fn defs_sub_payload_preserved() {
         JsonValue::Object(BTreeMap::from([("key".to_owned(), sv("value"))])),
     );
     let e = rx.try_recv().unwrap();
-    let JsonValue::Object(p) = e.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+    let JsonValue::Object(p) = _payload_json else {
         panic!("obj")
     };
     assert_eq!(p.get("key"), Some(&sv("value")));
@@ -254,7 +255,8 @@ fn defs_ext_43() {
         ])),
     );
     let e = r.try_recv().unwrap();
-    let JsonValue::Object(p) = e.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+    let JsonValue::Object(p) = _payload_json else {
         panic!("")
     };
     assert_eq!(p.get("type"), Some(&sv("ledgerClosed")));
@@ -273,7 +275,8 @@ fn defs_ext_44() {
         ])),
     );
     let e = r.try_recv().unwrap();
-    let JsonValue::Object(p) = e.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+    let JsonValue::Object(p) = _payload_json else {
         panic!("")
     };
     assert_eq!(p.get("type"), Some(&sv("transaction")));
@@ -292,7 +295,8 @@ fn defs_ext_45() {
         ])),
     );
     let e = r.try_recv().unwrap();
-    let JsonValue::Object(p) = e.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+    let JsonValue::Object(p) = _payload_json else {
         panic!("")
     };
     assert_eq!(p.get("type"), Some(&sv("serverStatus")));
@@ -315,7 +319,8 @@ fn defs_flags_14() {
         ])),
     );
     let e = r.try_recv().unwrap();
-    let JsonValue::Object(p) = e.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+    let JsonValue::Object(p) = _payload_json else {
         panic!("")
     };
     assert_eq!(p.get("type"), Some(&sv("ledgerClosed")));
@@ -342,7 +347,8 @@ fn defs_flags_15() {
         ])),
     );
     let e = r.try_recv().unwrap();
-    let JsonValue::Object(p) = e.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+    let JsonValue::Object(p) = _payload_json else {
         panic!("")
     };
     assert_eq!(p.get("type"), Some(&sv("transaction")));
@@ -368,7 +374,8 @@ fn defs_flags_16() {
         ])),
     );
     let e = r.try_recv().unwrap();
-    let JsonValue::Object(p) = e.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+    let JsonValue::Object(p) = _payload_json else {
         panic!("")
     };
     assert_eq!(p.get("type"), Some(&sv("serverStatus")));
@@ -391,7 +398,8 @@ fn defs_flags_17() {
         ])),
     );
     let e = r.try_recv().unwrap();
-    let JsonValue::Object(p) = e.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+    let JsonValue::Object(p) = _payload_json else {
         panic!("")
     };
     assert_eq!(p.get("type"), Some(&sv("validationReceived")));

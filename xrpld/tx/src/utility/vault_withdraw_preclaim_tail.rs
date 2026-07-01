@@ -12,6 +12,7 @@ use protocol::{Ter, is_tes_success};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VaultWithdrawPreclaimTailFacts {
     pub destination_is_submitter: bool,
+    pub fix_cleanup_3_3_0_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,16 +21,23 @@ pub enum VaultWithdrawRequireAuthType {
     StrongAuth,
 }
 
-pub fn run_vault_withdraw_preclaim_tail<RequireAuth, CheckDestinationFrozen, CheckSubmitterFrozen>(
+pub fn run_vault_withdraw_preclaim_tail<
+    RequireAuth,
+    CheckDestinationFrozen,
+    CheckSubmitterFrozen,
+    CheckWithdrawFreeze,
+>(
     facts: VaultWithdrawPreclaimTailFacts,
     require_auth: RequireAuth,
     check_destination_frozen: CheckDestinationFrozen,
     check_submitter_share_frozen: CheckSubmitterFrozen,
+    check_withdraw_freeze: CheckWithdrawFreeze,
 ) -> Ter
 where
     RequireAuth: FnOnce(VaultWithdrawRequireAuthType) -> Ter,
     CheckDestinationFrozen: FnOnce() -> Ter,
     CheckSubmitterFrozen: FnOnce() -> Ter,
+    CheckWithdrawFreeze: FnOnce() -> Ter,
 {
     let auth_type = if facts.destination_is_submitter {
         VaultWithdrawRequireAuthType::WeakAuth
@@ -42,14 +50,21 @@ where
         return ter;
     }
 
-    let ter = check_destination_frozen();
-    if !is_tes_success(ter) {
-        return ter;
-    }
+    if facts.fix_cleanup_3_3_0_enabled {
+        let ter = check_withdraw_freeze();
+        if !is_tes_success(ter) {
+            return ter;
+        }
+    } else {
+        let ter = check_destination_frozen();
+        if !is_tes_success(ter) {
+            return ter;
+        }
 
-    let ter = check_submitter_share_frozen();
-    if !is_tes_success(ter) {
-        return ter;
+        let ter = check_submitter_share_frozen();
+        if !is_tes_success(ter) {
+            return ter;
+        }
     }
 
     Ter::TES_SUCCESS
@@ -73,11 +88,13 @@ mod tests {
         let result = run_vault_withdraw_preclaim_tail(
             VaultWithdrawPreclaimTailFacts {
                 destination_is_submitter: true,
+                ..VaultWithdrawPreclaimTailFacts::default()
             },
             |auth_type| {
                 seen.set(Some(auth_type));
                 Ter::TES_SUCCESS
             },
+            || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
         );
@@ -98,6 +115,7 @@ mod tests {
             },
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
+            || Ter::TES_SUCCESS,
         );
 
         assert_eq!(result, Ter::TES_SUCCESS);
@@ -115,6 +133,7 @@ mod tests {
                 destination_checked.set(true);
                 Ter::TES_SUCCESS
             },
+            || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
         );
 
@@ -135,6 +154,7 @@ mod tests {
                 share_checked.set(true);
                 Ter::TES_SUCCESS
             },
+            || Ter::TES_SUCCESS,
         );
 
         assert_eq!(result, Ter::TEC_FROZEN);
@@ -149,6 +169,7 @@ mod tests {
             |_| Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TEC_LOCKED,
+            || Ter::TES_SUCCESS,
         );
 
         assert_eq!(result, Ter::TEC_LOCKED);
@@ -182,6 +203,7 @@ mod tests {
                     Ter::TES_SUCCESS
                 }
             },
+            || Ter::TES_SUCCESS,
         );
 
         assert_eq!(result, Ter::TES_SUCCESS);
@@ -189,5 +211,30 @@ mod tests {
             seen.borrow().as_slice(),
             ["auth", "destination_frozen", "share_frozen"]
         );
+    }
+
+    #[test]
+    fn vault_withdraw_preclaim_tail_uses_unified_freeze_when_amendment_enabled() {
+        let legacy_called = Cell::new(false);
+
+        let result = run_vault_withdraw_preclaim_tail(
+            VaultWithdrawPreclaimTailFacts {
+                fix_cleanup_3_3_0_enabled: true,
+                ..VaultWithdrawPreclaimTailFacts::default()
+            },
+            |_| Ter::TES_SUCCESS,
+            || {
+                legacy_called.set(true);
+                Ter::TES_SUCCESS
+            },
+            || {
+                legacy_called.set(true);
+                Ter::TES_SUCCESS
+            },
+            || Ter::TEC_FROZEN,
+        );
+
+        assert_eq!(result, Ter::TEC_FROZEN);
+        assert!(!legacy_called.get());
     }
 }

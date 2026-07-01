@@ -836,35 +836,40 @@ impl<'a, V: ApplyView> DelegateSetDeleteSink for ViewBackedDelegateSetSink<'a, V
         self.view.exists(self.keylet()).unwrap_or(false)
     }
 
-    fn dir_remove(&mut self) -> bool {
+    fn dir_remove_owner(&mut self) -> bool {
         let Ok(Some(delegate_sle)) = self.view.peek(self.keylet()) else {
             return false;
         };
 
-        let removed_owner = ledger::dir_remove(
+        ledger::dir_remove(
             self.view,
             &protocol::owner_dir_keylet(to_160(&self.account)),
             delegate_sle.get_field_u64(sf("sfOwnerNode")),
             *delegate_sle.key(),
             false,
         )
-        .unwrap_or(false);
-        if !removed_owner {
-            return false;
+        .unwrap_or(false)
+    }
+
+    fn dir_remove_destination(&mut self) -> Option<bool> {
+        let Ok(Some(delegate_sle)) = self.view.peek(self.keylet()) else {
+            return None;
+        };
+
+        if !delegate_sle.is_field_present(sf("sfDestinationNode")) {
+            return None;
         }
 
-        if delegate_sle.is_field_present(sf("sfDestinationNode")) {
-            return ledger::dir_remove(
+        Some(
+            ledger::dir_remove(
                 self.view,
                 &protocol::owner_dir_keylet(to_160(&self.authorize)),
                 delegate_sle.get_field_u64(sf("sfDestinationNode")),
                 *delegate_sle.key(),
                 false,
             )
-            .unwrap_or(false);
-        }
-
-        true
+            .unwrap_or(false),
+        )
     }
 
     fn owner_exists(&mut self) -> bool {
@@ -940,31 +945,39 @@ impl<'a, V: ApplyView> DelegateSetApplySink<u32> for ViewBackedDelegateSetSink<'
         self.staged_delegate = Some(sle);
     }
 
-    fn dir_insert_new_delegate(&mut self) -> Option<Self::OwnerNode> {
-        let staged_delegate = self.staged_delegate.as_mut()?;
-        let owner_page = ledger::dir_insert(
+    fn dir_insert_owner(&mut self) -> Option<Self::OwnerNode> {
+        let staged_delegate = self.staged_delegate.as_ref()?;
+        ledger::dir_insert(
             self.view,
             &protocol::owner_dir_keylet(to_160(&self.account)),
             *staged_delegate.key(),
             &|_| {},
         )
         .ok()
-        .flatten()?;
-        let destination_page = ledger::dir_insert(
+        .flatten()
+    }
+
+    fn set_owner_node(&mut self, page: Self::OwnerNode) {
+        if let Some(staged_delegate) = self.staged_delegate.as_mut() {
+            staged_delegate.set_field_u64(sf("sfOwnerNode"), page);
+        }
+    }
+
+    fn dir_insert_destination(&mut self) -> Option<Self::OwnerNode> {
+        let staged_delegate = self.staged_delegate.as_ref()?;
+        ledger::dir_insert(
             self.view,
             &protocol::owner_dir_keylet(to_160(&self.authorize)),
             *staged_delegate.key(),
             &|_| {},
         )
         .ok()
-        .flatten()?;
-        staged_delegate.set_field_u64(sf("sfDestinationNode"), destination_page);
-        Some(owner_page)
+        .flatten()
     }
 
-    fn set_new_delegate_owner_node(&mut self, page: Self::OwnerNode) {
+    fn set_destination_node(&mut self, page: Self::OwnerNode) {
         if let Some(staged_delegate) = self.staged_delegate.as_mut() {
-            staged_delegate.set_field_u64(sf("sfOwnerNode"), page);
+            staged_delegate.set_field_u64(sf("sfDestinationNode"), page);
         }
     }
 

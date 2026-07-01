@@ -134,6 +134,11 @@ fn vault_delete_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
 
     run_vault_delete_preflight(VaultDeletePreflightFacts {
         vault_id_is_zero: sttx.get_field_h256(sf("sfVaultID")).is_zero(),
+        has_memo_data: sttx.is_field_present(sf("sfMemoData")),
+        lending_protocol_v1_1_enabled: feature_enabled(view, "LendingProtocolV1_1"),
+        memo_data_length_valid: !sttx.is_field_present(sf("sfMemoData"))
+            || data_len(sttx, sf("sfMemoData"))
+                .map_or(true, |len| len <= tx::VAULT_DELETE_MAX_DATA_PAYLOAD_LENGTH),
     })
 }
 

@@ -35,6 +35,7 @@ pub mod persistence;
 pub mod ripple_calc;
 pub mod ripple_state_helpers;
 pub mod setup;
+pub mod sponsor_helpers;
 pub mod timeout_counter;
 pub mod token_helpers;
 pub mod transaction_state_sf;

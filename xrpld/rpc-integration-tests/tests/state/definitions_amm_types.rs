@@ -129,7 +129,7 @@ fn tx_type_code_8() {
     ]));
     m.publish_json(StreamKind::Ledger, p.clone());
     let e = r.try_recv().unwrap();
-    assert_eq!(e.payload, p);
+    { let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap(); assert_eq!(parsed, p); }
     assert_eq!(e.stream, StreamKind::Ledger);
 }
 #[test]
@@ -144,7 +144,7 @@ fn tx_type_code_9() {
     ]));
     m.publish_json(StreamKind::Transactions, p.clone());
     let e = r.try_recv().unwrap();
-    assert_eq!(e.payload, p);
+    { let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap(); assert_eq!(parsed, p); }
     assert_eq!(e.stream, StreamKind::Transactions);
 }
 #[test]
@@ -159,6 +159,6 @@ fn tx_type_code_10() {
     ]));
     m.publish_json(StreamKind::Server, p.clone());
     let e = r.try_recv().unwrap();
-    assert_eq!(e.payload, p);
+    { let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap(); assert_eq!(parsed, p); }
     assert_eq!(e.stream, StreamKind::Server);
 }
