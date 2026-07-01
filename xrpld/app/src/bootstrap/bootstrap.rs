@@ -1400,6 +1400,9 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 {
                     // Request: peer asks us for a fetch pack (matching rippled doFetchPack/makeFetchPack).
                     serve_fetch_pack_request(root, &overlay_rt, msg_envelope);
+                } else {
+                    // Generic GetObjectByHash query (state/tx/ledger nodes).
+                    serve_get_object_by_hash_request(root, &overlay_rt, msg_envelope);
                 }
             }
         }
@@ -1790,6 +1793,181 @@ fn serve_fetch_pack_request(
         ledger_hash: Some(ledger_hash_bytes.to_vec()),
         fat: None,
         objects,
+    };
+
+    let response = overlay::ProtocolMessage::new(overlay::ProtocolPayload::GetObjects(reply));
+    let message = overlay::Message::new(response, None);
+    if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
+        peer.send(message);
+    }
+}
+
+// --- GetObjectByHash rate limiting constants (matching rippled Tuning.h) ---
+
+/// Hard ceiling: reject requests asking for more than this many objects.
+const HARD_MAX_REPLY_NODES: usize = 12_288;
+
+/// First N objects per request are free (no cost charged).
+const FREE_OBJECTS_PER_REQUEST: u32 = 16;
+
+/// Cost per billable lookup that hits the cache/node store.
+const COST_PER_LOOKUP_HIT: u32 = 1;
+
+/// Cost per billable lookup that misses (not found in node store).
+const COST_PER_LOOKUP_MISS: u32 = 8;
+
+/// Size band boundary: requests with ≤64 objects are "small".
+const BAND_SMALL_MAX: usize = 64;
+
+/// Size band boundary: requests with ≤1024 objects are "medium".
+const BAND_MEDIUM_MAX: usize = 1024;
+
+/// Surcharge for small requests (none).
+const COST_BAND_SMALL: u32 = 0;
+
+/// Surcharge for medium-sized requests.
+const COST_BAND_MEDIUM: u32 = 100;
+
+/// Surcharge for large requests (>1024 objects).
+const COST_BAND_LARGE: u32 = 1000;
+
+/// If the computed cost exceeds this threshold, charge and warn about the peer.
+const DROP_THRESHOLD: u32 = 25_000;
+
+/// Serve a generic GetObjectByHash query from a peer (matching rippled processGetObjectByHash).
+///
+/// Looks up each requested hash in the node store, tracks hits/misses, applies
+/// differential pricing, and sends a reply. Oversized requests are rejected
+/// immediately. Excessively costly requests charge the peer.
+fn serve_get_object_by_hash_request(
+    root: &crate::ApplicationRoot,
+    overlay_rt: &Arc<crate::runtime::overlay_runtime::AppOverlayRuntime>,
+    req: &overlay::PeerMessage<overlay::TmGetObjectByHash>,
+) {
+    use overlay::Overlay;
+
+    let msg = &req.message;
+    let requested = msg.objects.len();
+
+    // Hard limit: reject oversized requests before touching the node store.
+    if requested > HARD_MAX_REPLY_NODES {
+        tracing::warn!(target: "overlay",
+            peer_id = req.peer_id,
+            requested,
+            limit = HARD_MAX_REPLY_NODES,
+            "GetObjectByHash: oversized request rejected"
+        );
+        return;
+    }
+
+    let Some(node_store) = root.node_store().as_ref() else {
+        return;
+    };
+
+    let mut reply_objects: Vec<overlay::message::wire::TmIndexedObject> = Vec::new();
+    let mut hits: u32 = 0;
+    let mut misses: u32 = 0;
+
+    let iter_limit = requested.min(HARD_MAX_REPLY_NODES);
+    for obj in msg.objects.iter().take(iter_limit) {
+        let Some(hash_bytes) = obj.hash.as_deref() else {
+            misses += 1;
+            continue;
+        };
+        let Some(hash) = Uint256::from_slice(hash_bytes) else {
+            misses += 1;
+            continue;
+        };
+
+        let ledger_seq = obj.ledger_seq.unwrap_or(0);
+        let fetched = match node_store {
+            crate::SHAMapStoreNodeStore::Single(database) => {
+                database.fetch_node_object(&hash, ledger_seq, FetchType::Synchronous, false)
+            }
+            crate::SHAMapStoreNodeStore::Rotating(database) => {
+                database.fetch_node_object(&hash, ledger_seq, FetchType::Synchronous, false)
+            }
+        };
+
+        if let Some(node_object) = fetched {
+            hits += 1;
+            reply_objects.push(overlay::message::wire::TmIndexedObject {
+                hash: Some(hash.data().to_vec()),
+                node_id: None,
+                index: obj.node_id.clone(),
+                data: Some(node_object.data().clone()),
+                ledger_seq: obj.ledger_seq,
+            });
+        } else {
+            misses += 1;
+        }
+    }
+
+    // Compute differential cost (matching rippled computeGetObjectByHashFee).
+    let billable = (requested as u32).saturating_sub(FREE_OBJECTS_PER_REQUEST);
+    let billable_misses = misses.min(billable);
+    let billable_hits = billable.saturating_sub(billable_misses);
+
+    let size_band = if requested > BAND_MEDIUM_MAX {
+        COST_BAND_LARGE
+    } else if requested > BAND_SMALL_MAX {
+        COST_BAND_MEDIUM
+    } else {
+        COST_BAND_SMALL
+    };
+
+    let cost =
+        billable_hits * COST_PER_LOOKUP_HIT + billable_misses * COST_PER_LOOKUP_MISS + size_band;
+
+    if cost > DROP_THRESHOLD {
+        tracing::warn!(target: "overlay",
+            peer_id = req.peer_id,
+            requested,
+            hits,
+            misses,
+            cost,
+            threshold = DROP_THRESHOLD,
+            "GetObjectByHash: cost exceeds drop threshold, charging peer"
+        );
+        if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
+            peer.charge(
+                resource::Charge::new(cost as i32, "GetObjectByHash excessive cost"),
+                "GetObjectByHash cost exceeded drop threshold".to_owned(),
+            );
+            overlay_rt.overlay().inc_peer_disconnect_charges();
+        }
+        return;
+    }
+
+    // Charge the peer with the computed cost.
+    if cost > 0 {
+        if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
+            peer.charge(
+                resource::Charge::new(cost as i32, "GetObjectByHash differential"),
+                "processed get object by hash request".to_owned(),
+            );
+        }
+    }
+
+    // Send reply only if we found at least one object.
+    if reply_objects.is_empty() {
+        return;
+    }
+
+    tracing::trace!(target: "overlay",
+        peer_id = req.peer_id,
+        found = reply_objects.len(),
+        requested,
+        cost,
+        "GetObjectByHash: serving reply"
+    );
+
+    let reply = overlay::TmGetObjectByHash {
+        r#type: msg.r#type,
+        query: false,
+        ledger_hash: msg.ledger_hash.clone(),
+        fat: msg.fat,
+        objects: reply_objects,
     };
 
     let response = overlay::ProtocolMessage::new(overlay::ProtocolPayload::GetObjects(reply));
