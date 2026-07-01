@@ -11,6 +11,7 @@ mod directory;
 mod entry;
 mod lending;
 mod mpt;
+mod object_deletion;
 mod permissioned_dex;
 mod permissioned_domain;
 mod vault;
@@ -22,6 +23,7 @@ use directory::*;
 use entry::*;
 use lending::*;
 use mpt::*;
+use object_deletion::*;
 use permissioned_dex::*;
 use permissioned_domain::*;
 use vault::*;
@@ -135,6 +137,10 @@ fn check_invariants_inner<V: ApplyView>(
     let mut vault = VaultState::default();
     let mut lending = LendingState::default();
     let mut clawback = ClawbackState::default();
+    let mut object_deletion = ObjectDeletionState::default();
+    let fix_cleanup_3_3_0 = sandbox
+        .rules()
+        .enabled(&protocol::fix_cleanup_3_3_0());
 
     for (index, entry) in sandbox.items() {
         let is_delete = entry.action == Action::Erase;
@@ -163,7 +169,11 @@ fn check_invariants_inner<V: ApplyView>(
         if is_delete {
             let sle_to_delete = before_sle.unwrap_or(&*entry.sle);
             if sle_to_delete.get_type() == LedgerEntryType::AccountRoot {
-                if txn_type != protocol::TxType::ACCOUNT_DELETE {
+                if txn_type != protocol::TxType::ACCOUNT_DELETE
+                    && txn_type != protocol::TxType::VAULT_DELETE
+                    && txn_type != protocol::TxType::LOAN_BROKER_DELETE
+                    && txn_type != protocol::TxType::AMM_DELETE
+                {
                     return Ter::TEC_INVARIANT_FAILED;
                 }
             }
@@ -209,6 +219,10 @@ fn check_invariants_inner<V: ApplyView>(
             record_permissioned_dex(&mut permissioned_dex, is_delete, before_sle, after_sle);
         }
         record_clawback_state(&mut clawback, before_sle);
+
+        if fix_cleanup_3_3_0 {
+            record_object_deletion_state(&mut object_deletion, is_delete, before_sle);
+        }
 
         if fix_cleanup_3_2_0 {
             let deleted_sle = before_sle.unwrap_or(&entry.sle);
@@ -477,6 +491,10 @@ fn check_invariants_inner<V: ApplyView>(
             &vault,
         )
     {
+        return Ter::TEC_INVARIANT_FAILED;
+    }
+
+    if fix_cleanup_3_3_0 && !validates_object_deletion(sandbox, &object_deletion) {
         return Ter::TEC_INVARIANT_FAILED;
     }
 
