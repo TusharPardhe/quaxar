@@ -3,7 +3,7 @@
 use crate::{
     ApplyContext, ApplyResult, PreclaimContext, PreflightContext, TransactorPreflight0Facts,
     TransactorPreflight1Facts, TransactorPreflight2Facts,
-    dex::{BookStepImpl, flow_cross},
+    dex::{BookStepImpl, flow_cross, get_transfer_rate_for_asset},
     run_transactor_preflight0, run_transactor_preflight1, run_transactor_preflight2,
 };
 use basics::base_uint::Uint160;
@@ -168,11 +168,15 @@ where
         (taker_pays.clone(), taker_gets.clone())
     } else {
         let mut book_step = BookStepImpl::new(reverse_book);
+        // Always charge transfer fee on the output asset (PR #7422 parity).
+        // The taker_pays asset is the output of the reverse book crossing.
+        let transfer_rate_out = get_transfer_rate_for_asset(ctx.view_mut(), taker_pays.asset());
         let cross_result = match flow_cross(
             ctx.view_mut(),
             &mut book_step,
             taker_pays.clone(),
             taker_gets.clone(),
+            transfer_rate_out,
         ) {
             Ok(res) => res,
             Err(_) => return ApplyResult::new(Ter::TEF_FAILURE, false, false),
