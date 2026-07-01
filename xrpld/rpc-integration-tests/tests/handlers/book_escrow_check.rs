@@ -319,7 +319,8 @@ fn subscribe_book_changes_stream() {
     );
 
     let event = rx.try_recv().expect("should receive book_changes");
-    let JsonValue::Object(payload) = event.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&event.payload).unwrap();
+    let JsonValue::Object(payload) = _payload_json else {
         panic!("object")
     };
     assert_eq!(
@@ -370,7 +371,8 @@ fn subscribe_validation_stream() {
     );
 
     let event = rx.try_recv().expect("should receive validation");
-    let JsonValue::Object(payload) = event.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&event.payload).unwrap();
+    let JsonValue::Object(payload) = _payload_json else {
         panic!("object")
     };
     assert_eq!(

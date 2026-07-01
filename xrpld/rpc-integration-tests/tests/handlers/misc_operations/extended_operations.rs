@@ -99,7 +99,7 @@ fn defs_ext_95() {
     let a = TestAccount::new("d95");
     let e = RpcTestEnv::new(&[(&a, 5_000_000_000)]);
     let s = e.rpc_source();
-    let JsonValue::Object(r) = rpc::do_ledger_data(
+    let rpc::LedgerDataResponse::Json(JsonValue::Object(r)) = rpc::do_ledger_data(
         &rpc::LedgerDataRequest {
             params: &json([("ledger_index", sv("current"))]),
             api_version: 1,
@@ -205,7 +205,7 @@ fn defs_fmt_46() {
     let a = TestAccount::new("c46");
     let e = RpcTestEnv::new(&[(&a, 5_000_000_000)]);
     let s = e.rpc_source();
-    let JsonValue::Object(r) = rpc::do_ledger_data(
+    let rpc::LedgerDataResponse::Json(JsonValue::Object(r)) = rpc::do_ledger_data(
         &rpc::LedgerDataRequest {
             params: &json([("ledger_index", sv("current"))]),
             api_version: 1,

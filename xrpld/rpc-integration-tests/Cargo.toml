@@ -14,6 +14,7 @@ rpc = { path = "../rpc" }
 server = { path = "../server" }
 shamap = { path = "../../xrpl/shamap" }
 tx = { path = "../tx" }
+serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
 
 [lib]

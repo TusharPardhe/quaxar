@@ -102,7 +102,7 @@ fn ledger_data_shows_account_roots_after_funding() {
         },
         &source,
     );
-    let JsonValue::Object(result) = result else {
+    let rpc::LedgerDataResponse::Json(JsonValue::Object(result)) = result else {
         panic!("object")
     };
 

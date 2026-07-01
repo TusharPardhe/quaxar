@@ -182,7 +182,8 @@ fn subscribe_peer_status_stream() {
         ])),
     );
     let event = rx.try_recv().expect("should receive");
-    let JsonValue::Object(p) = event.payload else {
+    let _payload_json: JsonValue = serde_json::from_slice(&event.payload).unwrap();
+    let JsonValue::Object(p) = _payload_json else {
         panic!("object")
     };
     assert_eq!(
@@ -215,10 +216,12 @@ fn subscribe_multiple_receivers_same_stream() {
 
     let e1 = rx1.try_recv().expect("rx1 should receive");
     let e2 = rx2.try_recv().expect("rx2 should receive");
-    let JsonValue::Object(p1) = e1.payload else {
+    let _p1_json: JsonValue = serde_json::from_slice(&e1.payload).unwrap();
+    let JsonValue::Object(p1) = _p1_json else {
         panic!("object")
     };
-    let JsonValue::Object(p2) = e2.payload else {
+    let _p2_json: JsonValue = serde_json::from_slice(&e2.payload).unwrap();
+    let JsonValue::Object(p2) = _p2_json else {
         panic!("object")
     };
     assert_eq!(p1.get("ledger_index"), Some(&JsonValue::Unsigned(99)));
