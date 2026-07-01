@@ -49,7 +49,6 @@ pub fn reserve_sponsor_allowed_tx_types() -> &'static [TxType] {
         TxType::CREDENTIAL_DELETE,
         TxType::ACCOUNT_SET,
         TxType::REGULAR_KEY_SET,
-        TxType::SPONSORSHIP_TRANSFER,
     ]
 }
 

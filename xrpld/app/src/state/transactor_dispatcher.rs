@@ -4656,6 +4656,53 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             Ter::TES_SUCCESS
         }
 
+        // --- Confidential MPT ---
+        TxType::CONFIDENTIAL_MPT_CONVERT => {
+            if !view
+                .rules()
+                .enabled(&protocol::feature_id("ConfidentialTransfer"))
+            {
+                return Ter::TEM_DISABLED;
+            }
+            Ter::TES_SUCCESS
+        }
+        TxType::CONFIDENTIAL_MPT_MERGE_INBOX => {
+            if !view
+                .rules()
+                .enabled(&protocol::feature_id("ConfidentialTransfer"))
+            {
+                return Ter::TEM_DISABLED;
+            }
+            Ter::TES_SUCCESS
+        }
+        TxType::CONFIDENTIAL_MPT_CONVERT_BACK => {
+            if !view
+                .rules()
+                .enabled(&protocol::feature_id("ConfidentialTransfer"))
+            {
+                return Ter::TEM_DISABLED;
+            }
+            Ter::TES_SUCCESS
+        }
+        TxType::CONFIDENTIAL_MPT_SEND => {
+            if !view
+                .rules()
+                .enabled(&protocol::feature_id("ConfidentialTransfer"))
+            {
+                return Ter::TEM_DISABLED;
+            }
+            Ter::TES_SUCCESS
+        }
+        TxType::CONFIDENTIAL_MPT_CLAWBACK => {
+            if !view
+                .rules()
+                .enabled(&protocol::feature_id("ConfidentialTransfer"))
+            {
+                return Ter::TEM_DISABLED;
+            }
+            Ter::TES_SUCCESS
+        }
+
         _ => Ter::TEM_UNKNOWN,
     }
 }

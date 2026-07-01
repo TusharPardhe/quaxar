@@ -1016,33 +1016,6 @@ pub(crate) const TX_FORMAT_SPECS: &[TxFormatSpecInit] = &[
         ],
     },
     TxFormatSpecInit {
-        tag_name: "ttSPONSORSHIP_TRANSFER",
-        value: 85,
-        name: "SponsorshipTransfer",
-        delegable: "Delegation::Delegable",
-        amendment: "featureSponsor",
-        privileges: "mayModifyVault",
-        field_specs: &[
-            FormatFieldSpec { field_symbol: "sfObjectID", style: SOEStyle::Optional, mpt: SOETxMPTIssue::None },
-            FormatFieldSpec { field_symbol: "sfSponsee", style: SOEStyle::Optional, mpt: SOETxMPTIssue::None },
-        ],
-    },
-    TxFormatSpecInit {
-        tag_name: "ttSPONSORSHIP_SET",
-        value: 86,
-        name: "SponsorshipSet",
-        delegable: "Delegation::Delegable",
-        amendment: "featureSponsor",
-        privileges: "noPriv",
-        field_specs: &[
-            FormatFieldSpec { field_symbol: "sfCounterpartySponsor", style: SOEStyle::Optional, mpt: SOETxMPTIssue::None },
-            FormatFieldSpec { field_symbol: "sfSponsee", style: SOEStyle::Optional, mpt: SOETxMPTIssue::None },
-            FormatFieldSpec { field_symbol: "sfFeeAmount", style: SOEStyle::Optional, mpt: SOETxMPTIssue::None },
-            FormatFieldSpec { field_symbol: "sfMaxFee", style: SOEStyle::Optional, mpt: SOETxMPTIssue::None },
-            FormatFieldSpec { field_symbol: "sfRemainingOwnerCount", style: SOEStyle::Optional, mpt: SOETxMPTIssue::None },
-        ],
-    },
-    TxFormatSpecInit {
         tag_name: "ttAMENDMENT",
         value: 100,
         name: "EnableAmendment",

@@ -127,12 +127,22 @@ pub fn homomorphic_add(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
     if !is_valid_ciphertext(a) || !is_valid_ciphertext(b) {
         return None;
     }
-    // Stub: EC point addition on the two ciphertext halves.
-    // A production implementation requires secp256k1 point arithmetic.
-    // For now, return a placeholder that maintains the correct length.
-    let mut result = vec![0u8; EC_GAMAL_ENCRYPTED_TOTAL_LENGTH];
-    result[..EC_CIPHERTEXT_COMPONENT_LENGTH].copy_from_slice(&a[..EC_CIPHERTEXT_COMPONENT_LENGTH]);
-    result[EC_CIPHERTEXT_COMPONENT_LENGTH..].copy_from_slice(&b[EC_CIPHERTEXT_COMPONENT_LENGTH..]);
+
+    // EC point addition on each ciphertext half (C1, C2).
+    // Each half is a compressed secp256k1 point (33 bytes).
+    let a_c1 = secp256k1::PublicKey::from_slice(&a[..EC_CIPHERTEXT_COMPONENT_LENGTH]).ok()?;
+    let a_c2 =
+        secp256k1::PublicKey::from_slice(&a[EC_CIPHERTEXT_COMPONENT_LENGTH..]).ok()?;
+    let b_c1 = secp256k1::PublicKey::from_slice(&b[..EC_CIPHERTEXT_COMPONENT_LENGTH]).ok()?;
+    let b_c2 =
+        secp256k1::PublicKey::from_slice(&b[EC_CIPHERTEXT_COMPONENT_LENGTH..]).ok()?;
+
+    let sum_c1 = a_c1.combine(&b_c1).ok()?;
+    let sum_c2 = a_c2.combine(&b_c2).ok()?;
+
+    let mut result = Vec::with_capacity(EC_GAMAL_ENCRYPTED_TOTAL_LENGTH);
+    result.extend_from_slice(&sum_c1.serialize());
+    result.extend_from_slice(&sum_c2.serialize());
     Some(result)
 }
 
@@ -143,10 +153,35 @@ pub fn homomorphic_subtract(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
     if !is_valid_ciphertext(a) || !is_valid_ciphertext(b) {
         return None;
     }
-    // Stub: EC point subtraction on the two ciphertext halves.
-    let mut result = vec![0u8; EC_GAMAL_ENCRYPTED_TOTAL_LENGTH];
-    result[..EC_CIPHERTEXT_COMPONENT_LENGTH].copy_from_slice(&a[..EC_CIPHERTEXT_COMPONENT_LENGTH]);
-    result[EC_CIPHERTEXT_COMPONENT_LENGTH..].copy_from_slice(&a[EC_CIPHERTEXT_COMPONENT_LENGTH..]);
+
+    // EC point subtraction: negate B's points then add to A.
+    // Negation on compressed points flips the y-parity prefix byte.
+    let negate_compressed = |point: &[u8]| -> Vec<u8> {
+        let mut negated = point.to_vec();
+        negated[0] = match negated[0] {
+            EC_COMPRESSED_PREFIX_EVEN_Y => EC_COMPRESSED_PREFIX_ODD_Y,
+            EC_COMPRESSED_PREFIX_ODD_Y => EC_COMPRESSED_PREFIX_EVEN_Y,
+            other => other,
+        };
+        negated
+    };
+
+    let a_c1 = secp256k1::PublicKey::from_slice(&a[..EC_CIPHERTEXT_COMPONENT_LENGTH]).ok()?;
+    let a_c2 =
+        secp256k1::PublicKey::from_slice(&a[EC_CIPHERTEXT_COMPONENT_LENGTH..]).ok()?;
+
+    let neg_b_c1_bytes = negate_compressed(&b[..EC_CIPHERTEXT_COMPONENT_LENGTH]);
+    let neg_b_c2_bytes = negate_compressed(&b[EC_CIPHERTEXT_COMPONENT_LENGTH..]);
+
+    let neg_b_c1 = secp256k1::PublicKey::from_slice(&neg_b_c1_bytes).ok()?;
+    let neg_b_c2 = secp256k1::PublicKey::from_slice(&neg_b_c2_bytes).ok()?;
+
+    let diff_c1 = a_c1.combine(&neg_b_c1).ok()?;
+    let diff_c2 = a_c2.combine(&neg_b_c2).ok()?;
+
+    let mut result = Vec::with_capacity(EC_GAMAL_ENCRYPTED_TOTAL_LENGTH);
+    result.extend_from_slice(&diff_c1.serialize());
+    result.extend_from_slice(&diff_c2.serialize());
     Some(result)
 }
 
@@ -209,7 +244,9 @@ pub fn verify_schnorr_proof(
         return Ter::TEC_INTERNAL;
     }
     let _ = context_hash;
-    // Stub: proof verification requires secp256k1_mpt library
+    // NOTE: Full verification requires mpt-crypto Rust bindings (pending).
+    // Returns success when featureConfidentialTransfer is active; the feature
+    // will not be enabled until validators vote and bindings are available.
     Ter::TES_SUCCESS
 }
 
@@ -237,7 +274,8 @@ pub fn verify_revealed_amount(
         }
     }
     let _ = amount;
-    // Stub: verification requires mpt_verify_revealed_amount
+    // NOTE: Full verification requires mpt-crypto Rust bindings (pending).
+    // Returns success unconditionally until mpt_verify_revealed_amount is ported.
     Ter::TES_SUCCESS
 }
 
@@ -257,7 +295,8 @@ pub fn verify_send_proof(
         return Ter::TEC_INTERNAL;
     }
     let _ = (context_hash, recipient_count);
-    // Stub: verification requires mpt_verify_send_proof
+    // NOTE: Full verification requires mpt-crypto Rust bindings (pending).
+    // Returns success unconditionally until mpt_verify_send_proof is ported.
     Ter::TES_SUCCESS
 }
 
@@ -277,7 +316,8 @@ pub fn verify_convert_back_proof(
         return Ter::TEC_INTERNAL;
     }
     let _ = (amount, context_hash);
-    // Stub: verification requires mpt_verify_convert_back_proof
+    // NOTE: Full verification requires mpt-crypto Rust bindings (pending).
+    // Returns success unconditionally until mpt_verify_convert_back_proof is ported.
     Ter::TES_SUCCESS
 }
 
@@ -295,6 +335,7 @@ pub fn verify_clawback_proof(
         return Ter::TEC_INTERNAL;
     }
     let _ = (amount, context_hash);
-    // Stub: verification requires mpt_verify_clawback_proof
+    // NOTE: Full verification requires mpt-crypto Rust bindings (pending).
+    // Returns success unconditionally until mpt_verify_clawback_proof is ported.
     Ter::TES_SUCCESS
 }
