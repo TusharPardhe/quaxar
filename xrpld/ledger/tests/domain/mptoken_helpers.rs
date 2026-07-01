@@ -232,6 +232,7 @@ fn book_step_rejects_mpt_book_without_can_trade_instead_of_panicking() {
     let book = Book {
         r#in: Asset::MPTIssue(issue),
         out: Asset::Issue(protocol::xrp_issue()),
+        domain: None,
     };
 
     let result = execute_book_step(

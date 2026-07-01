@@ -268,6 +268,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             let cross_book = ledger::ripple_calc::book_step::Book {
                 r#in: book_in,
                 out: book_out,
+                domain: None,
             };
             // Fallback to direct book step if strand building fails
             let result = ledger::ripple_calc::book_step::execute_book_step(
@@ -300,6 +301,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             let cross_book = ledger::ripple_calc::book_step::Book {
                 r#in: book_in,
                 out: book_out,
+                domain: None,
             };
             let result = ledger::ripple_calc::book_step::execute_book_step(
                 view,

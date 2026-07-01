@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::ApplyView;
 use crate::domain::ripple_state_helpers;
 use basics;
+use basics::base_uint::Uint256;
 use protocol::{
     AccountID, Amounts, Asset, MPTAmount, Quality, STAmount, STLedgerEntry, Ter,
     get_field_by_symbol as sf,
@@ -21,6 +22,7 @@ const QUALITY_ONE: u32 = 1_000_000_000;
 pub struct Book {
     pub r#in: Asset,
     pub out: Asset,
+    pub domain: Option<Uint256>,
 }
 
 /// Result of consuming offers from a book
@@ -108,6 +110,27 @@ pub fn execute_book_step<V: ApplyView>(
             remove_consumed_offer(view, &offer_sle);
             offers_consumed += 1;
             continue;
+        }
+
+        // Post-fixCleanup3_3_0: only validate domain membership when walking a
+        // domain book. Hybrid offers in the open book are not evicted on
+        // credential expiry. Pre-fix: always validate.
+        if offer_sle.is_field_present(sf("sfDomainID"))
+            && (!view.rules().enabled(&protocol::fix_cleanup_3_3_0())
+                || book.domain.is_some())
+        {
+            let offer_domain = offer_sle.get_field_h256(sf("sfDomainID"));
+            if !crate::permissioned_dex_helpers::offer_in_domain(
+                &*view,
+                offer_sle.key(),
+                &offer_domain,
+            )
+            .unwrap_or(false)
+            {
+                remove_consumed_offer(view, &offer_sle);
+                offers_consumed += 1;
+                continue;
+            }
         }
 
         // For OfferCreate, skip offers whose quality is worse than the taker's threshold.
@@ -531,7 +554,7 @@ pub fn get_book_best_quality<V: crate::ReadView>(view: &V, book: &Book) -> Optio
     let proto_book = protocol::Book {
         r#in: book.r#in,
         out: book.out,
-        domain: None,
+        domain: book.domain,
     };
     let book_base = protocol::get_book_base(proto_book);
     let book_end = protocol::get_quality_next(book_base);
@@ -579,7 +602,7 @@ fn get_book_offers<V: ApplyView>(view: &mut V, book: &Book, max: u32) -> Vec<STL
     let proto_book = protocol::Book {
         r#in: book.r#in,
         out: book.out,
-        domain: None,
+        domain: book.domain,
     };
     let book_base = protocol::get_book_base(proto_book);
     let book_end = protocol::get_quality_next(book_base);
@@ -1012,6 +1035,7 @@ pub fn execute_explicit_book_step<V: ApplyView>(
     let book = Book {
         r#in: max_in.asset(),
         out: max_out.asset(),
+        domain: None,
     };
     let result = execute_book_step(view, &book, max_in, max_out, true, None, None);
     if result.ter == Ter::TES_SUCCESS && result.amount_out.signum() > 0 {

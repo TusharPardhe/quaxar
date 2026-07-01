@@ -726,6 +726,7 @@ fn try_xrp_to_iou_default_path<V: ApplyView>(
     let book = book_step::Book {
         r#in: Asset::Issue(protocol::xrp_issue()),
         out: Asset::Issue(dst_issue),
+        domain: None,
     };
     let result = book_step::execute_book_step(
         view,
@@ -799,6 +800,7 @@ fn try_iou_to_xrp_default_path<V: ApplyView>(
     let book = book_step::Book {
         r#in: Asset::Issue(src_issue),
         out: Asset::Issue(protocol::xrp_issue()),
+        domain: None,
     };
     let result = book_step::execute_book_step(
         view,
