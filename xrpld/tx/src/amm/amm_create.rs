@@ -72,6 +72,9 @@ pub struct AMMCreatePreclaimFacts {
     pub amm_clawback_enabled: bool,
     pub amount_clawback_disabled_result: Ter,
     pub amount2_clawback_disabled_result: Ter,
+    pub amount_is_vault_share: bool,
+    pub amount2_is_vault_share: bool,
+    pub single_asset_vault_enabled: bool,
 }
 
 impl Default for AMMCreatePreclaimFacts {
@@ -95,6 +98,9 @@ impl Default for AMMCreatePreclaimFacts {
             amm_clawback_enabled: false,
             amount_clawback_disabled_result: Ter::TES_SUCCESS,
             amount2_clawback_disabled_result: Ter::TES_SUCCESS,
+            amount_is_vault_share: false,
+            amount2_is_vault_share: false,
+            single_asset_vault_enabled: false,
         }
     }
 }
@@ -138,6 +144,12 @@ pub fn run_amm_create_preclaim_facts(facts: AMMCreatePreclaimFacts) -> Ter {
 
     if facts.address_collision {
         return Ter::TER_ADDRESS_COLLISION;
+    }
+
+    if facts.single_asset_vault_enabled
+        && (facts.amount_is_vault_share || facts.amount2_is_vault_share)
+    {
+        return Ter::TEC_WRONG_ASSET;
     }
 
     if facts.amount_mpt_trade_transfer_result != Ter::TES_SUCCESS {
