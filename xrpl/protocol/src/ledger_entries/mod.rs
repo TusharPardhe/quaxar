@@ -24,6 +24,7 @@ pub mod pay_channel;
 pub mod permissioned_domain;
 pub mod ripple_state;
 pub mod signer_list;
+pub mod sponsorship;
 pub mod ticket;
 pub mod vault;
 pub mod x_chain_owned_claim_id;
@@ -55,6 +56,10 @@ pub use pay_channel::{PayChannel, PayChannelBuilder};
 pub use permissioned_domain::{PermissionedDomain, PermissionedDomainBuilder};
 pub use ripple_state::{RippleState, RippleStateBuilder};
 pub use signer_list::{SignerList, SignerListBuilder};
+pub use sponsorship::{
+    Sponsorship, SponsorshipBuilder, LSF_SPONSORSHIP_REQUIRE_SIGN_FOR_FEE,
+    LSF_SPONSORSHIP_REQUIRE_SIGN_FOR_RESERVE,
+};
 pub use ticket::{Ticket, TicketBuilder};
 pub use vault::{Vault, VaultBuilder};
 pub use x_chain_owned_claim_id::{XChainOwnedClaimID, XChainOwnedClaimIDBuilder};

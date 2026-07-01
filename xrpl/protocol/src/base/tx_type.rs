@@ -86,6 +86,8 @@ impl TxType {
     pub const LOAN_DELETE: Self = Self(81);
     pub const LOAN_MANAGE: Self = Self(82);
     pub const LOAN_PAY: Self = Self(84);
+    pub const SPONSORSHIP_TRANSFER: Self = Self(85);
+    pub const SPONSORSHIP_SET: Self = Self(86);
     pub const AMENDMENT: Self = Self(100);
     pub const FEE: Self = Self(101);
     pub const UNL_MODIFY: Self = Self(102);
@@ -257,6 +259,8 @@ const DISPATCHABLE_TX_TYPES: &[(u16, &str, &str)] = &[
     (81, "ttLOAN_DELETE", "LoanDelete"),
     (82, "ttLOAN_MANAGE", "LoanManage"),
     (84, "ttLOAN_PAY", "LoanPay"),
+    (85, "ttSPONSORSHIP_TRANSFER", "SponsorshipTransfer"),
+    (86, "ttSPONSORSHIP_SET", "SponsorshipSet"),
     (100, "ttAMENDMENT", "EnableAmendment"),
     (101, "ttFEE", "SetFee"),
     (102, "ttUNL_MODIFY", "UNLModify"),
@@ -387,6 +391,8 @@ const TX_TYPE_TAGS: &[(u16, &str, Option<&str>)] = &[
     (81, "ttLOAN_DELETE", Some("LoanDelete")),
     (82, "ttLOAN_MANAGE", Some("LoanManage")),
     (84, "ttLOAN_PAY", Some("LoanPay")),
+    (85, "ttSPONSORSHIP_TRANSFER", Some("SponsorshipTransfer")),
+    (86, "ttSPONSORSHIP_SET", Some("SponsorshipSet")),
     (100, "ttAMENDMENT", Some("EnableAmendment")),
     (101, "ttFEE", Some("SetFee")),
     (102, "ttUNL_MODIFY", Some("UNLModify")),
