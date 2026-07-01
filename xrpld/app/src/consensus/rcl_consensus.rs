@@ -1549,14 +1549,15 @@ where
         }
 
         // Match rippled's endConsensus → beginConsensus(networkClosed):
-        // Use our freshly built ledger when available — rippled's
-        // switchLastClosedLedger makes the built ledger the new closed,
-        // and beginConsensus starts from that. Only fall back to validation
-        // trie when we didn't build (or the build is clearly wrong).
-        let next_prev = built_ledger
-            .cloned()
-            .or_else(|| self.ledgers.acquire_consensus_ledger(&network_closed))
-            .or_else(|| self.ledger_acceptor.consensus_previous_ledger());
+        // After switchLastClosedLedger the application state is updated.
+        // beginConsensus uses the owner's current previous ledger as the
+        // starting point for the next round, and passes networkClosed so
+        // consensus knows what the network has agreed upon.
+        let next_prev = self
+            .ledger_acceptor
+            .consensus_previous_ledger()
+            .or_else(|| built_ledger.cloned())
+            .or_else(|| self.ledgers.acquire_consensus_ledger(&network_closed));
 
         if let Some(ledger) = next_prev {
             let now = self.clock.close_time();
@@ -1584,7 +1585,7 @@ where
             self.pending_start_round
                 .lock()
                 .expect("pending_start_round mutex")
-                .replace((now, next_id, prev_cx));
+                .replace((now, network_closed, prev_cx));
 
             tracing::info!(target: "consensus",
                 "[consensus] endConsensus: queued start_round for seq={}",

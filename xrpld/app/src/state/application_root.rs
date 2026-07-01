@@ -3202,7 +3202,9 @@ impl ApplicationRoot {
 
     pub fn network_ops_operating_mode_string(&self) -> &'static str {
         let op_mode = self.network_ops_state.operating_mode();
-        if op_mode == crate::network::network_ops::NetworkOpsOperatingMode::Full {
+        if op_mode == crate::network::network_ops::NetworkOpsOperatingMode::Full
+            && self.validation_public_key.is_some()
+        {
             return "proposing";
         }
         self.network_ops_state.str_operating_mode()
