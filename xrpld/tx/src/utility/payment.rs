@@ -295,8 +295,12 @@ pub struct PaymentCheckPermissionFacts {
     pub payment_mint_permission: bool,
     pub payment_burn_permission: bool,
     pub amount_is_xrp: bool,
+    pub is_mpt: bool,
     pub amount_issuer_is_source: bool,
     pub amount_issuer_is_destination: bool,
+    pub trustline_exists: bool,
+    pub account_is_holder: Option<bool>,
+    pub dest_limit_positive: Option<bool>,
 }
 
 pub fn run_payment_check_permission(facts: PaymentCheckPermissionFacts) -> NotTec {
@@ -312,11 +316,37 @@ pub fn run_payment_check_permission(facts: PaymentCheckPermissionFacts) -> NotTe
     if (facts.send_max_present && !facts.send_max_asset_matches_amount) || facts.paths_present {
         return Ter::TER_NO_DELEGATE_PERMISSION;
     }
-    if facts.payment_mint_permission && !facts.amount_is_xrp && facts.amount_issuer_is_source {
-        return Ter::TES_SUCCESS;
+    if facts.amount_is_xrp {
+        return Ter::TER_NO_DELEGATE_PERMISSION;
     }
-    if facts.payment_burn_permission && !facts.amount_is_xrp && facts.amount_issuer_is_destination {
-        return Ter::TES_SUCCESS;
+    if facts.is_mpt {
+        if facts.payment_mint_permission && facts.amount_issuer_is_source {
+            return Ter::TES_SUCCESS;
+        }
+        if facts.payment_burn_permission && facts.amount_issuer_is_destination {
+            return Ter::TES_SUCCESS;
+        }
+        return Ter::TER_NO_DELEGATE_PERMISSION;
+    }
+    if !facts.amount_issuer_is_source && !facts.amount_issuer_is_destination {
+        return Ter::TER_NO_DELEGATE_PERMISSION;
+    }
+    if !facts.trustline_exists {
+        return Ter::TER_NO_DELEGATE_PERMISSION;
+    }
+    if facts.payment_mint_permission {
+        if let (Some(dest_limit_positive), Some(account_is_holder)) =
+            (facts.dest_limit_positive, facts.account_is_holder)
+        {
+            if dest_limit_positive && !account_is_holder {
+                return Ter::TES_SUCCESS;
+            }
+        }
+    }
+    if facts.payment_burn_permission {
+        if let Some(true) = facts.account_is_holder {
+            return Ter::TES_SUCCESS;
+        }
     }
     Ter::TER_NO_DELEGATE_PERMISSION
 }
@@ -465,6 +495,9 @@ pub struct PaymentDoApplyFacts {
     pub mpt_issuer_is_destination: bool,
     pub xrp_source_exists: bool,
     pub xrp_has_funds_for_payment_plus_reserve: bool,
+    pub xrp_account_is_fee_payer: bool,
+    pub xrp_fee_exceeds_reserve: bool,
+    pub xrp_has_funds_for_payment_plus_fee: bool,
     pub xrp_destination_is_pseudo: bool,
     pub xrp_needs_deposit_preauth: bool,
     pub xrp_verify_deposit_preauth_result: Ter,
@@ -506,6 +539,9 @@ impl PaymentDoApplyFacts {
             mpt_issuer_is_destination: false,
             xrp_source_exists: true,
             xrp_has_funds_for_payment_plus_reserve: true,
+            xrp_account_is_fee_payer: true,
+            xrp_fee_exceeds_reserve: false,
+            xrp_has_funds_for_payment_plus_fee: true,
             xrp_destination_is_pseudo: false,
             xrp_needs_deposit_preauth: false,
             xrp_verify_deposit_preauth_result: Ter::TES_SUCCESS,
@@ -608,7 +644,12 @@ pub fn run_payment_do_apply_with_facts<S: PaymentDoApplySink>(
             if !facts.xrp_source_exists {
                 return Ter::TEF_INTERNAL;
             }
-            if !facts.xrp_has_funds_for_payment_plus_reserve {
+            let has_funds = if facts.xrp_account_is_fee_payer && facts.xrp_fee_exceeds_reserve {
+                facts.xrp_has_funds_for_payment_plus_fee
+            } else {
+                facts.xrp_has_funds_for_payment_plus_reserve
+            };
+            if !has_funds {
                 return Ter::TEC_UNFUNDED_PAYMENT;
             }
             if facts.xrp_destination_is_pseudo {

@@ -25,22 +25,25 @@ pub struct VaultDepositPreclaimFacts {
     pub vault_asset_is_issue: bool,
     pub vault_asset_frozen_for_account: bool,
     pub vault_share_frozen_for_account: bool,
+    pub fix_cleanup_3_3_0_enabled: bool,
     pub vault_is_private: bool,
     pub submitter_is_owner: bool,
     pub domain_id_present: bool,
     pub account_holds_sufficient_assets: bool,
 }
 
-pub fn run_vault_deposit_preclaim<CanTransfer, ValidDomain, RequireAuth>(
+pub fn run_vault_deposit_preclaim<CanTransfer, ValidDomain, RequireAuth, CheckDepositFreeze>(
     facts: VaultDepositPreclaimFacts,
     can_transfer: CanTransfer,
     valid_domain: ValidDomain,
     require_auth: RequireAuth,
+    check_deposit_freeze: CheckDepositFreeze,
 ) -> Ter
 where
     CanTransfer: FnOnce() -> Ter,
     ValidDomain: FnOnce() -> Ter,
     RequireAuth: FnOnce() -> Ter,
+    CheckDepositFreeze: FnOnce() -> Ter,
 {
     if !facts.vault_exists {
         return Ter::TEC_NO_ENTRY;
@@ -67,16 +70,23 @@ where
         return Ter::TEF_INTERNAL;
     }
 
-    if facts.vault_asset_frozen_for_account {
-        return if facts.vault_asset_is_issue {
-            Ter::TEC_FROZEN
-        } else {
-            Ter::TEC_LOCKED
-        };
-    }
+    if facts.fix_cleanup_3_3_0_enabled {
+        let ter = check_deposit_freeze();
+        if !is_tes_success(ter) {
+            return ter;
+        }
+    } else {
+        if facts.vault_asset_frozen_for_account {
+            return if facts.vault_asset_is_issue {
+                Ter::TEC_FROZEN
+            } else {
+                Ter::TEC_LOCKED
+            };
+        }
 
-    if facts.vault_share_frozen_for_account {
-        return Ter::TEC_LOCKED;
+        if facts.vault_share_frozen_for_account {
+            return Ter::TEC_LOCKED;
+        }
     }
 
     if facts.vault_is_private && !facts.submitter_is_owner {
@@ -122,6 +132,7 @@ mod tests {
             },
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
+            || Ter::TES_SUCCESS,
         );
 
         assert_eq!(result, Ter::TEC_NO_ENTRY);
@@ -142,6 +153,7 @@ mod tests {
                 can_transfer_called.set(true);
                 Ter::TES_SUCCESS
             },
+            || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
         );
@@ -167,6 +179,7 @@ mod tests {
                 Ter::TES_SUCCESS
             },
             || Ter::TES_SUCCESS,
+            || Ter::TES_SUCCESS,
         );
 
         assert_eq!(result, Ter::TER_NO_RIPPLE);
@@ -183,6 +196,7 @@ mod tests {
                 vault_share_matches_vault_asset: true,
                 ..VaultDepositPreclaimFacts::default()
             },
+            || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
@@ -203,6 +217,7 @@ mod tests {
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
+            || Ter::TES_SUCCESS,
         );
         let locked = run_vault_deposit_preclaim(
             VaultDepositPreclaimFacts {
@@ -212,6 +227,7 @@ mod tests {
                 issuance_locked: true,
                 ..VaultDepositPreclaimFacts::default()
             },
+            || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
@@ -235,6 +251,7 @@ mod tests {
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
+            || Ter::TES_SUCCESS,
         );
         let non_issue = run_vault_deposit_preclaim(
             VaultDepositPreclaimFacts {
@@ -244,6 +261,7 @@ mod tests {
                 vault_asset_frozen_for_account: true,
                 ..VaultDepositPreclaimFacts::default()
             },
+            || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
@@ -263,6 +281,7 @@ mod tests {
                 vault_share_frozen_for_account: true,
                 ..VaultDepositPreclaimFacts::default()
             },
+            || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
@@ -288,6 +307,7 @@ mod tests {
                 valid_domain_called.set(true);
                 Ter::TES_SUCCESS
             },
+            || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
         );
 
@@ -316,6 +336,7 @@ mod tests {
                 require_auth_called.set(true);
                 Ter::TES_SUCCESS
             },
+            || Ter::TES_SUCCESS,
         );
 
         assert_eq!(result, Ter::TES_SUCCESS);
@@ -336,6 +357,7 @@ mod tests {
             || Ter::TES_SUCCESS,
             || Ter::TEC_OBJECT_NOT_FOUND,
             || Ter::TES_SUCCESS,
+            || Ter::TES_SUCCESS,
         );
         let auth_failure = run_vault_deposit_preclaim(
             VaultDepositPreclaimFacts {
@@ -348,6 +370,7 @@ mod tests {
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TER_NO_ACCOUNT,
+            || Ter::TES_SUCCESS,
         );
         let insufficient_funds = run_vault_deposit_preclaim(
             VaultDepositPreclaimFacts {
@@ -356,6 +379,7 @@ mod tests {
                 issuance_exists: true,
                 ..VaultDepositPreclaimFacts::default()
             },
+            || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
             || Ter::TES_SUCCESS,
@@ -401,9 +425,46 @@ mod tests {
                     Ter::TES_SUCCESS
                 }
             },
+            || Ter::TES_SUCCESS,
         );
 
         assert_eq!(result, Ter::TES_SUCCESS);
         assert_eq!(seen.borrow().as_slice(), ["transfer", "domain", "auth"]);
+    }
+
+    #[test]
+    fn vault_deposit_preclaim_uses_unified_freeze_check_when_amendment_enabled() {
+        let result = run_vault_deposit_preclaim(
+            VaultDepositPreclaimFacts {
+                vault_exists: true,
+                deposited_asset_matches_vault_asset: true,
+                issuance_exists: true,
+                fix_cleanup_3_3_0_enabled: true,
+                vault_asset_frozen_for_account: true,
+                account_holds_sufficient_assets: true,
+                ..VaultDepositPreclaimFacts::default()
+            },
+            || Ter::TES_SUCCESS,
+            || Ter::TES_SUCCESS,
+            || Ter::TES_SUCCESS,
+            || Ter::TES_SUCCESS,
+        );
+        assert_eq!(result, Ter::TES_SUCCESS);
+
+        let frozen = run_vault_deposit_preclaim(
+            VaultDepositPreclaimFacts {
+                vault_exists: true,
+                deposited_asset_matches_vault_asset: true,
+                issuance_exists: true,
+                fix_cleanup_3_3_0_enabled: true,
+                account_holds_sufficient_assets: true,
+                ..VaultDepositPreclaimFacts::default()
+            },
+            || Ter::TES_SUCCESS,
+            || Ter::TES_SUCCESS,
+            || Ter::TES_SUCCESS,
+            || Ter::TEC_FROZEN,
+        );
+        assert_eq!(frozen, Ter::TEC_FROZEN);
     }
 }

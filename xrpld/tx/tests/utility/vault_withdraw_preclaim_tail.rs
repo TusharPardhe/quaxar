@@ -15,11 +15,13 @@ fn vault_withdraw_preclaim_tail_uses_weakauth_when_destination_is_submitter() {
     let result = run_vault_withdraw_preclaim_tail(
         VaultWithdrawPreclaimTailFacts {
             destination_is_submitter: true,
+            ..VaultWithdrawPreclaimTailFacts::default()
         },
         |auth_type| {
             seen.set(Some(auth_type));
             Ter::TES_SUCCESS
         },
+        || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
     );
@@ -40,6 +42,7 @@ fn vault_withdraw_preclaim_tail_uses_strongauth_when_destination_differs() {
         },
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
+        || Ter::TES_SUCCESS,
     );
 
     assert_eq!(result, Ter::TES_SUCCESS);
@@ -57,6 +60,7 @@ fn vault_withdraw_preclaim_tail_returns_auth_failure_first() {
             destination_checked.set(true);
             Ter::TES_SUCCESS
         },
+        || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
     );
 
@@ -77,6 +81,7 @@ fn vault_withdraw_preclaim_tail_returns_destination_freeze_failure_before_share_
             share_checked.set(true);
             Ter::TES_SUCCESS
         },
+        || Ter::TES_SUCCESS,
     );
 
     assert_eq!(result, Ter::TEC_FROZEN);
@@ -91,6 +96,7 @@ fn vault_withdraw_preclaim_tail_returns_submitter_share_freeze_failure() {
         |_| Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
         || Ter::TEC_LOCKED,
+        || Ter::TES_SUCCESS,
     );
 
     assert_eq!(result, Ter::TEC_LOCKED);
@@ -124,6 +130,7 @@ fn vault_withdraw_preclaim_tail_runs_current_on_success() {
                 Ter::TES_SUCCESS
             }
         },
+        || Ter::TES_SUCCESS,
     );
 
     assert_eq!(result, Ter::TES_SUCCESS);

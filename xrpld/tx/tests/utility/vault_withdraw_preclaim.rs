@@ -25,6 +25,7 @@ fn vault_withdraw_preclaim_returns_front_failure_before_tail() {
         },
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
+        || Ter::TES_SUCCESS,
     );
 
     assert_eq!(result, Ter::TEC_NO_ENTRY);
@@ -48,6 +49,7 @@ fn vault_withdraw_preclaim_returns_tail_failure_after_front_success() {
         |_| Ter::TEC_NO_AUTH,
         || Ter::TES_SUCCESS,
         || Ter::TES_SUCCESS,
+        || Ter::TES_SUCCESS,
     );
 
     assert_eq!(result, Ter::TEC_NO_AUTH);
@@ -69,6 +71,7 @@ fn vault_withdraw_preclaim_runs_current_cpp_stage_order() {
         },
         VaultWithdrawPreclaimTailFacts {
             destination_is_submitter: false,
+            ..VaultWithdrawPreclaimTailFacts::default()
         },
         {
             let seen = Rc::clone(&seen);
@@ -115,6 +118,7 @@ fn vault_withdraw_preclaim_runs_current_cpp_stage_order() {
                 Ter::TES_SUCCESS
             }
         },
+        || Ter::TES_SUCCESS,
     );
 
     assert_eq!(result, Ter::TES_SUCCESS);
