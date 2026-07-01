@@ -94,6 +94,7 @@ fn mp_token_issuance_create_preflight_guards() {
     let user_reference_holding =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
             fix_cleanup_3_2_0_enabled: true,
+            confidential_transfer_enabled: false,
             reference_holding_present: true,
             mutable_flags: None,
             tx_flags: 0,
@@ -106,6 +107,7 @@ fn mp_token_issuance_create_preflight_guards() {
     let invalid_mutable =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
             fix_cleanup_3_2_0_enabled: false,
+            confidential_transfer_enabled: false,
             reference_holding_present: false,
             mutable_flags: Some(0),
             tx_flags: 0,
@@ -118,6 +120,7 @@ fn mp_token_issuance_create_preflight_guards() {
     let invalid_mutable_mask =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
             fix_cleanup_3_2_0_enabled: false,
+            confidential_transfer_enabled: false,
             reference_holding_present: false,
             mutable_flags: Some(tmfMPTokenIssuanceCreateMutableMask),
             tx_flags: 0,
@@ -129,6 +132,7 @@ fn mp_token_issuance_create_preflight_guards() {
         });
     let bad_fee = run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
         fix_cleanup_3_2_0_enabled: false,
+            confidential_transfer_enabled: false,
         reference_holding_present: false,
         mutable_flags: None,
         tx_flags: tfMPTCanTransfer,
@@ -141,6 +145,7 @@ fn mp_token_issuance_create_preflight_guards() {
     let missing_transfer_flag =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
             fix_cleanup_3_2_0_enabled: false,
+            confidential_transfer_enabled: false,
             reference_holding_present: false,
             mutable_flags: None,
             tx_flags: 0,
@@ -152,6 +157,7 @@ fn mp_token_issuance_create_preflight_guards() {
         });
     let zero_domain = run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
         fix_cleanup_3_2_0_enabled: false,
+            confidential_transfer_enabled: false,
         reference_holding_present: false,
         mutable_flags: None,
         tx_flags: tfMPTRequireAuth,
@@ -164,6 +170,7 @@ fn mp_token_issuance_create_preflight_guards() {
     let missing_require_auth =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
             fix_cleanup_3_2_0_enabled: false,
+            confidential_transfer_enabled: false,
             reference_holding_present: false,
             mutable_flags: None,
             tx_flags: 0,
@@ -176,6 +183,7 @@ fn mp_token_issuance_create_preflight_guards() {
     let empty_metadata =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
             fix_cleanup_3_2_0_enabled: false,
+            confidential_transfer_enabled: false,
             reference_holding_present: false,
             mutable_flags: None,
             tx_flags: 0,
@@ -188,6 +196,7 @@ fn mp_token_issuance_create_preflight_guards() {
     let oversized_metadata =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
             fix_cleanup_3_2_0_enabled: false,
+            confidential_transfer_enabled: false,
             reference_holding_present: false,
             mutable_flags: None,
             tx_flags: 0,
@@ -199,6 +208,7 @@ fn mp_token_issuance_create_preflight_guards() {
         });
     let zero_max = run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
         fix_cleanup_3_2_0_enabled: false,
+            confidential_transfer_enabled: false,
         reference_holding_present: false,
         mutable_flags: None,
         tx_flags: 0,
@@ -211,6 +221,7 @@ fn mp_token_issuance_create_preflight_guards() {
     let oversized_max =
         run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
             fix_cleanup_3_2_0_enabled: false,
+            confidential_transfer_enabled: false,
             reference_holding_present: false,
             mutable_flags: None,
             tx_flags: 0,
@@ -238,6 +249,7 @@ fn mp_token_issuance_create_preflight_guards() {
 fn mp_token_issuance_create_preflight_accepts_valid_inputs() {
     let result = run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
         fix_cleanup_3_2_0_enabled: true,
+        confidential_transfer_enabled: false,
         reference_holding_present: false,
         mutable_flags: Some(tmfMPTCanMutateCanLock),
         tx_flags: tfMPTCanTransfer | tfMPTRequireAuth,
