@@ -1,10 +1,3 @@
-//! Deterministic the reference implementation helpers.
-//!
-//! This ports the current compatibility-safe behavior for:
-//!
-//! - `checkTxPermission(...)`, and
-//! - `loadGranularPermission(...)`.
-
 use std::collections::BTreeSet;
 
 use protocol::{NotTec, Ter};
@@ -55,13 +48,13 @@ where
     granular_permissions
 }
 
+pub fn is_delegated_tx(has_delegate_field: bool) -> bool {
+    has_delegate_field
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{
-        load_granular_permissions, permission_to_tx_type, run_check_tx_permission,
-        tx_to_permission_type,
-    };
-    use protocol::Ter;
+    use super::*;
 
     #[test]
     fn permission_type_helpers_match_cpp_translation() {
@@ -100,5 +93,11 @@ mod tests {
 
         assert_eq!(loaded.into_iter().collect::<Vec<_>>(), vec![65_540]);
         assert!(load_granular_permissions::<u16, _>(None, 5, |_| Some(5)).is_empty());
+    }
+
+    #[test]
+    fn is_delegated_tx_detects_delegate_field() {
+        assert!(is_delegated_tx(true));
+        assert!(!is_delegated_tx(false));
     }
 }

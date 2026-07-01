@@ -13,6 +13,8 @@ use crate::{ApplyFlags, TxQAccount, any_apply_flags};
 pub struct QueueHoldPreflight {
     pub has_previous_txn_id: bool,
     pub has_account_txn_id: bool,
+    pub has_delegate: bool,
+    pub has_fee_sponsor: bool,
     pub flags: ApplyFlags,
     pub last_valid_ledger: Option<u32>,
 }
@@ -27,9 +29,21 @@ impl QueueHoldPreflight {
         Self {
             has_previous_txn_id,
             has_account_txn_id,
+            has_delegate: false,
+            has_fee_sponsor: false,
             flags,
             last_valid_ledger,
         }
+    }
+
+    pub const fn with_delegate(mut self, has_delegate: bool) -> Self {
+        self.has_delegate = has_delegate;
+        self
+    }
+
+    pub const fn with_fee_sponsor(mut self, has_fee_sponsor: bool) -> Self {
+        self.has_fee_sponsor = has_fee_sponsor;
+        self
     }
 }
 
@@ -44,6 +58,15 @@ pub fn check_hold_preconditions(
         || preflight.has_account_txn_id
         || any_apply_flags(preflight.flags & ApplyFlags::FAIL_HARD)
     {
+        return Ter::TEL_CAN_NOT_QUEUE;
+    }
+
+    if preflight.has_delegate {
+        return Ter::TEL_CAN_NOT_QUEUE;
+    }
+
+    // Disallow sponsored transactions from being queued (PR #7674).
+    if preflight.has_fee_sponsor {
         return Ter::TEL_CAN_NOT_QUEUE;
     }
 
@@ -236,6 +259,23 @@ mod tests {
                 10,
             ),
             Ter::TEL_CAN_NOT_QUEUE
+        );
+    }
+
+    #[test]
+    fn hold_preconditions_reject_delegated_transactions() {
+        let preflight = QueueHoldPreflight::new(false, false, ApplyFlags::NONE, Some(200))
+            .with_delegate(true);
+        assert_eq!(
+            check_hold_preconditions(preflight, 100, 2),
+            Ter::TEL_CAN_NOT_QUEUE
+        );
+
+        let no_delegate = QueueHoldPreflight::new(false, false, ApplyFlags::NONE, Some(200))
+            .with_delegate(false);
+        assert_eq!(
+            check_hold_preconditions(no_delegate, 100, 2),
+            Ter::TES_SUCCESS
         );
     }
 
