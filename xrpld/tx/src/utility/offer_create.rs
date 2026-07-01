@@ -3,7 +3,7 @@
 use crate::{
     ApplyContext, ApplyResult, PreclaimContext, PreflightContext, TransactorPreflight0Facts,
     TransactorPreflight1Facts, TransactorPreflight2Facts,
-    dex::{BookStepImpl, flow_cross, get_transfer_rate_for_asset},
+    dex::{BookStepImpl, flow_cross},
     run_transactor_preflight0, run_transactor_preflight1, run_transactor_preflight2,
 };
 use basics::base_uint::Uint160;
@@ -106,6 +106,10 @@ pub struct OfferCreatePreclaimFacts {
     pub is_global_frozen_gets: bool,
     pub account_funds_zero: bool,
     pub is_taker_gets_mpt_issuer: bool,
+    /// Cached result of MPT DEX validation for TakerPays asset.
+    pub mpt_dex_pays_result: Ter,
+    /// Cached result of MPT DEX validation for TakerGets asset.
+    pub mpt_dex_gets_result: Ter,
 }
 
 pub fn run_offer_create_preclaim<Registry, View, Tx, Journal, ParentBatchId>(
@@ -116,6 +120,15 @@ pub fn run_offer_create_preclaim<Registry, View, Tx, Journal, ParentBatchId>(
         return Ter::TEC_FROZEN;
     }
 
+    // MPT DEX checks: canTrade, requireAuth, not frozen
+    if !is_tes_success(facts.mpt_dex_pays_result) {
+        return facts.mpt_dex_pays_result;
+    }
+    if !is_tes_success(facts.mpt_dex_gets_result) {
+        return facts.mpt_dex_gets_result;
+    }
+
+    // Allow unfunded MPT for issuer (OutstandingAmount >= MaximumAmount)
     if !facts.is_taker_gets_mpt_issuer && facts.account_funds_zero {
         return Ter::TEC_UNFUNDED_OFFER;
     }
@@ -168,15 +181,11 @@ where
         (taker_pays.clone(), taker_gets.clone())
     } else {
         let mut book_step = BookStepImpl::new(reverse_book);
-        // Always charge transfer fee on the output asset (PR #7422 parity).
-        // The taker_pays asset is the output of the reverse book crossing.
-        let transfer_rate_out = get_transfer_rate_for_asset(ctx.view_mut(), taker_pays.asset());
         let cross_result = match flow_cross(
             ctx.view_mut(),
             &mut book_step,
             taker_pays.clone(),
             taker_gets.clone(),
-            transfer_rate_out,
         ) {
             Ok(res) => res,
             Err(_) => return ApplyResult::new(Ter::TEF_FAILURE, false, false),

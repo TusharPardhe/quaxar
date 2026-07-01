@@ -228,6 +228,7 @@ fn strand_quality_above_threshold<V: crate::ReadView>(
             let book = Book {
                 r#in: protocol::Asset::Issue(*book_in),
                 out: protocol::Asset::Issue(*book_out),
+                domain: None,
             };
             // Get the best offer quality in this book (TakerGets/TakerPays = output/input)
             if let Some(q) = get_book_best_quality(view, &book) {
