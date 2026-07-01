@@ -13,6 +13,8 @@ pub const NFTOKEN_CANCEL_OFFER_FLAGS_MASK: u32 = 0;
 pub struct NFTokenCancelOfferPreflightFacts {
     pub nftoken_offers: Vec<Uint256>,
     pub flags: u32,
+    pub has_zero_offer_id: bool,
+    pub fix_cleanup_3_2_0_enabled: bool,
 }
 
 pub fn run_nftoken_cancel_offer_preflight<Registry, Tx, Journal, ParentBatchId>(
@@ -42,6 +44,10 @@ pub fn run_nftoken_cancel_offer_preflight<Registry, Tx, Journal, ParentBatchId>(
     }
 
     if facts.nftoken_offers.is_empty() {
+        return Ter::TEM_MALFORMED;
+    }
+
+    if facts.fix_cleanup_3_2_0_enabled && facts.has_zero_offer_id {
         return Ter::TEM_MALFORMED;
     }
 

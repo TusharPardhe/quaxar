@@ -644,6 +644,17 @@ pub(super) fn compute_overpayment_reamortization(
         management_fee_due: new_theoretical_state.management_fee_due + management_error,
     };
 
+    let fix_cleanup_3_2_0 = rules.enabled(&feature_id("fixCleanup3_2_0"));
+    let new_theoretical_state = if fix_cleanup_3_2_0 {
+        let value = new_theoretical_state.value_outstanding;
+        let principal = old_principal - tracked_principal_delta;
+        let management_fee =
+            tenth_bips_of_runtime_number(value - principal, u32::from(management_fee_rate.value()));
+        tx::construct_loan_set_state(value, principal, management_fee)
+    } else {
+        new_theoretical_state
+    };
+
     let new_principal = round_number_to_asset_with_scale(
         asset,
         new_theoretical_state.principal_outstanding,

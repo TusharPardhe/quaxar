@@ -544,12 +544,16 @@ pub fn run_amm_withdraw_apply_math_facts(
         let lp_balance = amm_helpers::stamount_as_number(&facts.lp_token_balance);
         let ae = amount_balance * e_price_number;
         let fee = protocol::get_fee(facts.trading_fee);
+        let denom = lp_balance * fee - ae;
+        if facts.rules.enabled(&protocol::fix_cleanup_3_3_0()) && denom == RuntimeNumber::zero() {
+            return Err(Ter::TEC_AMM_FAILED);
+        }
         let two = number_from_i64(2);
         let tokens = amm_helpers::get_rounded_lp_tokens_with_product(
             &facts.rules,
-            || lp_balance * (lp_balance + ae * (fee - two)) / (lp_balance * fee - ae),
+            || lp_balance * (lp_balance + ae * (fee - two)) / denom,
             &facts.lp_token_balance,
-            || (lp_balance + ae * (fee - two)) / (lp_balance * fee - ae),
+            || (lp_balance + ae * (fee - two)) / denom,
             IsDeposit::No,
         );
         if tokens.signum() <= 0 {
