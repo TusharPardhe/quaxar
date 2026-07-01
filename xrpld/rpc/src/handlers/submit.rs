@@ -2306,6 +2306,9 @@ fn submit_semantic_preflight_with_ledger(
             let vault_id = st_tx.get_field_h256(vault_id_field);
             let preflight = tx::run_vault_delete_preflight(tx::VaultDeletePreflightFacts {
                 vault_id_is_zero: vault_id.is_zero(),
+                has_memo_data: false,
+                lending_protocol_v1_1_enabled: false,
+                memo_data_length_valid: true,
             });
             if preflight != Ter::TES_SUCCESS {
                 return preflight;
