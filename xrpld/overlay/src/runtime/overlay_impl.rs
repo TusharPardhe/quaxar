@@ -722,7 +722,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         &mut self,
         message: &crate::message::TmProposeSet,
     ) -> crate::router::RouteAction {
-        tracing::info!(target: "overlay",
+        tracing::trace!(target: "overlay",
             sig_len = message.signature.len(),
             key_len = message.node_pub_key.len(),
             tx_hash_len = message.current_tx_hash.len(),
