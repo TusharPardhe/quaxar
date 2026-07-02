@@ -587,11 +587,12 @@ pub fn build_bootstrap_runtime(
 ) -> Result<AppBootstrapRuntime, String> {
     let bootstrap = build_bootstrap_root(config, options)?;
     let runtime = Arc::new(MainRuntime::new(bootstrap.root));
+    // - standalone → Full (node operates without network)
     // - start_valid → Full (node starts fully synced)
     // - non-standalone → Connected (node starts connected to network)
-    if !options.standalone {
+    {
         use crate::network::network_ops::NetworkOpsOperatingMode;
-        let mode = if options.start_valid {
+        let mode = if options.standalone || options.start_valid {
             NetworkOpsOperatingMode::Full
         } else {
             NetworkOpsOperatingMode::Connected
