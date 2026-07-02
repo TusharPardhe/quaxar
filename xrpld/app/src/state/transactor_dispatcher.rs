@@ -3260,31 +3260,55 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         TxType::NFTOKEN_CREATE_OFFER => {
             let account = sttx.get_account_id(sf("sfAccount"));
             let token_id = sttx.get_field_h256(sf("sfNFTokenID"));
+            let tx_flags = sttx.get_flags();
+            let is_sell = (tx_flags & protocol::tfSellNFToken) != 0;
             let offer_keylet = protocol::keylet::nft_offer_keylet_for_owner(
                 Uint160::from_void(account.data()),
                 sttx.get_seq_value(),
             );
+
+            // Insert into owner directory (matching rippled)
+            let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
+            let owner_node = match ledger::dir_append(view, &owner_dir, offer_keylet.key, &|_| {}) {
+                Ok(Some(page)) => page,
+                _ => return Ter::TEC_DIR_FULL,
+            };
+
+            // Insert into the token's sell or buy offer directory (matching rippled)
+            let token_dir_keylet = if is_sell {
+                protocol::nft_sell_offers_keylet(token_id)
+            } else {
+                protocol::nft_buy_offers_keylet(token_id)
+            };
+            let offer_node = match ledger::dir_append(view, &token_dir_keylet, offer_keylet.key, &|sle| {
+                sle.set_field_u32(sf("sfFlags"), if is_sell { protocol::lsfNFTokenSellOffers } else { protocol::lsfNFTokenBuyOffers });
+                sle.set_field_h256(sf("sfNFTokenID"), token_id);
+            }) {
+                Ok(Some(page)) => page,
+                _ => return Ter::TEC_DIR_FULL,
+            };
+
+            // Create the offer SLE
             let mut sle = STLedgerEntry::new(offer_keylet);
             sle.set_account_id(sf("sfOwner"), account);
             sle.set_field_h256(sf("sfNFTokenID"), token_id);
             sle.set_field_amount(sf("sfAmount"), sttx.get_field_amount(sf("sfAmount")));
+            let mut sle_flags = 0u32;
+            if is_sell {
+                sle_flags |= protocol::lsfSellNFToken;
+            }
+            sle.set_field_u32(sf("sfFlags"), sle_flags);
+            sle.set_field_u64(sf("sfOwnerNode"), owner_node);
+            sle.set_field_u64(sf("sfNFTokenOfferNode"), offer_node);
             if sttx.is_field_present(sf("sfDestination")) {
-                sle.set_account_id(
-                    sf("sfDestination"),
-                    sttx.get_account_id(sf("sfDestination")),
-                );
+                sle.set_account_id(sf("sfDestination"), sttx.get_account_id(sf("sfDestination")));
             }
             if sttx.is_field_present(sf("sfExpiration")) {
                 sle.set_field_u32(sf("sfExpiration"), sttx.get_field_u32(sf("sfExpiration")));
             }
-            sle.set_field_u32(sf("sfFlags"), sttx.get_field_u32(sf("sfFlags")));
-            // Insert into owner directory
-            let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-            if let Ok(Some(page)) = ledger::dir_append(view, &owner_dir, offer_keylet.key, &|_| {})
-            {
-                sle.set_field_u64(sf("sfOwnerNode"), page);
-            }
             let _ = view.insert(Arc::new(sle));
+
+            // Update owner count
             if let Ok(Some(acct)) =
                 view.peek(protocol::account_keylet(Uint160::from_void(account.data())))
             {
@@ -3352,6 +3376,19 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 let owner_node = offer.get_field_u64(sf("sfOwnerNode"));
                 let owner_dir = owner_dir_keylet(Uint160::from_void(owner.data()));
                 let _ = ledger::dir_remove(view, &owner_dir, owner_node, *offer.key(), false);
+                // Also remove from the NFToken's sell/buy offer directory
+                if offer.is_field_present(sf("sfNFTokenOfferNode")) {
+                    let offer_node = offer.get_field_u64(sf("sfNFTokenOfferNode"));
+                    let nftoken_id = offer.get_field_h256(sf("sfNFTokenID"));
+                    let flags = offer.get_field_u32(sf("sfFlags"));
+                    let is_sell = (flags & protocol::lsfSellNFToken) != 0;
+                    let token_dir = if is_sell {
+                        protocol::nft_sell_offers_keylet(nftoken_id)
+                    } else {
+                        protocol::nft_buy_offers_keylet(nftoken_id)
+                    };
+                    let _ = ledger::dir_remove(view, &token_dir, offer_node, *offer.key(), false);
+                }
                 if let Ok(Some(acct)) =
                     view.peek(protocol::account_keylet(Uint160::from_void(owner.data())))
                 {
