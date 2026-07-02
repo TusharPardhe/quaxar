@@ -47,3 +47,25 @@ pub fn get_taxon(id: Uint256) -> Taxon {
 pub fn get_issuer(id: Uint256) -> AccountID {
     AccountID::from_slice(&id.data()[4..24]).expect("issuer width")
 }
+
+/// Build the 32-byte NFTokenID from its components, matching rippled's
+/// `NFTokenMint::createNFTokenID` exactly.
+pub fn create_nftoken_id(
+    flags: u16,
+    transfer_fee: u16,
+    issuer: &AccountID,
+    taxon: Taxon,
+    token_seq: u32,
+) -> Uint256 {
+    // Cipher the taxon (linear congruential scramble)
+    let ciphered = ciphered_taxon(token_seq, taxon);
+
+    let mut buf = [0u8; 32];
+    buf[0..2].copy_from_slice(&flags.to_be_bytes());
+    buf[2..4].copy_from_slice(&transfer_fee.to_be_bytes());
+    buf[4..24].copy_from_slice(issuer.data());
+    buf[24..28].copy_from_slice(&to_u32(ciphered).to_be_bytes());
+    buf[28..32].copy_from_slice(&token_seq.to_be_bytes());
+
+    Uint256::from_void(&buf)
+}

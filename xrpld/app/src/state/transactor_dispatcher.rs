@@ -2023,6 +2023,16 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 None
             };
             if let Ok(facts) = build_escrow_create_facts(view, &account, &dst_account, &amount) {
+                let source_tag = if sttx.is_field_present(sf("sfSourceTag")) {
+                    Some(sttx.get_field_u32(sf("sfSourceTag")))
+                } else {
+                    None
+                };
+                let destination_tag = if sttx.is_field_present(sf("sfDestinationTag")) {
+                    Some(sttx.get_field_u32(sf("sfDestinationTag")))
+                } else {
+                    None
+                };
                 let mut sink = ViewBackedEscrowCreateSink {
                     view,
                     account,
@@ -2032,6 +2042,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     escrow_seq: sttx.get_seq_value(),
                     finish_after,
                     cancel_after,
+                    source_tag,
+                    destination_tag,
                 };
                 run_escrow_create_do_apply(facts, &mut sink)
             } else {
@@ -2385,6 +2397,21 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             sle.set_field_amount(sf("sfAmount"), amount.clone());
             sle.set_field_amount(sf("sfBalance"), STAmount::from_xrp_amount(XRPAmount::new()));
             sle.set_field_u32(sf("sfSettleDelay"), settle_delay);
+            // Copy PublicKey (required by rippled)
+            if sttx.is_field_present(sf("sfPublicKey")) {
+                let pk = sttx.get_field_vl(sf("sfPublicKey"));
+                sle.set_field_vl(sf("sfPublicKey"), &pk);
+            }
+            // Copy optional fields matching rippled
+            if sttx.is_field_present(sf("sfCancelAfter")) {
+                sle.set_field_u32(sf("sfCancelAfter"), sttx.get_field_u32(sf("sfCancelAfter")));
+            }
+            if sttx.is_field_present(sf("sfSourceTag")) {
+                sle.set_field_u32(sf("sfSourceTag"), sttx.get_field_u32(sf("sfSourceTag")));
+            }
+            if sttx.is_field_present(sf("sfDestinationTag")) {
+                sle.set_field_u32(sf("sfDestinationTag"), sttx.get_field_u32(sf("sfDestinationTag")));
+            }
             // Add to owner directory
             let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
             if let Ok(Some(page)) = ledger::dir_append(view, &owner_dir, chan_keylet.key, &|_| {}) {
@@ -3102,12 +3129,88 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         // --- NFTs ---
         TxType::NFTOKEN_MINT => {
             let account = sttx.get_account_id(sf("sfAccount"));
+            // Determine the actual issuer (sfIssuer if present, otherwise minting account)
+            let issuer = if sttx.is_field_present(sf("sfIssuer")) {
+                sttx.get_account_id(sf("sfIssuer"))
+            } else {
+                account
+            };
+
+            // Get or create the issuer's MintedNFTokens counter (matching rippled doApply)
+            let issuer_keylet = protocol::account_keylet(Uint160::from_void(issuer.data()));
+            let Some(issuer_sle) = view.peek(issuer_keylet).ok().flatten() else {
+                return Ter::TEC_NO_ISSUER;
+            };
+
+            let mut issuer_obj = issuer_sle.clone_as_object();
+
+            // Set FirstNFTokenSequence if not present (matching rippled)
+            if !issuer_obj.is_field_present(sf("sfFirstNFTokenSequence")) {
+                let acct_seq = issuer_obj.get_field_u32(sf("sfSequence"));
+                // If minted by owner using sequence (not ticket, not authorized minter):
+                // Sequence was already incremented by apply_submit_transactor_shell,
+                // so use acct_seq - 1. Otherwise use acct_seq as-is.
+                let first_seq = if !sttx.is_field_present(sf("sfIssuer"))
+                    && sttx.get_seq_proxy().is_seq()
+                {
+                    acct_seq.saturating_sub(1)
+                } else {
+                    acct_seq
+                };
+                issuer_obj.set_field_u32(sf("sfFirstNFTokenSequence"), first_seq);
+            }
+
+            // Get current MintedNFTokens and increment
+            let minted_count = if issuer_obj.is_field_present(sf("sfMintedNFTokens")) {
+                issuer_obj.get_field_u32(sf("sfMintedNFTokens"))
+            } else {
+                0
+            };
+            issuer_obj.set_field_u32(sf("sfMintedNFTokens"), minted_count.saturating_add(1));
+
+            // Compute token sequence = FirstNFTokenSequence + MintedNFTokens (before increment)
+            let first_nft_seq = issuer_obj.get_field_u32(sf("sfFirstNFTokenSequence"));
+            let token_seq = first_nft_seq.wrapping_add(minted_count);
+
+            // Update issuer account
+            let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
+                issuer_obj,
+                *issuer_sle.key(),
+            )));
+
+            // Compute the NFTokenID (matching rippled createNFTokenID exactly)
+            let nft_flags = (sttx.get_flags() & 0x0000FFFF) as u16;
+            let transfer_fee = if sttx.is_field_present(sf("sfTransferFee")) {
+                sttx.get_field_u16(sf("sfTransferFee"))
+            } else {
+                0
+            };
+            let taxon = protocol::nft::to_taxon(sttx.get_field_u32(sf("sfNFTokenTaxon")));
+            let nftoken_id = protocol::nft::create_nftoken_id(
+                nft_flags,
+                transfer_fee,
+                &issuer,
+                taxon,
+                token_seq,
+            );
+
+            // Read URI from transaction if present
+            let uri = if sttx.is_field_present(sf("sfURI")) {
+                let uri_bytes = sttx.get_field_vl(sf("sfURI"));
+                Some(protocol::STBlob::from_buffer(
+                    sf("sfURI"),
+                    basics::buffer::Buffer::from(uri_bytes.as_slice()),
+                ))
+            } else {
+                None
+            };
+
             let facts = NFTokenMintApplyFacts {
-                nftoken_id: Uint256::from(sttx.get_transaction_id()),
-                issuer: account,
+                nftoken_id,
+                issuer,
                 owner: account,
-                transfer_fee: None,
-                uri: None,
+                transfer_fee: if transfer_fee != 0 { Some(transfer_fee) } else { None },
+                uri,
             };
             let mut sink = ViewBackedNFTokenMintSink { view, account };
             run_nftoken_mint_do_apply(facts, &mut sink)
@@ -4803,6 +4906,8 @@ fn asf_to_lsf(asf: u32) -> u32 {
         13 => 0x0800_0000, // asfDisallowIncomingCheck
         14 => 0x1000_0000, // asfDisallowIncomingPayChan
         15 => 0x2000_0000, // asfDisallowIncomingTrustline
+        16 => 0x8000_0000, // asfAllowTrustLineClawback → lsfAllowTrustLineClawback
+        17 => 0x4000_0000, // asfAllowTrustLineLocking → lsfAllowTrustLineLocking
         _ => 0,
     }
 }

@@ -3387,6 +3387,31 @@ impl ApplicationRoot {
         self.ledger_master_state.closed_ledger_seq()
     }
 
+    /// Get the account's current sequence from the network ops pending state.
+    /// This accounts for transactions already submitted to the open ledger but not yet closed.
+    pub fn network_ops_current_account_seq(&self, account: &protocol::AccountID) -> Option<u32> {
+        // The network_ops runtime tracks account sequences for submitted txs.
+        // Read from the closed/validated ledger and add the count of pending txs for this account.
+        let base = self.closed_ledger().or_else(|| self.validated_ledger())?;
+        let keylet = protocol::account_keylet(
+            basics::base_uint::Uint160::from_void(account.data()),
+        );
+        let sle = base.read(keylet).ok().flatten()?;
+        let base_seq = sle.get_field_u32(protocol::get_field_by_symbol("sfSequence"));
+        // Count pending transactions from this account in the open ledger
+        let open_tx_count = {
+            use crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource;
+            self.open_ledger()
+                .current_open_transactions()
+                .iter()
+                .filter(|tx| {
+                    tx.get_account_id(protocol::get_field_by_symbol("sfAccount")) == *account
+                })
+                .count() as u32
+        };
+        Some(base_seq.saturating_add(open_tx_count))
+    }
+
     pub fn on_published_ledger(&self, ledger: Arc<Ledger>) {
         self.ledger_master_state
             .note_published_ledger(self.ledger_with_node_fetcher(ledger));

@@ -58,6 +58,8 @@ pub struct ViewBackedEscrowCreateSink<'a, V> {
     pub escrow_seq: u32,
     pub finish_after: Option<u32>,
     pub cancel_after: Option<u32>,
+    pub source_tag: Option<u32>,
+    pub destination_tag: Option<u32>,
 }
 
 impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, V> {
@@ -73,6 +75,12 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
         }
         if let Some(cancel_after) = self.cancel_after {
             sle.set_field_u32(get_field_by_symbol("sfCancelAfter"), cancel_after);
+        }
+        if let Some(source_tag) = self.source_tag {
+            sle.set_field_u32(get_field_by_symbol("sfSourceTag"), source_tag);
+        }
+        if let Some(destination_tag) = self.destination_tag {
+            sle.set_field_u32(get_field_by_symbol("sfDestinationTag"), destination_tag);
         }
         if !self.amount.native() {
             let rate = match self.amount.asset() {
