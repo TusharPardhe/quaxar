@@ -539,6 +539,10 @@ impl SharedAppTxQ {
         Self(Arc::new(Mutex::new(tx_q)))
     }
 
+    pub fn set_standalone(&self, standalone: bool) {
+        self.lock().set_standalone(standalone);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, AppTxQ> {
         self.0.lock().expect("app txq mutex must not be poisoned")
     }

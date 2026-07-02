@@ -635,6 +635,10 @@ pub fn build_bootstrap_root(
 
     root.set_path_search_levels(path_search_old, path_search, path_search_fast);
     let _ = root.set_path_search_max(path_search_max);
+    // Configure TxQ for standalone mode (higher min_txn prevents fee escalation).
+    if options.standalone {
+        root.tx_q().set_standalone(true);
+    }
     let _ = root.attach_default_resolver_runtime();
     let _ = root.attach_default_ledger_master_runtime();
     let _ = root.attach_default_network_ops_validation_runtime();
@@ -2733,7 +2737,7 @@ fn seed_startup_ledger_state(
             // If [amendments] is configured, use those IDs (matching rippled
             // which reads its [amendments] section to determine getDesired()).
             // Otherwise fall back to all supported + DefaultYes features.
-            let genesis_amendments = amendments_from_config(config);
+            let genesis_amendments = amendments_from_config(config, options.standalone);
             let genesis_config = LedgerConfig {
                 fees: ledger::CURRENT_DEFAULT_FEES,
                 ..LedgerConfig::default()
@@ -2813,7 +2817,7 @@ fn seed_startup_ledger_state(
     Ok(())
 }
 
-fn amendments_from_config(config: &BasicConfig) -> Vec<Uint256> {
+fn amendments_from_config(config: &BasicConfig, standalone: bool) -> Vec<Uint256> {
     let section = config.section("amendments");
     let values = section.values();
     if !values.is_empty() {
@@ -2829,12 +2833,21 @@ fn amendments_from_config(config: &BasicConfig) -> Vec<Uint256> {
             })
             .collect();
     }
-    // Fallback: all supported amendments voted DefaultYes.
-    REGISTERED_FEATURES
-        .iter()
-        .filter(|f| f.supported && f.vote == RegisteredFeatureVote::DefaultYes)
-        .map(|f| feature_id(f.name))
-        .collect()
+    // Standalone: enable ALL supported amendments (matching rippled standalone).
+    // Network mode: only amendments voted DefaultYes.
+    if standalone {
+        REGISTERED_FEATURES
+            .iter()
+            .filter(|f| f.supported)
+            .map(|f| feature_id(f.name))
+            .collect()
+    } else {
+        REGISTERED_FEATURES
+            .iter()
+            .filter(|f| f.supported && f.vote == RegisteredFeatureVote::DefaultYes)
+            .map(|f| feature_id(f.name))
+            .collect()
+    }
 }
 
 fn config_legacy_u32(config: &BasicConfig, section: &str) -> Option<u32> {

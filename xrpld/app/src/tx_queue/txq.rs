@@ -99,6 +99,11 @@ impl<Account, Tx, Journal, ParentBatchId> TxQ<Account, Tx, Journal, ParentBatchI
         &self.setup
     }
 
+    pub fn set_standalone(&mut self, standalone: bool) {
+        self.setup.standalone = standalone;
+        self.metrics = self.setup.fee_metrics_state();
+    }
+
     pub fn metrics(&self) -> &QueueFeeMetricsState {
         &self.metrics
     }
