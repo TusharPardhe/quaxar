@@ -645,7 +645,12 @@ pub fn build_bootstrap_root(
         .map_err(|error| error.to_string())?;
     let _ = root.load_peer_reservations()?;
     let _ = root.load_cluster_nodes_from_config(config)?;
-    let _ = root.attach_configured_overlay_runtime(config, Arc::new(BootstrapOverlayHandoff))?;
+
+    // Standalone mode operates without network peers — skip overlay entirely.
+    if !options.standalone {
+        let _ =
+            root.attach_configured_overlay_runtime(config, Arc::new(BootstrapOverlayHandoff))?;
+    }
 
     // Load validation seed into config BEFORE consensus runtime is created,
     // so the consensus adaptor can read it.
@@ -781,6 +786,7 @@ where
 
 pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), String> {
     let runtime = Arc::clone(&bootstrap.runtime);
+    let standalone = runtime.root().standalone();
     ensure_descriptor_budget(bootstrap.report.fd_required)?;
     runtime.start()?;
     tracing::info!(target: "app", "Node startup complete");
@@ -795,6 +801,27 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
                 lm.ledger_master().set_closed_ledger(Arc::clone(&validated));
             }
         }
+    }
+
+    // Standalone mode: no overlay, no consensus thread. The node operates in
+    // Full mode with the genesis ledger as validated. Ledger advancement is
+    // driven exclusively by `ledger_accept` RPC calls.
+    if standalone {
+        tracing::info!(
+            target: "app",
+            validated_seq = runtime.root().validated_ledger_seq(),
+            "Standalone mode active — no peers, no consensus. Use ledger_accept to advance."
+        );
+
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let stop_thread =
+            spawn_shutdown_watcher(Arc::clone(&runtime), Arc::clone(&stop_requested));
+
+        runtime.run();
+
+        stop_requested.store(true, Ordering::Release);
+        let _ = stop_thread.join();
+        return Ok(());
     }
 
     // Spawn a dedicated consensus event loop for --start mode (private networks).
@@ -2764,7 +2791,8 @@ fn seed_startup_ledger_state(
     // `tracking` state promotion that blocked ledger resolution.
     //
     // `switchLCL()` — it never calls `setValidLedger()` for network nodes.
-    if options.start_valid
+    if options.standalone
+        || options.start_valid
         || matches!(
             options.start_type,
             StartUpType::Load | StartUpType::LoadFile | StartUpType::Replay
