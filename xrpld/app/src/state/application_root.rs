@@ -202,6 +202,13 @@ pub struct ApplicationRoot {
     /// the shared fetch-pack cache was populated. Workers should re-check
     /// local storage immediately (matching rippled gotFetchPack).
     fetch_pack_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Tracks the next expected sequence for each account with pending open ledger txs.
+    /// Cleared on ledger_accept. Matches rippled's persistent OpenView behavior where
+    /// account sequences are updated during submit and visible to subsequent submits.
+    open_ledger_account_seqs: Arc<std::sync::Mutex<std::collections::HashMap<protocol::AccountID, u32>>>,
+    /// Persistent submit sandbox matching rippled's OpenView. Accumulates state changes
+    /// across submit calls within the same open ledger period. Reset on ledger_accept.
+    open_ledger_sandbox: Arc<std::sync::Mutex<Option<Sandbox<Ledger>>>>,
 }
 
 impl std::fmt::Debug for ApplicationRoot {
@@ -594,6 +601,7 @@ struct AppOpenLedgerTxQApplyRuntime<'a> {
     view: &'a mut AppOpenLedgerView,
     submit_view: &'a mut Sandbox<Ledger>,
     tx: Arc<STTx>,
+    account_seqs: Arc<std::sync::Mutex<std::collections::HashMap<protocol::AccountID, u32>>>,
     preflight_result:
         PreflightResult<AppTxQTransaction, TxConsequences, AppTxQJournalTag, AppTxQParentBatchId>,
     preclaim_result: PreclaimResult<AppTxQTransaction, AppTxQJournalTag, AppTxQParentBatchId>,
@@ -608,6 +616,7 @@ impl<'a> AppOpenLedgerTxQApplyRuntime<'a> {
         flags: ApplyFlags,
         current_ledger_seq: u32,
         preclaim_ter: Ter,
+        account_seqs: Arc<std::sync::Mutex<std::collections::HashMap<protocol::AccountID, u32>>>,
     ) -> Self {
         let fee_field = get_field_by_symbol("sfFee");
         let fee_drops = if tx.is_field_present(fee_field) {
@@ -647,6 +656,7 @@ impl<'a> AppOpenLedgerTxQApplyRuntime<'a> {
             view,
             submit_view,
             tx,
+            account_seqs,
             preflight_result,
             preclaim_result,
         }
@@ -671,6 +681,16 @@ impl QueueApplyExecutionRuntime<AppTxQTransaction, AppTxQJournalTag, AppTxQParen
         let applied = is_tes_success(ter) || is_tec_claim(ter);
         if applied {
             self.view.push_transaction(Arc::clone(&self.tx));
+            // Track the account's next expected sequence
+            let account = self.tx.get_account_id(get_field_by_symbol("sfAccount"));
+            let tx_seq = self.tx.get_seq_proxy().value();
+            if let Ok(mut seqs) = self.account_seqs.lock() {
+                let next = tx_seq.saturating_add(1);
+                let entry = seqs.entry(account).or_insert(next);
+                if next > *entry {
+                    *entry = next;
+                }
+            }
         }
 
         ApplyResult::new(ter, applied, false)
@@ -1700,6 +1720,8 @@ impl ApplicationRoot {
             shamap_store_service: None,
             shared_consensus_node_store: Arc::new(std::sync::RwLock::new(None)),
             fetch_pack_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            open_ledger_account_seqs: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            open_ledger_sandbox: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -2790,6 +2812,8 @@ impl ApplicationRoot {
         let open_ledger = self.registry.open_ledger.clone();
         let current_base_fee = self.open_ledger().current().base_fee_drops;
         let state_ledger = Arc::clone(&base_ledger);
+        let account_seqs = Arc::clone(&self.open_ledger_account_seqs);
+        let sandbox_holder = Arc::clone(&self.open_ledger_sandbox);
 
         self.apply_network_ops_pending_batch_with(
             current_ledger_index,
@@ -2797,7 +2821,13 @@ impl ApplicationRoot {
             move |transactions| {
                 let mut changed = false;
                 let mut lock = AppTxQLock;
-                let mut submit_view = Sandbox::new(Arc::clone(&base_ledger), ApplyFlags::NONE);
+                // Use the persistent sandbox (matching rippled's persistent OpenView).
+                // This ensures subsequent submits see state from prior ones.
+                let mut submit_view = sandbox_holder
+                    .lock()
+                    .expect("sandbox mutex")
+                    .take()
+                    .unwrap_or_else(|| Sandbox::new(Arc::clone(&base_ledger), ApplyFlags::NONE));
                 let _ = open_ledger.modify(|view| {
                     for entry in transactions.iter_mut() {
                         let tx = Arc::clone(
@@ -2821,8 +2851,23 @@ impl ApplicationRoot {
                             metrics_snapshot,
                         );
                         let submit_rules = submit_view.rules().clone();
-                        let preclaim_ter =
+                        let mut preclaim_ter =
                             queue_apply_preclaim_ter(&submit_view, tx.as_ref(), current_ledger_index);
+                        // If preclaim says terPRE_SEQ but our open ledger tracker shows
+                        // this sequence IS the next expected one, override to TES_SUCCESS.
+                        // This matches rippled where the persistent OpenView already has
+                        // the updated sequence from prior submissions.
+                        if preclaim_ter == Ter::TER_PRE_SEQ {
+                            let account = tx.get_account_id(get_field_by_symbol("sfAccount"));
+                            let tx_seq = tx.get_seq_proxy().value();
+                            if let Ok(seqs) = account_seqs.lock() {
+                                if let Some(&expected) = seqs.get(&account) {
+                                    if tx_seq == expected {
+                                        preclaim_ter = Ter::TES_SUCCESS;
+                                    }
+                                }
+                            }
+                        }
                         let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
                             view,
                             &mut submit_view,
@@ -2831,6 +2876,7 @@ impl ApplicationRoot {
                             networkops_apply_flags(entry.admin, entry.fail_hard),
                             current_ledger_index,
                             preclaim_ter,
+                            Arc::clone(&account_seqs),
                         );
                         let result = tx_q
                             .apply_with_owned_metrics_and_derived_preflight_facts_and_hold_admission(
@@ -2847,6 +2893,8 @@ impl ApplicationRoot {
                     }
                     changed
                 });
+                // Store the sandbox back for reuse by the next submit call
+                *sandbox_holder.lock().expect("sandbox mutex") = Some(submit_view);
                 changed
             },
             || {},
@@ -3390,26 +3438,42 @@ impl ApplicationRoot {
     /// Get the account's current sequence from the network ops pending state.
     /// This accounts for transactions already submitted to the open ledger but not yet closed.
     pub fn network_ops_current_account_seq(&self, account: &protocol::AccountID) -> Option<u32> {
-        // The network_ops runtime tracks account sequences for submitted txs.
-        // Read from the closed/validated ledger and add the count of pending txs for this account.
+        // Check the persistent open ledger sequence tracker first
+        if let Ok(seqs) = self.open_ledger_account_seqs.lock() {
+            if let Some(&seq) = seqs.get(account) {
+                return Some(seq);
+            }
+        }
+        // Fall back to closed/validated ledger
         let base = self.closed_ledger().or_else(|| self.validated_ledger())?;
         let keylet = protocol::account_keylet(
             basics::base_uint::Uint160::from_void(account.data()),
         );
         let sle = base.read(keylet).ok().flatten()?;
-        let base_seq = sle.get_field_u32(protocol::get_field_by_symbol("sfSequence"));
-        // Count pending transactions from this account in the open ledger
-        let open_tx_count = {
-            use crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource;
-            self.open_ledger()
-                .current_open_transactions()
-                .iter()
-                .filter(|tx| {
-                    tx.get_account_id(protocol::get_field_by_symbol("sfAccount")) == *account
-                })
-                .count() as u32
-        };
-        Some(base_seq.saturating_add(open_tx_count))
+        Some(sle.get_field_u32(protocol::get_field_by_symbol("sfSequence")))
+    }
+
+    /// Record that a transaction from this account was successfully submitted to the open ledger.
+    /// The next expected sequence is tx_seq + 1.
+    pub fn note_open_ledger_tx(&self, account: &protocol::AccountID, tx_seq: u32) {
+        if let Ok(mut seqs) = self.open_ledger_account_seqs.lock() {
+            let next = tx_seq.saturating_add(1);
+            let entry = seqs.entry(*account).or_insert(next);
+            if next > *entry {
+                *entry = next;
+            }
+        }
+    }
+
+    /// Clear the open ledger sequence tracker (called on ledger_accept/close).
+    pub fn clear_open_ledger_account_seqs(&self) {
+        if let Ok(mut seqs) = self.open_ledger_account_seqs.lock() {
+            seqs.clear();
+        }
+        // Also reset the persistent sandbox so next submit starts fresh from new closed ledger
+        if let Ok(mut sandbox) = self.open_ledger_sandbox.lock() {
+            *sandbox = None;
+        }
     }
 
     pub fn on_published_ledger(&self, ledger: Arc<Ledger>) {
@@ -3729,6 +3793,7 @@ impl ApplicationRoot {
             .save_validated_ledger(Arc::clone(&closed), true);
 
         let next_open_index = closed_seq.saturating_add(1);
+        self.clear_open_ledger_account_seqs();
         self.rebuild_open_ledger_after_close(
             next_open_index,
             base_fee_drops,

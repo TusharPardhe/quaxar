@@ -542,6 +542,7 @@ fn apply_submit_tx_for_test(
         ApplyFlags::NONE,
         current_ledger_index,
         preclaim_ter,
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     );
     runtime.direct_apply()
 }
