@@ -1,9 +1,418 @@
-.DS_Store
-*.log
-*.tmp
-.idea/
-.vscode/
+# =============================================================================
+# quaxar .gitignore
+# Comprehensive ignore rules for a Rust XRPL node implementation
+# =============================================================================
+
+# =============================================================================
+# Rust / Cargo
+# =============================================================================
+
+# Compiled output and build artifacts
 target/
 rust/target/
-ops/*
+
+# Cargo lock is committed for binary projects (keep Cargo.lock tracked)
+# But ignore any backup copies
+Cargo.lock.bak
+
+# Incremental compilation cache (sometimes outside target/)
+*.incremental/
+
+# Rust compiler artifacts
+*.rlib
+*.rmeta
+*.d
+
+# Generated binaries (release artifacts that shouldn't be in source)
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Profiling and debugging data from Rust tooling
+perf.data
+perf.data.old
+flamegraph.svg
+cargo-timing*.html
+cachegrind.out.*
+callgrind.out.*
+massif.out.*
+
+# cargo-expand output
+*.expanded.rs
+
+# =============================================================================
+# Operating System Files
+# =============================================================================
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.AppleDouble
+.LSOverride
+Icon?
+
+# macOS resource forks and thumbnails
+**/Thumbs.db
+**/.DS_Store
+
+# Linux
+*~
+.directory
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.stackdump
+[Dd]esktop.ini
+
+# Windows shortcuts
+*.lnk
+
+# =============================================================================
+# IDE and Editor Files
+# =============================================================================
+
+# JetBrains (IntelliJ, CLion, RustRover)
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+.idea_modules/
+atlassian-ide-plugin.xml
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+.history/
+
+# Visual Studio
+.vs/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Vim / Neovim
+*.swp
+*.swo
+*.swn
+*.vim
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+[._]sw[a-p]
+Session.vim
+Sessionx.vim
+.netrwhist
+tags
+tags.lock
+tags.temp
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# Zed
+.zed/
+
+# Fleet
+.fleet/
+
+# =============================================================================
+# AI Coding Agents and Assistants
+# =============================================================================
+
+# Kiro
+.kiro/
+
+# Cursor
+.cursor/
+.cursorignore
+.cursorindexingignore
+
+# GitHub Copilot
+.copilot/
+
+# Windsurf / Codeium
+.windsurf/
+.codeium/
+
+# Aider
+.aider*
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v3/
+
+# Continue
+.continue/
+
+# Cline
+.cline/
+.clinerules
+
+# Tabnine
+.tabnine/
+
+# Amazon Q / CodeWhisperer
+.aws/amazonq/
+.amazonq/
+
+# Augment
+.augment/
+
+# Claude
+.claude/
+CLAUDE.md
+
+# =============================================================================
+# Node Runtime Data (XRPL node databases and state)
+# =============================================================================
+
+# NuDB database files
+*.nudb
+db/
+data/
+/var/lib/xrpld/
+
+# RocksDB database directories
+*.sst
+*.log.old
+MANIFEST-*
+CURRENT
+LOCK
+OPTIONS-*
+LOG
+LOG.old
+
+# Ledger data and snapshots (large binary files)
+*.snapshot
+snapshots/
+
+# =============================================================================
+# Configuration Files with Secrets
+# =============================================================================
+
+# Environment files
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Local configuration overrides (may contain credentials)
+*.local.cfg
+*.local.toml
+*.local.yaml
+*.local.yml
+*.local.json
+xrpld.local.cfg
+
+# Secret keys and certificates
+*.pem
+*.key
+*.crt
+*.cert
+*.p12
+*.pfx
+*.jks
+*.keystore
+!validators.txt
+
+# Validator token files (sensitive)
+validator-token.txt
+validator_token.txt
+node_identity.txt
+
+# =============================================================================
+# Logs and Temporary Files
+# =============================================================================
+
+# Log files
+*.log
+*.log.*
+logs/
+log/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+*.rej
+*.patch
+
+# =============================================================================
+# Build and Distribution Artifacts
+# =============================================================================
+
+# Distribution directories
 dist/
+out/
+build/
+pkg/
+release/
+
+# Release archives and binaries
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.zip
+*.7z
+*.deb
+*.rpm
+*.msi
+*.dmg
+*.AppImage
+
+# Operations directory (deployment artifacts)
+ops/*
+!ops/.gitkeep
+
+# =============================================================================
+# Docker
+# =============================================================================
+
+# Docker compose override (local customizations)
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# Docker volumes and data
+docker-data/
+.docker/
+
+# =============================================================================
+# Testing and Coverage
+# =============================================================================
+
+# Code coverage output
+coverage/
+*.gcda
+*.gcno
+*.gcov
+lcov.info
+tarpaulin-report.html
+cobertura.xml
+
+# Test result files
+test-results/
+junit.xml
+test-output/
+
+# Fuzzing corpus and artifacts
+fuzz/corpus/
+fuzz/artifacts/
+crash-*
+leak-*
+timeout-*
+
+# Benchmarking output
+criterion/
+target/criterion/
+benchmark-results/
+
+# =============================================================================
+# Documentation Build Output
+# =============================================================================
+
+# Rust doc output (if generated locally)
+target/doc/
+
+# mdBook output
+book/
+
+# =============================================================================
+# Package Manager and Dependency Caches
+# =============================================================================
+
+# npm / node (if any JS tooling is used)
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+.npm/
+.yarn/
+
+# Python (if any Python scripts are used)
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+
+# =============================================================================
+# Miscellaneous
+# =============================================================================
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Valgrind output
+valgrind-*.log
+
+# Heap dumps
+*.hprof
+
+# Terraform / Infrastructure (if any IaC is added)
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+!*.tfvars.example
+
+# Nix
+result
+result-*
+
+# Direnv
+.envrc
+
+# asdf
+.tool-versions
+
+# mise (formerly rtx)
+.mise.toml
+.mise.*.toml
+
+# Cargo audit database cache
+advisory-db/
+
+# sccache
+.sccache/
+
+# =============================================================================
+# Project-Specific
+# =============================================================================
+
+# Load test output
+devnet-loadtest.log
+
+# Any generated protocol buffer files (if protobuf is used)
+*.pb.go
+*_pb2.py
