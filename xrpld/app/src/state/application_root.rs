@@ -3650,6 +3650,27 @@ impl ApplicationRoot {
             let result = handle_real_dispatch(&mut state_view, st_tx, txn_type, None);
             let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
             if applied {
+                // Increment account sequence and charge fee (transactor base lifecycle).
+                let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
+                let account_keylet =
+                    protocol::account_keylet(Uint160::from_void(account.data()));
+                if let Ok(Some(acct_sle)) = ledger::ApplyView::peek(&mut state_view, account_keylet) {
+                    let current_seq = acct_sle.get_field_u32(get_field_by_symbol("sfSequence"));
+                    let fee_drops = st_tx.get_field_amount(get_field_by_symbol("sfFee")).xrp().drops();
+                    let balance = acct_sle.get_field_amount(get_field_by_symbol("sfBalance")).xrp().drops();
+                    let mut obj = acct_sle.clone_as_object();
+                    obj.set_field_u32(get_field_by_symbol("sfSequence"), current_seq.saturating_add(1));
+                    let new_balance = balance.saturating_sub(fee_drops);
+                    obj.set_field_amount(
+                        get_field_by_symbol("sfBalance"),
+                        protocol::STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(new_balance)),
+                    );
+                    let _ = ledger::ApplyView::update(&mut state_view, Arc::new(protocol::STLedgerEntry::from_stobject(
+                        obj,
+                        *acct_sle.key(),
+                    )));
+                }
+
                 let mut meta = protocol::TxMeta::new(st_tx.get_transaction_id(), closed_seq);
                 let mut serializer = protocol::Serializer::default();
                 meta.add_raw(&mut serializer, result, accepted_entries.len() as u32);
