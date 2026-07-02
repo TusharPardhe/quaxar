@@ -187,6 +187,7 @@ pub(super) fn attach_test_server_ports(app: &mut ApplicationRoot, grpc: Option<P
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
             },
             ServerPortSetup {
                 name: "port_admin".to_owned(),
@@ -206,6 +207,7 @@ pub(super) fn attach_test_server_ports(app: &mut ApplicationRoot, grpc: Option<P
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
             },
         ],
         client: None,

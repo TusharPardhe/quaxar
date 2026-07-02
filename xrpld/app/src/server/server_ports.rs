@@ -94,6 +94,7 @@ pub struct ServerPortSetup {
     pub admin_nets_v6: Vec<IpNet>,
     pub secure_gateway_nets_v4: Vec<IpNet>,
     pub secure_gateway_nets_v6: Vec<IpNet>,
+    pub standalone_mode: bool,
 }
 
 impl ServerPortSetup {
@@ -116,6 +117,7 @@ impl ServerPortSetup {
             admin_nets_v6: parsed.admin_nets_v6,
             secure_gateway_nets_v4: parsed.secure_gateway_nets_v4,
             secure_gateway_nets_v6: parsed.secure_gateway_nets_v6,
+            standalone_mode: false,
         }
     }
 
@@ -191,7 +193,9 @@ impl ServerPortsSetup {
                     .flatten()
                     .or_else(|| config.section("server").get::<u32>("limit").ok().flatten())
                     .unwrap_or(0);
-                ServerPortSetup::from_parsed_config(parsed, limit)
+                let mut port = ServerPortSetup::from_parsed_config(parsed, limit);
+                port.standalone_mode = stand_alone;
+                port
             })
             .collect::<Vec<_>>();
         let grpc = parse_grpc_port_config(config).map(|grpc| PublishedGrpcPort {
@@ -348,6 +352,7 @@ mod tests {
                         .expect("secure gateway net should parse"),
                 ],
                 secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
             }],
             client: Some(ServerPortClientSetup {
                 secure: false,
@@ -453,6 +458,7 @@ mod tests {
             admin_nets_v6: Vec::new(),
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
         };
 
         assert!(port.allows_http());

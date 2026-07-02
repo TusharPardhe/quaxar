@@ -194,6 +194,7 @@ impl RpcServerPortBuild {
                     admin_nets_v6: port.admin_nets_v6.clone(),
                     secure_gateway_nets_v4: port.secure_gateway_nets_v4.clone(),
                     secure_gateway_nets_v6: port.secure_gateway_nets_v6.clone(),
+                    standalone_mode: port.standalone_mode,
                 },
                 tls_config,
             })
@@ -1215,6 +1216,7 @@ mod tests {
             admin_nets_v6: Vec::new(),
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
         };
         // https is now treated as http+TLS, so it should succeed
         assert!(RpcServerPortPolicy::try_from(&secure_port).is_ok());
@@ -1237,6 +1239,7 @@ mod tests {
             admin_nets_v6: Vec::new(),
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
         };
         assert!(RpcServerPortPolicy::try_from(&peer_port).is_err());
     }
@@ -1262,6 +1265,7 @@ mod tests {
             admin_nets_v6: Vec::new(),
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
         };
 
         let build =

@@ -179,6 +179,7 @@ fn build_server_ports_setup_from_bootstrap(
         ssl_ciphers: String::new(),
         secure_gateway_nets_v4: Vec::new(),
         secure_gateway_nets_v6: Vec::new(),
+        standalone_mode: false,
     };
 
     Ok(Arc::new(ServerPortsSetup {

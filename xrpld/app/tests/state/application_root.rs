@@ -1456,6 +1456,7 @@ fn application_root_can_attach_server_ports_setup_for_server_info_reads() {
             admin_nets_v6: Vec::new(),
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
         }],
         client: Some(ServerPortClientSetup {
             secure: false,
@@ -1497,6 +1498,7 @@ fn application_root_can_attach_server_ports_setup_for_server_info_reads() {
             admin_nets_v6: Vec::new(),
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
         }],
         client: Some(ServerPortClientSetup {
             secure: true,

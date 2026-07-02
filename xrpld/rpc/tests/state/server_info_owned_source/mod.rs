@@ -96,6 +96,7 @@ fn borrowed_and_owned_application_server_info_match_for_server_info_and_state() 
             admin_nets_v6: Vec::new(),
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
         }],
         client: None,
         overlay: None,

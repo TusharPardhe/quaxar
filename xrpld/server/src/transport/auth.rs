@@ -19,6 +19,7 @@ pub struct ServerAuthConfig {
     pub admin_nets_v6: Vec<IpNet>,
     pub secure_gateway_nets_v4: Vec<IpNet>,
     pub secure_gateway_nets_v6: Vec<IpNet>,
+    pub standalone_mode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +197,10 @@ pub fn password_unrequired_or_sent_correct(config: &ServerAuthConfig, params: &J
 }
 
 pub fn is_admin(config: &ServerAuthConfig, params: &JsonValue, remote_ip: IpAddr) -> bool {
+    // In standalone mode, all requests are admin (no network, local-only operation).
+    if config.standalone_mode {
+        return true;
+    }
     ip_allowed(remote_ip, &config.admin_nets_v4, &config.admin_nets_v6)
         && password_unrequired_or_sent_correct(config, params)
 }

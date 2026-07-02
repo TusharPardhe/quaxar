@@ -73,6 +73,7 @@ fn server_ports_setup(protocols: Vec<String>) -> Arc<ServerPortsSetup> {
             admin_nets_v6: Vec::new(),
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
         }],
         client: Some(ServerPortClientSetup {
             secure: false,
