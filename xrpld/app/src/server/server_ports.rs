@@ -352,7 +352,7 @@ mod tests {
                         .expect("secure gateway net should parse"),
                 ],
                 secure_gateway_nets_v6: Vec::new(),
-            standalone_mode: false,
+                standalone_mode: false,
             }],
             client: Some(ServerPortClientSetup {
                 secure: false,

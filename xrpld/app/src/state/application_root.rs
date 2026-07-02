@@ -3598,12 +3598,21 @@ impl ApplicationRoot {
         }
 
         let current = self.open_ledger().current();
-        let closed_seq = current
-            .ledger_current_index
-            .max(self.closed_ledger_seq().unwrap_or(0).saturating_add(1))
-            .max(self.validated_ledger_seq().unwrap_or(0).saturating_add(1))
+        let current_idx = current.ledger_current_index;
+        let closed_s = self.closed_ledger_seq().unwrap_or(0);
+        let validated_s = self.validated_ledger_seq().unwrap_or(0);
+        let closed_seq = current_idx
+            .max(closed_s.saturating_add(1))
+            .max(validated_s.saturating_add(1))
             .max(1);
-        let closed_seq = closed_seq.max(1);
+        tracing::info!(
+            target: "app",
+            current_idx,
+            closed_s,
+            validated_s,
+            closed_seq,
+            "accept_standalone_ledger: computing next seq"
+        );
         let close_time = self.current_close_time_seconds();
 
         self.accept_ledger(closed_seq, close_time, current.base_fee_drops)
