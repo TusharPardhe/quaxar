@@ -3605,17 +3605,112 @@ impl ApplicationRoot {
             .max(closed_s.saturating_add(1))
             .max(validated_s.saturating_add(1))
             .max(1);
-        tracing::info!(
-            target: "app",
-            current_idx,
-            closed_s,
-            validated_s,
-            closed_seq,
-            "accept_standalone_ledger: computing next seq"
-        );
         let close_time = self.current_close_time_seconds();
+        let base_fee_drops = current.base_fee_drops;
 
-        self.accept_ledger(closed_seq, close_time, current.base_fee_drops)
+        // In standalone mode, transactions are already applied to the open ledger
+        // during submit. We take those transactions and re-apply them against the
+        // parent ledger to build the closed ledger (matching rippled's standalone
+        // acceptLedger which promotes open ledger state directly).
+        let parent_ledger = self.closed_ledger().or_else(|| self.validated_ledger());
+        let parent = parent_ledger
+            .clone()
+            .unwrap_or_else(|| Arc::new(Ledger::from_ledger_seq_and_close_time(1, 0, false)));
+
+        // Flush any held transactions into the open ledger before closing.
+        let parent_hash = parent.header().hash;
+        let _ = self.apply_held_transactions_to_network_ops(parent_hash, |_sync| {});
+        // Apply any pending (from held flush) into the open ledger.
+        let _ = self.apply_network_ops_pending_to_open_ledger();
+
+        // Re-read open ledger txs after held transactions were applied.
+        use crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource;
+        let open_txs: Vec<Arc<protocol::STTx>> =
+            self.open_ledger().current_open_transactions();
+
+
+        // Verify sequence continuity
+        if parent.header().seq.saturating_add(1) != closed_seq {
+            return Err(format!(
+                "standalone accept expected next sequence {} but received {}",
+                parent.header().seq.saturating_add(1),
+                closed_seq
+            ));
+        }
+
+        // Apply transactions to a mutable view of the parent ledger
+        let mut state_view = ledger::ApplyViewImpl::new(
+            Arc::clone(&parent),
+            protocol::ApplyFlags::NONE,
+        );
+
+        let mut accepted_entries = Vec::new();
+        for st_tx in &open_txs {
+            let txn_type = st_tx.get_txn_type();
+            let result = handle_real_dispatch(&mut state_view, st_tx, txn_type, None);
+            let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
+            if applied {
+                let mut meta = protocol::TxMeta::new(st_tx.get_transaction_id(), closed_seq);
+                let mut serializer = protocol::Serializer::default();
+                meta.add_raw(&mut serializer, result, accepted_entries.len() as u32);
+
+                let _ = self.transaction_master.in_ledger(
+                    st_tx.get_transaction_id(),
+                    closed_seq,
+                    Some(accepted_entries.len() as u32),
+                    Some(self.registry.network_id_service.get_network_id()),
+                );
+
+                accepted_entries.push(StandaloneAcceptedTx {
+                    transaction_id: st_tx.get_transaction_id(),
+                    txn: Arc::new(protocol::Serializer::from_bytes(
+                        st_tx.get_serializer().data(),
+                    )),
+                    metadata: Arc::new(serializer),
+                });
+            }
+        }
+
+        // Build the closed ledger from the parent with accumulated state.
+        // from_previous creates a new ledger sharing the parent's state map (CoW).
+        let closed = {
+            let mut ledger = Ledger::from_previous(&parent, close_time);
+            // Apply state modifications from the transactor (new accounts, balance changes)
+            let _ = state_view.table().apply(&mut ledger);
+            // Insert accepted transactions into the tx map
+            for entry in &accepted_entries {
+                let _ = ledger.raw_tx_insert(
+                    entry.transaction_id,
+                    Arc::clone(&entry.txn),
+                    Some(Arc::clone(&entry.metadata)),
+                );
+            }
+            ledger.set_accepted(close_time, 0, true);
+            Arc::new(ledger)
+        };
+
+        let tx_count = accepted_entries.len();
+        tracing::info!(target: "app", seq = closed_seq, tx_count, close_time, "Standalone ledger closed");
+
+        let _ = self.process_closed_ledger_txq(closed.as_ref(), false);
+        self.on_closed_ledger(Arc::clone(&closed));
+        self.on_published_ledger(Arc::clone(&closed));
+        let _ = self.on_validated_ledger(Arc::clone(&closed));
+
+        use ledger::LedgerPersistenceRuntime;
+        self.build_ledger_persistence_runtime()
+            .save_validated_ledger(Arc::clone(&closed), true);
+
+        let next_open_index = closed_seq.saturating_add(1);
+        self.rebuild_open_ledger_after_close(
+            next_open_index,
+            base_fee_drops,
+            *closed.header().hash.as_uint256(),
+        );
+        self.set_status_rpc_current_ledger_index(Some(next_open_index));
+        self.set_status_rpc_queue_report(Some(self.tx_q_rpc_report()));
+
+        Ok(next_open_index)
     }
 
     pub fn accept_ledger(
