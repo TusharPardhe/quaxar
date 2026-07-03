@@ -150,25 +150,26 @@ fn execute_direct_fwd<V: ApplyView>(
         return Ok((input.zeroed(), input.zeroed()));
     }
 
-    // Compute what src actually pays (deliver * rate)
-    let (send_amount, consumed) = if has_rate {
+    // Compute what src actually pays (deliver * rate) for tracking purposes.
+    // account_send already applies the transfer rate internally, so we pass
+    // `deliver` (not the adjusted amount) to avoid double-application.
+    let consumed = if has_rate {
         let adjusted_iou = crate::domain::mul_ratio::mul_ratio(
             deliver_iou,
             rate,
             crate::domain::mul_ratio::QUALITY_ONE,
             true, // round up (src pays more)
         );
-        let adjusted = protocol::STAmount::from_iou_amount(
+        protocol::STAmount::from_iou_amount(
             sf("sfAmount"),
             adjusted_iou,
             step_issue,
-        );
-        (adjusted.clone(), adjusted)
+        )
     } else {
-        (deliver.clone(), deliver.clone())
+        deliver.clone()
     };
 
-    let result = ripple_state_helpers::account_send(view, src, dst, &send_amount);
+    let result = ripple_state_helpers::account_send(view, src, dst, &deliver);
     if result != Ter::TES_SUCCESS {
         return Err(result);
     }
