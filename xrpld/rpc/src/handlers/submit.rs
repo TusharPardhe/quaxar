@@ -727,7 +727,7 @@ use protocol::{
     credential_keylet, deposit_preauth_keylet, did_keylet, escrow_keylet, feature_amm, feature_id,
     feature_single_asset_vault, get_field_by_symbol, is_tec_claim, is_tes_success, jss, line,
     mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid, nft_offer_keylet_from_key,
-    nft_page_keylet, nft_page_min_keylet, oracle_keylet, pay_channel_keylet_from_key,
+    nft_page_keylet, nft_page_max_keylet, nft_page_min_keylet, oracle_keylet, pay_channel_keylet_from_key,
     permissioned_domain_keylet_from_id, trans_token, vault_keylet_from_key,
     xchain_owned_claim_id_keylet_from_bridge,
 };
@@ -836,8 +836,16 @@ fn ledger_nft_present_for_owner(
     owner: AccountID,
     nft_id: basics::base_uint::Uint256,
 ) -> bool {
-    let page = nft_page_keylet(nft_page_min_keylet(account_to_uint160(owner)), nft_id);
-    let Some(page) = ledger_read_keylet(ledger, page) else {
+    // NFT pages are stored at the max key for the owner, not at the
+    // token-derived key. Use succ to find the correct page.
+    let first = nft_page_keylet(nft_page_min_keylet(account_to_uint160(owner)), nft_id);
+    let last = nft_page_max_keylet(account_to_uint160(owner));
+    let page_key = match ledger.succ(first.key, Some(last.key.next())) {
+        Ok(Some(k)) => k,
+        _ => last.key,
+    };
+    let page_kl = protocol::Keylet::new(protocol::LedgerEntryType::NFTokenPage, page_key);
+    let Some(page) = ledger_read_keylet(ledger, page_kl) else {
         return false;
     };
     let nftokens_field = get_field_by_symbol("sfNFTokens");

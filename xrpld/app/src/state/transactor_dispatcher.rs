@@ -3404,11 +3404,10 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 account
             };
             let token_id = sttx.get_field_h256(sf("sfNFTokenID"));
-            let page_keylet = protocol::keylet::nft_page_keylet(
-                protocol::nft_page_min_keylet(Uint160::from_void(owner.data())),
-                Uint256::from(token_id),
-            );
-            if let Ok(Some(page)) = view.peek(page_keylet) {
+            // Use succ-based page lookup (pages are stored at the max key for the
+            // owner, not at the token-derived key). nft_locate_page uses succ() to
+            // find the correct page containing this token.
+            if let Ok(Some(page)) = nft_locate_page(view, &owner, token_id) {
                 let tokens = page.get_field_array(sf("sfNFTokens"));
                 let mut new_tokens = protocol::STArray::new(sf("sfNFTokens"));
                 let mut found = false;
@@ -3420,21 +3419,24 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         found = true;
                     }
                 }
-                if found {
-                    if new_tokens.is_empty() {
-                        let _ = view.erase(page);
-                    } else {
-                        let mut obj = page.clone_as_object();
-                        obj.set_field_array(sf("sfNFTokens"), new_tokens);
-                        let _ =
-                            view.update(Arc::new(STLedgerEntry::from_stobject(obj, *page.key())));
-                    }
-                    if let Ok(Some(acct)) =
-                        view.peek(protocol::account_keylet(Uint160::from_void(owner.data())))
-                    {
-                        let _ = ledger::adjust_owner_count(view, &acct, -1);
-                    }
+                if !found {
+                    return Ter::TEC_NO_ENTRY;
                 }
+                if new_tokens.is_empty() {
+                    let _ = view.erase(page);
+                } else {
+                    let mut obj = page.clone_as_object();
+                    obj.set_field_array(sf("sfNFTokens"), new_tokens);
+                    let _ =
+                        view.update(Arc::new(STLedgerEntry::from_stobject(obj, *page.key())));
+                }
+                if let Ok(Some(acct)) =
+                    view.peek(protocol::account_keylet(Uint160::from_void(owner.data())))
+                {
+                    let _ = ledger::adjust_owner_count(view, &acct, -1);
+                }
+            } else {
+                return Ter::TEC_NO_ENTRY;
             }
             Ter::TES_SUCCESS
         }
