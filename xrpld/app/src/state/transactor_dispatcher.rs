@@ -3761,7 +3761,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let id_bytes = nftoken_id.data();
             let nft_flags_from_id = ((id_bytes[0] as u16) << 8) | (id_bytes[1] as u16);
             let transfer_fee_bps = ((id_bytes[2] as u16) << 8) | (id_bytes[3] as u16);
-            let has_transfer_fee = (nft_flags_from_id & 0x0008) != 0 && transfer_fee_bps > 0;
+            let has_transfer_fee = transfer_fee_bps > 0;
 
             // Extract issuer from NFTokenID bytes 4..24
             let mut issuer_bytes = [0u8; 20];
