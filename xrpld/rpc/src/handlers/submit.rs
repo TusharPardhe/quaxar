@@ -1235,10 +1235,6 @@ fn submit_semantic_preflight_with_ledger(
                 if !st_tx.is_field_present(pay_channel_field) {
                     return Ter::TEM_MALFORMED;
                 }
-                let pay_channel = st_tx.get_field_h256(pay_channel_field);
-                if !ledger_keylet_exists(ledger, pay_channel_keylet_from_key(pay_channel)) {
-                    return Ter::TEC_NO_ENTRY;
-                }
             }
 
             Ter::TES_SUCCESS
@@ -1273,10 +1269,6 @@ fn submit_semantic_preflight_with_ledger(
                 let pay_channel_field = get_field_by_symbol("sfChannel");
                 if !st_tx.is_field_present(pay_channel_field) {
                     return Ter::TEM_MALFORMED;
-                }
-                let pay_channel = st_tx.get_field_h256(pay_channel_field);
-                if !ledger_keylet_exists(ledger, pay_channel_keylet_from_key(pay_channel)) {
-                    return Ter::TEC_NO_TARGET;
                 }
             }
 
@@ -1667,8 +1659,22 @@ fn submit_semantic_preflight_with_ledger(
             if let Some(ledger) = ledger {
                 let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
                 let nft_id = st_tx.get_field_h256(nft_id_field);
-                if !ledger_nft_present_for_owner(ledger, account, nft_id) {
+                // Use sfOwner if present (issuer burning someone else's NFT)
+                let owner = if st_tx.is_field_present(get_field_by_symbol("sfOwner")) {
+                    st_tx.get_account_id(get_field_by_symbol("sfOwner"))
+                } else {
+                    account
+                };
+                if !ledger_nft_present_for_owner(ledger, owner, nft_id) {
                     return Ter::TEC_NO_ENTRY;
+                }
+                // If account != owner, check burnable flag (bit 0x0001 in NFTokenID)
+                if account != owner {
+                    let id_bytes = nft_id.data();
+                    let nft_flags = ((id_bytes[0] as u16) << 8) | (id_bytes[1] as u16);
+                    if (nft_flags & 0x0001) == 0 {
+                        return Ter::TEC_NO_PERMISSION;
+                    }
                 }
             }
 

@@ -84,12 +84,12 @@ pub fn delete_sle(
             return Ok(Ter::TEF_BAD_LEDGER);
         }
 
-        if accepted {
-            let Some(subject_sle) = view.peek(account_keylet(to_uint160(subject)))? else {
-                return Ok(Ter::TEF_BAD_LEDGER);
-            };
-            adjust_owner_count(view, &subject_sle, -1)?;
-        }
+        // Always decrement subject OwnerCount when subject != issuer
+        // (OwnerCount was incremented on create when added to subject's directory)
+        let Some(subject_sle) = view.peek(account_keylet(to_uint160(subject)))? else {
+            return Ok(Ter::TEF_BAD_LEDGER);
+        };
+        adjust_owner_count(view, &subject_sle, -1)?;
     }
 
     view.erase(sle_credential)?;
