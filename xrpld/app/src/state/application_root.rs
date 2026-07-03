@@ -1861,9 +1861,23 @@ impl ApplicationRoot {
     ) {
         let local_txs = self.local_open_ledger_records();
         let mut retries = Vec::<AppOpenLedgerTxRecord>::new();
+
+        let transaction_master = &self.transaction_master;
         self.open_ledger().accept(
             || AppOpenLedgerView::with_parent_hash(next_open_index, base_fee_drops, parent_hash),
-            &|_: &Uint256| false,
+            &|tx_id: &Uint256| {
+                // Return true if this transaction is already in a closed ledger
+                // (i.e., it should NOT be re-applied to the new open ledger).
+                if let Some(txn) = transaction_master.fetch_from_cache(tx_id) {
+                    let status = txn
+                        .lock()
+                        .expect("transaction mutex must not be poisoned")
+                        .get_status();
+                    status == crate::tx_queue::transaction::TransStatus::COMMITTED
+                } else {
+                    false
+                }
+            },
             local_txs,
             false,
             &mut retries,
@@ -3815,6 +3829,11 @@ impl ApplicationRoot {
         self.on_published_ledger(Arc::clone(&closed));
         let _ = self.on_validated_ledger(Arc::clone(&closed));
 
+        // Sweep local_txs: remove transactions that are now in the closed ledger.
+        // Without this, rebuild_open_ledger_after_close would re-add them to the
+        // next open ledger causing duplicate application on subsequent accepts.
+        let _ = self.update_local_tx(closed.as_ref());
+
         use ledger::LedgerPersistenceRuntime;
         self.build_ledger_persistence_runtime()
             .save_validated_ledger(Arc::clone(&closed), true);
@@ -4008,6 +4027,11 @@ impl ApplicationRoot {
         self.on_closed_ledger(Arc::clone(&closed));
         self.on_published_ledger(Arc::clone(&closed));
         let _ = self.on_validated_ledger(Arc::clone(&closed));
+
+        // Sweep local_txs: remove transactions that are now in the closed ledger.
+        // Without this, rebuild_open_ledger_after_close would re-add them to the
+        // next open ledger causing duplicate application on subsequent accepts.
+        let _ = self.update_local_tx(closed.as_ref());
 
         use ledger::LedgerPersistenceRuntime;
         self.build_ledger_persistence_runtime()
