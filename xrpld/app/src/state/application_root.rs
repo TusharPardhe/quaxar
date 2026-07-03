@@ -3717,6 +3717,33 @@ impl ApplicationRoot {
         let open_txs: Vec<Arc<protocol::STTx>> =
             self.open_ledger().current_open_transactions();
 
+        // If no transactions are pending, still advance the ledger (matching rippled)
+        // but skip the state rebuild to avoid state map corruption from empty applies.
+        if open_txs.is_empty() {
+            let closed = {
+                let mut ledger = Ledger::from_previous(&parent, close_time);
+                ledger.set_accepted(close_time, 0, true);
+                Arc::new(ledger)
+            };
+            tracing::debug!(target: "app", seq = closed_seq, "Standalone ledger closed (empty)");
+            let _ = self.process_closed_ledger_txq(closed.as_ref(), false);
+            self.on_closed_ledger(Arc::clone(&closed));
+            self.on_published_ledger(Arc::clone(&closed));
+            let _ = self.on_validated_ledger(Arc::clone(&closed));
+            use ledger::LedgerPersistenceRuntime;
+            self.build_ledger_persistence_runtime()
+                .save_validated_ledger(Arc::clone(&closed), true);
+            let next_open_index = closed_seq.saturating_add(1);
+            self.clear_open_ledger_account_seqs();
+            self.rebuild_open_ledger_after_close(
+                next_open_index,
+                base_fee_drops,
+                *closed.header().hash.as_uint256(),
+            );
+            self.set_status_rpc_current_ledger_index(Some(next_open_index));
+            self.set_status_rpc_queue_report(Some(self.tx_q_rpc_report()));
+            return Ok(next_open_index);
+        }
 
         // Verify sequence continuity
         if parent.header().seq.saturating_add(1) != closed_seq {
