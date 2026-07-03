@@ -169,7 +169,7 @@ fn execute_direct_fwd<V: ApplyView>(
         deliver.clone()
     };
 
-    let result = ripple_state_helpers::account_send(view, src, dst, &deliver);
+    let result = ripple_state_helpers::account_send(view, src, dst, &consumed);
     if result != Ter::TES_SUCCESS {
         return Err(result);
     }

@@ -137,20 +137,9 @@ pub fn do_payment<V: ledger::ApplyView>(
         (has_paths || send_max.is_some() || !is_dst_native) && (!is_dst_mpt || mp_tokens_v2);
 
     if ripple {
-        if is_direct_iou_payment(&dst_amount, send_max.as_ref(), has_paths, &account, &dst_account_id) {
-            if let Some(ref dst_sle) = dst_exists {
-                if let Some(ter) = check_deposit_preauth(view, &account, &dst_account_id, dst_sle) {
-                    return ter;
-                }
-            }
-            return do_direct_iou_payment(
-                view,
-                &account,
-                &dst_account_id,
-                &dst_amount,
-                partial_payment_allowed,
-            );
-        }
+        // C++ parity: ALL IOU payments go through rippleCalc.
+        // No direct shortcut — the flow engine handles transfer rates,
+        // path finding, and multi-hop payments correctly.
 
         // IOU/path payment via RippleCalc
 
