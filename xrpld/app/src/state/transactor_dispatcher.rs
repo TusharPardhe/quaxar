@@ -3445,6 +3445,47 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let token_id = sttx.get_field_h256(sf("sfNFTokenID"));
             let tx_flags = sttx.get_flags();
             let is_sell = (tx_flags & protocol::tfSellNFToken) != 0;
+            let amount = sttx.get_field_amount(sf("sfAmount"));
+
+            // Determine the NFT owner for lookup purposes.
+            // For buy offers, sfOwner specifies who owns the token.
+            // For sell offers, the tx account must be the owner.
+            let nft_owner = if !is_sell && sttx.is_field_present(sf("sfOwner")) {
+                sttx.get_account_id(sf("sfOwner"))
+            } else {
+                account
+            };
+
+            // Verify NFT exists: look up the token in the owner's pages.
+            let nft_found = match nft_find_token_and_page(view, &nft_owner, token_id) {
+                Ok(Some(_)) => true,
+                _ => false,
+            };
+            if !nft_found {
+                return Ter::TEC_NO_ENTRY;
+            }
+
+            // Sell offers: account must own the NFT (already verified above since nft_owner == account for sell).
+            // Buy offers: cannot buy your own NFT.
+            if !is_sell {
+                if nft_owner == account {
+                    // Cannot create a buy offer for your own NFT
+                    return Ter::TEC_NO_PERMISSION;
+                }
+                // Buy offers must have positive amount
+                if amount.signum() <= 0 {
+                    return Ter::TEM_BAD_AMOUNT;
+                }
+            }
+
+            // tfOnlyXRP check: if the NFT has the tfOnlyXRP flag set (bit 0x0002 in
+            // the high 16 bits of NFTokenID), reject non-XRP amounts.
+            let id_bytes = token_id.data();
+            let nft_flags_from_id = ((id_bytes[0] as u16) << 8) | (id_bytes[1] as u16);
+            if (nft_flags_from_id & 0x0002) != 0 && !amount.native() && amount.signum() != 0 {
+                return Ter::TEM_BAD_AMOUNT;
+            }
+
             let offer_keylet = protocol::keylet::nft_offer_keylet_for_owner(
                 Uint160::from_void(account.data()),
                 sttx.get_seq_value(),
@@ -3475,7 +3516,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let mut sle = STLedgerEntry::new(offer_keylet);
             sle.set_account_id(sf("sfOwner"), account);
             sle.set_field_h256(sf("sfNFTokenID"), token_id);
-            sle.set_field_amount(sf("sfAmount"), sttx.get_field_amount(sf("sfAmount")));
+            sle.set_field_amount(sf("sfAmount"), amount);
             let mut sle_flags = 0u32;
             if is_sell {
                 sle_flags |= protocol::lsfSellNFToken;
@@ -3554,6 +3595,46 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 None
             };
 
+            // Validate: at least one offer must exist
+            if sell_offer.is_none() && buy_offer.is_none() {
+                return Ter::TEC_OBJECT_NOT_FOUND;
+            }
+
+            // Destination check: if a sell offer has a Destination, only that
+            // account (or a broker using both offers) can accept it.
+            if let Some(ref so) = sell_offer {
+                if so.is_field_present(sf("sfDestination")) {
+                    let dest = so.get_account_id(sf("sfDestination"));
+                    // In broker mode, the buy offer owner must be the destination.
+                    // In direct sell mode, the tx_account must be the destination.
+                    if buy_offer.is_some() {
+                        if let Some(ref bo) = buy_offer {
+                            if bo.get_account_id(sf("sfOwner")) != dest {
+                                return Ter::TEC_NO_PERMISSION;
+                            }
+                        }
+                    } else if tx_account != dest {
+                        return Ter::TEC_NO_PERMISSION;
+                    }
+                }
+            }
+
+            // Destination check for buy offers
+            if let Some(ref bo) = buy_offer {
+                if bo.is_field_present(sf("sfDestination")) {
+                    let dest = bo.get_account_id(sf("sfDestination"));
+                    if sell_offer.is_some() {
+                        if let Some(ref so) = sell_offer {
+                            if so.get_account_id(sf("sfOwner")) != dest {
+                                return Ter::TEC_NO_PERMISSION;
+                            }
+                        }
+                    } else if tx_account != dest {
+                        return Ter::TEC_NO_PERMISSION;
+                    }
+                }
+            }
+
             let delete_offer = |view: &mut V, offer: &Arc<STLedgerEntry>| {
                 let owner = offer.get_account_id(sf("sfOwner"));
                 let owner_node = offer.get_field_u64(sf("sfOwnerNode"));
@@ -3613,11 +3694,46 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     return Ter::TEF_INTERNAL;
                 };
 
+            // Transfer fee handling: extract transfer fee from NFTokenID.
+            // NFTokenID bytes 0-1 = flags, bytes 2-3 = transfer fee (basis points out of 50000).
+            // Bytes 4-23 = issuer account (20 bytes).
+            // Transfer fee only applies on secondary sales (seller != issuer).
+            let id_bytes = nftoken_id.data();
+            let nft_flags_from_id = ((id_bytes[0] as u16) << 8) | (id_bytes[1] as u16);
+            let transfer_fee_bps = ((id_bytes[2] as u16) << 8) | (id_bytes[3] as u16);
+            let has_transfer_fee = (nft_flags_from_id & 0x0008) != 0 && transfer_fee_bps > 0;
+
+            // Extract issuer from NFTokenID bytes 4..24
+            let mut issuer_bytes = [0u8; 20];
+            issuer_bytes.copy_from_slice(&id_bytes[4..24]);
+            let issuer_id = AccountID::from_array(issuer_bytes);
+
+            // Determine if this is a secondary sale (seller is not the issuer)
+            let is_secondary_sale = seller != issuer_id;
+
             if amount.signum() > 0 {
                 if amount.native() {
-                    do_xrp_payment(view, &buyer, &seller, &amount, 0);
+                    if has_transfer_fee && is_secondary_sale {
+                        // Calculate transfer fee: fee = amount * transferFee / 50000
+                        let total_drops = amount.xrp().drops();
+                        let fee_drops = (total_drops as u64 * transfer_fee_bps as u64 / 50000) as i64;
+                        let seller_drops = total_drops - fee_drops;
+
+                        // Pay seller (amount minus fee)
+                        let seller_amount = STAmount::from_xrp_amount(XRPAmount::from_drops(seller_drops));
+                        do_xrp_payment(view, &buyer, &seller, &seller_amount, 0);
+
+                        // Pay issuer the transfer fee
+                        if fee_drops > 0 {
+                            let fee_amount = STAmount::from_xrp_amount(XRPAmount::from_drops(fee_drops));
+                            do_xrp_payment(view, &buyer, &issuer_id, &fee_amount, 0);
+                        }
+                    } else {
+                        do_xrp_payment(view, &buyer, &seller, &amount, 0);
+                    }
                 } else {
                     // IOU payment via accountSend
+                    // TODO: IOU transfer fee would need similar handling
                     ledger::ripple_state_helpers::account_send(view, &buyer, &seller, &amount);
                 }
             }
