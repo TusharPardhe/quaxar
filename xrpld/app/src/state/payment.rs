@@ -137,7 +137,7 @@ pub fn do_payment<V: ledger::ApplyView>(
         (has_paths || send_max.is_some() || !is_dst_native) && (!is_dst_mpt || mp_tokens_v2);
 
     if ripple {
-        if is_direct_iou_payment(&dst_amount, send_max.as_ref(), has_paths) {
+        if is_direct_iou_payment(&dst_amount, send_max.as_ref(), has_paths, &account, &dst_account_id) {
             if let Some(ref dst_sle) = dst_exists {
                 if let Some(ter) = check_deposit_preauth(view, &account, &dst_account_id, dst_sle) {
                     return ter;
@@ -352,12 +352,23 @@ fn is_direct_iou_payment(
     dst_amount: &STAmount,
     send_max: Option<&STAmount>,
     has_paths: bool,
+    account: &AccountID,
+    dst_account_id: &AccountID,
 ) -> bool {
-    !has_paths
-        && !dst_amount.native()
-        && send_max.is_some_and(|send_max| {
-            send_max.asset() == dst_amount.asset() && send_max == dst_amount
-        })
+    // Only use the direct IOU when one party is the issuer.
+    // Non-issuer to non-issuer payments MUST go through rippleCalculate
+    // which builds the default path (sender → issuer → destination).
+    if has_paths || dst_amount.native() {
+        return false;
+    }
+    let issue = dst_amount.issue();
+    let one_is_issuer = *account == issue.account || *dst_account_id == issue.account;
+    if !one_is_issuer {
+        return false;
+    }
+    send_max.is_some_and(|send_max| {
+        send_max.asset() == dst_amount.asset() && send_max == dst_amount
+    })
 }
 
 fn do_direct_iou_payment<V: ledger::ApplyView>(
