@@ -2255,6 +2255,21 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let account = sttx.get_account_id(sf("sfAccount"));
             let dst = sttx.get_account_id(sf("sfDestination"));
             let send_max = sttx.get_field_amount(sf("sfSendMax"));
+            // Preclaim: destination must exist (matching rippled CheckCreate::preclaim)
+            let dst_keylet = protocol::account_keylet(Uint160::from_void(dst.data()));
+            let Some(dst_sle) = view.peek(dst_keylet).ok().flatten() else {
+                return Ter::TEC_NO_DST;
+            };
+            // Preclaim: check lsfDisallowIncomingCheck on destination
+            if dst_sle.is_flag(protocol::lsfDisallowIncomingCheck) {
+                return Ter::TEC_NO_PERMISSION;
+            }
+            // Preclaim: destination requires DestinationTag
+            if dst_sle.is_flag(protocol::lsfRequireDestTag)
+                && !sttx.is_field_present(sf("sfDestinationTag"))
+            {
+                return Ter::TEC_DST_TAG_NEEDED;
+            }
             let mpt_result = check_mpt_check_create_allowed(view, &account, &dst, &send_max);
             if mpt_result != Ter::TES_SUCCESS {
                 return mpt_result;
@@ -2266,6 +2281,18 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             sle.set_account_id(sf("sfDestination"), dst);
             sle.set_field_amount(sf("sfSendMax"), send_max);
             sle.set_field_u32(sf("sfSequence"), sttx.get_seq_value());
+            if sttx.is_field_present(sf("sfSourceTag")) {
+                sle.set_field_u32(sf("sfSourceTag"), sttx.get_field_u32(sf("sfSourceTag")));
+            }
+            if sttx.is_field_present(sf("sfDestinationTag")) {
+                sle.set_field_u32(sf("sfDestinationTag"), sttx.get_field_u32(sf("sfDestinationTag")));
+            }
+            if sttx.is_field_present(sf("sfExpiration")) {
+                sle.set_field_u32(sf("sfExpiration"), sttx.get_field_u32(sf("sfExpiration")));
+            }
+            if sttx.is_field_present(sf("sfInvoiceID")) {
+                sle.set_field_h256(sf("sfInvoiceID"), sttx.get_field_h256(sf("sfInvoiceID")));
+            }
             // Add to owner directory
             let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
             if let Ok(Some(page)) = ledger::dir_append(view, &owner_dir, check_keylet.key, &|_| {})
@@ -2286,19 +2313,30 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             Ter::TES_SUCCESS
         }
         TxType::CHECK_CANCEL => {
+            let tx_account = sttx.get_account_id(sf("sfAccount"));
             let check_id = sttx.get_field_h256(sf("sfCheckID"));
             let check_keylet = protocol::unchecked_keylet(check_id);
             if let Ok(Some(check_sle)) = view.peek(check_keylet) {
                 let owner = check_sle.get_account_id(sf("sfAccount"));
+                let destination = check_sle.get_account_id(sf("sfDestination"));
+                // Preclaim: if check is not expired, only creator or destination may cancel
+                let expired = if check_sle.is_field_present(sf("sfExpiration")) {
+                    let exp = check_sle.get_field_u32(sf("sfExpiration"));
+                    view.header().parent_close_time >= exp
+                } else {
+                    false
+                };
+                if !expired && tx_account != owner && tx_account != destination {
+                    return Ter::TEC_NO_PERMISSION;
+                }
                 // Remove from owner directory
                 let owner_node = check_sle.get_field_u64(sf("sfOwnerNode"));
                 let owner_dir = owner_dir_keylet(Uint160::from_void(owner.data()));
                 let _ = ledger::dir_remove(view, &owner_dir, owner_node, *check_sle.key(), false);
                 // Remove from destination directory
                 if check_sle.is_field_present(sf("sfDestinationNode")) {
-                    let dst = check_sle.get_account_id(sf("sfDestination"));
                     let dst_node = check_sle.get_field_u64(sf("sfDestinationNode"));
-                    let dst_dir = owner_dir_keylet(Uint160::from_void(dst.data()));
+                    let dst_dir = owner_dir_keylet(Uint160::from_void(destination.data()));
                     let _ = ledger::dir_remove(view, &dst_dir, dst_node, *check_sle.key(), false);
                 }
                 let _ = view.erase(check_sle);
@@ -2307,6 +2345,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 {
                     let _ = ledger::adjust_owner_count(view, &acct, -1);
                 }
+            } else {
+                return Ter::TEC_NO_ENTRY;
             }
             Ter::TES_SUCCESS
         }
@@ -2315,7 +2355,20 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let check_keylet = protocol::unchecked_keylet(check_id);
             if let Ok(Some(check_sle)) = view.peek(check_keylet) {
                 let source = check_sle.get_account_id(sf("sfAccount"));
-                let destination = sttx.get_account_id(sf("sfAccount"));
+                let tx_account = sttx.get_account_id(sf("sfAccount"));
+                let check_destination = check_sle.get_account_id(sf("sfDestination"));
+                // Preclaim: only the check's destination can cash it (matching rippled)
+                if tx_account != check_destination {
+                    return Ter::TEC_NO_PERMISSION;
+                }
+                // Preclaim: check for expiration
+                if check_sle.is_field_present(sf("sfExpiration")) {
+                    let exp = check_sle.get_field_u32(sf("sfExpiration"));
+                    if view.header().parent_close_time >= exp {
+                        return Ter::TEC_EXPIRED;
+                    }
+                }
+                let destination = tx_account;
                 let requested_amount = if sttx.is_field_present(sf("sfAmount")) {
                     sttx.get_field_amount(sf("sfAmount"))
                 } else {
@@ -2447,7 +2500,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let account = sttx.get_account_id(sf("sfAccount"));
             let channel_id = sttx.get_field_h256(sf("sfChannel"));
             let amount = sttx.get_field_amount(sf("sfAmount"));
-            let chan_keylet = protocol::unchecked_keylet(channel_id);
+            let chan_keylet = protocol::pay_channel_keylet_from_key(channel_id);
             if let Ok(Some(chan)) = view.peek(chan_keylet) {
                 // C++ parity: only the channel source can fund it
                 let chan_src = chan.get_account_id(sf("sfAccount"));
@@ -2480,7 +2533,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         }
         TxType::PAYCHAN_CLAIM => {
             let channel_id = sttx.get_field_h256(sf("sfChannel"));
-            let chan_keylet = protocol::unchecked_keylet(channel_id);
+            let chan_keylet = protocol::pay_channel_keylet_from_key(channel_id);
             let Some(chan) = view.peek(chan_keylet).ok().flatten() else {
                 return Ter::TEC_NO_TARGET;
             };
