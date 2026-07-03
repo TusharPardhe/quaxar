@@ -708,7 +708,16 @@ impl Ledger {
                 close_time_resolution,
                 ..LedgerHeader::default()
             },
-            state_map: prev_ledger.state_map.share_root_snapshot(),
+            state_map: {
+                let mut sm = prev_ledger.state_map.share_root_snapshot();
+                // Mark unbacked so mutations traverse only in-memory nodes.
+                // All loaded nodes from the parent tree are reachable via the
+                // shared root. This prevents traversal failures when the
+                // node_fetcher can't resolve hash-only references during COW
+                // operations on the child tree.
+                sm.set_unbacked();
+                sm
+            },
             tx_map: SyncTree::new_with_type(SHAMapType::Transaction, true, 0),
             fees: prev_ledger.fees,
             rules: prev_ledger.rules.clone(),
@@ -2563,11 +2572,23 @@ impl Ledger {
         for (op, key, payload) in ops {
             match op {
                 StateBatchOp::Insert => {
-                    tree.add_item_with_fetch(
+                    let inserted = tree.add_item_with_fetch(
                         shamap::tree_node::SHAMapNodeType::AccountState,
                         SHAMapItem::new(*key, payload.clone()),
                         &mut fetch_fn,
                     )?;
+                    // If the item already exists (add_item returns Ok(false)), fall back
+                    // to update. This handles the case where a sandbox tracks a modification
+                    // as Insert (because the item was created within the sandbox's scope)
+                    // but the item already exists in the underlying state map from a
+                    // previous ledger.
+                    if !inserted {
+                        tree.update_item_with_fetch(
+                            shamap::tree_node::SHAMapNodeType::AccountState,
+                            SHAMapItem::new(*key, payload.clone()),
+                            &mut fetch_fn,
+                        )?;
+                    }
                 }
                 StateBatchOp::Update => {
                     tree.update_item_with_fetch(
