@@ -709,7 +709,20 @@ pub fn choose_ledger_entry_type(params: &JsonValue) -> Result<Option<LedgerEntry
 }
 
 fn parse_sttx_from_json_value(tx_json: &JsonValue) -> Result<STTx, Status> {
-    let parsed = STParsedJSONObject::new("tx_json", tx_json);
+    // Strip display-only / computed fields that are not protocol SFields.
+    // sign_for and tx results include these in their tx_json output, but
+    // they must be removed before re-parsing for submit_multisigned.
+    let cleaned = match tx_json {
+        JsonValue::Object(map) => {
+            let mut m = map.clone();
+            m.remove(jss::DeliverMax);
+            m.remove(jss::hash);
+            JsonValue::Object(m)
+        }
+        other => other.clone(),
+    };
+
+    let parsed = STParsedJSONObject::new("tx_json", &cleaned);
     if let Some(object) = parsed.object {
         return Ok(STTx::from_stobject(object));
     }

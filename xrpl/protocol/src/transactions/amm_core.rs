@@ -128,10 +128,11 @@ pub fn invalid_amm_amount(
 pub fn amm_auction_time_slot(current: u64, auction_slot: &crate::STObject) -> Option<u8> {
     let expiration =
         u64::from(auction_slot.get_field_u32(crate::get_field_by_symbol("sfExpiration")));
-    assert!(
-        expiration >= u64::from(TOTAL_TIME_SLOT_SECS),
-        "xrpl::ammAuctionTimeSlot : minimum expiration"
-    );
+    if expiration < u64::from(TOTAL_TIME_SLOT_SECS) {
+        // Expiration is too small (can occur on fresh standalone ledgers where
+        // close_time is near epoch). Treat as expired slot.
+        return None;
+    }
     let start = expiration - u64::from(TOTAL_TIME_SLOT_SECS);
     if current >= start {
         let diff = current - start;

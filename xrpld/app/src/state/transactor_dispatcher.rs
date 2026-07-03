@@ -1606,24 +1606,94 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
     pre_fee_balance_drops: Option<i64>,
 ) -> Ter {
     // C++ Transactor::checkSign parity: reject transactions signed with
-    // master key when lsfDisableMaster is set on the account.
+    // master key when lsfDisableMaster is set on the account, and reject
+    // multi-signed transactions that lack a valid signer list or fail to
+    // meet the quorum requirement.
     let account = sttx.get_account_id(sf("sfAccount"));
     let signing_pub_key = sttx.get_field_vl(sf("sfSigningPubKey"));
     if !signing_pub_key.is_empty() {
         // Non-empty SigningPubKey means single-signed (not multi-sign).
-        // Derive AccountID from signing key: SHA256 → RIPEMD160.
+        // C++ parity: Transactor::checkSingleSign validates that the signing
+        // key corresponds to either the account's master key (if enabled) or
+        // its regular key (if set). Any other key is rejected with tefBAD_AUTH.
         use sha2::Digest;
         let sha = sha2::Sha256::digest(&signing_pub_key);
         let ripe = ripemd::Ripemd160::digest(sha);
-        let derived = protocol::AccountID::from_slice(&ripe).expect("20 bytes");
-        if derived == account {
-            // Signed with master key — check if master is disabled
-            let acct_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
-            if let Ok(Some(acct_sle)) = view.peek(acct_keylet) {
-                if acct_sle.get_field_u32(sf("sfFlags")) & lsfDisableMaster != 0 {
+        let id_signer = protocol::AccountID::from_slice(&ripe).expect("20 bytes");
+
+        let acct_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
+        if let Ok(Some(acct_sle)) = view.peek(acct_keylet) {
+            let is_master_disabled =
+                acct_sle.get_field_u32(sf("sfFlags")) & lsfDisableMaster != 0;
+
+            // Check 1: Signed with regular key
+            let regular_key_field = sf("sfRegularKey");
+            if acct_sle.is_field_present(regular_key_field) {
+                let regular_key = acct_sle.get_account_id(regular_key_field);
+                if id_signer == regular_key {
+                    // Valid: signed with the account's regular key.
+                    // (pass through to transaction dispatch below)
+                } else if !is_master_disabled && id_signer == account {
+                    // Check 2: Signed with enabled master key
+                    // (pass through)
+                } else if is_master_disabled && id_signer == account {
+                    // Check 3: Signed with disabled master key
                     return Ter::TEF_MASTER_DISABLED;
+                } else {
+                    // Check 4: Signed with unknown key
+                    return Ter::TEF_BAD_AUTH;
+                }
+            } else {
+                // No regular key set on account
+                if !is_master_disabled && id_signer == account {
+                    // Signed with enabled master key
+                    // (pass through)
+                } else if is_master_disabled && id_signer == account {
+                    // Signed with disabled master key
+                    return Ter::TEF_MASTER_DISABLED;
+                } else {
+                    // Signed with unknown key (not master, no regular key set)
+                    return Ter::TEF_BAD_AUTH;
                 }
             }
+        }
+    } else if sttx.is_field_present(sf("sfSigners")) {
+        // Empty SigningPubKey with sfSigners present means multi-signed.
+        // Validate that the account has a signer list and that the
+        // provided signers meet the quorum requirement.
+        let signer_keylet = signers_keylet(Uint160::from_void(account.data()));
+        let signer_list_sle = match view.read(signer_keylet) {
+            Ok(Some(sle)) => sle,
+            _ => return Ter::TEF_NOT_MULTI_SIGNING,
+        };
+
+        let quorum = signer_list_sle.get_field_u32(sf("sfSignerQuorum"));
+        let signer_entries = signer_list_sle.get_field_array(sf("sfSignerEntries"));
+
+        // Build a map of authorized signer account → weight from the on-ledger list.
+        let mut authorized: std::collections::HashMap<AccountID, u32> =
+            std::collections::HashMap::new();
+        for entry in signer_entries.iter() {
+            let signer_account = entry.get_account_id(sf("sfAccount"));
+            let weight = entry.get_field_u16(sf("sfSignerWeight")) as u32;
+            authorized.insert(signer_account, weight);
+        }
+
+        // Iterate over the transaction's signers and accumulate weight.
+        let tx_signers = sttx.get_field_array(sf("sfSigners"));
+        let mut weight_sum: u32 = 0;
+        for tx_signer in tx_signers.iter() {
+            let signer_account = tx_signer.get_account_id(sf("sfAccount"));
+            if let Some(&weight) = authorized.get(&signer_account) {
+                weight_sum = weight_sum.saturating_add(weight);
+            }
+            // Signers not in the list contribute zero weight but are not
+            // rejected here — the cryptographic signature check already
+            // validated their identity during preflight.
+        }
+
+        if weight_sum < quorum {
+            return Ter::TEF_BAD_QUORUM;
         }
     }
 
