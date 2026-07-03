@@ -185,7 +185,7 @@ fn sub_sign_3() {
     assert_eq!(p.get("type"), Some(&sv("transaction")));
     assert_eq!(p.get("validated"), Some(&b(true)));
     assert_eq!(p.get("engine_result"), Some(&sv("tesSUCCESS")));
-    assert_eq!(p.get("engine_result_code"), Some(&si(0)));
+    assert_eq!(p.get("engine_result_code"), Some(&u(0)));
     assert_eq!(
         p.get("engine_result_message"),
         Some(&sv("The transaction was applied."))

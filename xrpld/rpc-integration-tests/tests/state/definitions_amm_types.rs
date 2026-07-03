@@ -140,7 +140,7 @@ fn tx_type_code_9() {
         ("type".to_owned(), sv("transaction")),
         ("validated".to_owned(), b(true)),
         ("engine_result".to_owned(), sv("tesSUCCESS")),
-        ("engine_result_code".to_owned(), si(0)),
+        ("engine_result_code".to_owned(), u(0)),
     ]));
     m.publish_json(StreamKind::Transactions, p.clone());
     let e = r.try_recv().unwrap();

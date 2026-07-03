@@ -1945,6 +1945,64 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             if ledger_seq.saturating_sub(acct_seq) < 256 {
                 return Ter::TEC_TOO_SOON;
             }
+            // Scan owner directory — only tickets and credentials are deletable
+            let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
+            if view.exists(owner_dir).unwrap_or(false) {
+                // Collect all directory entries
+                let mut page = 0_u64;
+                let mut all_entries: Vec<basics::math::base_uint::Uint256> = Vec::new();
+                loop {
+                    let page_keylet = protocol::page_keylet(owner_dir, page);
+                    let Some(node) = view.peek(page_keylet).ok().flatten() else {
+                        break;
+                    };
+                    all_entries.extend(
+                        node.get_field_v256(sf("sfIndexes")).value().iter().copied(),
+                    );
+                    let next = node.get_field_u64(sf("sfIndexNext"));
+                    if next == 0 || next == page {
+                        break;
+                    }
+                    page = next;
+                }
+                // Check each entry: tickets/credentials are deletable, everything else is not
+                for entry_key in &all_entries {
+                    let Some(entry_sle) = view
+                        .peek(protocol::child_keylet(*entry_key))
+                        .ok()
+                        .flatten()
+                    else {
+                        return Ter::TEF_BAD_LEDGER;
+                    };
+                    match entry_sle.get_type() {
+                        LedgerEntryType::Ticket | LedgerEntryType::Credential => {
+                            // deletable — will be cleaned up below
+                        }
+                        _ => {
+                            return Ter::TEC_HAS_OBLIGATIONS;
+                        }
+                    }
+                }
+                // Delete all deletable entries
+                for entry_key in all_entries {
+                    if let Ok(Some(entry_sle)) =
+                        view.peek(protocol::child_keylet(entry_key))
+                    {
+                        let owner_node = entry_sle.get_field_u64(sf("sfOwnerNode"));
+                        let _ = ledger::dir_remove(
+                            view,
+                            &owner_dir,
+                            owner_node,
+                            entry_key,
+                            false,
+                        );
+                        if let Ok(Some(acct)) = view.peek(src_keylet) {
+                            let _ = ledger::adjust_owner_count(view, &acct, -1);
+                        }
+                        let _ = view.erase(entry_sle);
+                    }
+                }
+            }
             // Transfer remaining XRP to destination, delete account
             if let (Ok(Some(src)), Ok(Some(dst))) = (view.peek(src_keylet), view.peek(dst_keylet)) {
                 let balance = src.get_field_amount(sf("sfBalance")).xrp();
@@ -3667,6 +3725,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     let mut obj = line.clone_as_object();
                     obj.set_field_amount(sf("sfBalance"), new_balance);
                     let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *line.key())));
+                } else {
+                    return Ter::TEC_NO_LINE;
                 }
             }
             Ter::TES_SUCCESS

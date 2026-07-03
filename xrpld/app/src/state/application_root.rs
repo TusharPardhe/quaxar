@@ -71,7 +71,8 @@ use perflog::PerfLogImp;
 use protocol::{
     AccountID, BatchTransactionFlags, JsonOptions, JsonValue, NotTec, PublicKey, Rules, STAmount,
     STLedgerEntry, STTx, SecretKey, SeqProxy, Serializer, Ter, TxType, XRPAmount, account_keylet,
-    feature_xrp_fees, get_field_by_symbol, is_tec_claim, is_tes_success,
+    feature_xrp_fees, get_field_by_symbol, is_tec_claim, is_tef_failure, is_tem_malformed,
+    is_tes_success,
 };
 use shamap::family::{NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
 use shamap::tree_node_cache::TreeNodeCache;
@@ -1046,6 +1047,14 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
         // only applying it to the outer view when the result is NOT tecKILLED.
         let mut inner = ledger::FlowSandbox::new(view);
         let mut result = handle_real_dispatch(&mut inner, tx, txn_type, pre_fee_balance_drops);
+
+        // tef* and tem* failures should NOT consume sequence or fee.
+        // Revert the account root to its pre-apply state so the transaction
+        // is as if it was never applied.
+        if is_tef_failure(result) || is_tem_malformed(result) {
+            let _ = view.update(account_root.clone());
+            return result;
+        }
 
         if protocol::is_tes_success(result) || protocol::is_tec_claim(result) {
             let fee_amt = if tx.is_field_present(fee_field) {

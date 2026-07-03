@@ -59,8 +59,8 @@ use serde::{Deserialize, Serialize};
 pub enum JsonValue {
     Null,
     Bool(bool),
-    Signed(i64),
     Unsigned(u64),
+    Signed(i64),
     String(String),
     Array(Vec<JsonValue>),
     Object(BTreeMap<String, JsonValue>),

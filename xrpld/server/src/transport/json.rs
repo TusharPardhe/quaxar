@@ -7,10 +7,10 @@ pub fn to_protocol_json(value: serde_json::Value) -> JsonValue {
         serde_json::Value::Null => JsonValue::Null,
         serde_json::Value::Bool(value) => JsonValue::Bool(value),
         serde_json::Value::Number(number) => {
-            if let Some(value) = number.as_i64() {
-                JsonValue::Signed(value)
-            } else if let Some(value) = number.as_u64() {
+            if let Some(value) = number.as_u64() {
                 JsonValue::Unsigned(value)
+            } else if let Some(value) = number.as_i64() {
+                JsonValue::Signed(value)
             } else {
                 JsonValue::String(number.to_string())
             }

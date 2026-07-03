@@ -60,6 +60,11 @@ pub fn do_trust_set<V: ledger::ApplyView>(
     let currency = issue.currency;
     let dst_account_id = issue.account;
 
+    // C++ preflight: negative limit → temBAD_LIMIT
+    if limit_amount.signum() < 0 {
+        return Ter::TEM_BAD_LIMIT;
+    }
+
     // C++ preflight: cannot create trust line to self
     if account == dst_account_id {
         return Ter::TEM_DST_IS_SRC;
@@ -111,6 +116,20 @@ pub fn do_trust_set<V: ledger::ApplyView>(
         return Ter::TEC_NO_DST;
     }
     let sle_dst = sle_dst.unwrap();
+
+    // C++ preclaim: disallow incoming trust line check
+    let dst_flags = sle_dst.get_field_u32(sf("sfFlags"));
+    if (dst_flags & protocol::lsfDisallowIncomingTrustline) != 0 {
+        // fixDisallowIncomingV1: allow if trust line already exists
+        let line_exists = view
+            .peek(protocol::line(account, dst_account_id, currency))
+            .ok()
+            .flatten()
+            .is_some();
+        if !line_exists {
+            return Ter::TEC_NO_PERMISSION;
+        }
+    }
 
     // Prepare limit with account's own issuer
     let mut limit_allow = limit_amount.clone();

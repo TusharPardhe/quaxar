@@ -119,7 +119,7 @@ fn ledger_entry_type_4() {
         ("type".to_owned(), sv("transaction")),
         ("validated".to_owned(), b(true)),
         ("engine_result".to_owned(), sv("tesSUCCESS")),
-        ("engine_result_code".to_owned(), si(0)),
+        ("engine_result_code".to_owned(), u(0)),
         (
             "engine_result_message".to_owned(),
             sv("The transaction was applied."),
