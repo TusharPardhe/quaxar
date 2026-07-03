@@ -2533,12 +2533,20 @@ impl Ledger {
 
         let ledger_seq = self.header.seq;
 
+        // Use a globally unique cowid to prevent in-place mutation of shared nodes.
+        // In C++ rippled, each SHAMap has its own cowid_ incremented from the copy
+        // constructor. Using ledger_seq alone can collide when multiple MutableTrees
+        // are created from roots with the same cowid (e.g., submit-time sandbox and
+        // accept-time build both operating on the same closed ledger's state).
+        static NEXT_COWID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+
         // across ALL transactions, matching reference where stateMap_ is a persistent
         // SHAMap that rawInsert/rawErase/rawReplace all operate on directly.
         if self.mutable_state.is_none() {
+            let cowid = NEXT_COWID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.mutable_state = Some(MutableTree::from_loaded_root(
                 self.state_map.root(),
-                ledger_seq.max(1),
+                cowid.max(1),
             ));
         }
         let tree = self.mutable_state.as_mut().unwrap();

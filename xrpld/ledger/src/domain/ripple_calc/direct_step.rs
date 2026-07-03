@@ -44,6 +44,15 @@ pub fn max_payment_flow<V: ApplyView>(
     if protocol::is_xrp_currency(currency) {
         return (IOUAmount::new(), DebtDirection::Issues);
     }
+
+    // Compute how much src can send to dst on this trust line.
+    // Matches C++ maxPaymentFlow:
+    //   srcOwed = accountHolds(sb, src_, currency_, dst_)
+    //   if srcOwed > 0: return (srcOwed, Redeems)
+    //   else: return (creditLimit2(sb, dst_, src_, currency_) + srcOwed, Issues)
+    //
+    // credit_balance(view, src, dst, currency) returns how much src holds
+    // (from src's perspective). Positive = dst owes src (src can redeem).
     let balance = ripple_state_helpers::credit_balance(view, src, dst, currency);
 
     if balance.signum() > 0 {

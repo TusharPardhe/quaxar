@@ -72,7 +72,7 @@ fn execute_direct_fwd<V: ApplyView>(
 
     // This is what reference does in the reverse pass to determine capacity.
     // We do it inline here since we don't have a separate reverse pass.
-    let (max_flow, _debt_dir) =
+    let (max_flow, debt_dir) =
         crate::domain::ripple_calc::direct_step::max_payment_flow(view, src, dst, currency);
 
     if max_flow.is_zero() || max_flow.signum() <= 0 {
@@ -104,10 +104,20 @@ fn execute_direct_fwd<V: ApplyView>(
     } else {
         input_iou
     };
+    // When src redeems (positive balance), dst is the issuer (src is paying back).
+    // When src issues (zero/negative balance), src is the issuer (src creates IOUs).
+    let step_issue = Issue {
+        currency,
+        account: if debt_dir == crate::domain::ripple_calc::direct_step::DebtDirection::Redeems {
+            *dst
+        } else {
+            *src
+        },
+    };
     let deliver = protocol::STAmount::from_iou_amount(
         protocol::get_field_by_symbol("sfAmount"),
         deliver_iou,
-        input.issue(),
+        step_issue,
     );
 
     if deliver.signum() <= 0 {

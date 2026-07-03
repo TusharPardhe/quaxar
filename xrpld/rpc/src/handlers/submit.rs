@@ -1632,12 +1632,19 @@ fn submit_semantic_preflight_with_ledger(
                 return Ter::TEM_BAD_AMOUNT;
             }
 
-            if amount.native() && amount.mantissa() == 0 {
+            // (tokenOfferCreatePreflight): IOU zero is always bad
+            if !amount.native() && amount.mantissa() == 0 {
                 return Ter::TEM_BAD_AMOUNT;
             }
 
             let owner_field = get_field_by_symbol("sfOwner");
             let has_sell_flag = (st_tx.get_flags() & tx::TF_SELL_NFTOKEN) != 0;
+
+            // Buy offers must have non-zero amount (any currency)
+            if !has_sell_flag && amount.mantissa() == 0 {
+                return Ter::TEM_BAD_AMOUNT;
+            }
+
             if !has_sell_flag && !st_tx.is_field_present(owner_field) {
                 return Ter::TEM_MALFORMED;
             }

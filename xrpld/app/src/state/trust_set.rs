@@ -478,11 +478,19 @@ fn trust_create<V: ledger::ApplyView>(
     let zero_balance = limit_allow.zeroed();
     obj.set_field_amount(sf("sfBalance"), zero_balance);
 
+    // LowLimit issuer = low account, HighLimit issuer = high account
+    // limit_allow has issuer = account (the trust line creator)
+    // The OTHER side's limit gets a zero amount with the OTHER account as issuer
+    let mut peer_limit = limit_allow.zeroed();
+    peer_limit.set_issuer(*dst);
+
     if !b_high {
+        // account is low, dst is high
         obj.set_field_amount(sf("sfLowLimit"), limit_allow.clone());
-        obj.set_field_amount(sf("sfHighLimit"), limit_allow.zeroed());
+        obj.set_field_amount(sf("sfHighLimit"), peer_limit);
     } else {
-        obj.set_field_amount(sf("sfLowLimit"), limit_allow.zeroed());
+        // account is high, dst is low
+        obj.set_field_amount(sf("sfLowLimit"), peer_limit);
         obj.set_field_amount(sf("sfHighLimit"), limit_allow.clone());
     }
 

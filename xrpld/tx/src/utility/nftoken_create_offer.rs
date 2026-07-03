@@ -48,7 +48,14 @@ pub fn run_nftoken_create_offer_preflight<Registry, Tx, Journal, ParentBatchId>(
         return Ter::TEM_BAD_AMOUNT;
     }
 
-    if facts.amount.native() && facts.amount.mantissa() == 0 {
+    // (tokenOfferCreatePreflight): IOU zero is always bad
+    if !facts.amount.native() && facts.amount.mantissa() == 0 {
+        return Ter::TEM_BAD_AMOUNT;
+    }
+
+    // Buy offers must have non-zero amount
+    let is_sell = (facts.flags & TF_SELL_NFTOKEN) != 0;
+    if !is_sell && facts.amount.mantissa() == 0 {
         return Ter::TEM_BAD_AMOUNT;
     }
 
