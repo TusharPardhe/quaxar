@@ -3818,6 +3818,10 @@ impl ApplicationRoot {
                 );
             }
             ledger.set_accepted(close_time, 0, true);
+            // Mark state_map unbacked: all nodes are in memory (never flushed to NuDB
+            // in standalone mode). Without this, subsequent reads from child ledgers
+            // would try to fetch nodes from NuDB (which doesn't have them) and fail.
+            ledger.state_map_mut().set_unbacked();
             Arc::new(ledger)
         };
 
