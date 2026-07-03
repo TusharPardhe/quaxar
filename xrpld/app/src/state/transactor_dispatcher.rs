@@ -1988,7 +1988,11 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         | LedgerEntryType::Escrow
                         | LedgerEntryType::PayChannel
                         | LedgerEntryType::NFTokenOffer
-                        | LedgerEntryType::NFTokenPage => {
+                        | LedgerEntryType::NFTokenPage
+                        | LedgerEntryType::DirectoryNode
+                        | LedgerEntryType::MPToken
+                        | LedgerEntryType::Child
+                        | LedgerEntryType::Any => {
                             // deletable — will be cleaned up below
                         }
                         _ => {
@@ -3759,9 +3763,10 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             if amount.signum() > 0 {
                 if amount.native() {
                     if has_transfer_fee && is_secondary_sale {
-                        // Calculate transfer fee: fee = amount * transferFee / 50000
+                        // Calculate transfer fee: fee = amount * transferFee / 100000
+                        // TransferFee is in 1/100000 units (0.001%), max 50000 = 50%.
                         let total_drops = amount.xrp().drops();
-                        let fee_drops = (total_drops as u64 * transfer_fee_bps as u64 / 50000) as i64;
+                        let fee_drops = (total_drops as u64 * transfer_fee_bps as u64 / 100_000) as i64;
                         let seller_drops = total_drops - fee_drops;
 
                         // Pay seller (amount minus fee)
@@ -4669,12 +4674,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     return Ter::TEC_DIR_FULL;
                 };
                 sle.set_field_u64(sf("sfSubjectNode"), subject_page);
-                // C++ parity: increment subject's OwnerCount
-                if let Ok(Some(subject_sle)) =
-                    view.peek(protocol::account_keylet(Uint160::from_void(subject.data())))
-                {
-                    let _ = ledger::adjust_owner_count(view, &subject_sle, 1);
-                }
+                // Note: subject OwnerCount is NOT incremented on create.
+                // It's incremented on accept (ownership transfer from issuer to subject).
             }
 
             if view.insert(Arc::new(sle)).is_err() {

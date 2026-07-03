@@ -84,12 +84,14 @@ pub fn delete_sle(
             return Ok(Ter::TEF_BAD_LEDGER);
         }
 
-        // Always decrement subject OwnerCount when subject != issuer
-        // (OwnerCount was incremented on create when added to subject's directory)
-        let Some(subject_sle) = view.peek(account_keylet(to_uint160(subject)))? else {
-            return Ok(Ter::TEF_BAD_LEDGER);
-        };
-        adjust_owner_count(view, &subject_sle, -1)?;
+        // C++ parity: only decrement subject OwnerCount when credential was
+        // accepted (ownership transferred from issuer to subject on accept).
+        if accepted {
+            let Some(subject_sle) = view.peek(account_keylet(to_uint160(subject)))? else {
+                return Ok(Ter::TEF_BAD_LEDGER);
+            };
+            adjust_owner_count(view, &subject_sle, -1)?;
+        }
     }
 
     view.erase(sle_credential)?;

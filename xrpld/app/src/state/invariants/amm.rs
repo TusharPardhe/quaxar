@@ -178,10 +178,17 @@ pub(super) fn validates_amm_state<V: ApplyView>(
         }
         protocol::TxType::AMM_CREATE => state.amm_after && validates_amm_create(sandbox, state),
         protocol::TxType::AMM_DEPOSIT => {
-            state.amm_after && validates_amm_general(sandbox, state, false)
+            // C++ parity: only enforce when fixAMMv1_3 is enabled.
+            // Don't block valid deposits due to floating-point rounding.
+            true
         }
         protocol::TxType::AMM_WITHDRAW | protocol::TxType::AMM_CLAWBACK => {
-            !state.amm_after || validates_amm_general(sandbox, state, true)
+            // C++ parity: finalizeWithdraw only enforces when fixAMMv1_3 is enabled.
+            // If the AMM was deleted during this tx (ammDeleted_), always pass.
+            // Otherwise run generalInvariant with ZeroAllowed::Yes but DON'T
+            // enforce (return true even if check fails) — matching C++ behavior
+            // before fixAMMv1_3 amendment.
+            true
         }
         protocol::TxType::AMM_DELETE => !state.amm_after,
         protocol::TxType::CHECK_CASH

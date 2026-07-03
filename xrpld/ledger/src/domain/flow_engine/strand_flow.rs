@@ -149,16 +149,12 @@ fn execute_single_strand<V: ApplyView>(
     // The actual_out is what the last step produced.
 
     // Determine input for the first step.
-    // When max_in (SendMax) and max_out (Amount) are in the same asset, cap the
-    // input to max_out. This prevents over-delivery: without the cap the full
-    // SendMax flows through the issuer (where each hop has no transfer fee)
-    // and the destination receives more than Amount.
+    // When max_in (SendMax) is set, use it as the input limit.
+    // When absent, use max_out (Amount) as the starting input.
+    // The transfer rate in direct steps will naturally reduce output below input,
+    // and the final output is capped to max_out below.
     let first_input = if let Some(mi) = max_in {
-        if mi.asset() == max_out.asset() && *mi > *max_out {
-            max_out.clone()
-        } else {
-            mi.clone()
-        }
+        mi.clone()
     } else {
         max_out.clone()
     };
