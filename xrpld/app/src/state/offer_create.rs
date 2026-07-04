@@ -22,6 +22,15 @@ fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
 }
 
+/// C++ parity: isGlobalFrozen for IOU assets. Checks if the issuer has lsfGlobalFreeze set.
+fn is_global_frozen_iou<V: ledger::ApplyView>(view: &mut V, issuer: &AccountID) -> bool {
+    let keylet = protocol::account_keylet(Uint160::from_void(issuer.data()));
+    view.peek(keylet)
+        .ok()
+        .flatten()
+        .is_some_and(|sle| sle.is_flag(protocol::lsfGlobalFreeze))
+}
+
 fn check_mpt_offer_global_and_trade_allowed<V: ledger::ApplyView>(
     view: &V,
     asset: protocol::Asset,
@@ -96,6 +105,18 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     let mpt_allowed = check_mpt_offer_accept_asset_allowed(view, &account, taker_pays.asset());
     if mpt_allowed != Ter::TES_SUCCESS {
         return mpt_allowed;
+    }
+
+    // C++ parity: checkGlobalFrozen for IOU assets (preclaim check)
+    if let protocol::Asset::Issue(issue) = taker_pays.asset() {
+        if !issue.native() && is_global_frozen_iou(view, &issue.account) {
+            return Ter::TEC_FROZEN;
+        }
+    }
+    if let protocol::Asset::Issue(issue) = taker_gets.asset() {
+        if !issue.native() && is_global_frozen_iou(view, &issue.account) {
+            return Ter::TEC_FROZEN;
+        }
     }
 
     let is_passive = (tx_flags & TF_PASSIVE) != 0;

@@ -173,6 +173,8 @@ fn check_invariants_inner<V: ApplyView>(
                     && txn_type != protocol::TxType::VAULT_DELETE
                     && txn_type != protocol::TxType::LOAN_BROKER_DELETE
                     && txn_type != protocol::TxType::AMM_DELETE
+                    && txn_type != protocol::TxType::AMM_WITHDRAW
+                    && txn_type != protocol::TxType::AMM_CLAWBACK
                 {
                     return Ter::TEC_INVARIANT_FAILED;
                 }
@@ -364,6 +366,7 @@ fn check_invariants_inner<V: ApplyView>(
             }
             LedgerEntryType::AMM => {
                 if amm_invariant_enabled
+                    && amm_invariant_result_applies(result)
                     && let Some(a) = after_sle
                     && !validate_amm_entry(a)
                 {

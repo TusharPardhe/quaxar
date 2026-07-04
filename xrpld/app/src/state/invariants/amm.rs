@@ -1,6 +1,6 @@
 use super::common::*;
 use basics::number::{NumberParts as RuntimeNumber, get_mantissa_scale, root2};
-use ledger::{ApplyView, FlowSandbox};
+use ledger::{ApplyView, FlowSandbox, ReadView};
 use protocol::{AccountID, Asset, LedgerEntryType, STAmount, STLedgerEntry, Ter};
 
 #[derive(Default)]
@@ -193,7 +193,17 @@ pub(super) fn validates_amm_state<V: ApplyView>(
         protocol::TxType::AMM_DELETE => !state.amm_after,
         protocol::TxType::CHECK_CASH
         | protocol::TxType::OFFER_CREATE
-        | protocol::TxType::PAYMENT => !state.amm_after,
+        | protocol::TxType::PAYMENT => {
+            // C++ parity: finalizeDEX only fails if AMM object was changed
+            // AND fixAMMv1_3 (enforce) is enabled. Without fixAMMv1_3 it always passes.
+            if state.amm_after {
+                let enforce = sandbox.rules().enabled(&protocol::fix_ammv1_3());
+                if enforce {
+                    return false;
+                }
+            }
+            true
+        }
         _ => true,
     }
 }

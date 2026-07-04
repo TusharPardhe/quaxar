@@ -4932,8 +4932,24 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 return res;
             }
             let mut obj = amm_sle.clone_as_object();
-            obj.set_field_amount(sf("sfLPTokenBalance"), math.new_lp_token_balance);
+            obj.set_field_amount(sf("sfLPTokenBalance"), math.new_lp_token_balance.clone());
             let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *amm_sle.key())));
+
+            // C++ parity: deleteAMMAccountIfEmpty — if LP balance is now 0,
+            // delete the AMM (same as AMMWithdraw full withdrawal)
+            if math.new_lp_token_balance.signum() == 0 {
+                let _ = delete_empty_amm_owner_entries(view, &amm_account);
+                let account_keylet =
+                    protocol::account_keylet(Uint160::from_void(amm_account.data()));
+                if let Ok(Some(amm_root)) = view.peek(account_keylet) {
+                    let _ = view.erase(amm_root);
+                }
+                // Re-peek the AMM SLE (it was updated above) and erase it
+                let amm_keylet2 = protocol::keylet::amm(asset1, asset2);
+                if let Ok(Some(amm_sle2)) = view.peek(amm_keylet2) {
+                    let _ = view.erase(amm_sle2);
+                }
+            }
 
             let res = amm_clawback_send_amount(view, &holder, &issuer, amount1);
             if res != Ter::TES_SUCCESS {
