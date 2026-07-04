@@ -129,7 +129,7 @@ impl Pathfinder {
                     }
                 }
 
-                // 2. Expand via order books (C++ DestBook/Books node types)
+                // 2. Expand via order books (DestBook/Books node types)
                 // Check what currencies the source account holds, then look for
                 // books from those currencies to the destination currency.
                 if !dst_amount.native() {
@@ -175,10 +175,10 @@ impl Pathfinder {
                                         continue;
                                     }
 
-                                    // C++ DestBook: check if a book exists from
+                                    // DestBook: check if a book exists from
                                     // this currency to the destination currency.
                                     // Use succ() on the book base key (same as
-                                    // C++ BookTip::step which iterates the book
+                                    // BookTip step iterates the book
                                     // directory using the quality-keyed SHAMap).
                                     let src_asset = protocol::Asset::Issue(
                                         protocol::Issue::new(currency, issuer),

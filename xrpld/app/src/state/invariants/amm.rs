@@ -178,15 +178,15 @@ pub(super) fn validates_amm_state<V: ApplyView>(
         }
         protocol::TxType::AMM_CREATE => state.amm_after && validates_amm_create(sandbox, state),
         protocol::TxType::AMM_DEPOSIT => {
-            // C++ parity: only enforce when fixAMMv1_3 is enabled.
+            // Only enforce when fixAMMv1_3 amendment is enabled.
             // Don't block valid deposits due to floating-point rounding.
             true
         }
         protocol::TxType::AMM_WITHDRAW | protocol::TxType::AMM_CLAWBACK => {
-            // C++ parity: finalizeWithdraw only enforces when fixAMMv1_3 is enabled.
+            // Withdraw/clawback invariant only enforces when fixAMMv1_3 is enabled.
             // If the AMM was deleted during this tx (ammDeleted_), always pass.
             // Otherwise run generalInvariant with ZeroAllowed::Yes but DON'T
-            // enforce (return true even if check fails) — matching C++ behavior
+            // enforce (return true even if check fails) when amendment not enabled
             // before fixAMMv1_3 amendment.
             true
         }
@@ -194,7 +194,7 @@ pub(super) fn validates_amm_state<V: ApplyView>(
         protocol::TxType::CHECK_CASH
         | protocol::TxType::OFFER_CREATE
         | protocol::TxType::PAYMENT => {
-            // C++ parity: finalizeDEX only fails if AMM object was changed
+            // DEX invariant only fails if AMM object was changed
             // AND fixAMMv1_3 (enforce) is enabled. Without fixAMMv1_3 it always passes.
             if state.amm_after {
                 let enforce = sandbox.rules().enabled(&protocol::fix_ammv1_3());

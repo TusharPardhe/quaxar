@@ -1605,7 +1605,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
     txn_type: TxType,
     pre_fee_balance_drops: Option<i64>,
 ) -> Ter {
-    // C++ Transactor::checkSign parity: reject transactions signed with
+    // Reject transactions signed with
     // master key when lsfDisableMaster is set on the account, and reject
     // multi-signed transactions that lack a valid signer list or fail to
     // meet the quorum requirement.
@@ -1613,7 +1613,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
     let signing_pub_key = sttx.get_field_vl(sf("sfSigningPubKey"));
     if !signing_pub_key.is_empty() {
         // Non-empty SigningPubKey means single-signed (not multi-sign).
-        // C++ parity: Transactor::checkSingleSign validates that the signing
+        // Validate that the signing
         // key corresponds to either the account's master key (if enabled) or
         // its regular key (if set). Any other key is rejected with tefBAD_AUTH.
         use sha2::Digest;
@@ -1927,7 +1927,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         TxType::ACCOUNT_DELETE => {
             let account = sttx.get_account_id(sf("sfAccount"));
             let destination = sttx.get_account_id(sf("sfDestination"));
-            // C++ preclaim checks
+            // Preclaim checks
             if account == destination {
                 return Ter::TEM_DST_IS_SRC;
             }
@@ -1965,7 +1965,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     }
                     page = next;
                 }
-                // Check each entry: match rippled's AccountDelete which removes
+                // Check each entry type to determine if it blocks deletion
                 // lightweight account-owned objects. Obligations like AMM, Vault, Loan
                 // cannot be deleted.
                 for entry_key in &all_entries {
@@ -1977,8 +1977,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         return Ter::TEF_BAD_LEDGER;
                     };
                     match entry_sle.get_type() {
-                        // C++ parity: these are non-obligation objects that can be
-                        // deleted during AccountDelete (rippled's nonObligationDeleter)
+                        // Non-obligation objects that can be
+                        // deleted during AccountDelete (non-obligation deleter)
                         LedgerEntryType::Ticket
                         | LedgerEntryType::Credential
                         | LedgerEntryType::DepositPreauth
@@ -2037,7 +2037,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
 
         TxType::REGULAR_KEY_SET => {
             let account = sttx.get_account_id(sf("sfAccount"));
-            // C++ preflight: RegularKey == Account → temBAD_REGKEY
+            // Preflight: RegularKey == Account → temBAD_REGKEY
             if sttx.is_field_present(sf("sfRegularKey"))
                 && sttx.get_account_id(sf("sfRegularKey")) == account
             {
@@ -2396,7 +2396,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let account = sttx.get_account_id(sf("sfAccount"));
             let dst = sttx.get_account_id(sf("sfDestination"));
             let send_max = sttx.get_field_amount(sf("sfSendMax"));
-            // Preclaim: destination must exist (matching rippled CheckCreate::preclaim)
+            // Preclaim: destination must exist
             let dst_keylet = protocol::account_keylet(Uint160::from_void(dst.data()));
             let Some(dst_sle) = view.peek(dst_keylet).ok().flatten() else {
                 return Ter::TEC_NO_DST;
@@ -2498,7 +2498,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 let source = check_sle.get_account_id(sf("sfAccount"));
                 let tx_account = sttx.get_account_id(sf("sfAccount"));
                 let check_destination = check_sle.get_account_id(sf("sfDestination"));
-                // Preclaim: only the check's destination can cash it (matching rippled)
+                // Preclaim: only the check's destination can cash it
                 if tx_account != check_destination {
                     return Ter::TEC_NO_PERMISSION;
                 }
@@ -2581,7 +2581,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let amount = sttx.get_field_amount(sf("sfAmount"));
             let settle_delay = sttx.get_field_u32(sf("sfSettleDelay"));
 
-            // C++ parity: check destination's lsfRequireDestTag
+            // Check destination's lsfRequireDestTag
             if let Ok(Some(dst_sle)) =
                 view.peek(protocol::account_keylet(Uint160::from_void(dst.data())))
             {
@@ -2609,12 +2609,12 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             sle.set_field_amount(sf("sfAmount"), amount.clone());
             sle.set_field_amount(sf("sfBalance"), STAmount::from_xrp_amount(XRPAmount::new()));
             sle.set_field_u32(sf("sfSettleDelay"), settle_delay);
-            // Copy PublicKey (required by rippled)
+            // Copy PublicKey
             if sttx.is_field_present(sf("sfPublicKey")) {
                 let pk = sttx.get_field_vl(sf("sfPublicKey"));
                 sle.set_field_vl(sf("sfPublicKey"), &pk);
             }
-            // Copy optional fields matching rippled
+            // Copy optional fields
             if sttx.is_field_present(sf("sfCancelAfter")) {
                 sle.set_field_u32(sf("sfCancelAfter"), sttx.get_field_u32(sf("sfCancelAfter")));
             }
@@ -2629,7 +2629,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             if let Ok(Some(page)) = ledger::dir_append(view, &owner_dir, chan_keylet.key, &|_| {}) {
                 sle.set_field_u64(sf("sfOwnerNode"), page);
             }
-            // C++ parity: add to destination's owner directory too
+            // Add to destination's owner directory
             let dst_dir = owner_dir_keylet(Uint160::from_void(dst.data()));
             if let Ok(Some(page)) = ledger::dir_append(view, &dst_dir, chan_keylet.key, &|_| {}) {
                 sle.set_field_u64(sf("sfDestinationNode"), page);
@@ -2668,7 +2668,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let Some(chan) = view.peek(chan_keylet).ok().flatten() else {
                 return Ter::TEC_NO_ENTRY;
             };
-            // C++ parity: only the channel source can fund it
+            // Only the channel source can fund it
             let chan_src = chan.get_account_id(sf("sfAccount"));
             if chan_src != account {
                 return Ter::TEC_NO_PERMISSION;
@@ -2812,15 +2812,15 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let account = sttx.get_account_id(sf("sfAccount"));
             let amount1 = sttx.get_field_amount(sf("sfAmount"));
             let amount2 = sttx.get_field_amount(sf("sfAmount2"));
-            // C++ parity: reject same-asset AMM create with temBAD_AMM_TOKENS
+            // Reject same-asset AMM creation
             if amount1.asset() == amount2.asset() {
                 return Ter::TEM_BAD_AMM_TOKENS;
             }
-            // C++ parity: reject zero or negative amounts
+            // Reject zero or negative amounts
             if amount1.signum() <= 0 || amount2.signum() <= 0 {
                 return Ter::TEM_BAD_AMOUNT;
             }
-            // C++ parity: preclaim balance check — verify account has enough XRP
+            // Preclaim balance check: verify account has enough XRP
             // before creating AMM structures (prevents partial state corruption)
             if amount2.native() {
                 let acct_k = protocol::account_keylet(Uint160::from_void(account.data()));
@@ -3388,7 +3388,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 account
             };
 
-            // Get or create the issuer's MintedNFTokens counter (matching rippled doApply)
+            // Get or create the issuer's MintedNFTokens counter
             let issuer_keylet = protocol::account_keylet(Uint160::from_void(issuer.data()));
             let Some(issuer_sle) = view.peek(issuer_keylet).ok().flatten() else {
                 return Ter::TEC_NO_ISSUER;
@@ -3396,7 +3396,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
 
             let mut issuer_obj = issuer_sle.clone_as_object();
 
-            // Set FirstNFTokenSequence if not present (matching rippled)
+            // Set FirstNFTokenSequence if not present
             if !issuer_obj.is_field_present(sf("sfFirstNFTokenSequence")) {
                 let acct_seq = issuer_obj.get_field_u32(sf("sfSequence"));
                 // If minted by owner using sequence (not ticket, not authorized minter):
@@ -3430,7 +3430,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 *issuer_sle.key(),
             )));
 
-            // Compute the NFTokenID (matching rippled createNFTokenID exactly)
+            // Compute the NFTokenID
             let nft_flags = (sttx.get_flags() & 0x0000FFFF) as u16;
             let transfer_fee = if sttx.is_field_present(sf("sfTransferFee")) {
                 sttx.get_field_u16(sf("sfTransferFee"))
@@ -3476,7 +3476,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             };
             let token_id = sttx.get_field_h256(sf("sfNFTokenID"));
 
-            // C++ parity: if account != owner, the burner is the issuer trying
+            // If account != owner, the burner is the issuer trying
             // to burn someone else's NFT. Check the tfBurnable flag (bit 0x0001
             // in the NFTokenID flags field, bytes 0-1).
             if account != owner {
@@ -3574,14 +3574,14 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 sttx.get_seq_value(),
             );
 
-            // Insert into owner directory (matching rippled)
+            // Insert into owner directory
             let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
             let owner_node = match ledger::dir_append(view, &owner_dir, offer_keylet.key, &|_| {}) {
                 Ok(Some(page)) => page,
                 _ => return Ter::TEC_DIR_FULL,
             };
 
-            // Insert into the token's sell or buy offer directory (matching rippled)
+            // Insert into the sell or buy offer directory
             let token_dir_keylet = if is_sell {
                 protocol::nft_sell_offers_keylet(token_id)
             } else {
@@ -3772,7 +3772,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     let buyer = bo.get_account_id(sf("sfOwner"));
                     let nftoken_id = bo.get_field_h256(sf("sfNFTokenID"));
                     let amount = bo.get_field_amount(sf("sfAmount"));
-                    // C++ parity: verify tx_account actually owns the NFT
+                    // Verify tx_account actually owns the NFT
                     let owns = match nft_find_token_and_page(view, &tx_account, nftoken_id) {
                         Ok(Some(_)) => true,
                         _ => false,
@@ -3825,7 +3825,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     }
                 } else {
                     // IOU payment via accountSend
-                    // TODO: IOU transfer fee would need similar handling
+                    // Note: IOU transfer fee handling for brokered NFT sales is applied via account_send
                     ledger::ripple_state_helpers::account_send(view, &buyer, &seller, &amount);
                 }
             }
@@ -3835,7 +3835,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         TxType::CLAWBACK => {
             let issuer = sttx.get_account_id(sf("sfAccount"));
             let amount = sttx.get_field_amount(sf("sfAmount"));
-            // C++ parity: preflight validation
+            // Preflight validation
             if amount.signum() <= 0 {
                 return Ter::TEM_BAD_AMOUNT;
             }
@@ -3852,7 +3852,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     _ => return Ter::TEF_INTERNAL,
                 };
                 let mptid = mpt_issue.mpt_id();
-                // C++ parity: preclaim - check lsfMPTCanClawback
+                // Preclaim: check lsfMPTCanClawback
                 let issuance_keylet = protocol::mpt_issuance_keylet_from_mptid(mptid);
                 let Some(iss_sle) = view.peek(issuance_keylet).ok().flatten() else {
                     return Ter::TEC_OBJECT_NOT_FOUND;
@@ -3886,7 +3886,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 let _ = view.update(Arc::new(STLedgerEntry::from_stobject(iss_obj, *iss.key())));
             } else {
                 // IOU clawback — debit specific amount from holder's trust line
-                // C++ parity: preclaim - check lsfAllowTrustLineClawback
+                // Preclaim: check lsfAllowTrustLineClawback
                 let Some(issuer_sle) = view
                     .peek(protocol::account_keylet(Uint160::from_void(issuer.data())))
                     .ok()
@@ -4583,7 +4583,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let existing_domain_id = sttx
                 .is_field_present(sf("sfDomainID"))
                 .then(|| sttx.get_field_h256(sf("sfDomainID")));
-            // C++ parity: ownership verification on update
+            // Ownership verification on update
             if let Some(domain_id) = existing_domain_id {
                 if !domain_id.is_zero() {
                     let domain_keylet = protocol::permissioned_domain_keylet_from_id(domain_id);
@@ -4611,7 +4611,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         TxType::PERMISSIONED_DOMAIN_DELETE => {
             let account = sttx.get_account_id(sf("sfAccount"));
             let domain_id = sttx.get_field_h256(sf("sfDomainID"));
-            // C++ parity: ownership verification
+            // Ownership verification
             if !domain_id.is_zero() {
                 let domain_keylet = protocol::permissioned_domain_keylet_from_id(domain_id);
                 if let Ok(Some(domain_sle)) = view.peek(domain_keylet) {
@@ -4776,7 +4776,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 return Ter::TEC_INSUFFICIENT_RESERVE;
             }
 
-            // C++ parity: reject duplicate acceptance
+            // Reject duplicate acceptance
             if cred_sle.is_flag(protocol::lsfAccepted) {
                 return Ter::TEC_DUPLICATE;
             }
@@ -4961,7 +4961,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             obj.set_field_amount(sf("sfLPTokenBalance"), math.new_lp_token_balance.clone());
             let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *amm_sle.key())));
 
-            // C++ parity: deleteAMMAccountIfEmpty — if LP balance is now 0,
+            // Delete AMM if LP balance reaches zero after full clawback
             // delete the AMM (same as AMMWithdraw full withdrawal)
             if math.new_lp_token_balance.signum() == 0 {
                 let _ = delete_empty_amm_owner_entries(view, &amm_account);

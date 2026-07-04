@@ -613,8 +613,8 @@ fn direct_send_no_fee_iou<V: ApplyView>(
 
     let issue = amount.issue();
 
-    // C++ parity: only check freeze when check_issuer is true.
-    // AMMClawback passes check_issuer=false (FreezeHandling::IgnoreFreeze).
+    // Only check freeze when check_issuer is true.
+    // AMMClawback passes check_issuer=false to bypass freeze checks.
     if check_issuer && (is_frozen(view, sender, &issue) || is_frozen(view, receiver, &issue)) {
         return Ter::TEC_PATH_DRY;
     }

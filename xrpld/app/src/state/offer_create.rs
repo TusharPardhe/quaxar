@@ -22,7 +22,7 @@ fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
 }
 
-/// C++ parity: isGlobalFrozen for IOU assets. Checks if the issuer has lsfGlobalFreeze set.
+/// Checks if the issuer has lsfGlobalFreeze set (global freeze on IOU assets).
 fn is_global_frozen_iou<V: ledger::ApplyView>(view: &mut V, issuer: &AccountID) -> bool {
     let keylet = protocol::account_keylet(Uint160::from_void(issuer.data()));
     view.peek(keylet)
@@ -107,7 +107,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         return mpt_allowed;
     }
 
-    // C++ parity: checkGlobalFrozen for IOU assets (preclaim check)
+    // Check GlobalFreeze for IOU assets before crossing
     if let protocol::Asset::Issue(issue) = taker_pays.asset() {
         if !issue.native() && is_global_frozen_iou(view, &issue.account) {
             return Ter::TEC_FROZEN;
@@ -626,7 +626,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         let open_book_node =
             match ledger::dir_append(view, &open_quality_dir, offer_keylet.key, &|sle| {
                 // The legacy open-book key may use post-crossing quality, but
-                // C++ still records the original placement rate in metadata.
+                // Record the original placement rate in metadata.
                 set_book_directory_fields(sle, &taker_pays, &taker_gets, rate, None);
             }) {
                 Ok(Some(page)) => page,

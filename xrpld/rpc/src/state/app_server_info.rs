@@ -600,9 +600,9 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
                 ])));
             }
 
-            // C++ Pathfinder DestBook node type: discover cross-currency paths
+            // DestBook discovery: find cross-currency paths
             // through the DEX order book. Uses succ() on the book base key to
-            // check if offers exist (matching C++ BookTip::step which iterates
+            // check if offers exist by iterating
             // the quality-keyed directory in the SHAMap).
             if !has_direct_path {
                 if let Some(ref ledger) = ledger {
@@ -652,7 +652,7 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
                                             continue;
                                         }
 
-                                        // C++ BookTip::step equivalent: check if a book from
+                                        // Check if an order book exists from
                                         // this source currency to the destination exists by
                                         // looking for any entry in the book's quality range.
                                         let src_asset = protocol::Asset::Issue(
@@ -672,7 +672,7 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
                                             .is_some()
                                         {
                                             // Book exists. Build the path and alternative.
-                                            // C++ STPathElement: TypeCurrency|TypeIssuer for IOU book step
+                                            // Path element: currency + issuer for IOU book step
                                             let path_step = JsonValue::Object(BTreeMap::from([
                                                 ("currency".to_owned(), JsonValue::String(dst_currency.clone())),
                                                 ("issuer".to_owned(), JsonValue::String(dst_issuer_str.clone())),
@@ -1478,7 +1478,7 @@ impl<V: AppServerInfoView> TxSource for ApplicationServerInfo<V> {
             return Ok(TxLookupOutcome::Found(record));
         }
 
-        // C++ TransactionMaster::fetch only returns cache hits directly while
+        // TransactionMaster::fetch only returns cache hits directly while
         // they are unvalidated. Once validated, SQL history is authoritative so
         // metadata and TxnSeq are present. Keep this fallback for standalone
         // harnesses or tx-table-disabled runtimes where no SQL row exists.

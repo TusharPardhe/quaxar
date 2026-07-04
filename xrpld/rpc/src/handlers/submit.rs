@@ -1478,7 +1478,7 @@ fn submit_semantic_preflight_with_ledger(
                     return front;
                 }
 
-                // C++ parity: only reject if account has non-deletable objects.
+                // Only reject if account has non-deletable objects.
                 // Tickets, credentials, signer lists, etc. are deletable.
                 // If OwnerCount > 0, check if there are any NON-deletable items.
                 // For the simple case: trust lines with balance, escrows with
@@ -2608,7 +2608,7 @@ pub(crate) fn submit_sttx<Env, Runtime: RpcRuntime>(
 
     tracing::info!(target: "rpc", tx_hash = %st_tx.get_transaction_id(), "Transaction submitted via RPC");
 
-    // C++ parity: in standalone mode, submit immediately closes the ledger
+    // In standalone mode, submit immediately closes the ledger
     // so that subsequent RPC calls (account_info, etc.) see the state changes.
     if ctx.runtime.standalone() {
         let _ = ctx.runtime.ledger_accept();
@@ -2627,7 +2627,7 @@ pub fn do_submit<Runtime: RpcRuntime>(
     };
 
     // If tx_blob is not present, fall back to deprecated sign-and-submit mode
-    // (signing with secret + tx_json, same as rippled compatibility).
+    // (signing with secret + tx_json for legacy compatibility).
     if tx_blob.is_none() {
         let has_secret = matches!(ctx.params, JsonValue::Object(obj) if obj.contains_key(jss::secret) || obj.contains_key(jss::key_type));
         if has_secret {
@@ -2656,7 +2656,7 @@ pub fn do_submit<Runtime: RpcRuntime>(
 }
 
 /// Deprecated sign-and-submit mode: signs the transaction server-side using the
-/// provided secret/seed, then submits it. This matches rippled's legacy behavior
+/// provided secret/seed, then submits it. Legacy behavior
 /// for backward compatibility. Users should migrate to client-side signing.
 fn submit_with_sign<Runtime: RpcRuntime>(
     ctx: &RpcRequestContext<'_, SubmitSource, Runtime>,
