@@ -826,9 +826,8 @@ fn get_rate(taker_gets: &STAmount, taker_pays: &STAmount) -> u64 {
     if taker_gets.signum() <= 0 {
         return 0;
     }
-    // reference: STAmount r = divide(offerIn, offerOut, noIssue())
-    // offerIn = taker_pays, offerOut = taker_gets
-    let no_issue = protocol::Issue::default();
+    // STAmount r = divide(offerIn, offerOut, noIssue())
+    let no_issue = protocol::no_issue();
     let r = taker_pays.divide(taker_gets, no_issue);
     if r.signum() <= 0 {
         return 0;
