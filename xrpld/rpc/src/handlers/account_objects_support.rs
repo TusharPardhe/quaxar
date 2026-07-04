@@ -432,7 +432,9 @@ pub fn collect_account_objects<V: AccountObjectsView>(
 
         for entry in remaining.into_iter() {
             let Some(sle_node) = view.read_entry(child_keylet(entry))? else {
-                panic!("xrpl::AccountObjects : missing child entry");
+                // Directory may reference entries that have been deleted
+                // (e.g., cleaned up by transaction processing). Skip gracefully.
+                continue;
             };
 
             if type_matches(sle_node.get_type()) {
