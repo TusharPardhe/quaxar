@@ -605,7 +605,7 @@ fn direct_send_no_fee_iou<V: ApplyView>(
     sender: &AccountID,
     receiver: &AccountID,
     amount: &STAmount,
-    _check_issuer: bool,
+    check_issuer: bool,
 ) -> Ter {
     if sender == receiver || amount.signum() <= 0 {
         return Ter::TES_SUCCESS;
@@ -613,7 +613,9 @@ fn direct_send_no_fee_iou<V: ApplyView>(
 
     let issue = amount.issue();
 
-    if is_frozen(view, sender, &issue) || is_frozen(view, receiver, &issue) {
+    // C++ parity: only check freeze when check_issuer is true.
+    // AMMClawback passes check_issuer=false (FreezeHandling::IgnoreFreeze).
+    if check_issuer && (is_frozen(view, sender, &issue) || is_frozen(view, receiver, &issue)) {
         return Ter::TEC_PATH_DRY;
     }
 
