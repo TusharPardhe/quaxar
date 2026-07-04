@@ -519,7 +519,8 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
         };
 
         // Access the validated ledger to check if paths exist
-        let ledger = self.view.validated_ledger();
+        let ledger = self.view.validated_ledger()
+            .or_else(|| self.view.closed_ledger());
 
         let mut alternatives = Vec::new();
 
@@ -597,6 +598,114 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
                     ("paths_computed".to_owned(), JsonValue::Array(Vec::new())),
                     ("paths_canonical".to_owned(), JsonValue::Array(Vec::new())),
                 ])));
+            }
+
+            // C++ Pathfinder DestBook node type: discover cross-currency paths
+            // through the DEX order book. Uses succ() on the book base key to
+            // check if offers exist (matching C++ BookTip::step which iterates
+            // the quality-keyed directory in the SHAMap).
+            if !has_direct_path {
+                if let Some(ref ledger) = ledger {
+                    if let Some(ref dst_issuer_str) = dst_issuer {
+                        if let Some(dst_issuer_id) = parse_base58_account_id(dst_issuer_str) {
+                            let dst_currency_val = currency_from_string(&dst_currency);
+                            let dst_issue = protocol::Issue::new(dst_currency_val, dst_issuer_id);
+                            let dst_asset = protocol::Asset::Issue(dst_issue);
+
+                            // Scan source account's trust lines to find held currencies
+                            let src_dir = protocol::owner_dir_keylet(Uint160::from_void(src_id.data()));
+                            if let Ok(Some(dir_sle)) = ledger.read(src_dir) {
+                                let indexes = dir_sle.get_field_v256(protocol::get_field_by_symbol("sfIndexes"));
+                                for index in indexes.value() {
+                                    let entry_keylet = protocol::Keylet::new(
+                                        protocol::LedgerEntryType::RippleState, *index);
+                                    if let Ok(Some(entry)) = ledger.read(entry_keylet) {
+                                        if entry.get_type() != protocol::LedgerEntryType::RippleState {
+                                            continue;
+                                        }
+                                        let low_limit = entry.get_field_amount(
+                                            protocol::get_field_by_symbol("sfLowLimit"));
+                                        let high_limit = entry.get_field_amount(
+                                            protocol::get_field_by_symbol("sfHighLimit"));
+                                        let balance = entry.get_field_amount(
+                                            protocol::get_field_by_symbol("sfBalance"));
+                                        let low_account = low_limit.issue().account;
+                                        let currency = low_limit.issue().currency;
+                                        let issuer = if low_account == src_id {
+                                            high_limit.issue().account
+                                        } else {
+                                            low_account
+                                        };
+
+                                        // Source must hold positive balance in this currency
+                                        let src_is_low = low_account == src_id;
+                                        let has_balance = if src_is_low {
+                                            balance.signum() > 0
+                                        } else {
+                                            balance.signum() < 0
+                                        };
+                                        if !has_balance {
+                                            continue;
+                                        }
+                                        // Skip if same as destination currency
+                                        if currency == dst_currency_val && issuer == dst_issuer_id {
+                                            continue;
+                                        }
+
+                                        // C++ BookTip::step equivalent: check if a book from
+                                        // this source currency to the destination exists by
+                                        // looking for any entry in the book's quality range.
+                                        let src_asset = protocol::Asset::Issue(
+                                            protocol::Issue::new(currency, issuer));
+                                        let book = protocol::Book::new(src_asset, dst_asset, None);
+                                        let book_base = protocol::keylet::book(book).key;
+                                        let book_end = {
+                                            let mut end = book_base;
+                                            let bytes = end.data_mut();
+                                            for b in bytes[24..32].iter_mut() { *b = 0xFF; }
+                                            end
+                                        };
+
+                                        if ledger.succ(book_base, Some(book_end))
+                                            .ok()
+                                            .flatten()
+                                            .is_some()
+                                        {
+                                            // Book exists. Build the path and alternative.
+                                            // C++ STPathElement: TypeCurrency|TypeIssuer for IOU book step
+                                            let path_step = JsonValue::Object(BTreeMap::from([
+                                                ("currency".to_owned(), JsonValue::String(dst_currency.clone())),
+                                                ("issuer".to_owned(), JsonValue::String(dst_issuer_str.clone())),
+                                            ]));
+                                            let paths = JsonValue::Array(vec![
+                                                JsonValue::Array(vec![path_step]),
+                                            ]);
+                                            // Source amount matches the source currency
+                                            let src_cur_str = protocol::currency_to_string(currency);
+                                            let src_iss_str = protocol::to_base58(issuer);
+                                            let src_amt = JsonValue::Object(BTreeMap::from([
+                                                ("currency".to_owned(), JsonValue::String(src_cur_str)),
+                                                ("issuer".to_owned(), JsonValue::String(src_iss_str)),
+                                                ("value".to_owned(), match &request.destination_amount {
+                                                    JsonValue::Object(obj) => obj.get("value")
+                                                        .cloned()
+                                                        .unwrap_or(JsonValue::String("0".to_owned())),
+                                                    _ => JsonValue::String("0".to_owned()),
+                                                }),
+                                            ]));
+                                            alternatives.push(JsonValue::Object(BTreeMap::from([
+                                                ("source_amount".to_owned(), src_amt),
+                                                ("paths_computed".to_owned(), paths),
+                                                ("paths_canonical".to_owned(), JsonValue::Array(Vec::new())),
+                                            ])));
+                                            break; // One alternative is sufficient for this search level
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 

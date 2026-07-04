@@ -129,19 +129,101 @@ impl Pathfinder {
                     }
                 }
 
-                // 2. Expand via order books (Account -> Book -> Account)
-                // If the destination amount is IOU, check if there's a book
-                // from XRP to that IOU (XRP bridge path)
-                if !dst_amount.native() && !visited.contains(dst) {
+                // 2. Expand via order books (C++ DestBook/Books node types)
+                // Check what currencies the source account holds, then look for
+                // books from those currencies to the destination currency.
+                if !dst_amount.native() {
                     let dst_issue = dst_amount.issue();
-                    // Add XRP bridge: current account -> XRP -> destination issuer -> destination
-                    let issuer = dst_issue.account;
-                    if issuer != *acc && !visited.contains(&issuer) {
-                        let mut new_path = path.clone();
-                        new_path.nodes.push(PathNode::OrderBook(dst_issue));
-                        new_path.nodes.push(PathNode::Account(issuer));
-                        queue.push_back(new_path);
-                        visited.insert(issuer);
+
+                    // Scan the account's trust lines to find currencies it holds
+                    let owner_dir2 =
+                        protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(acc.data()));
+                    if let Ok(Some(dir_sle)) = view.read(owner_dir2) {
+                        let indexes = dir_sle.get_field_v256(sf("sfIndexes"));
+                        for index in indexes.value() {
+                            let entry_keylet = Keylet {
+                                entry_type: LedgerEntryType::RippleState,
+                                key: *index,
+                            };
+                            if let Ok(Some(entry)) = view.read(entry_keylet) {
+                                if entry.get_type() == LedgerEntryType::RippleState {
+                                    let low_limit = entry.get_field_amount(sf("sfLowLimit"));
+                                    let high_limit = entry.get_field_amount(sf("sfHighLimit"));
+                                    let balance = entry.get_field_amount(sf("sfBalance"));
+                                    let low_account = low_limit.issue().account;
+                                    let currency = low_limit.issue().currency;
+                                    let issuer = if low_account == *acc {
+                                        high_limit.issue().account
+                                    } else {
+                                        low_account
+                                    };
+
+                                    // Check source holds this currency (positive balance)
+                                    let src_is_low = low_account == *acc;
+                                    let has_balance = if src_is_low {
+                                        balance.signum() > 0
+                                    } else {
+                                        balance.signum() < 0
+                                    };
+
+                                    if !has_balance {
+                                        continue;
+                                    }
+
+                                    // Skip if same currency as destination
+                                    if currency == dst_issue.currency && issuer == dst_issue.account {
+                                        continue;
+                                    }
+
+                                    // C++ DestBook: check if a book exists from
+                                    // this currency to the destination currency.
+                                    // Use succ() on the book base key (same as
+                                    // C++ BookTip::step which iterates the book
+                                    // directory using the quality-keyed SHAMap).
+                                    let src_asset = protocol::Asset::Issue(
+                                        protocol::Issue::new(currency, issuer),
+                                    );
+                                    let dst_asset = protocol::Asset::Issue(dst_issue);
+                                    let book = protocol::Book::new(src_asset, dst_asset, None);
+                                    let book_base = protocol::keylet::book(book).key;
+                                    let book_end = {
+                                        let mut end = book_base;
+                                        let bytes = end.data_mut();
+                                        for b in bytes[24..32].iter_mut() { *b = 0xFF; }
+                                        end
+                                    };
+                                    if let Ok(Some(_)) = view.succ(book_base, Some(book_end)) {
+                                        // Book exists! Add path: source → book(dst_issue) → dst
+                                        if !visited.contains(dst) {
+                                            let mut new_path = path.clone();
+                                            new_path.nodes.push(PathNode::OrderBook(dst_issue));
+                                            new_path.nodes.push(PathNode::Account(*dst));
+                                            queue.push_back(new_path);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Also check XRP bridge: source XRP → book(XRP→dst) → dst
+                    if !visited.contains(dst) {
+                        let xrp_asset = protocol::Asset::Issue(protocol::xrp_issue());
+                        let dst_asset = protocol::Asset::Issue(dst_issue);
+                        let book = protocol::Book::new(xrp_asset, dst_asset, None);
+                        let book_base = protocol::keylet::book(book).key;
+                        let book_end = {
+                            let mut end = book_base;
+                            let bytes = end.data_mut();
+                            for b in bytes[24..32].iter_mut() { *b = 0xFF; }
+                            end
+                        };
+                        if let Ok(Some(_)) = view.succ(book_base, Some(book_end)) {
+                            let mut new_path = path.clone();
+                            new_path.nodes.push(PathNode::OrderBook(dst_issue));
+                            new_path.nodes.push(PathNode::Account(*dst));
+                            queue.push_back(new_path);
+                        }
                     }
                 }
             }
