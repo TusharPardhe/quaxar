@@ -457,61 +457,307 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
     fn find_paths(
         &self,
         request: &PathFinderRequest,
-        _params: &JsonValue,
-        search_level: u32,
+        params: &JsonValue,
+        _search_level: u32,
         _is_legacy: bool,
     ) -> Result<JsonValue, crate::RpcStatus> {
+        use protocol::{
+            parse_base58_account_id, currency_from_string,
+        };
+        use basics::base_uint::Uint160;
+
         let source_amount = request
             .send_max
             .as_ref()
             .cloned()
             .unwrap_or_else(|| request.destination_amount.clone());
 
-        // Build path alternatives
+        // Parse source and destination accounts
+        let src_id = match parse_base58_account_id(&request.source_account) {
+            Some(id) => id,
+            None => return Ok(JsonValue::Array(Vec::new())),
+        };
+        let dst_id = match parse_base58_account_id(&request.destination_account) {
+            Some(id) => id,
+            None => return Ok(JsonValue::Array(Vec::new())),
+        };
+
+        // Check if source_currencies is specified in params to limit results
+        let source_currencies_filter: Option<Vec<String>> = if let JsonValue::Object(obj) = params {
+            if let Some(JsonValue::Array(currencies)) = obj.get("source_currencies") {
+                let mut filter = Vec::new();
+                for c in currencies {
+                    match c {
+                        JsonValue::Object(cobj) => {
+                            if let Some(JsonValue::String(cur)) = cobj.get("currency") {
+                                filter.push(cur.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if filter.is_empty() { None } else { Some(filter) }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Determine what currency the destination needs
+        let (dst_currency, dst_issuer) = match &request.destination_amount {
+            JsonValue::String(_) => ("XRP".to_owned(), None), // XRP amount
+            JsonValue::Object(obj) => {
+                let currency = obj.get("currency")
+                    .and_then(|v| if let JsonValue::String(s) = v { Some(s.clone()) } else { None })
+                    .unwrap_or_else(|| "XRP".to_owned());
+                let issuer = obj.get("issuer")
+                    .and_then(|v| if let JsonValue::String(s) = v { Some(s.clone()) } else { None });
+                (currency, issuer)
+            }
+            _ => return Ok(JsonValue::Array(Vec::new())),
+        };
+
+        // Access the validated ledger to check if paths exist
+        let ledger = self.view.validated_ledger()
+            .or_else(|| self.view.closed_ledger());
+
         let mut alternatives = Vec::new();
 
-        // Alternative 1: Direct path (no intermediaries)
-        alternatives.push(JsonValue::Object(BTreeMap::from([
-            ("source_amount".to_owned(), source_amount.clone()),
-            (
-                "destination_amount".to_owned(),
-                request.destination_amount.clone(),
-            ),
-            ("paths_computed".to_owned(), JsonValue::Array(Vec::new())),
-            ("paths_canonical".to_owned(), JsonValue::Array(Vec::new())),
-            (
-                "search_level".to_owned(),
-                JsonValue::Unsigned(u64::from(search_level)),
-            ),
-        ])));
-
-        // Alternative 2: XRP-bridged path (source -> XRP -> destination)
-        if let (JsonValue::Object(src_obj), JsonValue::Object(_dst_obj)) =
-            (&source_amount, &request.destination_amount)
-        {
-            let src_is_iou = src_obj.contains_key("currency")
-                && src_obj.get("currency") != Some(&JsonValue::String("XRP".to_owned()));
-            if src_is_iou {
-                let xrp_step = JsonValue::Object(BTreeMap::from([(
-                    "currency".to_owned(),
-                    JsonValue::String("XRP".to_owned()),
-                )]));
+        // For XRP destination amounts, a direct path always exists if accounts exist
+        if dst_currency == "XRP" {
+            // XRP can always be sent directly if both accounts exist
+            if let Some(ref ledger) = ledger {
+                let src_keylet = protocol::account_keylet(Uint160::from_void(src_id.data()));
+                let dst_keylet_k = protocol::account_keylet(Uint160::from_void(dst_id.data()));
+                let src_exists = ledger.read(src_keylet).ok().flatten().is_some();
+                let dst_exists = ledger.read(dst_keylet_k).ok().flatten().is_some();
+                if src_exists && dst_exists {
+                    alternatives.push(JsonValue::Object(BTreeMap::from([
+                        ("source_amount".to_owned(), source_amount.clone()),
+                        ("paths_computed".to_owned(), JsonValue::Array(Vec::new())),
+                        ("paths_canonical".to_owned(), JsonValue::Array(Vec::new())),
+                    ])));
+                }
+            } else {
+                // No ledger available — optimistic fallback
                 alternatives.push(JsonValue::Object(BTreeMap::from([
                     ("source_amount".to_owned(), source_amount.clone()),
-                    (
-                        "destination_amount".to_owned(),
-                        request.destination_amount.clone(),
-                    ),
-                    (
-                        "paths_computed".to_owned(),
-                        JsonValue::Array(vec![JsonValue::Array(vec![xrp_step])]),
-                    ),
+                    ("paths_computed".to_owned(), JsonValue::Array(Vec::new())),
                     ("paths_canonical".to_owned(), JsonValue::Array(Vec::new())),
-                    (
-                        "search_level".to_owned(),
-                        JsonValue::Unsigned(u64::from(search_level)),
-                    ),
                 ])));
+            }
+        } else {
+            // IOU destination: check if a trust line exists
+            let mut has_direct_path = false;
+
+            if let Some(ref ledger) = ledger {
+                // Check for a direct trust line between source and destination
+                if let Some(ref issuer_str) = dst_issuer {
+                    if let Some(issuer_id) = parse_base58_account_id(issuer_str) {
+                        let currency_val = currency_from_string(&dst_currency);
+                        // If source IS the issuer, direct path exists if dst has trust line to issuer
+                        if src_id == issuer_id {
+                            let tl_keylet = protocol::line(dst_id, issuer_id, currency_val);
+                            if ledger.read(tl_keylet).ok().flatten().is_some() {
+                                has_direct_path = true;
+                            }
+                        } else {
+                            // Source is not issuer — check both trust lines
+                            let tl_src = protocol::line(src_id, issuer_id, currency_val);
+                            let tl_dst = protocol::line(dst_id, issuer_id, currency_val);
+                            let src_has_tl = ledger.read(tl_src).ok().flatten().is_some();
+                            let dst_has_tl = ledger.read(tl_dst).ok().flatten().is_some();
+                            if src_has_tl && dst_has_tl {
+                                has_direct_path = true;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No ledger — assume path exists (legacy behavior)
+                has_direct_path = true;
+            }
+
+            // Apply source_currencies filter
+            if let Some(ref filter) = source_currencies_filter {
+                let src_currency = match &source_amount {
+                    JsonValue::Object(obj) => obj.get("currency")
+                        .and_then(|v| if let JsonValue::String(s) = v { Some(s.clone()) } else { None })
+                        .unwrap_or_else(|| "XRP".to_owned()),
+                    _ => "XRP".to_owned(),
+                };
+                if !filter.contains(&src_currency) && !filter.contains(&dst_currency) {
+                    has_direct_path = false;
+                }
+            }
+
+            if has_direct_path {
+                alternatives.push(JsonValue::Object(BTreeMap::from([
+                    ("source_amount".to_owned(), source_amount.clone()),
+                    ("paths_computed".to_owned(), JsonValue::Array(Vec::new())),
+                    ("paths_canonical".to_owned(), JsonValue::Array(Vec::new())),
+                ])));
+            }
+
+            // DestBook discovery: find cross-currency paths
+            // through the DEX order book. Uses succ() on the book base key to
+            // check if offers exist by iterating
+            // the quality-keyed directory in the SHAMap).
+            if !has_direct_path {
+                if let Some(ref ledger) = ledger {
+                    if let Some(ref dst_issuer_str) = dst_issuer {
+                        if let Some(dst_issuer_id) = parse_base58_account_id(dst_issuer_str) {
+                            let dst_currency_val = currency_from_string(&dst_currency);
+                            let dst_issue = protocol::Issue::new(dst_currency_val, dst_issuer_id);
+                            let dst_asset = protocol::Asset::Issue(dst_issue);
+
+                            // Scan source account's trust lines to find held currencies
+                            let src_dir = protocol::owner_dir_keylet(Uint160::from_void(src_id.data()));
+                            if let Ok(Some(dir_sle)) = ledger.read(src_dir) {
+                                let indexes = dir_sle.get_field_v256(protocol::get_field_by_symbol("sfIndexes"));
+                                for index in indexes.value() {
+                                    let entry_keylet = protocol::Keylet::new(
+                                        protocol::LedgerEntryType::RippleState, *index);
+                                    if let Ok(Some(entry)) = ledger.read(entry_keylet) {
+                                        if entry.get_type() != protocol::LedgerEntryType::RippleState {
+                                            continue;
+                                        }
+                                        let low_limit = entry.get_field_amount(
+                                            protocol::get_field_by_symbol("sfLowLimit"));
+                                        let high_limit = entry.get_field_amount(
+                                            protocol::get_field_by_symbol("sfHighLimit"));
+                                        let balance = entry.get_field_amount(
+                                            protocol::get_field_by_symbol("sfBalance"));
+                                        let low_account = low_limit.issue().account;
+                                        let currency = low_limit.issue().currency;
+                                        let issuer = if low_account == src_id {
+                                            high_limit.issue().account
+                                        } else {
+                                            low_account
+                                        };
+
+                                        // Source must hold positive balance in this currency
+                                        let src_is_low = low_account == src_id;
+                                        let has_balance = if src_is_low {
+                                            balance.signum() > 0
+                                        } else {
+                                            balance.signum() < 0
+                                        };
+                                        if !has_balance {
+                                            continue;
+                                        }
+                                        // Skip if same as destination currency
+                                        if currency == dst_currency_val && issuer == dst_issuer_id {
+                                            continue;
+                                        }
+
+                                        // Check if an order book exists from
+                                        // this source currency to the destination exists by
+                                        // looking for any entry in the book's quality range.
+                                        let src_asset = protocol::Asset::Issue(
+                                            protocol::Issue::new(currency, issuer));
+                                        let book = protocol::Book::new(src_asset, dst_asset, None);
+                                        let book_base = protocol::keylet::book(book).key;
+                                        let book_end = {
+                                            let mut end = book_base;
+                                            let bytes = end.data_mut();
+                                            for b in bytes[24..32].iter_mut() { *b = 0xFF; }
+                                            end
+                                        };
+
+                                        if ledger.succ(book_base, Some(book_end))
+                                            .ok()
+                                            .flatten()
+                                            .is_some()
+                                        {
+                                            // Book exists. Build the path and alternative.
+                                            // Path element: currency + issuer for IOU book step
+                                            let path_step = JsonValue::Object(BTreeMap::from([
+                                                ("currency".to_owned(), JsonValue::String(dst_currency.clone())),
+                                                ("issuer".to_owned(), JsonValue::String(dst_issuer_str.clone())),
+                                            ]));
+                                            let paths = JsonValue::Array(vec![
+                                                JsonValue::Array(vec![path_step]),
+                                            ]);
+                                            // Source amount matches the source currency
+                                            let src_cur_str = protocol::currency_to_string(currency);
+                                            let src_iss_str = protocol::to_base58(issuer);
+                                            let src_amt = JsonValue::Object(BTreeMap::from([
+                                                ("currency".to_owned(), JsonValue::String(src_cur_str)),
+                                                ("issuer".to_owned(), JsonValue::String(src_iss_str)),
+                                                ("value".to_owned(), match &request.destination_amount {
+                                                    JsonValue::Object(obj) => obj.get("value")
+                                                        .cloned()
+                                                        .unwrap_or(JsonValue::String("0".to_owned())),
+                                                    _ => JsonValue::String("0".to_owned()),
+                                                }),
+                                            ]));
+                                            alternatives.push(JsonValue::Object(BTreeMap::from([
+                                                ("source_amount".to_owned(), src_amt),
+                                                ("paths_computed".to_owned(), paths),
+                                                ("paths_canonical".to_owned(), JsonValue::Array(Vec::new())),
+                                            ])));
+                                            // Continue scanning for more alternatives
+                                        }
+                                    }
+                                }
+                            }
+
+                            // XRP bridge path: Source currency → XRP → Destination currency
+                            // (C++ Pathfinder sxfd type: Source → XrpBook → DestBook → Destination)
+                            {
+                                let xrp_asset = protocol::Asset::Issue(protocol::xrp_issue());
+                                // Check book: source_currency → XRP
+                                // For each source currency the account holds, check if
+                                // there's also a XRP → destination book
+                                let xrp_to_dst_book = protocol::Book::new(xrp_asset, dst_asset, None);
+                                let xrp_dst_base = protocol::keylet::book(xrp_to_dst_book).key;
+                                let xrp_dst_end = {
+                                    let mut end = xrp_dst_base;
+                                    let bytes = end.data_mut();
+                                    for b in bytes[24..32].iter_mut() { *b = 0xFF; }
+                                    end
+                                };
+                                let has_xrp_to_dst = ledger.succ(xrp_dst_base, Some(xrp_dst_end))
+                                    .ok().flatten().is_some();
+
+                                if has_xrp_to_dst {
+                                    // XRP bridge available — add as alternative with XRP source
+                                    let xrp_step = JsonValue::Object(BTreeMap::from([
+                                        ("currency".to_owned(), JsonValue::String("XRP".to_owned())),
+                                    ]));
+                                    let dst_step = JsonValue::Object(BTreeMap::from([
+                                        ("currency".to_owned(), JsonValue::String(dst_currency.clone())),
+                                        ("issuer".to_owned(), JsonValue::String(dst_issuer_str.clone())),
+                                    ]));
+                                    let paths = JsonValue::Array(vec![
+                                        JsonValue::Array(vec![xrp_step, dst_step]),
+                                    ]);
+                                    let src_amt = JsonValue::String(
+                                        match &request.destination_amount {
+                                            JsonValue::Object(obj) => {
+                                                // Estimate XRP amount (1:1 for simplicity, actual
+                                                // rate determined at payment time by the flow engine)
+                                                obj.get("value")
+                                                    .and_then(|v| v.as_str())
+                                                    .and_then(|s| s.parse::<f64>().ok())
+                                                    .map(|v| format!("{}", (v * 1_000_000.0) as u64))
+                                                    .unwrap_or_else(|| "0".to_owned())
+                                            }
+                                            _ => "0".to_owned(),
+                                        }
+                                    );
+                                    alternatives.push(JsonValue::Object(BTreeMap::from([
+                                        ("source_amount".to_owned(), src_amt),
+                                        ("paths_computed".to_owned(), paths),
+                                        ("paths_canonical".to_owned(), JsonValue::Array(Vec::new())),
+                                    ])));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1284,7 +1530,7 @@ impl<V: AppServerInfoView> TxSource for ApplicationServerInfo<V> {
             return Ok(TxLookupOutcome::Found(record));
         }
 
-        // C++ TransactionMaster::fetch only returns cache hits directly while
+        // TransactionMaster::fetch only returns cache hits directly while
         // they are unvalidated. Once validated, SQL history is authoritative so
         // metadata and TxnSeq are present. Keep this fallback for standalone
         // harnesses or tx-table-disabled runtimes where no SQL row exists.

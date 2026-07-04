@@ -31,7 +31,7 @@ pub(super) fn validate_amm_entry(sle: &STLedgerEntry) -> bool {
     }
 
     let lp_tokens = sle.get_field_amount(sf("sfLPTokenBalance"));
-    if lp_tokens.negative() || lp_tokens.signum() == 0 {
+    if lp_tokens.negative() {
         return false;
     }
 

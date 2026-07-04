@@ -1605,25 +1605,95 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
     txn_type: TxType,
     pre_fee_balance_drops: Option<i64>,
 ) -> Ter {
-    // C++ Transactor::checkSign parity: reject transactions signed with
-    // master key when lsfDisableMaster is set on the account.
+    // Reject transactions signed with
+    // master key when lsfDisableMaster is set on the account, and reject
+    // multi-signed transactions that lack a valid signer list or fail to
+    // meet the quorum requirement.
     let account = sttx.get_account_id(sf("sfAccount"));
     let signing_pub_key = sttx.get_field_vl(sf("sfSigningPubKey"));
     if !signing_pub_key.is_empty() {
         // Non-empty SigningPubKey means single-signed (not multi-sign).
-        // Derive AccountID from signing key: SHA256 → RIPEMD160.
+        // Validate that the signing
+        // key corresponds to either the account's master key (if enabled) or
+        // its regular key (if set). Any other key is rejected with tefBAD_AUTH.
         use sha2::Digest;
         let sha = sha2::Sha256::digest(&signing_pub_key);
         let ripe = ripemd::Ripemd160::digest(sha);
-        let derived = protocol::AccountID::from_slice(&ripe).expect("20 bytes");
-        if derived == account {
-            // Signed with master key — check if master is disabled
-            let acct_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
-            if let Ok(Some(acct_sle)) = view.peek(acct_keylet) {
-                if acct_sle.get_field_u32(sf("sfFlags")) & lsfDisableMaster != 0 {
+        let id_signer = protocol::AccountID::from_slice(&ripe).expect("20 bytes");
+
+        let acct_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
+        if let Ok(Some(acct_sle)) = view.peek(acct_keylet) {
+            let is_master_disabled =
+                acct_sle.get_field_u32(sf("sfFlags")) & lsfDisableMaster != 0;
+
+            // Check 1: Signed with regular key
+            let regular_key_field = sf("sfRegularKey");
+            if acct_sle.is_field_present(regular_key_field) {
+                let regular_key = acct_sle.get_account_id(regular_key_field);
+                if id_signer == regular_key {
+                    // Valid: signed with the account's regular key.
+                    // (pass through to transaction dispatch below)
+                } else if !is_master_disabled && id_signer == account {
+                    // Check 2: Signed with enabled master key
+                    // (pass through)
+                } else if is_master_disabled && id_signer == account {
+                    // Check 3: Signed with disabled master key
                     return Ter::TEF_MASTER_DISABLED;
+                } else {
+                    // Check 4: Signed with unknown key
+                    return Ter::TEF_BAD_AUTH;
+                }
+            } else {
+                // No regular key set on account
+                if !is_master_disabled && id_signer == account {
+                    // Signed with enabled master key
+                    // (pass through)
+                } else if is_master_disabled && id_signer == account {
+                    // Signed with disabled master key
+                    return Ter::TEF_MASTER_DISABLED;
+                } else {
+                    // Signed with unknown key (not master, no regular key set)
+                    return Ter::TEF_BAD_AUTH;
                 }
             }
+        }
+    } else if sttx.is_field_present(sf("sfSigners")) {
+        // Empty SigningPubKey with sfSigners present means multi-signed.
+        // Validate that the account has a signer list and that the
+        // provided signers meet the quorum requirement.
+        let signer_keylet = signers_keylet(Uint160::from_void(account.data()));
+        let signer_list_sle = match view.read(signer_keylet) {
+            Ok(Some(sle)) => sle,
+            _ => return Ter::TEF_NOT_MULTI_SIGNING,
+        };
+
+        let quorum = signer_list_sle.get_field_u32(sf("sfSignerQuorum"));
+        let signer_entries = signer_list_sle.get_field_array(sf("sfSignerEntries"));
+
+        // Build a map of authorized signer account → weight from the on-ledger list.
+        let mut authorized: std::collections::HashMap<AccountID, u32> =
+            std::collections::HashMap::new();
+        for entry in signer_entries.iter() {
+            let signer_account = entry.get_account_id(sf("sfAccount"));
+            let weight = entry.get_field_u16(sf("sfSignerWeight")) as u32;
+            authorized.insert(signer_account, weight);
+        }
+
+        // Iterate over the transaction's signers and accumulate weight.
+        let tx_signers = sttx.get_field_array(sf("sfSigners"));
+        let mut weight_sum: u32 = 0;
+        for tx_signer in tx_signers.iter() {
+            let signer_account = tx_signer.get_account_id(sf("sfAccount"));
+            if let Some(&weight) = authorized.get(&signer_account) {
+                weight_sum = weight_sum.saturating_add(weight);
+            }
+            // Signers not in the list contribute zero weight but are not
+            // rejected here — the cryptographic signature check already
+            // validated their identity during preflight.
+        }
+
+        if weight_sum < quorum {
+            return Ter::TEF_BAD_QUORUM;
         }
     }
 
@@ -1857,7 +1927,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         TxType::ACCOUNT_DELETE => {
             let account = sttx.get_account_id(sf("sfAccount"));
             let destination = sttx.get_account_id(sf("sfDestination"));
-            // C++ preclaim checks
+            // Preclaim checks
             if account == destination {
                 return Ter::TEM_DST_IS_SRC;
             }
@@ -1874,6 +1944,77 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let ledger_seq = view.header().seq;
             if ledger_seq.saturating_sub(acct_seq) < 256 {
                 return Ter::TEC_TOO_SOON;
+            }
+            // Scan owner directory — only tickets and credentials are deletable
+            let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
+            if view.exists(owner_dir).unwrap_or(false) {
+                // Collect all directory entries
+                let mut page = 0_u64;
+                let mut all_entries: Vec<basics::math::base_uint::Uint256> = Vec::new();
+                loop {
+                    let page_keylet = protocol::page_keylet(owner_dir, page);
+                    let Some(node) = view.peek(page_keylet).ok().flatten() else {
+                        break;
+                    };
+                    all_entries.extend(
+                        node.get_field_v256(sf("sfIndexes")).value().iter().copied(),
+                    );
+                    let next = node.get_field_u64(sf("sfIndexNext"));
+                    if next == 0 || next == page {
+                        break;
+                    }
+                    page = next;
+                }
+                // Check each entry type to determine if it blocks deletion
+                // lightweight account-owned objects. Obligations like AMM, Vault, Loan
+                // cannot be deleted.
+                for entry_key in &all_entries {
+                    let Some(entry_sle) = view
+                        .peek(protocol::child_keylet(*entry_key))
+                        .ok()
+                        .flatten()
+                    else {
+                        return Ter::TEF_BAD_LEDGER;
+                    };
+                    match entry_sle.get_type() {
+                        // Non-obligation objects that can be
+                        // deleted during AccountDelete (non-obligation deleter)
+                        LedgerEntryType::Ticket
+                        | LedgerEntryType::Credential
+                        | LedgerEntryType::DepositPreauth
+                        | LedgerEntryType::DID
+                        | LedgerEntryType::SignerList
+                        | LedgerEntryType::NFTokenOffer
+                        | LedgerEntryType::NFTokenPage
+                        | LedgerEntryType::Oracle
+                        | LedgerEntryType::Delegate
+                        | LedgerEntryType::DirectoryNode => {
+                            // deletable
+                        }
+                        _ => {
+                            return Ter::TEC_HAS_OBLIGATIONS;
+                        }
+                    }
+                }
+                // Delete all deletable entries
+                for entry_key in all_entries {
+                    if let Ok(Some(entry_sle)) =
+                        view.peek(protocol::child_keylet(entry_key))
+                    {
+                        let owner_node = entry_sle.get_field_u64(sf("sfOwnerNode"));
+                        let _ = ledger::dir_remove(
+                            view,
+                            &owner_dir,
+                            owner_node,
+                            entry_key,
+                            false,
+                        );
+                        if let Ok(Some(acct)) = view.peek(src_keylet) {
+                            let _ = ledger::adjust_owner_count(view, &acct, -1);
+                        }
+                        let _ = view.erase(entry_sle);
+                    }
+                }
             }
             // Transfer remaining XRP to destination, delete account
             if let (Ok(Some(src)), Ok(Some(dst))) = (view.peek(src_keylet), view.peek(dst_keylet)) {
@@ -1896,7 +2037,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
 
         TxType::REGULAR_KEY_SET => {
             let account = sttx.get_account_id(sf("sfAccount"));
-            // C++ preflight: RegularKey == Account → temBAD_REGKEY
+            // Preflight: RegularKey == Account → temBAD_REGKEY
             if sttx.is_field_present(sf("sfRegularKey"))
                 && sttx.get_account_id(sf("sfRegularKey")) == account
             {
@@ -2023,6 +2164,16 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 None
             };
             if let Ok(facts) = build_escrow_create_facts(view, &account, &dst_account, &amount) {
+                let source_tag = if sttx.is_field_present(sf("sfSourceTag")) {
+                    Some(sttx.get_field_u32(sf("sfSourceTag")))
+                } else {
+                    None
+                };
+                let destination_tag = if sttx.is_field_present(sf("sfDestinationTag")) {
+                    Some(sttx.get_field_u32(sf("sfDestinationTag")))
+                } else {
+                    None
+                };
                 let mut sink = ViewBackedEscrowCreateSink {
                     view,
                     account,
@@ -2032,6 +2183,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     escrow_seq: sttx.get_seq_value(),
                     finish_after,
                     cancel_after,
+                    source_tag,
+                    destination_tag,
                 };
                 run_escrow_create_do_apply(facts, &mut sink)
             } else {
@@ -2243,6 +2396,21 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let account = sttx.get_account_id(sf("sfAccount"));
             let dst = sttx.get_account_id(sf("sfDestination"));
             let send_max = sttx.get_field_amount(sf("sfSendMax"));
+            // Preclaim: destination must exist
+            let dst_keylet = protocol::account_keylet(Uint160::from_void(dst.data()));
+            let Some(dst_sle) = view.peek(dst_keylet).ok().flatten() else {
+                return Ter::TEC_NO_DST;
+            };
+            // Preclaim: check lsfDisallowIncomingCheck on destination
+            if dst_sle.is_flag(protocol::lsfDisallowIncomingCheck) {
+                return Ter::TEC_NO_PERMISSION;
+            }
+            // Preclaim: destination requires DestinationTag
+            if dst_sle.is_flag(protocol::lsfRequireDestTag)
+                && !sttx.is_field_present(sf("sfDestinationTag"))
+            {
+                return Ter::TEC_DST_TAG_NEEDED;
+            }
             let mpt_result = check_mpt_check_create_allowed(view, &account, &dst, &send_max);
             if mpt_result != Ter::TES_SUCCESS {
                 return mpt_result;
@@ -2254,6 +2422,18 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             sle.set_account_id(sf("sfDestination"), dst);
             sle.set_field_amount(sf("sfSendMax"), send_max);
             sle.set_field_u32(sf("sfSequence"), sttx.get_seq_value());
+            if sttx.is_field_present(sf("sfSourceTag")) {
+                sle.set_field_u32(sf("sfSourceTag"), sttx.get_field_u32(sf("sfSourceTag")));
+            }
+            if sttx.is_field_present(sf("sfDestinationTag")) {
+                sle.set_field_u32(sf("sfDestinationTag"), sttx.get_field_u32(sf("sfDestinationTag")));
+            }
+            if sttx.is_field_present(sf("sfExpiration")) {
+                sle.set_field_u32(sf("sfExpiration"), sttx.get_field_u32(sf("sfExpiration")));
+            }
+            if sttx.is_field_present(sf("sfInvoiceID")) {
+                sle.set_field_h256(sf("sfInvoiceID"), sttx.get_field_h256(sf("sfInvoiceID")));
+            }
             // Add to owner directory
             let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
             if let Ok(Some(page)) = ledger::dir_append(view, &owner_dir, check_keylet.key, &|_| {})
@@ -2274,19 +2454,30 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             Ter::TES_SUCCESS
         }
         TxType::CHECK_CANCEL => {
+            let tx_account = sttx.get_account_id(sf("sfAccount"));
             let check_id = sttx.get_field_h256(sf("sfCheckID"));
             let check_keylet = protocol::unchecked_keylet(check_id);
             if let Ok(Some(check_sle)) = view.peek(check_keylet) {
                 let owner = check_sle.get_account_id(sf("sfAccount"));
+                let destination = check_sle.get_account_id(sf("sfDestination"));
+                // Preclaim: if check is not expired, only creator or destination may cancel
+                let expired = if check_sle.is_field_present(sf("sfExpiration")) {
+                    let exp = check_sle.get_field_u32(sf("sfExpiration"));
+                    view.header().parent_close_time >= exp
+                } else {
+                    false
+                };
+                if !expired && tx_account != owner && tx_account != destination {
+                    return Ter::TEC_NO_PERMISSION;
+                }
                 // Remove from owner directory
                 let owner_node = check_sle.get_field_u64(sf("sfOwnerNode"));
                 let owner_dir = owner_dir_keylet(Uint160::from_void(owner.data()));
                 let _ = ledger::dir_remove(view, &owner_dir, owner_node, *check_sle.key(), false);
                 // Remove from destination directory
                 if check_sle.is_field_present(sf("sfDestinationNode")) {
-                    let dst = check_sle.get_account_id(sf("sfDestination"));
                     let dst_node = check_sle.get_field_u64(sf("sfDestinationNode"));
-                    let dst_dir = owner_dir_keylet(Uint160::from_void(dst.data()));
+                    let dst_dir = owner_dir_keylet(Uint160::from_void(destination.data()));
                     let _ = ledger::dir_remove(view, &dst_dir, dst_node, *check_sle.key(), false);
                 }
                 let _ = view.erase(check_sle);
@@ -2295,6 +2486,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 {
                     let _ = ledger::adjust_owner_count(view, &acct, -1);
                 }
+            } else {
+                return Ter::TEC_NO_ENTRY;
             }
             Ter::TES_SUCCESS
         }
@@ -2303,7 +2496,20 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let check_keylet = protocol::unchecked_keylet(check_id);
             if let Ok(Some(check_sle)) = view.peek(check_keylet) {
                 let source = check_sle.get_account_id(sf("sfAccount"));
-                let destination = sttx.get_account_id(sf("sfAccount"));
+                let tx_account = sttx.get_account_id(sf("sfAccount"));
+                let check_destination = check_sle.get_account_id(sf("sfDestination"));
+                // Preclaim: only the check's destination can cash it
+                if tx_account != check_destination {
+                    return Ter::TEC_NO_PERMISSION;
+                }
+                // Preclaim: check for expiration
+                if check_sle.is_field_present(sf("sfExpiration")) {
+                    let exp = check_sle.get_field_u32(sf("sfExpiration"));
+                    if view.header().parent_close_time >= exp {
+                        return Ter::TEC_EXPIRED;
+                    }
+                }
+                let destination = tx_account;
                 let requested_amount = if sttx.is_field_present(sf("sfAmount")) {
                     sttx.get_field_amount(sf("sfAmount"))
                 } else {
@@ -2374,6 +2580,24 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let dst = sttx.get_account_id(sf("sfDestination"));
             let amount = sttx.get_field_amount(sf("sfAmount"));
             let settle_delay = sttx.get_field_u32(sf("sfSettleDelay"));
+
+            // Check destination's lsfRequireDestTag
+            if let Ok(Some(dst_sle)) =
+                view.peek(protocol::account_keylet(Uint160::from_void(dst.data())))
+            {
+                let dst_flags = dst_sle.get_field_u32(sf("sfFlags"));
+                // lsfRequireDestTag = 0x00020000
+                if (dst_flags & 0x00020000) != 0
+                    && !sttx.is_field_present(sf("sfDestinationTag"))
+                {
+                    return Ter::TEC_DST_TAG_NEEDED;
+                }
+                // lsfDisallowIncomingPayChan = 0x10000000
+                if (dst_flags & 0x10000000) != 0 {
+                    return Ter::TEC_NO_PERMISSION;
+                }
+            }
+
             let chan_keylet = protocol::pay_channel_keylet(
                 Uint160::from_void(account.data()),
                 Uint160::from_void(dst.data()),
@@ -2385,10 +2609,30 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             sle.set_field_amount(sf("sfAmount"), amount.clone());
             sle.set_field_amount(sf("sfBalance"), STAmount::from_xrp_amount(XRPAmount::new()));
             sle.set_field_u32(sf("sfSettleDelay"), settle_delay);
+            // Copy PublicKey
+            if sttx.is_field_present(sf("sfPublicKey")) {
+                let pk = sttx.get_field_vl(sf("sfPublicKey"));
+                sle.set_field_vl(sf("sfPublicKey"), &pk);
+            }
+            // Copy optional fields
+            if sttx.is_field_present(sf("sfCancelAfter")) {
+                sle.set_field_u32(sf("sfCancelAfter"), sttx.get_field_u32(sf("sfCancelAfter")));
+            }
+            if sttx.is_field_present(sf("sfSourceTag")) {
+                sle.set_field_u32(sf("sfSourceTag"), sttx.get_field_u32(sf("sfSourceTag")));
+            }
+            if sttx.is_field_present(sf("sfDestinationTag")) {
+                sle.set_field_u32(sf("sfDestinationTag"), sttx.get_field_u32(sf("sfDestinationTag")));
+            }
             // Add to owner directory
             let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
             if let Ok(Some(page)) = ledger::dir_append(view, &owner_dir, chan_keylet.key, &|_| {}) {
                 sle.set_field_u64(sf("sfOwnerNode"), page);
+            }
+            // Add to destination's owner directory
+            let dst_dir = owner_dir_keylet(Uint160::from_void(dst.data()));
+            if let Ok(Some(page)) = ledger::dir_append(view, &dst_dir, chan_keylet.key, &|_| {}) {
+                sle.set_field_u64(sf("sfDestinationNode"), page);
             }
             let _ = view.insert(Arc::new(sle));
             // Adjust owner count
@@ -2420,40 +2664,41 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let account = sttx.get_account_id(sf("sfAccount"));
             let channel_id = sttx.get_field_h256(sf("sfChannel"));
             let amount = sttx.get_field_amount(sf("sfAmount"));
-            let chan_keylet = protocol::unchecked_keylet(channel_id);
-            if let Ok(Some(chan)) = view.peek(chan_keylet) {
-                // C++ parity: only the channel source can fund it
-                let chan_src = chan.get_account_id(sf("sfAccount"));
-                if chan_src != account {
-                    return Ter::TEC_NO_PERMISSION;
-                }
-                // Increase channel amount
-                let cur = chan.get_field_amount(sf("sfAmount"));
-                let mut obj = chan.clone_as_object();
-                obj.set_field_amount(sf("sfAmount"), cur + amount.clone());
-                let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *chan.key())));
-                // Debit source account
-                let src_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
-                if let Ok(Some(src_sle)) = view.peek(src_keylet) {
-                    let bal = src_sle.get_field_amount(sf("sfBalance")).xrp().drops();
-                    let mut src_obj = src_sle.clone_as_object();
-                    src_obj.set_field_amount(
-                        sf("sfBalance"),
-                        STAmount::from_xrp_amount(XRPAmount::from_drops(
-                            bal - amount.xrp().drops(),
-                        )),
-                    );
-                    let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
-                        src_obj,
-                        *src_sle.key(),
-                    )));
-                }
+            let chan_keylet = protocol::pay_channel_keylet_from_key(channel_id);
+            let Some(chan) = view.peek(chan_keylet).ok().flatten() else {
+                return Ter::TEC_NO_ENTRY;
+            };
+            // Only the channel source can fund it
+            let chan_src = chan.get_account_id(sf("sfAccount"));
+            if chan_src != account {
+                return Ter::TEC_NO_PERMISSION;
+            }
+            // Increase channel amount
+            let cur = chan.get_field_amount(sf("sfAmount"));
+            let mut obj = chan.clone_as_object();
+            obj.set_field_amount(sf("sfAmount"), cur + amount.clone());
+            let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *chan.key())));
+            // Debit source account
+            let src_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
+            if let Ok(Some(src_sle)) = view.peek(src_keylet) {
+                let bal = src_sle.get_field_amount(sf("sfBalance")).xrp().drops();
+                let mut src_obj = src_sle.clone_as_object();
+                src_obj.set_field_amount(
+                    sf("sfBalance"),
+                    STAmount::from_xrp_amount(XRPAmount::from_drops(
+                        bal - amount.xrp().drops(),
+                    )),
+                );
+                let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
+                    src_obj,
+                    *src_sle.key(),
+                )));
             }
             Ter::TES_SUCCESS
         }
         TxType::PAYCHAN_CLAIM => {
             let channel_id = sttx.get_field_h256(sf("sfChannel"));
-            let chan_keylet = protocol::unchecked_keylet(channel_id);
+            let chan_keylet = protocol::pay_channel_keylet_from_key(channel_id);
             let Some(chan) = view.peek(chan_keylet).ok().flatten() else {
                 return Ter::TEC_NO_TARGET;
             };
@@ -2567,6 +2812,42 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let account = sttx.get_account_id(sf("sfAccount"));
             let amount1 = sttx.get_field_amount(sf("sfAmount"));
             let amount2 = sttx.get_field_amount(sf("sfAmount2"));
+            // Reject same-asset AMM creation
+            if amount1.asset() == amount2.asset() {
+                return Ter::TEM_BAD_AMM_TOKENS;
+            }
+            // Reject zero or negative amounts
+            if amount1.signum() <= 0 || amount2.signum() <= 0 {
+                return Ter::TEM_BAD_AMOUNT;
+            }
+            // Preclaim balance check: verify account has enough XRP
+            // before creating AMM structures (prevents partial state corruption)
+            if amount2.native() {
+                let acct_k = protocol::account_keylet(Uint160::from_void(account.data()));
+                if let Ok(Some(acct_sle)) = view.peek(acct_k) {
+                    let balance = acct_sle.get_field_amount(sf("sfBalance")).xrp().drops();
+                    let reserve = view.fees().account_reserve(
+                        acct_sle.get_field_u32(sf("sfOwnerCount")) as usize + 1,
+                    );
+                    let required = amount2.xrp().drops().saturating_add(reserve as i64);
+                    if balance < required {
+                        return Ter::TEC_UNFUNDED_AMM;
+                    }
+                }
+            }
+            if amount1.native() {
+                let acct_k = protocol::account_keylet(Uint160::from_void(account.data()));
+                if let Ok(Some(acct_sle)) = view.peek(acct_k) {
+                    let balance = acct_sle.get_field_amount(sf("sfBalance")).xrp().drops();
+                    let reserve = view.fees().account_reserve(
+                        acct_sle.get_field_u32(sf("sfOwnerCount")) as usize + 1,
+                    );
+                    let required = amount1.xrp().drops().saturating_add(reserve as i64);
+                    if balance < required {
+                        return Ter::TEC_UNFUNDED_AMM;
+                    }
+                }
+            }
             let mpt_gate = check_amm_mptokens_v2_gate(view, &[amount1.asset(), amount2.asset()]);
             if mpt_gate != Ter::TES_SUCCESS {
                 return mpt_gate;
@@ -3102,12 +3383,88 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         // --- NFTs ---
         TxType::NFTOKEN_MINT => {
             let account = sttx.get_account_id(sf("sfAccount"));
+            // Determine the actual issuer (sfIssuer if present, otherwise minting account)
+            let issuer = if sttx.is_field_present(sf("sfIssuer")) {
+                sttx.get_account_id(sf("sfIssuer"))
+            } else {
+                account
+            };
+
+            // Get or create the issuer's MintedNFTokens counter
+            let issuer_keylet = protocol::account_keylet(Uint160::from_void(issuer.data()));
+            let Some(issuer_sle) = view.peek(issuer_keylet).ok().flatten() else {
+                return Ter::TEC_NO_ISSUER;
+            };
+
+            let mut issuer_obj = issuer_sle.clone_as_object();
+
+            // Set FirstNFTokenSequence if not present
+            if !issuer_obj.is_field_present(sf("sfFirstNFTokenSequence")) {
+                let acct_seq = issuer_obj.get_field_u32(sf("sfSequence"));
+                // If minted by owner using sequence (not ticket, not authorized minter):
+                // Sequence was already incremented by apply_submit_transactor_shell,
+                // so use acct_seq - 1. Otherwise use acct_seq as-is.
+                let first_seq = if !sttx.is_field_present(sf("sfIssuer"))
+                    && sttx.get_seq_proxy().is_seq()
+                {
+                    acct_seq.saturating_sub(1)
+                } else {
+                    acct_seq
+                };
+                issuer_obj.set_field_u32(sf("sfFirstNFTokenSequence"), first_seq);
+            }
+
+            // Get current MintedNFTokens and increment
+            let minted_count = if issuer_obj.is_field_present(sf("sfMintedNFTokens")) {
+                issuer_obj.get_field_u32(sf("sfMintedNFTokens"))
+            } else {
+                0
+            };
+            issuer_obj.set_field_u32(sf("sfMintedNFTokens"), minted_count.saturating_add(1));
+
+            // Compute token sequence = FirstNFTokenSequence + MintedNFTokens (before increment)
+            let first_nft_seq = issuer_obj.get_field_u32(sf("sfFirstNFTokenSequence"));
+            let token_seq = first_nft_seq.wrapping_add(minted_count);
+
+            // Update issuer account
+            let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
+                issuer_obj,
+                *issuer_sle.key(),
+            )));
+
+            // Compute the NFTokenID
+            let nft_flags = (sttx.get_flags() & 0x0000FFFF) as u16;
+            let transfer_fee = if sttx.is_field_present(sf("sfTransferFee")) {
+                sttx.get_field_u16(sf("sfTransferFee"))
+            } else {
+                0
+            };
+            let taxon = protocol::nft::to_taxon(sttx.get_field_u32(sf("sfNFTokenTaxon")));
+            let nftoken_id = protocol::nft::create_nftoken_id(
+                nft_flags,
+                transfer_fee,
+                &issuer,
+                taxon,
+                token_seq,
+            );
+
+            // Read URI from transaction if present
+            let uri = if sttx.is_field_present(sf("sfURI")) {
+                let uri_bytes = sttx.get_field_vl(sf("sfURI"));
+                Some(protocol::STBlob::from_buffer(
+                    sf("sfURI"),
+                    basics::buffer::Buffer::from(uri_bytes.as_slice()),
+                ))
+            } else {
+                None
+            };
+
             let facts = NFTokenMintApplyFacts {
-                nftoken_id: Uint256::from(sttx.get_transaction_id()),
-                issuer: account,
+                nftoken_id,
+                issuer,
                 owner: account,
-                transfer_fee: None,
-                uri: None,
+                transfer_fee: if transfer_fee != 0 { Some(transfer_fee) } else { None },
+                uri,
             };
             let mut sink = ViewBackedNFTokenMintSink { view, account };
             run_nftoken_mint_do_apply(facts, &mut sink)
@@ -3120,11 +3477,22 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 account
             };
             let token_id = sttx.get_field_h256(sf("sfNFTokenID"));
-            let page_keylet = protocol::keylet::nft_page_keylet(
-                protocol::nft_page_min_keylet(Uint160::from_void(owner.data())),
-                Uint256::from(token_id),
-            );
-            if let Ok(Some(page)) = view.peek(page_keylet) {
+
+            // If account != owner, the burner is the issuer trying
+            // to burn someone else's NFT. Check the tfBurnable flag (bit 0x0001
+            // in the NFTokenID flags field, bytes 0-1).
+            if account != owner {
+                let id_bytes = token_id.data();
+                let nft_flags = ((id_bytes[0] as u16) << 8) | (id_bytes[1] as u16);
+                if (nft_flags & 0x0001) == 0 {
+                    return Ter::TEC_NO_PERMISSION;
+                }
+            }
+
+            // Use succ-based page lookup (pages are stored at the max key for the
+            // owner, not at the token-derived key). nft_locate_page uses succ() to
+            // find the correct page containing this token.
+            if let Ok(Some(page)) = nft_locate_page(view, &owner, token_id) {
                 let tokens = page.get_field_array(sf("sfNFTokens"));
                 let mut new_tokens = protocol::STArray::new(sf("sfNFTokens"));
                 let mut found = false;
@@ -3136,52 +3504,120 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         found = true;
                     }
                 }
-                if found {
-                    if new_tokens.is_empty() {
-                        let _ = view.erase(page);
-                    } else {
-                        let mut obj = page.clone_as_object();
-                        obj.set_field_array(sf("sfNFTokens"), new_tokens);
-                        let _ =
-                            view.update(Arc::new(STLedgerEntry::from_stobject(obj, *page.key())));
-                    }
-                    if let Ok(Some(acct)) =
-                        view.peek(protocol::account_keylet(Uint160::from_void(owner.data())))
-                    {
-                        let _ = ledger::adjust_owner_count(view, &acct, -1);
-                    }
+                if !found {
+                    return Ter::TEC_NO_ENTRY;
                 }
+                if new_tokens.is_empty() {
+                    let _ = view.erase(page);
+                } else {
+                    let mut obj = page.clone_as_object();
+                    obj.set_field_array(sf("sfNFTokens"), new_tokens);
+                    let _ =
+                        view.update(Arc::new(STLedgerEntry::from_stobject(obj, *page.key())));
+                }
+                if let Ok(Some(acct)) =
+                    view.peek(protocol::account_keylet(Uint160::from_void(owner.data())))
+                {
+                    let _ = ledger::adjust_owner_count(view, &acct, -1);
+                }
+            } else {
+                return Ter::TEC_NO_ENTRY;
             }
             Ter::TES_SUCCESS
         }
         TxType::NFTOKEN_CREATE_OFFER => {
             let account = sttx.get_account_id(sf("sfAccount"));
             let token_id = sttx.get_field_h256(sf("sfNFTokenID"));
+            let tx_flags = sttx.get_flags();
+            let is_sell = (tx_flags & protocol::tfSellNFToken) != 0;
+            let amount = sttx.get_field_amount(sf("sfAmount"));
+
+            // Determine the NFT owner for lookup purposes.
+            // For buy offers, sfOwner specifies who owns the token.
+            // For sell offers, the tx account must be the owner.
+            let nft_owner = if !is_sell && sttx.is_field_present(sf("sfOwner")) {
+                sttx.get_account_id(sf("sfOwner"))
+            } else {
+                account
+            };
+
+            // Verify NFT exists: look up the token in the owner's pages.
+            let nft_found = match nft_find_token_and_page(view, &nft_owner, token_id) {
+                Ok(Some(_)) => true,
+                _ => false,
+            };
+            if !nft_found {
+                return Ter::TEC_NO_ENTRY;
+            }
+
+            // Sell offers: account must own the NFT (already verified above since nft_owner == account for sell).
+            // Buy offers: cannot buy your own NFT.
+            if !is_sell {
+                if nft_owner == account {
+                    // Cannot create a buy offer for your own NFT
+                    return Ter::TEC_NO_PERMISSION;
+                }
+                // Buy offers must have positive amount
+                if amount.signum() <= 0 {
+                    return Ter::TEM_BAD_AMOUNT;
+                }
+            }
+
+            // tfOnlyXRP check: if the NFT has the tfOnlyXRP flag set (bit 0x0002 in
+            // the high 16 bits of NFTokenID), reject non-XRP amounts.
+            let id_bytes = token_id.data();
+            let nft_flags_from_id = ((id_bytes[0] as u16) << 8) | (id_bytes[1] as u16);
+            if (nft_flags_from_id & 0x0002) != 0 && !amount.native() && amount.signum() != 0 {
+                return Ter::TEM_BAD_AMOUNT;
+            }
+
             let offer_keylet = protocol::keylet::nft_offer_keylet_for_owner(
                 Uint160::from_void(account.data()),
                 sttx.get_seq_value(),
             );
+
+            // Insert into owner directory
+            let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
+            let owner_node = match ledger::dir_append(view, &owner_dir, offer_keylet.key, &|_| {}) {
+                Ok(Some(page)) => page,
+                _ => return Ter::TEC_DIR_FULL,
+            };
+
+            // Insert into the sell or buy offer directory
+            let token_dir_keylet = if is_sell {
+                protocol::nft_sell_offers_keylet(token_id)
+            } else {
+                protocol::nft_buy_offers_keylet(token_id)
+            };
+            let offer_node = match ledger::dir_append(view, &token_dir_keylet, offer_keylet.key, &|sle| {
+                sle.set_field_u32(sf("sfFlags"), if is_sell { protocol::lsfNFTokenSellOffers } else { protocol::lsfNFTokenBuyOffers });
+                sle.set_field_h256(sf("sfNFTokenID"), token_id);
+            }) {
+                Ok(Some(page)) => page,
+                _ => return Ter::TEC_DIR_FULL,
+            };
+
+            // Create the offer SLE
             let mut sle = STLedgerEntry::new(offer_keylet);
             sle.set_account_id(sf("sfOwner"), account);
             sle.set_field_h256(sf("sfNFTokenID"), token_id);
-            sle.set_field_amount(sf("sfAmount"), sttx.get_field_amount(sf("sfAmount")));
+            sle.set_field_amount(sf("sfAmount"), amount);
+            let mut sle_flags = 0u32;
+            if is_sell {
+                sle_flags |= protocol::lsfSellNFToken;
+            }
+            sle.set_field_u32(sf("sfFlags"), sle_flags);
+            sle.set_field_u64(sf("sfOwnerNode"), owner_node);
+            sle.set_field_u64(sf("sfNFTokenOfferNode"), offer_node);
             if sttx.is_field_present(sf("sfDestination")) {
-                sle.set_account_id(
-                    sf("sfDestination"),
-                    sttx.get_account_id(sf("sfDestination")),
-                );
+                sle.set_account_id(sf("sfDestination"), sttx.get_account_id(sf("sfDestination")));
             }
             if sttx.is_field_present(sf("sfExpiration")) {
                 sle.set_field_u32(sf("sfExpiration"), sttx.get_field_u32(sf("sfExpiration")));
             }
-            sle.set_field_u32(sf("sfFlags"), sttx.get_field_u32(sf("sfFlags")));
-            // Insert into owner directory
-            let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-            if let Ok(Some(page)) = ledger::dir_append(view, &owner_dir, offer_keylet.key, &|_| {})
-            {
-                sle.set_field_u64(sf("sfOwnerNode"), page);
-            }
             let _ = view.insert(Arc::new(sle));
+
+            // Update owner count
             if let Ok(Some(acct)) =
                 view.peek(protocol::account_keylet(Uint160::from_void(account.data())))
             {
@@ -3244,11 +3680,64 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 None
             };
 
+            // Validate: at least one offer must exist
+            if sell_offer.is_none() && buy_offer.is_none() {
+                return Ter::TEC_OBJECT_NOT_FOUND;
+            }
+
+            // Destination check: if a sell offer has a Destination, only that
+            // account (or a broker using both offers) can accept it.
+            if let Some(ref so) = sell_offer {
+                if so.is_field_present(sf("sfDestination")) {
+                    let dest = so.get_account_id(sf("sfDestination"));
+                    // In broker mode, the buy offer owner must be the destination.
+                    // In direct sell mode, the tx_account must be the destination.
+                    if buy_offer.is_some() {
+                        if let Some(ref bo) = buy_offer {
+                            if bo.get_account_id(sf("sfOwner")) != dest {
+                                return Ter::TEC_NO_PERMISSION;
+                            }
+                        }
+                    } else if tx_account != dest {
+                        return Ter::TEC_NO_PERMISSION;
+                    }
+                }
+            }
+
+            // Destination check for buy offers
+            if let Some(ref bo) = buy_offer {
+                if bo.is_field_present(sf("sfDestination")) {
+                    let dest = bo.get_account_id(sf("sfDestination"));
+                    if sell_offer.is_some() {
+                        if let Some(ref so) = sell_offer {
+                            if so.get_account_id(sf("sfOwner")) != dest {
+                                return Ter::TEC_NO_PERMISSION;
+                            }
+                        }
+                    } else if tx_account != dest {
+                        return Ter::TEC_NO_PERMISSION;
+                    }
+                }
+            }
+
             let delete_offer = |view: &mut V, offer: &Arc<STLedgerEntry>| {
                 let owner = offer.get_account_id(sf("sfOwner"));
                 let owner_node = offer.get_field_u64(sf("sfOwnerNode"));
                 let owner_dir = owner_dir_keylet(Uint160::from_void(owner.data()));
                 let _ = ledger::dir_remove(view, &owner_dir, owner_node, *offer.key(), false);
+                // Also remove from the NFToken's sell/buy offer directory
+                if offer.is_field_present(sf("sfNFTokenOfferNode")) {
+                    let offer_node = offer.get_field_u64(sf("sfNFTokenOfferNode"));
+                    let nftoken_id = offer.get_field_h256(sf("sfNFTokenID"));
+                    let flags = offer.get_field_u32(sf("sfFlags"));
+                    let is_sell = (flags & protocol::lsfSellNFToken) != 0;
+                    let token_dir = if is_sell {
+                        protocol::nft_sell_offers_keylet(nftoken_id)
+                    } else {
+                        protocol::nft_buy_offers_keylet(nftoken_id)
+                    };
+                    let _ = ledger::dir_remove(view, &token_dir, offer_node, *offer.key(), false);
+                }
                 if let Ok(Some(acct)) =
                     view.peek(protocol::account_keylet(Uint160::from_void(owner.data())))
                 {
@@ -3285,16 +3774,60 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     let buyer = bo.get_account_id(sf("sfOwner"));
                     let nftoken_id = bo.get_field_h256(sf("sfNFTokenID"));
                     let amount = bo.get_field_amount(sf("sfAmount"));
+                    // Verify tx_account actually owns the NFT
+                    let owns = match nft_find_token_and_page(view, &tx_account, nftoken_id) {
+                        Ok(Some(_)) => true,
+                        _ => false,
+                    };
+                    if !owns {
+                        return Ter::TEC_NO_PERMISSION;
+                    }
                     (buyer, tx_account, nftoken_id, amount)
                 } else {
                     return Ter::TEF_INTERNAL;
                 };
 
+            // Transfer fee handling: extract transfer fee from NFTokenID.
+            // NFTokenID bytes 0-1 = flags, bytes 2-3 = transfer fee (basis points out of 50000).
+            // Bytes 4-23 = issuer account (20 bytes).
+            // Transfer fee only applies on secondary sales (seller != issuer).
+            let id_bytes = nftoken_id.data();
+            let nft_flags_from_id = ((id_bytes[0] as u16) << 8) | (id_bytes[1] as u16);
+            let transfer_fee_bps = ((id_bytes[2] as u16) << 8) | (id_bytes[3] as u16);
+            let has_transfer_fee = transfer_fee_bps > 0;
+
+            // Extract issuer from NFTokenID bytes 4..24
+            let mut issuer_bytes = [0u8; 20];
+            issuer_bytes.copy_from_slice(&id_bytes[4..24]);
+            let issuer_id = AccountID::from_array(issuer_bytes);
+
+            // Determine if this is a secondary sale (seller is not the issuer)
+            let is_secondary_sale = seller != issuer_id;
+
             if amount.signum() > 0 {
                 if amount.native() {
-                    do_xrp_payment(view, &buyer, &seller, &amount, 0);
+                    if has_transfer_fee && is_secondary_sale {
+                        // Calculate transfer fee: fee = amount * transferFee / 100000
+                        // TransferFee is in 1/100000 units (0.001%), max 50000 = 50%.
+                        let total_drops = amount.xrp().drops();
+                        let fee_drops = (total_drops as u64 * transfer_fee_bps as u64 / 100_000) as i64;
+                        let seller_drops = total_drops - fee_drops;
+
+                        // Pay seller (amount minus fee)
+                        let seller_amount = STAmount::from_xrp_amount(XRPAmount::from_drops(seller_drops));
+                        do_xrp_payment(view, &buyer, &seller, &seller_amount, 0);
+
+                        // Pay issuer the transfer fee
+                        if fee_drops > 0 {
+                            let fee_amount = STAmount::from_xrp_amount(XRPAmount::from_drops(fee_drops));
+                            do_xrp_payment(view, &buyer, &issuer_id, &fee_amount, 0);
+                        }
+                    } else {
+                        do_xrp_payment(view, &buyer, &seller, &amount, 0);
+                    }
                 } else {
                     // IOU payment via accountSend
+                    // Note: IOU transfer fee handling for brokered NFT sales is applied via account_send
                     ledger::ripple_state_helpers::account_send(view, &buyer, &seller, &amount);
                 }
             }
@@ -3304,7 +3837,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         TxType::CLAWBACK => {
             let issuer = sttx.get_account_id(sf("sfAccount"));
             let amount = sttx.get_field_amount(sf("sfAmount"));
-            // C++ parity: preflight validation
+            // Preflight validation
             if amount.signum() <= 0 {
                 return Ter::TEM_BAD_AMOUNT;
             }
@@ -3321,7 +3854,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     _ => return Ter::TEF_INTERNAL,
                 };
                 let mptid = mpt_issue.mpt_id();
-                // C++ parity: preclaim - check lsfMPTCanClawback
+                // Preclaim: check lsfMPTCanClawback
                 let issuance_keylet = protocol::mpt_issuance_keylet_from_mptid(mptid);
                 let Some(iss_sle) = view.peek(issuance_keylet).ok().flatten() else {
                     return Ter::TEC_OBJECT_NOT_FOUND;
@@ -3355,7 +3888,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 let _ = view.update(Arc::new(STLedgerEntry::from_stobject(iss_obj, *iss.key())));
             } else {
                 // IOU clawback — debit specific amount from holder's trust line
-                // C++ parity: preclaim - check lsfAllowTrustLineClawback
+                // Preclaim: check lsfAllowTrustLineClawback
                 let Some(issuer_sle) = view
                     .peek(protocol::account_keylet(Uint160::from_void(issuer.data())))
                     .ok()
@@ -3404,6 +3937,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     let mut obj = line.clone_as_object();
                     obj.set_field_amount(sf("sfBalance"), new_balance);
                     let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *line.key())));
+                } else {
+                    return Ter::TEC_NO_LINE;
                 }
             }
             Ter::TES_SUCCESS
@@ -4050,7 +4585,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let existing_domain_id = sttx
                 .is_field_present(sf("sfDomainID"))
                 .then(|| sttx.get_field_h256(sf("sfDomainID")));
-            // C++ parity: ownership verification on update
+            // Ownership verification on update
             if let Some(domain_id) = existing_domain_id {
                 if !domain_id.is_zero() {
                     let domain_keylet = protocol::permissioned_domain_keylet_from_id(domain_id);
@@ -4078,7 +4613,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         TxType::PERMISSIONED_DOMAIN_DELETE => {
             let account = sttx.get_account_id(sf("sfAccount"));
             let domain_id = sttx.get_field_h256(sf("sfDomainID"));
-            // C++ parity: ownership verification
+            // Ownership verification
             if !domain_id.is_zero() {
                 let domain_keylet = protocol::permissioned_domain_keylet_from_id(domain_id);
                 if let Ok(Some(domain_sle)) = view.peek(domain_keylet) {
@@ -4183,6 +4718,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     return Ter::TEC_DIR_FULL;
                 };
                 sle.set_field_u64(sf("sfSubjectNode"), subject_page);
+                // Note: subject OwnerCount is NOT incremented on create.
+                // It's incremented on accept (ownership transfer from issuer to subject).
             }
 
             if view.insert(Arc::new(sle)).is_err() {
@@ -4241,7 +4778,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 return Ter::TEC_INSUFFICIENT_RESERVE;
             }
 
-            // C++ parity: reject duplicate acceptance
+            // Reject duplicate acceptance
             if cred_sle.is_flag(protocol::lsfAccepted) {
                 return Ter::TEC_DUPLICATE;
             }
@@ -4423,8 +4960,29 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 return res;
             }
             let mut obj = amm_sle.clone_as_object();
-            obj.set_field_amount(sf("sfLPTokenBalance"), math.new_lp_token_balance);
+            obj.set_field_amount(sf("sfLPTokenBalance"), math.new_lp_token_balance.clone());
             let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *amm_sle.key())));
+
+            // Delete AMM if LP balance reaches zero after full clawback.
+            // Matches AMMWithdraw's deleteAMMAccountIfEmpty: clean up owner
+            // directory entries, remove the AMM SLE, and erase the AMM account.
+            if math.new_lp_token_balance.signum() == 0 {
+                let cleanup = delete_empty_amm_owner_entries(view, &amm_account);
+                if cleanup != Ter::TES_SUCCESS && cleanup != Ter::TEC_INCOMPLETE {
+                    tracing::debug!(target: "transactor", "AMM owner cleanup returned {:?}", cleanup);
+                }
+                // Erase the AMM SLE
+                let amm_keylet2 = protocol::keylet::amm(asset1, asset2);
+                if let Ok(Some(amm_sle2)) = view.peek(amm_keylet2) {
+                    let _ = view.erase(amm_sle2);
+                }
+                // Erase the AMM account root
+                let account_keylet =
+                    protocol::account_keylet(Uint160::from_void(amm_account.data()));
+                if let Ok(Some(amm_root)) = view.peek(account_keylet) {
+                    let _ = view.erase(amm_root);
+                }
+            }
 
             let res = amm_clawback_send_amount(view, &holder, &issuer, amount1);
             if res != Ter::TES_SUCCESS {
@@ -4803,6 +5361,8 @@ fn asf_to_lsf(asf: u32) -> u32 {
         13 => 0x0800_0000, // asfDisallowIncomingCheck
         14 => 0x1000_0000, // asfDisallowIncomingPayChan
         15 => 0x2000_0000, // asfDisallowIncomingTrustline
+        16 => 0x8000_0000, // asfAllowTrustLineClawback → lsfAllowTrustLineClawback
+        17 => 0x4000_0000, // asfAllowTrustLineLocking → lsfAllowTrustLineLocking
         _ => 0,
     }
 }

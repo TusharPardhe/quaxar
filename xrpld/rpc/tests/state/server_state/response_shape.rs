@@ -88,6 +88,7 @@ fn server_state_reads_integer_load_fields_from_application_source() {
             admin_nets_v6: Vec::new(),
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
         }],
         client: None,
         overlay: None,

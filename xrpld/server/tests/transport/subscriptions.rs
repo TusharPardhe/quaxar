@@ -116,6 +116,7 @@ fn auth_request_role_detects_admin_and_gateway_roles() {
                 .expect("gateway admin network should parse"),
         ],
         secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
     });
 
     let request = http::Request::builder()

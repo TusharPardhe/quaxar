@@ -544,7 +544,16 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
         }
         TxType::NFTOKEN_CREATE_OFFER => {
             let amount = tx.get_field_amount(sf("sfAmount"));
-            if amount.signum() <= 0 {
+            if amount.negative() {
+                return Ter::TEM_BAD_AMOUNT;
+            }
+            // (tokenOfferCreatePreflight): IOU zero is always bad
+            if !amount.native() && amount.mantissa() == 0 {
+                return Ter::TEM_BAD_AMOUNT;
+            }
+            // Buy offers must have non-zero amount
+            let is_sell = (tx.get_flags() & protocol::tfSellNFToken) != 0;
+            if !is_sell && amount.mantissa() == 0 {
                 return Ter::TEM_BAD_AMOUNT;
             }
             if tx.is_field_present(sf("sfExpiration")) {

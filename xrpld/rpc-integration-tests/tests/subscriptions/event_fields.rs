@@ -375,7 +375,7 @@ fn subscribe_transaction_event_has_full_structure() {
     );
     assert_eq!(
         payload.get("engine_result_code"),
-        Some(&JsonValue::Signed(0))
+        Some(&JsonValue::Unsigned(0))
     );
     assert!(payload.contains_key("engine_result_message"));
 

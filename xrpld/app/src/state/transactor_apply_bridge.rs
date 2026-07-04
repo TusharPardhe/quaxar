@@ -995,40 +995,58 @@ pub struct ViewBackedNFTokenMintSink<'a, V> {
 
 impl<'a, V: ApplyView> NFTokenMintApplySink for ViewBackedNFTokenMintSink<'a, V> {
     fn mint_nftoken(&mut self, facts: &NFTokenMintApplyFacts) {
-        // Find or create an NFToken page for the owner
-        let page_keylet = protocol::nft_page_keylet(
-            protocol::nft_page_min_keylet(to_160(&facts.owner)),
-            facts.nftoken_id,
-        );
-
-        let existing = self.view.peek(page_keylet).ok().flatten();
-        let is_new_page = existing.is_none();
-
-        let mut tokens = if let Some(ref sle) = existing {
-            sle.get_field_array(get_field_by_symbol("sfNFTokens"))
-        } else {
-            protocol::STArray::new(get_field_by_symbol("sfNFTokens"))
-        };
-
-        // Add the NFToken to the array
+        // Build the NFToken object
         let mut token = STObject::new(get_field_by_symbol("sfNFToken"));
         token.set_field_h256(get_field_by_symbol("sfNFTokenID"), facts.nftoken_id);
         if let Some(uri) = &facts.uri {
             token.set_stbase(uri.clone());
         }
-        tokens.push_back(token);
 
-        if is_new_page {
-            let mut page_sle = STLedgerEntry::new(page_keylet);
-            page_sle.set_field_array(get_field_by_symbol("sfNFTokens"), tokens);
-            let _ = self.view.insert(Arc::new(page_sle));
-        } else {
-            let sle = existing.unwrap();
-            let mut obj = sle.clone_as_object();
-            obj.set_field_array(get_field_by_symbol("sfNFTokens"), tokens);
+        // Use succ-based page lookup matching rippled's nft::insertToken.
+        // Find the correct page for this token using the successor search.
+        let owner_160 = to_160(&facts.owner);
+        let base = protocol::nft_page_min_keylet(owner_160);
+        let first = protocol::nft_page_keylet(base, facts.nftoken_id);
+        let last = protocol::nft_page_max_keylet(owner_160);
+
+        let page_key = self
+            .view
+            .succ(first.key, Some(last.key.next()))
+            .ok()
+            .flatten()
+            .unwrap_or(last.key);
+
+        let page_kl = protocol::Keylet::new(protocol::LedgerEntryType::NFTokenPage, page_key);
+
+        if let Ok(Some(page)) = self.view.peek(page_kl) {
+            // Page exists — add token to it in sorted order
+            let mut tokens: Vec<_> = page
+                .get_field_array(get_field_by_symbol("sfNFTokens"))
+                .iter()
+                .cloned()
+                .collect();
+            tokens.push(token);
+            tokens.sort_by(|a, b| {
+                let a_id = a.get_field_h256(get_field_by_symbol("sfNFTokenID"));
+                let b_id = b.get_field_h256(get_field_by_symbol("sfNFTokenID"));
+                a_id.cmp(&b_id)
+            });
+            let mut arr = protocol::STArray::new(get_field_by_symbol("sfNFTokens"));
+            for t in tokens {
+                arr.push_back(t);
+            }
+            let mut obj = page.clone_as_object();
+            obj.set_field_array(get_field_by_symbol("sfNFTokens"), arr);
             let _ = self
                 .view
-                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
+                .update(Arc::new(STLedgerEntry::from_stobject(obj, *page.key())));
+        } else {
+            // No page exists — create the MAX page (matching rippled's initial page creation)
+            let mut arr = protocol::STArray::new(get_field_by_symbol("sfNFTokens"));
+            arr.push_back(token);
+            let mut page_sle = STLedgerEntry::new(last);
+            page_sle.set_field_array(get_field_by_symbol("sfNFTokens"), arr);
+            let _ = self.view.insert(Arc::new(page_sle));
         }
     }
     fn adjust_owner_count(&mut self, delta: i32) {

@@ -93,8 +93,14 @@ impl TryFrom<NumberParts> for XRPAmount {
 
 impl From<XRPAmount> for NumberParts {
     fn from(value: XRPAmount) -> Self {
-        NumberParts::try_from_external_parts(value.drops, 0, get_mantissa_scale())
-            .expect("XRPAmount should normalize into current Number range")
+        // XRP drops are always exact integers (max 10^17). Use try_normalize_exact
+        // with the current scale. If it fails (e.g. after fee subtraction produces a
+        // non-round value like 99999999999999988), fall back to the unchecked path
+        // which preserves the exact integer without loss.
+        let scale = get_mantissa_scale();
+        NumberParts::try_from_external_parts(value.drops, 0, scale).unwrap_or_else(|_| {
+            NumberParts::unchecked(value.drops < 0, value.drops.unsigned_abs(), 0)
+        })
     }
 }
 

@@ -60,6 +60,7 @@ fn server_info_ports_filter_protocols_and_append_grpc() {
             admin_nets_v6: Vec::new(),
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
         }],
         Some(PublishedGrpcPort {
             ip: "127.0.0.1".to_owned(),
@@ -132,6 +133,7 @@ fn server_info_ports_hide_admin_restricted_entries_from_non_admin() {
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
             },
             ServerPortSetup {
                 name: "port_admin".to_owned(),
@@ -151,6 +153,7 @@ fn server_info_ports_hide_admin_restricted_entries_from_non_admin() {
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
             },
         ],
         Some(PublishedGrpcPort {
@@ -223,6 +226,7 @@ fn server_info_ports_skip_empty_protocol_entries_and_blank_grpc() {
             admin_nets_v6: Vec::new(),
             secure_gateway_nets_v4: Vec::new(),
             secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
         }],
         Some(PublishedGrpcPort {
             ip: "".to_owned(),
@@ -276,6 +280,7 @@ fn server_state_ports_hide_admin_restricted_entries_from_non_admin() {
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
             },
             ServerPortSetup {
                 name: "port_admin".to_owned(),
@@ -295,6 +300,7 @@ fn server_state_ports_hide_admin_restricted_entries_from_non_admin() {
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
+            standalone_mode: false,
             },
         ],
         Some(PublishedGrpcPort {

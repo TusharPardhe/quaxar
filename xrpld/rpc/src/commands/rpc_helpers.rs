@@ -110,6 +110,38 @@ pub fn transaction_sign<Runtime: RpcRuntime, Source>(
     if app_network_id > 1024 && !st_tx.is_field_present(get_field_by_symbol("sfNetworkID")) {
         st_tx.set_field_u32(get_field_by_symbol("sfNetworkID"), app_network_id);
     }
+    // Auto-fill Sequence from the current account state (matching rippled).
+    // If Sequence is 0 (default/missing), look up the account's current sequence.
+    // Use the open ledger state (which reflects submitted-but-not-yet-closed txs)
+    // so that multiple transactions in the same ledger get correct sequences.
+    if st_tx.get_seq_value() == 0 {
+        if let Some(app) = ctx.runtime.app() {
+            let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
+            let account_keylet = protocol::account_keylet(
+                basics::base_uint::Uint160::from_void(account.data()),
+            );
+            // Try open ledger first (has latest state including pending txs)
+            let seq = app
+                .network_ops_current_account_seq(&account)
+                .or_else(|| {
+                    app.closed_ledger()
+                        .or_else(|| app.validated_ledger())
+                        .and_then(|ledger| ledger.read(account_keylet).ok().flatten())
+                        .map(|sle| sle.get_field_u32(get_field_by_symbol("sfSequence")))
+                })
+                .unwrap_or(1);
+            st_tx.set_field_u32(get_field_by_symbol("sfSequence"), seq);
+        }
+    }
+    // Auto-fill Fee if not set (default to base fee)
+    if !st_tx.is_field_present(get_field_by_symbol("sfFee"))
+        || st_tx.get_field_amount(get_field_by_symbol("sfFee")).xrp().drops() == 0
+    {
+        st_tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            protocol::STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(12)),
+        );
+    }
     let (public_key, secret_key) = keypair_for_signature(params)?;
     let signature_target = parse_signature_target(params)?;
     signer_target_object(&mut st_tx, signature_target).set_field_vl(
@@ -441,7 +473,27 @@ pub fn autofill_tx<Runtime: RpcRuntime>(
         map.insert(jss::Fee.to_string(), JsonValue::String("10".to_string()));
     }
     if !map.contains_key(jss::Sequence) {
-        map.insert(jss::Sequence.to_string(), JsonValue::Unsigned(1));
+        // Try to auto-fill from the account's current sequence.
+        let seq = if let Some(app) = _ctx.runtime.app() {
+            if let Some(JsonValue::String(acct_str)) = map.get("Account") {
+                let base_ledger = app.closed_ledger().or_else(|| app.validated_ledger());
+                base_ledger
+                    .and_then(|ledger| {
+                        let account_id = protocol::parse_base58_account_id(acct_str)?;
+                        let keylet = protocol::account_keylet(
+                            basics::base_uint::Uint160::from_void(account_id.data()),
+                        );
+                        ledger.read(keylet).ok().flatten()
+                    })
+                    .map(|sle| sle.get_field_u32(get_field_by_symbol("sfSequence")) as u64)
+                    .unwrap_or(1)
+            } else {
+                1
+            }
+        } else {
+            1
+        };
+        map.insert(jss::Sequence.to_string(), JsonValue::Unsigned(seq));
     }
     Ok(())
 }
@@ -657,7 +709,20 @@ pub fn choose_ledger_entry_type(params: &JsonValue) -> Result<Option<LedgerEntry
 }
 
 fn parse_sttx_from_json_value(tx_json: &JsonValue) -> Result<STTx, Status> {
-    let parsed = STParsedJSONObject::new("tx_json", tx_json);
+    // Strip display-only / computed fields that are not protocol SFields.
+    // sign_for and tx results include these in their tx_json output, but
+    // they must be removed before re-parsing for submit_multisigned.
+    let cleaned = match tx_json {
+        JsonValue::Object(map) => {
+            let mut m = map.clone();
+            m.remove(jss::DeliverMax);
+            m.remove(jss::hash);
+            JsonValue::Object(m)
+        }
+        other => other.clone(),
+    };
+
+    let parsed = STParsedJSONObject::new("tx_json", &cleaned);
     if let Some(object) = parsed.object {
         return Ok(STTx::from_stobject(object));
     }

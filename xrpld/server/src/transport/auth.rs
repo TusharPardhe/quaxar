@@ -19,6 +19,7 @@ pub struct ServerAuthConfig {
     pub admin_nets_v6: Vec<IpNet>,
     pub secure_gateway_nets_v4: Vec<IpNet>,
     pub secure_gateway_nets_v6: Vec<IpNet>,
+    pub standalone_mode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -120,10 +121,21 @@ pub fn forwarded_for(headers: &HeaderMap) -> Option<String> {
 }
 
 pub fn ip_allowed(remote_ip: IpAddr, nets4: &[IpNet], nets6: &[IpNet]) -> bool {
-    nets4
+    if nets4
         .iter()
         .chain(nets6.iter())
         .any(|net| net.contains(&remote_ip))
+    {
+        return true;
+    }
+    // Handle IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) which Docker and
+    // some runtimes produce. Extract the inner IPv4 and check the v4 nets.
+    if let IpAddr::V6(v6) = remote_ip {
+        if let Some(v4) = v6.to_ipv4_mapped() {
+            return nets4.iter().any(|net| net.contains(&IpAddr::V4(v4)));
+        }
+    }
+    false
 }
 
 pub fn authorized_http(config: &ServerAuthConfig, headers: &HeaderMap) -> bool {
@@ -185,6 +197,10 @@ pub fn password_unrequired_or_sent_correct(config: &ServerAuthConfig, params: &J
 }
 
 pub fn is_admin(config: &ServerAuthConfig, params: &JsonValue, remote_ip: IpAddr) -> bool {
+    // In standalone mode, all requests are admin (no network, local-only operation).
+    if config.standalone_mode {
+        return true;
+    }
     ip_allowed(remote_ip, &config.admin_nets_v4, &config.admin_nets_v6)
         && password_unrequired_or_sent_correct(config, params)
 }
@@ -233,8 +249,10 @@ fn request_role_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerAuthConfig, authorized_http, forwarded_for};
+    use super::{ServerAuthConfig, authorized_http, forwarded_for, ip_allowed};
     use http::{HeaderMap, HeaderValue, header};
+    use ipnet::IpNet;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn authorized_http_matches_basic_auth() {
@@ -291,5 +309,68 @@ mod tests {
             HeaderValue::from_static("xfor=198.51.100.1; for=203.0.113.9"),
         );
         assert_eq!(forwarded_for(&headers), Some("203.0.113.9".to_owned()));
+    }
+
+    #[test]
+    fn ip_allowed_matches_ipv4_in_v4_net() {
+        let nets4 = vec!["127.0.0.1/8".parse::<IpNet>().unwrap()];
+        let nets6 = vec![];
+        assert!(ip_allowed(IpAddr::V4(Ipv4Addr::LOCALHOST), &nets4, &nets6));
+        assert!(!ip_allowed(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            &nets4,
+            &nets6
+        ));
+    }
+
+    #[test]
+    fn ip_allowed_matches_ipv4_mapped_ipv6_against_v4_nets() {
+        // 0.0.0.0/0 matches all IPv4
+        let nets4 = vec!["0.0.0.0/0".parse::<IpNet>().unwrap()];
+        let nets6 = vec![];
+
+        // ::ffff:127.0.0.1 is an IPv4-mapped IPv6 address
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(mapped.is_ipv6());
+        assert!(ip_allowed(mapped, &nets4, &nets6));
+
+        // ::ffff:172.17.0.1 (Docker bridge as mapped)
+        let docker_mapped: IpAddr = "::ffff:172.17.0.1".parse().unwrap();
+        assert!(ip_allowed(docker_mapped, &nets4, &nets6));
+    }
+
+    #[test]
+    fn ip_allowed_wildcard_matches_all_variants() {
+        let nets4 = vec!["0.0.0.0/0".parse::<IpNet>().unwrap()];
+        let nets6 = vec!["::/0".parse::<IpNet>().unwrap()];
+
+        // IPv4 loopback
+        assert!(ip_allowed(IpAddr::V4(Ipv4Addr::LOCALHOST), &nets4, &nets6));
+        // IPv6 loopback
+        assert!(ip_allowed(IpAddr::V6(Ipv6Addr::LOCALHOST), &nets4, &nets6));
+        // IPv4-mapped IPv6
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(ip_allowed(mapped, &nets4, &nets6));
+        // Docker bridge
+        assert!(ip_allowed(
+            IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1)),
+            &nets4,
+            &nets6
+        ));
+    }
+
+    #[test]
+    fn ip_allowed_does_not_match_mapped_when_v4_net_excludes() {
+        // Only 10.0.0.0/8 allowed
+        let nets4 = vec!["10.0.0.0/8".parse::<IpNet>().unwrap()];
+        let nets6 = vec![];
+
+        // ::ffff:10.0.0.1 should match via extraction
+        let mapped_in: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+        assert!(ip_allowed(mapped_in, &nets4, &nets6));
+
+        // ::ffff:192.168.1.1 should not match
+        let mapped_out: IpAddr = "::ffff:192.168.1.1".parse().unwrap();
+        assert!(!ip_allowed(mapped_out, &nets4, &nets6));
     }
 }

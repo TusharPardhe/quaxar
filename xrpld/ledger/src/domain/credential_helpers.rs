@@ -84,6 +84,8 @@ pub fn delete_sle(
             return Ok(Ter::TEF_BAD_LEDGER);
         }
 
+        // C++ parity: only decrement subject OwnerCount when credential was
+        // accepted (ownership transferred from issuer to subject on accept).
         if accepted {
             let Some(subject_sle) = view.peek(account_keylet(to_uint160(subject)))? else {
                 return Ok(Ter::TEF_BAD_LEDGER);

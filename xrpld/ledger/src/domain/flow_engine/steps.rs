@@ -72,7 +72,7 @@ fn execute_direct_fwd<V: ApplyView>(
 
     // This is what reference does in the reverse pass to determine capacity.
     // We do it inline here since we don't have a separate reverse pass.
-    let (max_flow, _debt_dir) =
+    let (max_flow, debt_dir) =
         crate::domain::ripple_calc::direct_step::max_payment_flow(view, src, dst, currency);
 
     if max_flow.is_zero() || max_flow.signum() <= 0 {
@@ -89,7 +89,7 @@ fn execute_direct_fwd<V: ApplyView>(
 
     // Limit delivery to available capacity
     let input_iou = input.iou();
-    let deliver_iou = if input_iou > max_flow {
+    if input_iou > max_flow {
         static DIRECT_LIMIT_LOG: std::sync::atomic::AtomicU32 =
             std::sync::atomic::AtomicU32::new(0);
         if DIRECT_LIMIT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
@@ -100,25 +100,81 @@ fn execute_direct_fwd<V: ApplyView>(
                 max_flow.exponent()
             );
         }
+    }
+    // When src redeems (positive balance), dst is the issuer (src is paying back).
+    // When src issues (zero/negative balance), src is the issuer (src creates IOUs).
+    let step_issue = Issue {
+        currency,
+        account: if debt_dir == crate::domain::ripple_calc::direct_step::DebtDirection::Redeems {
+            *dst
+        } else {
+            *src
+        },
+    };
+
+    // Apply transfer rate: when src redeems (pays back to issuer dst),
+    // the issuer's transfer rate means src must pay MORE than what flows forward.
+    // Effective capacity is reduced: effective_max = max_flow / rate.
+    let rate = if debt_dir == crate::domain::ripple_calc::direct_step::DebtDirection::Redeems {
+        ripple_state_helpers::transfer_rate(view, dst)
+    } else {
+        crate::domain::mul_ratio::QUALITY_ONE
+    };
+    let has_rate = rate > crate::domain::mul_ratio::QUALITY_ONE;
+
+    // Effective max flow accounts for the rate: we can deliver at most max_flow/rate
+    let effective_max = if has_rate {
+        crate::domain::mul_ratio::mul_ratio(
+            max_flow,
+            crate::domain::mul_ratio::QUALITY_ONE,
+            rate,
+            false, // round down
+        )
+    } else {
         max_flow
+    };
+
+    let deliver_iou = if input_iou > effective_max {
+        effective_max
     } else {
         input_iou
     };
+
     let deliver = protocol::STAmount::from_iou_amount(
         protocol::get_field_by_symbol("sfAmount"),
         deliver_iou,
-        input.issue(),
+        step_issue,
     );
 
     if deliver.signum() <= 0 {
         return Ok((input.zeroed(), input.zeroed()));
     }
 
-    let result = ripple_state_helpers::account_send(view, src, dst, &deliver);
+    // Compute what src actually pays (deliver * rate) for tracking purposes.
+    // account_send already applies the transfer rate internally, so we pass
+    // `deliver` (not the adjusted amount) to avoid double-application.
+    let consumed = if has_rate {
+        let adjusted_iou = crate::domain::mul_ratio::mul_ratio(
+            deliver_iou,
+            rate,
+            crate::domain::mul_ratio::QUALITY_ONE,
+            true, // round up (src pays more)
+        );
+        protocol::STAmount::from_iou_amount(
+            sf("sfAmount"),
+            adjusted_iou,
+            step_issue,
+        )
+    } else {
+        deliver.clone()
+    };
+
+    let result = ripple_state_helpers::account_send(view, src, dst, &consumed);
     if result != Ter::TES_SUCCESS {
         return Err(result);
     }
-    Ok((deliver.clone(), deliver))
+
+    Ok((consumed, deliver))
 }
 
 fn execute_xrp_endpoint_fwd<V: ApplyView>(

@@ -409,7 +409,7 @@ fn defs_types_64_sub_tx_fields() {
     assert_eq!(p.get("type"), Some(&sv("transaction")));
     assert_eq!(p.get("validated"), Some(&b(true)));
     assert_eq!(p.get("engine_result"), Some(&sv("tesSUCCESS")));
-    assert_eq!(p.get("engine_result_code"), Some(&si(0)));
+    assert_eq!(p.get("engine_result_code"), Some(&u(0)));
     assert_eq!(p.get("ledger_index"), Some(&u(10)));
 }
 

@@ -7,7 +7,7 @@ use basics::{
 };
 
 use crate::{
-    JsonValue, LedgerFormats, Permission, STAccount, STAmount, STArray, STBlob, STCurrency,
+    JsonValue, LedgerFormats, Permission, SOEStyle, STAccount, STAmount, STArray, STBlob, STCurrency,
     STInt32, STIssue, STNumber, STObject, STUInt8, STUInt16, STUInt32, STUInt64, STUInt128,
     STUInt160, STUInt192, STUInt256, STVector256, STXChainBridge, SerializedTypeId, TxFormats,
     TxType, asset_from_json, currency_from_string, get_field_by_name, get_field_by_symbol,
@@ -81,6 +81,29 @@ fn parse_object(
         let Some(item) = TxFormats::get_instance().find_by_type(tx_type) else {
             return Err("Field 'TransactionType' is unknown.".to_owned());
         };
+        // Validate that all Required fields are present in the JSON input
+        // BEFORE applying the template (which would auto-fill defaults).
+        for element in item.so_template().iter() {
+            if element.style() == SOEStyle::Required {
+                let field_name = element.sfield().name();
+                // Common fields (Account, TransactionType, Fee, Sequence, SigningPubKey)
+                // are in the common template and auto-filled by signing; skip them.
+                let is_common = matches!(
+                    field_name,
+                    "Account"
+                        | "TransactionType"
+                        | "Fee"
+                        | "Sequence"
+                        | "SigningPubKey"
+                        | "OperationLimit"
+                );
+                if !is_common && !entries.contains_key(field_name) {
+                    return Err(format!(
+                        "Field '{name}.{field_name}' is required.",
+                    ));
+                }
+            }
+        }
         object.apply_template(item.so_template());
     }
 

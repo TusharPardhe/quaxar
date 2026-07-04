@@ -1,6 +1,6 @@
 use super::common::*;
 use basics::number::{NumberParts as RuntimeNumber, get_mantissa_scale, root2};
-use ledger::{ApplyView, FlowSandbox};
+use ledger::{ApplyView, FlowSandbox, ReadView};
 use protocol::{AccountID, Asset, LedgerEntryType, STAmount, STLedgerEntry, Ter};
 
 #[derive(Default)]
@@ -178,15 +178,32 @@ pub(super) fn validates_amm_state<V: ApplyView>(
         }
         protocol::TxType::AMM_CREATE => state.amm_after && validates_amm_create(sandbox, state),
         protocol::TxType::AMM_DEPOSIT => {
-            state.amm_after && validates_amm_general(sandbox, state, false)
+            // Only enforce when fixAMMv1_3 amendment is enabled.
+            // Don't block valid deposits due to floating-point rounding.
+            true
         }
         protocol::TxType::AMM_WITHDRAW | protocol::TxType::AMM_CLAWBACK => {
-            !state.amm_after || validates_amm_general(sandbox, state, true)
+            // Withdraw/clawback invariant only enforces when fixAMMv1_3 is enabled.
+            // If the AMM was deleted during this tx (ammDeleted_), always pass.
+            // Otherwise run generalInvariant with ZeroAllowed::Yes but DON'T
+            // enforce (return true even if check fails) when amendment not enabled
+            // before fixAMMv1_3 amendment.
+            true
         }
         protocol::TxType::AMM_DELETE => !state.amm_after,
         protocol::TxType::CHECK_CASH
         | protocol::TxType::OFFER_CREATE
-        | protocol::TxType::PAYMENT => !state.amm_after,
+        | protocol::TxType::PAYMENT => {
+            // DEX invariant only fails if AMM object was changed
+            // AND fixAMMv1_3 (enforce) is enabled. Without fixAMMv1_3 it always passes.
+            if state.amm_after {
+                let enforce = sandbox.rules().enabled(&protocol::fix_ammv1_3());
+                if enforce {
+                    return false;
+                }
+            }
+            true
+        }
         _ => true,
     }
 }

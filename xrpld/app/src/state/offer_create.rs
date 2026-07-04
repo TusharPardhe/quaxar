@@ -22,6 +22,15 @@ fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
 }
 
+/// Checks if the issuer has lsfGlobalFreeze set (global freeze on IOU assets).
+fn is_global_frozen_iou<V: ledger::ApplyView>(view: &mut V, issuer: &AccountID) -> bool {
+    let keylet = protocol::account_keylet(Uint160::from_void(issuer.data()));
+    view.peek(keylet)
+        .ok()
+        .flatten()
+        .is_some_and(|sle| sle.is_flag(protocol::lsfGlobalFreeze))
+}
+
 fn check_mpt_offer_global_and_trade_allowed<V: ledger::ApplyView>(
     view: &V,
     asset: protocol::Asset,
@@ -96,6 +105,18 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     let mpt_allowed = check_mpt_offer_accept_asset_allowed(view, &account, taker_pays.asset());
     if mpt_allowed != Ter::TES_SUCCESS {
         return mpt_allowed;
+    }
+
+    // Check GlobalFreeze for IOU assets before crossing
+    if let protocol::Asset::Issue(issue) = taker_pays.asset() {
+        if !issue.native() && is_global_frozen_iou(view, &issue.account) {
+            return Ter::TEC_FROZEN;
+        }
+    }
+    if let protocol::Asset::Issue(issue) = taker_gets.asset() {
+        if !issue.native() && is_global_frozen_iou(view, &issue.account) {
+            return Ter::TEC_FROZEN;
+        }
     }
 
     let is_passive = (tx_flags & TF_PASSIVE) != 0;
@@ -605,7 +626,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         let open_book_node =
             match ledger::dir_append(view, &open_quality_dir, offer_keylet.key, &|sle| {
                 // The legacy open-book key may use post-crossing quality, but
-                // C++ still records the original placement rate in metadata.
+                // Record the original placement rate in metadata.
                 set_book_directory_fields(sle, &taker_pays, &taker_gets, rate, None);
             }) {
                 Ok(Some(page)) => page,
@@ -805,9 +826,8 @@ fn get_rate(taker_gets: &STAmount, taker_pays: &STAmount) -> u64 {
     if taker_gets.signum() <= 0 {
         return 0;
     }
-    // reference: STAmount r = divide(offerIn, offerOut, noIssue())
-    // offerIn = taker_pays, offerOut = taker_gets
-    let no_issue = protocol::Issue::default();
+    // STAmount r = divide(offerIn, offerOut, noIssue())
+    let no_issue = protocol::no_issue();
     let r = taker_pays.divide(taker_gets, no_issue);
     if r.signum() <= 0 {
         return 0;

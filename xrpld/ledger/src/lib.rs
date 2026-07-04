@@ -708,7 +708,16 @@ impl Ledger {
                 close_time_resolution,
                 ..LedgerHeader::default()
             },
-            state_map: prev_ledger.state_map.share_root_snapshot(),
+            state_map: {
+                let mut sm = prev_ledger.state_map.share_root_snapshot();
+                // Mark unbacked so mutations traverse only in-memory nodes.
+                // All loaded nodes from the parent tree are reachable via the
+                // shared root. This prevents traversal failures when the
+                // node_fetcher can't resolve hash-only references during COW
+                // operations on the child tree.
+                sm.set_unbacked();
+                sm
+            },
             tx_map: SyncTree::new_with_type(SHAMapType::Transaction, true, 0),
             fees: prev_ledger.fees,
             rules: prev_ledger.rules.clone(),
@@ -2533,12 +2542,20 @@ impl Ledger {
 
         let ledger_seq = self.header.seq;
 
+        // Use a globally unique cowid to prevent in-place mutation of shared nodes.
+        // In C++ rippled, each SHAMap has its own cowid_ incremented from the copy
+        // constructor. Using ledger_seq alone can collide when multiple MutableTrees
+        // are created from roots with the same cowid (e.g., submit-time sandbox and
+        // accept-time build both operating on the same closed ledger's state).
+        static NEXT_COWID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
+
         // across ALL transactions, matching reference where stateMap_ is a persistent
         // SHAMap that rawInsert/rawErase/rawReplace all operate on directly.
         if self.mutable_state.is_none() {
+            let cowid = NEXT_COWID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.mutable_state = Some(MutableTree::from_loaded_root(
                 self.state_map.root(),
-                ledger_seq.max(1),
+                cowid.max(1),
             ));
         }
         let tree = self.mutable_state.as_mut().unwrap();
@@ -2555,11 +2572,23 @@ impl Ledger {
         for (op, key, payload) in ops {
             match op {
                 StateBatchOp::Insert => {
-                    tree.add_item_with_fetch(
+                    let inserted = tree.add_item_with_fetch(
                         shamap::tree_node::SHAMapNodeType::AccountState,
                         SHAMapItem::new(*key, payload.clone()),
                         &mut fetch_fn,
                     )?;
+                    // If the item already exists (add_item returns Ok(false)), fall back
+                    // to update. This handles the case where a sandbox tracks a modification
+                    // as Insert (because the item was created within the sandbox's scope)
+                    // but the item already exists in the underlying state map from a
+                    // previous ledger.
+                    if !inserted {
+                        tree.update_item_with_fetch(
+                            shamap::tree_node::SHAMapNodeType::AccountState,
+                            SHAMapItem::new(*key, payload.clone()),
+                            &mut fetch_fn,
+                        )?;
+                    }
                 }
                 StateBatchOp::Update => {
                     tree.update_item_with_fetch(

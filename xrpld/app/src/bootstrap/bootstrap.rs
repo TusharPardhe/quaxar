@@ -587,11 +587,12 @@ pub fn build_bootstrap_runtime(
 ) -> Result<AppBootstrapRuntime, String> {
     let bootstrap = build_bootstrap_root(config, options)?;
     let runtime = Arc::new(MainRuntime::new(bootstrap.root));
+    // - standalone → Full (node operates without network)
     // - start_valid → Full (node starts fully synced)
     // - non-standalone → Connected (node starts connected to network)
-    if !options.standalone {
+    {
         use crate::network::network_ops::NetworkOpsOperatingMode;
-        let mode = if options.start_valid {
+        let mode = if options.standalone || options.start_valid {
             NetworkOpsOperatingMode::Full
         } else {
             NetworkOpsOperatingMode::Connected
@@ -634,6 +635,10 @@ pub fn build_bootstrap_root(
 
     root.set_path_search_levels(path_search_old, path_search, path_search_fast);
     let _ = root.set_path_search_max(path_search_max);
+    // Configure TxQ for standalone mode (higher min_txn prevents fee escalation).
+    if options.standalone {
+        root.tx_q().set_standalone(true);
+    }
     let _ = root.attach_default_resolver_runtime();
     let _ = root.attach_default_ledger_master_runtime();
     let _ = root.attach_default_network_ops_validation_runtime();
@@ -644,7 +649,12 @@ pub fn build_bootstrap_root(
         .map_err(|error| error.to_string())?;
     let _ = root.load_peer_reservations()?;
     let _ = root.load_cluster_nodes_from_config(config)?;
-    let _ = root.attach_configured_overlay_runtime(config, Arc::new(BootstrapOverlayHandoff))?;
+
+    // Standalone mode operates without network peers — skip overlay entirely.
+    if !options.standalone {
+        let _ =
+            root.attach_configured_overlay_runtime(config, Arc::new(BootstrapOverlayHandoff))?;
+    }
 
     // Load validation seed into config BEFORE consensus runtime is created,
     // so the consensus adaptor can read it.
@@ -780,6 +790,7 @@ where
 
 pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), String> {
     let runtime = Arc::clone(&bootstrap.runtime);
+    let standalone = runtime.root().standalone();
     ensure_descriptor_budget(bootstrap.report.fd_required)?;
     runtime.start()?;
     tracing::info!(target: "app", "Node startup complete");
@@ -794,6 +805,27 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
                 lm.ledger_master().set_closed_ledger(Arc::clone(&validated));
             }
         }
+    }
+
+    // Standalone mode: no overlay, no consensus thread. The node operates in
+    // Full mode with the genesis ledger as validated. Ledger advancement is
+    // driven exclusively by `ledger_accept` RPC calls.
+    if standalone {
+        tracing::info!(
+            target: "app",
+            validated_seq = runtime.root().validated_ledger_seq(),
+            "Standalone mode active — no peers, no consensus. Use ledger_accept to advance."
+        );
+
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let stop_thread =
+            spawn_shutdown_watcher(Arc::clone(&runtime), Arc::clone(&stop_requested));
+
+        runtime.run();
+
+        stop_requested.store(true, Ordering::Release);
+        let _ = stop_thread.join();
+        return Ok(());
     }
 
     // Spawn a dedicated consensus event loop for --start mode (private networks).
@@ -2705,7 +2737,7 @@ fn seed_startup_ledger_state(
             // If [amendments] is configured, use those IDs (matching rippled
             // which reads its [amendments] section to determine getDesired()).
             // Otherwise fall back to all supported + DefaultYes features.
-            let genesis_amendments = amendments_from_config(config);
+            let genesis_amendments = amendments_from_config(config, options.standalone);
             let genesis_config = LedgerConfig {
                 fees: ledger::CURRENT_DEFAULT_FEES,
                 ..LedgerConfig::default()
@@ -2763,7 +2795,8 @@ fn seed_startup_ledger_state(
     // `tracking` state promotion that blocked ledger resolution.
     //
     // `switchLCL()` — it never calls `setValidLedger()` for network nodes.
-    if options.start_valid
+    if options.standalone
+        || options.start_valid
         || matches!(
             options.start_type,
             StartUpType::Load | StartUpType::LoadFile | StartUpType::Replay
@@ -2784,7 +2817,7 @@ fn seed_startup_ledger_state(
     Ok(())
 }
 
-fn amendments_from_config(config: &BasicConfig) -> Vec<Uint256> {
+fn amendments_from_config(config: &BasicConfig, standalone: bool) -> Vec<Uint256> {
     let section = config.section("amendments");
     let values = section.values();
     if !values.is_empty() {
@@ -2800,12 +2833,21 @@ fn amendments_from_config(config: &BasicConfig) -> Vec<Uint256> {
             })
             .collect();
     }
-    // Fallback: all supported amendments voted DefaultYes.
-    REGISTERED_FEATURES
-        .iter()
-        .filter(|f| f.supported && f.vote == RegisteredFeatureVote::DefaultYes)
-        .map(|f| feature_id(f.name))
-        .collect()
+    // Standalone: enable ALL supported amendments (matching rippled standalone).
+    // Network mode: only amendments voted DefaultYes.
+    if standalone {
+        REGISTERED_FEATURES
+            .iter()
+            .filter(|f| f.supported)
+            .map(|f| feature_id(f.name))
+            .collect()
+    } else {
+        REGISTERED_FEATURES
+            .iter()
+            .filter(|f| f.supported && f.vote == RegisteredFeatureVote::DefaultYes)
+            .map(|f| feature_id(f.name))
+            .collect()
+    }
 }
 
 fn config_legacy_u32(config: &BasicConfig, section: &str) -> Option<u32> {

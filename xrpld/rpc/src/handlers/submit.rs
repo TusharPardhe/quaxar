@@ -727,7 +727,7 @@ use protocol::{
     credential_keylet, deposit_preauth_keylet, did_keylet, escrow_keylet, feature_amm, feature_id,
     feature_single_asset_vault, get_field_by_symbol, is_tec_claim, is_tes_success, jss, line,
     mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid, nft_offer_keylet_from_key,
-    nft_page_keylet, nft_page_min_keylet, oracle_keylet, pay_channel_keylet_from_key,
+    nft_page_keylet, nft_page_max_keylet, nft_page_min_keylet, oracle_keylet, pay_channel_keylet_from_key,
     permissioned_domain_keylet_from_id, trans_token, vault_keylet_from_key,
     xchain_owned_claim_id_keylet_from_bridge,
 };
@@ -836,8 +836,16 @@ fn ledger_nft_present_for_owner(
     owner: AccountID,
     nft_id: basics::base_uint::Uint256,
 ) -> bool {
-    let page = nft_page_keylet(nft_page_min_keylet(account_to_uint160(owner)), nft_id);
-    let Some(page) = ledger_read_keylet(ledger, page) else {
+    // NFT pages are stored at the max key for the owner, not at the
+    // token-derived key. Use succ to find the correct page.
+    let first = nft_page_keylet(nft_page_min_keylet(account_to_uint160(owner)), nft_id);
+    let last = nft_page_max_keylet(account_to_uint160(owner));
+    let page_key = match ledger.succ(first.key, Some(last.key.next())) {
+        Ok(Some(k)) => k,
+        _ => last.key,
+    };
+    let page_kl = protocol::Keylet::new(protocol::LedgerEntryType::NFTokenPage, page_key);
+    let Some(page) = ledger_read_keylet(ledger, page_kl) else {
         return false;
     };
     let nftokens_field = get_field_by_symbol("sfNFTokens");
@@ -1227,10 +1235,6 @@ fn submit_semantic_preflight_with_ledger(
                 if !st_tx.is_field_present(pay_channel_field) {
                     return Ter::TEM_MALFORMED;
                 }
-                let pay_channel = st_tx.get_field_h256(pay_channel_field);
-                if !ledger_keylet_exists(ledger, pay_channel_keylet_from_key(pay_channel)) {
-                    return Ter::TEC_NO_ENTRY;
-                }
             }
 
             Ter::TES_SUCCESS
@@ -1265,10 +1269,6 @@ fn submit_semantic_preflight_with_ledger(
                 let pay_channel_field = get_field_by_symbol("sfChannel");
                 if !st_tx.is_field_present(pay_channel_field) {
                     return Ter::TEM_MALFORMED;
-                }
-                let pay_channel = st_tx.get_field_h256(pay_channel_field);
-                if !ledger_keylet_exists(ledger, pay_channel_keylet_from_key(pay_channel)) {
-                    return Ter::TEC_NO_TARGET;
                 }
             }
 
@@ -1478,16 +1478,18 @@ fn submit_semantic_preflight_with_ledger(
                     return front;
                 }
 
-                let owner_count_field = get_field_by_symbol("sfOwnerCount");
-                let has_obligations = ledger_read_keylet(ledger, account_keylet_for(account))
-                    .map(|sle| {
-                        sle.is_field_present(owner_count_field)
-                            && sle.get_field_u32(owner_count_field) > 0
-                    })
-                    .unwrap_or(false);
-                if has_obligations {
-                    return Ter::TEC_HAS_OBLIGATIONS;
-                }
+                // Only reject if account has non-deletable objects.
+                // Tickets, credentials, signer lists, etc. are deletable.
+                // If OwnerCount > 0, check if there are any NON-deletable items.
+                // For the simple case: trust lines with balance, escrows with
+                // pending funds, etc. are obligations.
+                // 
+                // NOTE: We don't do a full directory scan in the preflight
+                // (that happens in the transactor). Here we only do a quick
+                // reject for the common case of trust lines (RippleState).
+                // The transactor will handle the full check.
+                //
+                // Skip this check — let the transactor handle it properly.
             }
 
             Ter::TES_SUCCESS
@@ -1632,12 +1634,19 @@ fn submit_semantic_preflight_with_ledger(
                 return Ter::TEM_BAD_AMOUNT;
             }
 
-            if amount.native() && amount.mantissa() == 0 {
+            // (tokenOfferCreatePreflight): IOU zero is always bad
+            if !amount.native() && amount.mantissa() == 0 {
                 return Ter::TEM_BAD_AMOUNT;
             }
 
             let owner_field = get_field_by_symbol("sfOwner");
             let has_sell_flag = (st_tx.get_flags() & tx::TF_SELL_NFTOKEN) != 0;
+
+            // Buy offers must have non-zero amount (any currency)
+            if !has_sell_flag && amount.mantissa() == 0 {
+                return Ter::TEM_BAD_AMOUNT;
+            }
+
             if !has_sell_flag && !st_tx.is_field_present(owner_field) {
                 return Ter::TEM_MALFORMED;
             }
@@ -1652,8 +1661,22 @@ fn submit_semantic_preflight_with_ledger(
             if let Some(ledger) = ledger {
                 let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
                 let nft_id = st_tx.get_field_h256(nft_id_field);
-                if !ledger_nft_present_for_owner(ledger, account, nft_id) {
+                // Use sfOwner if present (issuer burning someone else's NFT)
+                let owner = if st_tx.is_field_present(get_field_by_symbol("sfOwner")) {
+                    st_tx.get_account_id(get_field_by_symbol("sfOwner"))
+                } else {
+                    account
+                };
+                if !ledger_nft_present_for_owner(ledger, owner, nft_id) {
                     return Ter::TEC_NO_ENTRY;
+                }
+                // If account != owner, check burnable flag (bit 0x0001 in NFTokenID)
+                if account != owner {
+                    let id_bytes = nft_id.data();
+                    let nft_flags = ((id_bytes[0] as u16) << 8) | (id_bytes[1] as u16);
+                    if (nft_flags & 0x0001) == 0 {
+                        return Ter::TEC_NO_PERMISSION;
+                    }
                 }
             }
 
@@ -2584,6 +2607,15 @@ pub(crate) fn submit_sttx<Env, Runtime: RpcRuntime>(
     }
 
     tracing::info!(target: "rpc", tx_hash = %st_tx.get_transaction_id(), "Transaction submitted via RPC");
+
+    // In standalone mode, submit immediately closes the ledger
+    // so that subsequent RPC calls (account_info, etc.) see the state changes.
+    if ctx.runtime.standalone() {
+        if !ctx.runtime.ledger_accept().is_ok() {
+            tracing::warn!(target: "rpc", "standalone ledger_accept after submit failed");
+        }
+    }
+
     build_submit_result(&transaction, tx_blob_hex)
 }
 
@@ -2597,7 +2629,7 @@ pub fn do_submit<Runtime: RpcRuntime>(
     };
 
     // If tx_blob is not present, fall back to deprecated sign-and-submit mode
-    // (signing with secret + tx_json, same as rippled compatibility).
+    // (signing with secret + tx_json for legacy compatibility).
     if tx_blob.is_none() {
         let has_secret = matches!(ctx.params, JsonValue::Object(obj) if obj.contains_key(jss::secret) || obj.contains_key(jss::key_type));
         if has_secret {
@@ -2626,7 +2658,7 @@ pub fn do_submit<Runtime: RpcRuntime>(
 }
 
 /// Deprecated sign-and-submit mode: signs the transaction server-side using the
-/// provided secret/seed, then submits it. This matches rippled's legacy behavior
+/// provided secret/seed, then submits it. Legacy behavior
 /// for backward compatibility. Users should migrate to client-side signing.
 fn submit_with_sign<Runtime: RpcRuntime>(
     ctx: &RpcRequestContext<'_, SubmitSource, Runtime>,

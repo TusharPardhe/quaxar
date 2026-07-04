@@ -164,28 +164,29 @@ impl ApplyStateTable {
         }
 
         // Find non-deleted successor in our list
-        for (item_key, entry) in self
+        let local_next = self
             .items
             .range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
-        {
-            if entry.action != Action::Erase {
-                // Found both, return the lower key
-                if next.is_none() || next.unwrap() > *item_key {
-                    next = Some(*item_key);
-                }
-                break;
-            }
-        }
+            .find(|(_, entry)| entry.action != Action::Erase)
+            .map(|(k, _)| *k);
 
-        // Nothing in our list, return what we got from the parent
-        if let Some(n) = next
+        // Pick the smaller of base result and local result
+        let result = match (next, local_next) {
+            (Some(n), Some(ln)) => Some(n.min(ln)),
+            (Some(n), None) => Some(n),
+            (None, Some(ln)) => Some(ln),
+            (None, None) => None,
+        };
+
+        // Apply the last-key filter
+        if let Some(n) = result
             && let Some(l) = last
             && n >= l
         {
             return Ok(None);
         }
 
-        Ok(next)
+        Ok(result)
     }
 
     pub fn exists(&self, base: &dyn ReadView, k: Keylet) -> Result<bool, ViewError> {
