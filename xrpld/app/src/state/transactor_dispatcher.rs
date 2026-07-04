@@ -2820,6 +2820,32 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             if amount1.signum() <= 0 || amount2.signum() <= 0 {
                 return Ter::TEM_BAD_AMOUNT;
             }
+            // C++ parity: preclaim balance check — verify account has enough XRP
+            // before creating AMM structures (prevents partial state corruption)
+            if amount2.native() {
+                let acct_k = protocol::account_keylet(Uint160::from_void(account.data()));
+                if let Ok(Some(acct_sle)) = view.peek(acct_k) {
+                    let balance = acct_sle.get_field_amount(sf("sfBalance")).xrp().drops();
+                    let reserve = view.fees().account_reserve(
+                        acct_sle.get_field_u32(sf("sfOwnerCount")) as usize + 1,
+                    );
+                    if balance < amount2.xrp().drops() + reserve as i64 {
+                        return Ter::TEC_UNFUNDED_ADD;
+                    }
+                }
+            }
+            if amount1.native() {
+                let acct_k = protocol::account_keylet(Uint160::from_void(account.data()));
+                if let Ok(Some(acct_sle)) = view.peek(acct_k) {
+                    let balance = acct_sle.get_field_amount(sf("sfBalance")).xrp().drops();
+                    let reserve = view.fees().account_reserve(
+                        acct_sle.get_field_u32(sf("sfOwnerCount")) as usize + 1,
+                    );
+                    if balance < amount1.xrp().drops() + reserve as i64 {
+                        return Ter::TEC_UNFUNDED_ADD;
+                    }
+                }
+            }
             let mpt_gate = check_amm_mptokens_v2_gate(view, &[amount1.asset(), amount2.asset()]);
             if mpt_gate != Ter::TES_SUCCESS {
                 return mpt_gate;
