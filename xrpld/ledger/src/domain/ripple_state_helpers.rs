@@ -1,4 +1,4 @@
-//! Full reference the reference source parity.
+//! Trust line and IOU transfer helpers.
 //!
 //! Trust line manipulation: issueIOU, redeemIOU, trustCreate, trustDelete,
 //! updateTrustLine, creditLimit, creditBalance, freeze checks.
@@ -11,7 +11,7 @@ use protocol::{
     get_field_by_symbol as sf,
 };
 
-// Trust line flags (reference lsf* constants)
+// Trust line flags (lsf* constants)
 const LSF_LOW_RESERVE: u32 = 0x0001_0000;
 const LSF_HIGH_RESERVE: u32 = 0x0002_0000;
 const LSF_LOW_NO_RIPPLE: u32 = 0x0010_0000;
@@ -457,12 +457,12 @@ pub fn account_send<V: ApplyView>(
         STAmount::from_iou_amount(sf("sfAmount"), adjusted, issue)
     };
 
-    // reference: directSendNoFeeIOU(view, issuer, receiver, amount, true)
+    // Send from issuer to receiver (no transfer fee applies)
     let res = direct_send_no_fee_iou(view, &issue.account, to, amount, true);
     if res != Ter::TES_SUCCESS {
         return res;
     }
-    // reference: directSendNoFeeIOU(view, sender, issuer, actualCost, true)
+    // Send actual cost from sender back to issuer
     direct_send_no_fee_iou(view, from, &issue.account, &actual_cost, true)
 }
 
@@ -804,9 +804,9 @@ pub fn is_frozen<V: ApplyView>(view: &mut V, account: &AccountID, issue: &Issue)
 /// (positive = low account holds). When account is the high account
 /// (account > issuer), negate to convert to account's perspective.
 ///
-/// NOTE: This is "hold semantics" — equivalent to reference getTrustLineBalance,
-/// NOT reference creditBalance (which has opposite/debt semantics).
-/// Do NOT change the sign rule to match reference creditBalance.
+/// NOTE: This is "hold semantics" — returns the balance the account holds,
+/// NOT debt semantics (opposite sign).
+/// Do NOT change the sign convention.
 pub fn credit_balance<V: ApplyView>(
     view: &mut V,
     account: &AccountID,

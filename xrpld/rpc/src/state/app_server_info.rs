@@ -698,9 +698,61 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
                                                 ("paths_computed".to_owned(), paths),
                                                 ("paths_canonical".to_owned(), JsonValue::Array(Vec::new())),
                                             ])));
-                                            break; // One alternative is sufficient for this search level
+                                            // Continue scanning for more alternatives
                                         }
                                     }
+                                }
+                            }
+
+                            // XRP bridge path: Source currency → XRP → Destination currency
+                            // (C++ Pathfinder sxfd type: Source → XrpBook → DestBook → Destination)
+                            {
+                                let xrp_asset = protocol::Asset::Issue(protocol::xrp_issue());
+                                // Check book: source_currency → XRP
+                                // For each source currency the account holds, check if
+                                // there's also a XRP → destination book
+                                let xrp_to_dst_book = protocol::Book::new(xrp_asset, dst_asset, None);
+                                let xrp_dst_base = protocol::keylet::book(xrp_to_dst_book).key;
+                                let xrp_dst_end = {
+                                    let mut end = xrp_dst_base;
+                                    let bytes = end.data_mut();
+                                    for b in bytes[24..32].iter_mut() { *b = 0xFF; }
+                                    end
+                                };
+                                let has_xrp_to_dst = ledger.succ(xrp_dst_base, Some(xrp_dst_end))
+                                    .ok().flatten().is_some();
+
+                                if has_xrp_to_dst {
+                                    // XRP bridge available — add as alternative with XRP source
+                                    let xrp_step = JsonValue::Object(BTreeMap::from([
+                                        ("currency".to_owned(), JsonValue::String("XRP".to_owned())),
+                                    ]));
+                                    let dst_step = JsonValue::Object(BTreeMap::from([
+                                        ("currency".to_owned(), JsonValue::String(dst_currency.clone())),
+                                        ("issuer".to_owned(), JsonValue::String(dst_issuer_str.clone())),
+                                    ]));
+                                    let paths = JsonValue::Array(vec![
+                                        JsonValue::Array(vec![xrp_step, dst_step]),
+                                    ]);
+                                    let src_amt = JsonValue::String(
+                                        match &request.destination_amount {
+                                            JsonValue::Object(obj) => {
+                                                // Estimate XRP amount (1:1 for simplicity, actual
+                                                // rate determined at payment time by the flow engine)
+                                                obj.get("value")
+                                                    .and_then(|v| v.as_str())
+                                                    .and_then(|s| s.parse::<f64>().ok())
+                                                    .map(|v| format!("{}", (v * 1_000_000.0) as u64))
+                                                    .unwrap_or_else(|| "0".to_owned())
+                                            }
+                                            _ => "0".to_owned(),
+                                        }
+                                    );
+                                    alternatives.push(JsonValue::Object(BTreeMap::from([
+                                        ("source_amount".to_owned(), src_amt),
+                                        ("paths_computed".to_owned(), paths),
+                                        ("paths_canonical".to_owned(), JsonValue::Array(Vec::new())),
+                                    ])));
                                 }
                             }
                         }
