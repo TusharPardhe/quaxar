@@ -152,9 +152,16 @@ fn execute_single_strand<V: ApplyView>(
     // When max_in (SendMax) is set, use it as the input limit.
     // When absent, use max_out (Amount) as the starting input.
     // The transfer rate in direct steps will naturally reduce output below input,
-    // and the final output is capped to max_out below.
+    // C++ parity: the strand should deliver at most max_out (the desired amount).
+    // When SendMax (max_in) is provided and exceeds max_out, use max_out as the
+    // strand input to prevent over-delivery. When max_in <= max_out or absent,
+    // use max_in as the input cap (the source can't send more than SendMax).
     let first_input = if let Some(mi) = max_in {
-        mi.clone()
+        if mi > max_out {
+            max_out.clone()
+        } else {
+            mi.clone()
+        }
     } else {
         max_out.clone()
     };
