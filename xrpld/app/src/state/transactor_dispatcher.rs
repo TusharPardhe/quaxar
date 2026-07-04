@@ -1977,31 +1977,21 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         return Ter::TEF_BAD_LEDGER;
                     };
                     match entry_sle.get_type() {
+                        // C++ parity: these are non-obligation objects that can be
+                        // deleted during AccountDelete (rippled's nonObligationDeleter)
                         LedgerEntryType::Ticket
                         | LedgerEntryType::Credential
                         | LedgerEntryType::DepositPreauth
                         | LedgerEntryType::DID
                         | LedgerEntryType::SignerList
-                        | LedgerEntryType::Offer
                         | LedgerEntryType::NFTokenOffer
-                        | LedgerEntryType::Oracle
-                        | LedgerEntryType::Delegate => {
-                            // deletable — matches C++ nonObligationDeleter
-                        }
-                        | LedgerEntryType::RippleState
-                        | LedgerEntryType::Check
-                        | LedgerEntryType::Escrow
-                        | LedgerEntryType::PayChannel
                         | LedgerEntryType::NFTokenPage
-                        | LedgerEntryType::DirectoryNode
-                        | LedgerEntryType::MPToken
-                        | LedgerEntryType::Child
-                        | LedgerEntryType::Any => {
-                            // Also allow these as deletable for now (needed for
-                            // existing test parity with our directory structure)
+                        | LedgerEntryType::Oracle
+                        | LedgerEntryType::Delegate
+                        | LedgerEntryType::DirectoryNode => {
+                            // deletable
                         }
-                        other => {
-                            eprintln!("[ACCT_DELETE] tecHAS_OBLIGATIONS for entry type: {:?}", other);
+                        _ => {
                             return Ter::TEC_HAS_OBLIGATIONS;
                         }
                     }
@@ -2591,11 +2581,18 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let amount = sttx.get_field_amount(sf("sfAmount"));
             let settle_delay = sttx.get_field_u32(sf("sfSettleDelay"));
 
-            // C++ parity: check destination's lsfDisallowIncomingPayChan flag
+            // C++ parity: check destination's lsfRequireDestTag
             if let Ok(Some(dst_sle)) =
                 view.peek(protocol::account_keylet(Uint160::from_void(dst.data())))
             {
                 let dst_flags = dst_sle.get_field_u32(sf("sfFlags"));
+                // lsfRequireDestTag = 0x00020000
+                if (dst_flags & 0x00020000) != 0
+                    && !sttx.is_field_present(sf("sfDestinationTag"))
+                {
+                    return Ter::TEC_DST_TAG_NEEDED;
+                }
+                // lsfDisallowIncomingPayChan = 0x10000000
                 if (dst_flags & 0x10000000) != 0 {
                     return Ter::TEC_NO_PERMISSION;
                 }
