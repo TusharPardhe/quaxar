@@ -2812,6 +2812,14 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let account = sttx.get_account_id(sf("sfAccount"));
             let amount1 = sttx.get_field_amount(sf("sfAmount"));
             let amount2 = sttx.get_field_amount(sf("sfAmount2"));
+            // C++ parity: reject same-asset AMM create with temBAD_AMM_TOKENS
+            if amount1.asset() == amount2.asset() {
+                return Ter::TEM_BAD_AMM_TOKENS;
+            }
+            // C++ parity: reject zero or negative amounts
+            if amount1.signum() <= 0 || amount2.signum() <= 0 {
+                return Ter::TEM_BAD_AMOUNT;
+            }
             let mpt_gate = check_amm_mptokens_v2_gate(view, &[amount1.asset(), amount2.asset()]);
             if mpt_gate != Ter::TES_SUCCESS {
                 return mpt_gate;
