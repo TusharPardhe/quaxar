@@ -2607,6 +2607,13 @@ pub(crate) fn submit_sttx<Env, Runtime: RpcRuntime>(
     }
 
     tracing::info!(target: "rpc", tx_hash = %st_tx.get_transaction_id(), "Transaction submitted via RPC");
+
+    // C++ parity: in standalone mode, submit immediately closes the ledger
+    // so that subsequent RPC calls (account_info, etc.) see the state changes.
+    if ctx.runtime.standalone() {
+        let _ = ctx.runtime.ledger_accept();
+    }
+
     build_submit_result(&transaction, tx_blob_hex)
 }
 
