@@ -2829,8 +2829,9 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     let reserve = view.fees().account_reserve(
                         acct_sle.get_field_u32(sf("sfOwnerCount")) as usize + 1,
                     );
-                    if balance < amount2.xrp().drops() + reserve as i64 {
-                        return Ter::TEC_UNFUNDED_ADD;
+                    let required = amount2.xrp().drops().saturating_add(reserve as i64);
+                    if balance < required {
+                        return Ter::TEC_UNFUNDED_AMM;
                     }
                 }
             }
@@ -2841,8 +2842,9 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     let reserve = view.fees().account_reserve(
                         acct_sle.get_field_u32(sf("sfOwnerCount")) as usize + 1,
                     );
-                    if balance < amount1.xrp().drops() + reserve as i64 {
-                        return Ter::TEC_UNFUNDED_ADD;
+                    let required = amount1.xrp().drops().saturating_add(reserve as i64);
+                    if balance < required {
+                        return Ter::TEC_UNFUNDED_AMM;
                     }
                 }
             }
@@ -4961,19 +4963,24 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             obj.set_field_amount(sf("sfLPTokenBalance"), math.new_lp_token_balance.clone());
             let _ = view.update(Arc::new(STLedgerEntry::from_stobject(obj, *amm_sle.key())));
 
-            // Delete AMM if LP balance reaches zero after full clawback
-            // delete the AMM (same as AMMWithdraw full withdrawal)
+            // Delete AMM if LP balance reaches zero after full clawback.
+            // Matches AMMWithdraw's deleteAMMAccountIfEmpty: clean up owner
+            // directory entries, remove the AMM SLE, and erase the AMM account.
             if math.new_lp_token_balance.signum() == 0 {
-                let _ = delete_empty_amm_owner_entries(view, &amm_account);
+                let cleanup = delete_empty_amm_owner_entries(view, &amm_account);
+                if cleanup != Ter::TES_SUCCESS && cleanup != Ter::TEC_INCOMPLETE {
+                    tracing::debug!(target: "transactor", "AMM owner cleanup returned {:?}", cleanup);
+                }
+                // Erase the AMM SLE
+                let amm_keylet2 = protocol::keylet::amm(asset1, asset2);
+                if let Ok(Some(amm_sle2)) = view.peek(amm_keylet2) {
+                    let _ = view.erase(amm_sle2);
+                }
+                // Erase the AMM account root
                 let account_keylet =
                     protocol::account_keylet(Uint160::from_void(amm_account.data()));
                 if let Ok(Some(amm_root)) = view.peek(account_keylet) {
                     let _ = view.erase(amm_root);
-                }
-                // Re-peek the AMM SLE (it was updated above) and erase it
-                let amm_keylet2 = protocol::keylet::amm(asset1, asset2);
-                if let Ok(Some(amm_sle2)) = view.peek(amm_keylet2) {
-                    let _ = view.erase(amm_sle2);
                 }
             }
 

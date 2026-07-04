@@ -2611,7 +2611,9 @@ pub(crate) fn submit_sttx<Env, Runtime: RpcRuntime>(
     // In standalone mode, submit immediately closes the ledger
     // so that subsequent RPC calls (account_info, etc.) see the state changes.
     if ctx.runtime.standalone() {
-        let _ = ctx.runtime.ledger_accept();
+        if !ctx.runtime.ledger_accept().is_ok() {
+            tracing::warn!(target: "rpc", "standalone ledger_accept after submit failed");
+        }
     }
 
     build_submit_result(&transaction, tx_blob_hex)

@@ -367,9 +367,10 @@ pub fn transfer_xrp<V: ApplyView>(
             return Ter::TER_NO_ACCOUNT;
         };
         let from_balance = from_sle.get_field_amount(sf("sfBalance")).xrp().drops();
-        // Prevent going negative (insufficient funds)
+        // Safety guard: prevent negative balance. Upstream callers should
+        // validate balances before reaching this point.
         if from_balance < amount.drops() {
-            return Ter::TEC_UNFUNDED;
+            return Ter::TEC_FAILED_PROCESSING;
         }
         let mut from_obj = from_sle.clone_as_object();
         from_obj.set_field_amount(
