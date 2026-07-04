@@ -160,8 +160,8 @@ pub fn load_snapshot(
         "Snapshot load complete, integrity verified"
     );
 
-    // TODO: Verify SHAMap root hash matches manifest.account_hash
-    // Requires the SHAMap crate; chunk-level SHA-256 already catches corruption.
+    // Future enhancement: verify SHAMap root hash matches manifest.account_hash
+    // for additional integrity assurance beyond chunk-level SHA-256 verification.
 
     Ok(manifest)
 }
