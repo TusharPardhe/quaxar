@@ -4214,6 +4214,42 @@ impl<D> BoundServerRuntime<D> {
                 }
                 }
 
+                // Create SharedInboundLedgers for the consensus driver.
+                let shared_inbound_registry: app::ledger::shared_inbound_ledgers::AcqRegistry =
+                    Arc::new(Mutex::new(HashMap::new()));
+                let (shared_completed_tx, _shared_completed_rx) =
+                    std::sync::mpsc::channel::<Arc<ledger::Ledger>>();
+                let shared_inbound = Arc::new(
+                    app::ledger::shared_inbound_ledgers::SharedInboundLedgers::new(
+                        Arc::clone(&shared_inbound_registry),
+                        Arc::clone(&shared_tree_cache),
+                        Arc::clone(&shared_full_below),
+                        Arc::clone(&shared_fetch_pack),
+                        Arc::new(app::ledger::shared_inbound_ledgers::RunDataLimiter::new(
+                            catchup_profile.run_data_concurrency,
+                        )),
+                        Arc::new(basics::tagged_cache::KeyCache::new(
+                            "shared-acq-dedup",
+                            catchup_profile.write_dedup_size,
+                            time::Duration::seconds(30),
+                            basics::tagged_cache::MonotonicClock::default(),
+                        )),
+                        shared_completed_tx,
+                    ),
+                );
+                if let Some(ns) = app.node_store().as_ref() {
+                    shared_inbound.set_node_store(ns.clone());
+                }
+                if let Some(ort) = app.overlay_runtime() {
+                    shared_inbound.set_overlay_rt(ort);
+                }
+                if let Some(lm_rt) = app.ledger_master_runtime() {
+                    *lm_rt
+                        .shared_inbound_ledgers
+                        .lock()
+                        .expect("shared_inbound_ledgers lock") = Some(Arc::clone(&shared_inbound));
+                }
+
                 let mut last_diag_at = Instant::now()
                     .checked_sub(Duration::from_secs(15))
                     .unwrap_or_else(Instant::now);
@@ -4388,7 +4424,7 @@ impl<D> BoundServerRuntime<D> {
                 // wakes instantly when a validation arrives from the overlay.
                 // Buffer of 1: multiple arrivals between wakes collapse into
                 // one signal, which is fine — we drain the full queue each wake.
-                let (val_notify_tx, val_notify_rx) = std::sync::mpsc::sync_channel::<()>(1);
+                let (_val_notify_tx, val_notify_rx) = std::sync::mpsc::sync_channel::<()>(1);
                 // validation_notify is set by the bootstrap validation-processor thread.
                 // Don't override it here.
                 let _ = thread::Builder::new()
@@ -4494,11 +4530,21 @@ impl<D> BoundServerRuntime<D> {
                     if !overlay_channel_registered {
                         let direct_registry = Arc::clone(&acq_registry);
                         let dc = Arc::clone(&direct_router_counter);
+                        let shared_inbound_router = Arc::clone(&shared_inbound);
                         overlay_runtime.overlay().queued_inbound()
                             .set_ledger_data_router(Box::new(move |peer_id, message| {
                                 dc.fetch_add(1, Ordering::Relaxed);
                                 if let Some((hash, packet)) = parse_ledger_data_packet(&message) {
                                     let hash = *hash.as_uint256();
+                                    if shared_inbound_router.contains(&hash) {
+                                        if let Some((_, packet2)) = parse_ledger_data_packet(&message) {
+                                            shared_inbound_router.route_response(
+                                                &hash,
+                                                peer_id as u64,
+                                                packet2,
+                                            );
+                                        }
+                                    }
                                     route_ledger_data_to_acq(
                                         &direct_registry,
                                         &hash,

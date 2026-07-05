@@ -368,10 +368,7 @@ impl<A: RclValidationsAdapter> RclValidations<A> {
             return Some((curr.seq(), curr.id()));
         }
 
-        self.acquiring
-            .iter()
-            .max_by(|left, right| (left.1.len(), left.0.1).cmp(&(right.1.len(), right.0.1)))
-            .map(|(ledger, _)| *ledger)
+        None
     }
 
     pub fn get_preferred_with_min_seq(

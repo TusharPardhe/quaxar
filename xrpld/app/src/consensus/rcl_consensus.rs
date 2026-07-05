@@ -1752,14 +1752,6 @@ where
 
         let valid_ledger_index = self.ledgers.get_valid_ledger_index();
 
-        // During early bootstrap (no validated ledger yet), don't switch.
-        // The node must complete its first consensus round with proposers,
-        // emit a validation, and advance valid_ledger_index before the trie
-        // can reliably guide ledger switching.
-        if valid_ledger_index == 0 {
-            return *prev_ledger_id;
-        }
-
         let preferred = self.validations.get_preferred_with_min_seq(
             validated_ledger_from_ledger(ledger.as_ref(), &NullRclValidationJournal),
             valid_ledger_index,
@@ -1843,8 +1835,6 @@ where
             let seq = built.header().seq;
             if self.validating.load(Ordering::Acquire)
                 && !consensus_fail
-                && current_mode == ConsensusMode::Proposing
-                && result.proposers > 0  // don't validate solo rounds
                 && seq > self.last_validated_seq.load(Ordering::Acquire)
             {
                 self.last_validated_seq.store(seq, Ordering::Release);
