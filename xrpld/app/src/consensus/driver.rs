@@ -144,9 +144,18 @@ impl RclValidationAcceptanceSink for DriverCheckAcceptSink {
             }
         }
 
-        // Ledger not found or quorum not met — trigger acquisition if seq is valid.
         if seq != 0 && !hash.is_zero() {
-            self.shared_inbound.acquire(hash, seq);
+            if let Some(lm_rt) = self.app.ledger_master_runtime() {
+                if let Some(sil) = lm_rt.shared_inbound_ledgers.lock()
+                    .expect("shared_inbound_ledgers lock").as_ref()
+                {
+                    sil.acquire(hash, seq);
+                } else {
+                    self.shared_inbound.acquire(hash, seq);
+                }
+            } else {
+                self.shared_inbound.acquire(hash, seq);
+            }
         }
 
         // Notify overlay of the target validated sequence for tracking mode.

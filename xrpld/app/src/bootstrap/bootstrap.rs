@@ -969,26 +969,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 shared_completed_tx.clone(),
             ))
         });
-
-    if let Some(overlay_rt) = runtime.root().overlay_runtime() {
-        let router_inbound = Arc::clone(&shared_inbound);
-        overlay_rt.overlay().queued_inbound()
-            .set_ledger_data_router(Box::new(move |peer_id, message| {
-                let Some(hash) = Uint256::from_slice(&message.ledger_hash) else { return; };
-                if !router_inbound.contains(&hash) { return; }
-                let packet_type = match message.r#type {
-                    0 => ledger::InboundLedgerDataType::Base,
-                    1 => ledger::InboundLedgerDataType::TransactionNode,
-                    2 => ledger::InboundLedgerDataType::StateNode,
-                    _ => return,
-                };
-                let nodes = message.nodes.iter()
-                    .map(|n| ledger::InboundLedgerNodeData::new(n.nodeid.clone(), n.nodedata.clone()))
-                    .collect();
-                let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
-                router_inbound.route_response(&hash, peer_id as u64, packet);
-            }));
-    }
+    
 
     let event_loop_app = runtime.root().clone();
     let event_loop_stop = Arc::clone(&stop);
