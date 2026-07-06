@@ -918,24 +918,11 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         .consensus_runtime()
         .and_then(|cr| cr.take_map_complete_receiver());
 
-    // For genesis networks, start consensus immediately without waiting for peers.
     let is_genesis = !runtime.root().need_network_ledger();
     let mut consensus_started = is_genesis;
     if is_genesis {
-        if let (Some(consensus_rt), Some(network_ops_rt)) = (
-            runtime.root().consensus_runtime(),
-            runtime.root().network_ops_runtime(),
-        ) {
-            if let Some(lm_rt) = runtime.root().ledger_master_runtime() {
-                if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
-                    network_ops_rt.maybe_begin_consensus_from_validated(
-                        consensus_rt.as_ref(),
-                        Arc::clone(&closed),
-                    );
-                    tracing::info!(target: "consensus", "Genesis bootstrap: consensus started immediately");
-                }
-            }
-        }
+        tracing::info!(target: "consensus", "Genesis mode: consensus will start when peers connect");
+    
     }
 
     // State for consensus ledger acquisition with targeted peer requests.

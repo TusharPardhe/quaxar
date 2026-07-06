@@ -406,6 +406,15 @@ fn tick_timer(app: &ApplicationRoot) {
         return;
     }
 
+    if let Some(lm_rt) = app.ledger_master_runtime() {
+        if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
+            network_ops_rt.maybe_begin_consensus_from_validated(
+                consensus_rt.as_ref(),
+                std::sync::Arc::clone(&closed),
+            );
+        }
+    }
+
     network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
 }
 
