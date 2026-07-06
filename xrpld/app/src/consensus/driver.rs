@@ -129,6 +129,8 @@ impl RclValidationAcceptanceSink for DriverCheckAcceptSink {
                         .insert(Arc::clone(&promoted), true);
                     lm.mark_ledger_complete(promoted.header().seq);
                     lm.set_valid_ledger_no_sweep(Arc::clone(&promoted), None, None);
+                    self.app.note_validated_ledger_for_sync(Arc::clone(&promoted));
+                    self.app.set_need_network_ledger(false);
                     if lm.published_ledger().is_none() {
                         lm.set_pub_ledger(Arc::clone(&promoted));
                     }
@@ -407,10 +409,7 @@ fn tick_timer(app: &ApplicationRoot) {
         })
         .unwrap_or(0);
 
-    let min_peers = {
-        let unl_size = app.validators().count();
-        if unl_size <= 1 { 1 } else { (unl_size - 1) / 2 }
-    };
+    let min_peers = 1usize;
     if peer_count < min_peers {
         return;
     }
