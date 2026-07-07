@@ -1513,7 +1513,7 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
         // dispatch pump needed here.
         let mut job_slot = Some(job);
         if !self.job_queue.add_job(
-            crate::job::job_types::JobType::Accept,
+            crate::job::job_types::JobType::JtAccept,
             "AcceptLedger",
             move || {
                 if let Some(job) = job_slot.take() {
@@ -1538,7 +1538,7 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
 
         if !self
             .job_queue
-            .add_job(crate::job::job_types::JobType::Accept, name, move || {
+            .add_job(crate::job::job_types::JobType::JtAccept, name, move || {
                 let _ = root.accept_ledger(closed_seq, close_time, base_fee_drops);
             })
         {
@@ -1555,7 +1555,7 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
 
         if !self
             .job_queue
-            .add_job(crate::job::job_types::JobType::Accept, name, move || {
+            .add_job(crate::job::job_types::JobType::JtAccept, name, move || {
                 root.on_consensus_built_ledger(Arc::clone(&ledger));
             })
         {
@@ -2727,7 +2727,7 @@ impl ApplicationRoot {
             runtime.submit_transaction(transaction, move |queued_transaction| {
                 let runtime = Arc::clone(&queued_runtime);
                 job_queue.add_job(
-                    crate::job::job_types::JobType::Transaction,
+                    crate::job::job_types::JobType::JtTransaction,
                     "SubmitTxn",
                     move || {
                         let mut transaction = Arc::clone(&queued_transaction);

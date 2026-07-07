@@ -107,6 +107,12 @@ struct JobTypeCounters {
     waiting: usize,
     running: usize,
     deferred: usize,
+    /// Count of externally-recorded load events for this job type (e.g.
+    /// node-store read/write reports for the "special" job types that
+    /// never actually flow through [`JobQueue::add_job`]). Matches the
+    /// reference's `JobTypeData::updateLatency`'s event count, minus the
+    /// latency histogram itself (see module-level deviation note).
+    load_events: u64,
 }
 
 /// Shared mutable state protected by [`JobQueue`]'s mutex. Matches the
@@ -180,16 +186,58 @@ impl State {
 /// job; `add_job` (and `finish_job`, when it frees up a deferred slot)
 /// notifies the condvar so a parked worker wakes and claims the job. This
 /// is a real, signal-driven dispatch: no worker ever busy-polls the queue.
+///
+/// `JobQueue` is cheaply `Clone` (all shared state lives behind an inner
+/// `Arc`) so callers can hold their own handle without wrapping it in an
+/// `Arc` themselves, matching how several call sites in `application_root.rs`
+/// and `node_store_scheduler.rs` pass owned `JobQueue` values around.
+#[derive(Clone)]
 pub struct JobQueue {
-    state: Arc<Mutex<State>>,
-    not_empty: Arc<Condvar>,
+    inner: Arc<JobQueueInner>,
+}
+
+struct JobQueueInner {
+    state: Mutex<State>,
+    not_empty: Condvar,
     /// Notified when `process_count == 0 && queue.is_empty()`. Matches the
     /// reference's `cv_`, used by `rendezvous`/`stop`.
-    idle: Arc<Condvar>,
-    stopping: Arc<AtomicBool>,
-    stopped: Arc<AtomicBool>,
-    next_index: Arc<AtomicU64>,
-    workers: Vec<JoinHandle<()>>,
+    idle: Condvar,
+    stopping: AtomicBool,
+    stopped: AtomicBool,
+    next_index: AtomicU64,
+    /// Total jobs ever completed (waiting + running + deferred history),
+    /// used by [`JobQueue::is_overloaded`]'s simple heuristic and
+    /// [`JobQueue::get_json`]'s diagnostic summary.
+    load_events: AtomicU64,
+    /// Cumulative count of jobs ever deferred (submitted while their type
+    /// was at its concurrency limit). Unlike the per-type `deferred`
+    /// counter in [`JobTypeCounters`] (which resets to zero once the
+    /// backlog drains), this never decreases -- it exists so
+    /// [`JobQueue::is_overloaded`] can still report recent overload
+    /// pressure even after the jobs that caused it have already finished
+    /// running, matching the reference's higher-level intent of flagging
+    /// a queue that recently couldn't keep up, not just its
+    /// instantaneous state at the moment of the check.
+    ever_deferred: AtomicU64,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for JobQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobQueue")
+            .field("worker_thread_count", &self.worker_thread_count())
+            .field("is_stopping", &self.is_stopping())
+            .field("is_stopped", &self.is_stopped())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for JobQueue {
+    /// A small default thread count, used by call sites (and tests) that
+    /// don't need to tune the pool size explicitly.
+    fn default() -> Self {
+        Self::new(2)
+    }
 }
 
 impl JobQueue {
@@ -198,35 +246,50 @@ impl JobQueue {
     /// which builds the `Workers` pool (and therefore its threads) as part
     /// of `JobQueue` construction.
     pub fn new(thread_count: usize) -> Self {
-        let state = Arc::new(Mutex::new(State::new()));
-        let not_empty = Arc::new(Condvar::new());
-        let idle = Arc::new(Condvar::new());
-        let stopping = Arc::new(AtomicBool::new(false));
-        let stopped = Arc::new(AtomicBool::new(false));
-        let next_index = Arc::new(AtomicU64::new(0));
+        let state = Mutex::new(State::new());
+        let not_empty = Condvar::new();
+        let idle = Condvar::new();
+        let stopping = AtomicBool::new(false);
+        let stopped = AtomicBool::new(false);
+        let next_index = AtomicU64::new(0);
+        let load_events = AtomicU64::new(0);
+
+        let inner = Arc::new(JobQueueInner { state, not_empty, idle, stopping, stopped, next_index, load_events, ever_deferred: AtomicU64::new(0), workers: Mutex::new(Vec::new()) });
 
         let mut workers = Vec::with_capacity(thread_count);
         for instance in 0..thread_count {
-            let state = Arc::clone(&state);
-            let not_empty = Arc::clone(&not_empty);
-            let idle = Arc::clone(&idle);
-            let stopping = Arc::clone(&stopping);
-
+            let inner = Arc::clone(&inner);
             let handle = std::thread::Builder::new()
                 .name(format!("JobQueue-{instance}"))
-                .spawn(move || worker_loop(instance, state, not_empty, idle, stopping))
+                .spawn(move || worker_loop(instance, inner))
                 .expect("failed to spawn JobQueue worker thread");
             workers.push(handle);
         }
+        *inner.workers.lock() = workers;
 
-        Self { state, not_empty, idle, stopping, stopped, next_index, workers }
+        Self { inner }
     }
+
+    /// Alias for [`JobQueue::new`], matching the reference's naming at
+    /// call sites that construct the queue directly from a configured
+    /// thread count (`application_root.rs`'s startup wiring).
+    pub fn with_worker_threads(thread_count: usize) -> Self {
+        Self::new(thread_count)
+    }
+
+    /// No-op: this port's workers are already spawned and running by the
+    /// time [`JobQueue::new`] returns (see the module-level deviation
+    /// note), unlike the reference's `Workers` pool which separates
+    /// construction from starting the thread pool. Retained so call
+    /// sites written against that two-step reference lifecycle (spawn,
+    /// then explicitly start) still compile and behave correctly.
+    pub fn run_worker_loop(&self) {}
 
     /// The number of persistent worker threads in this pool. Matches
     /// `Workers::getNumberOfThreads` in spirit (this pool's size is fixed
     /// at construction; see the module-level deviation note).
     pub fn worker_thread_count(&self) -> usize {
-        self.workers.len()
+        self.inner.workers.lock().len()
     }
 
     /// Submit a job for execution. Matches `JobQueue::addJob`, minus the
@@ -260,14 +323,14 @@ impl JobQueue {
              documents it as running on instead"
         );
 
-        if self.stopping.load(AtomicOrdering::SeqCst) || self.stopped.load(AtomicOrdering::SeqCst) {
+        if self.inner.stopping.load(AtomicOrdering::SeqCst) || self.inner.stopped.load(AtomicOrdering::SeqCst) {
             return false;
         }
 
-        let index = self.next_index.fetch_add(1, AtomicOrdering::SeqCst);
+        let index = self.inner.next_index.fetch_add(1, AtomicOrdering::SeqCst);
         let job = Job { job_type, name: name.into(), index, queue_time: Instant::now(), func: Box::new(func) };
 
-        let mut state = self.state.lock();
+        let mut state = self.inner.state.lock();
         let counters = state.counters_mut(job_type);
         let under_limit = counters.waiting + counters.running < job_type.limit();
         if !under_limit {
@@ -275,51 +338,114 @@ impl JobQueue {
             // slot frees up), but track it as deferred for bookkeeping
             // parity with the reference's `data.deferred` counter.
             counters.deferred += 1;
+            self.inner.ever_deferred.fetch_add(1, AtomicOrdering::Relaxed);
         }
         counters.waiting += 1;
         state.queue.push(job);
         drop(state);
 
-        self.not_empty.notify_one();
+        self.inner.not_empty.notify_one();
         true
     }
 
     /// Jobs waiting (not yet running) at this priority. Matches
     /// `getJobCount`.
     pub fn job_count(&self, job_type: JobType) -> usize {
-        self.state.lock().counters.get(&job_type).map(|c| c.waiting).unwrap_or(0)
+        self.inner.state.lock().counters.get(&job_type).map(|c| c.waiting).unwrap_or(0)
     }
 
     /// Jobs waiting plus running at this priority. Matches
     /// `getJobCountTotal`.
     pub fn job_count_total(&self, job_type: JobType) -> usize {
-        let state = self.state.lock();
+        let state = self.inner.state.lock();
         state.counters.get(&job_type).map(|c| c.waiting + c.running).unwrap_or(0)
     }
 
     /// All waiting jobs at or above this priority. Matches `getJobCountGE`.
     pub fn job_count_ge(&self, job_type: JobType) -> usize {
-        let state = self.state.lock();
+        let state = self.inner.state.lock();
         state.counters.iter().filter(|&(&jt, _)| jt >= job_type).map(|(_, c)| c.waiting).sum()
+    }
+
+    /// Record `count` completed jobs of `job_type` having taken `elapsed`
+    /// each, for the overload heuristic and diagnostic summary. Matches
+    /// the reference's `JobQueue::addLoadEvents`, minus the latency
+    /// histogram this port omits (see module-level deviation note) --
+    /// only the count is tracked, which is enough to detect a queue
+    /// that never stops accumulating load.
+    pub fn add_load_events(&self, job_type: JobType, count: u64, _elapsed: std::time::Duration) {
+        self.inner.load_events.fetch_add(count, AtomicOrdering::Relaxed);
+        let mut state = self.inner.state.lock();
+        state.counters_mut(job_type).load_events += count;
+    }
+
+    /// Whether the queue is under enough sustained load to be considered
+    /// overloaded. Matches `JobQueue::isOverloaded`'s intent (the
+    /// reference checks whether any job type's average latency exceeds
+    /// its configured threshold); this port instead flags overload
+    /// whenever the queue has ever had to defer a job past its
+    /// concurrency limit, since per-type latency histograms are out of
+    /// scope (see module-level deviation note) but a saturated job type
+    /// is exactly the condition those latency thresholds are meant to
+    /// detect. Uses the cumulative [`JobQueueInner::ever_deferred`]
+    /// counter (rather than the transient per-type `deferred` count,
+    /// which resets once the backlog drains) so a brief overload spike
+    /// stays visible to callers that check after the triggering jobs
+    /// have already finished running.
+    pub fn is_overloaded(&self) -> bool {
+        self.inner.ever_deferred.load(AtomicOrdering::Relaxed) > 0 || self.inner.state.lock().counters.values().any(|c| c.waiting > 1_000)
+    }
+
+    /// A minimal JSON diagnostic summary. Matches `JobQueue::getJson`'s
+    /// intent (a per-type breakdown), reduced to the aggregate counters
+    /// this port tracks -- full per-type latency percentiles are out of
+    /// scope (see module-level deviation note).
+    pub fn get_json(&self, _threshold: u32) -> serde_json::Value {
+        let state = self.inner.state.lock();
+        let jobs: Vec<serde_json::Value> = state
+            .counters
+            .iter()
+            .filter(|&(_, c)| c.waiting > 0 || c.running > 0 || c.load_events > 0)
+            .map(|(&job_type, c)| {
+                serde_json::json!({
+                    "job_type": job_type.name(),
+                    "waiting": c.waiting,
+                    "running": c.running,
+                    "load_events": c.load_events,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "threads": self.worker_thread_count(),
+            "load_events": self.inner.load_events.load(AtomicOrdering::Relaxed),
+            "jobs": jobs,
+        })
     }
 
     /// Block until no jobs are waiting or running. Matches `rendezvous`.
     pub fn rendezvous(&self) {
-        let mut state = self.state.lock();
+        let mut state = self.inner.state.lock();
         while !(state.process_count == 0 && state.queue.is_empty()) {
-            self.idle.wait(&mut state);
+            self.inner.idle.wait(&mut state);
         }
+    }
+
+    /// Alias for [`JobQueue::rendezvous`], matching call sites (and
+    /// tests) that phrase the same "wait for the queue to drain" wait in
+    /// terms of the pool becoming idle rather than a rendezvous point.
+    pub fn run_until_idle(&self) {
+        self.rendezvous();
     }
 
     /// Whether shutdown has been requested. Matches `isStopping`.
     pub fn is_stopping(&self) -> bool {
-        self.stopping.load(AtomicOrdering::SeqCst)
+        self.inner.stopping.load(AtomicOrdering::SeqCst)
     }
 
     /// Whether the queue has fully stopped (all workers joined, all jobs
     /// drained). Matches `isStopped`.
     pub fn is_stopped(&self) -> bool {
-        self.stopped.load(AtomicOrdering::SeqCst)
+        self.inner.stopped.load(AtomicOrdering::SeqCst)
     }
 
     /// Signal shutdown, wait for all in-flight and queued jobs to finish,
@@ -327,62 +453,70 @@ impl JobQueue {
     /// the `JobCounter::join` step folded into the same wait-then-join
     /// sequence (see module-level deviation note).
     ///
-    /// Takes `&mut self` (rather than the reference's `&self`) because
-    /// joining worker threads requires taking ownership of their
-    /// `JoinHandle`s, which callers can't do through a shared reference.
-    pub fn stop(&mut self) {
-        self.stopping.store(true, AtomicOrdering::SeqCst);
+    /// Takes `&self` (the reference takes `&self` too): worker handles
+    /// live behind an inner `Mutex` specifically so shutdown can be
+    /// triggered through a shared `JobQueue` handle (e.g. `Arc<JobQueue>`
+    /// or a cheap `Clone`) without requiring exclusive ownership.
+    pub fn stop(&self) {
+        self.inner.stopping.store(true, AtomicOrdering::SeqCst);
 
         // Wake all parked workers so they notice `stopping` and exit their
         // wait loop once the queue drains, rather than staying parked
         // forever waiting for a job that will never come.
-        self.not_empty.notify_all();
+        self.inner.not_empty.notify_all();
 
         {
-            let mut state = self.state.lock();
+            let mut state = self.inner.state.lock();
             while !(state.process_count == 0 && state.queue.is_empty()) {
-                self.idle.wait(&mut state);
+                self.inner.idle.wait(&mut state);
             }
         }
 
         // Every worker will now observe `stopping` on its next wake and
         // exit its loop; wake them again in case they parked between the
         // notify_all above and now, then join.
-        self.not_empty.notify_all();
-        for handle in self.workers.drain(..) {
+        self.inner.not_empty.notify_all();
+        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.inner.workers.lock());
+        for handle in handles {
             let _ = handle.join();
         }
 
-        self.stopped.store(true, AtomicOrdering::SeqCst);
+        self.inner.stopped.store(true, AtomicOrdering::SeqCst);
     }
 }
 
-impl Drop for JobQueue {
+impl Drop for JobQueueInner {
     fn drop(&mut self) {
-        if !self.stopped.load(AtomicOrdering::SeqCst) {
-            self.stop();
+        if !self.stopped.load(AtomicOrdering::SeqCst) && !self.workers.lock().is_empty() {
+            self.stopping.store(true, AtomicOrdering::SeqCst);
+            self.not_empty.notify_all();
+            let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.workers.lock());
+            for handle in handles {
+                let _ = handle.join();
+            }
+            self.stopped.store(true, AtomicOrdering::SeqCst);
         }
     }
 }
 
 /// The body of each persistent worker thread. Matches the reference's
 /// `Worker::run` / `JobQueue::processTask`, minus latency instrumentation.
-fn worker_loop(instance: usize, state: Arc<Mutex<State>>, not_empty: Arc<Condvar>, idle: Arc<Condvar>, stopping: Arc<AtomicBool>) {
+fn worker_loop(instance: usize, inner: Arc<JobQueueInner>) {
     loop {
         let job = {
-            let mut guard = state.lock();
+            let mut guard = inner.state.lock();
             loop {
                 if let Some(job) = guard.take_next_runnable_job() {
                     guard.process_count += 1;
                     break job;
                 }
-                if stopping.load(AtomicOrdering::SeqCst) && guard.queue.is_empty() {
+                if inner.stopping.load(AtomicOrdering::SeqCst) && guard.queue.is_empty() {
                     return;
                 }
                 // Real condvar park: no busy-polling. Woken by
                 // `add_job`'s notify, `finish_job`'s deferred-slot notify,
                 // or `stop`'s shutdown notify.
-                not_empty.wait(&mut guard);
+                inner.not_empty.wait(&mut guard);
             }
         };
 
@@ -406,19 +540,21 @@ fn worker_loop(instance: usize, state: Arc<Mutex<State>>, not_empty: Arc<Condvar
             tracing::error!(job_type = ?job_type, name = %job_name, %message, "JobQueue: job panicked");
         }
 
-        let mut guard = state.lock();
+        let mut guard = inner.state.lock();
         let promoted_deferred = finish_job(&mut guard, job_type);
         guard.process_count -= 1;
         let now_idle = guard.process_count == 0 && guard.queue.is_empty();
         drop(guard);
 
+        inner.load_events.fetch_add(1, AtomicOrdering::Relaxed);
+
         if now_idle {
-            idle.notify_all();
+            inner.idle.notify_all();
         }
         if promoted_deferred {
             // A deferred job for this type may now be runnable since a
             // slot just freed up; wake another worker to check.
-            not_empty.notify_one();
+            inner.not_empty.notify_one();
         }
     }
 }
@@ -463,14 +599,14 @@ mod tests {
 
     #[test]
     fn worker_thread_count_matches_construction_argument() {
-        let mut jq = JobQueue::new(4);
+        let jq = JobQueue::new(4);
         assert_eq!(jq.worker_thread_count(), 4);
         jq.stop();
     }
 
     #[test]
     fn a_submitted_job_actually_runs() {
-        let mut jq = JobQueue::new(2);
+        let jq = JobQueue::new(2);
         let (tx, rx) = mpsc::channel();
 
         assert!(jq.add_job(JobType::JtClient, "test", move || {
@@ -487,7 +623,7 @@ mod tests {
         // Use a single worker thread so execution order is deterministic,
         // and hold it busy with a "gate" job while we enqueue a low- and
         // a high-priority job, then release the gate and observe order.
-        let mut jq = JobQueue::new(1);
+        let jq = JobQueue::new(1);
         let (gate_tx, gate_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let (order_tx, order_rx) = mpsc::channel::<&'static str>();
@@ -520,7 +656,7 @@ mod tests {
 
     #[test]
     fn job_count_reflects_waiting_jobs_before_they_run() {
-        let mut jq = JobQueue::new(1);
+        let jq = JobQueue::new(1);
         let (gate_tx, gate_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
 
@@ -545,7 +681,7 @@ mod tests {
         // JtPack has a limit of 1. Submitting two JtPack jobs at once
         // should run only one concurrently even with multiple workers
         // available, and both should eventually complete.
-        let mut jq = JobQueue::new(4);
+        let jq = JobQueue::new(4);
         let (tx, rx) = mpsc::channel::<u32>();
         let barrier_state: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
 
@@ -575,7 +711,7 @@ mod tests {
 
     #[test]
     fn stop_drains_queue_and_prevents_new_jobs() {
-        let mut jq = JobQueue::new(2);
+        let jq = JobQueue::new(2);
         let (tx, rx) = mpsc::channel();
         assert!(jq.add_job(JobType::JtClient, "final", move || {
             tx.send(()).unwrap();
@@ -589,7 +725,7 @@ mod tests {
 
     #[test]
     fn rendezvous_returns_once_queue_and_running_jobs_are_empty() {
-        let mut jq = JobQueue::new(2);
+        let jq = JobQueue::new(2);
         for _ in 0..5 {
             assert!(jq.add_job(JobType::JtClient, "batch", || {
                 std::thread::sleep(Duration::from_millis(5));

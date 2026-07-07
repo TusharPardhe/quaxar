@@ -330,6 +330,7 @@ mod tests {
     use crate::job::job_queue::JobQueue;
     use crate::job::job_types::JobType;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -399,9 +400,17 @@ mod tests {
 
     #[test]
     fn load_manager_adjusts_fee_on_stop_using_queue_overload_state() {
-        let queue = JobQueue::new();
-        assert!(queue.add_job(JobType::Pack, "first", || {}));
-        assert!(queue.add_job(JobType::Pack, "second", || {}));
+        let queue = JobQueue::default();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        assert!(queue.add_job(JobType::JtPack, "first", move || {
+            gate_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        gate_rx.recv_timeout(Duration::from_secs(5)).expect("first JtPack job should start");
+        assert!(queue.add_job(JobType::JtPack, "second", || {}));
+        assert!(queue.is_overloaded(), "queue must be overloaded: JtPack's limit of 1 is already held by the still-running first job");
+        release_tx.send(()).unwrap();
 
         let fees = Arc::new(RecordingFees::default());
         let events = Arc::new(RecordingEvents::default());
