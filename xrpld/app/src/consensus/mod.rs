@@ -1,6 +1,8 @@
 pub mod censorship_detector;
 pub mod consensus_trans_set_sf;
+pub mod driver;
 pub mod fetch_pack;
-pub mod rcl_cx;
+pub mod rcl_consensus;
 pub mod rcl_cx_peer_pos;
-pub mod rcl_cx_tx;
+pub mod rcl_validation;
+pub mod rcl_validations;
