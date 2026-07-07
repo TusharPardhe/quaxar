@@ -456,15 +456,39 @@ pub fn should_log_build_details() -> bool {
 pub fn decode_acquired_tx_set(
     tx_items: &[(Vec<u8>, basics::base_uint::Uint256)],
     salt: basics::base_uint::Uint256,
+    node_type: shamap::tree_node::SHAMapNodeType,
 ) -> Vec<Arc<STTx>> {
     use protocol::SerialIter;
+    use shamap::tree_node::SHAMapNodeType;
 
     let mut txns = CanonicalTXSet::new(salt);
     for (tx_data, _tx_id) in tx_items {
-        let mut outer = SerialIter::new(tx_data);
-        let tx_bytes = outer.get_vl();
-        let mut sit = SerialIter::new(&tx_bytes);
-        txns.insert(Arc::new(STTx::from_serial_iter(&mut sit)));
+        // Matches reference TransactionMaster::fetchFromSHAMapItem exactly:
+        // TransactionNm leaves (plain consensus TxSet) store the serialized
+        // STTx directly with no outer VL-length wrapper. TransactionMd leaves
+        // (a validated ledger's tx map, tx+metadata pairs) wrap the tx blob
+        // in an outer VL-length field followed by the metadata blob.
+        let sttx = match node_type {
+            SHAMapNodeType::TransactionMd => {
+                let mut outer = SerialIter::new(tx_data);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let tx_bytes = outer.get_vl();
+                    let mut sit = SerialIter::new(&tx_bytes);
+                    STTx::from_serial_iter(&mut sit)
+                }));
+                result.ok()
+            }
+            _ => {
+                let mut sit = SerialIter::new(tx_data);
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    STTx::from_serial_iter(&mut sit)
+                }))
+                .ok()
+            }
+        };
+        if let Some(sttx) = sttx {
+            txns.insert(Arc::new(sttx));
+        }
     }
     txns.drain_ordered()
 }
@@ -530,7 +554,12 @@ pub fn build_ledger_from_acquired_tx(
     built.set_ledger_info(header);
 
     // Apply transactions from the acquired TX map in the reference CanonicalTXSet order.
-    let ordered_txs = decode_acquired_tx_set(tx_items, *acquired_header.tx_hash.as_uint256());
+    // The acquired ledger's tx_map stores TransactionMd (tx + metadata) leaves.
+    let ordered_txs = decode_acquired_tx_set(
+        tx_items,
+        *acquired_header.tx_hash.as_uint256(),
+        shamap::tree_node::SHAMapNodeType::TransactionMd,
+    );
     let tx_count = ordered_txs.len();
 
     // Parallel signature pre-validation: reject bad sigs early using rayon
@@ -940,7 +969,12 @@ pub fn build_ledger_from_consensus(
     // Apply transactions using OpenView accumulator (reference buildLedgerImpl parity)
     let mut accum = OpenView::new_closed(Arc::new(built.clone()));
 
-    let ordered_txs = decode_acquired_tx_set(tx_items, *header.tx_hash.as_uint256());
+    // The consensus TxSet stores plain TransactionNm leaves (no metadata yet).
+    let ordered_txs = decode_acquired_tx_set(
+        tx_items,
+        *header.tx_hash.as_uint256(),
+        shamap::tree_node::SHAMapNodeType::TransactionNm,
+    );
 
     // Parallel signature pre-validation: reject bad sigs early using rayon
     let bad_sigs = parallel_sig_precheck(&ordered_txs, built.rules());

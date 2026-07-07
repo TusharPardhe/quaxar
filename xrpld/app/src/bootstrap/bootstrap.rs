@@ -843,6 +843,25 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
     // and timer ticks. It does NOT do ledger acquisition or inbound ledger
     // processing — those are unnecessary when starting fresh.
     let consensus_stop = Arc::new(AtomicBool::new(false));
+
+    // Spawn JobQueue worker threads (matches rippled's JobQueue thread pool).
+    // Without these, jobs added via add_job() (e.g. RPC-submitted transactions
+    // routed through submit_transaction_to_network_ops) sit in the queue
+    // forever and never reach process_transaction, so they never enter the
+    // open ledger's transaction set or get included in consensus.
+    {
+        let jq_template = runtime.root().job_queue();
+        let worker_count = jq_template.worker_thread_count().max(1);
+        for i in 0..worker_count {
+            let jq = jq_template.clone();
+            std::thread::Builder::new()
+                .name(format!("jobqueue-worker-{i}"))
+                .spawn(move || {
+                    jq.run_worker_loop();
+                })
+                .expect("failed to spawn jobqueue worker thread");
+        }
+    }
     let consensus_thread = if matches!(
         bootstrap.report.startup_ledger_mode,
         StartUpType::Fresh | StartUpType::Network

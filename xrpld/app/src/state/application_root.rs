@@ -334,6 +334,15 @@ pub trait LedgerAcceptor: Send + Sync + 'static {
     /// Accept a ledger built by the consensus engine.
     fn consensus_built(&self, ledger: Arc<Ledger>) -> Result<(), String>;
 
+    /// Dispatch the heavy consensus-accept work (do_accept + end_consensus)
+    /// to run off the consensus timer thread, matching rippled's
+    /// `app_.getJobQueue().addJob(JtAccept, "AcceptLedger", ...)` in
+    /// RCLConsensus::Adaptor::onAccept. Default runs synchronously so
+    /// callers without a JobQueue (e.g. tests) still work correctly.
+    fn spawn_consensus_accept_job(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        job();
+    }
+
     /// Return the owner-tracked closed ledger for consensus handoff.
     fn consensus_closed_ledger(&self) -> Option<Arc<Ledger>> {
         None
@@ -682,6 +691,11 @@ impl QueueApplyExecutionRuntime<AppTxQTransaction, AppTxQJournalTag, AppTxQParen
         let applied = is_tes_success(ter) || is_tec_claim(ter);
         if applied {
             self.view.push_transaction(Arc::clone(&self.tx));
+            tracing::debug!(
+                target: "rpc",
+                ter = ?ter,
+                "direct_apply: pushed transaction into open ledger view"
+            );
             // Track the account's next expected sequence
             let account = self.tx.get_account_id(get_field_by_symbol("sfAccount"));
             let tx_seq = self.tx.get_seq_proxy().value();
@@ -1488,6 +1502,31 @@ impl
 }
 
 impl LedgerAcceptor for ConsensusLedgerAcceptor {
+    fn spawn_consensus_accept_job(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        // Matches rippled's app_.getJobQueue().addJob(JtAccept, "AcceptLedger", ...)
+        // in RCLConsensus::Adaptor::onAccept: run the heavy do_accept +
+        // end_consensus work on a JobQueue worker thread, off the consensus
+        // timer thread, so peer proposal draining stays responsive under
+        // load. The JobQueue's persistent worker-thread pool (spawned at
+        // startup via run_worker_loop, matching reference JobQueue's
+        // permanent worker threads) services this automatically — no manual
+        // dispatch pump needed here.
+        let mut job_slot = Some(job);
+        if !self.job_queue.add_job(
+            crate::job::job_types::JobType::Accept,
+            "AcceptLedger",
+            move || {
+                if let Some(job) = job_slot.take() {
+                    job();
+                }
+            },
+        ) {
+            // JobQueue is stopping (shutdown in progress) — run inline as a
+            // last resort so consensus state isn't silently dropped.
+            tracing::warn!(target: "consensus", "accept job queue is stopping; running on_accept inline");
+        }
+    }
+
     fn accept_ledger(
         &self,
         closed_seq: u32,
@@ -1495,45 +1534,33 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
         base_fee_drops: u64,
     ) -> Result<u32, String> {
         let root = self.root.clone();
-        let job_queue = Arc::clone(&self.job_queue);
         let name = format!("AcceptLedger#{closed_seq}");
 
-        if !job_queue.add_job(crate::job::job_types::JobType::Accept, name, move || {
-            let _ = root.accept_ledger(closed_seq, close_time, base_fee_drops);
-        }) {
+        if !self
+            .job_queue
+            .add_job(crate::job::job_types::JobType::Accept, name, move || {
+                let _ = root.accept_ledger(closed_seq, close_time, base_fee_drops);
+            })
+        {
             return Err("accept job queue is stopping".to_owned());
         }
-
-        let dispatch_queue = Arc::clone(&self.job_queue);
-        std::mem::drop(self.basic_app.spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = dispatch_queue.dispatch_next_job();
-            })
-            .await;
-        }));
 
         Ok(closed_seq.saturating_add(1))
     }
 
     fn consensus_built(&self, ledger: Arc<ledger::Ledger>) -> Result<(), String> {
         let root = self.root.clone();
-        let job_queue = Arc::clone(&self.job_queue);
         let seq = ledger.header().seq;
         let name = format!("ConsensusBuilt#{seq}");
 
-        if !job_queue.add_job(crate::job::job_types::JobType::Accept, name, move || {
-            root.on_consensus_built_ledger(Arc::clone(&ledger));
-        }) {
+        if !self
+            .job_queue
+            .add_job(crate::job::job_types::JobType::Accept, name, move || {
+                root.on_consensus_built_ledger(Arc::clone(&ledger));
+            })
+        {
             return Err("consensus_built job queue is stopping".to_owned());
         }
-
-        let dispatch_queue = Arc::clone(&self.job_queue);
-        std::mem::drop(self.basic_app.spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = dispatch_queue.dispatch_next_job();
-            })
-            .await;
-        }));
 
         Ok(())
     }
@@ -2831,6 +2858,13 @@ impl ApplicationRoot {
             .live_current_ledger_index()
             .unwrap_or_else(|| base_ledger.header().seq.saturating_add(1).max(1));
         let validated_ledger_index = self.validated_ledger_seq();
+        tracing::debug!(
+            target: "rpc",
+            base_seq = base_ledger.header().seq,
+            current_ledger_index,
+            pending_count = self.network_ops_pending_transaction_count(),
+            "apply_network_ops_pending_to_open_ledger: entry"
+        );
         let tx_q = self.registry.tx_q.clone();
         let open_ledger = self.registry.open_ledger.clone();
         let current_base_fee = self.open_ledger().current().base_fee_drops;
@@ -2842,6 +2876,11 @@ impl ApplicationRoot {
             current_ledger_index,
             validated_ledger_index,
             move |transactions| {
+                tracing::debug!(
+                    target: "rpc",
+                    batch_len = transactions.len(),
+                    "apply_network_ops_pending_to_open_ledger: batch closure entered"
+                );
                 let mut changed = false;
                 let mut lock = AppTxQLock;
                 // Use the persistent sandbox (matching rippled's persistent OpenView).

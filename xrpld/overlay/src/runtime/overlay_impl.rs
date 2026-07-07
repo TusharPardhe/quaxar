@@ -1731,6 +1731,10 @@ impl OverlayImpl {
         self.queued_inbound.requeue_validations(validations);
     }
 
+    pub fn requeue_transactions(&self, transactions: Vec<crate::QueuedTransaction>) {
+        self.queued_inbound.requeue_transactions(transactions);
+    }
+
     /// Register a channel for immediate TmLedgerData delivery from the
     /// network thread, matching reference InboundLedgers::gotLedgerData.
     pub fn set_ledger_data_channel(
@@ -1742,6 +1746,10 @@ impl OverlayImpl {
 
     pub fn take_validations(&self) -> Vec<crate::QueuedValidation> {
         self.queued_inbound.take_validations()
+    }
+
+    pub fn take_manifests(&self) -> Vec<crate::PeerMessage<crate::TmManifests>> {
+        self.queued_inbound.take_manifests()
     }
 
     pub fn take_proposals(&self) -> Vec<crate::QueuedProposal> {

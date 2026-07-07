@@ -120,6 +120,14 @@ const REACQUIRE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Timeout for stuck InProgress entries (reference ~180s with no progress).
 const STUCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+/// Maximum number of concurrent in-progress ledger acquisitions. Bounds
+/// resource usage when a node has diverged and is receiving a steady stream
+/// of validations/proposals referencing many distinct unfamiliar ledger
+/// hashes — without this cap each one would spawn its own persistent
+/// worker thread with no upper limit. Matches the general spirit of
+/// rippled's PeerSet-based request pacing, which naturally limits how many
+/// ledgers are chased at once.
+const MAX_CONCURRENT_ACQUISITIONS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryState {
@@ -130,7 +138,6 @@ enum EntryState {
 }
 
 struct InboundEntry {
-    #[allow(dead_code)]
     seq: u32,
     tx: Sender<AcqMsg>,
     started_at: Instant,
@@ -240,6 +247,44 @@ impl SharedInboundLedgers {
         if let Some(entry) = inner.entries.get_mut(&hash) {
             entry.last_touched = Instant::now();
             return;
+        }
+
+        // Bound concurrent in-progress acquisitions. Without this cap, a
+        // node that has diverged from the network receives a steady stream
+        // of validations/proposals referencing unfamiliar ledger hashes for
+        // many different (often stale) sequences, each of which would
+        // otherwise spawn its own persistent acquisition worker with no
+        // upper bound — starving I/O and thread capacity for the sequences
+        // that actually matter (the newest ones) and preventing the node
+        // from ever catching up. When at capacity, evict the in-progress
+        // entry with the lowest target sequence to make room for this one,
+        // since more recent acquisitions are more likely to still be
+        // relevant to where the network currently is.
+        let in_progress_count = inner
+            .entries
+            .values()
+            .filter(|e| e.state == EntryState::InProgress)
+            .count();
+        if in_progress_count >= MAX_CONCURRENT_ACQUISITIONS {
+            let lowest_seq_hash = inner
+                .entries
+                .iter()
+                .filter(|(_, e)| e.state == EntryState::InProgress)
+                .min_by_key(|(_, e)| e.seq)
+                .map(|(h, _)| *h);
+            if let Some(evict_hash) = lowest_seq_hash {
+                if let Some(evicted) = inner.entries.remove(&evict_hash) {
+                    let _ = evicted.tx.send(AcqMsg::Stop);
+                    tracing::debug!(target: "inbound_ledger",
+                        evicted_seq = evicted.seq,
+                        evicted_hash = %evict_hash,
+                        new_seq = seq,
+                        new_hash = %hash,
+                        "Evicting lowest-seq acquisition to bound concurrency"
+                    );
+                }
+                self.registry.lock().expect("acq registry").remove(&evict_hash);
+            }
         }
 
         // Validate required resources

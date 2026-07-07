@@ -73,7 +73,11 @@ fn acquired_tx_set_decodes_to_cpp_canonical_order_not_tx_map_leaf_order() {
         (tx_map_payload(&earlier), earlier.get_transaction_id()),
     ];
 
-    let ordered = decode_acquired_tx_set(&tx_items, Uint256::from_array([0xCF; 32]));
+    let ordered = decode_acquired_tx_set(
+        &tx_items,
+        Uint256::from_array([0xCF; 32]),
+        shamap::tree_node::SHAMapNodeType::TransactionMd,
+    );
     let sequences = ordered
         .iter()
         .map(|tx| tx.get_field_u32(get_field_by_symbol("sfSequence")))

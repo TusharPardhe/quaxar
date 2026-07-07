@@ -125,6 +125,14 @@ pub struct QueuedOverlayInboundHandler {
     /// matching reference where gotLedgerData dispatches directly from the network thread.
     #[allow(clippy::type_complexity)]
     ledger_data_router: Mutex<Option<Box<dyn Fn(PeerId, TmLedgerData) + Send + Sync>>>,
+    /// Direct routing callback for inbound transactions — dispatches
+    /// immediately to a JobQueue worker on receipt, matching reference
+    /// PeerImp::handleTransaction -> JobQueue::addJob(JtTransaction,
+    /// "RcvCheckTx", ...). Without this, transactions only got processed on
+    /// the next 1s overlay timer tick, which is too slow relative to
+    /// consensus round-close timing and causes sporadic quorum misses.
+    #[allow(clippy::type_complexity)]
+    transaction_router: Mutex<Option<Box<dyn Fn(PeerId, QueuedTransaction) + Send + Sync>>>,
     /// Notify channel for instant validation wake. When a validation arrives,
     /// a signal is sent so the validation processing thread wakes immediately
     /// instead of polling every 500ms. Matches reference where validations trigger
@@ -138,6 +146,7 @@ impl Default for QueuedOverlayInboundHandler {
             inner: Mutex::new(OverlayInboundSnapshot::default()),
             ledger_data_tx: Mutex::new(None),
             ledger_data_router: Mutex::new(None),
+            transaction_router: Mutex::new(None),
             validation_notify_tx: Mutex::new(None),
         }
     }
@@ -184,6 +193,17 @@ impl QueuedOverlayInboundHandler {
             .expect("ledger_data_router lock") = Some(router);
     }
 
+    /// Register the immediate transaction-dispatch callback. Matches
+    /// reference PeerImp::handleTransaction, which calls
+    /// JobQueue::addJob(JtTransaction, "RcvCheckTx", ...) synchronously on
+    /// receipt from the network thread, instead of waiting for a timer tick.
+    pub fn set_transaction_router(&self, router: Box<dyn Fn(PeerId, QueuedTransaction) + Send + Sync>) {
+        *self
+            .transaction_router
+            .lock()
+            .expect("transaction_router lock") = Some(router);
+    }
+
     /// Put validations back into the queue so they can be consumed by the
     /// validation processing loop. Called after take_snapshot() when the
     /// caller only needs ledger_data/get_objects but not validations.
@@ -209,6 +229,22 @@ impl QueuedOverlayInboundHandler {
             .extend(proposals);
     }
 
+    /// Re-queue transactions taken from a snapshot that the caller isn't
+    /// consuming itself (e.g. a validation-processor thread that only wants
+    /// manifests/validations). Without this, transactions taken via
+    /// take_snapshot() and not explicitly handled are silently dropped,
+    /// preventing them from ever being applied to the open ledger.
+    pub fn requeue_transactions(&self, transactions: Vec<QueuedTransaction>) {
+        if transactions.is_empty() {
+            return;
+        }
+        self.inner
+            .lock()
+            .expect("overlay inbound lock")
+            .transactions
+            .extend(transactions);
+    }
+
     /// Drain only validations from the queue, leaving all other messages.
     pub fn take_validations(&self) -> Vec<QueuedValidation> {
         std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").validations)
@@ -231,6 +267,15 @@ impl QueuedOverlayInboundHandler {
     /// Drain only ledger_data from the queue, leaving all other messages.
     pub fn take_ledger_data(&self) -> Vec<PeerMessage<TmLedgerData>> {
         std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").ledger_data)
+    }
+
+    /// Drain only manifests from the queue, leaving all other messages
+    /// (transactions, proposals, validations, etc.) for their rightful
+    /// single consumer. Matches take_validations/take_proposals pattern —
+    /// using take_snapshot() here would race with and steal messages meant
+    /// for other consumers.
+    pub fn take_manifests(&self) -> Vec<PeerMessage<TmManifests>> {
+        std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").manifests)
     }
 
     /// Drain only get_ledger requests from the queue, leaving all other messages.
@@ -263,12 +308,15 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
             .push(message);
     }
 
-    fn on_transaction(&self, _peer: &Arc<PeerImp>, message: QueuedTransaction) {
-        self.inner
-            .lock()
-            .expect("overlay inbound lock")
-            .transactions
-            .push(message);
+    fn on_transaction(&self, peer: &Arc<PeerImp>, message: QueuedTransaction) {
+        let router_guard = self.transaction_router.lock().expect("transaction_router lock");
+        if let Some(router) = router_guard.as_ref() {
+            router(peer.id(), message);
+            return;
+        }
+        drop(router_guard);
+        let mut guard = self.inner.lock().expect("overlay inbound lock");
+        guard.transactions.push(message);
     }
 
     fn on_get_ledger(&self, peer: &Arc<PeerImp>, message: TmGetLedger) {

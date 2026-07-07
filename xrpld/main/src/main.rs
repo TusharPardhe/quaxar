@@ -1,6 +1,6 @@
 use app::{
     AppBootstrapOptions, AppBootstrapRuntime, MainRuntime, ManagedComponent,
-    RclValidationAcceptanceSink, build_bootstrap_root, load_basic_config_file,
+    build_bootstrap_root, load_basic_config_file,
     parse_bootstrap_args, run_bootstrap_runtime,
 };
 use basics::base_uint::Uint256;
@@ -9,7 +9,6 @@ use overlay::Overlay;
 use overlay::Peer as _;
 // Import PeerSet trait for method access on SimplePeerSet
 use overlay::PeerSet as _;
-use protocol::{STValidation, SerialIter};
 use rpc::rpc_cmd_to_json;
 use server::{ServerRuntime, ServerRuntimeBuildReport};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -125,6 +124,456 @@ fn prune_recent_connect_attempts(
     now: Instant,
 ) {
     recent_attempts.retain(|_, until| *until > now);
+}
+
+/// Shared PeerFinder bookkeeping state, matching reference PeerFinder::Logic's
+/// internal livecache/bootcache/recent-attempts state. Wrapped in a single
+/// mutex so both the dedicated overlay-timer thread (sendEndpoints/autoConnect)
+/// and anything else that needs to inspect it can share ownership safely,
+/// without pinning this state to a specific thread's stack.
+struct PeerfinderState {
+    known_endpoints: HashMap<std::net::SocketAddr, KnownEndpoint>,
+    redirect_bootcache: std::collections::BTreeMap<std::net::SocketAddr, i32>,
+    bootcache_dirty: bool,
+    recent_autoconnect_attempts: HashMap<std::net::IpAddr, Instant>,
+    last_bootcache_save_at: Instant,
+}
+
+impl PeerfinderState {
+    fn new(peerfinder_bootcache_path: Option<&std::path::Path>) -> Self {
+        Self {
+            known_endpoints: HashMap::new(),
+            redirect_bootcache: peerfinder_bootcache_path
+                .map(load_peerfinder_bootcache)
+                .unwrap_or_default(),
+            bootcache_dirty: false,
+            recent_autoconnect_attempts: HashMap::new(),
+            last_bootcache_save_at: Instant::now(),
+        }
+    }
+}
+
+/// Dependencies for the dedicated overlay-timer thread. All fields are
+/// cheaply cloneable (Arc-backed), so this can be constructed once and moved
+/// into the spawned thread.
+struct OverlayTimerDeps {
+    app: app::ApplicationRoot,
+    ledger_data_rx: Arc<Mutex<Option<std::sync::mpsc::Receiver<overlay::PeerMessage<overlay::TmLedgerData>>>>>,
+    acq_registry: AcqRegistry,
+    shared_fetch_pack: Arc<ledger::FetchPackCache>,
+    loaded_ledger_runtime: Option<app::AppLoadedLedgerRuntime>,
+    peerfinder_bootcache_path: Option<PathBuf>,
+    peerfinder_state: Arc<Mutex<PeerfinderState>>,
+    stop: Arc<CatchUpState>,
+}
+
+/// Spawn the dedicated overlay-timer thread, matching reference
+/// OverlayImpl::Timer's fixed 1-second boost::asio::steady_timer cadence.
+///
+/// This replaces the previous approach of checking `elapsed() >= 1s` inside
+/// the main catchup loop's ~1ms busy-poll body: that coupled a 1Hz duty to a
+/// thread spinning at ~1000Hz, which churned the queued_inbound mutex and
+/// starved the consensus-driver thread badly enough that peer proposals
+/// looked stale by the propose_freshness cutoff, causing nodes to silently
+/// diverge. A dedicated thread that sleeps exactly 1 second per iteration —
+/// the same pattern already used by `consensus::driver::spawn_heartbeat` —
+/// runs these duties at the correct cadence independent of any other loop's
+/// polling rate.
+///
+/// Handles, in order, matching reference OverlayImpl::onTimer:
+/// sendEndpoints (PeerFinder::Logic::buildEndpointsForPeers), autoConnect
+/// (PeerFinder::Logic::autoconnect), ping (PeerImp::onTimer), and the
+/// inbound message-queue duties (ledger_data routing, get_objects routing,
+/// get_ledgers serving, and NetworkOPs::processTransaction for peer-relayed
+/// transactions).
+fn spawn_overlay_timer(deps: OverlayTimerDeps) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name("xrpld-overlay-timer".to_owned())
+        .spawn(move || {
+            tracing::info!(target: "overlay", "Overlay timer thread started (1s)");
+            let (bootcache_tx, bootcache_rx) =
+                std::sync::mpsc::channel::<PeerfinderBootcacheEvent>();
+            let mut last_endpoints_at = Instant::now()
+                .checked_sub(PEERFINDER_SECONDS_PER_MESSAGE)
+                .unwrap_or_else(Instant::now);
+            let mut last_auto_connect_at = Instant::now()
+                .checked_sub(PEERFINDER_SECONDS_PER_CONNECT)
+                .unwrap_or_else(Instant::now);
+
+            while !deps.stop.stop.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_secs(1));
+                if deps.stop.stop.load(Ordering::Acquire) {
+                    break;
+                }
+
+                let Some(overlay_runtime) = deps.app.overlay_runtime() else {
+                    continue;
+                };
+                use overlay::Overlay as _;
+                let peers = overlay_runtime.overlay().active_peers();
+
+                // sendEndpoints (reference PeerFinder::Logic::buildEndpointsForPeers)
+                if last_endpoints_at.elapsed() >= PEERFINDER_SECONDS_PER_MESSAGE {
+                    last_endpoints_at = Instant::now();
+                    let mut state = deps.peerfinder_state.lock().expect("peerfinder state");
+                    prune_known_endpoints(&mut state.known_endpoints, Instant::now());
+                    let listening_port = overlay_runtime.listener_setup().map(|setup| setup.port);
+                    for peer in &peers {
+                        let endpoints_v2 = build_endpoint_broadcast(
+                            listening_port,
+                            &state.known_endpoints,
+                            peer,
+                            Instant::now(),
+                        );
+                        if endpoints_v2.is_empty() {
+                            continue;
+                        }
+                        let msg = overlay::ProtocolMessage::new(
+                            overlay::ProtocolPayload::Endpoints(overlay::TmEndpoints {
+                                version: 2,
+                                endpoints_v2,
+                            }),
+                        );
+                        peer.send(overlay::Message::new(msg, None));
+                    }
+                }
+
+                // autoConnect (reference PeerFinder::Logic::autoconnect)
+                if last_auto_connect_at.elapsed() >= PEERFINDER_SECONDS_PER_CONNECT {
+                    last_auto_connect_at = Instant::now();
+                    let now = Instant::now();
+                    let mut state = deps.peerfinder_state.lock().expect("peerfinder state");
+                    prune_known_endpoints(&mut state.known_endpoints, now);
+                    prune_recent_connect_attempts(&mut state.recent_autoconnect_attempts, now);
+                    while let Ok(event) = bootcache_rx.try_recv() {
+                        match event {
+                            PeerfinderBootcacheEvent::Redirects(redirect_peers) => {
+                                let mut added = 0usize;
+                                for addr in redirect_peers.into_iter().take(PEERFINDER_MAX_REDIRECTS) {
+                                    if insert_peerfinder_bootcache(&mut state.redirect_bootcache, addr) {
+                                        state.bootcache_dirty = true;
+                                        added += 1;
+                                    }
+                                }
+                                if added > 0 {
+                                    tracing::debug!(target: "peerfinder", added, total = state.redirect_bootcache.len(), "Redirect bootcache updated");
+                                }
+                            }
+                            PeerfinderBootcacheEvent::Success(addr) => {
+                                peerfinder_bootcache_success(&mut state.redirect_bootcache, addr);
+                                state.bootcache_dirty = true;
+                            }
+                            PeerfinderBootcacheEvent::Failure(addr) => {
+                                peerfinder_bootcache_failure(&mut state.redirect_bootcache, addr);
+                                state.bootcache_dirty = true;
+                            }
+                        }
+                    }
+                    if state.bootcache_dirty
+                        && state.last_bootcache_save_at.elapsed()
+                            >= PEERFINDER_BOOTCACHE_UPDATE_COOLDOWN
+                    {
+                        if let Some(path) = deps.peerfinder_bootcache_path.as_deref() {
+                            save_peerfinder_bootcache(path, &state.redirect_bootcache);
+                        }
+                        state.bootcache_dirty = false;
+                        state.last_bootcache_save_at = Instant::now();
+                    }
+                    let target_outbound_peers = peerfinder_outbound_target(
+                        overlay_runtime.overlay().limit(),
+                        overlay_runtime.listener_setup().is_some(),
+                    );
+                    let active_outbound_peers =
+                        overlay_runtime.overlay().active_outbound_peers_count();
+                    if peers.len() < target_outbound_peers {
+                        tracing::debug!(target: "peerfinder", peers = peers.len(), outbound = active_outbound_peers, target_outbound = target_outbound_peers, pending = overlay_runtime.overlay().pending_outbound_attempts(), known_endpoints = state.known_endpoints.len(), "Peer count below target");
+                    }
+                    if active_outbound_peers < target_outbound_peers
+                        && overlay_runtime.overlay().pending_outbound_attempts() == 0
+                    {
+                        let mut connected_addrs: std::collections::HashSet<std::net::IpAddr> =
+                            peers
+                                .iter()
+                                .map(|p| peerfinder_canonical_ip(p.remote_address().ip()))
+                                .collect();
+                        let mut scheduled_attempts = 0usize;
+                        let selected = select_autoconnect_endpoints(
+                            &connected_addrs,
+                            &state.known_endpoints,
+                            &state.recent_autoconnect_attempts,
+                            now,
+                        );
+                        let selected = if selected.is_empty() {
+                            select_bootcache_endpoints(
+                                &connected_addrs,
+                                &state.redirect_bootcache,
+                                &state.recent_autoconnect_attempts,
+                                now,
+                            )
+                        } else {
+                            selected
+                        };
+                        if !selected.is_empty() {
+                            tracing::debug!(target: "peerfinder", selected = selected.len(), active_outbound = active_outbound_peers, target_outbound = target_outbound_peers, known_endpoints = state.known_endpoints.len(), bootcache = state.redirect_bootcache.len(), "Autoconnect selected");
+                        }
+                        for addr in selected {
+                            if active_outbound_peers + scheduled_attempts >= target_outbound_peers {
+                                break;
+                            }
+                            connected_addrs.insert(peerfinder_canonical_ip(addr.ip()));
+                            state.recent_autoconnect_attempts.insert(
+                                peerfinder_canonical_ip(addr.ip()),
+                                now + PEERFINDER_RECENT_ATTEMPT_DURATION,
+                            );
+                            scheduled_attempts += 1;
+                            let overlay = Arc::clone(&overlay_runtime.overlay());
+                            let bootcache_tx = bootcache_tx.clone();
+                            let _ = std::thread::Builder::new()
+                                .name("xrpld-auto-connect".to_owned())
+                                .spawn(move || {
+                                    let rt = tokio::runtime::Builder::new_current_thread()
+                                        .enable_all()
+                                        .build();
+                                    if let Ok(rt) = rt {
+                                        match rt.block_on(overlay.connect(addr)) {
+                                            Ok(mut result) => {
+                                                tracing::info!(target: "peerfinder", %addr, peer_id = result.peer.id(), "Autoconnect connected");
+                                                if let Some(session) = result.session.take() {
+                                                    overlay.spawn_peer_session(std::sync::Arc::clone(&result.peer), session);
+                                                }
+                                                let _ = bootcache_tx.send(PeerfinderBootcacheEvent::Success(addr));
+                                            }
+                                            Err(overlay::ConnectAttemptError::Redirect(redirect_peers)) => {
+                                                tracing::debug!(target: "peerfinder", %addr, redirect_count = redirect_peers.len(), "Autoconnect redirected");
+                                                let _ = bootcache_tx.send(PeerfinderBootcacheEvent::Redirects(redirect_peers));
+                                            }
+                                            Err(error) => {
+                                                tracing::debug!(target: "peerfinder", %addr, %error, "Autoconnect failed");
+                                                let _ = bootcache_tx.send(PeerfinderBootcacheEvent::Failure(addr));
+                                            }
+                                        }
+                                    }
+                                });
+                        }
+                    }
+                }
+
+                // === reference PeerImp::onTimer (every 60 seconds): send ping ===
+                // Folded into this 1s timer's own cadence tracking below.
+                {
+                    static_ping_tick(&overlay_runtime, &peers);
+                }
+
+                if peers.is_empty() {
+                    continue;
+                }
+
+                // === OVERLAY DUTIES (reference OverlayImpl::Timer message-queue duties) ===
+                let snapshot = overlay_runtime.overlay().take_queued_inbound_snapshot();
+                overlay_runtime.overlay().requeue_validations(snapshot.validations);
+
+                // Accumulate discovered endpoints for auto-connect
+                {
+                    let mut state = deps.peerfinder_state.lock().expect("peerfinder state");
+                    let now = Instant::now();
+                    for batch in &snapshot.endpoints {
+                        for ep in &batch.endpoints {
+                            if insert_peerfinder_bootcache(&mut state.redirect_bootcache, ep.endpoint) {
+                                state.bootcache_dirty = true;
+                            }
+                            remember_known_endpoint(&mut state.known_endpoints, ep.endpoint, ep.hops, now);
+                        }
+                    }
+                }
+
+                // --- Route TmLedgerData to acquisitions ---
+                let mut direct_messages = Vec::new();
+                let mut direct_channel_capped = false;
+                for _ in 0..MAX_DIRECT_LEDGER_DATA_PER_TICK {
+                    match deps.ledger_data_rx
+                        .lock()
+                        .expect("ledger_data_rx lock")
+                        .as_ref()
+                        .map(|rx| rx.try_recv())
+                        .unwrap_or(Err(std::sync::mpsc::TryRecvError::Disconnected))
+                    {
+                        Ok(msg) => direct_messages.push(msg),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+                if direct_messages.len() == MAX_DIRECT_LEDGER_DATA_PER_TICK {
+                    direct_channel_capped = true;
+                }
+                let total_ledger_data = snapshot.ledger_data.len() + direct_messages.len();
+                let mut routed = 0usize;
+                let mut unrouted = 0usize;
+
+                for message in &direct_messages {
+                    if let Some(cookie) = message.message.request_cookie {
+                        if let Some(target) = peers.iter().find(|p| p.id() == cookie) {
+                            let mut fwd = message.message.clone();
+                            fwd.request_cookie = None;
+                            let reply = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(fwd));
+                            target.send(overlay::Message::new(reply, None));
+                        }
+                        continue;
+                    }
+                    if let Some((hash, packet)) = parse_ledger_data_packet(&message.message) {
+                        let hash = *hash.as_uint256();
+                        if route_ledger_data_to_acq(&deps.acq_registry, &hash, message.peer_id as u64, packet.clone()) {
+                            routed += 1;
+                        } else {
+                            unrouted += 1;
+                            if message.message.r#type == 2
+                                && let Some((_, packet)) = parse_ledger_data_packet(&message.message) {
+                                    let mut fp_store = SharedFetchPack::new(Arc::clone(&deps.shared_fetch_pack));
+                                    let _ = ledger::stash_stale_packet(&packet, &mut fp_store);
+                                }
+                        }
+                    }
+                }
+
+                for message in &snapshot.ledger_data {
+                    if let Some(cookie) = message.message.request_cookie {
+                        if let Some(target) = peers.iter().find(|p| p.id() == cookie) {
+                            let mut fwd = message.message.clone();
+                            fwd.request_cookie = None;
+                            let reply = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(fwd));
+                            target.send(overlay::Message::new(reply, None));
+                        }
+                        continue;
+                    }
+                    if let Some((hash, packet)) = parse_ledger_data_packet(&message.message) {
+                        let hash = *hash.as_uint256();
+                        if route_ledger_data_to_acq(&deps.acq_registry, &hash, message.peer_id as u64, packet.clone()) {
+                            routed += 1;
+                        } else {
+                            unrouted += 1;
+                            if message.message.r#type == 2
+                                && let Some((_, packet)) = parse_ledger_data_packet(&message.message) {
+                                    let mut fp_store = SharedFetchPack::new(Arc::clone(&deps.shared_fetch_pack));
+                                    let _ = ledger::stash_stale_packet(&packet, &mut fp_store);
+                                }
+                        }
+                    }
+                }
+
+                // --- Route TMGetObjectByHash responses ---
+                for message in &snapshot.get_objects {
+                    if message.message.query { continue; }
+                    let ledger_hash = match message.message.ledger_hash.as_deref().and_then(Uint256::from_slice) {
+                        Some(h) => h,
+                        None => continue,
+                    };
+                    let packet_type = match message.message.r#type {
+                        3 => ledger::InboundLedgerDataType::TransactionNode,
+                        4 => ledger::InboundLedgerDataType::StateNode,
+                        6 => {
+                            for obj in &message.message.objects {
+                                let Some(hash_bytes) = obj.hash.as_deref() else { continue };
+                                let Some(hash) = Uint256::from_slice(hash_bytes) else { continue };
+                                let Some(data) = obj.data.as_ref() else { continue };
+                                deps.shared_fetch_pack.add_fetch_pack(hash, data.clone());
+                            }
+                            for tx in deps.acq_registry.lock().expect("acq registry").values() {
+                                let _ = tx.send(AcqMsg::FetchPackReady);
+                            }
+                            tracing::debug!(target: "inbound_ledger", objects = message.message.objects.len(), "Fetch-pack ingested");
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    let nodes: Vec<_> = message.message.objects.iter()
+                        .filter_map(|obj| {
+                            let data = obj.data.as_ref()?;
+                            Some(ledger::InboundLedgerNodeData::new(obj.node_id.clone(), data.clone()))
+                        })
+                        .collect();
+                    if nodes.is_empty() { continue; }
+                    let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
+                    route_ledger_data_to_acq(&deps.acq_registry, &ledger_hash, message.peer_id as u64, packet);
+                }
+
+                // --- Serve GetLedger requests (reference processLedgerRequest) ---
+                if let Some(loaded_ledger_runtime) = deps.loaded_ledger_runtime.as_ref() {
+                    for gl in &snapshot.get_ledgers {
+                        if let Some(peer) = peers.iter().find(|p| p.id() == gl.peer_id) {
+                            serve_get_ledger(loaded_ledger_runtime, &gl.message, peer.as_ref(), &peers);
+                        }
+                    }
+                }
+
+                if total_ledger_data > 0 || !snapshot.get_objects.is_empty() || !snapshot.get_ledgers.is_empty() {
+                    tracing::debug!(target: "overlay", total_ledger_data, direct_channel_capped, routed, unrouted, get_ledgers = snapshot.get_ledgers.len(), get_objects = snapshot.get_objects.len(), "Route summary");
+                }
+            }
+            tracing::info!(target: "overlay", "Overlay timer thread stopped");
+        })
+        .expect("spawn xrpld-overlay-timer")
+}
+
+/// Process a single inbound peer transaction, matching reference
+/// PeerImp::checkTransaction (called from a JobQueue JtTransaction worker).
+/// Applies the transaction to the open ledger via NetworkOPs::processTransaction.
+fn process_inbound_transaction(app: &app::ApplicationRoot, raw_transaction: &[u8]) {
+    let mut serial = protocol::SerialIter::new(raw_transaction);
+    let st_tx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        protocol::STTx::from_serial_iter(&mut serial)
+    })) {
+        Ok(tx) => tx,
+        Err(_) => return,
+    };
+    let st_tx = std::sync::Arc::new(st_tx);
+    let mut transaction: app::SharedTransaction = std::sync::Arc::new(std::sync::Mutex::new(
+        app::tx_queue::transaction::Transaction::new(std::sync::Arc::clone(&st_tx)),
+    ));
+    if let Some(network_ops_runtime) = app.network_ops_runtime() {
+        let _ = network_ops_runtime.process_transaction(
+            &mut transaction,
+            false,
+            false,
+            false,
+            || false,
+            || {},
+        );
+        let _ = app.apply_network_ops_pending_to_open_ledger();
+    }
+}
+
+/// Per-60s ping tick tracked via a thread-local-style static using an atomic
+/// timestamp, since the overlay-timer thread owns its own 1s loop and has no
+/// access to the main loop's `last_ping_at` local variable.
+fn static_ping_tick(overlay_runtime: &Arc<app::runtime::overlay_runtime::AppOverlayRuntime>, peers: &[Arc<dyn overlay::Peer>]) {
+    use std::sync::atomic::AtomicU64;
+    static LAST_PING_SECS: AtomicU64 = AtomicU64::new(0);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_PING_SECS.load(Ordering::Relaxed);
+    if now_secs.saturating_sub(last) < 60 {
+        return;
+    }
+    LAST_PING_SECS.store(now_secs, Ordering::Relaxed);
+    let ping_msg = overlay::ProtocolMessage::new(
+        overlay::ProtocolPayload::Ping(overlay::message::wire::TmPing {
+            r#type: 0,
+            seq: Some(basics::random::rand_int_to(u32::MAX)),
+            ping_time: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            ),
+            net_time: None,
+        }),
+    );
+    let wire = overlay::Message::new(ping_msg, None);
+    for p in peers {
+        p.send(wire.clone());
+    }
+    overlay_runtime.overlay().delete_idle_peers();
 }
 
 fn peerfinder_canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
@@ -1898,67 +2347,6 @@ fn path_size_bytes(path: &Path) -> u64 {
 /// matching reference `LedgerMaster::checkAccept` → `InboundLedgers::acquire`
 /// which is non-blocking. Called from inside the validations mutex so it
 /// must not block or re-acquire that lock.
-struct CheckAcceptSink {
-    app: app::ApplicationRoot,
-    validated_tx: std::sync::mpsc::Sender<(Uint256, u32)>,
-}
-
-impl RclValidationAcceptanceSink for CheckAcceptSink {
-    fn check_accept(&self, hash: Uint256, seq: u32) {
-        let valid_ledger_seq = self.app.validated_ledger_seq().unwrap_or(0);
-        if seq != 0 && seq <= valid_ledger_seq {
-            return;
-        }
-        let has_local = self
-            .app
-            .validated_ledger()
-            .is_some_and(|l| *l.header().hash.as_uint256() == hash);
-        if has_local {
-            return;
-        }
-
-        // Immediate promotion: if we have the ledger in history AND enough
-        // validations, promote to validated RIGHT NOW (matching rippled's
-        // event-driven checkAccept that fires on each validation receipt).
-        if let Some(lm_rt) = self.app.ledger_master_runtime() {
-            let lm = lm_rt.ledger_master();
-            if let Some(ledger) = lm.get_ledger_by_hash(
-                basics::sha_map_hash::SHAMapHash::new(hash)
-            ) {
-                let validations = self.app.validations().store()
-                    .trusted_for_ledger_by_sequence(hash, seq);
-                let val_count = self.app.validators()
-                    .negative_unl_filter_validations(validations).len();
-                let needed = if self.app.standalone() { 0 } else { self.app.validators().quorum() };
-                if val_count >= needed {
-                    let mut promoted = self.app.ledger_with_node_fetcher(ledger);
-                    {
-                        let l = std::sync::Arc::make_mut(&mut promoted);
-                        l.set_validated();
-                        l.set_full();
-                        l.finalize_immutable_no_setup();
-                    }
-                    lm.ledger_history().insert(std::sync::Arc::clone(&promoted), true);
-                    lm.mark_ledger_complete(promoted.header().seq);
-                    lm.set_valid_ledger_no_sweep(std::sync::Arc::clone(&promoted), None, None);
-                    if lm.published_ledger().is_none() {
-                        lm.set_pub_ledger(std::sync::Arc::clone(&promoted));
-                    }
-                }
-            }
-        }
-
-        // Also send to the catchup loop for acquisition if we don't have it
-        if seq != 0
-            && valid_ledger_seq == 0
-            && let Some(overlay) = self.app.overlay_runtime()
-        {
-            overlay.overlay().check_tracking(seq);
-        }
-        let _ = self.validated_tx.send((hash, seq));
-    }
-}
-
 /// Elevate the current thread to high scheduling priority.
 /// Consensus threads must never be starved by RPC workload — if validators
 /// can't emit validations on time, the network stalls. This mirrors rippled
@@ -1983,77 +2371,6 @@ fn set_consensus_thread_priority() {
             libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
         }
         tracing::info!(target: "consensus", "Consensus thread elevated to high priority");
-    }
-}
-
-/// Process queued validations from the overlay and feed them into the
-/// validation store, matching reference `PeerImp::checkValidation` →
-/// `NetworkOPs::recvValidation` → `handleNewValidation` → `checkAccept`.
-fn process_queued_validations(app: &app::ApplicationRoot, accept_sink: &CheckAcceptSink) {
-    let Some(overlay_runtime) = app.overlay_runtime() else {
-        return;
-    };
-    // Use take_validations to drain ONLY validations, leaving ledger_data
-    // and get_objects for the ledger acquisition loop.
-    let validations = overlay_runtime.overlay().take_validations();
-    if validations.is_empty() {
-        return;
-    }
-    for queued in &validations {
-        let mut serial = SerialIter::new(&queued.message.validation);
-        let parsed = STValidation::from_serial_iter_default_node_id(&mut serial, false);
-        let mut validation = match parsed {
-            Ok(v) => v,
-            Err(_e) => {
-                continue;
-            }
-        };
-        // Set seen_time to now, matching reference which sets it on receipt.
-        // Without this, seen_time=0 makes local_age check fail in is_current().
-        let now_wall = app.current_close_time_seconds();
-        validation.set_seen(now_wall);
-
-        // Adjust our clock from the validator's sign_time so is_current() passes.
-        // During cold bootstrap (need_network_ledger=true), allow unlimited offset
-        // since our clock is at genesis time and the network is hours/days ahead.
-        let sign_time = validation.get_sign_time();
-        if sign_time > 0 {
-            let now_wall_i = now_wall as i64;
-            let sign_i = sign_time as i64;
-            let offset = sign_i - now_wall_i;
-            // Always trust validator sign_time for clock sync.
-            // Validators are authoritative on network time.
-            app.time_keeper()
-                .adjust_close_time(time::Duration::seconds(offset));
-        }
-        let source = queued.peer_id.to_string();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            app.receive_validation_to_network_ops_with_accept(&mut validation, &source, accept_sink)
-        }));
-        let report = match result {
-            Ok(r) => r,
-            Err(e) => {
-                let _msg = e
-                    .downcast_ref::<String>()
-                    .map(|s| s.as_str())
-                    .or_else(|| e.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown");
-                continue;
-            }
-        };
-        if let Some(ref report) = report {
-            tracing::debug!(target: "consensus", hash = %report.ledger_hash, trusted = report.trusted, current = report.current, bypass = report.bypass_accept, "Validation received");
-        }
-        // Relay trusted validations to other peers.
-        if let Some(report) = &report
-            && report.relay
-        {
-            overlay_runtime.overlay().relay_validation(
-                queued.message.clone(),
-                queued.suppression,
-                *validation.get_signer_public(),
-            );
-        }
     }
 }
 
@@ -4253,13 +4570,6 @@ impl<D> BoundServerRuntime<D> {
                 let mut last_diag_at = Instant::now()
                     .checked_sub(Duration::from_secs(15))
                     .unwrap_or_else(Instant::now);
-                let mut last_endpoints_at = Instant::now()
-                    .checked_sub(PEERFINDER_SECONDS_PER_MESSAGE)
-                    .unwrap_or_else(Instant::now);
-                let mut last_auto_connect_at = Instant::now()
-                    .checked_sub(PEERFINDER_SECONDS_PER_CONNECT)
-                    .unwrap_or_else(Instant::now);
-                let mut last_bootcache_save_at = Instant::now();
                 let mut last_cache_sweep_at = Instant::now();
                 let mut last_inbound_sweep_at = Instant::now();
                 // reached quorum. The 1-second checkAccept timer re-checks this
@@ -4382,18 +4692,6 @@ impl<D> BoundServerRuntime<D> {
                     },
                     fetch_pack_issued_at: None,
                 };
-                let mut last_ping_at = Instant::now();
-                let mut known_endpoints: HashMap<std::net::SocketAddr, KnownEndpoint> =
-                    HashMap::new();
-                let mut redirect_bootcache = peerfinder_bootcache_path
-                    .as_deref()
-                    .map(load_peerfinder_bootcache)
-                    .unwrap_or_default();
-                let mut bootcache_dirty = false;
-                let mut recent_autoconnect_attempts: HashMap<std::net::IpAddr, Instant> =
-                    HashMap::new();
-                let (bootcache_tx, bootcache_rx) =
-                    std::sync::mpsc::channel::<PeerfinderBootcacheEvent>();
                 let loaded_ledger_runtime = app::AppLoadedLedgerRuntime::from_root(&app);
 
                 // Direct ledger_data channel from overlay to acquisition router.
@@ -4408,113 +4706,99 @@ impl<D> BoundServerRuntime<D> {
                 let mut overlay_channel_registered = false;
                 let direct_router_counter = Arc::new(AtomicU64::new(0));
 
+                // Spawn the dedicated overlay-timer thread, matching reference
+                // OverlayImpl::Timer's fixed 1-second boost::asio::steady_timer
+                // cadence — a genuine timer thread, decoupled from this catchup
+                // loop's own polling rate, instead of gating overlay duties with
+                // an elapsed()-check inside a busy-poll. Shares this catchup
+                // loop's own stop flag so both threads shut down together.
+                let peerfinder_state = Arc::new(Mutex::new(PeerfinderState::new(
+                    peerfinder_bootcache_path.as_deref(),
+                )));
+                let _overlay_timer_handle = spawn_overlay_timer(OverlayTimerDeps {
+                    app: app.clone(),
+                    ledger_data_rx: Arc::clone(&ledger_data_rx),
+                    acq_registry: Arc::clone(&acq_registry),
+                    shared_fetch_pack: Arc::clone(&shared_fetch_pack),
+                    loaded_ledger_runtime: loaded_ledger_runtime.clone(),
+                    peerfinder_bootcache_path: peerfinder_bootcache_path.clone(),
+                    peerfinder_state,
+                    stop: Arc::clone(&state),
+                });
+
+                // Spawn the real JobQueue worker-thread pool, matching
+                // reference JobQueue's persistent worker threads
+                // (JobQueue::run in rippled — N threads permanently blocked
+                // on a condvar, draining jobs as they're added). Without
+                // this, add_job() only enqueues work; nothing services the
+                // queue unless a caller happens to also invoke
+                // dispatch_next_job() afterward, which is a fragile,
+                // easily-starved pattern under concurrent job additions
+                // (confirmed this session: it left consensus's AcceptLedger
+                // job unserviced for 20+ seconds under heavy load, keeping
+                // consensus phase stuck at Accepted and silently dropping
+                // every incoming peer proposal for that window). Persistent
+                // workers guarantee every job gets serviced promptly
+                // regardless of how many are added at once.
+                let job_queue_worker_count = app.job_queue().worker_thread_count().max(1);
+                let mut _job_queue_worker_handles = Vec::with_capacity(job_queue_worker_count);
+                for worker_index in 0..job_queue_worker_count {
+                    let worker_queue = app.job_queue().clone();
+                    let handle = thread::Builder::new()
+                        .name(format!("xrpld-jobqueue-worker-{worker_index}"))
+                        .spawn(move || {
+                            worker_queue.run_worker_loop();
+                        })
+                        .expect("job queue worker thread should spawn");
+                    _job_queue_worker_handles.push(handle);
+                }
+
                 // Channel for checkAccept to send validated hashes to the
                 // catchup loop, matching reference InboundLedgers::acquire pattern.
-                let (validated_hash_tx, validated_hash_rx) =
+                let (_validated_hash_tx, validated_hash_rx) =
                     std::sync::mpsc::channel::<(Uint256, u32)>();
 
-                // Spawn a dedicated validation processing thread.
+                // Spawn a dedicated manifest-processing thread. Validations,
+                // proposals, map_complete, and the consensus timer tick are
+                // handled exclusively by the validation-forwarder +
+                // consensus-driver event loop (bootstrap.rs / driver.rs),
+                // matching reference NetworkOPs' single-owner design — running
+                // them here too would race for the same overlay queues and
+                // push proposals into the consensus engine from two threads.
                 let val_app = app.clone();
                 let val_state = Arc::clone(&state);
-                let val_accept_sink = CheckAcceptSink {
-                    app: val_app.clone(),
-                    validated_tx: validated_hash_tx,
-                };
-                // Create a bounded notify channel so the validation thread
-                // wakes instantly when a validation arrives from the overlay.
-                // Buffer of 1: multiple arrivals between wakes collapse into
-                // one signal, which is fine — we drain the full queue each wake.
-                let (_val_notify_tx, val_notify_rx) = std::sync::mpsc::sync_channel::<()>(1);
-                // validation_notify is set by the bootstrap validation-processor thread.
-                // Don't override it here.
                 let _ = thread::Builder::new()
                     .name("xrpld-validation-processor".to_owned())
                     .spawn(move || {
                         // Elevate thread priority — consensus must never be starved by RPC load.
                         set_consensus_thread_priority();
 
-                        // call got_tx_set when TX sets are acquired from peers.
-                        let map_complete_rx = val_app.consensus_runtime()
-                            .and_then(|cr| cr.take_map_complete_receiver());
-
                         while !val_state.stop.load(Ordering::Acquire) {
                             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            // Process manifests from peers — needed for validator key rotation
+                            // Process manifests from peers — needed for validator key rotation.
+                            // Uses a narrow drain (take_manifests) instead of take_snapshot()
+                            // to avoid racing with the main loop and validation-processor for
+                            // transactions/proposals/validations, which have their own single
+                            // dedicated consumers.
                             if let Some(overlay_runtime) = val_app.overlay_runtime() {
-                                let snapshot = overlay_runtime.overlay().queued_inbound().take_snapshot();
-                                for peer_msg in &snapshot.manifests {
+                                let manifests = overlay_runtime.overlay().take_manifests();
+                                for peer_msg in &manifests {
                                     for manifest_blob in &peer_msg.message.list {
                                         if let Some(manifest) = app::deserialize_manifest(&manifest_blob.stobject) {
                                             let _ = val_app.manifest_cache().apply_manifest(manifest);
                                         }
                                     }
                                 }
-                                // Re-queue validations that were in the snapshot
-                                overlay_runtime.overlay().queued_inbound().requeue_validations(snapshot.validations);
                             }
-                            // In --start mode, the bootstrap thread exclusively
-                            // processes validations. Skip here to avoid races.
-                            if !val_app.need_network_ledger() {
-                                process_queued_validations(&val_app, &val_accept_sink);
-                            }
-
-                            if !val_app.need_network_ledger()
-                            && let Some(rx) = &map_complete_rx {
-                                while let Ok((hash, set)) = rx.try_recv() {
-                                    if let (Some(consensus_runtime), Some(network_ops_runtime)) =
-                                        (val_app.consensus_runtime(), val_app.network_ops_runtime())
-                                    {
-                                        network_ops_runtime.handle_map_complete(
-                                            consensus_runtime.as_ref(),
-                                            hash,
-                                            set,
-                                        );
-                                    }
-                                }
-                            }
-
-                            // Process peer proposals — feed to consensus engine (only after sync)
-                            if !val_app.need_network_ledger()
-                            && let Some(overlay_runtime) = val_app.overlay_runtime() {
-                                let proposals = overlay_runtime.overlay().take_proposals();
-                                if !proposals.is_empty()
-                                    && let (Some(consensus_runtime), Some(_network_ops_runtime)) =
-                                        (val_app.consensus_runtime(), val_app.network_ops_runtime())
-                                    {
-                                        for proposal in proposals {
-                                            let close_time = val_app.shared_time_keeper().close_time();
-                                            let prop = consensus::ConsensusProposal::new(
-                                                proposal.previous_ledger,
-                                                proposal.message.propose_seq,
-                                                proposal.current_tx_hash,
-                                                close_time,
-                                                close_time,
-                                                proposal.public_key,
-                                            );
-                                            consensus_runtime.push_proposal(app::runtime::component_runtime::PendingProposal {
-                                                now: close_time,
-                                                public_key: proposal.public_key,
-                                                signature: proposal.message.signature.clone(),
-                                                suppression_id: proposal.suppression,
-                                                proposal: prop,
-                                            });
-                                        }
-                                    }
-                            }
-                            // Drive consensus state machine — but only after initial sync.
-                            // During cold bootstrap, timer_tick panics because the consensus
-                            // tokio::sync::Mutex was created on the main runtime which is
-                            // Consensus timer is driven exclusively by the bootstrap loop.
-                            if !val_app.need_network_ledger()
-                                && let Some(_consensus_runtime) = val_app.consensus_runtime() {
-                                    let tick_start = Instant::now();
-                                    let latency_ms = tick_start.elapsed().as_millis() as u64;
-                                    val_app.set_status_rpc_io_latency_ms(Some(latency_ms));
-                                }
                             })); // end catch_unwind
-                            // Wait for a validation to arrive (instant wake) or
-                            // fall through after 500ms for proposal/timer work.
-                            let _ = val_notify_rx.recv_timeout(Duration::from_millis(200));
+                            // Wait 1s between manifest-drain passes — this
+                            // thread now only handles manifests. Validations,
+                            // proposals, map_complete, and the consensus timer
+                            // tick are handled exclusively by the
+                            // validation-forwarder + consensus-driver event
+                            // loop (bootstrap.rs / driver.rs), matching
+                            // reference NetworkOPs' single-owner design.
+                            thread::sleep(Duration::from_secs(1));
                         }
                     });
 
@@ -4553,185 +4837,33 @@ impl<D> BoundServerRuntime<D> {
                                     );
                                 }
                             }));
+                        // Immediate transaction dispatch — matches reference
+                        // PeerImp::handleTransaction calling
+                        // JobQueue::addJob(JtTransaction, "RcvCheckTx", ...)
+                        // synchronously on receipt from the network thread,
+                        // instead of batching into the overlay timer's 1s tick.
+                        let router_app = app.clone();
+                        overlay_runtime.overlay().queued_inbound()
+                            .set_transaction_router(Box::new(move |_peer_id, message| {
+                                let job_app = router_app.clone();
+                                router_app.job_queue().add_job(
+                                    app::job::job_types::JobType::Transaction,
+                                    "RcvCheckTx",
+                                    move || {
+                                        process_inbound_transaction(&job_app, &message.message.raw_transaction);
+                                    },
+                                );
+                            }));
                         overlay_channel_registered = true;
                     }
 
                     // === reference OverlayImpl::Timer (every 1 second) ===
                     let peers = overlay_runtime.overlay().active_peers();
 
-                    // sendEndpoints (reference PeerFinder::Logic::buildEndpointsForPeers)
-                    if last_endpoints_at.elapsed() >= PEERFINDER_SECONDS_PER_MESSAGE {
-                        last_endpoints_at = Instant::now();
-                        prune_known_endpoints(&mut known_endpoints, Instant::now());
-                        let listening_port = overlay_runtime.listener_setup().map(|setup| setup.port);
-                        for peer in &peers {
-                            let endpoints_v2 = build_endpoint_broadcast(
-                                listening_port,
-                                &known_endpoints,
-                                peer,
-                                Instant::now(),
-                            );
-                            if endpoints_v2.is_empty() {
-                                continue;
-                            }
-                            let msg = overlay::ProtocolMessage::new(
-                                overlay::ProtocolPayload::Endpoints(overlay::TmEndpoints {
-                                    version: 2,
-                                    endpoints_v2,
-                                }),
-                            );
-                            peer.send(overlay::Message::new(msg, None));
-                        }
-                    }
-
-                    // autoConnect (reference PeerFinder::Logic::autoconnect)
-                    if last_auto_connect_at.elapsed() >= PEERFINDER_SECONDS_PER_CONNECT {
-                        last_auto_connect_at = Instant::now();
-                        let now = Instant::now();
-                        prune_known_endpoints(&mut known_endpoints, now);
-                        prune_recent_connect_attempts(&mut recent_autoconnect_attempts, now);
-                        while let Ok(event) = bootcache_rx.try_recv() {
-                            match event {
-                                PeerfinderBootcacheEvent::Redirects(peers) => {
-                                    let mut added = 0usize;
-                                    for addr in peers.into_iter().take(PEERFINDER_MAX_REDIRECTS) {
-                                        if insert_peerfinder_bootcache(&mut redirect_bootcache, addr)
-                                        {
-                                            bootcache_dirty = true;
-                                            added += 1;
-                                        }
-                                    }
-                                    if added > 0 {
-                                        tracing::debug!(target: "peerfinder", added, total = redirect_bootcache.len(), "Redirect bootcache updated");
-                                    }
-                                }
-                                PeerfinderBootcacheEvent::Success(addr) => {
-                                    peerfinder_bootcache_success(&mut redirect_bootcache, addr);
-                                    bootcache_dirty = true;
-                                }
-                                PeerfinderBootcacheEvent::Failure(addr) => {
-                                    peerfinder_bootcache_failure(&mut redirect_bootcache, addr);
-                                    bootcache_dirty = true;
-                                }
-                            }
-                        }
-                        if bootcache_dirty
-                            && last_bootcache_save_at.elapsed()
-                                >= PEERFINDER_BOOTCACHE_UPDATE_COOLDOWN
-                        {
-                            if let Some(path) = peerfinder_bootcache_path.as_deref() {
-                                save_peerfinder_bootcache(path, &redirect_bootcache);
-                            }
-                            bootcache_dirty = false;
-                            last_bootcache_save_at = Instant::now();
-                        }
-                        let target_outbound_peers = peerfinder_outbound_target(
-                            overlay_runtime.overlay().limit(),
-                            overlay_runtime.listener_setup().is_some(),
-                        );
-                        let active_outbound_peers =
-                            overlay_runtime.overlay().active_outbound_peers_count();
-                        if peers.len() < target_outbound_peers {
-                            tracing::debug!(target: "peerfinder", peers = peers.len(), outbound = active_outbound_peers, target_outbound = target_outbound_peers, pending = overlay_runtime.overlay().pending_outbound_attempts(), known_endpoints = known_endpoints.len(), "Peer count below target");
-                        }
-                        if active_outbound_peers < target_outbound_peers
-                            && overlay_runtime.overlay().pending_outbound_attempts() == 0
-                        {
-                            let mut connected_addrs: std::collections::HashSet<std::net::IpAddr> =
-                                peers
-                                    .iter()
-                                    .map(|p| peerfinder_canonical_ip(p.remote_address().ip()))
-                                    .collect();
-                            let mut scheduled_attempts = 0usize;
-                            let selected = select_autoconnect_endpoints(
-                                &connected_addrs,
-                                &known_endpoints,
-                                &recent_autoconnect_attempts,
-                                now,
-                            );
-                            let selected = if selected.is_empty() {
-                                select_bootcache_endpoints(
-                                    &connected_addrs,
-                                    &redirect_bootcache,
-                                    &recent_autoconnect_attempts,
-                                    now,
-                                )
-                            } else {
-                                selected
-                            };
-                            if !selected.is_empty() {
-                                tracing::debug!(target: "peerfinder", selected = selected.len(), active_outbound = active_outbound_peers, target_outbound = target_outbound_peers, known_endpoints = known_endpoints.len(), bootcache = redirect_bootcache.len(), "Autoconnect selected");
-                            }
-                            for addr in selected {
-                                if active_outbound_peers + scheduled_attempts
-                                    >= target_outbound_peers
-                                {
-                                    break;
-                                }
-                                connected_addrs.insert(peerfinder_canonical_ip(addr.ip()));
-                                recent_autoconnect_attempts.insert(
-                                    peerfinder_canonical_ip(addr.ip()),
-                                    now + PEERFINDER_RECENT_ATTEMPT_DURATION,
-                                );
-                                scheduled_attempts += 1;
-                                let overlay = Arc::clone(&overlay_runtime.overlay());
-                                let bootcache_tx = bootcache_tx.clone();
-                                let _ = std::thread::Builder::new()
-                                    .name("xrpld-auto-connect".to_owned())
-                                    .spawn(move || {
-                                        let rt = tokio::runtime::Builder::new_current_thread()
-                                            .enable_all()
-                                            .build();
-                                        if let Ok(rt) = rt {
-                                            match rt.block_on(overlay.connect(addr)) {
-                                                Ok(mut result) => {
-                                                    tracing::info!(target: "peerfinder", %addr, peer_id = result.peer.id(), "Autoconnect connected");
-                                                    // Start the peer session read/write loop
-                                                    if let Some(session) = result.session.take() {
-                                                        overlay.spawn_peer_session(std::sync::Arc::clone(&result.peer), session);
-                                                    }
-                                                    let _ = bootcache_tx
-                                                        .send(PeerfinderBootcacheEvent::Success(addr));
-                                                }
-                                                Err(overlay::ConnectAttemptError::Redirect(peers)) => {
-                                                    tracing::debug!(target: "peerfinder", %addr, redirect_count = peers.len(), "Autoconnect redirected");
-                                                    let _ = bootcache_tx
-                                                        .send(PeerfinderBootcacheEvent::Redirects(peers));
-                                                }
-                                                Err(error) => {
-                                                    tracing::debug!(target: "peerfinder", %addr, %error, "Autoconnect failed");
-                                                    let _ = bootcache_tx
-                                                        .send(PeerfinderBootcacheEvent::Failure(addr));
-                                                }
-                                            }
-                                        }
-                                    });
-                            }
-                        }
-                    }
-
-                    // === reference PeerImp::onTimer (every 60 seconds): send ping ===
-                    if last_ping_at.elapsed() >= Duration::from_secs(60) {
-                        last_ping_at = Instant::now();
-                        let ping_msg = overlay::ProtocolMessage::new(
-                            overlay::ProtocolPayload::Ping(overlay::message::wire::TmPing {
-                                r#type: 0,
-                                seq: Some(basics::random::rand_int_to(u32::MAX)),
-                                ping_time: Some(
-                                    std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
-                                        .as_millis() as u64,
-                                ),
-                                net_time: None,
-                            }),
-                        );
-                        let wire = overlay::Message::new(ping_msg, None);
-                        for p in &peers {
-                            p.send(wire.clone());
-                        }
-                        overlay_runtime.overlay().delete_idle_peers();
-                    }
+                    // sendEndpoints, autoConnect, and ping now run in the dedicated
+                    // xrpld-overlay-timer thread (spawn_overlay_timer), matching
+                    // reference OverlayImpl::Timer's fixed 1-second cadence instead
+                    // of being polled inside this catchup loop's ~1ms busy-poll body.
 
                     if peers.is_empty() {
                         thread::sleep(Duration::from_secs(2));
@@ -5062,6 +5194,13 @@ impl<D> BoundServerRuntime<D> {
                             }
                         }
 
+                    inbound_ledgers.send_peers(&peers);
+
+                    // OVERLAY DUTIES (message-queue routing, endpoint discovery,
+                    // and inbound peer transaction processing) now run in the
+                    // dedicated xrpld-overlay-timer thread, matching reference
+                    // OverlayImpl::Timer's fixed 1-second cadence.
+
                     if target_seq > 1 {
                         // --- Persistent tick-based acquisition (reference InboundLedger parity) ---
                         // Maintain persistent InboundLedgerLocal owners that
@@ -5164,232 +5303,7 @@ impl<D> BoundServerRuntime<D> {
                             }
                             // seq=0: handled by 1-second checkAccept timer via last_validated_target
 
-                        inbound_ledgers.send_peers(&peers);
 
-                        // === OVERLAY DUTIES (always, matching reference OverlayImpl::Timer) ===
-                        // Take overlay snapshot once per loop iteration.
-                        // PeerImp::onMessage handlers. We consolidate here.
-                        {
-                            let snapshot = overlay_runtime.overlay().take_queued_inbound_snapshot();
-                            overlay_runtime
-                                .overlay()
-                                .requeue_validations(snapshot.validations);
-
-                            // Accumulate discovered endpoints for auto-connect
-                            let now = Instant::now();
-                            for batch in &snapshot.endpoints {
-                                for ep in &batch.endpoints {
-                                    // mtENDPOINTS into both livecache and bootcache. The
-                                    // live cache intentionally expires after 30s, while
-                                    // bootcache keeps usable candidates for later
-                                    // autoconnect rounds.
-                                    if insert_peerfinder_bootcache(
-                                        &mut redirect_bootcache,
-                                        ep.endpoint,
-                                    ) {
-                                        bootcache_dirty = true;
-                                    }
-                                    remember_known_endpoint(
-                                        &mut known_endpoints,
-                                        ep.endpoint,
-                                        ep.hops,
-                                        now,
-                                    );
-                                }
-                            }
-
-                            // --- Route TmLedgerData to acquisitions ---
-                            // Use direct channel (immediate from overlay) plus
-                            // snapshot (for any that arrived before channel was
-                            // registered). reference gotLedgerData is called directly
-                            // from the network thread for immediate processing.
-                            let mut direct_messages = Vec::new();
-                            let mut direct_channel_capped = false;
-                            for _ in 0..MAX_DIRECT_LEDGER_DATA_PER_TICK {
-                                match ledger_data_rx
-                                    .lock()
-                                    .expect("ledger_data_rx lock")
-                                    .as_ref()
-                                    .map(|rx| rx.try_recv())
-                                    .unwrap_or(Err(std::sync::mpsc::TryRecvError::Disconnected))
-                                {
-                                    Ok(msg) => direct_messages.push(msg),
-                                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                                }
-                            }
-                            if direct_messages.len() == MAX_DIRECT_LEDGER_DATA_PER_TICK {
-                                direct_channel_capped = true;
-                            }
-                            let total_ledger_data = snapshot.ledger_data.len() + direct_messages.len();
-                            let mut routed = 0usize;
-                            let mut unrouted = 0usize;
-
-                            // Process direct channel messages first (faster path)
-                            for message in &direct_messages {
-                                if let Some(cookie) = message.message.request_cookie {
-                                    if let Some(target) = peers.iter().find(|p| p.id() == cookie) {
-                                        let mut fwd = message.message.clone();
-                                        fwd.request_cookie = None;
-                                        let reply = overlay::ProtocolMessage::new(
-                                            overlay::ProtocolPayload::LedgerData(fwd),
-                                        );
-                                        target.send(overlay::Message::new(reply, None));
-                                    }
-                                    continue;
-                                }
-                                if let Some((hash, packet)) =
-                                    parse_ledger_data_packet(&message.message)
-                                {
-                                    let hash = *hash.as_uint256();
-                                    if route_ledger_data_to_acq(&acq_registry, &hash, message.peer_id as u64, packet.clone()) {
-                                        routed += 1;
-                                    } else {
-                                        unrouted += 1;
-                                        // into the shared fetch-pack cache. This is free
-                                        // future progress. reference the reference source:209.
-                                        if message.message.r#type == 2
-                                            && let Some((_, packet)) = parse_ledger_data_packet(&message.message) {
-                                                let mut fp_store = SharedFetchPack::new(Arc::clone(&shared_fetch_pack));
-                                                let _ = ledger::stash_stale_packet(&packet, &mut fp_store);
-                                            }
-                                    }
-                                }
-                            }
-
-                            // Also process snapshot ledger_data (fallback path)
-                            for message in &snapshot.ledger_data {
-                                // to the peer identified by the cookie.
-                                if let Some(cookie) = message.message.request_cookie {
-                                    if let Some(target) = peers.iter().find(|p| p.id() == cookie) {
-                                        let mut fwd = message.message.clone();
-                                        fwd.request_cookie = None;
-                                        let reply = overlay::ProtocolMessage::new(
-                                            overlay::ProtocolPayload::LedgerData(fwd),
-                                        );
-                                        target.send(overlay::Message::new(reply, None));
-                                    }
-                                    continue;
-                                }
-                                if let Some((hash, packet)) =
-                                    parse_ledger_data_packet(&message.message)
-                                {
-                                    let hash = *hash.as_uint256();
-                                    if route_ledger_data_to_acq(&acq_registry, &hash, message.peer_id as u64, packet.clone()) {
-                                        routed += 1;
-                                    } else {
-                                        unrouted += 1;
-                                        if message.message.r#type == 2
-                                            && let Some((_, packet)) = parse_ledger_data_packet(&message.message) {
-                                                let mut fp_store = SharedFetchPack::new(Arc::clone(&shared_fetch_pack));
-                                                let _ = ledger::stash_stale_packet(&packet, &mut fp_store);
-                                            }
-                                    }
-                                }
-                            }
-
-                            // --- Route TMGetObjectByHash responses ---
-                            for message in &snapshot.get_objects {
-                                if message.message.query { continue; }
-                                let ledger_hash = match message.message.ledger_hash.as_deref()
-                                    .and_then(Uint256::from_slice)
-                                {
-                                    Some(h) => h,
-                                    None => continue,
-                                };
-                                let packet_type = match message.message.r#type {
-                                    3 => ledger::InboundLedgerDataType::TransactionNode,
-                                    4 => ledger::InboundLedgerDataType::StateNode,
-                                    6 => {
-                                        // otFETCH_PACK: reference adds each object to the
-                                        // shared fetch-pack cache via addFetchPack, then
-                                        // calls gotFetchPack which triggers checkLocal on
-                                        // all active InboundLedgers.
-                                        for obj in &message.message.objects {
-                                            let Some(hash_bytes) = obj.hash.as_deref() else { continue };
-                                            let Some(hash) = Uint256::from_slice(hash_bytes) else { continue };
-                                            let Some(data) = obj.data.as_ref() else { continue };
-                                            // Add to shared cache (reference addFetchPack)
-                                            shared_fetch_pack.add_fetch_pack(hash, data.clone());
-                                        }
-                                        // active acquisitions immediately so they find the
-                                        // new data in the shared cache via AccountStateSF::getNode.
-                                        for tx in acq_registry.lock().expect("acq registry").values() {
-                                            let _ = tx.send(AcqMsg::FetchPackReady);
-                                        }
-                                        tracing::debug!(target: "inbound_ledger", objects = message.message.objects.len(), acquisitions = inbound_ledgers.active_count(), "Fetch-pack ingested");
-                                        continue;
-                                    }
-                                    _ => continue,
-                                };
-                                let nodes: Vec<_> = message.message.objects.iter()
-                                    .filter_map(|obj| {
-                                        let data = obj.data.as_ref()?;
-                                        Some(ledger::InboundLedgerNodeData::new(
-                                            obj.node_id.clone(), data.clone(),
-                                        ))
-                                    })
-                                    .collect();
-                                if nodes.is_empty() { continue; }
-                                let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
-                                route_ledger_data_to_acq(&acq_registry, &ledger_hash, message.peer_id as u64, packet);
-                            }
-
-                            // --- Serve GetLedger requests (reference processLedgerRequest) ---
-                            if let Some(loaded_ledger_runtime) = loaded_ledger_runtime.as_ref() {
-                                for gl in &snapshot.get_ledgers {
-                                    if let Some(peer) = peers.iter().find(|p| p.id() == gl.peer_id) {
-                                        serve_get_ledger(
-                                            loaded_ledger_runtime,
-                                            &gl.message,
-                                            peer.as_ref(),
-                                            &peers,
-                                        );
-                                    }
-                                }
-                            }
-
-                            if total_ledger_data > 0 || !snapshot.get_objects.is_empty()
-                                || !snapshot.get_ledgers.is_empty()
-                            {
-                                tracing::debug!(target: "overlay", total_ledger_data, direct_channel_capped, routed, unrouted, get_ledgers = snapshot.get_ledgers.len(), get_objects = snapshot.get_objects.len(), acqs = inbound_ledgers.active_count(), "Route summary");
-                            }
-
-                            // --- Process inbound transactions from peers (reference NetworkOPs::processTransaction) ---
-                            if !snapshot.transactions.is_empty() {
-                                for queued_tx in &snapshot.transactions {
-                                    let mut serial = protocol::SerialIter::new(&queued_tx.message.raw_transaction);
-                                    let st_tx = match std::panic::catch_unwind(
-                                        std::panic::AssertUnwindSafe(|| {
-                                            protocol::STTx::from_serial_iter(&mut serial)
-                                        }),
-                                    ) {
-                                        Ok(tx) => tx,
-                                        Err(_) => continue,
-                                    };
-                                    let st_tx = std::sync::Arc::new(st_tx);
-                                    let mut transaction: app::SharedTransaction =
-                                        std::sync::Arc::new(std::sync::Mutex::new(
-                                            app::tx_queue::transaction::Transaction::new(
-                                                std::sync::Arc::clone(&st_tx),
-                                            ),
-                                        ));
-                                    if let Some(network_ops_runtime) = app.network_ops_runtime() {
-                                        let _ = network_ops_runtime.process_transaction(
-                                            &mut transaction,
-                                            false,
-                                            false,
-                                            false,
-                                            || {
-                                                app.job_queue().dispatch_next_job();
-                                                true
-                                            },
-                                            || {},
-                                        );
-                                    }
-                                }
-                            }
-                        }
 
                         // --- Check acquisition results (reference InboundLedgers parity) ---
                         // Sweep stale entries on timer
@@ -5978,6 +5892,10 @@ impl<D> BoundServerRuntime<D> {
     fn stop_catch_up_loop(&self) {
         tracing::info!(target: "main", "Shutdown signal received");
         self.catch_up_state.stop.store(true, Ordering::Release);
+        // Stop the JobQueue so its persistent worker threads (spawned at
+        // startup alongside the overlay timer) exit their run_worker_loop
+        // and can be joined during process shutdown.
+        self.app.job_queue().stop();
         if let Some(handle) = self
             .catch_up_state
             .worker
