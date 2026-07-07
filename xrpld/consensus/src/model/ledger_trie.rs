@@ -270,11 +270,7 @@ impl<L: TrieLedger> LedgerTrie<L> {
     /// Find the node with an exact ledger-id match to `ledger`'s tip.
     /// O(n). Matches `findByLedgerID()`.
     fn find_by_ledger_id(&self, ledger_id: L::Id) -> Option<usize> {
-        self.nodes
-            .iter()
-            .enumerate()
-            .find(|(idx, n)| n.live && (*idx == ROOT || n.tip_support > 0 || true) && n.span.tip().id == ledger_id)
-            .map(|(idx, _)| idx)
+        self.nodes.iter().enumerate().find(|(_, n)| n.live && n.span.tip().id == ledger_id).map(|(idx, _)| idx)
     }
 
     /// Insert and/or increment support for `ledger`. Matches `insert()`.
