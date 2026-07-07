@@ -72,9 +72,9 @@ impl LoadManagerJournal for RecordingJournal {
 
 #[test]
 fn load_manager_warns_on_stall_and_raises_fee_on_stop_when_queue_is_overloaded() {
-    let queue = JobQueue::new();
-    assert!(queue.add_job(JobType::Pack, "first", || {}));
-    assert!(queue.add_job(JobType::Pack, "second", || {}));
+    let queue = JobQueue::default();
+    assert!(queue.add_job(JobType::JtPack, "first", || {}));
+    assert!(queue.add_job(JobType::JtPack, "second", || {}));
 
     let fees = Arc::new(RecordingFees::default());
     let events = Arc::new(RecordingEvents::default());
@@ -115,9 +115,9 @@ fn load_manager_warns_on_stall_and_raises_fee_on_stop_when_queue_is_overloaded()
 
 #[test]
 fn load_manager_can_raise_real_load_fee_track_on_stop() {
-    let queue = JobQueue::new();
-    assert!(queue.add_job(JobType::Pack, "first", || {}));
-    assert!(queue.add_job(JobType::Pack, "second", || {}));
+    let queue = JobQueue::default();
+    assert!(queue.add_job(JobType::JtPack, "first", || {}));
+    assert!(queue.add_job(JobType::JtPack, "second", || {}));
 
     let fees = Arc::new(SharedLoadFeeTrack::new());
     let events = Arc::new(RecordingEvents::default());

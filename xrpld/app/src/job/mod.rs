@@ -5,5 +5,5 @@
 pub mod job_queue;
 pub mod job_types;
 
-pub use job_queue::JobQueue;
+pub use job_queue::{JobQueue, RunningJob};
 pub use job_types::{JobType, JobTypeInfo};

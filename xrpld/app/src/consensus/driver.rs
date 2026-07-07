@@ -50,7 +50,13 @@ pub fn consensus_event_channel() -> (Sender<ConsensusEvent>, Receiver<ConsensusE
 /// `NetworkOPsImp::recvValidation`.
 fn parse_validation(bytes: &[u8]) -> Option<STValidation> {
     let mut sit = protocol::SerialIter::new(bytes);
-    STValidation::from_serial_iter_default_node_id(&mut sit, true).ok()
+    match STValidation::from_serial_iter_default_node_id(&mut sit, true) {
+        Ok(v) => Some(v),
+        Err(err) => {
+            tracing::warn!(target: "consensus", ?err, "validation parse failed");
+            None
+        }
+    }
 }
 
 /// Spawn the consensus event-loop background thread. Processes

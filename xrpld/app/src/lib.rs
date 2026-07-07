@@ -96,3 +96,19 @@ pub fn reload_log_filter(filter: &str) -> Result<(), String> {
 pub fn consensus_ledger_from_ledger(ledger_arc: &std::sync::Arc<::ledger::Ledger>) -> ::consensus::RclCxLedger {
     ::consensus::RclCxLedger::new(std::sync::Arc::clone(ledger_arc))
 }
+
+/// A no-op `ledger::LedgerJournal`, re-exported under this name for call
+/// sites (e.g. `xrpld/main`'s ledger-catch-up logic) that construct a
+/// [`consensus::rcl_validation::RclValidatedLedger`] via
+/// [`validated_ledger_from_ledger`] without a real diagnostics journal
+/// wired in.
+pub use ::ledger::NullLedgerJournal as NullRclValidationJournal;
+
+/// Wrap a real `&ledger::Ledger` as the ancestor-trie-carrying
+/// `RclValidatedLedger` Phase 5's validations tracker needs for
+/// `get_preferred`/`get_preferred_lcl` queries (see `xrpld/main`'s
+/// `preferred_closed_ledger_hash`-adjacent catch-up logic). Matches the
+/// reference's implicit `RCLValidatedLedger{ledger}` construction.
+pub fn validated_ledger_from_ledger(ledger: &::ledger::Ledger, journal: &impl ::ledger::LedgerJournal) -> consensus::rcl_validation::RclValidatedLedger {
+    consensus::rcl_validation::RclValidatedLedger::from_ledger_with_journal(ledger, journal)
+}

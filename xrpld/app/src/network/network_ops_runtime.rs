@@ -256,6 +256,32 @@ impl AppNetworkOpsRuntime {
             .store(false, Ordering::Release);
     }
 
+    /// Start a consensus round on `ledger` (its id is used as the new
+    /// round's previous-ledger id). Unlike
+    /// [`NetworkOpsRuntime::maybe_begin_consensus_from_validated`], this is
+    /// NOT gated by the one-shot `consensus_bootstrap_started` flag -- it
+    /// is meant to be called once per round, every time a ledger is
+    /// accepted, matching the reference's `NetworkOPsImp::endConsensus`
+    /// unconditionally calling `beginConsensus` (which in turn calls
+    /// `Consensus::startRound`) after `RCLConsensus::Adaptor::onAccept`
+    /// finishes building the new ledger. Without this repeated call,
+    /// `Consensus::timerEntry` would tick forever on a round already in
+    /// the `Accepted` phase (a no-op, per `timerEntry`'s early return) and
+    /// the chain would permanently stall after its first ledger.
+    pub fn start_next_round(&self, consensus_runtime: &AppConsensusRuntime, ledger: Arc<Ledger>) {
+        let now = current_net_time();
+        let prev_id = *ledger.header().hash.as_uint256();
+        let prev_cx = consensus_ledger_from_ledger(&ledger);
+        let runtime = consensus_runtime.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("network ops start-next-round runtime");
+        rt.block_on(async {
+            runtime.start_round(now, prev_id, prev_cx).await;
+        });
+    }
+
     pub fn maybe_begin_consensus_from_validated(
         &self,
         consensus_runtime: &AppConsensusRuntime,

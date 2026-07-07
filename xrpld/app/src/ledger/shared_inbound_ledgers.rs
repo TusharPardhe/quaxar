@@ -83,6 +83,79 @@ pub enum NodeStoreWriteMsg {
     Stop,
 }
 
+/// Spawn a dedicated background thread that flushes acquired SHAMap nodes
+/// to the node store, draining `NodeStoreWriteMsg`s sent by acquisition
+/// workers. Ported from `xrpld/main`'s own `spawn_nodestore_writer` (used
+/// there for the standalone/normal catchup loop's `InboundLedgers`) so
+/// `--start` mode's `SharedInboundLedgers` instance -- previously
+/// constructed but never wired to a real node-store write path via
+/// `set_write_tx`/`set_pending_writes` -- has the same real persistence
+/// pipeline. Without this, `SharedInboundLedgers::acquire` early-returns
+/// unconditionally (its `write_tx`/`pending_writes` guards are `None`),
+/// silently no-opping every active-acquisition request `--start` mode's
+/// `Consensus::checkLedger` -> `handleWrongLedger` -> `acquireLedger` path
+/// needs to catch a node up to a ledger it doesn't have cached locally.
+pub fn spawn_nodestore_writer(
+    ns: crate::shamap::shamap_store_backend::SHAMapStoreNodeStore,
+    pending_writes: Arc<Mutex<HashMap<Uint256, PendingNodeStoreObject>>>,
+) -> (Sender<NodeStoreWriteMsg>, thread::JoinHandle<()>) {
+    let (tx, rx) = std::sync::mpsc::channel::<NodeStoreWriteMsg>();
+    let handle = thread::Builder::new()
+        .name("xrpld-nudb-writer".to_owned())
+        .spawn(move || {
+            let mut total_writes = 0u64;
+            let mut last_log = Instant::now();
+            let do_store = |ns: &crate::shamap::shamap_store_backend::SHAMapStoreNodeStore, obj_type, data, hash, seq| match ns {
+                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => db.store(obj_type, data, hash, seq),
+                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => db.store(obj_type, data, hash, seq),
+            };
+            let mut total_store_us = 0u64;
+            loop {
+                // Block waiting for first message
+                let first = match rx.recv() {
+                    Ok(NodeStoreWriteMsg::Write { obj_type, data, hash, seq }) => Some((obj_type, data, hash, seq)),
+                    Ok(NodeStoreWriteMsg::Flush(ack)) => {
+                        let _ = ack.send(());
+                        None
+                    }
+                    Ok(NodeStoreWriteMsg::Stop) | Err(_) => return,
+                };
+                // Process the first write
+                if let Some((obj_type, data, hash, seq)) = first {
+                    let t = Instant::now();
+                    do_store(&ns, obj_type, data, hash, seq);
+                    pending_writes.lock().expect("pending node-store writes mutex").remove(&hash);
+                    total_store_us += t.elapsed().as_micros() as u64;
+                    total_writes += 1;
+                }
+                // Drain ALL queued writes without blocking
+                loop {
+                    match rx.try_recv() {
+                        Ok(NodeStoreWriteMsg::Write { obj_type, data, hash, seq }) => {
+                            let t = Instant::now();
+                            do_store(&ns, obj_type, data, hash, seq);
+                            pending_writes.lock().expect("pending node-store writes mutex").remove(&hash);
+                            total_store_us += t.elapsed().as_micros() as u64;
+                            total_writes += 1;
+                        }
+                        Ok(NodeStoreWriteMsg::Flush(ack)) => {
+                            let _ = ack.send(());
+                        }
+                        Ok(NodeStoreWriteMsg::Stop) => return,
+                        Err(_) => break,
+                    }
+                }
+                if last_log.elapsed() >= std::time::Duration::from_secs(10) {
+                    let avg_us = if total_writes > 0 { total_store_us / total_writes } else { 0 };
+                    tracing::debug!(target: "nodestore", total_writes, avg_us, "NuDB writer status (start-mode)");
+                    last_log = Instant::now();
+                }
+            }
+        })
+        .expect("nudb writer thread");
+    (tx, handle)
+}
+
 /// Limits concurrent run_data processing to reduce cache mutex contention.
 pub struct RunDataLimiter {
     state: Mutex<usize>,

@@ -38,26 +38,83 @@ pub trait RclValidationTrustSource {
 /// storage). Matches the reference's `Application::getValidationsDB`
 /// forwarding: `handleNewValidation` calls this fire-and-forget for every
 /// full validation, trusted or not, once it has been accepted as current.
-pub trait RclValidationStore: Send + Sync {
-    fn store(&self, validation: &STValidation);
+///
+/// Distinct from [`SharedAppValidations::store`] (which returns a
+/// [`RclValidationsStoreView`] over the tracker's own historical query
+/// surface, matching the reference's `RCLValidations` being both tracker
+/// and queryable store in one type) -- this trait is the narrower
+/// external-persistence hook passed into [`handle_new_validation_with_store`],
+/// kept separate so a caller can plug in real disk/database persistence
+/// without that concern leaking into the query-facing `store()` accessor.
+pub trait RclValidationPersistence: Send + Sync {
+    fn persist(&self, validation: &STValidation);
 }
 
-/// A no-op store, used where the caller has no local validation
-/// persistence configured.
+/// A no-op persistence hook, used where the caller has no external
+/// validation storage configured.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct NullRclValidationStore;
+pub struct NullRclValidationPersistence;
 
-impl RclValidationStore for NullRclValidationStore {
-    fn store(&self, _validation: &STValidation) {}
+impl RclValidationPersistence for NullRclValidationPersistence {
+    fn persist(&self, _validation: &STValidation) {}
 }
 
 /// Notified synchronously when a validation for the *current* working
 /// ledger is accepted, so the caller (typically `NetworkOPs`) can trigger
-/// an immediate `checkAccept`-style re-evaluation without waiting for the
-/// next timer tick. Matches the reference's inline `app_.getOPs().pubValidation(val)`
-/// plus `checkAccept` call sequence at the end of `NetworkOPsImp::recvValidation`.
+/// an immediate `checkAccept`-style re-evaluation of whether that ledger
+/// now has enough validation support to promote, without waiting for the
+/// next timer tick. Matches the reference's
+/// `app_.getLedgerMaster().checkAccept(ledgerHash, ledgerSeq)` call at the
+/// end of `NetworkOPsImp::recvValidation`.
 pub trait RclValidationAcceptanceSink {
-    fn on_validation_current(&self, validation: &STValidation);
+    fn check_accept(&self, ledger_hash: Uint256, ledger_seq: u32);
+}
+
+/// A view over [`SharedAppValidations`]'s tracker exposing its historical
+/// query surface, matching the reference's `RCLValidations` being usable
+/// directly as both the live tracker and a queryable store of past
+/// validations. Returned by [`SharedAppValidations::store`] so callers
+/// (see `xrpld/main`'s ledger-catch-up and fee-voting logic) can chain
+/// `.validations().store().trusted_for_ledger_by_sequence(...)` /
+/// `.fees_for_ledger(...)` directly.
+pub struct RclValidationsStoreView<'a, Clock: crate::state::time_keeper::TimeKeeperClock> {
+    shared: &'a SharedAppValidations<Clock>,
+}
+
+impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> RclValidationsStoreView<'_, Clock> {
+    /// The signer public keys of trusted, full validations tracked for
+    /// `ledger_id` at sequence `seq`. Matches the reference's
+    /// `RCLValidations::getTrustedForLedger` usage in
+    /// `NegativeUNLVote`/ledger-catch-up code (see `xrpld/main`'s
+    /// `try_promote_ledger_with_validations` and negative-UNL voting call
+    /// sites, which feed the result directly into
+    /// `ValidatorList::negative_unl_filter_validations(Vec<STValidation>)`).
+    /// Returns owned `STValidation`s (cloned out of the tracker's shared
+    /// `Arc<STValidation>` wrapper) rather than just signer keys, since
+    /// that filter needs the full validation to look up the signer's
+    /// current master key.
+    pub fn trusted_for_ledger_by_sequence(&self, ledger_id: Uint256, seq: u32) -> Vec<STValidation> {
+        self.shared
+            .inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .get_trusted_for_ledger(&ledger_id, seq)
+            .into_iter()
+            .map(|wrapped| (*wrapped).clone())
+            .collect()
+    }
+
+    /// Fees reported by trusted, full validators for `ledger_id`,
+    /// substituting `base_fee` for any validation that did not report a
+    /// load fee. Matches `Validations::fees`; the `seq` parameter is
+    /// accepted for call-site symmetry with `trusted_for_ledger_by_sequence`
+    /// but not used for filtering -- the reference's own `fees()` likewise
+    /// has no sequence filter, since fee-voting only cares about which
+    /// ledger id validators are on, not which round each individual
+    /// validation was issued in.
+    pub fn fees_for_ledger(&self, ledger_id: Uint256, _seq: u32, base_fee: u32) -> Vec<u32> {
+        self.shared.inner.lock().expect("shared app validations mutex must not be poisoned").fees(&ledger_id, base_fee)
+    }
 }
 
 /// The concrete `Validations<RclValidationsAdaptor>` instantiation used by
@@ -71,7 +128,7 @@ pub type RclValidationsInner = Validations<RclValidationsAdaptor>;
 /// accessor, minus the `Application` coupling.
 pub struct SharedAppValidations<Clock: crate::state::time_keeper::TimeKeeperClock> {
     inner: Arc<Mutex<RclValidationsInner>>,
-    store: Arc<dyn RclValidationStore>,
+    persistence: Arc<dyn RclValidationPersistence>,
     ledger_master_state: Arc<crate::ledger::ledger_master_state::SharedLedgerMasterState>,
     journal: Arc<crate::state::app_registry::AppJournal>,
     ledger_master_runtime: Arc<Mutex<Option<Arc<AppLedgerMasterRuntime>>>>,
@@ -88,7 +145,7 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock> Clone for SharedAppValid
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
-            store: Arc::clone(&self.store),
+            persistence: Arc::clone(&self.persistence),
             ledger_master_state: Arc::clone(&self.ledger_master_state),
             journal: Arc::clone(&self.journal),
             ledger_master_runtime: Arc::clone(&self.ledger_master_runtime),
@@ -114,7 +171,7 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
         let adaptor = RclValidationsAdaptor::new(now_source);
         Self {
             inner: Arc::new(Mutex::new(Validations::new(consensus::rcl_support::ValidationParms::default(), adaptor))),
-            store: Arc::new(NullRclValidationStore),
+            persistence: Arc::new(NullRclValidationPersistence),
             ledger_master_state,
             journal,
             ledger_master_runtime: Arc::new(Mutex::new(None)),
@@ -122,10 +179,10 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
         }
     }
 
-    /// Attach a validation persistence store (defaults to a no-op store
-    /// when constructed via [`Self::new`]).
-    pub fn with_store(mut self, store: Arc<dyn RclValidationStore>) -> Self {
-        self.store = store;
+    /// Attach an external validation persistence hook (defaults to a
+    /// no-op when constructed via [`Self::new`]).
+    pub fn with_persistence(mut self, persistence: Arc<dyn RclValidationPersistence>) -> Self {
+        self.persistence = persistence;
         self
     }
 
@@ -138,9 +195,17 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
         &self.inner
     }
 
-    /// The configured validation persistence store.
-    pub fn store(&self) -> &Arc<dyn RclValidationStore> {
-        &self.store
+    /// The external validation persistence hook.
+    pub fn persistence(&self) -> &Arc<dyn RclValidationPersistence> {
+        &self.persistence
+    }
+
+    /// A queryable view over this tracker's historical validation data.
+    /// Matches the reference's `RCLValidations` being directly usable for
+    /// both live tracking and historical queries; see
+    /// [`RclValidationsStoreView`].
+    pub fn store(&self) -> RclValidationsStoreView<'_, Clock> {
+        RclValidationsStoreView { shared: self }
     }
 
     /// The ledger-master state this tracker was constructed against.
@@ -203,7 +268,7 @@ pub fn handle_new_validation_with_store(
     validation: &mut STValidation,
     bypass_accept: bool,
     accept_sink: Option<&dyn RclValidationAcceptanceSink>,
-    store: Option<&dyn RclValidationStore>,
+    persistence: Option<&dyn RclValidationPersistence>,
     journal: Option<&dyn RclValidationJournal>,
 ) -> consensus::ValidationStatus {
     let signing_key = *validation.get_signer_public();
@@ -232,10 +297,10 @@ pub fn handle_new_validation_with_store(
         if !bypass_accept
             && let Some(sink) = accept_sink
         {
-            sink.on_validation_current(validation);
+            sink.check_accept(validation.get_ledger_hash(), validation.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence")));
         }
-        if let Some(store) = store {
-            store.store(validation);
+        if let Some(persistence) = persistence {
+            persistence.persist(validation);
         }
     }
 

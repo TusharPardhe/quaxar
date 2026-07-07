@@ -237,7 +237,7 @@ impl AppNetworkOpsValidationRuntime {
                 validation,
                 bypass_accept,
                 accept_sink,
-                Some(self.validations.store().as_ref()),
+                Some(self.validations.persistence().as_ref()),
                 Some(self.journal.as_ref()),
             ) == consensus::ValidationStatus::Current
         };

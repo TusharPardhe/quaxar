@@ -2122,7 +2122,7 @@ fn peer_prefers_different_closed_ledger(
         .validations()
         .lock()
         .expect("validations lock should not be poisoned")
-        .get_preferred(app::validated_ledger_from_ledger(
+        .get_preferred(&app::validated_ledger_from_ledger(
             accepted_ledger,
             &app::NullRclValidationJournal,
         ));
@@ -2204,7 +2204,7 @@ fn update_operating_mode_after_accepted_ledger(
                 .validations()
                 .lock()
                 .expect("validations lock")
-                .get_preferred(app::validated_ledger_from_ledger(
+                .get_preferred(&app::validated_ledger_from_ledger(
                     accepted_ledger,
                     &app::NullRclValidationJournal,
                 ));
@@ -4847,7 +4847,7 @@ impl<D> BoundServerRuntime<D> {
                             .set_transaction_router(Box::new(move |_peer_id, message| {
                                 let job_app = router_app.clone();
                                 router_app.job_queue().add_job(
-                                    app::job::job_types::JobType::Transaction,
+                                    app::job::job_types::JobType::JtTransaction,
                                     "RcvCheckTx",
                                     move || {
                                         process_inbound_transaction(&job_app, &message.message.raw_transaction);

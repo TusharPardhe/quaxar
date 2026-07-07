@@ -222,6 +222,90 @@ struct JobQueueInner {
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
+/// An RAII handle representing a job reserved via
+/// [`JobQueue::reserve_next_job`], owning that job's "running" slot until
+/// [`RunningJob::finish`] is called or the handle is dropped. Exposes the
+/// same descriptive fields as the reference's `Job` (`job_type`, `name`,
+/// `index`, `queue_time`) for callers driving execution manually.
+///
+/// If the handle is dropped without an explicit call to
+/// [`RunningJob::finish`] (e.g. the reserving thread panics, or the
+/// caller simply lets it go out of scope after running the job inline),
+/// `Drop` performs the same `finish_job` bookkeeping and wakes a worker
+/// in case a deferred job of this type is now runnable -- so the
+/// concurrency-limit slot is never leaked regardless of how the handle's
+/// lifetime ends.
+pub struct RunningJob {
+    inner: Arc<JobQueueInner>,
+    job_type: JobType,
+    name: String,
+    index: u64,
+    queue_time: Instant,
+    func: Option<Box<dyn FnOnce() + Send + 'static>>,
+    finished: bool,
+}
+
+impl RunningJob {
+    /// The job type this reservation holds a "running" slot for.
+    pub fn job_type(&self) -> JobType {
+        self.job_type
+    }
+
+    /// The name the job was submitted with.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The monotonically increasing submission index used to break ties
+    /// between same-priority jobs (earliest submitted runs first).
+    pub fn index(&self) -> u64 {
+        self.index
+    }
+
+    /// When this job was originally submitted to the queue (not when it
+    /// was reserved), matching the reference's `Job::queueTime()`.
+    pub fn queue_time(&self) -> Instant {
+        self.queue_time
+    }
+
+    /// Explicitly release this job's "running" slot, promoting a
+    /// deferred job of the same type if one is waiting and waking a
+    /// worker to check for newly-runnable work. Idempotent: calling this
+    /// more than once (or letting the handle drop afterward) has no
+    /// further effect.
+    pub fn finish(mut self) {
+        self.finish_inner();
+    }
+
+    fn finish_inner(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+
+        let mut guard = self.inner.state.lock();
+        let promoted_deferred = finish_job(&mut guard, self.job_type);
+        guard.process_count -= 1;
+        let now_idle = guard.process_count == 0 && guard.queue.is_empty();
+        drop(guard);
+
+        self.inner.load_events.fetch_add(1, AtomicOrdering::Relaxed);
+
+        if now_idle {
+            self.inner.idle.notify_all();
+        }
+        if promoted_deferred {
+            self.inner.not_empty.notify_one();
+        }
+    }
+}
+
+impl Drop for RunningJob {
+    fn drop(&mut self) {
+        self.finish_inner();
+    }
+}
+
 impl std::fmt::Debug for JobQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JobQueue")
@@ -377,6 +461,45 @@ impl JobQueue {
         self.inner.load_events.fetch_add(count, AtomicOrdering::Relaxed);
         let mut state = self.inner.state.lock();
         state.counters_mut(job_type).load_events += count;
+    }
+
+    /// Reserve the highest-priority runnable job without running it,
+    /// returning an RAII handle ([`RunningJob`]) that owns the "running"
+    /// slot until it is explicitly finished (via [`RunningJob::finish`])
+    /// or dropped. Returns `None` if no job is currently runnable (the
+    /// queue is empty, or every waiting job's type is at its concurrency
+    /// limit).
+    ///
+    /// This is a manual, synchronous alternative to the persistent
+    /// worker-pool dispatch `add_job` normally triggers automatically --
+    /// useful for callers that want to drive job execution themselves
+    /// (e.g. a single-threaded test harness, or a custom worker loop) on
+    /// a `JobQueue` that was constructed without its own workers doing
+    /// the dispatching. It reuses the same underlying scheduling state
+    /// and concurrency-limit bookkeeping as the automatic worker loop
+    /// (`take_next_runnable_job`/`finish_job`), so counts observed via
+    /// `job_count`/`job_count_total`/`job_count_ge` stay consistent
+    /// regardless of which dispatch path is used.
+    pub fn reserve_next_job(&self) -> Option<RunningJob> {
+        let mut state = self.inner.state.lock();
+        let job = state.take_next_runnable_job()?;
+        state.process_count += 1;
+        Some(RunningJob { inner: Arc::clone(&self.inner), job_type: job.job_type, name: job.name, index: job.index, queue_time: job.queue_time, func: Some(job.func), finished: false })
+    }
+
+    /// Reserve and immediately run the next runnable job on the calling
+    /// thread, then mark it finished. Returns `None` (without blocking)
+    /// if no job is currently runnable. Matches the same manual-dispatch
+    /// use case as [`JobQueue::reserve_next_job`], but folds
+    /// reserve-run-finish into a single call for callers that just want
+    /// to drive the queue forward one job at a time on their own thread
+    /// (e.g. `while queue.dispatch_next_job().is_some() {}`).
+    pub fn dispatch_next_job(&self) -> Option<()> {
+        let mut running = self.reserve_next_job()?;
+        let func = running.func.take().expect("RunningJob::func is only taken once, by dispatch_next_job or Drop");
+        func();
+        running.finish();
+        Some(())
     }
 
     /// Whether the queue is under enough sustained load to be considered

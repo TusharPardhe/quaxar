@@ -29,7 +29,6 @@
 //! two seams where both are needed (`get_prev_ledger`, `on_close`).
 
 use basics::unordered_containers::HashSet;
-use consensus::model::TrieLedger;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration as StdDuration;
 
@@ -71,6 +70,19 @@ pub trait RclConsensusOpenLedgerSource {
 pub trait RclConsensusValidationSource {
     fn num_trusted_for_ledger(&self, ledger_id: Uint256) -> usize;
     fn preferred_lcl(&self, lcl: &crate::consensus::rcl_validation::RclValidatedLedger, min_seq: u32, peer_counts: &std::collections::BTreeMap<Uint256, u32>) -> Uint256;
+    /// The trust-trie-preferred working ledger, derived purely from trusted
+    /// validations received so far (no peer input). Matches the reference's
+    /// `Validations::getPreferred(Ledger const&, Seq)` overload, which is
+    /// what `RCLConsensus::Adaptor::getPrevLedger` actually calls -- NOT
+    /// `getPreferredLCL`'s peer-counts-aware overload (that one is reserved
+    /// for `NetworkOPsImp::checkLastClosedLedger`/`endConsensus`). This is
+    /// the real catch-up mechanism: if this node's validations trie shows a
+    /// different (further-ahead) branch than what consensus is currently
+    /// building on, `getPrevLedger` detects the mismatch and triggers
+    /// `handleWrongLedger`, forcing this node to acquire and switch to the
+    /// network's actual preferred ledger instead of blindly continuing to
+    /// build its own.
+    fn preferred_min_seq(&self, curr: &crate::consensus::rcl_validation::RclValidatedLedger, min_valid_seq: u32) -> Uint256;
 }
 
 impl RclConsensusValidationSource for SharedAppValidations<SystemTimeKeeperClock> {
@@ -80,6 +92,10 @@ impl RclConsensusValidationSource for SharedAppValidations<SystemTimeKeeperClock
 
     fn preferred_lcl(&self, lcl: &crate::consensus::rcl_validation::RclValidatedLedger, min_seq: u32, peer_counts: &std::collections::BTreeMap<Uint256, u32>) -> Uint256 {
         self.validations().lock().expect("shared app validations mutex must not be poisoned").get_preferred_lcl(lcl, min_seq, peer_counts)
+    }
+
+    fn preferred_min_seq(&self, curr: &crate::consensus::rcl_validation::RclValidatedLedger, min_valid_seq: u32) -> Uint256 {
+        self.validations().lock().expect("shared app validations mutex must not be poisoned").get_preferred_min_seq(curr, min_valid_seq)
     }
 }
 
@@ -381,8 +397,29 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
 
     fn acquire_ledger(&self, ledger_id: &Uint256) -> Option<Self::Ledger> {
         let hash = basics::sha_map_hash::SHAMapHash::new(*ledger_id);
-        let ledger = self.ledger_master_runtime.ledger_master().ledger_history().get_cached_ledger_by_hash(hash)?;
-        Some(RclCxLedger::new(ledger))
+        if let Some(ledger) = self.ledger_master_runtime.ledger_master().ledger_history().get_cached_ledger_by_hash(hash) {
+            return Some(RclCxLedger::new(ledger));
+        }
+
+        // Matches the reference's `RCLConsensus::Adaptor::acquireLedger`:
+        // when the cache lookup misses, ACTIVELY dispatch a fetch for the
+        // consensus ledger (`app.getInboundLedgers().acquireAsync(id, 0,
+        // Reason::CONSENSUS)`), rather than passively waiting for it to
+        // arrive via some unrelated path. `SharedInboundLedgers::acquire`
+        // dedupes internally (a repeated call for the same hash while one
+        // is already in flight just touches its last-seen time), so this
+        // is safe to call unconditionally on every tick that still can't
+        // find the ledger cached -- matching the reference's own
+        // `acquiringLedger_ != hash` guard, which exists purely to avoid
+        // re-logging/re-dispatching every single tick, not for
+        // correctness (a duplicate `acquireAsync` for the same hash is
+        // itself a no-op in the reference's `InboundLedgers::acquire`).
+        if let Some(guard) = self.ledger_master_runtime.shared_inbound_ledgers.lock().ok()
+            && let Some(shared) = guard.as_ref()
+        {
+            shared.acquire(*ledger_id, 0);
+        }
+        None
     }
 
     fn acquire_tx_set(&self, set_id: &Uint256) -> Option<Self::TxSet> {
@@ -405,11 +442,25 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         RclConsensusValidationSource::num_trusted_for_ledger(&self.validations, *prev_ledger_id)
     }
 
-    fn get_prev_ledger(&self, prev_ledger_id: &Uint256, prev_ledger: &Self::Ledger, _mode: ConsensusMode) -> Uint256 {
-        let mut peer_counts = std::collections::BTreeMap::new();
-        peer_counts.insert(*prev_ledger_id, 1u32);
+    fn get_prev_ledger(&self, _prev_ledger_id: &Uint256, prev_ledger: &Self::Ledger, _mode: ConsensusMode) -> Uint256 {
+        // Matches the reference's `RCLConsensus::Adaptor::getPrevLedger`:
+        // ask the trust trie (built purely from received trusted
+        // validations, independent of what any single peer reports) which
+        // branch it prefers, using `ledgerMaster_.getValidLedgerIndex()` as
+        // the minimum sequence floor. This is the real catch-up trigger --
+        // if this node's own view has fallen behind what the network's
+        // trusted validators have actually validated, the trie will prefer
+        // a different (further-ahead) ledger id than `prev_ledger_id`, and
+        // `Consensus::checkLedger` will detect that mismatch and call
+        // `handleWrongLedger` to force this node to acquire and switch to
+        // it -- rather than blindly continuing to build on its own stale
+        // view, which is what happens if this always echoes back
+        // `prev_ledger_id` unconditionally (the bug this replaces: seeding
+        // `getPreferredLCL`'s peer-counts map with only our own id can
+        // never disagree with ourselves, permanently defeating catch-up).
+        let min_valid_seq = self.ledger_master_runtime.ledger_master().valid_ledger_seq();
         let wrapped = self.validated_view(prev_ledger);
-        RclConsensusValidationSource::preferred_lcl(&self.validations, &wrapped, wrapped.seq(), &peer_counts)
+        RclConsensusValidationSource::preferred_min_seq(&self.validations, &wrapped, min_valid_seq)
     }
 
     fn on_mode_change(&self, before: ConsensusMode, after: ConsensusMode) {
@@ -440,7 +491,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         prev_ledger: &Self::Ledger,
         _close_resolution: StdDuration,
         _raw_close_times: &ConsensusCloseTimes,
-        _mode: ConsensusMode,
+        mode: ConsensusMode,
     ) {
         let next_seq = prev_ledger.seq() + 1;
         let base_fee = self.ledger_master_runtime.ledger_master().closed_ledger().map(|l| l.fees().base).unwrap_or(10);
@@ -448,14 +499,65 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         RclConsensusOpenLedgerSource::accept_consensus_ledger(&self.open_ledger, next_seq, base_fee, &prev_ledger.id());
 
         let close_time = result.position.close_time().as_seconds();
-        let closed_seq = next_seq.saturating_sub(1);
+        // `ApplicationRoot::accept_ledger`'s `closed_seq` parameter names the
+        // sequence of the ledger being built (checked against
+        // `parent.seq() + 1` internally), not the previous/parent ledger's
+        // own sequence -- so this must be `next_seq` directly, not
+        // `next_seq - 1` (which would just be `prev_ledger.seq()` again and
+        // fail that internal guard, silently erroring out of every accept
+        // past the first ledger).
+        let closed_seq = next_seq;
+
+        // Matches the reference's `RCLConsensus::Adaptor::doAccept` calling
+        // `validate(built, result.txns, proposing)` when this node is a
+        // configured validator. This is not merely a diagnostic artifact:
+        // without publishing a validation for every accepted ledger, no
+        // node's trust trie (`Validations`) ever accumulates real
+        // cross-node data, so `getPrevLedger`'s `Validations::getPreferred`
+        // lookup can never detect that a node has fallen behind the
+        // network's actual validated chain -- the exact catch-up mechanism
+        // `checkLedger`/`handleWrongLedger` depends on.
+        //
+        // Signing happens INSIDE the spawned job, after `accept_ledger`
+        // succeeds and the real built ledger's hash is known -- NOT here.
+        // `STValidation::new_signed` computes and embeds the signature
+        // over the validation's fields as they exist at signing time;
+        // mutating any field afterward (e.g. setting `sfLedgerHash` post
+        // hoc once the async build finishes) invalidates that signature,
+        // which is exactly the bug an earlier version of this code had
+        // (every peer's `from_serial_iter` signature check failed with
+        // `InvalidSignature` because `sfLedgerHash` was being set after
+        // `new_signed` had already signed the object without it).
+        //
+        // Even after fixing that, a SECOND, subtler bug remained: signing
+        // right after `ledger_acceptor.accept_ledger(...)` returns (as this
+        // code used to do) races `ConsensusLedgerAcceptor::accept_ledger`'s
+        // async, fire-and-forget wrapper, which enqueues the real ledger
+        // build and returns `Ok` immediately WITHOUT waiting for it. Reading
+        // `closed_ledger()` immediately after that `Ok` can observe the
+        // PREVIOUS ledger, producing a validation whose `sfLedgerHash`
+        // doesn't match its claimed `sfLedgerSequence` -- which corrupted
+        // the trust trie with an internally inconsistent `(seq, id)` pair,
+        // making `Validations::getPreferred` return nonsense and causing
+        // `Consensus::checkLedger` to reset back to genesis every round.
+        // Fixed by moving signing INSIDE `ConsensusLedgerAcceptor::
+        // accept_ledger`'s own inner job (see `application_root.rs`), which
+        // runs synchronously right after the real, just-built ledger's hash
+        // is known -- passed down here as a `PendingValidation` rather than
+        // signed at this call site.
+        let pending_validation = self.validator_keys.keys.as_ref().map(|keys| crate::state::application_root::PendingValidation {
+            public_key: keys.public_key,
+            secret_key: keys.secret_key.clone(),
+            node_id: protocol::calc_node_id(&keys.public_key),
+            consensus_hash: result.txns.id(),
+            proposing: mode == ConsensusMode::Proposing,
+        });
+
         let ledger_acceptor = Arc::clone(&self.ledger_acceptor);
         let journal = Arc::clone(&self.journal);
-        self.ledger_acceptor.spawn_consensus_accept_job(Box::new(move || {
-            if let Err(err) = ledger_acceptor.accept_ledger(closed_seq, close_time, base_fee) {
-                journal.error(&format!("on_accept: accept_ledger failed: {err}"));
-            }
-        }));
+        if let Err(err) = ledger_acceptor.accept_ledger(closed_seq, close_time, base_fee, pending_validation) {
+            journal.error(&format!("on_accept: accept_ledger failed: {err}"));
+        }
     }
 
     fn propose(&self, pos: &consensus::ConsensusProposal<PublicKey, Uint256, Uint256>) {
@@ -487,20 +589,15 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         &self.parms
     }
 
-    fn next_ledger_time_resolution(&self, previous_resolution: StdDuration, _previous_agree: bool, _ledger_seq: u32) -> StdDuration {
-        // Matches the reference's `getNextLedgerTimeResolution`: the
-        // resolution ladder is a ledger-agnostic algorithm already ported
-        // in Phase 1 (`ConsensusParms`); this adaptor hook exists purely
-        // for the crate boundary, so it simply forwards to the pure
-        // function rather than reimplementing the ladder here.
-        previous_resolution
+    fn next_ledger_time_resolution(&self, previous_resolution: StdDuration, previous_agree: bool, ledger_seq: u32) -> StdDuration {
+        let previous = time::Duration::seconds(previous_resolution.as_secs() as i64);
+        let next = consensus::algorithm::timing::get_next_ledger_time_resolution(previous, previous_agree, ledger_seq);
+        StdDuration::from_secs(next.whole_seconds().max(0) as u64)
     }
 
     fn round_close_time(&self, raw: NetClockTimePoint, resolution: StdDuration) -> NetClockTimePoint {
-        let resolution_secs = resolution.as_secs().max(1);
-        let raw_secs = u64::from(raw.as_seconds());
-        let rounded = ((raw_secs + resolution_secs / 2) / resolution_secs) * resolution_secs;
-        NetClockTimePoint::new(rounded as u32)
+        let resolution = time::Duration::seconds(resolution.as_secs() as i64);
+        consensus::algorithm::timing::round_close_time(raw, resolution)
     }
 }
 
@@ -524,6 +621,13 @@ pub trait ConsensusRunner: Send + Sync {
     fn timer_tick<'a>(&'a self, now: NetClockTimePoint) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 
     fn got_tx_set<'a>(&'a self, now: NetClockTimePoint, txs: Vec<RclCxTx>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+    /// The current round's phase. Matches the reference's
+    /// `Consensus::phase()`, used by `NetworkOPsImp::processHeartbeatTimer`
+    /// to detect phase transitions and by `endConsensus`/`beginConsensus`'s
+    /// caller to know when a round has finished (`Accepted`) and a new one
+    /// needs to be started.
+    fn phase(&self) -> consensus::algorithm::ConsensusPhase;
 }
 
 /// Concrete [`ConsensusRunner`] wrapping Phase 3's
@@ -612,6 +716,10 @@ impl ConsensusRunner for AppConsensus {
             let mut state = self.state.lock().expect("consensus state mutex must not be poisoned");
             state.got_tx_set(&self.adaptor, now, &set);
         })
+    }
+
+    fn phase(&self) -> consensus::algorithm::ConsensusPhase {
+        self.state.lock().expect("consensus state mutex must not be poisoned").phase()
     }
 }
 

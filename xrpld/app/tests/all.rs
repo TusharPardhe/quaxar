@@ -2,7 +2,6 @@
 
 mod amendments;
 mod bootstrap;
-mod consensus;
 mod integration;
 mod job;
 mod ledger;

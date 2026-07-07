@@ -1,8 +1,7 @@
 //! server info tests part B.
 
 use super::*;
-use app::JobType;
-use perflog::PerfLog;
+use perflog::{JobType, PerfLog};
 use std::time::Instant;
 
 #[test]

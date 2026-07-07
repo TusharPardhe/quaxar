@@ -2396,7 +2396,7 @@ impl RpcRuntime for ApplicationRoot {
     }
 
     fn client_job_count(&self) -> u32 {
-        u32::try_from(self.job_queue().get_job_count_ge(JobType::Client)).unwrap_or(u32::MAX)
+        u32::try_from(self.job_queue().job_count_ge(JobType::JtClient)).unwrap_or(u32::MAX)
     }
 
     fn has_current_ledger(&self) -> bool {

@@ -4,6 +4,7 @@
 pub mod consensus;
 pub mod functions;
 pub mod params;
+pub mod timing;
 pub mod types;
 
 pub use consensus::{Consensus, ConsensusAdaptor, ConsensusClock, ConsensusLedger, ConsensusTx, ConsensusTxSet, PeerPosition, SystemConsensusClock};
