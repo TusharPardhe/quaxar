@@ -20,8 +20,8 @@ use std::collections::BTreeMap;
 /// cheaply-copyable type with a sequence number, an identity, and the
 /// ability to look up an ancestor's id at any earlier sequence.
 pub trait TrieLedger: Clone {
-    type Seq: Copy + Ord + Default + std::ops::Add<u32, Output = Self::Seq> + std::ops::Sub<u32, Output = Self::Seq>;
-    type Id: Copy + Eq + Ord + Default;
+    type Seq: Copy + Ord + Default + std::hash::Hash + std::ops::Add<u32, Output = Self::Seq> + std::ops::Sub<u32, Output = Self::Seq>;
+    type Id: Copy + Eq + Ord + Default + std::hash::Hash;
 
     /// The genesis ledger: prefixes all other ledgers, at `Seq` zero.
     fn genesis() -> Self;

@@ -507,6 +507,7 @@ name = "consensus"
 version = "0.1.0"
 dependencies = [
  "basics",
+ "parking_lot",
  "protocol",
  "rand 0.8.5",
  "serde_json",
