@@ -49,6 +49,7 @@ use crate::state::time_keeper::{SystemTimeKeeperClock, TimeKeeper};
 use crate::tx_queue::transaction_master::TransactionMaster;
 use crate::validator::validator_keys::ValidatorKeys;
 use crate::validator::validator_list::ValidatorList;
+use overlay::Overlay;
 
 pub type RclCxTx = consensus::RclCxTx;
 pub type RclCxLedger = consensus::RclCxLedger;
@@ -159,19 +160,63 @@ impl RclConsensusRelay for AppRclConsensusRelay {
             self.journal.trace("relay_proposal: no overlay attached, skipping broadcast");
             return;
         };
-        let _ = (overlay, peer_pos);
-        // Wire format construction/broadcast for TMProposeSet is owned by
-        // the overlay crate's message-building helpers; this hook exists
-        // so `AppRclConsensusAdaptor::propose`/`share_peer_position` have a
-        // single, testable seam to call into once that wiring lands.
+
+        let proposal = peer_pos.proposal();
+        let message = overlay::TmProposeSet {
+            propose_seq: proposal.propose_seq(),
+            current_tx_hash: proposal.position().data().to_vec(),
+            node_pub_key: peer_pos.public_key().as_bytes().to_vec(),
+            close_time: proposal.close_time().as_seconds(),
+            signature: peer_pos.signature().to_vec(),
+            previousledger: proposal.prev_ledger().data().to_vec(),
+            added_transactions: Vec::new(),
+            removed_transactions: Vec::new(),
+            ..Default::default()
+        };
+
+        // Matches the reference's `app_.overlay().relay(peerPos, suppression, validatorKeys)`:
+        // squelch-aware relay keyed by this proposal's suppression id, so
+        // peers that already saw the same proposal (via a different path)
+        // don't get it re-forwarded. Both our own freshly-signed proposals
+        // (from `AppRclConsensusAdaptor::propose`) and peer proposals we're
+        // forwarding (from `share_peer_position`) go through this same
+        // suppression-aware path, matching the reference's unified
+        // `relay()` call for both cases.
+        let _ = overlay.relay_proposal(message, peer_pos.suppression_id(), *peer_pos.public_key());
     }
 
     fn relay_tx_set(&self, set: &consensus::RclTxSet) {
-        let _ = set;
+        let Some(overlay) = self.overlay.as_ref() else {
+            self.journal.trace("relay_tx_set: no overlay attached, skipping broadcast");
+            return;
+        };
+
+        // Matches the reference's `app_.overlay().relay(TMHaveTransactionSet)`:
+        // announce that we now have this tx-set (peers that want its
+        // contents will pull it via `TMGetLedger`/`TMLedgerData`, matching
+        // the pull-based tx-set acquisition `acquire_tx_set` implements on
+        // the receiving side), rather than eagerly pushing the full set.
+        let message = overlay::ProtocolMessage::new(overlay::ProtocolPayload::HaveSet(overlay::TmHaveTransactionSet {
+            status: 1, // tsHAVE
+            hash: set.id().data().to_vec(),
+        }));
+        overlay.broadcast(&message);
     }
 
     fn relay_disputed_tx(&self, tx: &consensus::RclCxTxRef) {
-        let _ = tx;
+        let Some(overlay) = self.overlay.as_ref() else {
+            self.journal.trace("relay_disputed_tx: no overlay attached, skipping broadcast");
+            return;
+        };
+
+        let raw_transaction = tx.item().data().to_vec();
+        let message = overlay::TmTransaction {
+            raw_transaction,
+            status: 2, // tsCURRENT
+            receive_timestamp: None,
+            deferred: None,
+        };
+        overlay.relay_transaction(tx.id(), Some(message), &std::collections::BTreeSet::new());
     }
 }
 
@@ -217,6 +262,18 @@ pub struct AppRclConsensusAdaptor {
     #[allow(dead_code)]
     overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
     parms: ConsensusParms,
+    /// A single, long-lived tree-node cache shared by every `RclTxSet`
+    /// this adaptor builds or adopts (`on_close`'s initial position,
+    /// `acquire_tx_set`'s adopted peer sets, and `AppConsensus::got_tx_set`'s
+    /// reconstructed sets). Matches the reference's single shared
+    /// `TreeNodeCache` for the transaction-tree family: reusing one cache
+    /// (rather than a fresh, empty one per call) means a tx-set adopted
+    /// from an acquired `SyncTree` and a tx-set rebuilt independently from
+    /// the same transactions' blobs can share cached nodes, and matters
+    /// for correctness (not just performance) when comparing two `RclTxSet`s
+    /// built through different paths, since `RclTxSet::compare` fetches
+    /// through this cache on cache misses.
+    tx_set_cache: consensus::rcl::RclTxSetSharedCache,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -239,6 +296,12 @@ impl AppRclConsensusAdaptor {
         amendment_status: Option<Arc<crate::amendments::amendment_status::AmendmentStatus>>,
         overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
     ) -> Self {
+        let tx_set_cache: consensus::rcl::RclTxSetSharedCache = Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
+            "consensus-tx-set-cache",
+            256,
+            time::Duration::minutes(5),
+            basics::tagged_cache::MonotonicClock::default(),
+        ));
         Self {
             options,
             time_keeper,
@@ -257,6 +320,7 @@ impl AppRclConsensusAdaptor {
             amendment_status,
             overlay,
             parms: ConsensusParms::default(),
+            tx_set_cache,
         }
     }
 
@@ -279,6 +343,34 @@ impl AppRclConsensusAdaptor {
     fn validated_view(&self, ledger: &RclCxLedger) -> crate::consensus::rcl_validation::RclValidatedLedger {
         crate::consensus::rcl_validation::RclValidatedLedger::from_ledger(&ledger.ledger())
     }
+
+    /// Adopt a completed `shamap::sync::SyncTree` (as delivered by
+    /// `InboundTransactions::get_set` once a peer tx-set finishes
+    /// acquiring) as an `RclTxSet`, sharing this adaptor's persistent
+    /// tree-node cache. Matches the reference's implicit construction of
+    /// an `RCLTxSet` directly from the acquired `SHAMap`.
+    ///
+    /// `SyncTree` does not expose a public `ledger_seq()` getter (only a
+    /// setter), so this uses `0` for the resulting `RclTxSet`'s ledger-seq
+    /// bookkeeping field. That field only affects the SHAMap storage
+    /// tree's internal write-versioning; since the adopted tree is only
+    /// ever read/compared afterward (a peer's tx-set position is never
+    /// mutated once acquired), its value has no bearing on correctness
+    /// here -- matching the same reasoning already applied to
+    /// `AppConsensus::got_tx_set`'s own reconstruction.
+    fn sync_tree_to_rcl_tx_set(&self, sync_tree: &shamap::sync::SyncTree) -> consensus::RclTxSet {
+        sync_tree_to_rcl_tx_set(sync_tree, &self.tx_set_cache)
+    }
+}
+
+/// Adopt a completed `shamap::sync::SyncTree` as an `RclTxSet` sharing the
+/// given tree-node cache. Extracted as a free function (rather than an
+/// `AppRclConsensusAdaptor` method only) so it can be unit-tested directly
+/// against a real `SyncTree` without needing to construct a full adaptor.
+/// See [`AppRclConsensusAdaptor::sync_tree_to_rcl_tx_set`] for the full
+/// rationale on the `ledger_seq` placeholder.
+fn sync_tree_to_rcl_tx_set(sync_tree: &shamap::sync::SyncTree, cache: &consensus::rcl::RclTxSetSharedCache) -> consensus::RclTxSet {
+    consensus::RclTxSet::from_parts(sync_tree.root(), Arc::clone(cache), sync_tree.backed(), 0)
 }
 
 impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
@@ -294,14 +386,11 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
     }
 
     fn acquire_tx_set(&self, set_id: &Uint256) -> Option<Self::TxSet> {
-        let mut guard = self.inbound_transactions.lock().expect("inbound transactions mutex must not be poisoned");
-        let _sync_tree = guard.get_set(*set_id, true)?;
-        // The acquired `SyncTree` becomes usable as an `RclTxSet` once its
-        // root is adopted; this seam intentionally stays narrow (returns
-        // `None` until the sync tree round-trips through the same
-        // SHAMap-backed storage `RclTxSet` uses) rather than guessing at
-        // an unverified `SyncTree -> RclTxSet` conversion API.
-        None
+        let sync_tree = {
+            let mut guard = self.inbound_transactions.lock().expect("inbound transactions mutex must not be poisoned");
+            guard.get_set(*set_id, true)?
+        };
+        Some(self.sync_tree_to_rcl_tx_set(&sync_tree))
     }
 
     fn has_open_transactions(&self) -> bool {
@@ -329,13 +418,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
 
     fn on_close(&self, prev_ledger: &Self::Ledger, now: NetClockTimePoint, _mode: ConsensusMode) -> consensus::algorithm::consensus::ConsensusResultOf<Self> {
         let txs = RclConsensusOpenLedgerSource::current_open_transactions(&self.open_ledger);
-        let cache: consensus::rcl::RclTxSetSharedCache = Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
-            "consensus-initial-txset",
-            256,
-            time::Duration::minutes(5),
-            basics::tagged_cache::MonotonicClock::default(),
-        ));
-        let mut set = consensus::RclTxSet::new(cache, prev_ledger.seq() + 1);
+        let mut set = consensus::RclTxSet::new(Arc::clone(&self.tx_set_cache), prev_ledger.seq() + 1);
         {
             let mut editable = set.mutable_view();
             for tx in &txs {
@@ -496,28 +579,32 @@ impl ConsensusRunner for AppConsensus {
 
     fn got_tx_set<'a>(&'a self, now: NetClockTimePoint, txs: Vec<RclCxTx>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            let cache: consensus::rcl::RclTxSetSharedCache = Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
-                "consensus-got-txset",
-                256,
-                time::Duration::minutes(5),
-                basics::tagged_cache::MonotonicClock::default(),
-            ));
-            let ledger_seq = {
-                let state = self.state.lock().expect("consensus state mutex must not be poisoned");
-                // The tx-set's own ledger_seq bookkeeping only affects the
-                // SHAMap backing store's version stamp, not consensus
-                // correctness; 0 is the same "not yet backed" sentinel
-                // `RclTxSet::new` itself already documents.
-                let _ = state.prev_ledger_id();
-                0u32
-            };
-            let mut set = consensus::RclTxSet::new(cache, ledger_seq);
+            // `txs` carries only the transaction ids that make up the
+            // completed acquired tx-set (matches `network_ops_runtime.rs`'s
+            // `handle_map_complete`, which visits the acquired `SyncTree`'s
+            // leaves for ids but does not forward the tree itself). Rebuild
+            // an `RclTxSet` from those ids' full transaction blobs, sourced
+            // from the transaction master cache -- this reconstruction is
+            // deterministic (SHAMap hashing depends only on the tx set's
+            // contents), so the resulting `RclTxSet::id()` will match the
+            // originally-acquired set's hash as long as every transaction
+            // is present in the cache. Transactions this node has already
+            // seen (via ordinary relay, which normally arrives at or
+            // before tx-set acquisition completes) will be present; any
+            // that are not will simply be missing from the reconstructed
+            // set, which would produce a hash mismatch `Consensus::got_tx_set`
+            // itself cannot detect (it trusts the id it's given) -- this
+            // matches the reference's own trust model, which likewise
+            // assumes a fully hydrated `SHAMap` from the acquisition layer.
+            let mut set = consensus::RclTxSet::new(Arc::clone(&self.adaptor.tx_set_cache), 0);
             {
                 let mut editable = set.mutable_view();
                 for tx in &txs {
                     if let Some(shared) = self.adaptor.transaction_master.fetch_from_cache(&tx.id) {
                         let guard = shared.lock().expect("transaction master entry mutex must not be poisoned");
                         editable.insert(&consensus::RclCxTxRef::from_transaction(guard.get_s_transaction()));
+                    } else {
+                        self.adaptor.journal.warn(&format!("got_tx_set: transaction {} not found in local cache; reconstructed tx-set may not match the acquired hash", tx.id));
                     }
                 }
                 set = editable.freeze();
@@ -525,5 +612,96 @@ impl ConsensusRunner for AppConsensus {
             let mut state = self.state.lock().expect("consensus state mutex must not be poisoned");
             state.got_tx_set(&self.adaptor, now, &set);
         })
+    }
+}
+
+#[cfg(test)]
+mod sync_tree_conversion_tests {
+    use super::sync_tree_to_rcl_tx_set;
+    use basics::hardened_hash::HardenedHashBuilder;
+    use basics::tagged_cache::MonotonicClock;
+    use protocol::{STAmount, STTx, TxType, get_field_by_symbol, serialize_blob};
+    use shamap::item::SHAMapItem;
+    use shamap::storage::StorageTree;
+    use shamap::sync::{SHAMapType, SyncState, SyncTree};
+    use shamap::tree_node::SHAMapNodeType;
+    use std::sync::Arc;
+
+    fn cache() -> consensus::rcl::RclTxSetSharedCache {
+        Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
+            "sync-tree-conversion-test",
+            32,
+            time::Duration::minutes(5),
+            basics::tagged_cache::MonotonicClock::default(),
+        ))
+    }
+
+    fn payment(fill: u8) -> STTx {
+        STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_field_u32(get_field_by_symbol("sfSequence"), u32::from(fill));
+            tx.set_field_amount(get_field_by_symbol("sfAmount"), STAmount::new_native(u64::from(fill), false));
+            tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(10, false));
+        })
+    }
+
+    /// Build a real, completed `SyncTree` containing the given transactions,
+    /// matching the shape `InboundTransactions::get_set` hands back once a
+    /// peer tx-set finishes acquiring (an unbacked, non-synching tree with
+    /// every leaf already attached). Uses `StorageTree` directly (the same
+    /// underlying primitive `consensus::RclTxSet` builds on) since
+    /// `RclTxSet`'s own root is private to its crate.
+    fn completed_sync_tree(txs: &[STTx], cache: consensus::rcl::RclTxSetSharedCache) -> SyncTree {
+        let cache: Arc<shamap::tree_node_cache::TreeNodeCache<MonotonicClock, HardenedHashBuilder>> = cache;
+        let mut map = StorageTree::new(1, false, 1, cache);
+        for tx in txs {
+            let item = SHAMapItem::new(tx.get_transaction_id(), serialize_blob(tx));
+            map.add_item(SHAMapNodeType::TransactionNm, item).expect("insert into a fresh test tree should not need fetches");
+        }
+        map.unshare();
+
+        let tree = SyncTree::from_root_with_type(map.root(), SHAMapType::Transaction, false, 1, SyncState::Modifying);
+        tree.set_full();
+        tree
+    }
+
+    #[test]
+    fn sync_tree_to_rcl_tx_set_preserves_id_and_membership() {
+        let tx1 = payment(1);
+        let tx2 = payment(2);
+        let tx1_id = tx1.get_transaction_id();
+        let tx2_id = tx2.get_transaction_id();
+
+        let shared_cache = cache();
+        let tree = completed_sync_tree(&[tx1, tx2], cache());
+        let adopted = sync_tree_to_rcl_tx_set(&tree, &shared_cache);
+
+        assert!(adopted.exists(tx1_id));
+        assert!(adopted.exists(tx2_id));
+        assert_eq!(adopted.id(), *tree.root().get_hash().as_uint256());
+    }
+
+    #[test]
+    fn sync_tree_to_rcl_tx_set_matches_hash_of_independently_built_equivalent_set() {
+        // The whole point of the SyncTree->RclTxSet conversion is that an
+        // acquired peer tx-set and a locally-reconstructed one containing
+        // the exact same transactions must compare equal (same root hash),
+        // since that's what lets `Consensus::got_tx_set`'s `id()` check
+        // succeed for a set rebuilt from cached transaction blobs (see
+        // `AppConsensus::got_tx_set`'s doc comment).
+        let tx1 = payment(3);
+        let tx2 = payment(4);
+
+        let tree = completed_sync_tree(&[tx1.clone(), tx2.clone()], cache());
+        let adopted = sync_tree_to_rcl_tx_set(&tree, &cache());
+
+        let mut rebuilt = consensus::RclTxSet::new(cache(), 1);
+        {
+            let mut editable = rebuilt.mutable_view();
+            editable.insert(&consensus::RclCxTxRef::from_transaction(&tx1));
+            editable.insert(&consensus::RclCxTxRef::from_transaction(&tx2));
+            rebuilt = editable.freeze();
+        }
+
+        assert_eq!(adopted.id(), rebuilt.id());
     }
 }
