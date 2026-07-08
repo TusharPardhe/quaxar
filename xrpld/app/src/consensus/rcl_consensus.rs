@@ -59,7 +59,25 @@ pub type RclCxLedger = consensus::RclCxLedger;
 pub trait RclConsensusOpenLedgerSource {
     fn current_open_transactions(&self) -> Vec<Arc<protocol::STTx>>;
     fn has_open_transactions(&self) -> bool;
-    fn accept_consensus_ledger(&self, next_seq: u32, base_fee: u64, parent_hash: &Uint256);
+    /// Resets the open ledger for the next round, matching the reference's
+    /// `app_.getOpenLedger().accept(...)`. `accepted_ids` is the set of
+    /// transaction IDs that were just built into the accepted ledger --
+    /// anything present in the OLD open ledger's transactions that is NOT
+    /// in this set is carried forward into the new (reset) open ledger,
+    /// matching the reference's carry-forward of `localTxs_`/leftover
+    /// retriable transactions rather than a full destructive reset. This
+    /// covers transactions submitted between `on_close`'s capture of
+    /// `result.txns` for this round and this reset running (a real, if
+    /// narrow, window during every consensus round) -- without carrying
+    /// them forward, such a submission would be silently and permanently
+    /// lost rather than picked up by the next round, unlike the reference.
+    fn accept_consensus_ledger(
+        &self,
+        next_seq: u32,
+        base_fee: u64,
+        parent_hash: &Uint256,
+        accepted_ids: &std::collections::HashSet<Uint256>,
+    );
 }
 
 /// The validation-tracking surface the adaptor needs to answer
@@ -489,16 +507,111 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         &self,
         result: &consensus::algorithm::consensus::ConsensusResultOf<Self>,
         prev_ledger: &Self::Ledger,
-        _close_resolution: StdDuration,
-        _raw_close_times: &ConsensusCloseTimes,
+        close_resolution: StdDuration,
+        raw_close_times: &ConsensusCloseTimes,
         mode: ConsensusMode,
     ) {
         let next_seq = prev_ledger.seq() + 1;
         let base_fee = self.ledger_master_runtime.ledger_master().closed_ledger().map(|l| l.fees().base).unwrap_or(10);
 
-        RclConsensusOpenLedgerSource::accept_consensus_ledger(&self.open_ledger, next_seq, base_fee, &prev_ledger.id());
+        // Matches the reference's `doAccept` building `retriableTxs` from
+        // `result.txns` (the transaction set `onClose` captured earlier
+        // from the open ledger, now consensus-agreed) -- NOT by re-reading
+        // the open ledger's current contents, which is about to be reset
+        // for the next round below. Deserialize failures are skipped
+        // (matching the reference's own try/catch around
+        // `std::make_shared<STTx const>(SerialIter{item.slice()})`, which
+        // tracks failed items separately but does not abort the round).
+        let txns: Vec<Arc<protocol::STTx>> = result
+            .txns
+            .all_items()
+            .into_iter()
+            .map(|item| {
+                let mut sit: protocol::SerialIter<'_> = item.data().into();
+                Arc::new(protocol::STTx::from_serial_iter(&mut sit))
+            })
+            .collect();
+        let accepted_ids: std::collections::HashSet<Uint256> =
+            txns.iter().map(|tx| tx.get_transaction_id()).collect();
 
-        let close_time = result.position.close_time().as_seconds();
+        // Reset the open ledger for the next round, carrying forward
+        // anything submitted between `on_close`'s capture (above) and this
+        // point that did NOT make it into the just-accepted set -- see
+        // `RclConsensusOpenLedgerSource::accept_consensus_ledger`'s doc
+        // comment for why this carry-forward matters.
+        RclConsensusOpenLedgerSource::accept_consensus_ledger(&self.open_ledger, next_seq, base_fee, &prev_ledger.id(), &accepted_ids);
+
+        // Matches the reference's `doAccept`:
+        //
+        //   if (consensusCloseTime == NetClock::time_point{}) {
+        //       // We agreed to disagree on the close time
+        //       consensusCloseTime = prevLedger.closeTime() + 1s;
+        //       closeTimeCorrect = false;
+        //   } else {
+        //       consensusCloseTime =
+        //           effCloseTime(consensusCloseTime, closeResolution, prevLedger.closeTime());
+        //       closeTimeCorrect = true;
+        //   }
+        //
+        // `result.position.close_time()` is each node's OWN final position
+        // out of `updateOurPositions` -- close-time agreement
+        // (`haveCloseTimeConsensus_`) is tracked completely separately
+        // from transaction-set agreement (`checkConsensus`'s
+        // proposers/agreement-percentage threshold, verified faithful
+        // elsewhere), so a round can legitimately reach
+        // `ConsensusState::Yes` (and thus `on_accept`) while every node's
+        // own `result.position.close_time()` differs, or while it never
+        // crossed ANY vote threshold at all -- in which case
+        // `update_our_positions` leaves it at `NetClockTimePoint::default()`
+        // (the zero/epoch sentinel; see
+        // `consensus::algorithm::consensus::Consensus::update_our_positions`).
+        // Using that raw, per-node value VERBATIM as the new ledger's
+        // `close_time` (as this function used to do) bakes a
+        // node-divergent value directly into the built ledger's header --
+        // a hash-affecting field -- producing a different ledger hash on
+        // every node despite identical parent, identical (possibly empty)
+        // transaction set, and correct algorithm-layer consensus. Once
+        // that happens once, every subsequent round is built on an
+        // already-diverged parent and the fork is permanent: this is the
+        // root cause of the 5-way genesis-cluster consensus fork this
+        // function's fix addresses (see
+        // `CONSENSUS_FORK_INVESTIGATION.md`). The zero-sentinel branch
+        // derives a value purely from `prev_ledger.close_time()`
+        // (identical on every node by construction), and the non-zero
+        // branch rounds to `close_resolution` and floors at
+        // `prev_ledger.close_time() + 1s` via `effective_close_time` --
+        // both `NetClockTimePoint`s here, so no `.as_seconds()` overflow
+        // concerns. `close_resolution` (renamed from the previously
+        // unused, underscore-prefixed `_close_resolution`) is exactly
+        // `Consensus::phaseEstablish`'s own `closeResolution_`, passed
+        // down by the algorithm layer to this call unchanged.
+        let raw_close_time = result.position.close_time();
+        let close_time_correct = raw_close_time != NetClockTimePoint::default();
+        let effective_close_time = if !close_time_correct {
+            NetClockTimePoint::new(prev_ledger.close_time().as_seconds().saturating_add(1))
+        } else {
+            let resolution = time::Duration::seconds(close_resolution.as_secs() as i64);
+            consensus::algorithm::timing::effective_close_time(raw_close_time, resolution, prev_ledger.close_time())
+        };
+        let close_time = effective_close_time.as_seconds();
+        // Stored verbatim into the built ledger's header (`LedgerInfo::
+        // closeTimeResolution`), matching the reference's `buildLedger`
+        // stashing `closeResolution` (this round's `Consensus::
+        // closeResolution_`, i.e. this exact `close_resolution` parameter)
+        // onto the new ledger via `Ledger::setAccepted`. Consumed by the
+        // NEXT round's `next_ledger_time_resolution` call (see
+        // `Consensus::start_round_internal`) as `previous_resolution` --
+        // if this were hardcoded instead of the real value (as it
+        // previously was, always writing `0`, a value absent from
+        // `LEDGER_POSSIBLE_TIME_RESOLUTIONS`), every future round's
+        // resolution lookup permanently fails to find a match and freezes
+        // at `0` forever, which in turn makes `effective_close_time`'s own
+        // rounding step above a complete no-op (rounding to a 0-second
+        // bucket rounds to itself) -- silently defeating the very
+        // determinism this function's zero-sentinel handling exists to
+        // provide. `close_resolution.as_secs()` fits in a `u8` for every
+        // entry in `LEDGER_POSSIBLE_TIME_RESOLUTIONS` (max 120s).
+        let close_resolution_secs = close_resolution.as_secs().min(u8::MAX as u64) as u8;
         // `ApplicationRoot::accept_ledger`'s `closed_seq` parameter names the
         // sequence of the ledger being built (checked against
         // `parent.seq() + 1` internally), not the previous/parent ledger's
@@ -553,9 +666,54 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             proposing: mode == ConsensusMode::Proposing,
         });
 
+        // Matches the reference's `doAccept`'s clock-adjustment block: once
+        // we've completed a round with the network (not after a
+        // `WrongLedger`/`SwitchedLedger` round, and not after a round that
+        // ended in `ConsensusState::MovedOn`), compare our own close time
+        // to the weighted average of every peer close-time vote received
+        // this round (`rawCloseTimes.peers`, vote count per distinct close
+        // time) and nudge `TimeKeeper`'s `closeOffset_` a quarter-step
+        // toward that average via `adjust_close_time`. This is the
+        // mechanism that lets each node's own future `close_time()`/`now()`
+        // calls -- which is what `on_close` uses to build ITS OWN close
+        // time proposal for the NEXT round -- gradually converge toward
+        // the network's actual observed consensus time, round over round,
+        // even if this node's raw local clock started with meaningful
+        // jitter relative to its peers (e.g. at genesis/startup, before
+        // any convergence has had a chance to happen). Without this call,
+        // `close_offset_` never moves, so a node's own close-time votes
+        // stay permanently anchored to whatever its local wall clock
+        // happened to be at process start, with no self-correction --
+        // this was previously a silently dropped parameter
+        // (`_raw_close_times`).
+        let consensus_fail = result.state == consensus::algorithm::types::ConsensusState::MovedOn;
+        if (mode == ConsensusMode::Proposing || mode == ConsensusMode::Observing) && !consensus_fail {
+            let close_time = raw_close_times.self_;
+            let mut close_total: i64 = i64::from(close_time.as_seconds());
+            let mut close_count: i64 = 1;
+            for (t, v) in &raw_close_times.peers {
+                close_count += i64::from(*v);
+                close_total += i64::from(t.as_seconds()) * i64::from(*v);
+            }
+            close_total += close_count / 2;
+            close_total /= close_count;
+
+            let offset_seconds = close_total - i64::from(close_time.as_seconds());
+            let new_offset = self.time_keeper.adjust_close_time(time::Duration::seconds(offset_seconds));
+            tracing::warn!(
+                target: "consensus",
+                self_close_time = close_time.as_seconds(),
+                peer_vote_count = raw_close_times.peers.len(),
+                peer_votes = ?raw_close_times.peers.iter().map(|(t, v)| (t.as_seconds(), *v)).collect::<Vec<_>>(),
+                computed_offset_seconds = offset_seconds,
+                new_close_offset_seconds = new_offset.whole_seconds(),
+                "DIAG close_time_adjust"
+            );
+        }
+
         let ledger_acceptor = Arc::clone(&self.ledger_acceptor);
         let journal = Arc::clone(&self.journal);
-        if let Err(err) = ledger_acceptor.accept_ledger(closed_seq, close_time, base_fee, pending_validation) {
+        if let Err(err) = ledger_acceptor.accept_ledger(closed_seq, close_time, close_resolution_secs, close_time_correct, base_fee, txns, pending_validation) {
             journal.error(&format!("on_accept: accept_ledger failed: {err}"));
         }
     }

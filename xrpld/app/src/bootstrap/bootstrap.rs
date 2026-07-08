@@ -1068,6 +1068,61 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             .expect("spawn validation-forwarder thread");
     }
 
+    // Immediate transaction dispatch — matches reference
+    // `PeerImp::handleTransaction` calling
+    // `JobQueue::addJob(JtTransaction, "RcvCheckTx", ...)` synchronously on
+    // receipt from the network thread. Without this, `--start` mode never
+    // registers a transaction router on `QueuedOverlayInboundHandler`, so
+    // every inbound `TMTransaction` from a peer gets queued into
+    // `OverlayInboundSnapshot::transactions` and is NEVER consumed or
+    // applied -- confirmed via a live cluster test where a burst of
+    // transactions submitted to one node's RPC never appeared on ANY other
+    // node's ledger, even though the peer network delivered the raw
+    // message (peers recognized the transaction's hash via `tx` lookups,
+    // just permanently unvalidated). This meant nodes could only ever
+    // include transactions submitted directly to their own RPC endpoint,
+    // making network-wide agreement on a shared transaction set impossible
+    // except by coincidence. Mirrors `main.rs`'s standalone catchup wiring
+    // (`process_inbound_transaction`) exactly: parse the raw bytes back
+    // into an `STTx`, wrap it, and run it through the SAME
+    // `process_transaction` + `apply_network_ops_pending_to_open_ledger`
+    // pipeline a local RPC submission uses, with `local=false` (matching
+    // reference's `bLocal=false` for network-received transactions).
+    if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+        let router_root = runtime.root().clone();
+        overlay_rt.overlay().queued_inbound().set_transaction_router(Box::new(move |_peer_id, message| {
+            let job_root = router_root.clone();
+            router_root.job_queue().add_job(
+                crate::job::job_types::JobType::JtTransaction,
+                "RcvCheckTx",
+                move || {
+                    let mut serial = protocol::SerialIter::new(&message.message.raw_transaction);
+                    let st_tx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        protocol::STTx::from_serial_iter(&mut serial)
+                    })) {
+                        Ok(tx) => tx,
+                        Err(_) => return,
+                    };
+                    let st_tx = Arc::new(st_tx);
+                    let mut transaction: crate::SharedTransaction = Arc::new(std::sync::Mutex::new(
+                        crate::tx_queue::transaction::Transaction::new(Arc::clone(&st_tx)),
+                    ));
+                    if let Some(network_ops_runtime) = job_root.network_ops_runtime() {
+                        let _ = network_ops_runtime.process_transaction(
+                            &mut transaction,
+                            false,
+                            false,
+                            false,
+                            || false,
+                            || {},
+                        );
+                        let _ = job_root.apply_network_ops_pending_to_open_ledger();
+                    }
+                },
+            );
+        }));
+    }
+
     while !stop.load(Ordering::Acquire) {
         let root = runtime.root();
 
@@ -1354,6 +1409,28 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                     proposal: prop,
                 });
             }
+
+            // Matches the reference's `PeerImp::onMessage(TMProposeSet)`
+            // calling `app_.getOPs().processTrustedProposal(peerPos)` ->
+            // `consensus_.peerProposal(...)` SYNCHRONOUSLY, directly from
+            // the network I/O thread, the instant a proposal arrives --
+            // completely independent of `Consensus::timerEntry`'s own 1s
+            // cadence (`ledgerGRANULARITY`). Without this call, proposals
+            // pushed into `pending_proposals` above only ever got drained
+            // inside `handle_consensus_timer` (gated by the 1s
+            // `maybe_tick_consensus!` cooldown below), meaning a proposal
+            // that arrived over the wire in milliseconds could sit unread
+            // by the algorithm for up to a full second. Confirmed via a
+            // live cluster test: nodes reached `update_our_positions` with
+            // `curr_peer_positions` empty on nearly every round despite
+            // peers continuously sending proposals, causing each node to
+            // pick its own close time independently and permanently fork
+            // from genesis+1 onward. `drain_proposals` (unlike
+            // `handle_consensus_timer`) only feeds `peer_proposal` and
+            // does NOT run the heavier `phase_open`/`phase_establish`
+            // state machine, so calling it every ~50ms iteration is cheap
+            // and matches the reference's real latency characteristics.
+            network_ops_rt.drain_proposals(consensus_rt.as_ref());
         }
 
         maybe_tick_consensus!();
@@ -1410,10 +1487,19 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 .expect("completed_ledgers_rx");
             if let Some(rx) = rx_guard.as_ref() {
                 while let Ok(ledger) = rx.try_recv() {
-                    lm_rt
+                    let inserted = lm_rt
                         .ledger_master()
                         .ledger_history()
                         .insert(std::sync::Arc::clone(&ledger), true);
+                    if !inserted {
+                        tracing::warn!(
+                            target: "consensus",
+                            seq = ledger.header().seq,
+                            hash = %ledger.header().hash,
+                            immutable = ledger.is_immutable(),
+                            "Rejected completed ledger insert from completed_ledgers_rx"
+                        );
+                    }
                     let _ = event_tx.send(
                         crate::consensus::driver::ConsensusEvent::LedgerDone(
                             std::sync::Arc::clone(&ledger),
@@ -1424,10 +1510,19 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         }
         while let Ok(ledger) = shared_completed_rx.try_recv() {
             if let Some(lm_rt) = root.ledger_master_runtime() {
-                lm_rt
+                let inserted = lm_rt
                     .ledger_master()
                     .ledger_history()
                     .insert(std::sync::Arc::clone(&ledger), true);
+                if !inserted {
+                    tracing::warn!(
+                        target: "consensus",
+                        seq = ledger.header().seq,
+                        hash = %ledger.header().hash,
+                        immutable = ledger.is_immutable(),
+                        "Rejected completed ledger insert from shared_completed_rx"
+                    );
+                }
             }
             let _ = event_tx.send(
                 crate::consensus::driver::ConsensusEvent::LedgerDone(ledger),

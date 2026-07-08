@@ -246,7 +246,13 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
     /// validated ledgers).
     pub fn set_ledger_master_runtime(&self, runtime: Option<Arc<AppLedgerMasterRuntime>>) -> Option<Arc<AppLedgerMasterRuntime>> {
         let mut slot = self.ledger_master_runtime.lock().expect("shared app validations ledger master runtime mutex must not be poisoned");
-        std::mem::replace(&mut *slot, runtime)
+        let previous = std::mem::replace(&mut *slot, runtime.clone());
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .adaptor()
+            .set_ledger_master_runtime(runtime);
+        previous
     }
 }
 

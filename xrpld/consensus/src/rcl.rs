@@ -129,6 +129,21 @@ impl RclTxSet {
         map.peek_item(entry, &mut |_| None).expect("loaded consensus tx set should not need fetches").map(Arc::new)
     }
 
+    /// Returns every item stored in this transaction set. Matches the
+    /// reference's `for (auto const& item : *result.txns.map)` iteration in
+    /// `RCLConsensus::Adaptor::doAccept`, used to build the `CanonicalTXSet`
+    /// (`retriableTxs`) that is actually applied to build the new ledger.
+    /// This is the one true source of "what did consensus agree to include"
+    /// -- it must be read directly from this already-captured set, not by
+    /// re-querying any mutable, concurrently-reset open ledger view.
+    pub fn all_items(&self) -> Vec<Arc<SHAMapItem>> {
+        let map = StorageTree::from_loaded_root(self.root.clone(), 1, self.backed, self.ledger_seq, Arc::clone(&self.cache));
+        let mut items = Vec::new();
+        map.visit_leaves(&mut |_| None, &mut |item| items.push(Arc::new(item.clone())))
+            .expect("loaded consensus tx set should not need fetches");
+        items
+    }
+
     pub fn id(&self) -> Uint256 {
         *self.root.get_hash().as_uint256()
     }

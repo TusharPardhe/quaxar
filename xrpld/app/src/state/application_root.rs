@@ -1,6 +1,7 @@
 //! Honest application-root owner for the migrated runtime shell.
 
 use crate::amendments::amendment_status::{AmendmentStatus, UnsupportedMajorityWarningDetails};
+use crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource;
 use crate::consensus::rcl_validations::SharedAppValidations;
 use crate::job::job_queue::JobQueue;
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
@@ -349,11 +350,24 @@ pub struct PendingValidation {
 }
 
 pub trait LedgerAcceptor: Send + Sync + 'static {
+    /// `txns` is the exact transaction set consensus agreed on this round
+    /// (the reference's `result.txns`, captured by `onClose` from the open
+    /// ledger's contents at that earlier point in time and passed down
+    /// through `doAccept` unchanged). This must NOT be re-derived by
+    /// re-reading the open ledger's CURRENT contents at accept time: the
+    /// open ledger is reset for the next round (see
+    /// `accept_consensus_ledger`) synchronously, at the START of
+    /// `on_accept`, before this (async, JobQueue-dispatched) call's inner
+    /// job actually runs -- re-reading it here would race that reset and
+    /// see the wrong (usually empty, freshly-reset) set.
     fn accept_ledger(
         &self,
         closed_seq: u32,
         close_time: u32,
+        close_resolution: u8,
+        correct_close_time: bool,
         base_fee_drops: u64,
+        txns: Vec<Arc<protocol::STTx>>,
         validation: Option<PendingValidation>,
     ) -> Result<u32, String>;
 
@@ -421,10 +435,13 @@ impl LedgerAcceptor for ApplicationRoot {
         &self,
         closed_seq: u32,
         close_time: u32,
+        close_resolution: u8,
+        correct_close_time: bool,
         base_fee_drops: u64,
+        txns: Vec<Arc<protocol::STTx>>,
         _validation: Option<PendingValidation>,
     ) -> Result<u32, String> {
-        self.accept_ledger(closed_seq, close_time, base_fee_drops)
+        self.accept_ledger_with_txns(closed_seq, close_time, close_resolution, correct_close_time, base_fee_drops, txns)
     }
 
     fn consensus_built(&self, ledger: Arc<ledger::Ledger>) -> Result<(), String> {
@@ -1576,7 +1593,10 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
         &self,
         closed_seq: u32,
         close_time: u32,
+        close_resolution: u8,
+        correct_close_time: bool,
         base_fee_drops: u64,
+        txns: Vec<Arc<protocol::STTx>>,
         validation: Option<PendingValidation>,
     ) -> Result<u32, String> {
         let root = self.root.clone();
@@ -1585,7 +1605,7 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
         if !self
             .job_queue
             .add_job(crate::job::job_types::JobType::JtAccept, name, move || {
-                match root.accept_ledger(closed_seq, close_time, base_fee_drops) {
+                match root.accept_ledger_with_txns(closed_seq, close_time, close_resolution, correct_close_time, base_fee_drops, txns) {
                     Ok(_) => {
                         // Matches the reference's `RCLConsensus::Adaptor::doAccept`
                         // calling `notify(neACCEPTED_LEDGER, built, haveCorrectLCL)`
@@ -2753,6 +2773,7 @@ impl ApplicationRoot {
             Arc::clone(&self.registry.hash_router),
             Arc::clone(&self.transaction_master),
             Arc::clone(&self.ledger_master_state),
+            self.shared_time_keeper(),
         ));
         let _ = self.attach_network_ops_runtime(Arc::clone(&runtime));
         runtime
@@ -3885,6 +3906,24 @@ impl ApplicationRoot {
         let ledger = self.ledger_with_node_fetcher(ledger);
         self.ledger_master_state
             .note_validated_ledger(Arc::clone(&ledger));
+        // Matches the reference's `LedgerMaster::setFullLedger`: once a
+        // ledger is fully validated (`ledger->setValidated()`), it calls
+        // `ledgerHistory_.insert(ledger, true)` -- with `validated=true`,
+        // unlike `on_closed_ledger`'s earlier `insert(..., false)` call
+        // (matching `storeLedger`'s pre-validation insert, called before
+        // this point in the same round). `LedgerHistory::insert` only
+        // populates its by-SEQUENCE index (`ledgers_by_index`) when
+        // `validated` is true -- passing `false` here would leave `--start`
+        // mode's per-round accepted ledgers permanently unreachable via
+        // `get_ledger_by_seq`/`ledger_index: <n>` RPC lookups (only the
+        // single most-recent `ledger_master_state` pointer would remain
+        // reachable), even though `ledger_history` is exactly the cache
+        // `ledger_history`/`online_delete` config is meant to size.
+        if let Some(runtime) = self.ledger_master_runtime()
+            && ledger.is_immutable()
+        {
+            runtime.ledger_master().ledger_history().insert(Arc::clone(&ledger), true);
+        }
         self.amendment_status.do_validated_ledger(ledger.as_ref());
         if !self.network_ops_state.is_blocked() {
             if self.amendment_status.has_unsupported_enabled() {
@@ -4086,11 +4125,43 @@ impl ApplicationRoot {
         close_time: u32,
         base_fee_drops: u64,
     ) -> Result<u32, String> {
+        // Standalone/test call sites have no separate consensus round with
+        // an already-captured transaction set, so read the open ledger's
+        // current contents directly -- there is no concurrent reset racing
+        // this synchronous call the way there is for the real `--start`
+        // mode consensus path (see `accept_ledger_with_txns`). Unlike that
+        // real path, there is no multi-node determinism concern here (this
+        // is a single-node helper), so the close-resolution schedule is
+        // simply pinned at the reference's `kLedgerDefaultTimeResolution`
+        // (30s) with `closeTimeCorrect = true`, matching this function's
+        // previous (hardcoded) behavior exactly.
+        let txns = self.registry.open_ledger.current_open_transactions();
+        self.accept_ledger_with_txns(closed_seq, close_time, 30, true, base_fee_drops, txns)
+    }
+
+    /// Builds and persists the real accepted ledger from `txns` -- the
+    /// exact transaction set that should be applied, matching the
+    /// reference's `RCLConsensus::Adaptor::doAccept` building
+    /// `retriableTxs` from `result.txns` (itself captured earlier, in
+    /// `onClose`, from `app_.getOpenLedger().current()->txs`). Callers
+    /// driven by live consensus MUST pass the transaction set captured at
+    /// `on_close` time, NOT a fresh read of the open ledger's current
+    /// contents -- by the time this runs (asynchronously, on a JobQueue
+    /// worker), the open ledger has typically already been reset for the
+    /// next round by `accept_consensus_ledger` (called synchronously at
+    /// the START of `on_accept`, before this job is even enqueued), so
+    /// re-reading it here would almost always see the wrong (freshly
+    /// emptied) set.
+    pub fn accept_ledger_with_txns(
+        &self,
+        closed_seq: u32,
+        close_time: u32,
+        close_resolution: u8,
+        correct_close_time: bool,
+        base_fee_drops: u64,
+        txns: Vec<Arc<protocol::STTx>>,
+    ) -> Result<u32, String> {
         let parent_ledger = self.closed_ledger().or_else(|| self.validated_ledger());
-        let current_rules = parent_ledger
-            .as_ref()
-            .map(|ledger| ledger.rules().clone())
-            .unwrap_or_else(|| Rules::new(std::iter::empty::<Uint256>()));
         let accept_journal = self.registry.logs.journal("accept_ledger");
         let next_open_parent_hash = self
             .closed_ledger()
@@ -4110,88 +4181,77 @@ impl ApplicationRoot {
             protocol::ApplyFlags::NONE,
         ));
 
-        if let Some(report) = self.apply_network_ops_pending_with(
-            closed_seq,
-            self.validated_ledger_seq(),
-            {
-                let _current_rules = current_rules.clone();
-                let _parent_ledger = parent_ledger.clone();
-                let _accept_journal = Arc::clone(&accept_journal);
-                let state_view_ref = &state_view;
-                move |tx, _flags| {
-                    // Run the REAL transactor on the shared state view
-                    let sttx = tx
-                        .lock()
-                        .expect("transaction mutex must not be poisoned")
-                        .get_s_transaction()
-                        .clone();
-                    let txn_type = sttx.get_txn_type();
-                    let mut view = state_view_ref
-                        .lock()
-                        .expect("state view mutex must not be poisoned");
-                    let result = handle_real_dispatch(&mut *view, &sttx, txn_type, None);
-                    let applied =
-                        protocol::is_tes_success(result) || protocol::is_tec_claim(result);
-                    tx::ApplyResult::new(result, applied, false)
-                }
-            },
-            || {},
-            |_tx, _result| {},
-            |_tx| {},
-            |_tx| false,
-            |_tx| None::<()>,
-            |_tx, _deferred, _skip| {},
-            |_tx| crate::NetworkOpsCurrentLedgerState {
-                fee: protocol::XRPAmount::from_drops(base_fee_drops as i64),
-                account_seq: 0_u32,
-                available_seq: 0_u32,
-            },
-        ) {
-            for (index, entry) in report.entries.iter().enumerate() {
-                if entry.applied {
-                    let _ = self.transaction_master.in_ledger(
-                        entry.transaction_id,
-                        closed_seq,
-                        Some(index as u32),
-                        Some(self.registry.network_id_service.get_network_id()),
-                    );
-
-                    if let Some(shared_tx) = self
-                        .transaction_master
-                        .fetch_from_cache(&entry.transaction_id)
-                    {
-                        if let Ok(tx) = shared_tx.lock() {
-                            let mut meta = protocol::TxMeta::new(entry.transaction_id, closed_seq);
-                            let mut serializer = protocol::Serializer::default();
-                            meta.add_raw(&mut serializer, entry.result, index as u32);
-                            
-                            use protocol::StBase;
-                            if let Some(publisher) = &self.ledger_delta_publisher {
-                                let mut tx_json = protocol::JsonValue::Object(std::collections::BTreeMap::new());
-                                if let protocol::JsonValue::Object(map) = &mut tx_json {
-                                    map.insert("transaction".to_string(), protocol::JsonValue::String(entry.transaction_id.to_string()));
-                                    map.insert("meta".to_string(), meta.get_nodes().json(protocol::JsonOptions::NONE));
-                                }
-                                let mut delta_msg = protocol::JsonValue::Object(std::collections::BTreeMap::new());
-                                if let protocol::JsonValue::Object(map) = &mut delta_msg {
-                                    map.insert("type".to_string(), protocol::JsonValue::String("ledgerDelta".to_string()));
-                                    map.insert("ledger_index".to_string(), protocol::JsonValue::Unsigned(closed_seq as u64));
-                                    map.insert("transaction".to_string(), tx_json);
-                                }
-                                publisher(delta_msg);
-                            }
-
-                            accepted_entries.push(StandaloneAcceptedTx {
-                                transaction_id: entry.transaction_id,
-                                txn: Arc::new(protocol::Serializer::from_bytes(
-                                    tx.get_s_transaction().get_serializer().data(),
-                                )),
-                                metadata: Arc::new(serializer),
-                            });
-                        }
-                    }
-                }
+        // Matches the reference's `RCLConsensus::Adaptor::doAccept`: the real
+        // ledger build applies `result.txns` -- the SAME transaction set
+        // `onClose` captured from `app_.getOpenLedger().current()->txs` --
+        // NOT a separately-drained submission queue. `pending_transactions`
+        // (this port's equivalent of `NetworkOPsImp::transactions_`) is
+        // purely a submission-batching buffer that RPC submit already
+        // applies non-destructively onto `self.registry.open_ledger`
+        // (matching `NetworkOPsImp::apply`'s `getOpenLedger().modify(...)`);
+        // it is NOT the source of what gets built into a real ledger. Using
+        // it here (as an earlier version of this function did, via
+        // `apply_network_ops_pending_with`) raced the RPC submit path's own
+        // drain of that same queue -- whichever caller ran first each round
+        // won, and since RPC submit runs synchronously on every single
+        // submit call, it almost always won, silently starving every
+        // accept_ledger call of the transactions it needed to persist.
+        let open_txs = txns;
+        for sttx in &open_txs {
+            let transaction_id = sttx.get_hash(protocol::HashPrefix::TransactionId);
+            let mut view = state_view.lock().expect("state view mutex must not be poisoned");
+            let txn_type = sttx.get_txn_type();
+            // `apply_submit_transactor_shell` (not the bare
+            // `handle_real_dispatch`) is required here: it implements the
+            // reference's `Transactor::apply` generic preamble --
+            // `consumeSeqProxy` (incrementing the SOURCE account's own
+            // `sfSequence`, which no per-transaction-type handler does on
+            // its own) and `payFee` (deducting the fee from the source's
+            // balance) -- BEFORE dispatching to the transaction-type
+            // handler. Calling `handle_real_dispatch` directly here (as an
+            // earlier version of this function did) skipped that preamble
+            // entirely, so successfully-applied transactions never
+            // incremented their sender's sequence number.
+            let result = apply_submit_transactor_shell(&mut *view, sttx, txn_type);
+            drop(view);
+            let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
+            if !applied {
+                continue;
             }
+
+            let index = accepted_entries.len();
+            let _ = self.transaction_master.in_ledger(
+                transaction_id,
+                closed_seq,
+                Some(index as u32),
+                Some(self.registry.network_id_service.get_network_id()),
+            );
+
+            let mut meta = protocol::TxMeta::new(transaction_id, closed_seq);
+            let mut serializer = protocol::Serializer::default();
+            meta.add_raw(&mut serializer, result, index as u32);
+
+            use protocol::StBase;
+            if let Some(publisher) = &self.ledger_delta_publisher {
+                let mut tx_json = protocol::JsonValue::Object(std::collections::BTreeMap::new());
+                if let protocol::JsonValue::Object(map) = &mut tx_json {
+                    map.insert("transaction".to_string(), protocol::JsonValue::String(transaction_id.to_string()));
+                    map.insert("meta".to_string(), meta.get_nodes().json(protocol::JsonOptions::NONE));
+                }
+                let mut delta_msg = protocol::JsonValue::Object(std::collections::BTreeMap::new());
+                if let protocol::JsonValue::Object(map) = &mut delta_msg {
+                    map.insert("type".to_string(), protocol::JsonValue::String("ledgerDelta".to_string()));
+                    map.insert("ledger_index".to_string(), protocol::JsonValue::Unsigned(closed_seq as u64));
+                    map.insert("transaction".to_string(), tx_json);
+                }
+                publisher(delta_msg);
+            }
+
+            accepted_entries.push(StandaloneAcceptedTx {
+                transaction_id,
+                txn: Arc::new(protocol::Serializer::from_bytes(sttx.get_serializer().data())),
+                metadata: Arc::new(serializer),
+            });
         }
 
         let closed = match parent_ledger {
@@ -4199,8 +4259,8 @@ impl ApplicationRoot {
                 crate::build_ledger_from_view(
                     Arc::clone(&parent),
                     close_time,
-                    true,
-                    0,
+                    correct_close_time,
+                    close_resolution,
                     accept_journal.as_ref(),
                     |built| {
                         StandaloneLedgerBuildView::from_base(
@@ -4234,7 +4294,7 @@ impl ApplicationRoot {
                     ),
                     &mut closed,
                 );
-                closed.set_accepted(close_time, 0, true);
+                closed.set_accepted(close_time, close_resolution, correct_close_time);
                 Arc::new(closed)
             }
         };

@@ -182,6 +182,7 @@ impl ValidationsLedger for RclValidatedLedger {
 pub struct RclValidationsAdaptor {
     ledgers: parking_lot::Mutex<std::collections::HashMap<Uint256, RclValidatedLedger>>,
     now: Arc<dyn Fn() -> NetClockTimePoint + Send + Sync>,
+    ledger_master_runtime: parking_lot::Mutex<Option<Arc<crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime>>>,
 }
 
 impl RclValidationsAdaptor {
@@ -191,12 +192,25 @@ impl RclValidationsAdaptor {
     /// reads the same clock the rest of the node's networking layer uses,
     /// which this crate does not own.
     pub fn new(now: impl Fn() -> NetClockTimePoint + Send + Sync + 'static) -> Self {
-        Self { ledgers: parking_lot::Mutex::new(std::collections::HashMap::new()), now: Arc::new(now) }
+        Self {
+            ledgers: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            now: Arc::new(now),
+            ledger_master_runtime: parking_lot::Mutex::new(None),
+        }
     }
 
     pub fn register_ledger(&self, ledger: &Ledger) {
         let wrapped = RclValidatedLedger::from_ledger(ledger);
         self.ledgers.lock().insert(wrapped.id(), wrapped);
+    }
+
+    /// Attach (or detach) the ledger master runtime this adaptor consults
+    /// on a cache miss in `acquire`, matching the reference's
+    /// `RCLValidationsAdaptor` holding a reference to the owning
+    /// `Application` for `app_.getLedgerMaster()`/`app_.getInboundLedgers()`
+    /// access.
+    pub fn set_ledger_master_runtime(&self, runtime: Option<Arc<crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime>>) {
+        *self.ledger_master_runtime.lock() = runtime;
     }
 }
 
@@ -209,7 +223,43 @@ impl consensus::rcl_support::ValidationsAdaptor for RclValidationsAdaptor {
     }
 
     fn acquire(&self, ledger_id: &Uint256) -> Option<RclValidatedLedger> {
-        self.ledgers.lock().get(ledger_id).cloned()
+        if let Some(ledger) = self.ledgers.lock().get(ledger_id).cloned() {
+            return Some(ledger);
+        }
+
+        // Matches the reference's `RCLValidationsAdaptor::acquire`: a
+        // local-map miss falls back to the shared ledger history cache
+        // (populated by completed acquisitions/validated ledgers from
+        // anywhere in the app, not just this adaptor's own
+        // `register_ledger` calls), and if THAT also misses, actively
+        // dispatches a fetch (matching the reference's `GetConsL2` job
+        // calling `InboundLedgers::acquireAsync`) rather than silently
+        // giving up. This is the third of the reference's three
+        // redundant acquisition triggers (the other two being
+        // `Consensus::checkLedger`'s `acquireLedger` and `InboundLedger`'s
+        // own retry timer) -- `Validations::updateTrie` calls this
+        // adaptor method every time a new TRUSTED validation references a
+        // ledger not yet cached, so leaving this as a pure cache read
+        // (the bug this replaces) meant the trie could never actively
+        // pull in ledgers referenced only by validations, weakening
+        // fork-recovery specifically in the scenario where a node has
+        // fallen behind and peers are validating ledgers it has not
+        // acquired via any other path.
+        let Some(runtime) = self.ledger_master_runtime.lock().clone() else {
+            return None;
+        };
+
+        let hash = basics::sha_map_hash::SHAMapHash::new(*ledger_id);
+        if let Some(ledger) = runtime.ledger_master().ledger_history().get_cached_ledger_by_hash(hash) {
+            return Some(RclValidatedLedger::from_ledger(&ledger));
+        }
+
+        if let Some(guard) = runtime.shared_inbound_ledgers.lock().ok()
+            && let Some(shared) = guard.as_ref()
+        {
+            shared.acquire(*ledger_id, 0);
+        }
+        None
     }
 }
 

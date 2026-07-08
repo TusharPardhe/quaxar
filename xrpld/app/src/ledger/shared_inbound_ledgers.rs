@@ -1163,10 +1163,22 @@ fn run_acquisition_worker(
             if inbound.is_failed() {
                 break;
             }
-            let Some(ledger) = inbound.ledger().cloned() else {
+            // Match the reference's InboundLedger::done() contract:
+            // finalize completion/signaling before publishing the ledger.
+            inbound.finish_if_done_with_family_and_config(&journal, &config, &family);
+            if inbound.is_failed() {
+                tracing::warn!(target: "inbound_ledger", seq, "Shared acq completion finalization failed");
+                break;
+            }
+            let Some(mut ledger) = inbound.ledger().cloned() else {
                 tracing::warn!(target: "inbound_ledger", seq, "Shared acq missing ledger on completion");
                 break;
             };
+            // C++ parity: InboundLedger::done() sets immutable before storeLedger().
+            if !ledger.is_immutable() {
+                ledger.set_immutable(false);
+            }
+            ledger.set_full();
             if !flush_writes(&store.write_tx) {
                 tracing::warn!(target: "inbound_ledger", seq, "Shared acq flush failed");
                 break;
@@ -1179,7 +1191,11 @@ fn run_acquisition_worker(
 
     // Post-loop completion check
     if inbound.is_complete() && !inbound.is_failed() {
-        if let Some(ledger) = inbound.ledger().cloned() {
+        if let Some(mut ledger) = inbound.ledger().cloned() {
+            if !ledger.is_immutable() {
+                ledger.set_immutable(false);
+            }
+            ledger.set_full();
             let _ = flush_writes(&store.write_tx);
             tracing::info!(target: "inbound_ledger", seq, "SHARED LEDGER ACQUIRED");
             let _ = store_tx.send(Arc::new(ledger));

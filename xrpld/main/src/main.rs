@@ -4507,6 +4507,7 @@ impl<D> BoundServerRuntime<D> {
                 // new acquisitions through a global active-ledger cap.
                 let (completed_ledgers_tx, completed_ledgers_rx) =
                     std::sync::mpsc::channel::<Arc<ledger::Ledger>>();
+                let shared_completed_tx = completed_ledgers_tx.clone();
                 let mut inbound_ledgers = InboundLedgers::new(
                     Arc::clone(&acq_registry),
                     Arc::clone(&shared_tree_cache),
@@ -4534,8 +4535,6 @@ impl<D> BoundServerRuntime<D> {
                 // Create SharedInboundLedgers for the consensus driver.
                 let shared_inbound_registry: app::ledger::shared_inbound_ledgers::AcqRegistry =
                     Arc::new(Mutex::new(HashMap::new()));
-                let (shared_completed_tx, _shared_completed_rx) =
-                    std::sync::mpsc::channel::<Arc<ledger::Ledger>>();
                 let shared_inbound = Arc::new(
                     app::ledger::shared_inbound_ledgers::SharedInboundLedgers::new(
                         Arc::clone(&shared_inbound_registry),
