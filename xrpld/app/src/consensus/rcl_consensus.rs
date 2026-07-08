@@ -810,6 +810,11 @@ impl ConsensusRunner for AppConsensus {
         Box::pin(async move {
             let proposing = self.adaptor.is_validator() && !self.adaptor.options.standalone;
             let mut state = self.state.lock().expect("consensus state mutex must not be poisoned");
+            if self.adaptor.validators.count() > 0 && self.adaptor.validators.unl_size() == 0 {
+                self.adaptor.network_ops_mode_owner.set_unl_blocked(true);
+            } else {
+                self.adaptor.network_ops_mode_owner.set_unl_blocked(false);
+            }
             state.start_round(&self.adaptor, now, prev_ledger_id, prev_ledger, &HashSet::default(), proposing);
         })
     }
