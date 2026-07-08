@@ -2427,10 +2427,11 @@ impl RpcRuntime for ApplicationRoot {
     }
 
     fn network_synced(&self) -> bool {
-        matches!(
-            self.network_ops_operating_mode(),
-            NetworkOpsOperatingMode::Tracking | NetworkOpsOperatingMode::Full
-        )
+        // Matches reference `conditionMet`'s gate: `getOperatingMode() <
+        // OperatingMode::SYNCING` is rejected, so SYNCING, TRACKING, and
+        // FULL (displayed as "proposing" once active-validating) all count
+        // as synced. Only DISCONNECTED/CONNECTED are rejected.
+        self.network_ops_operating_mode() >= NetworkOpsOperatingMode::Syncing
     }
 
     fn current_ledger_index(&self) -> Option<u32> {
