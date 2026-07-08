@@ -3951,6 +3951,49 @@ impl ApplicationRoot {
             .note_validated_ledger(self.ledger_with_node_fetcher(ledger));
     }
 
+    /// Promotes `NetworkOpsOperatingMode` past CONNECTED/SYNCING once the
+    /// node has a fresh, network-required ledger. This mirrors the reference
+    /// `NetworkOPsImp::endConsensus`'s CONNECTED/SYNCING -> TRACKING -> FULL
+    /// promotion (and `xrpld/main/src/main.rs`'s
+    /// `select_post_acquisition_operating_mode`, which this duplicates for
+    /// the live per-round consensus-accept path that actually runs in this
+    /// build: `accept_ledger_with_txns`/its standalone-empty sibling call
+    /// `on_validated_ledger` directly and never go through
+    /// `promote_current_ledger`, so without this hook the operating mode is
+    /// permanently stuck at CONNECTED/SYNCING regardless of how many ledgers
+    /// validate).
+    pub fn promote_operating_mode_after_accepted_ledger(&self, ledger: &Ledger) {
+        let current_mode = self.network_ops_operating_mode();
+        let need_network_ledger = self.need_network_ledger();
+
+        let now_close_time = self.current_close_time_seconds();
+        let last_closed_close_time = ledger.header().close_time;
+        let close_time_resolution = u32::from(ledger.header().close_time_resolution);
+        let current_ledger_fresh = now_close_time
+            < last_closed_close_time.saturating_add(close_time_resolution.saturating_mul(2));
+
+        let mut next_mode = current_mode;
+        if matches!(
+            next_mode,
+            NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Syncing
+        ) && !need_network_ledger
+        {
+            next_mode = NetworkOpsOperatingMode::Tracking;
+        }
+        if matches!(
+            next_mode,
+            NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Tracking
+        ) && !need_network_ledger
+            && current_ledger_fresh
+        {
+            next_mode = NetworkOpsOperatingMode::Full;
+        }
+
+        if next_mode != current_mode {
+            let _ = self.set_network_ops_operating_mode(next_mode);
+        }
+    }
+
     pub fn validated_ledger(&self) -> Option<Arc<Ledger>> {
         self.ledger_master_state.validated_ledger()
     }
@@ -4008,6 +4051,7 @@ impl ApplicationRoot {
             self.on_closed_ledger(Arc::clone(&closed));
             self.on_published_ledger(Arc::clone(&closed));
             let _ = self.on_validated_ledger(Arc::clone(&closed));
+            self.promote_operating_mode_after_accepted_ledger(closed.as_ref());
             use ledger::LedgerPersistenceRuntime;
             self.build_ledger_persistence_runtime()
                 .save_validated_ledger(Arc::clone(&closed), true);
@@ -4096,6 +4140,7 @@ impl ApplicationRoot {
         self.on_closed_ledger(Arc::clone(&closed));
         self.on_published_ledger(Arc::clone(&closed));
         let _ = self.on_validated_ledger(Arc::clone(&closed));
+        self.promote_operating_mode_after_accepted_ledger(closed.as_ref());
 
         // Sweep local_txs: remove transactions that are now in the closed ledger.
         // Without this, rebuild_open_ledger_after_close would re-add them to the
@@ -4316,6 +4361,7 @@ impl ApplicationRoot {
         self.on_closed_ledger(Arc::clone(&closed));
         self.on_published_ledger(Arc::clone(&closed));
         let _ = self.on_validated_ledger(Arc::clone(&closed));
+        self.promote_operating_mode_after_accepted_ledger(closed.as_ref());
 
         // Sweep local_txs: remove transactions that are now in the closed ledger.
         // Without this, rebuild_open_ledger_after_close would re-add them to the

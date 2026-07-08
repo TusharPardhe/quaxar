@@ -4228,10 +4228,19 @@ fn run_acquisition_thread(
             if inbound.is_failed() {
                 break;
             }
-            let Some(ledger) = inbound.ledger().cloned() else {
+            let Some(mut ledger) = inbound.ledger().cloned() else {
                 tracing::warn!(target: "inbound_ledger", seq, "Accepted completion missing ledger after owner acceptance");
                 break;
             };
+            // C++ parity: InboundLedger::done() calls ledger_->setImmutable()
+            // before storeLedger(). Without this, LedgerHistory::insert()
+            // rejects the ledger (it requires is_immutable()), which silently
+            // drops every acquired ledger and starves consensus of ledger
+            // history it needs to promote past SYNCING/CONNECTED.
+            if !ledger.is_immutable() {
+                ledger.set_immutable(false);
+            }
+            ledger.set_full();
             if !flush_nodestore_writes(&store.write_tx) {
                 tracing::warn!(target: "inbound_ledger", seq, "Failed to flush nodestore writes before completion");
                 break;
@@ -4266,7 +4275,11 @@ fn run_acquisition_thread(
     if inbound.is_complete() && !inbound.is_failed() && !stopped {
         // The is_done() break fires before the inline completion handler.
         // Build the ledger and send Complete here so poll_results receives it.
-        if let Some(ledger) = inbound.ledger().cloned() {
+        if let Some(mut ledger) = inbound.ledger().cloned() {
+            if !ledger.is_immutable() {
+                ledger.set_immutable(false);
+            }
+            ledger.set_full();
             let _ = flush_nodestore_writes(&store.write_tx);
             tracing::info!(target: "inbound_ledger", seq, "LEDGER ACQUIRED");
             counters.log_status(seq, inbound.stats(), true);
