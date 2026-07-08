@@ -4067,14 +4067,16 @@ impl ApplicationRoot {
             return Ok(next_open_index);
         }
 
-        // Verify sequence continuity
-        if parent.header().seq.saturating_add(1) != closed_seq {
-            return Err(format!(
-                "standalone accept expected next sequence {} but received {}",
-                parent.header().seq.saturating_add(1),
-                closed_seq
-            ));
-        }
+        // Sequence continuity: `closed_seq` was captured when consensus
+        // decided to close this round, but this job runs asynchronously on
+        // a JobQueue worker and a concurrent ledger-acquisition/catchup
+        // jump can advance `parent` past that point before this job runs.
+        // rippled's `doAccept`/`buildLCL` never re-validates against a live
+        // "current" parent -- it just builds on the `prevLedger` snapshot
+        // it was given. Match that: derive the sequence from `parent`
+        // itself instead of hard-failing (and thereby permanently dropping
+        // this node out of active consensus) on a stale `closed_seq`.
+        let closed_seq = parent.header().seq.saturating_add(1);
 
         // Apply transactions to a mutable view of the parent ledger
         let mut state_view = ledger::ApplyViewImpl::new(
@@ -4207,6 +4209,11 @@ impl ApplicationRoot {
         txns: Vec<Arc<protocol::STTx>>,
     ) -> Result<u32, String> {
         let parent_ledger = self.closed_ledger().or_else(|| self.validated_ledger());
+
+        let closed_seq = parent_ledger
+            .as_ref()
+            .map(|parent| parent.header().seq.saturating_add(1))
+            .unwrap_or(closed_seq);
         let accept_journal = self.registry.logs.journal("accept_ledger");
         let next_open_parent_hash = self
             .closed_ledger()
@@ -4300,7 +4307,8 @@ impl ApplicationRoot {
         }
 
         let closed = match parent_ledger {
-            Some(parent) if parent.header().seq.saturating_add(1) == closed_seq => {
+
+            Some(parent) => {
                 crate::build_ledger_from_view(
                     Arc::clone(&parent),
                     close_time,
@@ -4321,13 +4329,6 @@ impl ApplicationRoot {
                     tracing::error!(target: "app", "Failed to apply state to closed ledger");
                     format!("standalone ledger build failed: {error:?}")
                 })?
-            }
-            Some(parent) => {
-                return Err(format!(
-                    "standalone accept expected next sequence {} but received {}",
-                    parent.header().seq.saturating_add(1),
-                    closed_seq
-                ));
             }
             None => {
                 let mut closed =
