@@ -2590,7 +2590,14 @@ pub(crate) fn submit_sttx<Env, Runtime: RpcRuntime>(
         || false,
         || {
             if let Some(app) = ctx.runtime.app() {
-                let _ = app.apply_network_ops_pending_to_open_ledger();
+                let report = app.apply_network_ops_pending_to_open_ledger();
+                tracing::debug!(
+                    target: "rpc",
+                    applied_report = ?report.is_some(),
+                    "submit_sttx: apply_network_ops_pending_to_open_ledger called"
+                );
+            } else {
+                tracing::warn!(target: "rpc", "submit_sttx: ctx.runtime.app() returned None");
             }
         },
     );

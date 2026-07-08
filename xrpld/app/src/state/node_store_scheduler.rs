@@ -77,7 +77,7 @@ impl NodeStoreScheduler {
         let perform_in_job = Arc::clone(&perform);
         let scheduled = self
             .job_queue
-            .add_job(JobType::Write, "NObjStore", move || {
+            .add_job(JobType::JtWrite, "NObjStore", move || {
                 if let Some(perform) = perform_in_job
                     .lock()
                     .expect("scheduled task mutex must not be poisoned")
@@ -107,8 +107,8 @@ impl NodeStoreScheduler {
         }
 
         let job_type = match report.fetch_type {
-            NodeStoreFetchType::Async => JobType::NsAsyncRead,
-            NodeStoreFetchType::Synchronous => JobType::NsSyncRead,
+            NodeStoreFetchType::Async => JobType::JtNsAsyncRead,
+            NodeStoreFetchType::Synchronous => JobType::JtNsSyncRead,
         };
         self.job_queue.add_load_events(job_type, 1, report.elapsed);
     }
@@ -119,7 +119,7 @@ impl NodeStoreScheduler {
         }
 
         self.job_queue
-            .add_load_events(JobType::NsWrite, report.write_count, report.elapsed);
+            .add_load_events(JobType::JtNsWrite, report.write_count as u64, report.elapsed);
     }
 }
 
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn node_store_scheduler_queues_tasks_and_records_io_load() {
-        let queue = JobQueue::new();
+        let queue = JobQueue::default();
         let scheduler = NodeStoreScheduler::new(queue.clone());
         let task = Arc::new(RecordingTask::default());
 

@@ -1227,7 +1227,14 @@ fn request_ledger_via_overlay(
         return Err(Status::new(RpcErrorCode::NoNetwork));
     }
 
-    let _ = overlay.take_queued_inbound_snapshot();
+    // Discard any stale ledger_data/get_objects responses left over from a
+    // previous acquisition attempt before issuing a fresh request. Uses
+    // narrow drains instead of take_queued_inbound_snapshot() — the latter
+    // takes EVERYTHING including transactions/proposals/validations, which
+    // have their own dedicated single consumers and must not be silently
+    // discarded here.
+    let _ = overlay.take_ledger_data();
+    let _ = overlay.take_get_objects();
 
     let (ledger_hash, ledger_seq) = match target {
         LedgerRequestTarget::Seq(seq) => (None, Some(seq)),
@@ -1345,9 +1352,13 @@ fn request_ledger_via_overlay(
     while last_target_progress_at.elapsed() < LEDGER_REQUEST_TIMEOUT {
         thread::sleep(LEDGER_REQUEST_POLL_INTERVAL);
 
-        let snapshot = overlay.take_queued_inbound_snapshot();
+        // Narrow drains only — take_queued_inbound_snapshot() here would run
+        // every 250ms during acquisition and silently discard transactions/
+        // proposals/validations meant for their own dedicated consumers.
+        let get_objects = overlay.take_get_objects();
+        let ledger_data = overlay.take_ledger_data();
 
-        for message in snapshot.get_objects {
+        for message in get_objects {
             if message.message.query {
                 continue;
             }
@@ -1443,7 +1454,7 @@ fn request_ledger_via_overlay(
             }
         }
 
-        for message in snapshot.ledger_data {
+        for message in ledger_data {
             packets_seen += 1;
             let Some((hash, packet)) = inbound_packet_from_wire(&message.message) else {
                 continue;
@@ -2385,7 +2396,7 @@ impl RpcRuntime for ApplicationRoot {
     }
 
     fn client_job_count(&self) -> u32 {
-        u32::try_from(self.job_queue().get_job_count_ge(JobType::Client)).unwrap_or(u32::MAX)
+        u32::try_from(self.job_queue().job_count_ge(JobType::JtClient)).unwrap_or(u32::MAX)
     }
 
     fn has_current_ledger(&self) -> bool {

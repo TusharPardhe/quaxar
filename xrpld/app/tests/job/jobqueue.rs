@@ -5,16 +5,16 @@ use std::time::Instant;
 
 #[test]
 fn job_queue_prefers_higher_priority_waiting_jobs_in_the_same_window() {
-    let queue = JobQueue::new();
+    let queue = JobQueue::default();
     let order = Arc::new(Mutex::new(Vec::new()));
 
     let low_order = Arc::clone(&order);
-    assert!(queue.add_job(JobType::Pack, "low", move || {
+    assert!(queue.add_job(JobType::JtPack, "low", move || {
         low_order.lock().expect("order mutex poisoned").push("pack");
     }));
 
     let high_order = Arc::clone(&order);
-    assert!(queue.add_job(JobType::Accept, "high", move || {
+    assert!(queue.add_job(JobType::JtAccept, "high", move || {
         high_order
             .lock()
             .expect("order mutex poisoned")
@@ -30,51 +30,51 @@ fn job_queue_prefers_higher_priority_waiting_jobs_in_the_same_window() {
 
 #[test]
 fn job_queue_counts_waiting_and_running_jobs_per_type() {
-    let queue = JobQueue::new();
+    let queue = JobQueue::default();
 
-    assert!(queue.add_job(JobType::Pack, "pack-1", || {}));
-    assert!(queue.add_job(JobType::Pack, "pack-2", || {}));
-    assert!(queue.add_job(JobType::Accept, "accept-1", || {}));
+    assert!(queue.add_job(JobType::JtPack, "pack-1", || {}));
+    assert!(queue.add_job(JobType::JtPack, "pack-2", || {}));
+    assert!(queue.add_job(JobType::JtAccept, "accept-1", || {}));
 
-    assert_eq!(queue.get_job_count(JobType::Pack), 2);
-    assert_eq!(queue.get_job_count_total(JobType::Pack), 2);
-    assert_eq!(queue.get_job_count_ge(JobType::Pack), 3);
-    assert_eq!(queue.get_job_count_ge(JobType::Accept), 1);
+    assert_eq!(queue.job_count(JobType::JtPack), 2);
+    assert_eq!(queue.job_count_total(JobType::JtPack), 2);
+    assert_eq!(queue.job_count_ge(JobType::JtPack), 3);
+    assert_eq!(queue.job_count_ge(JobType::JtAccept), 1);
 
     let first = queue
         .reserve_next_job()
         .expect("one job should be runnable");
-    assert_eq!(first.job_type(), JobType::Accept);
-    assert_eq!(queue.get_job_count(JobType::Accept), 0);
-    assert_eq!(queue.get_job_count_total(JobType::Accept), 1);
-    assert_eq!(queue.get_job_count(JobType::Pack), 2);
-    assert_eq!(queue.get_job_count_total(JobType::Pack), 2);
-    assert_eq!(queue.get_job_count_ge(JobType::Pack), 2);
-    assert_eq!(queue.get_job_count_ge(JobType::Accept), 0);
+    assert_eq!(first.job_type(), JobType::JtAccept);
+    assert_eq!(queue.job_count(JobType::JtAccept), 0);
+    assert_eq!(queue.job_count_total(JobType::JtAccept), 1);
+    assert_eq!(queue.job_count(JobType::JtPack), 2);
+    assert_eq!(queue.job_count_total(JobType::JtPack), 2);
+    assert_eq!(queue.job_count_ge(JobType::JtPack), 2);
+    assert_eq!(queue.job_count_ge(JobType::JtAccept), 0);
 
     first.finish();
 
     let second = queue.reserve_next_job().expect("pack job should now run");
-    assert_eq!(second.job_type(), JobType::Pack);
-    assert_eq!(queue.get_job_count(JobType::Pack), 1);
-    assert_eq!(queue.get_job_count_total(JobType::Pack), 2);
+    assert_eq!(second.job_type(), JobType::JtPack);
+    assert_eq!(queue.job_count(JobType::JtPack), 1);
+    assert_eq!(queue.job_count_total(JobType::JtPack), 2);
     second.finish();
 }
 
 #[test]
 fn job_queue_stop_waits_for_running_and_queued_work_to_drain() {
-    let queue = JobQueue::new();
+    let queue = JobQueue::default();
     let order = Arc::new(Mutex::new(Vec::new()));
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
 
     let low_order = Arc::clone(&order);
-    assert!(queue.add_job(JobType::Pack, "low", move || {
+    assert!(queue.add_job(JobType::JtPack, "low", move || {
         low_order.lock().expect("order mutex poisoned").push("pack");
     }));
 
     let high_order = Arc::clone(&order);
-    assert!(queue.add_job(JobType::Accept, "high", move || {
+    assert!(queue.add_job(JobType::JtAccept, "high", move || {
         started_tx.send(()).expect("start signal should send");
         release_rx.recv().expect("release signal should arrive");
         high_order
@@ -103,10 +103,10 @@ fn job_queue_stop_waits_for_running_and_queued_work_to_drain() {
     worker.join().expect("worker should finish");
 
     assert!(queue.is_stopped());
-    assert_eq!(queue.get_job_count(JobType::Pack), 0);
-    assert_eq!(queue.get_job_count_total(JobType::Pack), 0);
-    assert_eq!(queue.get_job_count(JobType::Accept), 0);
-    assert_eq!(queue.get_job_count_total(JobType::Accept), 0);
+    assert_eq!(queue.job_count(JobType::JtPack), 0);
+    assert_eq!(queue.job_count_total(JobType::JtPack), 0);
+    assert_eq!(queue.job_count(JobType::JtAccept), 0);
+    assert_eq!(queue.job_count_total(JobType::JtAccept), 0);
     assert_eq!(
         order.lock().expect("order mutex poisoned").as_slice(),
         &["accept", "pack"]
@@ -115,26 +115,26 @@ fn job_queue_stop_waits_for_running_and_queued_work_to_drain() {
 
 #[test]
 fn job_queue_limit_zero_types_are_not_runnable() {
-    let queue = JobQueue::new();
-    assert!(queue.add_job(JobType::Peer, "peer", || {}));
-    assert_eq!(queue.get_job_count(JobType::Peer), 1);
-    assert_eq!(queue.get_job_count_total(JobType::Peer), 1);
+    let queue = JobQueue::default();
+    assert!(queue.add_job(JobType::JtPeer, "peer", || {}));
+    assert_eq!(queue.job_count(JobType::JtPeer), 1);
+    assert_eq!(queue.job_count_total(JobType::JtPeer), 1);
     assert!(queue.reserve_next_job().is_none());
 }
 
 #[test]
 fn job_queue_running_job_is_fully_owned_by_the_reservation() {
-    let queue = JobQueue::new();
-    assert!(queue.add_job(JobType::Pack, "pack", || {}));
+    let queue = JobQueue::default();
+    assert!(queue.add_job(JobType::JtPack, "pack", || {}));
 
     let running = queue.reserve_next_job().expect("job should be reserved");
-    assert_eq!(running.job_type(), JobType::Pack);
+    assert_eq!(running.job_type(), JobType::JtPack);
     assert_eq!(running.name(), "pack");
     assert_eq!(running.index(), 1);
     assert!(running.queue_time() <= Instant::now());
-    assert_eq!(queue.get_job_count(JobType::Pack), 0);
-    assert_eq!(queue.get_job_count_total(JobType::Pack), 1);
+    assert_eq!(queue.job_count(JobType::JtPack), 0);
+    assert_eq!(queue.job_count_total(JobType::JtPack), 1);
 
     drop(running);
-    assert_eq!(queue.get_job_count_total(JobType::Pack), 0);
+    assert_eq!(queue.job_count_total(JobType::JtPack), 0);
 }

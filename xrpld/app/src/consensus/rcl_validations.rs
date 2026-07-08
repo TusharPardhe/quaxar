@@ -1,19 +1,24 @@
-//! App-owned validation intake seams above the generic consensus owner.
+//! App-level wiring for Phase 5's generic `Validations<Adaptor>` tracker
+//! against real `STValidation`/`Ledger` types, plus the `NetworkOPs`
+//! validation-ingress support types (`RclValidationJournal`,
+//! `RclValidationAcceptanceSink`, `RclValidationTrustSource`) and the
+//! `SharedAppValidations<Clock>` handle used throughout
+//! `network_ops_validation_runtime.rs`, `application_root.rs`, and
+//! `validator_list.rs`. Ported from `RCLValidations.h`'s
+//! `handleNewValidation` free function and the app-level ownership that
+//! wraps `RCLValidations` in the reference `Application`.
 
-use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
-use crate::ledger::ledger_master_state::SharedLedgerMasterState;
-use crate::state::time_keeper::{TimeKeeper, TimeKeeperClock};
-use basics::base_uint::Uint256;
-use basics::chrono::NetClockTimePoint;
-use basics::sha_map_hash::SHAMapHash;
-use consensus::{
-    RclValidatedLedger, RclValidation, RclValidations, RclValidationsAdapter, ValidationStatus,
-};
-use ledger::Ledger;
-use protocol::{PublicKey, STValidation, get_field_by_symbol, skip_keylet};
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use basics::base_uint::Uint256;
+use consensus::rcl_support::Validations;
+use protocol::{PublicKey, STValidation};
+
+use crate::consensus::rcl_validation::{RclValidatedLedger, RclValidation, RclValidationsAdaptor};
+use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
+
+/// Journal sink for validation-processing diagnostics. Matches the
+/// reference's `beast::Journal` usage inside `handleNewValidation`.
 pub trait RclValidationJournal {
     fn trace(&self, message: &str);
     fn info(&self, message: &str);
@@ -21,848 +26,391 @@ pub trait RclValidationJournal {
     fn warn(&self, message: &str);
 }
 
-impl<T> RclValidationJournal for Arc<T>
-where
-    T: RclValidationJournal + ?Sized,
-{
-    fn trace(&self, message: &str) {
-        (**self).trace(message);
-    }
-
-    fn info(&self, message: &str) {
-        (**self).info(message);
-    }
-
-    fn error(&self, message: &str) {
-        (**self).error(message);
-    }
-
-    fn warn(&self, message: &str) {
-        (**self).warn(message);
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct NullRclValidationJournal;
-
-impl RclValidationJournal for NullRclValidationJournal {
-    fn trace(&self, _message: &str) {}
-    fn info(&self, _message: &str) {}
-    fn error(&self, _message: &str) {}
-    fn warn(&self, _message: &str) {}
-}
-
-pub trait RclValidationLedgerSource: Clone {
-    fn now(&self) -> NetClockTimePoint;
-    fn acquire_ledger(&self, ledger_id: &Uint256) -> Option<RclValidatedLedger>;
-    fn request_validated_ledger(&self, ledger_id: &Uint256);
-}
-
-#[derive(Debug, Clone)]
-pub struct AppRclValidationsAdaptor<S, J = NullRclValidationJournal> {
-    source: S,
-    journal: J,
-}
-
-pub type AppValidationJournalHandle = Arc<dyn RclValidationJournal + Send + Sync>;
-
-pub struct AppRclValidationLedgerSource<C = crate::state::time_keeper::SystemTimeKeeperClock>
-where
-    C: TimeKeeperClock,
-{
-    time_keeper: Arc<TimeKeeper<C>>,
-    ledger_master_state: Arc<SharedLedgerMasterState>,
-    ledger_master_runtime: Arc<Mutex<Option<Arc<AppLedgerMasterRuntime>>>>,
-}
-
-impl<C> Clone for AppRclValidationLedgerSource<C>
-where
-    C: TimeKeeperClock,
-{
-    fn clone(&self) -> Self {
-        Self {
-            time_keeper: Arc::clone(&self.time_keeper),
-            ledger_master_state: Arc::clone(&self.ledger_master_state),
-            ledger_master_runtime: Arc::clone(&self.ledger_master_runtime),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct AppRclValidationStore {
-    retained_ledgers: u32,
-    inner: Mutex<AppRclValidationStoreState>,
-}
-
-#[derive(Debug, Default)]
-struct AppRclValidationStoreState {
-    newest_seq: u32,
-    by_ledger: BTreeMap<(u32, Uint256), BTreeMap<PublicKey, STValidation>>,
-}
-
-impl AppRclValidationStore {
-    pub fn new(retained_ledgers: u32) -> Self {
-        Self {
-            retained_ledgers: retained_ledgers.max(1),
-            inner: Mutex::new(AppRclValidationStoreState::default()),
-        }
-    }
-
-    pub fn record(&self, validation: &STValidation) {
-        if !validation.is_trusted() || !validation.is_full() {
-            return;
-        }
-
-        let ledger_id = validation.get_ledger_hash();
-        let seq = validation.get_field_u32(get_field_by_symbol("sfLedgerSequence"));
-        let signer = *validation.get_signer_public();
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("validation store mutex must not be poisoned");
-        inner.newest_seq = inner.newest_seq.max(seq);
-        inner
-            .by_ledger
-            .entry((seq, ledger_id))
-            .or_default()
-            .insert(signer, validation.clone());
-
-        let floor = inner.newest_seq.saturating_sub(self.retained_ledgers);
-        inner
-            .by_ledger
-            .retain(|(entry_seq, _), _| *entry_seq >= floor);
-    }
-
-    pub fn trusted_for_ledger_by_sequence(
-        &self,
-        ledger_id: Uint256,
-        seq: u32,
-    ) -> Vec<STValidation> {
-        self.inner
-            .lock()
-            .expect("validation store mutex must not be poisoned")
-            .by_ledger
-            .get(&(seq, ledger_id))
-            .map(|bucket| bucket.values().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    pub fn tracked_keys(&self, ledger_id: Uint256, seq: u32) -> BTreeSet<PublicKey> {
-        self.inner
-            .lock()
-            .expect("validation store mutex must not be poisoned")
-            .by_ledger
-            .get(&(seq, ledger_id))
-            .map(|bucket| bucket.keys().copied().collect())
-            .unwrap_or_default()
-    }
-
-    /// for a given ledger hash. Returns fee values for median computation.
-    pub fn fees_for_ledger(&self, ledger_id: Uint256, seq: u32, base_fee: u32) -> Vec<u32> {
-        let guard = self
-            .inner
-            .lock()
-            .expect("validation store mutex must not be poisoned");
-        let Some(bucket) = guard.by_ledger.get(&(seq, ledger_id)) else {
-            return Vec::new();
-        };
-        bucket
-            .values()
-            .filter(|v| v.is_trusted())
-            .map(|v| {
-                let load_fee_field = protocol::get_field_by_symbol("sfLoadFee");
-                if v.is_field_present(load_fee_field) {
-                    v.get_field_u32(load_fee_field)
-                } else {
-                    base_fee
-                }
-            })
-            .collect()
-    }
-}
-
-impl Default for AppRclValidationStore {
-    fn default() -> Self {
-        Self::new(256)
-    }
-}
-
-#[derive(Clone)]
-pub struct AppRclConsensusValidationBridge<A>
-where
-    A: RclValidationsAdapter + Send + 'static,
-{
-    validations: Arc<Mutex<RclValidations<A>>>,
-    store: Arc<AppRclValidationStore>,
-}
-
-pub type AppValidationsCore<C = crate::state::time_keeper::SystemTimeKeeperClock> = RclValidations<
-    AppRclValidationsAdaptor<AppRclValidationLedgerSource<C>, AppValidationJournalHandle>,
->;
-
-#[derive(Clone)]
-pub struct SharedAppValidations<C = crate::state::time_keeper::SystemTimeKeeperClock>
-where
-    C: TimeKeeperClock,
-{
-    bridge: AppRclConsensusValidationBridge<
-        AppRclValidationsAdaptor<AppRclValidationLedgerSource<C>, AppValidationJournalHandle>,
-    >,
-    source: AppRclValidationLedgerSource<C>,
-}
-
-impl<C> std::fmt::Debug for AppRclValidationLedgerSource<C>
-where
-    C: TimeKeeperClock,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("AppRclValidationLedgerSource")
-            .field(
-                "has_ledger_master_runtime",
-                &self
-                    .ledger_master_runtime
-                    .lock()
-                    .expect("validation ledger source mutex must not be poisoned")
-                    .is_some(),
-            )
-            .field(
-                "validated_ledger_seq",
-                &self.ledger_master_state.validated_ledger_seq(),
-            )
-            .finish()
-    }
-}
-
-impl<C> std::fmt::Debug for SharedAppValidations<C>
-where
-    C: TimeKeeperClock,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SharedAppValidations")
-            .field("source", &self.source)
-            .field(
-                "tracked_parent_ledgers",
-                &self
-                    .bridge
-                    .store()
-                    .tracked_keys(Uint256::default(), 0)
-                    .len(),
-            )
-            .finish()
-    }
-}
-
-impl<A> AppRclConsensusValidationBridge<A>
-where
-    A: RclValidationsAdapter + Send + 'static,
-{
-    pub fn new(
-        validations: Arc<Mutex<RclValidations<A>>>,
-        store: Arc<AppRclValidationStore>,
-    ) -> Self {
-        Self { validations, store }
-    }
-
-    pub fn validations(&self) -> &Arc<Mutex<RclValidations<A>>> {
-        &self.validations
-    }
-
-    pub fn store(&self) -> &Arc<AppRclValidationStore> {
-        &self.store
-    }
-}
-
-impl<S, J> AppRclValidationsAdaptor<S, J> {
-    pub fn new(source: S, journal: J) -> Self {
-        Self { source, journal }
-    }
-
-    pub fn source(&self) -> &S {
-        &self.source
-    }
-
-    pub fn journal(&self) -> &J {
-        &self.journal
-    }
-}
-
-impl<C> AppRclValidationLedgerSource<C>
-where
-    C: TimeKeeperClock,
-{
-    pub fn new(
-        time_keeper: Arc<TimeKeeper<C>>,
-        ledger_master_state: Arc<SharedLedgerMasterState>,
-    ) -> Self {
-        Self {
-            time_keeper,
-            ledger_master_state,
-            ledger_master_runtime: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    pub fn set_ledger_master_runtime(
-        &self,
-        ledger_master_runtime: Option<Arc<AppLedgerMasterRuntime>>,
-    ) -> Option<Arc<AppLedgerMasterRuntime>> {
-        let mut current = self
-            .ledger_master_runtime
-            .lock()
-            .expect("validation ledger source mutex must not be poisoned");
-        std::mem::replace(&mut *current, ledger_master_runtime)
-    }
-
-    fn lookup_ledger(&self, ledger_id: &Uint256) -> Option<Arc<Ledger>> {
-        let runtime = self
-            .ledger_master_runtime
-            .lock()
-            .expect("validation ledger source mutex must not be poisoned")
-            .clone();
-        if let Some(runtime) = runtime
-            && let Some(ledger) = runtime
-                .ledger_master()
-                .get_ledger_by_hash(SHAMapHash::new(*ledger_id))
-        {
-            return Some(ledger);
-        }
-
-        self.ledger_master_state
-            .validated_ledger()
-            .filter(|ledger| ledger.header().hash.as_uint256() == ledger_id)
-            .or_else(|| {
-                self.ledger_master_state
-                    .published_ledger()
-                    .filter(|ledger| ledger.header().hash.as_uint256() == ledger_id)
-            })
-            .or_else(|| {
-                self.ledger_master_state
-                    .closed_ledger()
-                    .filter(|ledger| ledger.header().hash.as_uint256() == ledger_id)
-            })
-    }
-}
-
-impl<C> SharedAppValidations<C>
-where
-    C: TimeKeeperClock,
-{
-    pub fn new(
-        time_keeper: Arc<TimeKeeper<C>>,
-        ledger_master_state: Arc<SharedLedgerMasterState>,
-        journal: AppValidationJournalHandle,
-    ) -> Self {
-        let source = AppRclValidationLedgerSource::new(time_keeper, ledger_master_state);
-        let validations = Arc::new(Mutex::new(RclValidations::new(
-            AppRclValidationsAdaptor::new(source.clone(), journal),
-            consensus::ConsensusParms::default(),
-        )));
-        let store = Arc::new(AppRclValidationStore::default());
-        Self {
-            bridge: AppRclConsensusValidationBridge::new(validations, store),
-            source,
-        }
-    }
-
-    pub fn validations(&self) -> &Arc<Mutex<AppValidationsCore<C>>> {
-        self.bridge.validations()
-    }
-
-    pub fn store(&self) -> &Arc<AppRclValidationStore> {
-        self.bridge.store()
-    }
-
-    pub fn bridge(
-        &self,
-    ) -> &AppRclConsensusValidationBridge<
-        AppRclValidationsAdaptor<AppRclValidationLedgerSource<C>, AppValidationJournalHandle>,
-    > {
-        &self.bridge
-    }
-
-    pub fn set_ledger_master_runtime(
-        &self,
-        ledger_master_runtime: Option<Arc<AppLedgerMasterRuntime>>,
-    ) -> Option<Arc<AppLedgerMasterRuntime>> {
-        self.source.set_ledger_master_runtime(ledger_master_runtime)
-    }
-}
-
-impl<S, J> RclValidationsAdapter for AppRclValidationsAdaptor<S, J>
-where
-    S: RclValidationLedgerSource,
-    J: RclValidationJournal + Clone,
-{
-    fn now(&self) -> NetClockTimePoint {
-        self.source.now()
-    }
-
-    fn acquire(&mut self, ledger_id: &Uint256) -> Option<RclValidatedLedger> {
-        if let Some(ledger) = self.source.acquire_ledger(ledger_id) {
-            return Some(ledger);
-        }
-
-        self.journal.warn(&format!(
-            "Need validated ledger for preferred ledger analysis {ledger_id}"
-        ));
-        self.source.request_validated_ledger(ledger_id);
-        None
-    }
-}
-
-impl<C> RclValidationLedgerSource for AppRclValidationLedgerSource<C>
-where
-    C: TimeKeeperClock,
-{
-    fn now(&self) -> NetClockTimePoint {
-        self.time_keeper.close_time()
-    }
-
-    fn acquire_ledger(&self, ledger_id: &Uint256) -> Option<RclValidatedLedger> {
-        self.lookup_ledger(ledger_id)
-            .map(|ledger| validated_ledger_from_ledger(ledger.as_ref(), &NullRclValidationJournal))
-    }
-
-    fn request_validated_ledger(&self, _ledger_id: &Uint256) {}
-}
-
+/// Resolves trusted/listed signing keys for a validator identity. Matches
+/// the reference's `ValidatorList::getTrustedKey` / `getListedKey` usage
+/// inside `handleNewValidation`.
 pub trait RclValidationTrustSource {
     fn get_trusted_key(&self, identity: &PublicKey) -> Option<PublicKey>;
     fn get_listed_key(&self, identity: &PublicKey) -> Option<PublicKey>;
 }
 
+/// Persists validations for later retrieval (e.g. by RPC or local
+/// storage). Matches the reference's `Application::getValidationsDB`
+/// forwarding: `handleNewValidation` calls this fire-and-forget for every
+/// full validation, trusted or not, once it has been accepted as current.
+///
+/// Distinct from [`SharedAppValidations::store`] (which returns a
+/// [`RclValidationsStoreView`] over the tracker's own historical query
+/// surface, matching the reference's `RCLValidations` being both tracker
+/// and queryable store in one type) -- this trait is the narrower
+/// external-persistence hook passed into [`handle_new_validation_with_store`],
+/// kept separate so a caller can plug in real disk/database persistence
+/// without that concern leaking into the query-facing `store()` accessor.
+pub trait RclValidationPersistence: Send + Sync {
+    fn persist(&self, validation: &STValidation);
+}
+
+/// A no-op persistence hook, used where the caller has no external
+/// validation storage configured.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullRclValidationPersistence;
+
+impl RclValidationPersistence for NullRclValidationPersistence {
+    fn persist(&self, _validation: &STValidation) {}
+}
+
+/// Notified synchronously when a validation for the *current* working
+/// ledger is accepted, so the caller (typically `NetworkOPs`) can trigger
+/// an immediate `checkAccept`-style re-evaluation of whether that ledger
+/// now has enough validation support to promote, without waiting for the
+/// next timer tick. Matches the reference's
+/// `app_.getLedgerMaster().checkAccept(ledgerHash, ledgerSeq)` call at the
+/// end of `NetworkOPsImp::recvValidation`.
 pub trait RclValidationAcceptanceSink {
-    fn check_accept(&self, hash: Uint256, seq: u32);
+    fn check_accept(&self, ledger_hash: Uint256, ledger_seq: u32);
 }
 
-pub fn wrap_st_validation(validation: &STValidation) -> RclValidation {
-    RclValidation {
-        ledger_id: validation.get_ledger_hash(),
-        seq: validation.get_field_u32(get_field_by_symbol("sfLedgerSequence")),
-        sign_time: NetClockTimePoint::new(validation.get_sign_time()),
-        seen_time: NetClockTimePoint::new(validation.get_seen_time()),
-        key: *validation.get_signer_public(),
-        trusted: validation.is_trusted(),
-        full: validation.is_full(),
-        load_fee: validation
-            .is_field_present(get_field_by_symbol("sfLoadFee"))
-            .then(|| validation.get_field_u32(get_field_by_symbol("sfLoadFee"))),
-        cookie: validation.get_field_u64(get_field_by_symbol("sfCookie")),
+/// A view over [`SharedAppValidations`]'s tracker exposing its historical
+/// query surface, matching the reference's `RCLValidations` being usable
+/// directly as both the live tracker and a queryable store of past
+/// validations. Returned by [`SharedAppValidations::store`] so callers
+/// (see `xrpld/main`'s ledger-catch-up and fee-voting logic) can chain
+/// `.validations().store().trusted_for_ledger_by_sequence(...)` /
+/// `.fees_for_ledger(...)` directly.
+pub struct RclValidationsStoreView<'a, Clock: crate::state::time_keeper::TimeKeeperClock> {
+    shared: &'a SharedAppValidations<Clock>,
+}
+
+impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> RclValidationsStoreView<'_, Clock> {
+    /// The signer public keys of trusted, full validations tracked for
+    /// `ledger_id` at sequence `seq`. Matches the reference's
+    /// `RCLValidations::getTrustedForLedger` usage in
+    /// `NegativeUNLVote`/ledger-catch-up code (see `xrpld/main`'s
+    /// `try_promote_ledger_with_validations` and negative-UNL voting call
+    /// sites, which feed the result directly into
+    /// `ValidatorList::negative_unl_filter_validations(Vec<STValidation>)`).
+    /// Returns owned `STValidation`s (cloned out of the tracker's shared
+    /// `Arc<STValidation>` wrapper) rather than just signer keys, since
+    /// that filter needs the full validation to look up the signer's
+    /// current master key.
+    pub fn trusted_for_ledger_by_sequence(&self, ledger_id: Uint256, seq: u32) -> Vec<STValidation> {
+        self.shared
+            .inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .get_trusted_for_ledger(&ledger_id, seq)
+            .into_iter()
+            .map(|wrapped| (*wrapped).clone())
+            .collect()
+    }
+
+    /// Fees reported by trusted, full validators for `ledger_id`,
+    /// substituting `base_fee` for any validation that did not report a
+    /// load fee. Matches `Validations::fees`; the `seq` parameter is
+    /// accepted for call-site symmetry with `trusted_for_ledger_by_sequence`
+    /// but not used for filtering -- the reference's own `fees()` likewise
+    /// has no sequence filter, since fee-voting only cares about which
+    /// ledger id validators are on, not which round each individual
+    /// validation was issued in.
+    pub fn fees_for_ledger(&self, ledger_id: Uint256, _seq: u32, base_fee: u32) -> Vec<u32> {
+        self.shared.inner.lock().expect("shared app validations mutex must not be poisoned").fees(&ledger_id, base_fee)
     }
 }
 
-pub fn validated_ledger_from_ledger<J>(ledger: &Ledger, journal: &J) -> RclValidatedLedger
-where
-    J: RclValidationJournal,
-{
-    let mut ancestors = Vec::new();
-    match ledger.read(skip_keylet()) {
-        Ok(Some(hashes)) => {
-            if ledger.header().seq > 0 {
-                assert_eq!(
-                    hashes.get_field_u32(get_field_by_symbol("sfLastLedgerSequence")),
-                    ledger.header().seq - 1,
-                    "xrpl::RCLValidatedLedger::RCLValidatedLedger(Ledger) : valid last ledger sequence"
-                );
-            }
-            ancestors = hashes
-                .get_field_v256(get_field_by_symbol("sfHashes"))
-                .value()
-                .to_vec();
+/// The concrete `Validations<RclValidationsAdaptor>` instantiation used by
+/// the running node. Matches the reference's `RCLValidations` alias.
+pub type RclValidationsInner = Validations<RclValidationsAdaptor>;
+
+/// Shared, clonable handle to the node's validation tracker plus its
+/// persistence store, generic over the time-keeper clock so it can be
+/// constructed against either the system clock or a deterministic test
+/// clock. Matches the reference's `Application`-owned `RCLValidations&`
+/// accessor, minus the `Application` coupling.
+pub struct SharedAppValidations<Clock: crate::state::time_keeper::TimeKeeperClock> {
+    inner: Arc<Mutex<RclValidationsInner>>,
+    persistence: Arc<dyn RclValidationPersistence>,
+    ledger_master_state: Arc<crate::ledger::ledger_master_state::SharedLedgerMasterState>,
+    journal: Arc<crate::state::app_registry::AppJournal>,
+    ledger_master_runtime: Arc<Mutex<Option<Arc<AppLedgerMasterRuntime>>>>,
+    _clock: std::marker::PhantomData<Clock>,
+}
+
+impl<Clock: crate::state::time_keeper::TimeKeeperClock> std::fmt::Debug for SharedAppValidations<Clock> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedAppValidations").finish_non_exhaustive()
+    }
+}
+
+impl<Clock: crate::state::time_keeper::TimeKeeperClock> Clone for SharedAppValidations<Clock> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            persistence: Arc::clone(&self.persistence),
+            ledger_master_state: Arc::clone(&self.ledger_master_state),
+            journal: Arc::clone(&self.journal),
+            ledger_master_runtime: Arc::clone(&self.ledger_master_runtime),
+            _clock: std::marker::PhantomData,
         }
-        Ok(None) | Err(_) => {
-            journal.warn(&format!(
-                "Ledger {}:{} missing recent ancestor hashes",
-                ledger.header().seq,
-                ledger.header().hash
-            ));
-        }
-    }
-
-    RclValidatedLedger {
-        ledger_id: *ledger.header().hash.as_uint256(),
-        ledger_seq: ledger.header().seq,
-        ancestors,
     }
 }
 
-pub fn handle_new_validation<A, T, S, J>(
-    trust_source: &T,
-    validations: &mut RclValidations<A>,
+impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValidations<Clock> {
+    /// Construct a new shared validations tracker bound to `time_keeper`'s
+    /// network-time source (see [`RclValidationsAdaptor::new`]),
+    /// `ledger_master_state` (consulted for ledger-close-time-driven
+    /// staleness bookkeeping shared with the rest of the ledger-master
+    /// subsystem), and `journal` for diagnostics. Matches the reference's
+    /// `Application`-owned `RCLValidations` construction, which similarly
+    /// threads the shared clock and journal through at startup.
+    pub fn new(
+        time_keeper: Arc<crate::state::time_keeper::TimeKeeper<Clock>>,
+        ledger_master_state: Arc<crate::ledger::ledger_master_state::SharedLedgerMasterState>,
+        journal: Arc<crate::state::app_registry::AppJournal>,
+    ) -> Self {
+        let now_source = move || time_keeper.close_time();
+        let adaptor = RclValidationsAdaptor::new(now_source);
+        Self {
+            inner: Arc::new(Mutex::new(Validations::new(consensus::rcl_support::ValidationParms::default(), adaptor))),
+            persistence: Arc::new(NullRclValidationPersistence),
+            ledger_master_state,
+            journal,
+            ledger_master_runtime: Arc::new(Mutex::new(None)),
+            _clock: std::marker::PhantomData,
+        }
+    }
+
+    /// Attach an external validation persistence hook (defaults to a
+    /// no-op when constructed via [`Self::new`]).
+    pub fn with_persistence(mut self, persistence: Arc<dyn RclValidationPersistence>) -> Self {
+        self.persistence = persistence;
+        self
+    }
+
+    /// The raw validation tracker, guarded by a `std::sync::Mutex` (a
+    /// separate lock layer from `Validations<A>`'s own internal
+    /// `parking_lot::Mutex`, which only guards that struct's private
+    /// bookkeeping). Callers such as `handle_new_validation_with_store`
+    /// lock this to get exclusive access to call through to the tracker.
+    pub fn validations(&self) -> &Mutex<RclValidationsInner> {
+        &self.inner
+    }
+
+    /// The external validation persistence hook.
+    pub fn persistence(&self) -> &Arc<dyn RclValidationPersistence> {
+        &self.persistence
+    }
+
+    /// A queryable view over this tracker's historical validation data.
+    /// Matches the reference's `RCLValidations` being directly usable for
+    /// both live tracking and historical queries; see
+    /// [`RclValidationsStoreView`].
+    pub fn store(&self) -> RclValidationsStoreView<'_, Clock> {
+        RclValidationsStoreView { shared: self }
+    }
+
+    /// The ledger-master state this tracker was constructed against.
+    pub fn ledger_master_state(&self) -> &Arc<crate::ledger::ledger_master_state::SharedLedgerMasterState> {
+        &self.ledger_master_state
+    }
+
+    /// The diagnostics journal this tracker was constructed against.
+    pub fn journal(&self) -> &Arc<crate::state::app_registry::AppJournal> {
+        &self.journal
+    }
+
+    /// Register a newly-validated ledger with the underlying adaptor so
+    /// `Validations::add`'s trie bookkeeping can resolve its ancestry.
+    /// Matches the reference's `RCLValidationsAdaptor::onLedgerAcquired`-style
+    /// hook, called wherever the node processes a newly built or acquired
+    /// ledger.
+    pub fn register_ledger(&self, ledger: &ledger::Ledger) {
+        self.inner.lock().expect("shared app validations mutex must not be poisoned").adaptor().register_ledger(ledger);
+    }
+
+    /// Number of trusted, full validations tracked for `ledger_hash`.
+    /// Matches `Validations::numTrustedForLedger`, exposed directly since
+    /// `bootstrap.rs`'s catch-up loop calls this without needing the full
+    /// tracker.
+    pub fn num_trusted_for_ledger(&self, ledger_hash: Uint256) -> usize {
+        self.inner.lock().expect("shared app validations mutex must not be poisoned").num_trusted_for_ledger(&ledger_hash)
+    }
+
+    /// Attach (or detach) the ledger master runtime this validations
+    /// tracker should coordinate with when ledgers are attached/rotated.
+    /// Returns the previously-attached runtime, if any. This is a thin
+    /// bookkeeping slot -- `Validations<RclValidationsAdaptor>` resolves
+    /// ledger ancestry through `register_ledger`/`acquire`, not through
+    /// this runtime directly; it is retained here purely so
+    /// `ApplicationRoot::attach_ledger_master_runtime` has a place to wire
+    /// the two together for future extension (e.g. auto-registering newly
+    /// validated ledgers).
+    pub fn set_ledger_master_runtime(&self, runtime: Option<Arc<AppLedgerMasterRuntime>>) -> Option<Arc<AppLedgerMasterRuntime>> {
+        let mut slot = self.ledger_master_runtime.lock().expect("shared app validations ledger master runtime mutex must not be poisoned");
+        let previous = std::mem::replace(&mut *slot, runtime.clone());
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .adaptor()
+            .set_ledger_master_runtime(runtime);
+        previous
+    }
+}
+
+/// Process a newly-received validation against the tracker, mirroring the
+/// reference's `handleNewValidation` free function: resolve the signer's
+/// trust status via `trust_source`, add it to `validations`, notify
+/// `accept_sink` if it became the current validation for its round, and
+/// persist it via `store` regardless of trust (matching the reference's
+/// unconditional store-on-accept behavior).
+///
+/// `bypass_accept` mirrors the reference's `NetworkOPsImp::recvValidation`
+/// dedup rule: when a validation for the same ledger hash is already
+/// mid-flight, later arrivals are still added to the tracker but skip the
+/// acceptance-sink notification (since the first arrival already
+/// triggered it).
+pub fn handle_new_validation_with_store(
+    trust_source: &dyn RclValidationTrustSource,
+    validations: &mut RclValidationsInner,
     validation: &mut STValidation,
     bypass_accept: bool,
-    accept_sink: Option<&S>,
-    journal: Option<&J>,
-) -> ValidationStatus
-where
-    A: RclValidationsAdapter,
-    T: RclValidationTrustSource + ?Sized,
-    S: RclValidationAcceptanceSink + ?Sized,
-    J: RclValidationJournal + ?Sized,
-{
+    accept_sink: Option<&dyn RclValidationAcceptanceSink>,
+    persistence: Option<&dyn RclValidationPersistence>,
+    journal: Option<&dyn RclValidationJournal>,
+) -> consensus::ValidationStatus {
     let signing_key = *validation.get_signer_public();
-    let hash = validation.get_ledger_hash();
-    let seq = validation.get_field_u32(get_field_by_symbol("sfLedgerSequence"));
 
-    let mut master_key = trust_source.get_trusted_key(&signing_key);
-    if !validation.is_trusted() && master_key.is_some() {
+    // Matches the reference's `handleNewValidation`: a validation is
+    // trusted only if its signing key currently maps to a trusted master
+    // key in the active UNL. Being merely "listed" (known but not
+    // currently trusted) or unrecognized entirely both result in an
+    // untrusted validation -- listing only affects whether it is worth
+    // tracking at all, which this port always does regardless.
+    if trust_source.get_trusted_key(&signing_key).is_some() {
         validation.set_trusted();
-    }
-    if master_key.is_none() {
-        master_key = trust_source.get_listed_key(&signing_key);
-    }
-
-    let node_id = master_key.unwrap_or(signing_key);
-    let outcome = validations.add(node_id, wrap_st_validation(validation));
-
-    if outcome == ValidationStatus::Current {
-        if validation.is_trusted() {
-            if bypass_accept {
-                if let Some(journal) = journal {
-                    journal.trace(&format!("Bypassing checkAccept for validation {hash}"));
-                }
-            } else if let Some(accept_sink) = accept_sink {
-                accept_sink.check_accept(hash, seq);
-            }
-        }
-        return outcome;
+    } else {
+        validation.set_untrusted();
     }
 
-    // Also trigger checkAccept for trusted non-current validations.
-    // On testnet with few peers, validations often arrive slightly late
-    // (current=false) but are still valid for advancing the validated ledger.
-    if validation.is_trusted() && !bypass_accept {
-        if let Some(accept_sink) = accept_sink {
-            accept_sink.check_accept(hash, seq);
-        }
+    let node_id = validation.get_node_id();
+    let wrapped = RclValidation::new(Arc::new(validation.clone()));
+    let status = validations.add(node_id, wrapped);
+
+    if let Some(journal) = journal {
+        journal.trace(&format!("handleNewValidation: {status} for ledger {}", validation.get_ledger_hash()));
     }
 
-    if matches!(
-        outcome,
-        ValidationStatus::Conflicting | ValidationStatus::Multiple
-    ) {
-        let node_label = if let Some(master_key) = master_key
-            && master_key != signing_key
+    if status == consensus::ValidationStatus::Current {
+        if !bypass_accept
+            && let Some(sink) = accept_sink
         {
-            format!(
-                "{}:{}",
-                signing_key.to_node_public_base58(),
-                master_key.to_node_public_base58()
-            )
-        } else {
-            signing_key.to_node_public_base58()
-        };
-
-        if let Some(journal) = journal {
-            let message = match outcome {
-                ValidationStatus::Conflicting => format!(
-                    "Byzantine Behavior Detector: {}{}: Conflicting validation for {seq}!",
-                    if validation.is_trusted() {
-                        "trusted "
-                    } else {
-                        "untrusted "
-                    },
-                    node_label,
-                ),
-                ValidationStatus::Multiple => format!(
-                    "Byzantine Behavior Detector: {}{}: Multiple validations for {seq}/{hash}!",
-                    if validation.is_trusted() {
-                        "trusted "
-                    } else {
-                        "untrusted "
-                    },
-                    node_label,
-                ),
-                _ => unreachable!("guarded above"),
-            };
-
-            if validation.is_trusted() {
-                journal.error(&message);
-            } else {
-                journal.info(&message);
-            }
+            sink.check_accept(validation.get_ledger_hash(), validation.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence")));
+        }
+        if let Some(persistence) = persistence {
+            persistence.persist(validation);
         }
     }
 
-    outcome
+    status
 }
 
-pub fn handle_new_validation_with_store<A, T, S, J>(
-    trust_source: &T,
-    validations: &mut RclValidations<A>,
-    validation: &mut STValidation,
-    bypass_accept: bool,
-    accept_sink: Option<&S>,
-    validation_store: Option<&AppRclValidationStore>,
-    journal: Option<&J>,
-) -> ValidationStatus
-where
-    A: RclValidationsAdapter,
-    T: RclValidationTrustSource + ?Sized,
-    S: RclValidationAcceptanceSink + ?Sized,
-    J: RclValidationJournal + ?Sized,
-{
-    let outcome = handle_new_validation(
-        trust_source,
-        validations,
-        validation,
-        bypass_accept,
-        accept_sink,
-        journal,
-    );
-
-    if outcome == ValidationStatus::Current
-        && validation.is_trusted()
-        && validation.is_full()
-        && let Some(store) = validation_store
-    {
-        store.record(validation);
-    }
-
-    outcome
-}
+/// Marker type distinguishing the ledger type used by
+/// [`SharedAppValidations`] from the generic `A::Ledger` associated type,
+/// kept here purely for documentation discoverability from
+/// `rcl_consensus.rs`.
+pub type SharedAppValidationsLedger = RclValidatedLedger;
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AppRclValidationStore, AppRclValidationsAdaptor, NullRclValidationJournal,
-        RclValidationJournal, RclValidationLedgerSource, handle_new_validation_with_store,
-        wrap_st_validation,
-    };
-    use basics::base_uint::Uint256;
-    use basics::chrono::NetClockTimePoint;
-    use consensus::{
-        ConsensusParms, RclValidatedLedger, RclValidations, RclValidationsAdapter, ValidationStatus,
-    };
-    use protocol::{
-        KeyType, STValidation, SecretKey, VF_FULL_VALIDATION, calc_node_id, derive_public_key,
-        get_field_by_symbol,
-    };
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use super::*;
+    use crate::ledger::ledger_master_state::{LedgerMasterCloseTimeProvider, SharedLedgerMasterState};
+    use crate::state::app_registry::AppJournal;
+    use crate::state::time_keeper::{SystemTimeKeeperClock, TimeKeeper};
+    use protocol::{KeyType, calc_node_id, derive_public_key, generate_secret_key, get_field_by_symbol, random_seed};
 
-    #[derive(Clone)]
-    struct MockSource {
-        now: NetClockTimePoint,
-        ledgers: HashMap<Uint256, RclValidatedLedger>,
-        requested: Arc<Mutex<Vec<Uint256>>>,
-    }
-
-    impl MockSource {
-        fn new(now: u32) -> Self {
-            Self {
-                now: NetClockTimePoint::new(now),
-                ledgers: HashMap::new(),
-                requested: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-    }
-
-    impl RclValidationLedgerSource for MockSource {
-        fn now(&self) -> NetClockTimePoint {
-            self.now
-        }
-
-        fn acquire_ledger(&self, ledger_id: &Uint256) -> Option<RclValidatedLedger> {
-            self.ledgers.get(ledger_id).cloned()
-        }
-
-        fn request_validated_ledger(&self, ledger_id: &Uint256) {
-            self.requested
-                .lock()
-                .expect("requested mutex")
-                .push(*ledger_id);
-        }
-    }
-
-    #[derive(Debug, Clone, Default)]
-    struct RecordingJournal {
-        entries: Arc<Mutex<Vec<(String, String)>>>,
-    }
-
-    impl RecordingJournal {
-        fn entries(&self) -> Vec<(String, String)> {
-            self.entries.lock().expect("entries mutex").clone()
-        }
-    }
-
-    impl RclValidationJournal for RecordingJournal {
-        fn trace(&self, message: &str) {
-            self.entries
-                .lock()
-                .expect("entries mutex")
-                .push(("trace".to_owned(), message.to_owned()));
-        }
-
-        fn info(&self, message: &str) {
-            self.entries
-                .lock()
-                .expect("entries mutex")
-                .push(("info".to_owned(), message.to_owned()));
-        }
-
-        fn error(&self, message: &str) {
-            self.entries
-                .lock()
-                .expect("entries mutex")
-                .push(("error".to_owned(), message.to_owned()));
-        }
-
-        fn warn(&self, message: &str) {
-            self.entries
-                .lock()
-                .expect("entries mutex")
-                .push(("warn".to_owned(), message.to_owned()));
-        }
-    }
-
-    fn signed_validation(seed: u8, ledger_id: Uint256, seq: u32, trusted: bool) -> STValidation {
-        let secret = SecretKey::from_bytes([seed; 32]);
-        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
-        let mut validation = STValidation::new_signed(
-            1000,
-            &public,
-            calc_node_id(&public),
-            &secret,
-            |validation| {
-                validation.set_field_h256(get_field_by_symbol("sfLedgerHash"), ledger_id);
-                validation.set_field_u32(get_field_by_symbol("sfLedgerSequence"), seq);
-                validation.set_field_u64(get_field_by_symbol("sfCookie"), 11);
-                validation.set_flag(VF_FULL_VALIDATION);
-            },
-        )
-        .expect("signed validation");
-        if trusted {
-            validation.set_trusted();
-        }
-        validation
-    }
-
-    #[test]
-    fn adaptor_requests_missing_ledgers() {
-        let requested = Arc::new(Mutex::new(Vec::new()));
-        let source = MockSource {
-            now: NetClockTimePoint::new(10),
-            ledgers: HashMap::new(),
-            requested: Arc::clone(&requested),
-        };
-        let journal = RecordingJournal::default();
-        let mut adaptor = AppRclValidationsAdaptor::new(source, journal.clone());
-        let missing = Uint256::from_u64(901);
-
-        assert!(adaptor.acquire(&missing).is_none());
-        assert_eq!(
-            requested.lock().expect("requested mutex").as_slice(),
-            &[missing]
-        );
-        assert_eq!(
-            journal.entries()[0],
-            (
-                "warn".to_owned(),
-                format!("Need validated ledger for preferred ledger analysis {missing}")
-            )
-        );
-    }
-
-    #[test]
-    fn wrap_st_validation_preserves_validation_metadata() {
-        let validation = signed_validation(7, Uint256::from_u64(77), 55, true);
-        let wrapped = wrap_st_validation(&validation);
-
-        assert_eq!(wrapped.ledger_id, Uint256::from_u64(77));
-        assert_eq!(wrapped.seq, 55);
-        assert!(wrapped.trusted);
-        assert!(wrapped.full);
-        assert_eq!(wrapped.cookie, 11);
-    }
-
-    #[test]
-    fn adaptor_exposes_source_and_journal_handles() {
-        let source = MockSource::new(33);
-        let adaptor = AppRclValidationsAdaptor::new(source.clone(), NullRclValidationJournal);
-
-        assert_eq!(adaptor.source().now(), NetClockTimePoint::new(33));
-        assert!(
-            adaptor
-                .source()
-                .acquire_ledger(&Uint256::from_u64(1))
-                .is_none()
-        );
-        let _ = adaptor.journal();
-    }
-
-    #[derive(Default)]
-    struct TrustSource;
-
-    impl super::RclValidationTrustSource for TrustSource {
-        fn get_trusted_key(&self, identity: &protocol::PublicKey) -> Option<protocol::PublicKey> {
+    struct AllTrusted;
+    impl RclValidationTrustSource for AllTrusted {
+        fn get_trusted_key(&self, identity: &PublicKey) -> Option<PublicKey> {
             Some(*identity)
         }
+        fn get_listed_key(&self, identity: &PublicKey) -> Option<PublicKey> {
+            Some(*identity)
+        }
+    }
 
-        fn get_listed_key(&self, _identity: &protocol::PublicKey) -> Option<protocol::PublicKey> {
+    struct NoneTrusted;
+    impl RclValidationTrustSource for NoneTrusted {
+        fn get_trusted_key(&self, _identity: &PublicKey) -> Option<PublicKey> {
+            None
+        }
+        fn get_listed_key(&self, _identity: &PublicKey) -> Option<PublicKey> {
             None
         }
     }
 
-    struct NoopAcceptSink;
+    fn signed_validation(ledger_hash: Uint256, seq: u32, sign_time: u32) -> STValidation {
+        let seed = random_seed();
+        let secret_key = generate_secret_key(KeyType::Secp256k1, &seed).expect("secret key generation should succeed");
+        let public_key = derive_public_key(KeyType::Secp256k1, &secret_key).expect("public key derivation should succeed");
+        let node_id = calc_node_id(&public_key);
 
-    impl super::RclValidationAcceptanceSink for NoopAcceptSink {
-        fn check_accept(&self, _hash: Uint256, _seq: u32) {}
+        STValidation::new_signed(sign_time, &public_key, node_id, &secret_key, |v| {
+            v.set_field_h256(get_field_by_symbol("sfLedgerHash"), ledger_hash);
+            v.set_field_u32(get_field_by_symbol("sfLedgerSequence"), seq);
+            v.set_field_u32(get_field_by_symbol("sfFlags"), protocol::VF_FULL_VALIDATION);
+        })
+        .expect("validation signing should succeed")
+    }
+
+    fn shared_validations() -> (SharedAppValidations<SystemTimeKeeperClock>, u32) {
+        let time_keeper = Arc::new(TimeKeeper::new());
+        let now = time_keeper.close_time().as_seconds();
+        let close_time_provider = Arc::clone(&time_keeper) as Arc<dyn LedgerMasterCloseTimeProvider>;
+        let ledger_master_state = Arc::new(SharedLedgerMasterState::new(close_time_provider));
+        (SharedAppValidations::new(time_keeper, ledger_master_state, Arc::new(AppJournal::new("Validations"))), now)
     }
 
     #[test]
-    fn validation_store_records_current_trusted_validations() {
-        let source = MockSource::new(1_000);
-        let mut validations = RclValidations::new(
-            AppRclValidationsAdaptor::new(source, NullRclValidationJournal),
-            ConsensusParms::default(),
-        );
-        let store = AppRclValidationStore::new(8);
-        let ledger_id = Uint256::from_u64(333);
-        let mut validation = signed_validation(10, ledger_id, 88, true);
+    fn handle_new_validation_marks_trusted_and_returns_current() {
+        let (shared, now) = shared_validations();
+        let ledger = ledger::Ledger::from_ledger_seq_and_close_time(1, 100, false);
+        shared.register_ledger(&ledger);
+        let ledger_hash = *ledger.header().hash.as_uint256();
 
-        let outcome = handle_new_validation_with_store(
-            &TrustSource,
-            &mut validations,
-            &mut validation,
-            false,
-            None::<&NoopAcceptSink>,
-            Some(&store),
-            None::<&NullRclValidationJournal>,
-        );
+        let mut validation = signed_validation(ledger_hash, 1, now);
+        let mut inner = shared.validations().lock().unwrap();
+        let status = handle_new_validation_with_store(&AllTrusted, &mut inner, &mut validation, false, None, None, None);
 
-        assert_eq!(outcome, ValidationStatus::Current);
-        assert_eq!(store.trusted_for_ledger_by_sequence(ledger_id, 88).len(), 1);
-        assert_eq!(
-            store.tracked_keys(ledger_id, 88),
-            std::iter::once(*validation.get_signer_public()).collect()
-        );
+        assert_eq!(status, consensus::ValidationStatus::Current);
+        assert!(validation.is_trusted());
     }
 
     #[test]
-    fn validation_store_prunes_entries_older_than_retention_window() {
-        let store = AppRclValidationStore::new(2);
-        store.record(&signed_validation(11, Uint256::from_u64(1), 10, true));
-        store.record(&signed_validation(12, Uint256::from_u64(2), 11, true));
-        store.record(&signed_validation(13, Uint256::from_u64(3), 13, true));
+    fn handle_new_validation_marks_untrusted_when_not_listed() {
+        let (shared, now) = shared_validations();
+        let ledger = ledger::Ledger::from_ledger_seq_and_close_time(1, 100, false);
+        shared.register_ledger(&ledger);
+        let ledger_hash = *ledger.header().hash.as_uint256();
 
-        assert!(
-            store
-                .trusted_for_ledger_by_sequence(Uint256::from_u64(1), 10)
-                .is_empty()
-        );
-        assert_eq!(
-            store
-                .trusted_for_ledger_by_sequence(Uint256::from_u64(2), 11)
-                .len(),
-            1
-        );
-        assert_eq!(
-            store
-                .trusted_for_ledger_by_sequence(Uint256::from_u64(3), 13)
-                .len(),
-            1
-        );
+        let mut validation = signed_validation(ledger_hash, 1, now);
+        let mut inner = shared.validations().lock().unwrap();
+        let _ = handle_new_validation_with_store(&NoneTrusted, &mut inner, &mut validation, false, None, None, None);
+
+        assert!(!validation.is_trusted());
+    }
+
+    #[test]
+    fn num_trusted_for_ledger_reflects_added_validation() {
+        let (shared, now) = shared_validations();
+        let ledger = ledger::Ledger::from_ledger_seq_and_close_time(1, 100, false);
+        shared.register_ledger(&ledger);
+        let ledger_hash = *ledger.header().hash.as_uint256();
+
+        let mut validation = signed_validation(ledger_hash, 1, now);
+        {
+            let mut inner = shared.validations().lock().unwrap();
+            let _ = handle_new_validation_with_store(&AllTrusted, &mut inner, &mut validation, false, None, None, None);
+        }
+
+        assert_eq!(shared.num_trusted_for_ledger(ledger_hash), 1);
     }
 }

@@ -39,12 +39,13 @@ pub mod paths;
 pub use amendments::{amendment_status::*, negative_unl_vote::*};
 pub use basics::log::{LogSeverity, Logs};
 pub use bootstrap::{bootstrap::*, build_ledger::*};
-pub use consensus::{censorship_detector::*, fetch_pack::*, rcl_cx_peer_pos::*, rcl_cx_tx::*};
-pub use consensus::{consensus_trans_set_sf::*, rcl_consensus::*, rcl_cx::*, rcl_validations::*};
+pub use consensus::{censorship_detector::*, fetch_pack::*, rcl_cx_peer_pos::*};
+pub use consensus::{consensus_trans_set_sf::*, driver::*, rcl_consensus::*, rcl_validations::*};
 pub use job::{job_queue::*, job_types::*};
 pub use ledger::{
     ledger_history::*, ledger_master_runtime::*, ledger_master_state::*,
     ledger_persistence_runtime::*, loaded_ledger_runtime::*, open_ledger::*,
+    shared_inbound_ledgers::*,
 };
 pub use ledger_to_json::{ledger_to_json_context::*, ledger_to_json_entrypoint::*};
 pub use load::{deliver_max::*, fee_vote::*, load_fee_track::*, load_manager::*};
@@ -86,4 +87,28 @@ pub fn set_log_reload_fn(f: impl Fn(&str) -> Result<(), String> + Send + Sync + 
 pub fn reload_log_filter(filter: &str) -> Result<(), String> {
     let f = LOG_RELOAD_FN.get().ok_or("Log reload not initialized")?;
     f(filter)
+}
+
+/// Wrap a real `Arc<Ledger>` as the `consensus::RclCxLedger` view Phase 3's
+/// `Consensus<Adaptor>` state machine and the `ConsensusRunner` trait use.
+/// Matches the reference's implicit `RCLCxLedger{ledger}` construction at
+/// each `startRound`/`gotTxSet` call site.
+pub fn consensus_ledger_from_ledger(ledger_arc: &std::sync::Arc<::ledger::Ledger>) -> ::consensus::RclCxLedger {
+    ::consensus::RclCxLedger::new(std::sync::Arc::clone(ledger_arc))
+}
+
+/// A no-op `ledger::LedgerJournal`, re-exported under this name for call
+/// sites (e.g. `xrpld/main`'s ledger-catch-up logic) that construct a
+/// [`consensus::rcl_validation::RclValidatedLedger`] via
+/// [`validated_ledger_from_ledger`] without a real diagnostics journal
+/// wired in.
+pub use ::ledger::NullLedgerJournal as NullRclValidationJournal;
+
+/// Wrap a real `&ledger::Ledger` as the ancestor-trie-carrying
+/// `RclValidatedLedger` Phase 5's validations tracker needs for
+/// `get_preferred`/`get_preferred_lcl` queries (see `xrpld/main`'s
+/// `preferred_closed_ledger_hash`-adjacent catch-up logic). Matches the
+/// reference's implicit `RCLValidatedLedger{ledger}` construction.
+pub fn validated_ledger_from_ledger(ledger: &::ledger::Ledger, journal: &impl ::ledger::LedgerJournal) -> consensus::rcl_validation::RclValidatedLedger {
+    consensus::rcl_validation::RclValidatedLedger::from_ledger_with_journal(ledger, journal)
 }

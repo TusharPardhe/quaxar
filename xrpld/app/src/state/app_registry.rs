@@ -507,9 +507,26 @@ impl crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource for SharedApp
         next_seq: u32,
         base_fee: u64,
         parent_hash: &basics::base_uint::Uint256,
+        accepted_ids: &std::collections::HashSet<basics::base_uint::Uint256>,
     ) {
+        // Capture anything left in the OLD open ledger that did NOT make it
+        // into the just-accepted set, so it can be carried forward into the
+        // new one -- matching the reference's `getOpenLedger().accept(...)`
+        // reseeding from `localTxs_`/leftover retriable transactions
+        // instead of a full destructive reset. See the trait doc comment
+        // for why this matters (transactions submitted between `on_close`'s
+        // capture and this reset would otherwise be silently lost).
+        let leftover: Vec<std::sync::Arc<protocol::STTx>> = self
+            .current_open_transactions()
+            .into_iter()
+            .filter(|tx| !accepted_ids.contains(&tx.get_transaction_id()))
+            .collect();
+
         self.modify(|view| {
             *view = AppOpenLedgerView::with_parent_hash(next_seq, base_fee, *parent_hash);
+            for tx in leftover {
+                view.push_transaction(tx);
+            }
             true
         });
     }

@@ -55,6 +55,7 @@ fn runtime(
         Arc::new(HashRouter::new(HashRouterSetup::default())),
         Arc::new(app::TransactionMaster::new()),
         Arc::new(SharedLedgerMasterState::new(Arc::new(TimeKeeper::new()))),
+        Arc::new(TimeKeeper::new()),
     )
 }
 

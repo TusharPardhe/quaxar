@@ -227,6 +227,7 @@ snapshots/
 *.local.yml
 *.local.json
 xrpld.local.cfg
+*.txt
 
 # Secret keys and certificates
 *.pem

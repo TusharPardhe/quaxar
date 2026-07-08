@@ -464,6 +464,10 @@ impl<C: ValidatorListClock> ValidatorList<C> {
         self.state.read().expect("validator list read lock").quorum
     }
 
+    pub fn unl_size(&self) -> usize {
+        self.state.read().expect("validator list read lock").trusted_master_keys.len()
+    }
+
     pub fn trusted(&self, identity: PublicKey) -> bool {
         let state = self.state.read().expect("validator list read lock");
         let public_key = self.validator_manifests.get_master_key(&identity);

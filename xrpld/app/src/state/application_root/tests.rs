@@ -1165,7 +1165,7 @@ fn application_root_tracks_stop_reason_family_cleanup_and_runtime_bindings() {
     assert_eq!(app.stop_reason(), Some("testing".to_owned()));
     assert_eq!(
         app.job_queue()
-            .get_job_count(crate::job::job_types::JobType::Accept),
+            .job_count(crate::job::job_types::JobType::JtAccept),
         0
     );
     assert_eq!(app.time_keeper().close_offset(), time::Duration::seconds(0));

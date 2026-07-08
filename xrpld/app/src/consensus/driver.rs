@@ -1,183 +1,95 @@
-//! `ConsensusDriver` — the single entry point for consensus participation.
+//! The consensus event-loop driver: a dedicated background thread that
+//! processes incoming validations and newly-completed ledgers, feeding
+//! them into `NetworkOPs`-equivalent validation ingress
+//! (`receive_validation_to_network_ops_with_accept`) and ledger-history
+//! bookkeeping. Ported from the event-driven portions of
+//! `NetworkOPsImp::recvValidation` and `LedgerMaster::checkAccept`'s
+//! newly-completed-ledger handling.
 //!
-//! Replaces the fragmented AppConsensusRuntime + NetworkOpsRuntime + bootstrap
-//! timer with a unified architecture matching rippled:
-//!
-//! - ONE `parking_lot::Mutex` protects the consensus state machine
-//! - ONE heartbeat thread (1s) drives `timer_entry`
-//! - Proposals arrive DIRECTLY from overlay threads (no batching)
-//! - Accept work runs inside on_accept → pending_start_round (existing pattern)
-//!
-//! See docs/CONSENSUS_REDESIGN.md for the full architecture.
+//! `bootstrap.rs` constructs the channel via [`consensus_event_channel`],
+//! spawns the loop via [`spawn_event_loop`], and forwards events into it
+//! from two sources: a dedicated validation-forwarder thread (bridging the
+//! overlay's `SyncSender<()>` notify pattern into [`ConsensusEvent::Validation`])
+//! and the main bootstrap loop's `storeLedger` handling (emitting
+//! [`ConsensusEvent::LedgerDone`] whenever an `InboundLedger` or shared
+//! ledger-completion channel produces a new ledger).
 
-use basics::chrono::NetClockTimePoint;
-use consensus::{RclCxLedger, RclCxPeerPos, RclCxTx, RclConsensusAdapter};
-use basics::base_uint::Uint256;
-use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
-/// Operating mode (matches rippled OperatingMode). AtomicU8 for lock-free reads.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum OperatingMode {
-    Disconnected = 0,
-    Connected = 1,
-    Syncing = 2,
-    Tracking = 3,
-    Full = 4,
+use overlay::QueuedValidation;
+use protocol::STValidation;
+
+use crate::ledger::shared_inbound_ledgers::SharedInboundLedgers;
+use crate::state::application_root::ApplicationRoot;
+
+/// An event fed into the consensus driver's event loop.
+pub enum ConsensusEvent {
+    /// A validation received from a peer, still in wire form (its
+    /// suppression id and originating peer are carried alongside the raw
+    /// `TMValidation` payload for dedup/relay bookkeeping upstream).
+    Validation(QueuedValidation),
+    /// A ledger has finished acquiring/building and is ready for
+    /// `checkAccept`-style promotion to validated, if it has sufficient
+    /// validation support.
+    LedgerDone(Arc<ledger::Ledger>),
 }
 
-impl From<u8> for OperatingMode {
-    fn from(v: u8) -> Self {
-        match v {
-            1 => Self::Connected,
-            2 => Self::Syncing,
-            3 => Self::Tracking,
-            4 => Self::Full,
-            _ => Self::Disconnected,
-        }
-    }
+/// Construct the channel used to feed [`ConsensusEvent`]s into
+/// [`spawn_event_loop`]'s background thread.
+pub fn consensus_event_channel() -> (Sender<ConsensusEvent>, Receiver<ConsensusEvent>) {
+    channel()
 }
 
-/// The consensus driver. Type-parameterized by the RCL adaptor.
-pub struct ConsensusDriver<A: RclConsensusAdapter> {
-    /// The RclConsensus engine (behind parking_lot::Mutex)
-    engine: Mutex<consensus::RclConsensus<A>>,
-
-    /// Operating mode
-    mode: AtomicU8,
-
-    /// Last locally-validated sequence (canValidateSeq enforcement)
-    last_validated_seq: AtomicU32,
-
-    /// Stop flag for heartbeat
-    stop: AtomicBool,
-
-    /// Minimum peer count before consensus ticks
-    min_peer_count: usize,
-}
-
-impl<A: RclConsensusAdapter> ConsensusDriver<A> {
-    /// Create a new driver wrapping an existing RclConsensus engine.
-    pub fn new(engine: consensus::RclConsensus<A>, min_peer_count: usize) -> Self {
-        Self {
-            engine: Mutex::new(engine),
-            mode: AtomicU8::new(OperatingMode::Connected as u8),
-            last_validated_seq: AtomicU32::new(0),
-            stop: AtomicBool::new(false),
-            min_peer_count,
+/// Parse a wire-format validation payload (`TMValidation.validation`) into
+/// an `STValidation`, resolving the signer's node id via `calc_node_id`
+/// (matching the reference's default lookup when no local manifest cache
+/// override applies). Returns `None` on malformed input, matching the
+/// reference's `invalid_argument` catch-and-drop behavior in
+/// `NetworkOPsImp::recvValidation`.
+fn parse_validation(bytes: &[u8]) -> Option<STValidation> {
+    let mut sit = protocol::SerialIter::new(bytes);
+    match STValidation::from_serial_iter_default_node_id(&mut sit, true) {
+        Ok(v) => Some(v),
+        Err(err) => {
+            tracing::warn!(target: "consensus", ?err, "validation parse failed");
+            None
         }
-    }
-
-    /// Called by the heartbeat thread every 1 second.
-    /// Matches rippled's processHeartbeatTimer.
-    pub fn heartbeat(&self, now: NetClockTimePoint, peer_count: usize) {
-        // Gate: don't tick consensus without peers (prevents solo closing)
-        if peer_count < self.min_peer_count {
-            self.set_mode(OperatingMode::Disconnected);
-            return;
-        }
-
-        // Mode promotion: DISCONNECTED → CONNECTED
-        if self.mode() == OperatingMode::Disconnected {
-            self.set_mode(OperatingMode::Connected);
-        }
-
-        // Tick the consensus state machine.
-        // RclConsensus::timer_tick is async (due to vestigial RclRoundTimer),
-        // so we use a minimal block_on.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("heartbeat tokio runtime");
-        let pending_round = rt.block_on(async {
-            let mut engine = self.engine.lock();
-            let _decision = engine.timer_tick(now).await;
-            engine.adaptor().inner.take_pending_start_round()
-        });
-
-        // Start next round (re-acquires lock)
-        if let Some((round_now, prev_id, prev_cx)) = pending_round {
-            self.engine.lock().start_round(round_now, prev_id, prev_cx);
-        }
-    }
-
-    /// Called from overlay peer handler when a trusted proposal arrives.
-    /// No batching — takes the mutex, updates state, returns.
-    pub fn peer_proposal(&self, now: NetClockTimePoint, pos: RclCxPeerPos) -> bool {
-        self.engine.lock().peer_proposal(now, pos)
-    }
-
-    /// Called from overlay when a transaction set is received.
-    pub fn got_tx_set(&self, now: NetClockTimePoint, txset: Vec<RclCxTx>) {
-        self.engine.lock().got_tx_set(now, txset);
-    }
-
-    /// Start the first consensus round (before overlay starts).
-    pub fn begin_consensus(&self, now: NetClockTimePoint, prev_id: Uint256, prev: RclCxLedger) {
-        self.engine.lock().start_round(now, prev_id, prev);
-        tracing::info!(target: "consensus", "ConsensusDriver: initial round started");
-    }
-
-    /// Get the current operating mode (lock-free).
-    pub fn mode(&self) -> OperatingMode {
-        OperatingMode::from(self.mode.load(Ordering::Acquire))
-    }
-
-    /// Set operating mode.
-    pub fn set_mode(&self, mode: OperatingMode) {
-        self.mode.store(mode as u8, Ordering::Release);
-    }
-
-    /// canValidateSeq: returns true only for strictly increasing sequences.
-    pub fn can_validate_seq(&self, seq: u32) -> bool {
-        let current = self.last_validated_seq.load(Ordering::Acquire);
-        if seq <= current {
-            return false;
-        }
-        self.last_validated_seq.store(seq, Ordering::Release);
-        true
-    }
-
-    pub fn last_validated_seq(&self) -> u32 {
-        self.last_validated_seq.load(Ordering::Acquire)
-    }
-
-    pub fn stop(&self) {
-        self.stop.store(true, Ordering::Release);
-    }
-
-    pub fn is_stopped(&self) -> bool {
-        self.stop.load(Ordering::Acquire)
-    }
-
-    /// Access the engine under lock (for state queries like consensus_info RPC)
-    pub fn with_engine<R>(&self, f: impl FnOnce(&consensus::RclConsensus<A>) -> R) -> R {
-        f(&self.engine.lock())
     }
 }
 
-/// Spawn the heartbeat thread. Returns JoinHandle for clean shutdown.
-pub fn spawn_heartbeat<A: RclConsensusAdapter + 'static>(
-    driver: Arc<ConsensusDriver<A>>,
-    get_peer_count: impl Fn() -> usize + Send + 'static,
-    get_now: impl Fn() -> NetClockTimePoint + Send + 'static,
-) -> JoinHandle<()> {
-    thread::Builder::new()
-        .name("consensus-heartbeat".into())
+/// Spawn the consensus event-loop background thread. Processes
+/// [`ConsensusEvent`]s from `event_rx` until `stop` is set, dispatching
+/// validations into `NetworkOPs`-equivalent ingress and newly-completed
+/// ledgers into ledger-history bookkeeping.
+pub fn spawn_event_loop(app: ApplicationRoot, shared_inbound: Arc<SharedInboundLedgers>, event_rx: Receiver<ConsensusEvent>, stop: Arc<AtomicBool>) {
+    std::thread::Builder::new()
+        .name("consensus-event-loop".into())
         .spawn(move || {
-            tracing::info!(target: "consensus", "Heartbeat thread started (1s)");
-            loop {
-                thread::sleep(Duration::from_secs(1));
-                if driver.is_stopped() {
-                    break;
+            let _ = &shared_inbound;
+            while !stop.load(Ordering::Acquire) {
+                let event = match event_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                    Ok(event) => event,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+
+                match event {
+                    ConsensusEvent::Validation(queued) => {
+                        let Some(mut validation) = parse_validation(&queued.message.validation) else {
+                            tracing::warn!(target: "consensus", peer = ?queued.peer_id, "dropped malformed validation");
+                            continue;
+                        };
+                        let _ = app.receive_validation_to_network_ops(&mut validation, "peer");
+                    }
+                    ConsensusEvent::LedgerDone(ledger) => {
+                        if let Some(runtime) = app.ledger_master_runtime() {
+                            runtime.ledger_master().ledger_history().insert(Arc::clone(&ledger), true);
+                        }
+                    }
                 }
-                driver.heartbeat(get_now(), get_peer_count());
             }
-            tracing::info!(target: "consensus", "Heartbeat thread stopped");
         })
-        .expect("spawn consensus-heartbeat")
+        .expect("spawn consensus-event-loop thread");
 }

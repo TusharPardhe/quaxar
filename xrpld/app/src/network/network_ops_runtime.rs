@@ -28,6 +28,7 @@ use crate::network::network_ops::{
     run_networkops_submit_transaction_gate,
 };
 use crate::runtime::component_runtime::AppConsensusRuntime;
+use crate::state::time_keeper::{SystemTimeKeeperClock, TimeKeeper};
 use crate::tx_queue::transaction::{CurrentLedgerState, SubmitResult, TransStatus, Transaction};
 use crate::tx_queue::transaction_master::{SharedTransaction, TransactionMaster};
 use basics::base_uint::Uint256;
@@ -121,6 +122,7 @@ pub struct AppNetworkOpsRuntime {
     transaction_master: Arc<TransactionMaster>,
     ledger_master_state: Arc<SharedLedgerMasterState>,
     consensus_bootstrap_started: AtomicBool,
+    time_keeper: Arc<TimeKeeper<SystemTimeKeeperClock>>,
 }
 
 impl std::fmt::Debug for AppNetworkOpsRuntime {
@@ -151,6 +153,7 @@ impl AppNetworkOpsRuntime {
         hash_router: Arc<HashRouter>,
         transaction_master: Arc<TransactionMaster>,
         ledger_master_state: Arc<SharedLedgerMasterState>,
+        time_keeper: Arc<TimeKeeper<SystemTimeKeeperClock>>,
     ) -> Self {
         Self::with_state(
             network_ops_state,
@@ -158,6 +161,7 @@ impl AppNetworkOpsRuntime {
             hash_router,
             transaction_master,
             ledger_master_state,
+            time_keeper,
             NetworkOpsRuntimeState::default(),
         )
     }
@@ -168,6 +172,7 @@ impl AppNetworkOpsRuntime {
         hash_router: Arc<HashRouter>,
         transaction_master: Arc<TransactionMaster>,
         ledger_master_state: Arc<SharedLedgerMasterState>,
+        time_keeper: Arc<TimeKeeper<SystemTimeKeeperClock>>,
         state: NetworkOpsRuntimeState<AppNetworkOpsPendingTransaction>,
     ) -> Self {
         Self {
@@ -178,7 +183,25 @@ impl AppNetworkOpsRuntime {
             transaction_master,
             ledger_master_state,
             consensus_bootstrap_started: AtomicBool::new(false),
+            time_keeper,
         }
+    }
+
+    /// The current network-adjusted time, matching the reference's
+    /// `registry_.get().getTimeKeeper().closeTime()` -- i.e. the raw
+    /// system clock nudged by `TimeKeeper::closeOffset()`, which
+    /// `RCLConsensus::Adaptor::doAccept` continuously adjusts toward the
+    /// network's observed consensus close time (see
+    /// `AppRclConsensusAdaptor::on_accept`'s clock-adjustment block).
+    /// Every internal `current_net_time()` call site below reads this
+    /// instead of an unadjusted OS clock read, so that
+    /// `Consensus::timerEntry`'s notion of "now" -- which drives
+    /// `on_close`'s own close-time proposal for the next round -- can
+    /// actually benefit from that convergence feedback loop. Before this,
+    /// the offset was computed and stored but never read back anywhere,
+    /// making the adjustment a no-op in practice.
+    fn current_net_time(&self) -> basics::chrono::NetClockTimePoint {
+        self.time_keeper.close_time()
     }
 
     pub fn network_ops_state(&self) -> Arc<SharedNetworkOpsState> {
@@ -256,6 +279,32 @@ impl AppNetworkOpsRuntime {
             .store(false, Ordering::Release);
     }
 
+    /// Start a consensus round on `ledger` (its id is used as the new
+    /// round's previous-ledger id). Unlike
+    /// [`NetworkOpsRuntime::maybe_begin_consensus_from_validated`], this is
+    /// NOT gated by the one-shot `consensus_bootstrap_started` flag -- it
+    /// is meant to be called once per round, every time a ledger is
+    /// accepted, matching the reference's `NetworkOPsImp::endConsensus`
+    /// unconditionally calling `beginConsensus` (which in turn calls
+    /// `Consensus::startRound`) after `RCLConsensus::Adaptor::onAccept`
+    /// finishes building the new ledger. Without this repeated call,
+    /// `Consensus::timerEntry` would tick forever on a round already in
+    /// the `Accepted` phase (a no-op, per `timerEntry`'s early return) and
+    /// the chain would permanently stall after its first ledger.
+    pub fn start_next_round(&self, consensus_runtime: &AppConsensusRuntime, ledger: Arc<Ledger>) {
+        let now = self.current_net_time();
+        let prev_id = *ledger.header().hash.as_uint256();
+        let prev_cx = consensus_ledger_from_ledger(&ledger);
+        let runtime = consensus_runtime.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("network ops start-next-round runtime");
+        rt.block_on(async {
+            runtime.start_round(now, prev_id, prev_cx).await;
+        });
+    }
+
     pub fn maybe_begin_consensus_from_validated(
         &self,
         consensus_runtime: &AppConsensusRuntime,
@@ -269,7 +318,7 @@ impl AppNetworkOpsRuntime {
             return false;
         }
 
-        let now = current_net_time();
+        let now = self.current_net_time();
         let prev_id = *ledger.header().hash.as_uint256();
         let prev_cx = consensus_ledger_from_ledger(&ledger);
         let runtime = consensus_runtime.clone();
@@ -299,7 +348,7 @@ impl AppNetworkOpsRuntime {
             txs.push(RclCxTx { id: item.key() });
         });
 
-        let now = current_net_time();
+        let now = self.current_net_time();
         let runtime = consensus_runtime.clone();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -326,7 +375,7 @@ impl AppNetworkOpsRuntime {
         suppression_id: Uint256,
         proposal: consensus::ConsensusProposal<protocol::PublicKey, Uint256, Uint256>,
     ) -> bool {
-        let now = current_net_time();
+        let now = self.current_net_time();
         let runtime = consensus_runtime.clone();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -340,7 +389,7 @@ impl AppNetworkOpsRuntime {
     }
 
     pub fn handle_consensus_timer(&self, consensus_runtime: &AppConsensusRuntime) {
-        let now = current_net_time();
+        let now = self.current_net_time();
         let runtime = consensus_runtime.clone();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -354,7 +403,7 @@ impl AppNetworkOpsRuntime {
     /// Drain pending proposals without running timer_entry.
     /// Called on every 50ms bootstrap iteration for low-latency proposal feeding.
     pub fn drain_proposals(&self, consensus_runtime: &AppConsensusRuntime) {
-        let now = current_net_time();
+        let now = self.current_net_time();
         let runtime = consensus_runtime.clone();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1010,16 +1059,6 @@ impl AppNetworkOpsRuntime {
     }
 }
 
-fn current_net_time() -> basics::chrono::NetClockTimePoint {
-    basics::chrono::NetClockTimePoint::new(
-        (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .saturating_sub(946684800)) as u32,
-    )
-}
-
 fn shared_transaction(transaction: Arc<STTx>) -> SharedTransaction {
     Arc::new(Mutex::new(Transaction::new(transaction)))
 }
@@ -1178,6 +1217,7 @@ mod tests {
             Arc::new(HashRouter::new(HashRouterSetup::default())),
             Arc::new(crate::tx_queue::transaction_master::TransactionMaster::new()),
             Arc::new(SharedLedgerMasterState::new(Arc::new(TimeKeeper::new()))),
+            Arc::new(TimeKeeper::new()),
         )
     }
 
@@ -1341,6 +1381,7 @@ mod tests {
             Arc::new(HashRouter::new(HashRouterSetup::default())),
             Arc::new(crate::tx_queue::transaction_master::TransactionMaster::new()),
             Arc::new(SharedLedgerMasterState::new(Arc::new(TimeKeeper::new()))),
+            Arc::new(TimeKeeper::new()),
             NetworkOpsRuntimeState::new(
                 vec![pending_transaction(
                     Arc::new(Mutex::new(Transaction::new(payment_tx(

@@ -324,6 +324,14 @@ impl AppConsensusRuntime {
         self.runner.blocking_lock()
     }
 
+    /// The current round's phase, or `Open` if no runner is attached yet.
+    /// Matches the reference's `Consensus::phase()` accessor used by
+    /// `NetworkOPsImp` to detect phase transitions and to know when a
+    /// round has finished (`Accepted`) and needs restarting.
+    pub fn phase(&self) -> consensus::algorithm::ConsensusPhase {
+        self.runner_blocking().as_ref().map(|runner| runner.phase()).unwrap_or(consensus::algorithm::ConsensusPhase::Open)
+    }
+
     pub async fn peer_proposal(
         &self,
         now: basics::chrono::NetClockTimePoint,

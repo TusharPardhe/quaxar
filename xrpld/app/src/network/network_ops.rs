@@ -60,6 +60,7 @@ pub fn normalize_operating_mode_for_validated_age(
     };
 
     if mode > NetworkOpsOperatingMode::Connected && is_blocked {
+        tracing::warn!(target: "app", ?mode, ?is_blocked, "downgrading mode because is_blocked=true");
         mode = NetworkOpsOperatingMode::Connected;
     }
 
@@ -218,7 +219,12 @@ impl SharedNetworkOpsState {
     }
 
     pub fn is_blocked(&self) -> bool {
-        self.amendment_blocked() || self.unl_blocked()
+        let amendment = self.amendment_blocked();
+        let unl = self.unl_blocked();
+        if amendment || unl {
+            tracing::warn!(target: "app", ?amendment, ?unl, "is_blocked returning true");
+        }
+        amendment || unl
     }
 
     pub fn str_operating_mode(&self) -> &'static str {
@@ -321,6 +327,17 @@ impl AppNetworkOpsModeOwner {
 
     pub fn is_blocked(&self) -> bool {
         self.state.is_blocked()
+    }
+
+    pub fn set_unl_blocked(&self, unl_blocked: bool) {
+        self.state.set_unl_blocked(unl_blocked);
+        if unl_blocked {
+            self.set_operating_mode(NetworkOpsOperatingMode::Connected);
+        }
+    }
+
+    pub fn unl_blocked(&self) -> bool {
+        self.state.unl_blocked()
     }
 
     pub fn set_consensus_mode(&self, mode: u8) {

@@ -259,7 +259,7 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
     }
 
     fn client_job_count(&self) -> u32 {
-        u32::try_from(self.view.job_queue().get_job_count_ge(JobType::Client)).unwrap_or(u32::MAX)
+        u32::try_from(self.view.job_queue().job_count_ge(JobType::JtClient)).unwrap_or(u32::MAX)
     }
 
     fn has_current_ledger(&self) -> bool {
@@ -2186,7 +2186,7 @@ impl<V: AppServerInfoView> crate::handlers::book_offers::BookOffersSource
     for ApplicationServerInfo<V>
 {
     fn client_job_count_gt(&self, threshold: u32) -> bool {
-        u32::try_from(self.view.job_queue().get_job_count_ge(JobType::Client)).unwrap_or(0)
+        u32::try_from(self.view.job_queue().job_count_ge(JobType::JtClient)).unwrap_or(0)
             > threshold
     }
 }

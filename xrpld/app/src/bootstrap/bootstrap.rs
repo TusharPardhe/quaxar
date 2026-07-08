@@ -7,7 +7,7 @@
 
 use crate::{
     ApplicationRoot, ApplicationRootOptions, BootstrapOverlayHandoff, DescriptorLimitProvider,
-    LedgerReplay, MainRuntime, RclConsensusValidationSource, SHAMapStoreComponent,
+    LedgerReplay, MainRuntime, SHAMapStoreComponent,
     SHAMapStoreComponentRuntime, SHAMapStoreHealthRuntime, SHAMapStoreOperatingMode,
     SHAMapStoreRuntime, adjust_descriptor_limit, bootstrap_shamap_store,
 };
@@ -40,6 +40,7 @@ use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use xrpl_core::{ServiceRegistry, StartUpType};
@@ -795,17 +796,12 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
     runtime.start()?;
     tracing::info!(target: "app", "Node startup complete");
 
-    // For --start mode: store genesis as closed ledger so consensus can find
-    // it as a parent. The first round is started in the event loop once peers
-    // are connected (so proposals arrive before the idle timeout closes it).
-    if bootstrap.report.startup_ledger_mode == StartUpType::Fresh {
-        let root = runtime.root();
-        if let Some(lm) = root.ledger_master_runtime() {
-            if let Some(validated) = root.validated_ledger() {
-                lm.ledger_master().set_closed_ledger(Arc::clone(&validated));
-            }
-        }
-    }
+    // For --start mode: `root.on_closed_ledger` (called during genesis
+    // ledger load, see `build_bootstrap_root`) already seeded
+    // `ApplicationRoot`'s single closed-ledger tracker with the genesis
+    // ledger, so consensus can find it as a parent. The first round is
+    // started in the event loop once peers are connected (so proposals
+    // arrive before the idle timeout closes it).
 
     // Standalone mode: no overlay, no consensus thread. The node operates in
     // Full mode with the genesis ledger as validated. Ledger advancement is
@@ -842,6 +838,25 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
     // and timer ticks. It does NOT do ledger acquisition or inbound ledger
     // processing — those are unnecessary when starting fresh.
     let consensus_stop = Arc::new(AtomicBool::new(false));
+
+    // Spawn JobQueue worker threads (matches rippled's JobQueue thread pool).
+    // Without these, jobs added via add_job() (e.g. RPC-submitted transactions
+    // routed through submit_transaction_to_network_ops) sit in the queue
+    // forever and never reach process_transaction, so they never enter the
+    // open ledger's transaction set or get included in consensus.
+    {
+        let jq_template = runtime.root().job_queue();
+        let worker_count = jq_template.worker_thread_count().max(1);
+        for i in 0..worker_count {
+            let jq = jq_template.clone();
+            std::thread::Builder::new()
+                .name(format!("jobqueue-worker-{i}"))
+                .spawn(move || {
+                    jq.run_worker_loop();
+                })
+                .expect("failed to spawn jobqueue worker thread");
+        }
+    }
     let consensus_thread = if matches!(
         bootstrap.report.startup_ledger_mode,
         StartUpType::Fresh | StartUpType::Network
@@ -852,8 +867,7 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
         // For joining an existing network (seq>1), wait for peer confirmation.
         let is_genesis = runtime
             .root()
-            .ledger_master_runtime()
-            .and_then(|lm| lm.ledger_master().closed_ledger())
+            .closed_ledger()
             .map(|l| l.header().seq <= 1)
             .unwrap_or(false);
         if !is_genesis {
@@ -917,173 +931,196 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         .consensus_runtime()
         .and_then(|cr| cr.take_map_complete_receiver());
 
-    // For genesis networks, start consensus immediately without waiting for peers.
     let is_genesis = !runtime.root().need_network_ledger();
-    let mut consensus_started = is_genesis;
+    let mut consensus_started = false;
+    let mut last_timer_tick = std::time::Instant::now();
+    let mut last_round_ledger_id: Option<Uint256> = None;
     if is_genesis {
-        if let (Some(consensus_rt), Some(network_ops_rt)) = (
-            runtime.root().consensus_runtime(),
-            runtime.root().network_ops_runtime(),
-        ) {
-            if let Some(lm_rt) = runtime.root().ledger_master_runtime() {
-                if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
-                    network_ops_rt.maybe_begin_consensus_from_validated(
-                        consensus_rt.as_ref(),
-                        Arc::clone(&closed),
-                    );
-                    tracing::info!(target: "consensus", "Genesis bootstrap: consensus started immediately");
-                }
-            }
-        }
+        tracing::info!(target: "consensus", "Genesis mode: starting consensus immediately on the genesis ledger");
     }
 
-    // State for consensus ledger acquisition with targeted peer requests.
+    // Consensus event channel: validations and completed ledgers feed into the
+    // driver event loop which handles checkAccept + ledger promotion.
+    let (event_tx, event_rx) =
+        crate::consensus::driver::consensus_event_channel();
 
-    // Consensus timing is handled by the dedicated heartbeat thread above.
+    let (shared_completed_tx, shared_completed_rx) = std::sync::mpsc::channel::<Arc<ledger::Ledger>>();
+    let lm_rt_for_shared_inbound = runtime.root().ledger_master_runtime();
+    let shared_inbound = lm_rt_for_shared_inbound
+        .as_ref()
+        .and_then(|lm_rt| lm_rt.shared_inbound_ledgers.lock().ok()?.clone())
+        .unwrap_or_else(|| {
+            Arc::new(crate::ledger::shared_inbound_ledgers::SharedInboundLedgers::new(
+                Arc::new(Mutex::new(std::collections::HashMap::new())),
+                Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
+                    "driver-tc",
+                    1024,
+                    time::Duration::seconds(60),
+                    basics::tagged_cache::MonotonicClock::default(),
+                )),
+                Arc::new(shamap::family::FullBelowCacheImpl::new(
+                    0,
+                    basics::tagged_cache::MonotonicClock::default(),
+                    basics::hardened_hash::HardenedHashBuilder::default(),
+                    1024,
+                )),
+                Arc::new(ledger::FetchPackCache::new(
+                    256,
+                    time::Duration::seconds(120),
+                    basics::tagged_cache::MonotonicClock::default(),
+                )),
+                Arc::new(crate::ledger::shared_inbound_ledgers::RunDataLimiter::new(4)),
+                Arc::new(basics::tagged_cache::KeyCache::new(
+                    "driver-dedup",
+                    1024,
+                    time::Duration::seconds(30),
+                    basics::tagged_cache::MonotonicClock::default(),
+                )),
+                shared_completed_tx.clone(),
+            ))
+        });
+    // Store the (possibly freshly constructed) instance back into
+    // `AppLedgerMasterRuntime` so every OTHER consumer -- most importantly
+    // `AppRclConsensusAdaptor::acquire_ledger`, which needs to actively
+    // dispatch a fetch for a ledger consensus doesn't have yet (matching
+    // the reference's `RCLConsensus::Adaptor::acquireLedger` calling
+    // `app.getInboundLedgers().acquireAsync(id, 0, Reason::CONSENSUS)`
+    // when the cache lookup misses) -- sees and uses the SAME instance
+    // this loop's `spawn_event_loop`/`shared_completed_rx` are wired to.
+    // Without this, a second, throwaway `SharedInboundLedgers` would be
+    // constructed by whoever calls `acquire_ledger` next, whose
+    // completions would never reach this loop's `ledger_history()` insert
+    // (they'd arrive on a *different*, disconnected `shared_completed_tx`).
+    if let Some(lm_rt) = lm_rt_for_shared_inbound.as_ref()
+        && let Ok(mut guard) = lm_rt.shared_inbound_ledgers.lock()
+        && guard.is_none()
+    {
+        *guard = Some(Arc::clone(&shared_inbound));
+    }
 
-    // Consensus heartbeat thread (1s interval, matching rippled ledgerGRANULARITY).
-    // This is the SOLE driver of consensus timing. No other thread calls timer_entry.
-    // Proposals are processed directly by peer I/O threads via push_proposal →
-    // drained inside timer_tick. The 1s cadence ensures tick_fixed(1s) runs at real speed.
-    let consensus_timer_stop = Arc::clone(&stop);
-    let consensus_timer_runtime = Arc::clone(&runtime);
-    std::thread::Builder::new()
-        .name("consensus-heartbeat".into())
-        .spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_secs(1));
-                if consensus_timer_stop.load(Ordering::Acquire) {
-                    break;
-                }
-                let root = consensus_timer_runtime.root();
-                let (Some(consensus_rt), Some(network_ops_rt)) =
-                    (root.consensus_runtime(), root.network_ops_runtime())
-                else {
-                    continue;
-                };
+    // Wire the shared acquisition instance to a real node-store write
+    // pipeline and the overlay, matching `xrpld/main`'s own standalone
+    // catchup wiring (`inbound_ledgers.set_node_store`/`set_write_tx`/
+    // `set_pending_writes`/`set_overlay_rt`). Without this,
+    // `SharedInboundLedgers::acquire` early-returns unconditionally on its
+    // internal `node_store`/`write_tx`/`pending_writes` guards, silently
+    // no-opping every active-acquisition request -- this was a genuine,
+    // previously-undiscovered gap: `--start` mode's `AppRclConsensusAdaptor
+    // ::acquire_ledger` only ever did a passive cache lookup and never had
+    // a way to actively catch a lagging node up to a ledger it doesn't
+    // have, because this whole pipeline was never connected.
+    if let Some(ns) = runtime.root().node_store().as_ref() {
+        shared_inbound.set_node_store(ns.clone());
+        let pending_writes = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let (write_tx, _write_handle) = crate::ledger::shared_inbound_ledgers::spawn_nodestore_writer(ns.clone(), Arc::clone(&pending_writes));
+        shared_inbound.set_write_tx(write_tx);
+        shared_inbound.set_pending_writes(pending_writes);
+    }
+    if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+        shared_inbound.set_overlay_rt(overlay_rt);
+    }
 
-                // Peer count gate: don't tick consensus without peers
-                // (matches rippled's processHeartbeatTimer peer count check)
-                let peer_count = root
-                    .overlay_runtime()
-                    .map(|ort| {
-                        use overlay::Overlay;
-                        ort.overlay().active_peers().len()
-                    })
-                    .unwrap_or(0);
-                // Match rippled processHeartbeatTimer: skip timerEntry when
-                // insufficient peers are connected. Requires a majority of
-                // the configured UNL to be present before consensus ticks,
-                // preventing solo ledger closes during network formation.
-                let min_peers = {
-                    let unl_size = root.validators().count();
-                    if unl_size <= 1 { 1 } else { (unl_size - 1) / 2 }
-                };
-                if peer_count < min_peers {
-                    continue;
-                }
+    let event_loop_app = runtime.root().clone();
+    let event_loop_stop = Arc::clone(&stop);
+    crate::consensus::driver::spawn_event_loop(
+        event_loop_app,
+        Arc::clone(&shared_inbound),
+        event_rx,
+        event_loop_stop,
+    );
 
-                // Drain proposals + tick consensus (1s cadence = real-time tick_fixed)
-                network_ops_rt.drain_proposals(consensus_rt.as_ref());
-                network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
-            }
-        })
-        .expect("spawn consensus-heartbeat thread");
-
-    // Validation processing thread (channel-driven, matching rippled's jtVALIDATION).
-    // Blocks on recv() — wakes INSTANTLY when overlay receives a validation.
-    // No polling, no sleep. This ensures ledger promotion never competes with
-    // peer I/O in the bootstrap loop.
-    let validation_stop = Arc::clone(&stop);
-    let validation_runtime = Arc::clone(&runtime);
+    // Validation forwarding thread: receives overlay notify signal, takes
+    // validations, and forwards them as ConsensusEvent::Validation to the
+    // event loop. This bridges the overlay's SyncSender<()> notify pattern
+    // to the unified event channel.
     {
         let (val_notify_tx, val_notify_rx) = std::sync::mpsc::sync_channel::<()>(1);
-        // Wire the notify channel into the overlay so on_validation signals us
         if let Some(overlay_rt) = runtime.root().overlay_runtime() {
             overlay_rt
                 .overlay()
                 .queued_inbound()
                 .set_validation_notify(val_notify_tx);
         }
+        let fwd_stop = Arc::clone(&stop);
+        let fwd_runtime = Arc::clone(&runtime);
+        let fwd_event_tx = event_tx.clone();
         std::thread::Builder::new()
-            .name("validation-processor".into())
+            .name("validation-forwarder".into())
             .spawn(move || {
                 loop {
-                    // Block until signaled by overlay (instant wake, zero CPU)
                     let _ = val_notify_rx.recv();
-                    if validation_stop.load(Ordering::Acquire) {
+                    if fwd_stop.load(Ordering::Acquire) {
                         break;
                     }
-                    let root = validation_runtime.root();
+                    let root = fwd_runtime.root();
                     let Some(overlay_rt) = root.overlay_runtime() else { continue; };
-                    
                     let validations = overlay_rt.overlay().take_validations();
-                    for queued in &validations {
-                        let mut serial =
-                            protocol::SerialIter::new(&queued.message.validation);
-                        let Ok(mut validation) =
-                            protocol::STValidation::from_serial_iter_default_node_id(
-                                &mut serial, false,
-                            )
-                        else { continue; };
-                        let now_wall = root.current_close_time_seconds();
-                        validation.set_seen(now_wall);
-                        let sign_time = validation.get_sign_time();
-                        if sign_time > 0 {
-                            let offset = sign_time as i64 - now_wall as i64;
-                            root.time_keeper()
-                                .adjust_close_time(time::Duration::seconds(offset));
-                        }
-                        let source = queued.peer_id.to_string();
-                        let _ = root.receive_validation_to_network_ops(
-                            &mut validation, &source,
-                        );
-                        // Immediate checkAccept: promote if quorum met
-                        if let Some(lm_rt) = root.ledger_master_runtime() {
-                            let hash = validation.get_ledger_hash();
-                            let seq = validation.get_field_u32(
-                                protocol::get_field_by_symbol("sfLedgerSequence"),
-                            );
-                            if seq > lm_rt.ledger_master().valid_ledger_seq() {
-                                if let Some(ledger) = lm_rt.ledger_master().get_ledger_by_hash(
-                                    basics::sha_map_hash::SHAMapHash::new(hash),
-                                ) {
-                                    let vals = root.validations().store()
-                                        .trusted_for_ledger_by_sequence(hash, seq);
-                                    let val_count = root.validators()
-                                        .negative_unl_filter_validations(vals).len();
-                                    let needed = root.validators().quorum();
-                                    if val_count >= needed {
-                                        let mut promoted =
-                                            root.ledger_with_node_fetcher(ledger);
-                                        {
-                                            let l = std::sync::Arc::make_mut(&mut promoted);
-                                            l.set_validated();
-                                            l.set_full();
-                                            l.finalize_immutable_no_setup();
-                                        }
-                                        let lm = lm_rt.ledger_master();
-                                        lm.ledger_history().insert(
-                                            std::sync::Arc::clone(&promoted), true,
-                                        );
-                                        lm.mark_ledger_complete(seq);
-                                        lm.set_valid_ledger_no_sweep(promoted, None, None);
-                                    }
-                                }
-                            }
-                        }
-                        // Relay trusted validations
-                        if validation.is_trusted() {
-                            overlay_rt.overlay().relay_validation(
-                                queued.message.clone(),
-                                queued.suppression,
-                                *validation.get_signer_public(),
-                            );
+                    for queued in validations {
+                        if fwd_event_tx
+                            .send(crate::consensus::driver::ConsensusEvent::Validation(queued))
+                            .is_err()
+                        {
+                            return;
                         }
                     }
                 }
             })
-            .expect("spawn validation-processor thread");
+            .expect("spawn validation-forwarder thread");
+    }
+
+    // Immediate transaction dispatch — matches reference
+    // `PeerImp::handleTransaction` calling
+    // `JobQueue::addJob(JtTransaction, "RcvCheckTx", ...)` synchronously on
+    // receipt from the network thread. Without this, `--start` mode never
+    // registers a transaction router on `QueuedOverlayInboundHandler`, so
+    // every inbound `TMTransaction` from a peer gets queued into
+    // `OverlayInboundSnapshot::transactions` and is NEVER consumed or
+    // applied -- confirmed via a live cluster test where a burst of
+    // transactions submitted to one node's RPC never appeared on ANY other
+    // node's ledger, even though the peer network delivered the raw
+    // message (peers recognized the transaction's hash via `tx` lookups,
+    // just permanently unvalidated). This meant nodes could only ever
+    // include transactions submitted directly to their own RPC endpoint,
+    // making network-wide agreement on a shared transaction set impossible
+    // except by coincidence. Mirrors `main.rs`'s standalone catchup wiring
+    // (`process_inbound_transaction`) exactly: parse the raw bytes back
+    // into an `STTx`, wrap it, and run it through the SAME
+    // `process_transaction` + `apply_network_ops_pending_to_open_ledger`
+    // pipeline a local RPC submission uses, with `local=false` (matching
+    // reference's `bLocal=false` for network-received transactions).
+    if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+        let router_root = runtime.root().clone();
+        overlay_rt.overlay().queued_inbound().set_transaction_router(Box::new(move |_peer_id, message| {
+            let job_root = router_root.clone();
+            router_root.job_queue().add_job(
+                crate::job::job_types::JobType::JtTransaction,
+                "RcvCheckTx",
+                move || {
+                    let mut serial = protocol::SerialIter::new(&message.message.raw_transaction);
+                    let st_tx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        protocol::STTx::from_serial_iter(&mut serial)
+                    })) {
+                        Ok(tx) => tx,
+                        Err(_) => return,
+                    };
+                    let st_tx = Arc::new(st_tx);
+                    let mut transaction: crate::SharedTransaction = Arc::new(std::sync::Mutex::new(
+                        crate::tx_queue::transaction::Transaction::new(Arc::clone(&st_tx)),
+                    ));
+                    if let Some(network_ops_runtime) = job_root.network_ops_runtime() {
+                        let _ = network_ops_runtime.process_transaction(
+                            &mut transaction,
+                            false,
+                            false,
+                            false,
+                            || false,
+                            || {},
+                        );
+                        let _ = job_root.apply_network_ops_pending_to_open_ledger();
+                    }
+                },
+            );
+        }));
     }
 
     while !stop.load(Ordering::Acquire) {
@@ -1098,12 +1135,73 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             continue;
         };
 
-        // Helper: fire consensus tick if ≥1s elapsed since last tick.
-        // Called after each heavy I/O operation to prevent timer starvation.
-        // Consensus is driven exclusively by the 1s heartbeat thread.
-        // No timer_entry calls from the main loop.
+        // Genesis private networks start consensus on the genesis ledger
+        // immediately -- there is no network ledger to acquire first, and
+        // no peer-confirmation gate to wait on (matching rippled's own
+        // standalone/fresh-network behavior of calling `beginConsensus` as
+        // soon as the first heartbeat fires). This must run exactly once,
+        // before the first `timer_tick`, so `Consensus::startRound`
+        // establishes the initial round that `timer_tick` then drives
+        // forward. Reads `root.closed_ledger()` -- `ApplicationRoot`'s
+        // `SharedLedgerMasterState`, the single source of truth for "the
+        // closed ledger" everywhere in this loop (matching the reference's
+        // single `LedgerMaster::closedLedger_`; there is no second tracker
+        // read from anywhere in this function).
+        if is_genesis && !consensus_started {
+            if let Some(closed) = root.closed_ledger() {
+                if network_ops_rt
+                    .maybe_begin_consensus_from_validated(consensus_rt.as_ref(), Arc::clone(&closed))
+                {
+                    tracing::info!(target: "consensus",
+                        seq = closed.header().seq,
+                        "Consensus started on genesis ledger"
+                    );
+                    consensus_started = true;
+                    last_round_ledger_id = Some(*closed.header().hash.as_uint256());
+                    last_timer_tick = std::time::Instant::now();
+                }
+            }
+        }
+
+        // Once a round reaches `Accepted`, `Consensus::timer_entry` becomes
+        // a permanent no-op (it early-returns in that phase) until a new
+        // round is started. Matches the reference's `NetworkOPsImp::onAccept`
+        // job unconditionally calling `endConsensus` -> `beginConsensus` ->
+        // `Consensus::startRound` after building the new ledger; without an
+        // equivalent re-trigger here, the chain would build exactly one
+        // ledger and then stall forever on every subsequent tick. Detected
+        // by polling `root.closed_ledger()`'s id: once `on_accept`'s
+        // spawned job (`AppRclConsensusAdaptor::on_accept` ->
+        // `ApplicationRoot::accept_ledger` -> `on_closed_ledger`) advances
+        // it past whatever id consensus most recently started its round
+        // with, immediately start the next round on that new ledger.
+        if consensus_started && consensus_rt.phase() == consensus::algorithm::ConsensusPhase::Accepted {
+            if let Some(closed) = root.closed_ledger() {
+                let closed_id = *closed.header().hash.as_uint256();
+                if last_round_ledger_id != Some(closed_id) {
+                    network_ops_rt.start_next_round(consensus_rt.as_ref(), Arc::clone(&closed));
+                    tracing::info!(target: "consensus",
+                        seq = closed.header().seq,
+                        "Consensus started next round on newly accepted ledger"
+                    );
+                    last_round_ledger_id = Some(closed_id);
+                    last_timer_tick = std::time::Instant::now();
+                }
+            }
+        }
+
+        // Helper: fire consensus tick if >=1s elapsed since last tick.
+        // Matches rippled's own ~1s `NetworkOPsImp::processHeartbeatTimer`
+        // cadence -- this loop's per-iteration work (fetch-pack service,
+        // proposal draining, etc.) happens every 50ms, but
+        // `Consensus::timer_entry` itself must only run once per second.
         macro_rules! maybe_tick_consensus {
-            () => {};
+            () => {
+                if consensus_started && last_timer_tick.elapsed() >= Duration::from_secs(1) {
+                    network_ops_rt.handle_consensus_timer(consensus_rt.as_ref());
+                    last_timer_tick = std::time::Instant::now();
+                }
+            };
         }
 
         // Serve TmGetLedger requests from peers (PART 1).
@@ -1113,200 +1211,139 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         // Broadcast our closed ledger to peers via StatusChange so they
         // can detect whether we're at genesis or ahead. This replaces the
         // overlay timer StatusChange that doesn't run in --start mode.
+        // Matches the reference's `notify(neACCEPTED_LEDGER, ...)`, called
+        // once here for the pre-consensus-start bootstrap window; once
+        // consensus is running, `ConsensusLedgerAcceptor`'s accept job
+        // broadcasts the equivalent `TMStatusChange` on every round.
         if !consensus_started {
-            if let Some(lm_rt) = root.ledger_master_runtime() {
-                if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
-                    use overlay::Overlay;
-                    let hdr = closed.header();
-                    let status =
-                        overlay::ProtocolMessage::new(overlay::ProtocolPayload::StatusChange(
-                            overlay::message::wire::TmStatusChange {
-                                new_status: Some(1),
-                                new_event: Some(1),
-                                ledger_seq: Some(hdr.seq),
-                                ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
-                                ledger_hash_previous: Some(
-                                    hdr.parent_hash.as_uint256().data().to_vec(),
-                                ),
-                                network_time: None,
-                                first_seq: Some(1),
-                                last_seq: Some(hdr.seq),
-                            },
-                        ));
-                    overlay_rt.overlay().broadcast(&status);
-                }
+            if let Some(closed) = root.closed_ledger() {
+                use overlay::Overlay;
+                let hdr = closed.header();
+                let status =
+                    overlay::ProtocolMessage::new(overlay::ProtocolPayload::StatusChange(
+                        overlay::message::wire::TmStatusChange {
+                            new_status: Some(1),
+                            new_event: Some(1),
+                            ledger_seq: Some(hdr.seq),
+                            ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
+                            ledger_hash_previous: Some(
+                                hdr.parent_hash.as_uint256().data().to_vec(),
+                            ),
+                            network_time: None,
+                            first_seq: Some(1),
+                            last_seq: Some(hdr.seq),
+                        },
+                    ));
+                overlay_rt.overlay().broadcast(&status);
             }
         }
 
         // Before starting consensus, acquire the network's validated ledger.
+        // This path only matters for nodes JOINING an existing network
+        // (is_genesis == false); genesis nodes already started above.
         if !consensus_started {
-            // Check peers for a ledger we need to acquire.
-            if true {
-                use overlay::Overlay;
-                let peers = overlay_rt.overlay().active_peers();
-                if true {
-                    // Start even without peers like rippled
-                    let any_ahead = peers.iter().find(|p| {
-                        let h = p.closed_ledger_hash();
-                        if h.is_zero() {
-                            return false;
-                        }
-                        if let Some(lm_rt) = root.ledger_master_runtime() {
-                            lm_rt
-                                .ledger_master()
-                                .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(h))
-                                .is_none()
-                        } else {
-                            false
-                        }
-                    });
-                    if let Some(peer) = any_ahead {
-                        // Trigger acquisition for that peer's ledger.
-                        let closed_hash = peer.closed_ledger_hash();
-                        if let Some(lm_rt) = root.ledger_master_runtime() {
-                            let mut pending = lm_rt
-                                .pending_consensus_ledger
-                                .lock()
-                                .expect("pending_consensus_ledger lock");
-                            if pending.is_none() {
-                                *pending = Some(closed_hash);
-                                tracing::info!(target: "consensus",
-                                    hash = %closed_hash,
-                                    peer_id = peer.id(),
-                                    "Requesting peer's current closed ledger"
-                                );
-                            }
-                        }
-                    } else {
-                        // All peers are at genesis or we already have their
-                        // ledger. Only start if at least one peer has actively
-                        // reported their closed ledger (non-zero). Peers that
-                        // haven't sent StatusChange yet report zero — wait for
-                        // them to confirm before starting.
-                        if let Some(lm_rt) = root.ledger_master_runtime() {
-                            if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
-                                let closed_hash = *closed.header().hash.as_uint256();
-                                let any_confirmed =
-                                    peers.iter().any(|p| !p.closed_ledger_hash().is_zero());
-                                if true && root.need_network_ledger() {
-                                    // Start immediately like rippled
-                                    // Drain queued proposals into the consensus
-                                    // engine BEFORE starting so that startRound's
-                                    // playback_proposals finds them (matching
-                                    // rippled where proposals arrive via JobQueue
-                                    // before startRound runs).
-                                    let proposals = overlay_rt.overlay().take_proposals();
-                                    for proposal in &proposals {
-                                        let now = root.shared_time_keeper().close_time();
-                                        let peer_close_time =
-                                            basics::chrono::NetClockTimePoint::new(
-                                                proposal.message.close_time,
-                                            );
-                                        let prop = consensus::ConsensusProposal::new(
-                                            proposal.previous_ledger,
-                                            proposal.message.propose_seq,
-                                            proposal.current_tx_hash,
-                                            peer_close_time,
-                                            now,
-                                            proposal.public_key,
-                                        );
-                                        consensus_rt.push_proposal(
-                                            crate::runtime::component_runtime::PendingProposal {
-                                                now,
-                                                public_key: proposal.public_key,
-                                                signature: proposal.message.signature.clone(),
-                                                suppression_id: proposal.suppression,
-                                                proposal: prop,
-                                            },
-                                        );
-                                    }
-                                    if network_ops_rt.maybe_begin_consensus_from_validated(
-                                        consensus_rt.as_ref(),
-                                        Arc::clone(&closed),
-                                    ) {
-                                        tracing::info!(target: "consensus",
-                                            seq = closed.header().seq,
-                                            "Consensus started — peers confirmed current ledger"
-                                        );
-                                        consensus_started = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
+            use overlay::Overlay;
+            let peers = overlay_rt.overlay().active_peers();
+            // Start even without peers like rippled
+            let any_ahead = peers.iter().find(|p| {
+                let h = p.closed_ledger_hash();
+                if h.is_zero() {
+                    return false;
                 }
-            }
-
-            // Process validations to sync clock and detect network state.
-            let validations = overlay_rt.overlay().take_validations();
-            for queued in &validations {
-                let mut serial = protocol::SerialIter::new(&queued.message.validation);
-                let parsed =
-                    protocol::STValidation::from_serial_iter_default_node_id(&mut serial, false);
-                let mut validation = match parsed {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                // Adjust clock from validator sign_time FIRST so that
-                // set_seen and is_current use a synchronized clock.
-                let sign_time = validation.get_sign_time();
-                if sign_time > 0 {
-                    let now = root.current_close_time_seconds() as i64;
-                    let offset = sign_time as i64 - now;
-                    root.time_keeper()
-                        .adjust_close_time(time::Duration::seconds(offset));
-                }
-                // Set seen_time AFTER clock adjustment so is_current passes.
-                validation.set_seen(root.current_close_time_seconds());
-                let source = queued.peer_id.to_string();
-                let _ = root.receive_validation_to_network_ops(&mut validation, &source);
-
-                // If this is a trusted validation for a ledger we don't have,
-                // trigger acquisition from the peer that sent it.
-                if validation.is_trusted() {
-                    let val_hash = validation.get_ledger_hash();
-                    let val_seq =
-                        validation.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence"));
-                    if let Some(lm_rt) = root.ledger_master_runtime() {
-                        let lm = lm_rt.ledger_master();
-                        if lm
-                            .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(val_hash))
-                            .is_none()
-                            && val_seq > 1
-                        {
-                            let mut pending = lm_rt
-                                .pending_consensus_ledger
-                                .lock()
-                                .expect("pending_consensus_ledger lock");
-                            if pending.is_none() {
-                                *pending = Some(val_hash);
-                                tracing::info!(target: "consensus",
-                                    hash = %val_hash, seq = val_seq,
-                                    peer_id = queued.peer_id,
-                                    "Trusted validation for missing ledger — triggering acquisition"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // If acquisition completed, closed_ledger updated → start consensus
-            if !consensus_started {
                 if let Some(lm_rt) = root.ledger_master_runtime() {
-                    if let Some(closed) = lm_rt.ledger_master().closed_ledger() {
-                        if closed.header().seq > 1 {
-                            if network_ops_rt.maybe_begin_consensus_from_validated(
-                                consensus_rt.as_ref(),
-                                Arc::clone(&closed),
-                            ) {
-                                tracing::info!(target: "consensus",
-                                    seq = closed.header().seq,
-                                    "Consensus started from acquired network ledger"
-                                );
-                                consensus_started = true;
-                            }
-                        }
+                    lm_rt
+                        .ledger_master()
+                        .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(h))
+                        .is_none()
+                } else {
+                    false
+                }
+            });
+            if let Some(peer) = any_ahead {
+                // Trigger acquisition for that peer's ledger.
+                let closed_hash = peer.closed_ledger_hash();
+                if let Some(lm_rt) = root.ledger_master_runtime() {
+                    let mut pending = lm_rt
+                        .pending_consensus_ledger
+                        .lock()
+                        .expect("pending_consensus_ledger lock");
+                    if pending.is_none() {
+                        *pending = Some(closed_hash);
+                        tracing::info!(target: "consensus",
+                            hash = %closed_hash,
+                            peer_id = peer.id(),
+                            "Requesting peer's current closed ledger"
+                        );
+                    }
+                }
+            } else if let Some(closed) = root.closed_ledger() {
+                // All peers are at genesis or we already have their
+                // ledger. Only start if we actually need a network ledger
+                // (joining case) -- genesis nodes are handled above and
+                // must not re-enter this path.
+                if root.need_network_ledger() {
+                    // Drain queued proposals into the consensus engine
+                    // BEFORE starting so that startRound's
+                    // playback_proposals finds them (matching rippled
+                    // where proposals arrive via JobQueue before
+                    // startRound runs).
+                    let proposals = overlay_rt.overlay().take_proposals();
+                    for proposal in &proposals {
+                        let now = root.shared_time_keeper().close_time();
+                        let peer_close_time =
+                            basics::chrono::NetClockTimePoint::new(
+                                proposal.message.close_time,
+                            );
+                        let prop = consensus::ConsensusProposal::new(
+                            proposal.previous_ledger,
+                            proposal.message.propose_seq,
+                            proposal.current_tx_hash,
+                            peer_close_time,
+                            now,
+                            proposal.public_key,
+                        );
+                        consensus_rt.push_proposal(
+                            crate::runtime::component_runtime::PendingProposal {
+                                now,
+                                public_key: proposal.public_key,
+                                signature: proposal.message.signature.clone(),
+                                suppression_id: proposal.suppression,
+                                proposal: prop,
+                            },
+                        );
+                    }
+                    if network_ops_rt.maybe_begin_consensus_from_validated(
+                        consensus_rt.as_ref(),
+                        Arc::clone(&closed),
+                    ) {
+                        tracing::info!(target: "consensus",
+                            seq = closed.header().seq,
+                            "Consensus started — peers confirmed current ledger"
+                        );
+                        consensus_started = true;
+                        last_round_ledger_id = Some(*closed.header().hash.as_uint256());
+                        last_timer_tick = std::time::Instant::now();
+                    }
+                }
+            }
+
+            // Validations are now processed exclusively by the consensus event-loop
+            // thread via the validation-forwarder. No processing here.
+
+            // If acquisition completed, closed_ledger updated -> start consensus
+            if !consensus_started {
+                if let Some(closed) = root.closed_ledger() {
+                    if closed.header().seq > 1 && network_ops_rt.maybe_begin_consensus_from_validated(
+                        consensus_rt.as_ref(),
+                        Arc::clone(&closed),
+                    ) {
+                        tracing::info!(target: "consensus",
+                            seq = closed.header().seq,
+                            "Consensus started from acquired network ledger"
+                        );
+                        consensus_started = true;
+                        last_round_ledger_id = Some(*closed.header().hash.as_uint256());
+                        last_timer_tick = std::time::Instant::now();
                     }
                 }
             }
@@ -1372,29 +1409,30 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                     proposal: prop,
                 });
             }
+
+            // Matches the reference's `PeerImp::onMessage(TMProposeSet)`
+            // calling `app_.getOPs().processTrustedProposal(peerPos)` ->
+            // `consensus_.peerProposal(...)` SYNCHRONOUSLY, directly from
+            // the network I/O thread, the instant a proposal arrives --
+            // completely independent of `Consensus::timerEntry`'s own 1s
+            // cadence (`ledgerGRANULARITY`). Without this call, proposals
+            // pushed into `pending_proposals` above only ever got drained
+            // inside `handle_consensus_timer` (gated by the 1s
+            // `maybe_tick_consensus!` cooldown below), meaning a proposal
+            // that arrived over the wire in milliseconds could sit unread
+            // by the algorithm for up to a full second. Confirmed via a
+            // live cluster test: nodes reached `update_our_positions` with
+            // `curr_peer_positions` empty on nearly every round despite
+            // peers continuously sending proposals, causing each node to
+            // pick its own close time independently and permanently fork
+            // from genesis+1 onward. `drain_proposals` (unlike
+            // `handle_consensus_timer`) only feeds `peer_proposal` and
+            // does NOT run the heavier `phase_open`/`phase_establish`
+            // state machine, so calling it every ~50ms iteration is cheap
+            // and matches the reference's real latency characteristics.
+            network_ops_rt.drain_proposals(consensus_rt.as_ref());
         }
 
-        // Drain and process inbound validations.
-        let validations = overlay_rt.overlay().take_validations();
-        for queued in &validations {
-            let mut serial = protocol::SerialIter::new(&queued.message.validation);
-            let parsed =
-                protocol::STValidation::from_serial_iter_default_node_id(&mut serial, false);
-            let mut validation = match parsed {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let sign_time = validation.get_sign_time();
-            if sign_time > 0 {
-                let now = root.current_close_time_seconds() as i64;
-                let offset = sign_time as i64 - now;
-                root.time_keeper()
-                    .adjust_close_time(time::Duration::seconds(offset));
-            }
-            validation.set_seen(root.current_close_time_seconds());
-            let source = queued.peer_id.to_string();
-            let _ = root.receive_validation_to_network_ops(&mut validation, &source);
-        }
         maybe_tick_consensus!();
 
         // Process fetch pack messages (responses AND requests).
@@ -1441,8 +1479,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         maybe_tick_consensus!();
 
         // storeLedger: drain completed InboundLedger results into LedgerHistory
-        // (matching rippled's done() → storeLedger() with 50ms latency).
-        // Insert with validated=true so ledgers are indexed by seq for tryAdvance lookups.
+        // and forward to the consensus event loop for checkAccept promotion.
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let rx_guard = lm_rt
                 .completed_ledgers_rx
@@ -1450,46 +1487,47 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 .expect("completed_ledgers_rx");
             if let Some(rx) = rx_guard.as_ref() {
                 while let Ok(ledger) = rx.try_recv() {
-                    lm_rt
+                    let inserted = lm_rt
                         .ledger_master()
                         .ledger_history()
                         .insert(std::sync::Arc::clone(&ledger), true);
-                }
-            }
-        }
-
-        // Consensus wrong-ledger recovery: trigger fetch for requested ledger.
-        // The consensus adapter stores the hash in pending_consensus_ledger when
-        // acquire_ledger fails. We pick it up here and send a TmGetLedger to
-        // peers. When the response arrives (via fetch pack / ledger data), it
-        // lands in LedgerHistory where acquire_ledger will find it next tick.
-        if let Some(lm_rt) = root.ledger_master_runtime() {
-            if let Some(hash) = lm_rt.take_pending_consensus_ledger() {
-                if !hash.is_zero()
-                    && lm_rt
-                        .ledger_master()
-                        .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(hash))
-                        .is_none()
-                {
-                    use overlay::Overlay;
-                    let msg = ledger::make_fetch_pack_request(
-                        basics::sha_map_hash::SHAMapHash::new(hash),
-                    );
-                    let wire = overlay::Message::new(msg, None);
-                    for p in overlay_rt.overlay().active_peers().iter().take(2) {
-                        p.send(wire.clone());
+                    if !inserted {
+                        tracing::warn!(
+                            target: "consensus",
+                            seq = ledger.header().seq,
+                            hash = %ledger.header().hash,
+                            immutable = ledger.is_immutable(),
+                            "Rejected completed ledger insert from completed_ledgers_rx"
+                        );
                     }
+                    let _ = event_tx.send(
+                        crate::consensus::driver::ConsensusEvent::LedgerDone(
+                            std::sync::Arc::clone(&ledger),
+                        ),
+                    );
                 }
             }
         }
-
-        // Feed proposals to consensus every 50ms (every loop iteration).
-        // matching rippled where proposals are processed immediately via JobQueue.
-        network_ops_rt.drain_proposals(consensus_rt.as_ref());
-
-        // Tick the consensus state machine (sole consensus driver).
-        // Time-gated: only fire once per second to avoid blocking the loop.
-        // Consensus timer_entry is driven exclusively by the heartbeat thread.
+        while let Ok(ledger) = shared_completed_rx.try_recv() {
+            if let Some(lm_rt) = root.ledger_master_runtime() {
+                let inserted = lm_rt
+                    .ledger_master()
+                    .ledger_history()
+                    .insert(std::sync::Arc::clone(&ledger), true);
+                if !inserted {
+                    tracing::warn!(
+                        target: "consensus",
+                        seq = ledger.header().seq,
+                        hash = %ledger.header().hash,
+                        immutable = ledger.is_immutable(),
+                        "Rejected completed ledger insert from shared_completed_rx"
+                    );
+                }
+            }
+            let _ = event_tx.send(
+                crate::consensus::driver::ConsensusEvent::LedgerDone(ledger),
+            );
+        }
 
         // checkAccept + tryAdvance burst catch-up (matching rippled LedgerMaster.cpp):
         // 1. First check if the closed ledger can be promoted to validated.
@@ -1497,12 +1535,20 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         //    each one that has sufficient validations (burst catch-up).
         // This allows validating N+1, N+2, ... N+50 in a single tick if all
         // intermediate ledgers are available in history with quorum validations.
+        // Reads `root.closed_ledger()` for the "which ledger just closed"
+        // check (the single source of truth), but keeps using
+        // `lm.valid_ledger_seq()`/`lm.ledger_history()`/
+        // `lm.set_valid_ledger_no_sweep(...)` for the VALIDATED-ledger
+        // burst-advance bookkeeping -- that is legitimately
+        // `ledger::LedgerMaster`'s own internal state (distinct from "the
+        // closed ledger"), not duplicated anywhere else, so it is not part
+        // of the dual-tracker bug this rewrite fixes.
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let lm = lm_rt.ledger_master();
             let quorum = root.validators().quorum();
 
             // checkAccept: promote closed ledger if it has quorum
-            if let Some(closed) = lm.closed_ledger() {
+            if let Some(closed) = root.closed_ledger() {
                 let closed_seq = closed.header().seq;
                 if closed_seq > lm.valid_ledger_seq() {
                     let closed_hash = *closed.header().hash.as_uint256();
@@ -1560,7 +1606,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             // directly — no need to fetch from peers.
             if advanced == 0 && lm.valid_ledger_seq() == 0 {
                 use overlay::Overlay;
-                let our_closed_hash = lm
+                let our_closed_hash = root
                     .closed_ledger()
                     .map(|l| *l.header().hash.as_uint256())
                     .unwrap_or(basics::base_uint::Uint256::zero());
@@ -1595,14 +1641,12 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             }
         }
 
-        // --- Consensus ledger acquisition ---
         std::thread::sleep(Duration::from_millis(50));
     }
 
     tracing::info!(target: "consensus", "Start-mode consensus event loop stopped");
 }
 
-/// State for targeted ledger acquisition with peer rotation and 2s retry.
 fn serve_get_ledger_requests(
     root: &crate::ApplicationRoot,
     overlay_rt: &Arc<crate::runtime::overlay_runtime::AppOverlayRuntime>,
