@@ -1937,6 +1937,74 @@ impl Ledger {
         self.tx_map = next;
     }
 
+    /// Persist dirty SHAMap nodes to the node store WITHOUT rebuilding
+    /// the in-memory tree. This matches rippled's BuildLedger.cpp
+    /// flushDirty() which writes to NuDB but keeps the full tree in
+    /// memory for immediate serving via get_node_fat.
+    ///
+    /// Unlike `flush_state_map_to_store` (which rebuilds from root, losing
+    /// in-memory children), this preserves the full tree structure so the
+    /// ledger can be served to peers via InboundLedger immediately.
+    pub fn persist_dirty_nodes_to_store(&mut self) {
+        let ledger_seq = self.header.seq;
+        let writer = self.node_writer.clone();
+        if writer.is_none() {
+            return;
+        }
+
+        // Flush state map dirty nodes
+        let mut state_tree = self.mutable_state.take().unwrap_or_else(|| {
+            MutableTree::from_loaded_root(self.state_map.root(), ledger_seq.max(1))
+        });
+        state_tree.flush_dirty(
+            &mut |node: basics::memory::intrusive_pointer::SharedIntrusive<
+                shamap::nodes::tree_node::SHAMapTreeNode,
+            >|
+             -> basics::memory::intrusive_pointer::SharedIntrusive<
+                shamap::nodes::tree_node::SHAMapTreeNode,
+            > {
+                if let Some(ref write_fn) = writer {
+                    let hash = node.get_hash();
+                    if let Ok(data) = node.serialize_with_prefix() {
+                        write_fn(
+                            LedgerNodeObjectType::AccountNode,
+                            *hash.as_uint256(),
+                            data,
+                            ledger_seq,
+                        );
+                    }
+                }
+                node
+            },
+        );
+        // Keep mutable_state so the tree stays in memory
+        self.mutable_state = Some(state_tree);
+
+        // Flush tx map dirty nodes
+        let mut tx_tree = MutableTree::from_loaded_root(self.tx_map.root(), ledger_seq.max(1));
+        tx_tree.flush_dirty(
+            &mut |node: basics::memory::intrusive_pointer::SharedIntrusive<
+                shamap::nodes::tree_node::SHAMapTreeNode,
+            >|
+             -> basics::memory::intrusive_pointer::SharedIntrusive<
+                shamap::nodes::tree_node::SHAMapTreeNode,
+            > {
+                if let Some(ref write_fn) = writer {
+                    let hash = node.get_hash();
+                    if let Ok(data) = node.serialize_with_prefix() {
+                        write_fn(
+                            LedgerNodeObjectType::TransactionNode,
+                            *hash.as_uint256(),
+                            data,
+                            ledger_seq,
+                        );
+                    }
+                }
+                node
+            },
+        );
+    }
+
     /// Set the node writer closure for flushing dirty nodes to the store.
     pub fn set_node_writer(
         &mut self,

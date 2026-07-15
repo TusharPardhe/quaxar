@@ -424,7 +424,14 @@ impl NumberParts {
             };
         }
 
-        self.mantissa.cmp(&other.mantissa)
+        // When both values share the same sign and exponent, compare
+        // mantissas directly. For negative numbers, a larger mantissa means
+        // a MORE negative (lesser) value, so the comparison reverses.
+        if self.negative {
+            other.mantissa.cmp(&self.mantissa)
+        } else {
+            self.mantissa.cmp(&other.mantissa)
+        }
     }
 
     pub fn shift_exponent(

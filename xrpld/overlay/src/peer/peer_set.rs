@@ -101,13 +101,14 @@ impl PeerSet for SimplePeerSet {
             peer.send(wire);
             return;
         }
-        // Broadcast to all tracked peers (reference iterates peers_ set)
-        let peer_ids = self.peer_ids.lock().expect("peer ids lock");
+        // Broadcast to ALL peers (not just tracked ones in peer_ids).
+        // For tx-set acquisition, the request must reach the one peer that
+        // actually has the set. With only 2 peers tracked via add_peers,
+        // the owner may not be included. Matching rippled's behavior where
+        // PeerSet broadcasts to all active peers when no specific target.
         let peers = self.peers.lock().expect("peer set lock");
         for p in peers.iter() {
-            if peer_ids.contains(&p.id()) {
-                p.send(wire.clone());
-            }
+            p.send(wire.clone());
         }
     }
 
@@ -205,5 +206,27 @@ impl PeerSet for DummyPeerSet {
 
     fn peer_count(&self) -> usize {
         0
+    }
+}
+
+/// A PeerSetBuilder that dynamically queries the overlay for current
+/// active peers at build() time. This ensures TransactionAcquire always
+/// has a current peer list to send requests to, matching rippled's
+/// InboundTransactions which calls app.overlay().getActivePeers()
+/// each time it needs to send a request.
+pub struct OverlayPeerSetBuilder {
+    overlay: std::sync::Arc<crate::runtime::overlay_impl::OverlayImpl>,
+}
+
+impl OverlayPeerSetBuilder {
+    pub fn new(overlay: std::sync::Arc<crate::runtime::overlay_impl::OverlayImpl>) -> Self {
+        Self { overlay }
+    }
+}
+
+impl PeerSetBuilder for OverlayPeerSetBuilder {
+    fn build(&self) -> std::sync::Arc<dyn PeerSet> {
+        use crate::Overlay;
+        std::sync::Arc::new(SimplePeerSet::new(self.overlay.active_peers().into_iter()))
     }
 }

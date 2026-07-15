@@ -78,6 +78,9 @@ where
         self.our_vote
     }
 
+    pub fn yays(&self) -> i32 { self.yays }
+    pub fn nays(&self) -> i32 { self.nays }
+
     /// The disputed transaction. `tx()`.
     pub fn tx(&self) -> &Tx {
         &self.tx

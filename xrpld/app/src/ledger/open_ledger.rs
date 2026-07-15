@@ -90,6 +90,25 @@ impl<V> OpenLedger<V> {
             .expect("OpenLedger current lock poisoned")
             .clone()
     }
+
+    /// Read the current view while holding the modify_mutex, ensuring any
+    /// in-progress `modify` call completes first. Matches rippled's implicit
+    /// serialization of `onClose`'s `openLedger.current()` read with
+    /// `NetworkOPs::apply`'s `openLedger.modify(...)` via the master mutex.
+    /// Without this, `on_close` can snapshot the open ledger mid-batch,
+    /// missing transactions that are currently being applied on another
+    /// thread — causing different nodes to capture different tx-sets under
+    /// load (the root cause of the stress-test divergence).
+    pub fn current_synchronized(&self) -> Arc<V> {
+        let _modify_guard = self
+            .modify_mutex
+            .lock()
+            .expect("OpenLedger modify lock poisoned");
+        self.current
+            .lock()
+            .expect("OpenLedger current lock poisoned")
+            .clone()
+    }
 }
 
 impl<V> OpenLedger<V> {

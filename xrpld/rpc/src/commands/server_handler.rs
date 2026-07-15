@@ -132,6 +132,7 @@ static HANDLER_MAP: phf::Map<&'static str, RpcHandlerSpec> = phf::phf_map! {
     "noripple_check"        => RpcHandlerSpec::new("noripple_check",        Role::User,  HandlerCondition::None,                1, u32::MAX),
     "tx_reduce_relay"       => RpcHandlerSpec::new("tx_reduce_relay",       Role::User,  HandlerCondition::None,                1, u32::MAX),
     "vault_info"            => RpcHandlerSpec::new("vault_info",            Role::User,  HandlerCondition::None,                1, u32::MAX),
+    "version"               => RpcHandlerSpec::new("version",               Role::User,  HandlerCondition::None,                1, u32::MAX),
 };
 
 const HANDLERS: &[RpcHandlerSpec] = &[
@@ -548,6 +549,13 @@ const HANDLERS: &[RpcHandlerSpec] = &[
     ),
     RpcHandlerSpec::new(
         "vault_info",
+        Role::User,
+        HandlerCondition::None,
+        1,
+        u32::MAX,
+    ),
+    RpcHandlerSpec::new(
+        "version",
         Role::User,
         HandlerCondition::None,
         1,

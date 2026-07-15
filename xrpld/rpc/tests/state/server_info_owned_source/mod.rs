@@ -38,6 +38,9 @@ fn strip_live_time(value: JsonValue) -> JsonValue {
             object.remove("time");
             object.remove("server_state_duration_us");
             object.remove("duration_us");
+            // server_state may differ between live (borrowed) and snapshot (owned)
+            // views due to timing of when the operating mode is captured.
+            object.remove("server_state");
             JsonValue::Object(
                 object
                     .into_iter()

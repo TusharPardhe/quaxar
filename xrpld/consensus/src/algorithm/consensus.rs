@@ -359,6 +359,12 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         if self.first_round {
             self.prev_round_time = adaptor.parms().ledger_idle_interval;
             self.prev_close_time = prev_ledger.close_time();
+            // Genesis ledger has close_time=0; treat "now" as the effective
+            // close time so the first round doesn't compute a bogus
+            // since_close spanning the entire network epoch.
+            if self.prev_close_time == NetClockTimePoint::default() {
+                self.prev_close_time = now;
+            }
             self.first_round = false;
         } else {
             self.prev_close_time = self.raw_close_times.self_;
@@ -575,10 +581,6 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
     fn check_ledger(&mut self, adaptor: &A) {
         let net_lgr = adaptor.get_prev_ledger(&self.prev_ledger_id, &self.previous_ledger, self.mode.get());
 
-        // The reference checks these as two separate conditions (view of
-        // consensus changed vs. previousLedger_ not yet caught up), but
-        // both lead to the identical handleWrongLedger call, so they are
-        // combined here.
         if net_lgr != self.prev_ledger_id || self.previous_ledger.id() != self.prev_ledger_id {
             self.handle_wrong_ledger(adaptor, net_lgr);
         }
@@ -611,6 +613,21 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         let previous_close_correct = mode != ConsensusMode::WrongLedger && close_agree && (prev_close_time != prev_parent_close_time_plus_1);
 
         let last_close_time = if previous_close_correct { prev_close_time } else { self.prev_close_time };
+
+        // Guard against zero close time (genesis or early rounds before
+        // any real close time was established). Without this, since_close
+        // computes as the entire network epoch duration (~836M seconds),
+        // causing shouldCloseLedger to fire immediately on the very first
+        // timer tick, before peers have time to exchange proposals.
+        // Use the captured prev_close_time from start_round (which was
+        // set to `now` at round-start for genesis) as the reference point,
+        // NOT the continuously-advancing self.now (which would make
+        // since_close=0 permanently, preventing the ledger from ever closing).
+        let last_close_time = if last_close_time == NetClockTimePoint::default() {
+            self.prev_close_time
+        } else {
+            last_close_time
+        };
 
         let since_close = if self.now >= last_close_time {
             time_duration_to_std(self.now - last_close_time)
@@ -705,7 +722,15 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         }
 
         self.prev_proposers = self.curr_peer_positions.len();
-        self.prev_round_time = self.result.as_ref().expect("result set").round_time.read();
+        // Cap prev_round_time to prevent cascading slowdowns. If one round
+        // takes 22s due to disputes, without a cap the NEXT round must stay
+        // open for 11s (prev_round_time/2 guard in shouldCloseLedger).
+        // Rippled never hits this because it gets 0 disputes, but a cap at
+        // 10s (producing a 5s minimum open time) prevents permanent divergence
+        // if a single slow round occurs. The av_min_consensus_time (5s) is the
+        // natural floor — there's no benefit to prev_round_time exceeding 2x that.
+        let raw_round_time = self.result.as_ref().expect("result set").round_time.read();
+        self.prev_round_time = raw_round_time.min(Duration::from_secs(10));
         self.phase = ConsensusPhase::Accepted;
 
         let result = self.result.take().expect("result set");
@@ -767,8 +792,12 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             let result = self.result.as_mut().expect("result set during update_our_positions");
             let mut mutable_set: Option<A::TxSet> = None;
 
+            let dispute_count = result.disputes.len();
+            let mut vote_changes = 0usize;
+
             for (tx_id, dispute) in result.disputes.iter_mut() {
                 if dispute.update_vote(self.converge_percent as i32, proposing, &parms) {
+                    vote_changes += 1;
                     if mutable_set.is_none() {
                         mutable_set = Some(result.txns.clone());
                     }
@@ -779,6 +808,11 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
                         set.erase(tx_id);
                     }
                 }
+            }
+
+            if dispute_count > 0 || vote_changes > 0 {
+                let vote_detail: Vec<(bool, i32, i32)> = result.disputes.values().map(|d| (d.get_our_vote(), d.yays(), d.nays())).collect();
+                tracing::info!(target: "consensus", dispute_count, vote_changes, proposing, converge_pct = self.converge_percent, votes = ?vote_detail, "update_our_positions: dispute status");
             }
 
             our_new_set = mutable_set;

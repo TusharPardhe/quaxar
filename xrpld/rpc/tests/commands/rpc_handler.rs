@@ -220,7 +220,8 @@ fn rpc_handler_registry_table_plus_expected_aliases() {
             "export_snapshot".to_owned(),
             "ledger".to_owned(),
             "log_rotate".to_owned(),
-            "no_ripple_check".to_owned()
+            "no_ripple_check".to_owned(),
+            "version".to_owned(),
         ]
     );
 }

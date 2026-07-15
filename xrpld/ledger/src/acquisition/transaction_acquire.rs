@@ -222,7 +222,14 @@ impl TransactionAcquire {
                 query_type: (self.timeouts != 0).then_some(QT_INDIRECT),
                 query_depth: Some(QUERY_DEPTH),
             }));
-            self.send_request(&request, peer);
+            // Broadcast the root request to ALL peers (pass None to
+            // send_request which triggers the broadcast path). This ensures
+            // the request reaches the one peer that actually has the set,
+            // even if TMHaveTransactionSet hasn't been processed yet due to
+            // message ordering. For a 5-node cluster this is just 4 extra
+            // messages per acquisition — negligible overhead, and critical
+            // for dispute resolution to complete within the round time.
+            self.send_request(&request, None);
             return;
         }
 
@@ -295,11 +302,8 @@ impl TransactionAcquire {
             return;
         }
 
-        self.peer_set.add_peers(
-            1,
-            &mut |candidate| candidate.has_tx_set(self.hash),
-            &mut |candidate| self.peer_set.send_request(request, Some(candidate)),
-        );
+        // Broadcast to all peers via the PeerSet's None path.
+        self.peer_set.send_request(request, None);
     }
 
     fn with_built_filter<T>(

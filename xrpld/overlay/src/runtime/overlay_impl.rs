@@ -56,7 +56,7 @@ use crate::transport::handshake::is_public_ip;
 use crate::tx_metrics::TxMetrics;
 use crate::{HARD_MAX_REPLY_NODES, ProtocolFeature, ProtocolVersion, parse_protocol_versions};
 
-const PEER_LIMIT_REJECTION_REASON: &str = "peer limit reached for unreserved peer";
+const PEER_LIMIT_REJECTION_REASON: &str = "slots full";
 const PEERFINDER_MAX_HOPS: u32 = 6;
 const PEERFINDER_MAX_ACCEPTED_ENDPOINTS: usize = 64;
 const PEERFINDER_REDIRECT_ENDPOINT_COUNT: usize = 10;
@@ -697,7 +697,6 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         message: &crate::message::TmLedgerData,
     ) -> crate::router::RouteAction {
         if Uint256::from_slice(&message.ledger_hash).is_none() {
-            tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid ledger_data hash");
             return crate::router::RouteAction::Continue;
         }
         if !(0..=3).contains(&message.r#type) {
@@ -1762,6 +1761,10 @@ impl OverlayImpl {
 
     pub fn take_get_ledgers(&self) -> Vec<crate::PeerMessage<crate::TmGetLedger>> {
         self.queued_inbound.take_get_ledgers()
+    }
+
+    pub fn take_transactions(&self) -> Vec<crate::QueuedTransaction> {
+        self.queued_inbound.take_transactions()
     }
 
     pub fn take_get_objects(&self) -> Vec<crate::PeerMessage<crate::TmGetObjectByHash>> {

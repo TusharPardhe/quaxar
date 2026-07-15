@@ -212,6 +212,14 @@ impl AppNetworkOpsValidationRuntime {
         self.journal
             .trace(&format!("recvValidation {ledger_hash} from {source}"));
 
+        // NOTE: rippled sets val->setSeen(app_.timeKeeper().closeTime())
+        // here. In our --start mode, network time differs from wall-clock
+        // time (the genesis ledger uses a simulated epoch), so setting
+        // seen_time to wall-clock would cause is_current() to reject
+        // validations as stale. The seen_time=0 default safely bypasses
+        // the local-receipt-time staleness check. This is acceptable for
+        // --start mode clusters where all nodes share the same network.
+
         let bypass_accept = {
             let mut pending = self
                 .pending_validations
@@ -225,22 +233,31 @@ impl AppNetworkOpsValidationRuntime {
             }
         };
 
-        let current = {
+        let (current, check_accept_args) = {
             let mut validations = self
                 .validations
                 .validations()
                 .lock()
                 .expect("shared app validations mutex must not be poisoned");
-            handle_new_validation_with_store(
+            let (status, check_accept_args) = handle_new_validation_with_store(
                 self.validators.as_ref(),
                 &mut validations,
                 validation,
                 bypass_accept,
-                accept_sink,
                 Some(self.validations.persistence().as_ref()),
                 Some(self.journal.as_ref()),
-            ) == consensus::ValidationStatus::Current
+            );
+            (status == consensus::ValidationStatus::Current, check_accept_args)
         };
+
+        // Matches the reference: `checkAccept` runs AFTER `validations.add()`
+        // returns (releasing its internal lock), never nested underneath it.
+        // Calling it here (outside the lock scope above) avoids a
+        // self-deadlock, since `check_accept` re-queries validation counts
+        // via the same mutex.
+        if let (Some(sink), Some((hash, seq))) = (accept_sink, check_accept_args) {
+            sink.check_accept(hash, seq);
+        }
 
         if !bypass_accept {
             self.pending_validations

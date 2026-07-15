@@ -72,7 +72,7 @@ pub fn parse_path_finder_request(params: &JsonValue) -> Result<PathFinderRequest
         Some(JsonValue::String(value)) if parse_base58_account_id(value).is_some() => value.clone(),
         Some(JsonValue::String(_)) => return Err(Status::new(RpcErrorCode::SrcActNotFound)),
         Some(_) => return Err(Status::invalid_field_error("source_account")),
-        None => return Err(Status::missing_field_error("source_account")),
+        None => return Err(Status::new(RpcErrorCode::SrcActMissing)),
     };
 
     let destination_account = match object.get("destination_account") {

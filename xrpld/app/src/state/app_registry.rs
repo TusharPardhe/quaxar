@@ -491,7 +491,7 @@ impl SharedAppOpenLedger {
 
 impl crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource for SharedAppOpenLedger {
     fn current_open_transactions(&self) -> Vec<Arc<protocol::STTx>> {
-        self.current()
+        self.current_synchronized()
             .ordered_txs()
             .into_iter()
             .map(|record| record.tx.clone())

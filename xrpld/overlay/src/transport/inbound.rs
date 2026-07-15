@@ -138,6 +138,10 @@ pub struct QueuedOverlayInboundHandler {
     /// instead of polling every 500ms. Matches reference where validations trigger
     /// checkAccept synchronously on the network thread.
     validation_notify_tx: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+    /// Notify callback for instant batch-thread wake when a relay transaction
+    /// arrives and no router is set. Matches rippled's doTransactionAsync
+    /// scheduling a JtBatch job on first arrival.
+    transaction_notify: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl Default for QueuedOverlayInboundHandler {
@@ -148,6 +152,7 @@ impl Default for QueuedOverlayInboundHandler {
             ledger_data_router: Mutex::new(None),
             transaction_router: Mutex::new(None),
             validation_notify_tx: Mutex::new(None),
+            transaction_notify: Mutex::new(None),
         }
     }
 }
@@ -187,10 +192,18 @@ impl QueuedOverlayInboundHandler {
     /// called FIRST (before the channel), directly from the network thread.
     /// This eliminates the router thread channel hop for maximum throughput.
     pub fn set_ledger_data_router(&self, router: Box<dyn Fn(PeerId, TmLedgerData) + Send + Sync>) {
+        tracing::info!(target: "consensus", handler_ptr = format!("{:p}", self), "set_ledger_data_router: SETTING router");
         *self
             .ledger_data_router
             .lock()
             .expect("ledger_data_router lock") = Some(router);
+    }
+
+    pub fn ledger_data_router_is_set(&self) -> bool {
+        self.ledger_data_router
+            .lock()
+            .expect("ledger_data_router lock")
+            .is_some()
     }
 
     /// Register the immediate transaction-dispatch callback. Matches
@@ -202,6 +215,22 @@ impl QueuedOverlayInboundHandler {
             .transaction_router
             .lock()
             .expect("transaction_router lock") = Some(router);
+    }
+
+    /// Clear the transaction router so that incoming transactions accumulate
+    /// in the queue (retrieved via `take_transactions`). Used when consensus
+    /// starts and the bootstrap loop takes over transaction processing.
+    pub fn clear_transaction_router(&self) {
+        *self
+            .transaction_router
+            .lock()
+            .expect("transaction_router lock") = None;
+    }
+
+    /// Set a notify callback for when relay transactions are queued (no router set).
+    /// Called by the batch-apply thread setup to get instant wake on relay arrival.
+    pub fn set_transaction_notify(&self, notify: Box<dyn Fn() + Send + Sync>) {
+        *self.transaction_notify.lock().expect("transaction_notify lock") = Some(notify);
     }
 
     /// Put validations back into the queue so they can be consumed by the
@@ -283,6 +312,14 @@ impl QueuedOverlayInboundHandler {
         std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").get_ledgers)
     }
 
+    pub fn take_transactions(&self) -> Vec<QueuedTransaction> {
+        std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").transactions)
+    }
+
+    pub fn transaction_count(&self) -> usize {
+        self.inner.lock().expect("overlay inbound lock").transactions.len()
+    }
+
     pub fn take_get_objects(&self) -> Vec<PeerMessage<TmGetObjectByHash>> {
         std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").get_objects)
     }
@@ -317,6 +354,14 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
         drop(router_guard);
         let mut guard = self.inner.lock().expect("overlay inbound lock");
         guard.transactions.push(message);
+        drop(guard);
+        // Wake the batch-apply thread immediately (matches rippled's
+        // doTransactionAsync scheduling JtBatch on first arrival)
+        if let Ok(notify) = self.transaction_notify.lock() {
+            if let Some(ref f) = *notify {
+                f();
+            }
+        }
     }
 
     fn on_get_ledger(&self, peer: &Arc<PeerImp>, message: TmGetLedger) {
@@ -331,6 +376,9 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     }
 
     fn on_ledger_data(&self, peer: &Arc<PeerImp>, message: TmLedgerData) {
+        if message.r#type == 3 {
+            tracing::info!(target: "consensus", handler_ptr = format!("{:p}", self), peer_id = peer.id(), "on_ledger_data: type=3 ARRIVED");
+        }
         // Try direct router callback first — zero channel hops, called
         // directly from the network thread matching reference gotLedgerData.
         {

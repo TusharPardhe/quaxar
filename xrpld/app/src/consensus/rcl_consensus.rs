@@ -87,6 +87,7 @@ pub trait RclConsensusOpenLedgerSource {
 /// validation state stays swappable/testable.
 pub trait RclConsensusValidationSource {
     fn num_trusted_for_ledger(&self, ledger_id: Uint256) -> usize;
+    fn get_nodes_after(&self, ledger: &crate::consensus::rcl_validation::RclValidatedLedger, ledger_id: &Uint256) -> usize;
     fn preferred_lcl(&self, lcl: &crate::consensus::rcl_validation::RclValidatedLedger, min_seq: u32, peer_counts: &std::collections::BTreeMap<Uint256, u32>) -> Uint256;
     /// The trust-trie-preferred working ledger, derived purely from trusted
     /// validations received so far (no peer input). Matches the reference's
@@ -106,6 +107,10 @@ pub trait RclConsensusValidationSource {
 impl RclConsensusValidationSource for SharedAppValidations<SystemTimeKeeperClock> {
     fn num_trusted_for_ledger(&self, ledger_id: Uint256) -> usize {
         SharedAppValidations::num_trusted_for_ledger(self, ledger_id)
+    }
+
+    fn get_nodes_after(&self, ledger: &crate::consensus::rcl_validation::RclValidatedLedger, ledger_id: &Uint256) -> usize {
+        self.validations().lock().expect("shared app validations mutex must not be poisoned").get_nodes_after(ledger, ledger_id)
     }
 
     fn preferred_lcl(&self, lcl: &crate::consensus::rcl_validation::RclValidatedLedger, min_seq: u32, peer_counts: &std::collections::BTreeMap<Uint256, u32>) -> Uint256 {
@@ -170,6 +175,7 @@ pub trait RclConsensusRelay: Send + Sync {
 /// sign outgoing proposals).
 pub struct AppRclConsensusRelay {
     overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
+    inbound_transactions: AppInboundTransactions,
     validator_keys: ValidatorKeys,
     journal: Arc<dyn RclConsensusJournal>,
 }
@@ -179,8 +185,8 @@ impl AppRclConsensusRelay {
     /// given validator identity/journal. Matches the reference's
     /// `RCLConsensus::Adaptor` constructor capturing `app_` for later
     /// `app_.overlay()` access.
-    pub fn from_application_root(root: &ApplicationRoot, validator_keys: ValidatorKeys, journal: impl RclConsensusJournal + 'static) -> Self {
-        Self { overlay: root.overlay_runtime().map(|rt| rt.overlay()), validator_keys, journal: Arc::new(journal) }
+    pub fn from_application_root(root: &ApplicationRoot, inbound_transactions: AppInboundTransactions, validator_keys: ValidatorKeys, journal: impl RclConsensusJournal + 'static) -> Self {
+        Self { overlay: root.overlay_runtime().map(|rt| rt.overlay()), inbound_transactions, validator_keys, journal: Arc::new(journal) }
     }
 
     pub fn validator_keys(&self) -> &ValidatorKeys {
@@ -220,6 +226,20 @@ impl RclConsensusRelay for AppRclConsensusRelay {
     }
 
     fn relay_tx_set(&self, set: &consensus::RclTxSet) {
+        // Store in InboundTransactions so peers can pull-acquire this set
+        // via TMGetLedger(itype=3). Matches rippled where every tx-set
+        // position change (from update_our_positions/dispute resolution)
+        // makes the set available for serving. Without this, peers request
+        // our updated set hash but get "set not found" because only the
+        // INITIAL on_close set was stored — updated positions from dispute
+        // resolution were broadcast but never stored for serving.
+        let set_id = consensus::ConsensusTxSet::id(set);
+        {
+            let sync_tree = set.to_sync_tree();
+            let mut guard = self.inbound_transactions.lock().expect("inbound_transactions mutex");
+            guard.give_set(set_id, std::sync::Arc::new(sync_tree), false);
+        }
+
         let Some(overlay) = self.overlay.as_ref() else {
             self.journal.trace("relay_tx_set: no overlay attached, skipping broadcast");
             return;
@@ -232,7 +252,7 @@ impl RclConsensusRelay for AppRclConsensusRelay {
         // the receiving side), rather than eagerly pushing the full set.
         let message = overlay::ProtocolMessage::new(overlay::ProtocolPayload::HaveSet(overlay::TmHaveTransactionSet {
             status: 1, // tsHAVE
-            hash: set.id().data().to_vec(),
+            hash: set_id.data().to_vec(),
         }));
         overlay.broadcast(&message);
     }
@@ -263,6 +283,9 @@ pub struct AppRclConsensusAdaptor {
     ledger_master_runtime: Arc<AppLedgerMasterRuntime>,
     open_ledger: SharedAppOpenLedger,
     validations: SharedAppValidations<SystemTimeKeeperClock>,
+    /// ApplicationRoot reference for calling apply_network_ops_pending_to_open_ledger
+    /// in on_close (matching rippled's applyHeldTransactions before capturing the open ledger).
+    app_root: crate::state::application_root::ApplicationRoot,
     // The following fields are accepted from the constructor call site
     // (`application_root.rs`'s `attach_default_consensus_runtime`, which
     // passes them in exactly this order) and retained for the follow-up
@@ -329,6 +352,7 @@ impl AppRclConsensusAdaptor {
         negative_unl_vote: Option<Arc<crate::amendments::negative_unl_vote::NegativeUNLVote>>,
         amendment_status: Option<Arc<crate::amendments::amendment_status::AmendmentStatus>>,
         overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
+        app_root: crate::state::application_root::ApplicationRoot,
     ) -> Self {
         let tx_set_cache: consensus::rcl::RclTxSetSharedCache = Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
             "consensus-tx-set-cache",
@@ -342,6 +366,7 @@ impl AppRclConsensusAdaptor {
             ledger_master_runtime,
             open_ledger,
             validations,
+            app_root,
             validators,
             network_ops_mode_owner,
             ledger_acceptor,
@@ -456,26 +481,22 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         RclConsensusValidationSource::num_trusted_for_ledger(&self.validations, *prev_ledger)
     }
 
-    fn proposers_finished(&self, _prev_ledger: &Self::Ledger, prev_ledger_id: &Uint256) -> usize {
-        RclConsensusValidationSource::num_trusted_for_ledger(&self.validations, *prev_ledger_id)
+    fn proposers_finished(&self, prev_ledger: &Self::Ledger, prev_ledger_id: &Uint256) -> usize {
+        // Matches rippled's `proposersFinished` calling
+        // `vals.getNodesAfter(ledger, prevLedgerID)` — counts validators
+        // that have validated a ledger AFTER (higher sequence than) the
+        // one we're currently building on. This is NOT the same as
+        // counting validations FOR prev_ledger_id (which would always
+        // return the quorum count for an already-validated parent, causing
+        // checkConsensus's MovedOn fallback to fire immediately on every
+        // round and force-close before dispute resolution can complete).
+        let wrapped = self.validated_view(prev_ledger);
+        RclConsensusValidationSource::get_nodes_after(&self.validations, &wrapped, prev_ledger_id)
     }
 
     fn get_prev_ledger(&self, _prev_ledger_id: &Uint256, prev_ledger: &Self::Ledger, _mode: ConsensusMode) -> Uint256 {
-        // Matches the reference's `RCLConsensus::Adaptor::getPrevLedger`:
-        // ask the trust trie (built purely from received trusted
-        // validations, independent of what any single peer reports) which
-        // branch it prefers, using `ledgerMaster_.getValidLedgerIndex()` as
-        // the minimum sequence floor. This is the real catch-up trigger --
-        // if this node's own view has fallen behind what the network's
-        // trusted validators have actually validated, the trie will prefer
-        // a different (further-ahead) ledger id than `prev_ledger_id`, and
-        // `Consensus::checkLedger` will detect that mismatch and call
-        // `handleWrongLedger` to force this node to acquire and switch to
-        // it -- rather than blindly continuing to build on its own stale
-        // view, which is what happens if this always echoes back
-        // `prev_ledger_id` unconditionally (the bug this replaces: seeding
-        // `getPreferredLCL`'s peer-counts map with only our own id can
-        // never disagree with ourselves, permanently defeating catch-up).
+        // Matches rippled's `RCLConsensus::Adaptor::getPrevLedger`:
+        // uses the validation trie's preferred branch.
         let min_valid_seq = self.ledger_master_runtime.ledger_master().valid_ledger_seq();
         let wrapped = self.validated_view(prev_ledger);
         RclConsensusValidationSource::preferred_min_seq(&self.validations, &wrapped, min_valid_seq)
@@ -486,6 +507,12 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
     }
 
     fn on_close(&self, prev_ledger: &Self::Ledger, now: NetClockTimePoint, _mode: ConsensusMode) -> consensus::algorithm::consensus::ConsensusResultOf<Self> {
+        // Apply any remaining pending transactions. The dedicated batch-apply
+        // thread has been continuously applying relay for the past ~995ms.
+        // This final apply catches any stragglers from the last few ms.
+        // Matches rippled's applyHeldTransactions() in onClose.
+        let _ = self.app_root.apply_network_ops_pending_to_open_ledger();
+
         let txs = RclConsensusOpenLedgerSource::current_open_transactions(&self.open_ledger);
         let mut set = consensus::RclTxSet::new(Arc::clone(&self.tx_set_cache), prev_ledger.seq() + 1);
         {
@@ -499,6 +526,17 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         let position_id = consensus::ConsensusTxSet::id(&set);
         let node_id = self.validator_keys.keys.as_ref().map(|k| k.public_key).unwrap_or_else(|| PublicKey::from_bytes([0u8; 33]));
         let position = Proposal::new(prev_ledger.id(), 0, position_id, now, now, node_id);
+
+        // Store our own tx-set in InboundTransactions so peers that
+        // request it via TMGetLedger(liTS_CANDIDATE) can be served.
+        // Matches rippled's InboundTransactions always having the local
+        // node's own set available for peer pull-requests.
+        {
+            let sync_tree = set.to_sync_tree();
+            let mut guard = self.inbound_transactions.lock().expect("inbound_transactions mutex");
+            guard.give_set(position_id, Arc::new(sync_tree), false);
+            tracing::info!(target: "consensus", %position_id, "on_close: stored tx-set");
+        }
 
         consensus::algorithm::types::ConsensusResult::new(set, position, position_id)
     }

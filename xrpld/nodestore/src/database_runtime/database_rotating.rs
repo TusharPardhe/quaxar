@@ -23,6 +23,8 @@ struct RotatingState {
 
 struct DatabaseRotatingCore {
     state: Arc<Mutex<RotatingState>>,
+    rotation_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    copy_forward_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DatabaseRotatingCore {
@@ -95,6 +97,15 @@ impl DatabaseDelegate for DatabaseRotatingCore {
                 if duplicate {
                     writable.store(Arc::clone(node_object_ref));
                 }
+                // While rotation is in flight, copy archive-served reads
+                // forward into the writable backend. The archive is about
+                // to be deleted; without this, a node canonicalized into
+                // the cache after the freshen snapshot would survive only
+                // in RAM once the archive is dropped.
+                if !duplicate && self.rotation_in_flight.load(std::sync::atomic::Ordering::Acquire) {
+                    writable.store(Arc::clone(node_object_ref));
+                    self.copy_forward_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
 
@@ -110,6 +121,8 @@ pub struct DatabaseRotatingImp {
     state: Arc<Mutex<RotatingState>>,
     journal: Arc<dyn NodeStoreJournal>,
     fd_required: i32,
+    rotation_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    copy_forward_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Drop for DatabaseRotatingImp {
@@ -132,9 +145,13 @@ impl DatabaseRotatingImp {
             writable_backend,
             archive_backend,
         }));
+        let rotation_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let copy_forward_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let database = DatabaseRuntime::new(
             Arc::new(DatabaseRotatingCore {
                 state: Arc::clone(&state),
+                rotation_in_flight: Arc::clone(&rotation_in_flight),
+                copy_forward_count: Arc::clone(&copy_forward_count),
             }),
             scheduler,
             read_threads,
@@ -147,7 +164,21 @@ impl DatabaseRotatingImp {
             state,
             journal,
             fd_required,
+            rotation_in_flight,
+            copy_forward_count,
         }))
+    }
+
+    /// Enable/disable copy-forward of archive reads during rotation.
+    /// Call with `true` before starting the copy phase, `false` after
+    /// rotate() completes. Matches rippled's setRotationInFlight().
+    pub fn set_rotation_in_flight(&self, in_flight: bool) {
+        self.rotation_in_flight.store(in_flight, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Returns and resets the count of nodes copied forward during rotation.
+    pub fn take_copy_forward_count(&self) -> u64 {
+        self.copy_forward_count.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn rotate_impl(&self, new_backend: Box<dyn Backend>, callback: &mut dyn FnMut(&str, &str)) {

@@ -2490,7 +2490,7 @@ impl InboundLedgerLocal {
 
         if !was_progress {
             self.timeouts = self.timeouts.saturating_add(1);
-            tracing::warn!(target: "ledger", seq = self.seq, peer_id = 0u64, "Ledger data request timeout");
+            tracing::debug!(target: "ledger", seq = self.seq, peer_id = 0u64, "Ledger data request timeout");
 
             // Fail after max timeouts
             if self.timeouts > inbound_ledger_timeout_retries_max() {
@@ -2498,7 +2498,7 @@ impl InboundLedgerLocal {
                     "{} timeouts for ledger seq={} hash={}",
                     self.timeouts, self.seq, self.hash
                 ));
-                tracing::warn!(target: "ledger", seq = self.seq, "Ledger acquisition failed — retrying");
+                tracing::debug!(target: "ledger", seq = self.seq, "Ledger acquisition failed — retrying");
                 self.failed = true;
                 return true;
             }

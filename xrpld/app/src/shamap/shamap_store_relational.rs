@@ -135,12 +135,21 @@ impl SqliteSHAMapStoreRelational {
                 )
                 .map_err(|error| error.to_string())?;
 
-            if !accepted_ledger_tx.get_affected().is_empty() {
+            // Use affected accounts from metadata; fall back to accounts
+            // mentioned in the transaction itself (for standalone mode where
+            // metadata may not have proper AffectedNodes).
+            let affected: std::collections::BTreeSet<_> = if accepted_ledger_tx.get_affected().is_empty() {
+                accepted_ledger_tx.get_txn().get_mentioned_accounts()
+            } else {
+                accepted_ledger_tx.get_affected().clone()
+            };
+
+            if !affected.is_empty() {
                 let mut sql = String::from(
                     "INSERT INTO AccountTransactions (TransID, Account, LedgerSeq, TxnSeq) VALUES ",
                 );
 
-                for (index, account) in accepted_ledger_tx.get_affected().iter().enumerate() {
+                for (index, account) in affected.iter().enumerate() {
                     if index != 0 {
                         sql.push_str(", ");
                     }

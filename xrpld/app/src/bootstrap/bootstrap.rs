@@ -88,7 +88,7 @@ impl Default for AppBootstrapOptions {
             standalone: false,
             start_valid: false,
             elb_support: false,
-            io_threads: 4,
+            io_threads: 6,
             job_queue_threads: 1,
             debug: false,
             silent: false,
@@ -935,6 +935,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
     let mut consensus_started = false;
     let mut last_timer_tick = std::time::Instant::now();
     let mut last_round_ledger_id: Option<Uint256> = None;
+    let mut last_acquire_tick = std::time::Instant::now();
     if is_genesis {
         tracing::info!(target: "consensus", "Genesis mode: starting consensus immediately on the genesis ledger");
     }
@@ -1017,6 +1018,21 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         shared_inbound.set_pending_writes(pending_writes);
     }
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+        // Wire InboundTransactions with a live-peer PeerSetBuilder so
+        // TransactionAcquire can actually send requests to peers.
+        // At registry construction time the overlay doesn't exist yet
+        // (SimplePeerSetBuilder::new(Vec::new())), so this must be done
+        // once the overlay is confirmed ready.
+        {
+            let mut guard = runtime
+                .root()
+                .inbound_transactions()
+                .lock()
+                .expect("inbound_transactions mutex");
+            guard.set_peer_set_builder(Arc::new(
+                overlay::OverlayPeerSetBuilder::new(overlay_rt.overlay()),
+            ));
+        }
         shared_inbound.set_overlay_rt(overlay_rt);
     }
 
@@ -1085,41 +1101,186 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
     // except by coincidence. Mirrors `main.rs`'s standalone catchup wiring
     // (`process_inbound_transaction`) exactly: parse the raw bytes back
     // into an `STTx`, wrap it, and run it through the SAME
-    // `process_transaction` + `apply_network_ops_pending_to_open_ledger`
-    // pipeline a local RPC submission uses, with `local=false` (matching
-    // reference's `bLocal=false` for network-received transactions).
+    // Transaction relay: process_transaction on network thread immediately.
+    // This adds each relayed tx to the NetworkOps pending queue as fast as
+    // possible (sub-ms). The open-ledger modify happens in ONE batch in the
+    // drain block (50ms) and in on_close (before capture). This matches
+    // rippled's doTransactionAsync: adds to transactions_ queue on network
+    // thread, then transactionBatch/apply() does one openLedger.modify().
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         let router_root = runtime.root().clone();
         overlay_rt.overlay().queued_inbound().set_transaction_router(Box::new(move |_peer_id, message| {
-            let job_root = router_root.clone();
-            router_root.job_queue().add_job(
-                crate::job::job_types::JobType::JtTransaction,
-                "RcvCheckTx",
-                move || {
-                    let mut serial = protocol::SerialIter::new(&message.message.raw_transaction);
-                    let st_tx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        protocol::STTx::from_serial_iter(&mut serial)
-                    })) {
-                        Ok(tx) => tx,
-                        Err(_) => return,
-                    };
-                    let st_tx = Arc::new(st_tx);
-                    let mut transaction: crate::SharedTransaction = Arc::new(std::sync::Mutex::new(
-                        crate::tx_queue::transaction::Transaction::new(Arc::clone(&st_tx)),
-                    ));
-                    if let Some(network_ops_runtime) = job_root.network_ops_runtime() {
-                        let _ = network_ops_runtime.process_transaction(
-                            &mut transaction,
-                            false,
-                            false,
-                            false,
-                            || false,
-                            || {},
-                        );
-                        let _ = job_root.apply_network_ops_pending_to_open_ledger();
+            let mut serial = protocol::SerialIter::new(&message.message.raw_transaction);
+            let st_tx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                protocol::STTx::from_serial_iter(&mut serial)
+            })) {
+                Ok(tx) => tx,
+                Err(_) => return,
+            };
+            let st_tx = Arc::new(st_tx);
+            let mut transaction: crate::SharedTransaction = Arc::new(std::sync::Mutex::new(
+                crate::tx_queue::transaction::Transaction::new(Arc::clone(&st_tx)),
+            ));
+            if let Some(network_ops_runtime) = router_root.network_ops_runtime() {
+                let _ = network_ops_runtime.process_transaction(
+                    &mut transaction,
+                    false,
+                    false,
+                    false,
+                    || false,
+                    || {},
+                );
+                // Do NOT call apply_pending here. Relay transactions are
+                // staged in the shared pending queue and applied by the SAME
+                // apply_pending call that processes local (RPC) transactions.
+                // This ensures ONE openLedger.modify() processes all pending
+                // (local + relay) together — same TxQ fee escalation decisions
+                // on all nodes, matching rippled's transactionBatch/apply().
+                tracing::info!(target: "app", "DIAG router: relay tx process_transaction done, notifying batch");
+                router_root.notify_tx_pending();
+            }
+        }));
+    }
+
+    // Route ALL incoming TmLedgerData responses from the network thread,
+    // matching rippled's PeerImp::onMessage(TMLedgerData) which dispatches
+    // to both InboundLedgers::gotLedgerData (types 0/1/2) and
+    // InboundTransactions::gotData (type 3) synchronously.
+    if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+        let router_root = runtime.root().clone();
+        let router_overlay = overlay_rt.overlay();
+        let router_shared_inbound = Arc::clone(&shared_inbound);
+        overlay_rt.overlay().queued_inbound().set_ledger_data_router(Box::new(move |peer_id, message| {
+            use overlay::Overlay;
+            tracing::trace!(target: "consensus", r#type = message.r#type, hash_len = message.ledger_hash.len(), "router_callback ENTRY");
+            let Some(hash) = Uint256::from_slice(&message.ledger_hash) else { return; };
+
+            match message.r#type {
+                3 => {
+                    // liTS_CANDIDATE: route to InboundTransactions for
+                    // tx-set dispute resolution during consensus.
+                    let peer = router_overlay.find_peer_by_short_id(peer_id);
+                    let mut guard = router_root
+                        .inbound_transactions()
+                        .lock()
+                        .expect("inbound_transactions mutex");
+                    let status = guard.got_data(hash, peer, &message);
+                    tracing::info!(target: "consensus",
+                        %hash,
+                        nodes_count = message.nodes.len(),
+                        status = ?status,
+                        "ledger_data_router: type-3 response received"
+                    );
+                    if let Some(acquire) = guard.acquire(hash) {
+                        let complete = acquire.is_complete();
+                        let failed = acquire.is_failed();
+                        tracing::info!(target: "consensus", %hash, complete, failed, "ledger_data_router: acquire state after got_data");
+                        if complete {
+                            let set = Arc::new(acquire.map().clone());
+                            guard.give_set(hash, set, true);
+                        }
+                    } else {
+                        tracing::info!(target: "consensus", %hash, "ledger_data_router: no active acquire for this hash");
                     }
-                },
-            );
+                }
+                0 | 1 | 2 => {
+                    // li_BASE / liTX_NODE / liAS_NODE: route to
+                    // SharedInboundLedgers for ledger catchup/acquisition.
+                    let packet_type = match message.r#type {
+                        0 => ledger::InboundLedgerDataType::Base,
+                        1 => ledger::InboundLedgerDataType::TransactionNode,
+                        _ => ledger::InboundLedgerDataType::StateNode,
+                    };
+                    let nodes: Vec<ledger::InboundLedgerNodeData> = message
+                        .nodes
+                        .iter()
+                        .map(|n| ledger::InboundLedgerNodeData::new(
+                            n.nodeid.clone(),
+                            n.nodedata.clone(),
+                        ))
+                        .collect();
+                    let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
+                    router_shared_inbound.route_response(&hash, peer_id as u64, packet);
+                }
+                _ => {}
+            }
+        }));
+    }
+
+    // === BATCH APPLY THREAD (matches rippled's JtBatch worker) ===
+    // Dedicated thread whose ONLY job is: wake on notify_tx_pending →
+    // drain overlay queue → process → apply_network_ops_pending → sleep.
+    // Runs independently from the consensus timer (1s heartbeat below).
+    // This gives ~995ms of headroom: by the time the timer fires,
+    // this thread has already applied ALL relay from the past second.
+    let batch_root = runtime.root().clone();
+    let batch_overlay = runtime.root().overlay_runtime().map(|rt| rt.overlay().clone());
+    let batch_network_ops: Option<Arc<crate::network::network_ops_runtime::AppNetworkOpsRuntime>> = runtime.root().network_ops_runtime();
+    let batch_stop = Arc::clone(&stop);
+    let _batch_thread = std::thread::Builder::new()
+        .name("tx-batch-apply".to_string())
+        .spawn(move || {
+            while !batch_stop.load(Ordering::Acquire) {
+                // Block until relay arrives (or 50ms timeout as fallback)
+                batch_root.wait_tx_or_timeout(Duration::from_millis(50));
+
+                if batch_stop.load(Ordering::Acquire) {
+                    break;
+                }
+
+                // Loop until pending is truly empty — matches rippled's
+                // transactionBatch: while(!transactions_.empty()) { apply(); }
+                // This ensures we never fall behind the arrival rate.
+                loop {
+                    // Drain overlay queue → process each
+                    if let Some(ref overlay) = batch_overlay {
+                        let relayed = overlay.take_transactions();
+                        if let Some(ref network_ops_rt) = batch_network_ops {
+                            for message in relayed {
+                                let mut serial = protocol::SerialIter::new(&message.message.raw_transaction);
+                                let st_tx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    protocol::STTx::from_serial_iter(&mut serial)
+                                })) {
+                                    Ok(tx) => tx,
+                                    Err(_) => continue,
+                                };
+                                let st_tx = Arc::new(st_tx);
+                                let mut transaction: crate::SharedTransaction = Arc::new(std::sync::Mutex::new(
+                                    crate::tx_queue::transaction::Transaction::new(Arc::clone(&st_tx)),
+                                ));
+                                let _ = network_ops_rt.process_transaction(
+                                    &mut transaction,
+                                    false,
+                                    false,
+                                    false,
+                                    || false,
+                                    || {},
+                                );
+                            }
+                        }
+                    }
+
+                    // Apply batch
+                    let report = batch_root.apply_network_ops_pending_to_open_ledger();
+                    let applied = report.as_ref().map_or(0, |r| r.entries.len());
+
+                    // If nothing was applied AND overlay queue is empty, we're caught up
+                    let overlay_empty = batch_overlay.as_ref()
+                        .map_or(true, |o| o.queued_inbound().transaction_count() == 0);
+                    if applied == 0 && overlay_empty {
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn tx-batch-apply thread");
+
+    // Wire up instant-wake notification: when overlay queues a relay tx
+    // (no router set), wake the batch thread immediately.
+    if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+        let notify_root = runtime.root().clone();
+        overlay_rt.overlay().queued_inbound().set_transaction_notify(Box::new(move || {
+            notify_root.notify_tx_pending();
         }));
     }
 
@@ -1157,6 +1318,9 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                         "Consensus started on genesis ledger"
                     );
                     consensus_started = true;
+                    // Clear main.js's transaction router so relayed txns
+                    // accumulate in the overlay queue for single-strand processing.
+                    overlay_rt.overlay().queued_inbound().clear_transaction_router();
                     last_round_ledger_id = Some(*closed.header().hash.as_uint256());
                     last_timer_tick = std::time::Instant::now();
                 }
@@ -1190,11 +1354,12 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             }
         }
 
-        // Helper: fire consensus tick if >=1s elapsed since last tick.
-        // Matches rippled's own ~1s `NetworkOPsImp::processHeartbeatTimer`
-        // cadence -- this loop's per-iteration work (fetch-pack service,
-        // proposal draining, etc.) happens every 50ms, but
-        // `Consensus::timer_entry` itself must only run once per second.
+        // Fire consensus tick if >=1s elapsed since last tick.
+        // Matches rippled's `JtNetopTimer` heartbeat at ledgerGRANULARITY=1s.
+        // This is a SEPARATE cadence from the batch-apply thread — by the time
+        // this fires, the batch thread has already applied ALL relay transactions
+        // that arrived in the past ~995ms, giving natural headroom for all nodes
+        // to converge on the same open ledger state before shouldCloseLedger fires.
         macro_rules! maybe_tick_consensus {
             () => {
                 if consensus_started && last_timer_tick.elapsed() >= Duration::from_secs(1) {
@@ -1204,9 +1369,20 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             };
         }
 
-        // Serve TmGetLedger requests from peers (PART 1).
-        serve_get_ledger_requests(root, &overlay_rt);
+        // Serve TmGetLedger requests from peers (PART 1). Matches the
+        // reference's `PeerImp::onMessage(TMGetLedger)` dispatching via
+        // `app_.getJobQueue().addJob(JtLedgerReq, "RcvGetLedger", ...)`
+        // instead of servicing the (potentially disk-touching) SHAMap node
+        // walk inline on the network/consensus-timer thread. Previously
+        // this ran synchronously here, sharing this loop's thread with
+        // Consensus tick first, so on_close/give_set fires before we
+        // serve any liTS_CANDIDATE requests (which need the stored set).
         maybe_tick_consensus!();
+
+        // Serve peer ledger/tx-set requests AFTER the consensus tick,
+        // ensuring any tx-set stored by on_close during this tick is
+        // available for get_set lookups in the itype=3 handler.
+        dispatch_get_ledger_requests(root, &overlay_rt);
 
         // Broadcast our closed ledger to peers via StatusChange so they
         // can detect whether we're at genesis or ahead. This replaces the
@@ -1321,6 +1497,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                             "Consensus started — peers confirmed current ledger"
                         );
                         consensus_started = true;
+                        overlay_rt.overlay().queued_inbound().clear_transaction_router();
                         last_round_ledger_id = Some(*closed.header().hash.as_uint256());
                         last_timer_tick = std::time::Instant::now();
                     }
@@ -1356,6 +1533,68 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         if let Some(ref rx) = map_complete_rx {
             while let Ok((hash, set)) = rx.try_recv() {
                 network_ops_rt.handle_map_complete(consensus_rt.as_ref(), hash, set);
+            }
+        }
+
+        // Route incoming TmLedgerData responses with type liTS_CANDIDATE (3)
+        // to InboundTransactions::got_data, matching rippled's
+        // PeerImp::onMessage(TMLedgerData) calling
+        // app_.getInboundTransactions().gotData(ledgerHash, peer, m).
+        // Without this, TransactionAcquire objects started by
+        // acquire_tx_set (when a peer proposes a tx-set hash we don't
+        // have locally) never receive their response data, so the
+        // consensus dispute resolution mechanism can never compare
+        // differing transaction sets and every node closes with only
+        // its own locally-submitted transactions.
+        {
+            use overlay::Overlay;
+            let ledger_data_msgs = overlay_rt.overlay().take_ledger_data();
+            for msg in ledger_data_msgs {
+                if msg.message.r#type == 3 {
+                    // liTS_CANDIDATE response: route to InboundTransactions
+                    let nodes_received = msg.message.nodes.len();
+                    tracing::info!(target: "consensus",
+                        peer_id = msg.peer_id,
+                        nodes_received,
+                        "routing liTS_CANDIDATE response to InboundTransactions"
+                    );
+                    let hash = msg.message.ledger_hash.as_slice();
+                    if let Some(hash) = Uint256::from_slice(hash) {
+                        let peer = overlay_rt
+                            .overlay()
+                            .find_peer_by_short_id(msg.peer_id);
+                        let mut guard = root
+                            .inbound_transactions()
+                            .lock()
+                            .expect("inbound_transactions mutex");
+                        let status = guard.got_data(hash, peer.clone(), &msg.message);
+                        // Check if the acquisition completed after feeding data.
+                        // With fat_leaves=true serving, the full tree arrives in
+                        // one response and completes immediately (rxrpl-style bypass).
+                        if let Some(acquire) = guard.acquire(hash) {
+                            if acquire.is_complete() {
+                                tracing::info!(target: "consensus",
+                                    %hash,
+                                    nodes_received,
+                                    "tx-set acquisition completed in single response (rxrpl-style)"
+                                );
+                                let set = Arc::new(acquire.map().clone());
+                                guard.give_set(hash, set, true);
+                            } else {
+                                tracing::debug!(target: "consensus",
+                                    %hash,
+                                    nodes_received,
+                                    has_root = acquire.has_root(),
+                                    "tx-set acquisition NOT complete after response, will need more round-trips"
+                                );
+                            }
+                        }
+                        drop(guard);
+                    }
+                }
+                // Non-liTS_CANDIDATE TmLedgerData responses (types 0,1,2)
+                // are ledger acquisition responses already handled via the
+                // SharedInboundLedgers pipeline wired separately.
             }
         }
 
@@ -1408,6 +1647,9 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                     suppression_id: proposal.suppression,
                     proposal: prop,
                 });
+                // Wake loop immediately so proposal is processed and
+                // shouldCloseLedger can check proposersClosed ASAP.
+                root.notify_tx_pending();
             }
 
             // Matches the reference's `PeerImp::onMessage(TMProposeSet)`
@@ -1431,14 +1673,38 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             // state machine, so calling it every ~50ms iteration is cheap
             // and matches the reference's real latency characteristics.
             network_ops_rt.drain_proposals(consensus_rt.as_ref());
+
+            // Consume pending_consensus_ledger and trigger InboundLedger
+            // acquisition. This is the bridge between fork detection (which
+            // sets pending_consensus_ledger) and the actual P2P fetch of the
+            // ledger the network is on.
+            if let Some(lm_rt) = root.ledger_master_runtime() {
+                let pending = lm_rt.take_pending_consensus_ledger();
+                if let Some(hash) = pending {
+                    shared_inbound.acquire(hash, 0);
+                }
+            }
         }
+
+        // Batch apply is handled by the dedicated tx-batch-apply thread.
+        // By the time the 1s consensus timer fires below, that thread has
+        // already applied ALL relay transactions from the past ~995ms.
 
         maybe_tick_consensus!();
 
-        // Process fetch pack messages (responses AND requests).
+        // Process fetch pack / get-object-by-hash messages (responses AND
+        // requests). Responses (fetch-pack data arriving from a peer we
+        // asked) are cheap cache inserts and stay inline so
+        // `signal_fetch_pack_ready` fires promptly. Requests (a peer
+        // asking US to walk our own SHAMap/NodeStore) dispatch onto the
+        // `JtLedgerReq` job queue -- matching the reference's
+        // `PeerImp::onMessage(TMGetObjectByHash)` calling
+        // `app_.getJobQueue().addJob(JtLedgerReq, "RcvGetObjByHash", ...)`
+        // -- so this loop's thread never blocks on another peer's
+        // catch-up request before it can reach `drain_proposals` again.
         {
             let messages = overlay_rt.overlay().take_get_objects();
-            for msg_envelope in &messages {
+            for msg_envelope in messages {
                 let msg = &msg_envelope.message;
 
                 if !msg.query {
@@ -1469,10 +1735,26 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                     == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32
                 {
                     // Request: peer asks us for a fetch pack (matching rippled doFetchPack/makeFetchPack).
-                    serve_fetch_pack_request(root, &overlay_rt, msg_envelope);
+                    let job_root = root.clone();
+                    let job_overlay_rt = Arc::clone(&overlay_rt);
+                    root.job_queue().add_job(
+                        crate::job::job_types::JobType::JtLedgerReq,
+                        "RcvGetObjByHash",
+                        move || {
+                            serve_fetch_pack_request(&job_root, &job_overlay_rt, &msg_envelope);
+                        },
+                    );
                 } else {
                     // Generic GetObjectByHash query (state/tx/ledger nodes).
-                    serve_get_object_by_hash_request(root, &overlay_rt, msg_envelope);
+                    let job_root = root.clone();
+                    let job_overlay_rt = Arc::clone(&overlay_rt);
+                    root.job_queue().add_job(
+                        crate::job::job_types::JobType::JtLedgerReq,
+                        "RcvGetObjByHash",
+                        move || {
+                            serve_get_object_by_hash_request(&job_root, &job_overlay_rt, &msg_envelope);
+                        },
+                    );
                 }
             }
         }
@@ -1546,6 +1828,94 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let lm = lm_rt.ledger_master();
             let quorum = root.validators().quorum();
+
+            // -----------------------------------------------------------
+            // switchLastClosedLedger (rippled parity):
+            // When need_network_ledger is true, we're joining an existing
+            // network. Instead of requiring full quorum (which requires our
+            // OWN validation — impossible until we're on the same chain),
+            // switch to the network's chain when we have an acquired ledger
+            // that ANY trusted peer has validated. This matches rippled's
+            // checkLastClosedLedger → switchLastClosedLedger flow where a
+            // joining node adopts the network's preferred LCL based on peer
+            // consensus, not its own validation count.
+            // -----------------------------------------------------------
+            if root.need_network_ledger() {
+                // Find the best acquired ledger: check recent entries in
+                // ledger_history that have at least 1 trusted peer validation
+                // and differ from our current closed ledger.
+                let our_closed_hash = root.closed_ledger()
+                    .map(|l| *l.header().hash.as_uint256())
+                    .unwrap_or_default();
+
+                // Check the latest acquired ledger from shared_completed_rx
+                // which was just inserted into history above. Walk a range
+                // of recent sequences looking for peer-validated ones.
+                let mut best_validated: Option<Arc<ledger::Ledger>> = None;
+                // Try getting any ledger from history that peers validated.
+                // Use the ledger_history's by-hash cache since by-seq may
+                // not have all entries.
+                let acquired_hashes: Vec<_> = {
+                    use overlay::Overlay;
+                    let peers = overlay_rt.overlay().active_peers();
+                    peers.iter()
+                        .map(|p| p.closed_ledger_hash())
+                        .filter(|h| !h.is_zero() && *h != our_closed_hash)
+                        .collect()
+                };
+                for hash in &acquired_hashes {
+                    let candidate = lm.ledger_history().get_cached_ledger_by_hash(
+                        basics::sha_map_hash::SHAMapHash::new(*hash)
+                    );
+                    if let Some(candidate) = candidate {
+                        let candidate_hash = *candidate.header().hash.as_uint256();
+                        let val_count = root.validations().num_trusted_for_ledger(candidate_hash);
+                        if val_count > 0 {
+                            if best_validated.as_ref().map_or(true, |b| candidate.header().seq > b.header().seq) {
+                                best_validated = Some(candidate);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(network_ledger) = best_validated {
+                    let new_seq = network_ledger.header().seq;
+                    let new_hash = *network_ledger.header().hash.as_uint256();
+                    let val_count = root.validations().num_trusted_for_ledger(new_hash);
+                    tracing::info!(target: "consensus",
+                        new_seq, %new_hash, val_count,
+                        "switchLastClosedLedger: adopting network chain"
+                    );
+
+                    // Promote to validated
+                    let mut l = (*network_ledger).clone();
+                    l.set_validated();
+                    let validated = Arc::new(l);
+                    lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
+                    root.note_validated_ledger_for_sync(Arc::clone(&validated));
+
+                    // Switch closed ledger to the network's chain
+                    root.on_closed_ledger(Arc::clone(&validated));
+                    root.set_need_network_ledger(false);
+
+                    // Restart consensus from the new LCL (matches rippled's
+                    // switchLastClosedLedger → beginConsensus flow)
+                    let now = root.shared_time_keeper().close_time();
+                    let prev_cx = crate::consensus_ledger_from_ledger(&validated);
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("switch lcl consensus runtime");
+                    rt.block_on(async {
+                        consensus_rt.start_round(now, new_hash, prev_cx).await;
+                    });
+                    last_round_ledger_id = Some(new_hash);
+                    tracing::info!(target: "consensus",
+                        new_seq, %new_hash,
+                        "Consensus restarted on network chain (switchLastClosedLedger)"
+                    );
+                }
+            }
 
             // checkAccept: promote closed ledger if it has quorum
             if let Some(closed) = root.closed_ledger() {
@@ -1641,132 +2011,314 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             }
         }
 
+        // Tick pending TransactionAcquire objects at ~1s cadence (matching
+        // rippled's InboundTransactions timer). Must NOT be called every
+        // 50ms loop iteration — invoke_on_timer increments timeouts on
+        // Tick pending tx-set acquisitions. 500ms cadence balances fast
+        // multi-round-trip SHAMap downloads against timeout sensitivity.
+        if last_acquire_tick.elapsed() >= Duration::from_millis(500) {
+            let mut guard = root
+                .inbound_transactions()
+                .lock()
+                .expect("inbound_transactions mutex");
+            guard.tick_pending_acquires();
+            last_acquire_tick = std::time::Instant::now();
+        }
+
+        // Main loop polls at 50ms for proposal processing and ledger
+        // requests. Consensus tick (shouldCloseLedger/on_close) is gated
+        // to 1-second inside maybe_tick_consensus. This matches rippled:
+        // proposals delivered immediately, timer fires every 1 second.
         std::thread::sleep(Duration::from_millis(50));
     }
 
     tracing::info!(target: "consensus", "Start-mode consensus event loop stopped");
 }
 
-fn serve_get_ledger_requests(
+/// Drain queued `TMGetLedger` requests and dispatch each one onto the
+/// `JtLedgerReq` job queue, matching the reference's
+/// `PeerImp::onMessage(TMGetLedger)` calling
+/// `app_.getJobQueue().addJob(JtLedgerReq, "RcvGetLedger", ...)`. The actual
+/// SHAMap node walk (`serve_one_get_ledger_request`) runs entirely inside
+/// the dispatched job, on a `JobQueue` worker thread -- never on the
+/// caller's thread -- so a burst of peer catch-up requests cannot delay
+/// whatever the caller needs to do next (in particular, this loop's own
+/// `drain_proposals` call later in the same iteration).
+fn dispatch_get_ledger_requests(
     root: &crate::ApplicationRoot,
     overlay_rt: &Arc<crate::runtime::overlay_runtime::AppOverlayRuntime>,
 ) {
-    use overlay::Overlay;
-
     let requests = overlay_rt.overlay().take_get_ledgers();
     if requests.is_empty() {
         return;
     }
+
+    for req in requests {
+        if req.message.itype == 3 {
+            // liTS_CANDIDATE: serve inline for minimal latency. Tx-set
+            // lookups are just a HashMap get + serialize — fast enough to
+            // run synchronously, and time-critical for dispute resolution
+            // to complete within the consensus round.
+            serve_one_get_ledger_request(root, overlay_rt, req);
+        } else {
+            let job_root = root.clone();
+            let job_overlay_rt = Arc::clone(overlay_rt);
+            root.job_queue().add_job(
+                crate::job::job_types::JobType::JtLedgerReq,
+                "RcvGetLedger",
+                move || {
+                    serve_one_get_ledger_request(&job_root, &job_overlay_rt, req);
+                },
+            );
+        }
+    }
+}
+
+fn serve_one_get_ledger_request(
+    root: &crate::ApplicationRoot,
+    overlay_rt: &Arc<crate::runtime::overlay_runtime::AppOverlayRuntime>,
+    req: overlay::PeerMessage<overlay::TmGetLedger>,
+) {
+    use overlay::Overlay;
+
+    let Some(hash_bytes) = req.message.ledger_hash.as_deref() else {
+        return;
+    };
+    let Some(hash) = Uint256::from_slice(hash_bytes) else {
+        return;
+    };
+
+    let itype = req.message.itype;
+    let mut nodes: Vec<overlay::message::wire::TmLedgerNode> = Vec::new();
+
+    // liTS_CANDIDATE (3) uses InboundTransactions, not LedgerMaster.
+    // Handle it before the ledger lookup which would early-return for
+    // tx-set hashes that aren't ledger hashes.
+    if itype == 3 {
+        let mut guard = root
+            .inbound_transactions()
+            .lock()
+            .expect("inbound_transactions mutex");
+        let set = guard.get_set(hash, false);
+        if set.is_none() {
+            // Log both the requested hash AND every stored hash for direct comparison
+            let stored: Vec<Uint256> = guard.stored_hashes();
+            let match_found = stored.iter().any(|h| *h == hash);
+            tracing::warn!(target: "consensus",
+                requested = %hash,
+                stored_count = stored.len(),
+                btree_match = match_found,
+                "liTS_CANDIDATE: set not found"
+            );
+            if !stored.is_empty() {
+                for (i, h) in stored.iter().enumerate().take(3) {
+                    tracing::warn!(target: "consensus",
+                        index = i,
+                        stored_hash = %h,
+                        bytes_match = (h.data() == hash.data()),
+                        "liTS_CANDIDATE: stored hash comparison"
+                    );
+                }
+            }
+            drop(guard);
+            return;
+        }
+        drop(guard);
+        let sync_tree = set.unwrap();
+        let mut fetch = |_h: basics::sha_map_hash::SHAMapHash| -> Option<
+            basics::memory::intrusive_pointer::SharedIntrusive<
+                shamap::nodes::tree_node::SHAMapTreeNode,
+            >,
+        > { None };
+        let requested_node_ids = &req.message.node_i_ds;
+        if requested_node_ids.is_empty() {
+            // No specific nodes requested: nothing to do
+            return;
+        }
+        // Check if this is a root-only request (first request from TransactionAcquire).
+        // If so, serve ALL nodes at once for 1-round-trip acquisition (matching rxrpl).
+        let is_root_request = requested_node_ids.len() == 1
+            && requested_node_ids[0] == shamap::nodes::node_id::SHAMapNodeId::default().get_raw_string();
+
+        if is_root_request {
+            // Serve the entire tree in one response: root + all inner + all leaves.
+            // depth=8 covers any realistic tx-set (1000 txns fit in depth 4-5).
+            // fat_leaves=true ensures leaf nodes (actual transactions) are included,
+            // enabling single-round-trip acquisition (rxrpl-style bypass).
+            let mut fetch = |_h: basics::sha_map_hash::SHAMapHash| -> Option<
+                basics::memory::intrusive_pointer::SharedIntrusive<
+                    shamap::nodes::tree_node::SHAMapTreeNode,
+                >,
+            > { None };
+            let root_id = shamap::nodes::node_id::SHAMapNodeId::default();
+            let mut data: Vec<(shamap::nodes::node_id::SHAMapNodeId, Vec<u8>)> = Vec::new();
+            let _ = sync_tree.get_node_fat(root_id, &mut data, true, 8, &mut fetch);
+            tracing::debug!(target: "consensus",
+                %hash,
+                total_nodes = data.len(),
+                "liTS_CANDIDATE: serving full tree (fat_leaves=true, depth=8)"
+            );
+            for (nid, ndata) in &data {
+                nodes.push(overlay::message::wire::TmLedgerNode {
+                    nodeid: Some(nid.get_raw_string()),
+                    nodedata: ndata.clone(),
+                });
+                if nodes.len() >= 2048 {
+                    break;
+                }
+            }
+        } else {
+            for node_id_bytes in requested_node_ids {
+                let Some(node_id) =
+                    shamap::nodes::node_id::deserialize_shamap_node_id(node_id_bytes)
+                else {
+                    continue;
+                };
+                let mut data: Vec<(shamap::nodes::node_id::SHAMapNodeId, Vec<u8>)> = Vec::new();
+                if sync_tree
+                    .get_node_fat(node_id, &mut data, false, 1, &mut fetch)
+                    .is_ok()
+                {
+                    for (nid, ndata) in &data {
+                        nodes.push(overlay::message::wire::TmLedgerNode {
+                            nodeid: Some(nid.get_raw_string()),
+                            nodedata: ndata.clone(),
+                        });
+                        if nodes.len() >= 256 {
+                            break;
+                        }
+                    }
+                }
+                if nodes.len() >= 256 {
+                    break;
+                }
+            }
+        }
+
+        if nodes.is_empty() {
+            tracing::warn!(target: "consensus", %hash, "liTS_CANDIDATE: serialization produced empty nodes");
+            return;
+        }
+
+        let response_data = overlay::TmLedgerData {
+            ledger_hash: hash.data().to_vec(),
+            ledger_seq: 0,
+            r#type: 3,
+            nodes,
+            request_cookie: req.message.request_cookie.map(|c| c as u32),
+            error: None,
+        };
+        tracing::info!(target: "consensus",
+            %hash,
+            nodes_count = response_data.nodes.len(),
+            first_node_data_len = response_data.nodes.first().map(|n| n.nodedata.len()).unwrap_or(0),
+            "liTS_CANDIDATE: sending response (as type 3)"
+        );
+        let response = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(response_data));
+        let message = overlay::Message::new(response, None);
+        if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
+            peer.send(message);
+        }
+        return;
+    }
+
     let Some(lm_rt) = root.ledger_master_runtime() else {
         return;
     };
     let lm = lm_rt.ledger_master();
 
-    // Limit to 2 requests per loop iteration to prevent I/O starvation
-    for req in requests.into_iter().take(2) {
-        let Some(hash_bytes) = req.message.ledger_hash.as_deref() else {
-            continue;
-        };
-        let Some(hash) = Uint256::from_slice(hash_bytes) else {
-            continue;
-        };
-        let Some(ledger) = lm.get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(hash))
-        else {
-            continue;
-        };
+    let Some(ledger) = lm.get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(hash)) else {
+        return;
+    };
 
-        let itype = req.message.itype;
-        let mut nodes: Vec<overlay::message::wire::TmLedgerNode> = Vec::new();
-
-        match itype {
-            0 => {
-                // li_BASE: header + state root + tx root (matching rippled sendLedgerBase)
-                let header_data = protocol::serialize_ledger_header(&ledger.header(), false);
-                nodes.push(overlay::message::wire::TmLedgerNode {
-                    nodeid: None,
-                    nodedata: header_data,
-                });
-                // State map root
-                if !ledger.header().account_hash.is_zero() {
-                    if let Ok(root_data) = ledger.state_map().serialize_root() {
-                        nodes.push(overlay::message::wire::TmLedgerNode {
-                            nodeid: None,
-                            nodedata: root_data,
-                        });
-                    }
-                }
-                // Tx map root
-                if !ledger.header().tx_hash.is_zero() {
-                    if let Ok(root_data) = ledger.tx_map().serialize_root() {
-                        nodes.push(overlay::message::wire::TmLedgerNode {
-                            nodeid: None,
-                            nodedata: root_data,
-                        });
-                    }
+    match itype {
+        0 => {
+            // li_BASE: header + state root + tx root (matching rippled sendLedgerBase)
+            let header_data = protocol::serialize_ledger_header(&ledger.header(), false);
+            nodes.push(overlay::message::wire::TmLedgerNode {
+                nodeid: None,
+                nodedata: header_data,
+            });
+            // State map root
+            if !ledger.header().account_hash.is_zero() {
+                if let Ok(root_data) = ledger.state_map().serialize_root() {
+                    nodes.push(overlay::message::wire::TmLedgerNode {
+                        nodeid: None,
+                        nodedata: root_data,
+                    });
                 }
             }
-            1 | 2 => {
-                // liTX_NODE (1) or liAS_NODE (2): serve requested SHAMap nodes
-                let map = if itype == 1 {
-                    ledger.tx_map()
-                } else {
-                    ledger.state_map()
-                };
-                let fat_leaves = itype == 1; // fat for TX, not for AS
-                let depth = req.message.query_depth.unwrap_or(1);
+            // Tx map root
+            if !ledger.header().tx_hash.is_zero() {
+                if let Ok(root_data) = ledger.tx_map().serialize_root() {
+                    nodes.push(overlay::message::wire::TmLedgerNode {
+                        nodeid: None,
+                        nodedata: root_data,
+                    });
+                }
+            }
+        }
+        1 | 2 => {
+            // liTX_NODE (1) or liAS_NODE (2): serve requested SHAMap nodes
+            let map = if itype == 1 {
+                ledger.tx_map()
+            } else {
+                ledger.state_map()
+            };
+            let fat_leaves = itype == 1; // fat for TX, not for AS
+            let depth = req.message.query_depth.unwrap_or(1);
 
-                for node_id_bytes in &req.message.node_i_ds {
-                    let Some(node_id) =
-                        shamap::nodes::node_id::deserialize_shamap_node_id(node_id_bytes)
-                    else {
-                        continue;
-                    };
-                    let mut data: Vec<(shamap::nodes::node_id::SHAMapNodeId, Vec<u8>)> = Vec::new();
-                    let mut fetch = |_h: basics::sha_map_hash::SHAMapHash| -> Option<
-                        basics::memory::intrusive_pointer::SharedIntrusive<
-                            shamap::nodes::tree_node::SHAMapTreeNode,
-                        >,
-                    > { None };
-                    if map
-                        .get_node_fat(node_id, &mut data, fat_leaves, depth, &mut fetch)
-                        .is_ok()
-                    {
-                        for (nid, ndata) in &data {
-                            nodes.push(overlay::message::wire::TmLedgerNode {
-                                nodeid: Some(nid.get_raw_string()),
-                                nodedata: ndata.clone(),
-                            });
-                            if nodes.len() >= 256 {
-                                break;
-                            }
+            for node_id_bytes in &req.message.node_i_ds {
+                let Some(node_id) =
+                    shamap::nodes::node_id::deserialize_shamap_node_id(node_id_bytes)
+                else {
+                    continue;
+                };
+                let mut data: Vec<(shamap::nodes::node_id::SHAMapNodeId, Vec<u8>)> = Vec::new();
+                let mut fetch = |_h: basics::sha_map_hash::SHAMapHash| -> Option<
+                    basics::memory::intrusive_pointer::SharedIntrusive<
+                        shamap::nodes::tree_node::SHAMapTreeNode,
+                    >,
+                > { None };
+                if map
+                    .get_node_fat(node_id, &mut data, fat_leaves, depth, &mut fetch)
+                    .is_ok()
+                {
+                    for (nid, ndata) in &data {
+                        nodes.push(overlay::message::wire::TmLedgerNode {
+                            nodeid: Some(nid.get_raw_string()),
+                            nodedata: ndata.clone(),
+                        });
+                        if nodes.len() >= 256 {
+                            break;
                         }
                     }
-                    if nodes.len() >= 256 {
-                        break;
-                    }
+                }
+                if nodes.len() >= 256 {
+                    break;
                 }
             }
-            _ => continue,
         }
+        _ => return,
+    }
 
-        if nodes.is_empty() {
-            continue;
-        }
+    if nodes.is_empty() {
+        return;
+    }
 
-        let response = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(
-            overlay::TmLedgerData {
-                ledger_hash: hash.data().to_vec(),
-                ledger_seq: ledger.header().seq,
-                r#type: itype,
-                nodes,
-                request_cookie: req.message.request_cookie.map(|c| c as u32),
-                error: None,
-            },
-        ));
-        let message = overlay::Message::new(response, None);
-        if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
-            peer.send(message);
-        }
+    let response = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(
+        overlay::TmLedgerData {
+            ledger_hash: hash.data().to_vec(),
+            ledger_seq: ledger.header().seq,
+            r#type: itype,
+            nodes,
+            request_cookie: req.message.request_cookie.map(|c| c as u32),
+            error: None,
+        },
+    ));
+    let message = overlay::Message::new(response, None);
+    if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
+        peer.send(message);
     }
 }
 

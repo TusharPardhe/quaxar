@@ -161,6 +161,16 @@ impl RclTxSet {
             })
             .collect()
     }
+
+    pub fn to_sync_tree(&self) -> shamap::sync::SyncTree {
+        shamap::sync::SyncTree::from_root_with_type(
+            self.root.clone(),
+            shamap::sync::SHAMapType::Transaction,
+            self.backed,
+            self.ledger_seq,
+            shamap::sync::SyncState::Modifying,
+        )
+    }
 }
 
 impl RclTxSetMutable {
@@ -174,7 +184,9 @@ impl RclTxSetMutable {
 
     pub fn freeze(mut self) -> RclTxSet {
         self.map.unshare();
-        RclTxSet { root: self.map.root(), cache: self.cache, backed: self.backed, ledger_seq: self.ledger_seq }
+        let root = self.map.root();
+        root.update_hash_deep();
+        RclTxSet { root, cache: self.cache, backed: self.backed, ledger_seq: self.ledger_seq }
     }
 }
 

@@ -619,6 +619,43 @@ impl<A: ValidationsAdaptor> Validations<A> {
                 .map(|(key, _)| *key);
         };
 
+        // Check if the acquiring map has a ledger with MORE validator support
+        // than the trie's preferred branch. This handles fork recovery: after
+        // divergence, peer validations for ledgers we don't have go to
+        // `acquiring` (not the trie). Without this check, we'd always prefer
+        // our own chain (trie has only our validations) and never detect the
+        // wrong fork.
+        let trie_support = inner.with_trie(&self.adaptor, &self.parms, |trie| {
+            trie.tip_support(preferred.id)
+        });
+        let best_acquiring_count = inner
+            .acquiring
+            .iter()
+            .map(|(_, nodes)| nodes.len())
+            .max()
+            .unwrap_or(0);
+        tracing::debug!(
+            target: "consensus",
+            trie_support,
+            acquiring_entries = inner.acquiring.len(),
+            best_acquiring_count,
+            "get_preferred: fork-recovery check"
+        );
+        if let Some(((acq_seq, acq_id), acq_nodes)) = inner
+            .acquiring
+            .iter()
+            .max_by_key(|(_, nodes)| nodes.len())
+        {
+            if acq_nodes.len() as u32 > trie_support {
+                tracing::warn!(
+                    target: "consensus",
+                    acq_support = acq_nodes.len(), trie_support,
+                    "get_preferred: FORK DETECTED, preferring acquiring branch"
+                );
+                return Some((*acq_seq, *acq_id));
+            }
+        }
+
         // If we are the parent of the preferred ledger, stick with our
         // current ledger since we might be about to generate it.
         if preferred.seq == curr.seq() + 1 && preferred.ancestor(curr.seq()) == curr.id() {

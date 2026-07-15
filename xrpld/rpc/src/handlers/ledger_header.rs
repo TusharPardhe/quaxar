@@ -45,9 +45,49 @@ pub fn do_ledger_header<S: LedgerHeaderSource>(source: &S) -> JsonValue {
 
     let mut result = resolved.base_json;
     let object = ensure_object(&mut result);
+
+    // Binary-encoded header data
     object.insert(
         "ledger_data".to_owned(),
         JsonValue::String(str_hex(serialize_ledger_header(&resolved.header))),
     );
+
+    // JSON header fields matching rippled's ledger_header response
+    let mut ledger = BTreeMap::new();
+    ledger.insert(
+        "ledger_hash".to_owned(),
+        JsonValue::String(resolved.header.hash.to_string()),
+    );
+    ledger.insert(
+        "ledger_index".to_owned(),
+        JsonValue::String(resolved.header.seq.to_string()),
+    );
+    ledger.insert(
+        "close_time".to_owned(),
+        JsonValue::Unsigned(u64::from(resolved.header.close_time)),
+    );
+    ledger.insert(
+        "parent_close_time".to_owned(),
+        JsonValue::Unsigned(u64::from(resolved.header.parent_close_time)),
+    );
+    ledger.insert(
+        "parent_hash".to_owned(),
+        JsonValue::String(resolved.header.parent_hash.to_string()),
+    );
+    ledger.insert(
+        "total_coins".to_owned(),
+        JsonValue::String(resolved.header.drops.to_string()),
+    );
+    ledger.insert(
+        "transaction_hash".to_owned(),
+        JsonValue::String(resolved.header.tx_hash.to_string()),
+    );
+    ledger.insert(
+        "account_hash".to_owned(),
+        JsonValue::String(resolved.header.account_hash.to_string()),
+    );
+    ledger.insert("closed".to_owned(), JsonValue::Bool(true));
+    object.insert("ledger".to_owned(), JsonValue::Object(ledger));
+
     result
 }

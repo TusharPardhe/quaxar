@@ -156,7 +156,22 @@ fn fee_json_from_report(report: tx::QueueTxQRpcReport) -> JsonValue {
 impl<V: AppServerInfoView> ServerInfoSource for ApplicationServerInfo<V> {
     fn get_server_info(&self, human: bool, admin: bool, counters: bool) -> JsonValue {
         let mut info = BTreeMap::new();
-        let status_snapshot = self.view.status_snapshot();
+        let mut status_snapshot = self.view.status_snapshot();
+
+        // Derive complete_ledgers from the validated/closed ledger when the
+        // status-rpc-state hasn't been populated yet (e.g. standalone or early
+        // startup).
+        if status_snapshot.complete_ledgers.is_none() {
+            if let Some(ledger) = self.view.validated_ledger().or_else(|| self.view.closed_ledger())
+            {
+                let seq = ledger.header().seq;
+                if seq > 0 {
+                    status_snapshot.complete_ledgers = Some(format!("{}-{}", seq, seq));
+                } else {
+                    status_snapshot.complete_ledgers = Some("empty".to_owned());
+                }
+            }
+        }
 
         append_runtime_metadata(&mut info, &status_snapshot, human, admin);
         append_time_field(&mut info, &self.view);
@@ -481,6 +496,19 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
             Some(id) => id,
             None => return Ok(JsonValue::Array(Vec::new())),
         };
+
+        // Validate that the destination account exists on the ledger.
+        // rippled returns actNotFound for unfunded destination accounts.
+        if let Some(ref ledger) = self.view.validated_ledger().or_else(|| self.view.closed_ledger())
+        {
+            let dst_keylet =
+                protocol::account_keylet(Uint160::from_void(dst_id.data()));
+            if ledger.read(dst_keylet).ok().flatten().is_none() {
+                return Err(crate::RpcStatus::new(
+                    crate::status::RpcErrorCode::ActNotFound,
+                ));
+            }
+        }
 
         // Check if source_currencies is specified in params to limit results
         let source_currencies_filter: Option<Vec<String>> = if let JsonValue::Object(obj) = params {
@@ -2174,11 +2202,36 @@ impl<V: AppServerInfoView> crate::handlers::book_changes::BookChangesSource
 {
     fn book_changes_ledger(
         &self,
-        _ledger: LedgerLookupLedger,
+        ledger_lookup: LedgerLookupLedger,
     ) -> Option<crate::handlers::book_changes::BookChangesLedger> {
-        // Book changes require iterating transaction metadata which isn't
-        // exposed through the current view. Return None.
-        None
+        let resolved = resolve_lookup_ledger(&self.view, &ledger_lookup)?;
+        let ledger_time = resolved.header().close_time;
+
+        // Walk the transaction map and extract (STTx, TxMeta) pairs.
+        let mut transactions = Vec::new();
+        if let Ok(txs) = ledger::ReadView::txs(resolved.as_ref()) {
+            for read_view_tx in txs {
+                let (tx_arc, meta_arc_opt) = read_view_tx.into_parts();
+                let Some(meta_arc) = meta_arc_opt else {
+                    continue;
+                };
+                let tx = (*tx_arc).clone();
+                let meta = protocol::TxMeta::from_stobject(
+                    Uint256::zero(),
+                    resolved.header().seq,
+                    (*meta_arc).clone(),
+                );
+                transactions.push(crate::handlers::book_changes::BookChangesTransaction {
+                    txn: tx,
+                    meta,
+                });
+            }
+        }
+
+        Some(crate::handlers::book_changes::BookChangesLedger {
+            ledger_time,
+            transactions,
+        })
     }
 }
 
@@ -2736,6 +2789,51 @@ impl<V: AppServerInfoView> crate::state::tx_reduce_relay::TxReduceRelaySource
 {
     fn tx_metrics_json(&self) -> JsonValue {
         JsonValue::Object(BTreeMap::new())
+    }
+}
+
+impl<V: AppServerInfoView> crate::handlers::get_aggregate_price::AggregatePriceSource
+    for ApplicationServerInfo<V>
+{
+    fn read_oracle(&self, account: &str, document_id: u32) -> Option<crate::handlers::get_aggregate_price::OracleData> {
+        let ledger = self.view.validated_ledger().or_else(|| self.view.closed_ledger())?;
+        let account_id = protocol::parse_base58_account_id(account)?;
+        let keylet = protocol::oracle_keylet(
+            Uint160::from_void(account_id.data()),
+            document_id,
+        );
+        let sle = ledger.read(keylet).ok().flatten()?;
+        let last_update_time = sle.get_field_u32(protocol::get_field_by_symbol("sfLastUpdateTime"));
+        let price_data_series_arr = sle.get_field_array(protocol::get_field_by_symbol("sfPriceDataSeries"));
+        let mut entries = Vec::new();
+        for entry in price_data_series_arr.iter() {
+            let base_asset = protocol::currency_to_string(
+                entry.get_field_currency(protocol::get_field_by_symbol("sfBaseAsset")).currency(),
+            );
+            let quote_asset = protocol::currency_to_string(
+                entry.get_field_currency(protocol::get_field_by_symbol("sfQuoteAsset")).currency(),
+            );
+            let asset_price = if entry.is_field_present(protocol::get_field_by_symbol("sfAssetPrice")) {
+                Some(entry.get_field_u64(protocol::get_field_by_symbol("sfAssetPrice")))
+            } else {
+                None
+            };
+            let scale = if entry.is_field_present(protocol::get_field_by_symbol("sfScale")) {
+                entry.get_field_u8(protocol::get_field_by_symbol("sfScale"))
+            } else {
+                0
+            };
+            entries.push(crate::handlers::get_aggregate_price::PriceDataEntry {
+                base_asset,
+                quote_asset,
+                asset_price,
+                scale,
+            });
+        }
+        Some(crate::handlers::get_aggregate_price::OracleData {
+            last_update_time,
+            price_data_series: entries,
+        })
     }
 }
 

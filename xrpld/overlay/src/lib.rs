@@ -60,7 +60,7 @@ pub use overlay_impl::{
 };
 pub use peer::{Peer, PeerId, ProtocolFeature};
 pub use peer_imp::PeerImp;
-pub use peer_set::{DummyPeerSet, PeerSet, PeerSetBuilder, SimplePeerSet, SimplePeerSetBuilder};
+pub use peer_set::{DummyPeerSet, OverlayPeerSetBuilder, PeerSet, PeerSetBuilder, SimplePeerSet, SimplePeerSetBuilder};
 pub use predicates::{
     MatchPeer, PeerInCluster, PeerInSet, SendAlways, SendIf, SendIfNot, send_if, send_if_not,
 };

@@ -310,6 +310,12 @@ pub fn lookup_ledger_with_result<S: LedgerLookupSource>(
                 "ledger_current_index".to_owned(),
                 JsonValue::Unsigned(u64::from(ledger.seq)),
             );
+            // Also include ledger_index for compatibility — some clients
+            // expect it regardless of open/closed status.
+            object.insert(
+                "ledger_index".to_owned(),
+                JsonValue::Unsigned(u64::from(ledger.seq)),
+            );
         }
         object.insert(
             "validated".to_owned(),

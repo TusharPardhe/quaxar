@@ -81,12 +81,30 @@ pub fn spawn_event_loop(app: ApplicationRoot, shared_inbound: Arc<SharedInboundL
                             tracing::warn!(target: "consensus", peer = ?queued.peer_id, "dropped malformed validation");
                             continue;
                         };
-                        let _ = app.receive_validation_to_network_ops(&mut validation, "peer");
+                        let _ = app.receive_validation_to_network_ops_with_accept(&mut validation, "peer", &app);
                     }
                     ConsensusEvent::LedgerDone(ledger) => {
                         if let Some(runtime) = app.ledger_master_runtime() {
                             runtime.ledger_master().ledger_history().insert(Arc::clone(&ledger), true);
+                            // Matches rippled's storeLedger() → checkAccept(ledger):
+                            // once a newly-acquired ledger is stored in history,
+                            // immediately check whether it has reached quorum.
+                            // Without this, the ledger sits in history until
+                            // the periodic bootstrap check finds it (~50ms),
+                            // or worse, if the acquiring map promotion already
+                            // happened before this event fires, the trie has
+                            // the entry but check_accept was never triggered.
+                            app.check_accept_hash_seq(
+                                *ledger.header().hash.as_uint256(),
+                                ledger.header().seq,
+                            );
                         }
+                        // Matches rippled's Validations::onLedger(ledger):
+                        // register the ledger in the validations adaptor's
+                        // local cache so subsequent trie operations
+                        // (updateTrie → acquire) find it immediately without
+                        // falling through to the slower ledger_history lookup.
+                        app.validations().register_ledger(&ledger);
                     }
                 }
             }

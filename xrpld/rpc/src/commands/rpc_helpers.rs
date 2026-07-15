@@ -564,6 +564,10 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
             JsonValue::String("tesSUCCESS".to_string()),
         );
         ret.insert(jss::engine_result_code.to_string(), JsonValue::Signed(0));
+        ret.insert(
+            "engine_result_message".to_string(),
+            JsonValue::String("The transaction was applied. Only final in a validated ledger.".to_string()),
+        );
     }
 
     if !ctx
@@ -751,6 +755,21 @@ fn keypair_for_signature(
         }
         None => None,
     };
+
+    // Reject conflicting key sources: only one of secret, seed, seed_hex, or
+    // passphrase may be provided.
+    let has_secret = params.contains_key(jss::secret);
+    let has_seed = params.contains_key(jss::seed);
+    let has_seed_hex = params.contains_key(jss::seed_hex);
+    let has_passphrase = params.contains_key(jss::passphrase);
+    let source_count =
+        has_secret as u8 + has_seed as u8 + has_seed_hex as u8 + has_passphrase as u8;
+    if source_count > 1 {
+        return Err(Status::with_message(
+            RpcErrorCode::InvalidParams,
+            "Exactly one of the following must be specified: secret, seed, seed_hex, passphrase.",
+        ));
+    }
 
     let seed = if let Some(JsonValue::String(secret)) = params.get(jss::secret) {
         if key_type.is_none() && secret.starts_with("sEd") {

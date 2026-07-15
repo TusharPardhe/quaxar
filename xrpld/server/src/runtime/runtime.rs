@@ -161,6 +161,9 @@ pub struct ServerRuntime<D> {
     status_source: Option<Arc<dyn ServerStatusSource>>,
     state: Arc<ServerRuntimeState>,
     deferred_protocols: Vec<RpcServerPortDeferredProtocol>,
+    /// Shared subscription manager across ALL ports. Ensures that a
+    /// publish from the HTTP handler reaches WS subscribers.
+    shared_subscriptions: Arc<crate::SubscriptionManager>,
 }
 
 pub struct ServerRuntimeBuildReport<D> {
@@ -243,6 +246,7 @@ where
             status_source,
             state: Arc::new(ServerRuntimeState::default()),
             deferred_protocols: Vec::new(),
+            shared_subscriptions: Arc::new(crate::SubscriptionManager::default()),
         }
     }
 
@@ -273,15 +277,11 @@ where
         listener: StdTcpListener,
     ) -> Result<(), String> {
         let listener_name = policy.name.clone();
-        let server = if let Some(status_source) = self.status_source.as_ref() {
-            RpcServer::with_port_policy_and_status_source(
-                self.dispatcher.clone(),
-                policy.clone(),
-                Arc::clone(status_source),
-            )
-        } else {
-            RpcServer::with_port_policy(self.dispatcher.clone(), policy.clone())
-        };
+        let server = RpcServer::with_auth_and_subscriptions(
+            self.dispatcher.clone(),
+            crate::auth::ServerAuth::new(policy.auth.clone()),
+            Arc::clone(&self.shared_subscriptions),
+        );
         let state = Arc::clone(&self.state);
         let shutdown = Arc::clone(&self.state);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -436,10 +436,11 @@ impl ServerRuntime<BuiltinDispatcher<ApplicationServerInfo<OwnedApplicationServe
             ));
         }
 
+        let shared_subs = Arc::new(SubscriptionManager::default());
         let source =
             ApplicationServerInfo::new(OwnedApplicationServerInfo::from_application_root(app));
         let path_source: Arc<dyn rpc::PathFinderSource + Send + Sync> = Arc::new(source.clone());
-        let dispatcher = BuiltinDispatcher::new(source, SubscriptionManager::default())
+        let dispatcher = BuiltinDispatcher::new(source, (*shared_subs).clone())
             .with_path_find(Arc::new(rpc::PathRequestManager::new()), path_source);
         let mut runtime = Self::with_status_source(
             app.basic_app().handle(),
@@ -449,6 +450,7 @@ impl ServerRuntime<BuiltinDispatcher<ApplicationServerInfo<OwnedApplicationServe
                 app,
             ))),
         );
+        runtime.shared_subscriptions = shared_subs;
         runtime.deferred_protocols = deferred_protocols.clone();
         Ok(ServerRuntimeBuildReport {
             runtime,
@@ -473,7 +475,7 @@ where
     S: Clone + Send + Sync + 'static,
 {
     pub fn subscriptions(&self) -> crate::SubscriptionManager {
-        self.dispatcher.subscriptions.clone()
+        (*self.shared_subscriptions).clone()
     }
 }
 

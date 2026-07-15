@@ -40,7 +40,7 @@ pub fn should_close_ledger(
     // unexpectedly large values for either duration; those are unexpected
     // cases where we just close the ledger.
     if prev_round_time > Duration::from_secs(600) || time_since_prev_close > Duration::from_secs(600) {
-        warn!(
+        debug!(
             any_transactions,
             prev_proposers,
             proposers_closed,

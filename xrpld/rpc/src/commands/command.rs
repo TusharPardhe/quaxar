@@ -153,6 +153,14 @@ where
         }
         "subscribe" => do_subscribe(context),
         "unsubscribe" => do_unsubscribe(context),
+        "version" => {
+            let mut version_obj = BTreeMap::new();
+            version_obj.insert("first".to_owned(), JsonValue::Unsigned(1));
+            version_obj.insert("last".to_owned(), JsonValue::Unsigned(2));
+            let mut result = BTreeMap::new();
+            result.insert("version".to_owned(), JsonValue::Object(version_obj));
+            JsonValue::Object(result)
+        }
         _ => rpc_error(RpcErrorCode::UnknownCommand),
     }
 }

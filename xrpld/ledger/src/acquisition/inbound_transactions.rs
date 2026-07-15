@@ -159,11 +159,18 @@ impl InboundTransactions {
         self.map_complete_tx = Some(tx);
     }
 
+    pub fn set_peer_set_builder(&mut self, builder: Arc<dyn PeerSetBuilder>) {
+        self.peer_set_builder = builder;
+    }
+
+    pub fn set_filter_factory(&mut self, factory: Arc<dyn TransactionAcquireFilterFactory>) {
+        self.filter_factory = Some(factory);
+    }
+
     pub fn new_round(&mut self, seq: u32) {
-        let Some(zero) = self.sets.get_mut(&Uint256::zero()) else {
-            return;
-        };
-        zero.seq = seq;
+        if let Some(zero) = self.sets.get_mut(&Uint256::zero()) {
+            zero.seq = seq;
+        }
 
         if self.seq == seq {
             return;
@@ -197,6 +204,44 @@ impl InboundTransactions {
 
     pub fn is_empty(&self) -> bool {
         self.sets.is_empty()
+    }
+
+    pub fn stored_hashes(&self) -> Vec<Uint256> {
+        self.sets.iter().filter(|(_, v)| v.set.is_some()).map(|(h, _)| *h).collect()
+    }
+
+    /// Drive pending TransactionAcquire objects forward. Each pending
+    /// acquisition's `invoke_on_timer` is called, which handles
+    /// retry/re-request logic internally. Acquisitions that complete
+    /// (or fail) as a result are finalized here via `give_set`.
+    /// Matches rippled's InboundTransactions timer sweep.
+    pub fn tick_pending_acquires(&mut self) {
+        let hashes: Vec<Uint256> = self
+            .sets
+            .iter()
+            .filter(|(_, v)| v.acquire.is_some())
+            .map(|(h, _)| *h)
+            .collect();
+        for hash in hashes {
+            if let Some(inbound) = self.sets.get_mut(&hash) {
+                if let Some(acquire) = inbound.acquire.as_mut() {
+                    acquire.invoke_on_timer();
+                    if acquire.is_complete() {
+                        let set = Arc::new(acquire.map().clone());
+                        inbound.acquire = None;
+                        let is_new = inbound.set.is_none();
+                        if is_new {
+                            inbound.set = Some(Arc::clone(&set));
+                            if let Some(tx) = &self.map_complete_tx {
+                                let _ = tx.send((hash, set));
+                            }
+                        }
+                    } else if acquire.is_failed() {
+                        inbound.acquire = None;
+                    }
+                }
+            }
+        }
     }
 }
 

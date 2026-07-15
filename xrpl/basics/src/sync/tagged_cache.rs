@@ -844,13 +844,25 @@ where
     }
 
     pub fn get_keys(&self) -> Vec<K> {
-        self.state
-            .lock()
-            .expect("TaggedCache mutex must not be poisoned")
-            .cache
-            .iter()
-            .map(|(key, _)| key.clone())
-            .collect()
+        // Pre-allocate outside the lock to avoid blocking other threads
+        // during potentially expensive heap allocation (rippled parity:
+        // TaggedCache::getKeys() memory outside of lock).
+        let mut capacity = 0;
+        loop {
+            let mut result = Vec::with_capacity(capacity);
+            let guard = self
+                .state
+                .lock()
+                .expect("TaggedCache mutex must not be poisoned");
+            let len = guard.cache.len();
+            if result.capacity() >= len {
+                result.extend(guard.cache.iter().map(|(key, _)| key.clone()));
+                return result;
+            }
+            // Capacity too small — drop the lock, grow, retry.
+            drop(guard);
+            capacity = len + len / 4; // 25% headroom for concurrent inserts
+        }
     }
 }
 

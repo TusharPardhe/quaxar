@@ -273,10 +273,9 @@ pub fn handle_new_validation_with_store(
     validations: &mut RclValidationsInner,
     validation: &mut STValidation,
     bypass_accept: bool,
-    accept_sink: Option<&dyn RclValidationAcceptanceSink>,
     persistence: Option<&dyn RclValidationPersistence>,
     journal: Option<&dyn RclValidationJournal>,
-) -> consensus::ValidationStatus {
+) -> (consensus::ValidationStatus, Option<(Uint256, u32)>) {
     let signing_key = *validation.get_signer_public();
 
     // Matches the reference's `handleNewValidation`: a validation is
@@ -299,18 +298,27 @@ pub fn handle_new_validation_with_store(
         journal.trace(&format!("handleNewValidation: {status} for ledger {}", validation.get_ledger_hash()));
     }
 
+    let mut check_accept_args = None;
     if status == consensus::ValidationStatus::Current {
-        if !bypass_accept
-            && let Some(sink) = accept_sink
-        {
-            sink.check_accept(validation.get_ledger_hash(), validation.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence")));
+        if !bypass_accept {
+            // Matches the reference: `validations.add()` fully returns
+            // (releasing its internal lock) BEFORE `checkAccept` runs --
+            // they are sequential, not nested. Returning the args here
+            // instead of invoking the sink directly lets the caller run
+            // it AFTER releasing the validations lock it's holding,
+            // avoiding a self-deadlock (num_trusted_for_ledger inside
+            // check_accept needs to re-lock the same mutex).
+            check_accept_args = Some((
+                validation.get_ledger_hash(),
+                validation.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence")),
+            ));
         }
         if let Some(persistence) = persistence {
             persistence.persist(validation);
         }
     }
 
-    status
+    (status, check_accept_args)
 }
 
 /// Marker type distinguishing the ledger type used by
@@ -378,7 +386,7 @@ mod tests {
 
         let mut validation = signed_validation(ledger_hash, 1, now);
         let mut inner = shared.validations().lock().unwrap();
-        let status = handle_new_validation_with_store(&AllTrusted, &mut inner, &mut validation, false, None, None, None);
+        let status = handle_new_validation_with_store(&AllTrusted, &mut inner, &mut validation, false, None, None).0;
 
         assert_eq!(status, consensus::ValidationStatus::Current);
         assert!(validation.is_trusted());
@@ -393,7 +401,7 @@ mod tests {
 
         let mut validation = signed_validation(ledger_hash, 1, now);
         let mut inner = shared.validations().lock().unwrap();
-        let _ = handle_new_validation_with_store(&NoneTrusted, &mut inner, &mut validation, false, None, None, None);
+        let _ = handle_new_validation_with_store(&NoneTrusted, &mut inner, &mut validation, false, None, None);
 
         assert!(!validation.is_trusted());
     }
@@ -408,7 +416,7 @@ mod tests {
         let mut validation = signed_validation(ledger_hash, 1, now);
         {
             let mut inner = shared.validations().lock().unwrap();
-            let _ = handle_new_validation_with_store(&AllTrusted, &mut inner, &mut validation, false, None, None, None);
+            let _ = handle_new_validation_with_store(&AllTrusted, &mut inner, &mut validation, false, None, None);
         }
 
         assert_eq!(shared.num_trusted_for_ledger(ledger_hash), 1);

@@ -395,6 +395,10 @@ impl SyncTree {
         self.backed = false;
     }
 
+    pub fn set_backed(&mut self) {
+        self.backed = true;
+    }
+
     pub fn backed(&self) -> bool {
         self.backed
     }

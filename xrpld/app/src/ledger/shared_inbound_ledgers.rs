@@ -392,6 +392,14 @@ impl SharedInboundLedgers {
         let ss = Arc::clone(&self.shared_stored);
         let store_tx = self.completed_ledgers_tx.clone();
 
+        // Register in overlay router BEFORE spawning the worker thread to
+        // avoid a race where rippled's TmLedgerData response arrives before
+        // the registry entry exists (causing route_response to drop the data).
+        self.registry
+            .lock()
+            .expect("acq registry")
+            .insert(hash, acq_tx.clone());
+
         let _acq_handle = thread::Builder::new()
             .name("xrpld-acq-process".to_owned())
             .spawn(move || {
@@ -400,12 +408,6 @@ impl SharedInboundLedgers {
                 );
             })
             .expect("acquisition thread should spawn");
-
-        // Register in overlay router
-        self.registry
-            .lock()
-            .expect("acq registry")
-            .insert(hash, acq_tx.clone());
 
         let now = Instant::now();
 
@@ -598,7 +600,7 @@ fn run_acquisition_worker(
             tracing::debug!(target: "inbound_ledger", "{msg}");
         }
         fn warn(&self, msg: &str) {
-            tracing::warn!(target: "inbound_ledger", "{msg}");
+            tracing::debug!(target: "inbound_ledger", "{msg}");
         }
         fn fatal(&self, msg: &str) {
             tracing::error!(target: "inbound_ledger", "{msg}");
@@ -1126,7 +1128,7 @@ fn run_acquisition_worker(
                     &mut send_fn,
                 );
                 if failed {
-                    tracing::warn!(target: "inbound_ledger", seq, "Shared acq timer failure");
+                    tracing::debug!(target: "inbound_ledger", seq, "Shared acq timer failure");
                     break;
                 }
 
@@ -1176,12 +1178,57 @@ fn run_acquisition_worker(
             };
             // C++ parity: InboundLedger::done() sets immutable before storeLedger().
             if !ledger.is_immutable() {
-                ledger.set_immutable(false);
+                ledger.set_immutable(true);
             }
             ledger.set_full();
             if !flush_writes(&store.write_tx) {
                 tracing::warn!(target: "inbound_ledger", seq, "Shared acq flush failed");
                 break;
+            }
+            // Attach a node_fetcher so reads can resolve nodes from NuDB.
+            // Without this, any state/tx map traversal hits MissingNode
+            // because the SyncTree only has root+inner nodes in memory but
+            // the full_below cache marked subtrees as "complete" (they ARE
+            // in NuDB, just not loaded into the tree).
+            {
+                let fetcher_ns = ns.clone();
+                let fetcher_pending = Arc::clone(&shared_pending_writes);
+                let fetcher_tc = shared_tree_cache.clone();
+                ledger.set_node_fetcher(Arc::new(move |hash| {
+                    // Check tree cache first
+                    if let Some(node) = fetcher_tc.fetch(hash.as_uint256()) {
+                        return Some(node);
+                    }
+                    // Check pending writes (not yet flushed to NuDB)
+                    if let Ok(pending) = fetcher_pending.lock() {
+                        if let Some(obj) = pending.get(hash.as_uint256()) {
+                            return shamap::nodes::tree_node::SHAMapTreeNode::make_from_prefix(
+                                &obj.data, hash,
+                            ).ok();
+                        }
+                    }
+                    // Fetch from NuDB
+                    let data = match &fetcher_ns {
+                        crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => db
+                            .fetch_node_object(
+                                &hash.as_uint256(),
+                                0,
+                                nodestore::FetchType::Synchronous,
+                                false,
+                            ),
+                        crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => db
+                            .fetch_node_object(
+                                &hash.as_uint256(),
+                                0,
+                                nodestore::FetchType::Synchronous,
+                                false,
+                            ),
+                    };
+                    let obj = data?;
+                    shamap::nodes::tree_node::SHAMapTreeNode::make_from_prefix(
+                        obj.data(), hash,
+                    ).ok()
+                }));
             }
             tracing::info!(target: "inbound_ledger", seq, "SHARED LEDGER ACQUIRED");
             let _ = store_tx.send(Arc::new(ledger));
@@ -1193,10 +1240,48 @@ fn run_acquisition_worker(
     if inbound.is_complete() && !inbound.is_failed() {
         if let Some(mut ledger) = inbound.ledger().cloned() {
             if !ledger.is_immutable() {
-                ledger.set_immutable(false);
+                ledger.set_immutable(true);
             }
             ledger.set_full();
             let _ = flush_writes(&store.write_tx);
+            // Attach node_fetcher (same as primary path above)
+            {
+                let fetcher_ns = ns.clone();
+                let fetcher_pending = Arc::clone(&shared_pending_writes);
+                let fetcher_tc = shared_tree_cache.clone();
+                ledger.set_node_fetcher(Arc::new(move |hash| {
+                    if let Some(node) = fetcher_tc.fetch(hash.as_uint256()) {
+                        return Some(node);
+                    }
+                    if let Ok(pending) = fetcher_pending.lock() {
+                        if let Some(obj) = pending.get(hash.as_uint256()) {
+                            return shamap::nodes::tree_node::SHAMapTreeNode::make_from_prefix(
+                                &obj.data, hash,
+                            ).ok();
+                        }
+                    }
+                    let data = match &fetcher_ns {
+                        crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => db
+                            .fetch_node_object(
+                                &hash.as_uint256(),
+                                0,
+                                nodestore::FetchType::Synchronous,
+                                false,
+                            ),
+                        crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => db
+                            .fetch_node_object(
+                                &hash.as_uint256(),
+                                0,
+                                nodestore::FetchType::Synchronous,
+                                false,
+                            ),
+                    };
+                    let obj = data?;
+                    shamap::nodes::tree_node::SHAMapTreeNode::make_from_prefix(
+                        obj.data(), hash,
+                    ).ok()
+                }));
+            }
             tracing::info!(target: "inbound_ledger", seq, "SHARED LEDGER ACQUIRED");
             let _ = store_tx.send(Arc::new(ledger));
         }

@@ -123,6 +123,17 @@ pub struct AppNetworkOpsRuntime {
     ledger_master_state: Arc<SharedLedgerMasterState>,
     consensus_bootstrap_started: AtomicBool,
     time_keeper: Arc<TimeKeeper<SystemTimeKeeperClock>>,
+    /// Long-lived single-threaded Tokio runtime used exclusively by
+    /// `drain_proposals` to `block_on` `AppConsensusRuntime::timer_tick`.
+    /// Constructed once here instead of per-call: `drain_proposals` runs on
+    /// every iteration of the consensus loop's ~50ms cadence (see
+    /// `bootstrap::run_start_mode_consensus_loop`), and
+    /// `tokio::runtime::Builder::new_current_thread().build()` allocates a
+    /// fresh reactor/executor (real OS-level setup, not a cheap
+    /// allocation) on every call -- rebuilding it ~20 times a second adds
+    /// avoidable latency to the exact loop iteration that must stay
+    /// responsive to incoming peer proposals under load.
+    proposal_drain_runtime: tokio::runtime::Runtime,
 }
 
 impl std::fmt::Debug for AppNetworkOpsRuntime {
@@ -184,6 +195,10 @@ impl AppNetworkOpsRuntime {
             ledger_master_state,
             consensus_bootstrap_started: AtomicBool::new(false),
             time_keeper,
+            proposal_drain_runtime: tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("network ops proposal-drain runtime"),
         }
     }
 
@@ -405,11 +420,7 @@ impl AppNetworkOpsRuntime {
     pub fn drain_proposals(&self, consensus_runtime: &AppConsensusRuntime) {
         let now = self.current_net_time();
         let runtime = consensus_runtime.clone();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("network ops drain proposals runtime");
-        rt.block_on(async {
+        self.proposal_drain_runtime.block_on(async {
             runtime.timer_tick(now, false).await;
         });
     }

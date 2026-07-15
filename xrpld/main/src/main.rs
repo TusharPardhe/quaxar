@@ -4088,7 +4088,7 @@ fn run_acquisition_thread(
                         &mut send_fn,
                     );
                     if failed {
-                        tracing::warn!(target: "inbound_ledger", seq, "Timer failure — retiring");
+                        tracing::debug!(target: "inbound_ledger", seq, "Timer failure — retiring");
                         break;
                     }
                 } else {
@@ -4113,7 +4113,7 @@ fn run_acquisition_thread(
                         &mut send_fn,
                     );
                     if failed {
-                        tracing::warn!(target: "inbound_ledger", seq, "Timer failure — retiring");
+                        tracing::debug!(target: "inbound_ledger", seq, "Timer failure — retiring");
                         break;
                     }
 
@@ -4827,6 +4827,14 @@ impl<D> BoundServerRuntime<D> {
                         let direct_registry = Arc::clone(&acq_registry);
                         let dc = Arc::clone(&direct_router_counter);
                         let shared_inbound_router = Arc::clone(&shared_inbound);
+                        // Only set if no router already registered (bootstrap.rs
+                        // sets a router that handles ALL types including
+                        // liTS_CANDIDATE for tx-set dispute resolution).
+                        if overlay_runtime.overlay().queued_inbound()
+                            .ledger_data_router_is_set()
+                        {
+                            // Router already set by bootstrap consensus loop — skip.
+                        } else {
                         overlay_runtime.overlay().queued_inbound()
                             .set_ledger_data_router(Box::new(move |peer_id, message| {
                                 dc.fetch_add(1, Ordering::Relaxed);
@@ -4849,6 +4857,7 @@ impl<D> BoundServerRuntime<D> {
                                     );
                                 }
                             }));
+                        }
                         // Immediate transaction dispatch — matches reference
                         // PeerImp::handleTransaction calling
                         // JobQueue::addJob(JtTransaction, "RcvCheckTx", ...)
@@ -4858,13 +4867,10 @@ impl<D> BoundServerRuntime<D> {
                         overlay_runtime.overlay().queued_inbound()
                             .set_transaction_router(Box::new(move |_peer_id, message| {
                                 let job_app = router_app.clone();
-                                router_app.job_queue().add_job(
-                                    app::job::job_types::JobType::JtTransaction,
-                                    "RcvCheckTx",
-                                    move || {
-                                        process_inbound_transaction(&job_app, &message.message.raw_transaction);
-                                    },
-                                );
+                                // Process synchronously matching rippled's
+                                // PeerImp::onMessage(TMTransaction) which applies
+                                // immediately, NOT via a JobQueue job.
+                                process_inbound_transaction(&job_app, &message.message.raw_transaction);
                             }));
                         overlay_channel_registered = true;
                     }
