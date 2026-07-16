@@ -2010,6 +2010,22 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 root.set_status_rpc_complete_ledgers(Some(range_str));
             }
 
+            // Operating mode promotion: Connected → Full
+            // Matches rippled's endConsensus: promote to Full when:
+            // 1. Mode is Connected (not Disconnected)
+            // 2. Validated ledger parent is in complete_ledgers range
+            // 3. Close time is recent (handled by normalize_operating_mode_for_validated_age)
+            {
+                use crate::network::network_ops::NetworkOpsOperatingMode;
+                let current_mode = root.network_ops_state().operating_mode();
+                if current_mode == NetworkOpsOperatingMode::Connected {
+                    let valid_seq = lm.valid_ledger_seq();
+                    if valid_seq > 1 && lm.have_ledger(valid_seq - 1) {
+                        root.set_network_ops_operating_mode(NetworkOpsOperatingMode::Full);
+                    }
+                }
+            }
+
             // Gap-fill: only request fetch packs during initial catchup.
             // Once we have a validated ledger, consensus builds new ledgers
             // directly — no need to fetch from peers.

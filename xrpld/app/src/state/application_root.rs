@@ -4210,6 +4210,7 @@ impl ApplicationRoot {
         l.set_validated();
         let validated = Arc::new(l);
         lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
+        lm.mark_ledger_complete(validated.header().seq);
         self.note_validated_ledger_for_sync(Arc::clone(&validated));
         self.set_need_network_ledger(false);
         tracing::info!(
