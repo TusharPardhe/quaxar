@@ -255,8 +255,9 @@ fn parse_networks(section: &Section, field: &str) -> Result<Option<ParsedNetwork
 
         if let Ok(ip) = candidate.parse::<IpAddr>() {
             if ip.is_unspecified() {
-                nets_v4.push(IpNet::from(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).trunc());
-                nets_v6.push(IpNet::from(IpAddr::V6(Ipv6Addr::UNSPECIFIED)).trunc());
+                // 0.0.0.0 means "allow all" — use /0 prefix to match any IP
+                nets_v4.push(IpNet::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).expect("valid /0"));
+                nets_v6.push(IpNet::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).expect("valid /0"));
                 break;
             }
 
@@ -436,11 +437,11 @@ mod tests {
         assert_eq!(ports[0].ip, IpAddr::V6(Ipv6Addr::UNSPECIFIED));
         assert_eq!(
             ports[0].admin_nets_v4,
-            vec![IpNet::from(IpAddr::V4(Ipv4Addr::UNSPECIFIED)).trunc()]
+            vec![IpNet::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap()]
         );
         assert_eq!(
             ports[0].admin_nets_v6,
-            vec![IpNet::from(IpAddr::V6(Ipv6Addr::UNSPECIFIED)).trunc()]
+            vec![IpNet::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).unwrap()]
         );
         assert_eq!(
             ports[0].secure_gateway_nets_v4,

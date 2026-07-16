@@ -250,7 +250,6 @@ pub struct OwnedApplicationServerInfo {
     open_ledger: SharedAppOpenLedger,
     tx_q: SharedAppTxQ,
     status_metrics: Option<Arc<dyn StatusMetricsSource>>,
-    overlay_status: Option<Arc<dyn OverlayStatusSource>>,
     published_server_ports: Option<Arc<dyn PublishedServerPortsSource>>,
     validators: Arc<ValidatorList>,
     load_fee_track: Arc<SharedLoadFeeTrack>,
@@ -279,7 +278,6 @@ impl OwnedApplicationServerInfo {
             open_ledger: app.open_ledger().clone(),
             tx_q: app.tx_q().clone(),
             status_metrics: app.status_metrics(),
-            overlay_status: app.overlay_status(),
             published_server_ports: app.published_server_ports(),
             validators: app.validators(),
             load_fee_track: app.load_fee_track(),
@@ -487,7 +485,8 @@ impl AppServerInfoView for OwnedApplicationServerInfo {
     }
 
     fn overlay_status(&self) -> Option<Arc<dyn OverlayStatusSource>> {
-        self.overlay_status.as_ref().map(Arc::clone)
+        // Read from live app — overlay may be attached after this struct was created
+        self.app.overlay_status()
     }
 
     fn published_server_ports(&self) -> Option<Arc<dyn PublishedServerPortsSource>> {

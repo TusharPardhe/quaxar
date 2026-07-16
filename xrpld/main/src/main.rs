@@ -1286,7 +1286,7 @@ fn print_unknown_command(command: &str, subcommands: &[&str]) {
         );
     }
 
-    eprintln!("    Run `xrpld --help` to see available commands.");
+    eprintln!("    Run `quaxar --help` to see available commands.");
 }
 
 fn command_suggestions<'a>(command: &str, subcommands: &'a [&str]) -> Vec<&'a str> {
@@ -1355,7 +1355,7 @@ fn main() -> ExitCode {
             .map_err(|e| format!("Reload failed: {e}"))
     });
 
-    tracing::info!(target: "main", version = env!("CARGO_PKG_VERSION"), "XRPLD starting");
+    tracing::info!(target: "main", version = env!("CARGO_PKG_VERSION"), "QUAXAR starting");
 
     let start_time = Instant::now();
 

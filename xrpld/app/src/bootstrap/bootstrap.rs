@@ -640,7 +640,7 @@ pub fn build_bootstrap_root(
     if options.standalone {
         root.tx_q().set_standalone(true);
     }
-    // Apply [transaction_queue] config overrides (rippled parity).
+    // Apply [transaction_queue] config overrides.
     let txq_setup = parse_txq_setup(config);
     if config.exists("transaction_queue") {
         root.tx_q().reconfigure_setup(txq_setup);
@@ -941,6 +941,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
     let mut last_timer_tick = std::time::Instant::now();
     let mut last_round_ledger_id: Option<Uint256> = None;
     let mut last_acquire_tick = std::time::Instant::now();
+    let mut last_history_tick = std::time::Instant::now();
     if is_genesis {
         tracing::info!(target: "consensus", "Genesis mode: starting consensus immediately on the genesis ledger");
     }
@@ -1797,18 +1798,23 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         }
         while let Ok(ledger) = shared_completed_rx.try_recv() {
             if let Some(lm_rt) = root.ledger_master_runtime() {
-                let inserted = lm_rt
-                    .ledger_master()
+                let lm = lm_rt.ledger_master();
+                let inserted = lm
                     .ledger_history()
                     .insert(std::sync::Arc::clone(&ledger), true);
                 if !inserted {
-                    tracing::warn!(
+                    tracing::debug!(
                         target: "consensus",
                         seq = ledger.header().seq,
                         hash = %ledger.header().hash,
-                        immutable = ledger.is_immutable(),
-                        "Rejected completed ledger insert from shared_completed_rx"
+                        "Ledger already in history (shared_completed_rx dedup)"
                     );
+                }
+                // Always mark as complete — whether newly inserted or already
+                // present. The ledger was successfully acquired and verified.
+                let ledger_seq = ledger.header().seq;
+                if ledger_seq > 0 {
+                    lm.mark_ledger_complete(ledger_seq);
                 }
             }
             let _ = event_tx.send(
@@ -1835,13 +1841,13 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             let quorum = root.validators().quorum();
 
             // -----------------------------------------------------------
-            // switchLastClosedLedger (rippled parity):
+            // switchLastClosedLedger:
             // When need_network_ledger is true, we're joining an existing
             // network. Instead of requiring full quorum (which requires our
             // OWN validation — impossible until we're on the same chain),
             // switch to the network's chain when we have an acquired ledger
             // that ANY trusted peer has validated. This matches rippled's
-            // checkLastClosedLedger → switchLastClosedLedger flow where a
+            // When need_network_ledger is true, adopts the network chain when a
             // joining node adopts the network's preferred LCL based on peer
             // consensus, not its own validation count.
             // -----------------------------------------------------------
@@ -1884,6 +1890,22 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 }
 
                 if let Some(network_ledger) = best_validated {
+                    // Rippled parity: only switch when the ledger is FULLY
+                    // complete (state map + tx map downloaded, not just header).
+                    // InboundLedgers::acquire() returns nullptr until isComplete().
+                    // Without this check, we'd switch to a ledger whose state
+                    // can't be traversed, causing all account queries to fail.
+                    let state_complete = !network_ledger.state_map().is_synching();
+                    let tx_complete = network_ledger.header().tx_hash.is_zero()
+                        || !network_ledger.tx_map().is_synching();
+
+                    if !state_complete || !tx_complete {
+                        tracing::debug!(target: "consensus",
+                            seq = network_ledger.header().seq,
+                            state_complete, tx_complete,
+                            "switchLastClosedLedger: waiting for full state download"
+                        );
+                    } else {
                     let new_seq = network_ledger.header().seq;
                     let new_hash = *network_ledger.header().hash.as_uint256();
                     let val_count = root.validations().num_trusted_for_ledger(new_hash);
@@ -1897,6 +1919,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                     l.set_validated();
                     let validated = Arc::new(l);
                     lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
+                    lm.mark_ledger_complete(validated.header().seq);
                     root.note_validated_ledger_for_sync(Arc::clone(&validated));
 
                     // Switch closed ledger to the network's chain
@@ -1919,6 +1942,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                         new_seq, %new_hash,
                         "Consensus restarted on network chain (switchLastClosedLedger)"
                     );
+                    } // else (state_complete)
                 }
             }
 
@@ -1934,6 +1958,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                         let validated = std::sync::Arc::new(l);
                         lm.set_valid_ledger_no_sweep(std::sync::Arc::clone(&validated), None, None);
                         root.note_validated_ledger_for_sync(std::sync::Arc::clone(&validated));
+                        lm.mark_ledger_complete(validated.header().seq);
                         root.set_need_network_ledger(false);
                         tracing::info!(target: "consensus",
                             seq = closed_seq, val_count, quorum,
@@ -1964,6 +1989,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 let validated = std::sync::Arc::new(l);
                 lm.set_valid_ledger_no_sweep(std::sync::Arc::clone(&validated), None, None);
                 root.note_validated_ledger_for_sync(std::sync::Arc::clone(&validated));
+                lm.mark_ledger_complete(validated.header().seq);
                 root.set_need_network_ledger(false);
                 advanced += 1;
             }
@@ -1974,6 +2000,14 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                     quorum,
                     "tryAdvance burst: validated consecutive ledgers from history"
                 );
+            }
+
+            // Update complete_ledgers display in StatusRpcState.
+            // Without this, server_info falls back to "seq-seq" format.
+            let complete_range = lm.complete_ledgers();
+            let range_str = complete_range.to_string();
+            if !range_str.is_empty() {
+                root.set_status_rpc_complete_ledgers(Some(range_str));
             }
 
             // Gap-fill: only request fetch packs during initial catchup.
@@ -2009,6 +2043,63 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                                 let wire = overlay::Message::new(fp_msg, None);
                                 p.send(wire);
                                 break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ─── History Backfill (rippled doAdvance/fetchForHistory parity) ───
+        // After tracking head, backfill missing historical ledgers backwards
+        // from the validated seq. This fills the complete_ledgers range so the
+        // node eventually reaches 'full' operating mode.
+        // Throttled to once per 3 seconds to avoid overwhelming peers.
+        if let Some(lm_rt) = root.ledger_master_runtime() {
+            let lm = lm_rt.ledger_master();
+            let valid_seq = lm.valid_ledger_seq();
+            // Only backfill if we have a validated ledger
+            if valid_seq > 1 {
+                if last_history_tick.elapsed() >= Duration::from_secs(3) {
+                    last_history_tick = std::time::Instant::now();
+
+                    // Find the first missing ledger in the range
+                    let ledger_history_limit = 512u32; // from [ledger_history] config
+                    let earliest_wanted = valid_seq.saturating_sub(ledger_history_limit);
+                    let complete = lm.complete_ledgers();
+
+                    // Walk backwards to find the first gap
+                    let mut missing_seq = None;
+                    for seq in (earliest_wanted..valid_seq).rev() {
+                        if seq <= 1 { break; }
+                        if !complete.contains(seq) {
+                            missing_seq = Some(seq);
+                            break;
+                        }
+                    }
+
+                    if let Some(missing) = missing_seq {
+                        // Get the hash for the missing ledger from the next ledger's parent_hash
+                        let parent_hash = lm.ledger_history()
+                            .get_cached_ledger_by_seq(missing + 1)
+                            .map(|l| *l.header().parent_hash.as_uint256());
+
+                        if let Some(hash) = parent_hash {
+                            if !hash.is_zero() {
+                                let sha_hash = basics::sha_map_hash::SHAMapHash::new(hash);
+                                // Check if we already have it in history
+                                let already_have = lm.ledger_history()
+                                    .get_cached_ledger_by_hash(sha_hash)
+                                    .is_some();
+
+                                if !already_have {
+                                    // Acquire from peers
+                                    shared_inbound.acquire(hash, missing);
+                                    tracing::debug!(target: "consensus",
+                                        missing, %hash,
+                                        "history backfill: acquiring missing ledger"
+                                    );
+                                }
                             }
                         }
                     }
@@ -3465,7 +3556,7 @@ fn config_legacy_usize(config: &BasicConfig, section: &str) -> Option<usize> {
     config.legacy(section).ok()?.trim().parse::<usize>().ok()
 }
 
-/// Parse the `[transaction_queue]` config section (rippled parity).
+/// Parse the `[transaction_queue]` config section.
 /// All fields are optional — unset fields use TxQSetup::default().
 fn parse_txq_setup(config: &BasicConfig) -> tx::TxQSetup {
     use tx::TxQSetup;
