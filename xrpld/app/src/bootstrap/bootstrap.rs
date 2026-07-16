@@ -2014,14 +2014,24 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             // Matches rippled's endConsensus: promote to Full when:
             // 1. Mode is Connected (not Disconnected)
             // 2. Validated ledger parent is in complete_ledgers range
-            // 3. Close time is recent (handled by normalize_operating_mode_for_validated_age)
+            // 3. Current validated ledger's state map is accessible (not synching)
+            // 4. Close time is recent (handled by normalize_operating_mode_for_validated_age)
             {
                 use crate::network::network_ops::NetworkOpsOperatingMode;
                 let current_mode = root.network_ops_state().operating_mode();
                 if current_mode == NetworkOpsOperatingMode::Connected {
                     let valid_seq = lm.valid_ledger_seq();
                     if valid_seq > 1 && lm.have_ledger(valid_seq - 1) {
-                        root.set_network_ops_operating_mode(NetworkOpsOperatingMode::Full);
+                        // Only promote if the validated ledger's state is
+                        // fully accessible (can serve account queries).
+                        // Without this, we'd claim "full" but return
+                        // actNotFound for all account queries.
+                        let state_ok = root.validated_ledger()
+                            .map(|l| !l.state_map().is_synching())
+                            .unwrap_or(false);
+                        if state_ok {
+                            root.set_network_ops_operating_mode(NetworkOpsOperatingMode::Full);
+                        }
                     }
                 }
             }
