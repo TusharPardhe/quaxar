@@ -104,6 +104,15 @@ impl<Account, Tx, Journal, ParentBatchId> TxQ<Account, Tx, Journal, ParentBatchI
         self.metrics = self.setup.fee_metrics_state();
     }
 
+    /// Reconfigure the TxQ setup from a parsed config section.
+    /// Matches rippled's `setupTxQ(Config const& config)`.
+    pub fn reconfigure_setup(&mut self, new_setup: TxQSetup) {
+        let standalone = self.setup.standalone;
+        self.setup = new_setup;
+        self.setup.standalone = standalone;
+        self.metrics = self.setup.fee_metrics_state();
+    }
+
     pub fn metrics(&self) -> &QueueFeeMetricsState {
         &self.metrics
     }

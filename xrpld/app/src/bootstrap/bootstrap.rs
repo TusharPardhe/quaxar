@@ -640,6 +640,11 @@ pub fn build_bootstrap_root(
     if options.standalone {
         root.tx_q().set_standalone(true);
     }
+    // Apply [transaction_queue] config overrides (rippled parity).
+    let txq_setup = parse_txq_setup(config);
+    if config.exists("transaction_queue") {
+        root.tx_q().reconfigure_setup(txq_setup);
+    }
     let _ = root.attach_default_resolver_runtime();
     let _ = root.attach_default_ledger_master_runtime();
     let _ = root.attach_default_network_ops_validation_runtime();
@@ -3458,6 +3463,98 @@ fn config_legacy_u32(config: &BasicConfig, section: &str) -> Option<u32> {
 
 fn config_legacy_usize(config: &BasicConfig, section: &str) -> Option<usize> {
     config.legacy(section).ok()?.trim().parse::<usize>().ok()
+}
+
+/// Parse the `[transaction_queue]` config section (rippled parity).
+/// All fields are optional — unset fields use TxQSetup::default().
+fn parse_txq_setup(config: &BasicConfig) -> tx::TxQSetup {
+    use tx::TxQSetup;
+    let mut setup = TxQSetup::default();
+
+    if !config.exists("transaction_queue") {
+        return setup;
+    }
+
+    let section_values: Vec<(String, String)> = config
+        .section("transaction_queue")
+        .values()
+        .iter()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(2, '=').collect();
+            if parts.len() == 2 {
+                Some((parts[0].trim().to_string(), parts[1].trim().to_string()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (key, value) in &section_values {
+        match key.as_str() {
+            "ledgers_in_queue" => {
+                if let Ok(v) = value.parse::<usize>() { setup.ledgers_in_queue = v; }
+            }
+            "minimum_queue_size" => {
+                if let Ok(v) = value.parse::<usize>() { setup.queue_size_min = v; }
+            }
+            "retry_sequence_percent" => {
+                if let Ok(v) = value.parse::<u32>() { setup.retry_sequence_percent = v; }
+            }
+            "minimum_txn_in_ledger" => {
+                if let Ok(v) = value.parse::<usize>() { setup.minimum_txn_in_ledger = v; }
+            }
+            "minimum_txn_in_ledger_standalone" => {
+                if let Ok(v) = value.parse::<usize>() { setup.minimum_txn_in_ledger_standalone = v; }
+            }
+            "target_txn_in_ledger" => {
+                if let Ok(v) = value.parse::<usize>() { setup.target_txn_in_ledger = v; }
+            }
+            "maximum_txn_in_ledger" => {
+                if let Ok(v) = value.parse::<usize>() { setup.maximum_txn_in_ledger = Some(v); }
+            }
+            "normal_consensus_increase_percent" => {
+                if let Ok(v) = value.parse::<u32>() {
+                    setup.normal_consensus_increase_percent = v.clamp(0, 1000);
+                }
+            }
+            "slow_consensus_decrease_percent" => {
+                if let Ok(v) = value.parse::<u32>() {
+                    setup.slow_consensus_decrease_percent = v.clamp(0, 100);
+                }
+            }
+            "maximum_txn_per_account" => {
+                if let Ok(v) = value.parse::<u32>() { setup.maximum_txn_per_account = v; }
+            }
+            "minimum_last_ledger_buffer" => {
+                if let Ok(v) = value.parse::<u32>() { setup.minimum_last_ledger_buffer = v; }
+            }
+            _ => {
+                tracing::warn!(target: "bootstrap", key, "Unknown [transaction_queue] config key");
+            }
+        }
+    }
+
+    // Validation: maximum must not be less than minimum
+    if let Some(max) = setup.maximum_txn_in_ledger {
+        if max < setup.minimum_txn_in_ledger {
+            panic!(
+                "The minimum number of low-fee transactions allowed per ledger \
+                 (minimum_txn_in_ledger={}) exceeds the maximum (maximum_txn_in_ledger={})",
+                setup.minimum_txn_in_ledger, max
+            );
+        }
+    }
+
+    tracing::info!(target: "bootstrap",
+        ledgers_in_queue = setup.ledgers_in_queue,
+        queue_size_min = setup.queue_size_min,
+        minimum_txn_in_ledger = setup.minimum_txn_in_ledger,
+        target_txn_in_ledger = setup.target_txn_in_ledger,
+        maximum_txn_per_account = setup.maximum_txn_per_account,
+        "Loaded [transaction_queue] config"
+    );
+
+    setup
 }
 
 fn config_path_search_max(config: &BasicConfig) -> u32 {

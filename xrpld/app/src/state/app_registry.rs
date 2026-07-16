@@ -560,6 +560,10 @@ impl SharedAppTxQ {
         self.lock().set_standalone(standalone);
     }
 
+    pub fn reconfigure_setup(&self, setup: tx::TxQSetup) {
+        self.lock().reconfigure_setup(setup);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, AppTxQ> {
         self.0.lock().expect("app txq mutex must not be poisoned")
     }
