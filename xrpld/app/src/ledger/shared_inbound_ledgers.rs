@@ -590,7 +590,7 @@ fn run_acquisition_worker(
         InboundLedgerStore, LedgerConfig,
     };
     use overlay::{Peer as _, PeerSet as _};
-    use shamap::family::{NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher};
+    use shamap::family::{FullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher};
     use std::time::{Duration, Instant};
 
     struct WorkerJournal;
@@ -933,9 +933,24 @@ fn run_acquisition_worker(
             continue;
         }
 
+        // Each acquisition worker uses its OWN full_below_cache to prevent
+        // concurrent workers from sharing `full_below_gen` marks. Without this,
+        // worker B sees worker A's "full below" marks and skips subtrees whose
+        // leaf nodes were never actually downloaded — causing have_state=true
+        // with an incomplete state map (accounts unqueryable).
+        // Matches rippled: each InboundLedger's getMissingNodes traversal
+        // operates independently; the shared fullBelowCache is only valid
+        // AFTER nodes are confirmed in NuDB.
+        let worker_full_below = shamap::family::FullBelowCacheImpl::new(
+            (*shared_full_below).generation().wrapping_add(1),
+            basics::tagged_cache::MonotonicClock::default(),
+            basics::hardened_hash::HardenedHashBuilder::default(),
+            1024,
+        );
+
         let family = SHAMapFamily::new(
             shared_tree_cache.clone(),
-            &*shared_full_below,
+            &worker_full_below,
             WorkerNodeFetcher {
                 node_store: ns.clone(),
                 pending_writes: Arc::clone(&shared_pending_writes),

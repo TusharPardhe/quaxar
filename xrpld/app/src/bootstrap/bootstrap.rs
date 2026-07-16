@@ -2011,10 +2011,10 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             }
 
             // Operating mode promotion: Connected → Full
-            // Matches rippled's endConsensus: promote to Full when:
-            // 1. Mode is Connected (not Disconnected)
-            // 2. Validated ledger parent is in complete_ledgers range
-            // 3. Close time is recent (handled by normalize_operating_mode_for_validated_age)
+            // Promote when validated ledger parent exists in complete_ledgers.
+            // The switchLastClosedLedger gate (is_synching check) ensures we
+            // only adopt ledgers with accessible state — so if we're here with
+            // a valid range, the state should be queryable.
             {
                 use crate::network::network_ops::NetworkOpsOperatingMode;
                 let current_mode = root.network_ops_state().operating_mode();
