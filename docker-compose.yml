@@ -11,6 +11,7 @@ services:
       - xrpld-data:/var/lib/xrpld
       - ./xrpld.cfg:/etc/xrpld/xrpld.cfg:ro
       - ./validators.txt:/etc/xrpld/validators.txt:ro
+    user: "0:0"  # Run as root to avoid permission issues with volume
     deploy:
       resources:
         limits:
