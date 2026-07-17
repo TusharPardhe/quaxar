@@ -781,6 +781,19 @@ fn run_acquisition_worker(
             hash: Uint256,
             seq: u32,
         ) {
+            // Dedup: if this hash was already stored by this worker, skip the
+            // redundant pending_writes insert and NuDB write enqueue. This
+            // closes the gap where multiple peer responses deliver the same
+            // node concurrently — each delivery increments the SHAMap-layer
+            // `good` counter (correctly — the tree accepted it), but only the
+            // first should enqueue an actual NuDB store. Without this gate,
+            // the unbounded mpsc write queue and `write_count` inflated by 10-
+            // 27x relative to actual unique keys in NuDB, drowning the writer
+            // thread in redundant work and inflating RSS via pending_writes.
+            if !self.shared_stored.insert(hash) {
+                return;
+            }
+
             self.pending_writes
                 .lock()
                 .expect("pending writes lock")
@@ -868,6 +881,34 @@ fn run_acquisition_worker(
         shared_stored,
     };
 
+    // Constructed ONCE per acquisition target (not per loop tick). This cache's
+    // `touch_if_exists` is the fast-path skip that lets `get_missing_nodes` avoid
+    // re-descending into subtrees already confirmed complete — rippled's exact
+    // mechanism (SHAMapSync.cpp: fullBelowCache->touchIfExists(childHash) before
+    // descending). Recreating this cache every tick (the previous behavior) reset
+    // its internal hash set to empty every ~1s, permanently defeating that skip:
+    // the underlying tree nodes' `full_below_gen` marks stayed correct (they live
+    // on the node itself, not the cache), but nothing could ever short-circuit on
+    // them, forcing an exhaustive re-scan of already-resolved subtrees on every
+    // tick. This was directly observed on testnet as `good`/write_count climbing
+    // into the millions for a single ledger's state tree that should hold far
+    // fewer entries, with `have_state` never converging.
+    //
+    // Still isolated PER WORKER (not the process-wide `shared_full_below`): two
+    // concurrent workers acquiring different ledgers must not share full-below
+    // marks, since a mark set by worker A for a subtree it fully downloaded does
+    // not mean worker B (acquiring a different target ledger, potentially with an
+    // overlapping state tree) has that subtree in ITS OWN NuDB-backed reads yet —
+    // see MAX_CONCURRENT_ACQUISITIONS. This preserves that isolation while fixing
+    // the per-tick churn.
+    let worker_full_below = shamap::family::FullBelowCacheImpl::new(
+        (*shared_full_below).generation().wrapping_add(1),
+        basics::tagged_cache::MonotonicClock::default(),
+        basics::hardened_hash::HardenedHashBuilder::default(),
+        524_288, // rippled kFullBelowTargetSize — must be large enough to hold marks
+                 // for the full state tree without eviction during a single acquisition
+    );
+
     loop {
         let msgs = {
             let mut queue = shared_queue.lock().expect("acq queue");
@@ -941,12 +982,12 @@ fn run_acquisition_worker(
         // Matches rippled: each InboundLedger's getMissingNodes traversal
         // operates independently; the shared fullBelowCache is only valid
         // AFTER nodes are confirmed in NuDB.
-        let worker_full_below = shamap::family::FullBelowCacheImpl::new(
-            (*shared_full_below).generation().wrapping_add(1),
-            basics::tagged_cache::MonotonicClock::default(),
-            basics::hardened_hash::HardenedHashBuilder::default(),
-            1024,
-        );
+        //
+        // `worker_full_below` is constructed once above the outer loop (see the
+        // comment there) and reused across every tick of this worker's lifetime
+        // — it must NOT be recreated here every tick, or its fast-path skip is
+        // permanently defeated. See the hoisted declaration for the full
+        // explanation of the bug this previously caused.
 
         let family = SHAMapFamily::new(
             shared_tree_cache.clone(),

@@ -2741,6 +2741,13 @@ impl NodeStoreWriter {
         hash: Uint256,
         seq: u32,
     ) {
+        // Dedup gate: skip redundant writes for hashes already stored by this
+        // worker. This is the missing call that the comment below previously
+        // (incorrectly) claimed was already happening "before serialization."
+        if !self.shared_stored.insert(hash) {
+            return;
+        }
+
         self.counters.inc_nodestore_write(obj_type);
         self.pending_writes
             .lock()
@@ -2753,7 +2760,6 @@ impl NodeStoreWriter {
                     hash,
                 },
             );
-        // Dedup already checked by should_store_hash before serialization
         let _ = self.write_tx.send(NodeStoreWriteMsg::Write {
             obj_type,
             data,
