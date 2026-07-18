@@ -736,9 +736,7 @@ fn only_below_loaded_leaf(
             }
 
             let Some(child) = node.get_child(branch) else {
-                return Err(MutationError::Traversal(TraversalError::MissingNode(
-                    node.get_child_hash(branch),
-                )));
+                return Ok(None);
             };
             if next.is_some() {
                 return Ok(None);

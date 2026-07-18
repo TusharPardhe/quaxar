@@ -963,6 +963,13 @@ fn run_acquisition_worker(
                  // for the full state tree without eviction during a single acquisition
     );
 
+    let acquisition_cache = Arc::new(TreeNodeCache::new(
+        "acq-worker",
+        100_000_000,
+        time::Duration::seconds(3600),
+        basics::tagged_cache::MonotonicClock::default(),
+    ));
+
     loop {
         let msgs = {
             let mut queue = shared_queue.lock().expect("acq queue");
@@ -1044,7 +1051,7 @@ fn run_acquisition_worker(
         // explanation of the bug this previously caused.
 
         let family = SHAMapFamily::new(
-            shared_tree_cache.clone(),
+            acquisition_cache.clone(),
             &worker_full_below,
             WorkerNodeFetcher {
                 node_store: ns.clone(),
@@ -1298,13 +1305,7 @@ fn run_acquisition_worker(
             // All nodes are now persisted in NuDB. Clear pending_writes to
             // free RAM. The node_fetcher falls through to NuDB for reads.
             shared_pending_writes.lock().expect("pending writes lock").clear();
-            let tc_size_before_1 = shared_tree_cache.size();
-            shared_tree_cache.clear();
-            let tc_size_after_1 = shared_tree_cache.size();
-            tracing::info!(target: "inbound_ledger", seq,
-                tc_size_before_1, tc_size_after_1,
-                "SHARED LEDGER ACQUIRED: shared_tree_cache real size before/after clear"
-            );
+            tracing::info!(target: "inbound_ledger", acq_cache_size = acquisition_cache.size(), "SHARED LEDGER ACQUIRED: acquisition complete, cache will drop on worker exit");
             // Attach a node_fetcher so reads can resolve nodes from NuDB.
             // Without this, any state/tx map traversal hits MissingNode
             // because the SyncTree only has root+inner nodes in memory but
@@ -1386,11 +1387,8 @@ fn run_acquisition_worker(
             // All nodes are now persisted in NuDB. Clear pending_writes to
             // free RAM. The node_fetcher falls through to NuDB for reads.
             shared_pending_writes.lock().expect("pending writes lock").clear();
-            let tc_size_before_2 = shared_tree_cache.size();
-            shared_tree_cache.clear();
+            tracing::info!(target: "inbound_ledger", acq_cache_size = acquisition_cache.size(), "SHARED LEDGER ACQUIRED: acquisition complete, cache will drop on worker exit");
             // Attach node_fetcher (same as primary path above)
-            let tc_size_after_2 = shared_tree_cache.size();
-            tracing::info!(target: "inbound_ledger", tc_size_before_2, tc_size_after_2, "SHARED LEDGER ACQUIRED (post-loop): shared_tree_cache real size before/after clear");
             {
                 let fetcher_ns = ns.clone();
                 let fetcher_pending = Arc::clone(&shared_pending_writes);
