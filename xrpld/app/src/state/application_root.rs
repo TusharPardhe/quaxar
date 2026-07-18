@@ -4295,6 +4295,14 @@ impl ApplicationRoot {
             seq = validated.header().seq, val_count, quorum,
             "check_accept: validated ledger advanced (synchronous, on validation receipt)"
         );
+
+        // Promote as the closed ledger so the consensus state machine
+        // transitions to proposing and on_closed_ledger's steady-state
+        // sweep can bound the shared tree cache. Without this, the node
+        // validates the acquired ledger but stays at "connected" indefinitely
+        // because the closed-ledger slot never advances past genesis.
+        self.on_closed_ledger(Arc::clone(&validated));
+        self.promote_operating_mode_after_accepted_ledger(&validated);
     }
 
     /// Records the app-visible validated ledger without running heavier
