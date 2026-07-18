@@ -10,6 +10,7 @@ name = "app"
 path = "src/lib.rs"
 
 [dependencies]
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 tracing = "0.1"
 xrpld-metrics = { path = "../metrics" }
 parking_lot = "0.12"

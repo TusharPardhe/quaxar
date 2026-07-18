@@ -3879,7 +3879,38 @@ impl ApplicationRoot {
         // root node as the original via SharedIntrusive refcount. Releasing here
         // frees the full tree (~33GB on testnet) from ALL holders at once since
         // they share the same underlying nodes. Future reads go to NuDB on demand.
-        normalized.release_maps_to_disk();
+        {
+            // Log jemalloc stats before/after release to verify memory is freed
+            #[cfg(not(target_env = "msvc"))]
+            {
+                use tikv_jemalloc_ctl::{epoch, stats};
+                epoch::advance().ok();
+                let before_allocated = stats::allocated::read().unwrap_or(0);
+                let before_resident = stats::resident::read().unwrap_or(0);
+
+                normalized.release_maps_to_disk();
+
+                epoch::advance().ok();
+                let after_allocated = stats::allocated::read().unwrap_or(0);
+                let after_resident = stats::resident::read().unwrap_or(0);
+                let freed_allocated = before_allocated.saturating_sub(after_allocated);
+                let freed_resident = before_resident.saturating_sub(after_resident);
+                tracing::info!(
+                    target: "ledger",
+                    before_allocated_mb = before_allocated / 1024 / 1024,
+                    after_allocated_mb = after_allocated / 1024 / 1024,
+                    freed_allocated_mb = freed_allocated / 1024 / 1024,
+                    before_resident_mb = before_resident / 1024 / 1024,
+                    after_resident_mb = after_resident / 1024 / 1024,
+                    freed_resident_mb = freed_resident / 1024 / 1024,
+                    "on_closed_ledger: jemalloc stats after release_maps_to_disk"
+                );
+            }
+            #[cfg(target_env = "msvc")]
+            {
+                normalized.release_maps_to_disk();
+            }
+        }
         // `SharedLedgerMasterState` (behind `ledger_master_state`) is this
         // node's SINGLE source of truth for "the closed ledger", matching
         // the reference's `LedgerMaster::closedLedger_` (exactly one

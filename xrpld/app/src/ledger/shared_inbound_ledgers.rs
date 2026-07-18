@@ -1291,6 +1291,25 @@ fn run_acquisition_worker(
                 }));
             }
             tracing::info!(target: "inbound_ledger", seq, "SHARED LEDGER ACQUIRED");
+            // Release the in-memory tree nodes BEFORE sending. The nodes are
+            // already in NuDB (written by store_object during acquisition).
+            // Without this, the full tree (~34GB on testnet) transfers to the
+            // receiver and stays in RAM until the process exits.
+            ledger.release_maps_to_disk();
+            {
+                #[cfg(not(target_env = "msvc"))]
+                {
+                    use tikv_jemalloc_ctl::{epoch, stats};
+                    epoch::advance().ok();
+                    let allocated = stats::allocated::read().unwrap_or(0);
+                    let resident = stats::resident::read().unwrap_or(0);
+                    tracing::info!(target: "inbound_ledger", seq,
+                        allocated_mb = allocated / 1024 / 1024,
+                        resident_mb = resident / 1024 / 1024,
+                        "SHARED LEDGER ACQUIRED: jemalloc stats after release"
+                    );
+                }
+            }
             let _ = store_tx.send(Arc::new(ledger));
             return;
         }
@@ -1347,6 +1366,21 @@ fn run_acquisition_worker(
                 }));
             }
             tracing::info!(target: "inbound_ledger", seq, "SHARED LEDGER ACQUIRED");
+            ledger.release_maps_to_disk();
+            {
+                #[cfg(not(target_env = "msvc"))]
+                {
+                    use tikv_jemalloc_ctl::{epoch, stats};
+                    epoch::advance().ok();
+                    let allocated = stats::allocated::read().unwrap_or(0);
+                    let resident = stats::resident::read().unwrap_or(0);
+                    tracing::info!(target: "inbound_ledger", seq,
+                        allocated_mb = allocated / 1024 / 1024,
+                        resident_mb = resident / 1024 / 1024,
+                        "SHARED LEDGER ACQUIRED (post-loop): jemalloc stats after release"
+                    );
+                }
+            }
             let _ = store_tx.send(Arc::new(ledger));
         }
     }
