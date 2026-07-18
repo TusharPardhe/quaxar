@@ -1076,6 +1076,24 @@ impl Ledger {
         &mut self.tx_map
     }
 
+    /// Release all in-memory tree nodes from both state and transaction maps.
+    ///
+    /// Takes `&self` — operates via interior mutability (per-branch spinlocks
+    /// on SHAMapTreeNode). This means it works on `Arc<Ledger>` directly,
+    /// so ALL holders of this ledger (closed/validated/published slots, history
+    /// cache, consensus state) automatically see the released tree without any
+    /// slot-swapping or cloning.
+    ///
+    /// After this call, all SHAMap reads go through the `node_fetcher` to NuDB
+    /// on demand. The tree's identity (root hash, branch topology) is preserved.
+    ///
+    /// Call AFTER the ledger's nodes are confirmed durable in NuDB (either via
+    /// the acquisition worker's store_object path, or persist_dirty_nodes_to_store).
+    pub fn release_maps_to_disk(&self) {
+        self.state_map.release_to_disk();
+        self.tx_map.release_to_disk();
+    }
+
     pub fn needed_tx_hashes_with_family<CLOCK, S, C, F, MR, NS>(
         &mut self,
         max: i32,

@@ -3850,8 +3850,36 @@ impl ApplicationRoot {
     }
 
     pub fn on_closed_ledger(&self, ledger: Arc<Ledger>) {
+        // Diagnostic: check incoming tree state before clone
+        {
+            let mut loaded = 0u32;
+            let mut non_empty = 0u32;
+            for branch in 0..16 {
+                if !ledger.state_map().root().is_empty_branch(branch) {
+                    non_empty += 1;
+                    if ledger.state_map().root().get_child(branch).is_some() {
+                        loaded += 1;
+                    }
+                }
+            }
+            tracing::info!(
+                target: "ledger",
+                seq = ledger.header().seq,
+                non_empty, loaded,
+                backed = ledger.state_map().backed(),
+                "on_closed_ledger: INCOMING tree state (before clone)"
+            );
+        }
+
         let normalized = self.ledger_with_node_fetcher(ledger);
         self.ledger_master_state.note_closed_ledger(Arc::clone(&normalized));
+
+        // Release in-memory tree nodes IMMEDIATELY after promotion.
+        // The normalized ledger (clone with fetcher attached) shares the same
+        // root node as the original via SharedIntrusive refcount. Releasing here
+        // frees the full tree (~33GB on testnet) from ALL holders at once since
+        // they share the same underlying nodes. Future reads go to NuDB on demand.
+        normalized.release_maps_to_disk();
         // `SharedLedgerMasterState` (behind `ledger_master_state`) is this
         // node's SINGLE source of truth for "the closed ledger", matching
         // the reference's `LedgerMaster::closedLedger_` (exactly one
@@ -3873,6 +3901,9 @@ impl ApplicationRoot {
             // -- that would resurrect the second tracker as a write target
             // that nothing needs to read from anymore.
             runtime.ledger_master().ledger_history().insert(Arc::clone(&normalized), false);
+            // Sweep stale entries to bound RAM — without this, every closed
+            // ledger accumulates indefinitely in the cache (~240KB each).
+            runtime.ledger_master().ledger_history().sweep();
             // Matches rippled's Validations::onLedger: pre-populate the
             // validations adaptor's local cache so `updateTrie` →
             // `acquire` doesn't need the slower ledger_history fallback.
@@ -4213,6 +4244,18 @@ impl ApplicationRoot {
         lm.mark_ledger_complete(validated.header().seq);
         self.note_validated_ledger_for_sync(Arc::clone(&validated));
         self.set_need_network_ledger(false);
+
+        // Release in-memory tree nodes on the ORIGINAL ledger (the one held in
+        // the closed_ledger slot and potentially in ledger_history/validations
+        // caches). Since release_maps_to_disk takes &self, it operates in-place
+        // via interior mutability on ALL Arc<Ledger> holders simultaneously —
+        // no slot-swapping or cloning needed. After this, the ~33GB+ state tree
+        // is freed; future reads fetch from NuDB on demand.
+        ledger.release_maps_to_disk();
+        // Also release on the validated clone (which shares no nodes with the
+        // original since it was cloned before release).
+        validated.release_maps_to_disk();
+
         tracing::info!(
             target: "consensus",
             seq = validated.header().seq, val_count, quorum,
