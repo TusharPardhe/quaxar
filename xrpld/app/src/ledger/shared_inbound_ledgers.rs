@@ -306,6 +306,37 @@ impl SharedInboundLedgers {
 
         let mut inner = self.inner.lock().expect("shared_inbound lock");
 
+        // Cold start gate: only ONE acquisition at a time until the first
+        // ledger completes. Without this, consensus proposals trigger dozens
+        // of concurrent workers for different ledger hashes, each downloading
+        // the near-identical full state tree independently (~8GB each, 13+
+        // concurrent = 34 GB+ RAM). After the first completion, normal
+        // concurrency limits apply for history backfill.
+        let has_any_complete = inner
+            .entries
+            .values()
+            .any(|e| matches!(e.state, EntryState::Complete));
+        if !has_any_complete {
+            let has_any_in_progress = inner
+                .entries
+                .values()
+                .any(|e| e.state == EntryState::InProgress);
+            if has_any_in_progress {
+                // Already have a worker running — just send it peers and return.
+                if let Some(overlay_rt) = {
+                    let guard = self.overlay_rt.read().expect("overlay_rt read");
+                    guard.as_ref().map(|rt| rt.clone())
+                } {
+                    use overlay::Overlay as _;
+                    let peers = overlay_rt.overlay().active_peers();
+                    if !peers.is_empty() {
+                        self.send_peers_locked(&inner, &peers);
+                    }
+                }
+                return;
+            }
+        }
+
         // Check recent failures
         if let Some(failed_at) = inner.recent_failures.get(&hash) {
             if failed_at.elapsed() < REACQUIRE_INTERVAL {
@@ -339,6 +370,25 @@ impl SharedInboundLedgers {
             .filter(|e| e.state == EntryState::InProgress)
             .count();
         if in_progress_count >= MAX_CONCURRENT_ACQUISITIONS {
+            // During cold start (no ledger completed yet), BLOCK entirely
+            // instead of evicting. Evict-and-replace causes 13+ concurrent
+            // workers each holding multi-GB trees (observed: 34 GB total from
+            // 13 concurrent workers each with 7.5M inner nodes). A cold node
+            // must finish ONE full state-tree acquisition before starting more.
+            let has_any_complete = inner
+                .entries
+                .values()
+                .any(|e| matches!(e.state, EntryState::Complete));
+            if !has_any_complete {
+                // Cold start: don't evict, just refuse. The existing worker
+                // will complete eventually and free its resources.
+                tracing::trace!(target: "inbound_ledger",
+                    in_progress_count, hash = %hash, seq,
+                    "acquire() blocked during cold start (waiting for first completion)"
+                );
+                return;
+            }
+
             let lowest_seq_hash = inner
                 .entries
                 .iter()
@@ -501,6 +551,10 @@ impl SharedInboundLedgers {
     /// Send current peers to all active acquisition workers.
     pub fn send_peers(&self, peers: &[Arc<dyn Peer>]) {
         let inner = self.inner.lock().expect("shared_inbound lock");
+        self.send_peers_locked(&inner, peers);
+    }
+
+    fn send_peers_locked(&self, inner: &Inner, peers: &[Arc<dyn Peer>]) {
         for entry in inner.entries.values() {
             if entry.state == EntryState::InProgress {
                 let _ = entry.tx.send(AcqMsg::Peers(peers.to_vec()));
