@@ -1298,7 +1298,13 @@ fn run_acquisition_worker(
             // All nodes are now persisted in NuDB. Clear pending_writes to
             // free RAM. The node_fetcher falls through to NuDB for reads.
             shared_pending_writes.lock().expect("pending writes lock").clear();
+            let tc_size_before_1 = shared_tree_cache.size();
             shared_tree_cache.clear();
+            let tc_size_after_1 = shared_tree_cache.size();
+            tracing::info!(target: "inbound_ledger", seq,
+                tc_size_before_1, tc_size_after_1,
+                "SHARED LEDGER ACQUIRED: shared_tree_cache real size before/after clear"
+            );
             // Attach a node_fetcher so reads can resolve nodes from NuDB.
             // Without this, any state/tx map traversal hits MissingNode
             // because the SyncTree only has root+inner nodes in memory but
@@ -1380,8 +1386,11 @@ fn run_acquisition_worker(
             // All nodes are now persisted in NuDB. Clear pending_writes to
             // free RAM. The node_fetcher falls through to NuDB for reads.
             shared_pending_writes.lock().expect("pending writes lock").clear();
+            let tc_size_before_2 = shared_tree_cache.size();
             shared_tree_cache.clear();
             // Attach node_fetcher (same as primary path above)
+            let tc_size_after_2 = shared_tree_cache.size();
+            tracing::info!(target: "inbound_ledger", tc_size_before_2, tc_size_after_2, "SHARED LEDGER ACQUIRED (post-loop): shared_tree_cache real size before/after clear");
             {
                 let fetcher_ns = ns.clone();
                 let fetcher_pending = Arc::clone(&shared_pending_writes);
