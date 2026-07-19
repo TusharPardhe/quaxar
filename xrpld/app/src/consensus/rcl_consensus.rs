@@ -277,6 +277,21 @@ impl RclConsensusRelay for AppRclConsensusRelay {
 /// Bridges Phase 3's generic `Consensus<Adaptor>` state machine to real
 /// `Ledger`/`SHAMap`/`ValidatorList` types. Matches the reference's
 /// `RCLConsensus::Adaptor`.
+/// Work captured by `on_accept` that must execute synchronously while the
+/// consensus state mutex is still held, matching rippled's single-threaded
+/// `doAccept → endConsensus → beginConsensus` call chain. Stored in the
+/// adaptor's `pending_accept` field and drained by `AppConsensus::timer_tick`
+/// immediately after `timer_entry` returns (before releasing the mutex).
+pub(crate) struct PendingAcceptWork {
+    pub closed_seq: u32,
+    pub close_time: u32,
+    pub close_resolution: u8,
+    pub correct_close_time: bool,
+    pub base_fee_drops: u64,
+    pub txns: Vec<Arc<protocol::STTx>>,
+    pub validation: Option<crate::state::application_root::PendingValidation>,
+}
+
 pub struct AppRclConsensusAdaptor {
     options: AppRclConsensusOptions,
     time_keeper: Arc<TimeKeeper<SystemTimeKeeperClock>>,
@@ -336,6 +351,12 @@ pub struct AppRclConsensusAdaptor {
     /// built through different paths, since `RclTxSet::compare` fetches
     /// through this cache on cache misses.
     tx_set_cache: consensus::rcl::RclTxSetSharedCache,
+    /// Accept-work captured by `on_accept` for synchronous execution in
+    /// `timer_tick` while the consensus mutex is still held. This is the
+    /// key mechanism that eliminates the thread-scheduling gap between
+    /// `on_accept` and `start_next_round`, matching rippled's single-threaded
+    /// `doAccept → endConsensus → beginConsensus` flow.
+    pub(crate) pending_accept: StdMutex<Option<PendingAcceptWork>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -385,6 +406,7 @@ impl AppRclConsensusAdaptor {
             overlay,
             parms: ConsensusParms::default(),
             tx_set_cache,
+            pending_accept: StdMutex::new(None),
         }
     }
 
@@ -755,11 +777,25 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             );
         }
 
-        let ledger_acceptor = Arc::clone(&self.ledger_acceptor);
-        let journal = Arc::clone(&self.journal);
-        if let Err(err) = ledger_acceptor.accept_ledger(closed_seq, close_time, close_resolution_secs, close_time_correct, base_fee, txns, pending_validation) {
-            journal.error(&format!("on_accept: accept_ledger failed: {err}"));
+        // Store the accept work for synchronous execution in timer_tick,
+        // while the consensus state mutex is still held. This eliminates
+        // the thread-scheduling gap between on_accept and start_next_round
+        // that caused proposals to be missed during the Accepted→Open
+        // transition. Matches rippled's single-threaded doAccept →
+        // endConsensus → beginConsensus flow.
+        {
+            let mut pending = self.pending_accept.lock().expect("pending_accept mutex must not be poisoned");
+            *pending = Some(PendingAcceptWork {
+                closed_seq,
+                close_time,
+                close_resolution: close_resolution_secs,
+                correct_close_time: close_time_correct,
+                base_fee_drops: base_fee,
+                txns,
+                validation: pending_validation,
+            });
         }
+        tracing::debug!(target: "consensus", closed_seq, "on_accept: stored pending accept work for synchronous execution");
     }
 
     fn propose(&self, pos: &consensus::ConsensusProposal<PublicKey, Uint256, Uint256>) {
@@ -847,6 +883,198 @@ impl AppConsensus {
     pub fn new(adaptor: AppRclConsensusAdaptor, _parms: ConsensusParms) -> Self {
         Self { adaptor, state: StdMutex::new(Consensus::new()) }
     }
+
+    /// Execute the accept-ledger work and start the next consensus round
+    /// synchronously, while the consensus state mutex is still held. This
+    /// matches rippled's single-threaded flow:
+    ///   doAccept (build ledger) → endConsensus (checkLastClosedLedger) →
+    ///   beginConsensus (start_round)
+    /// all happening atomically before any proposal can be processed.
+    fn execute_accept_and_start_next_round(
+        &self,
+        state: &mut Consensus<AppRclConsensusAdaptor>,
+        now: NetClockTimePoint,
+        work: PendingAcceptWork,
+    ) {
+        let closed_seq = work.closed_seq;
+
+        // Phase 1: Build the accepted ledger (matches doAccept → buildLCL).
+        // This is the heavy work: apply transactions, build SHAMap, persist
+        // to NuDB. It runs synchronously here (blocking the consensus
+        // timer), matching rippled where the JtAccept job blocks its own
+        // strand for the same duration.
+        let root = self.adaptor.app_root.clone();
+        match root.accept_ledger_with_txns(
+            work.closed_seq,
+            work.close_time,
+            work.close_resolution,
+            work.correct_close_time,
+            work.base_fee_drops,
+            work.txns,
+        ) {
+            Ok(_) => {
+                // Phase 2: Broadcast StatusChange (neACCEPTED_LEDGER) and
+                // sign/publish validation. Matches doAccept tail.
+                if let Some(closed) = root.closed_ledger() {
+                    let hdr = closed.header();
+                    if let Some(overlay_rt) = root.overlay_runtime() {
+                        use overlay::Overlay;
+                        let status = overlay::ProtocolMessage::new(overlay::ProtocolPayload::StatusChange(overlay::message::wire::TmStatusChange {
+                            new_status: None,
+                            new_event: Some(2), // neACCEPTED_LEDGER
+                            ledger_seq: Some(hdr.seq),
+                            ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
+                            ledger_hash_previous: Some(hdr.parent_hash.as_uint256().data().to_vec()),
+                            network_time: None,
+                            first_seq: Some(0),
+                            last_seq: Some(0),
+                        }));
+                        overlay_rt.overlay().broadcast(&status);
+                    }
+
+                    if let Some(pending) = work.validation {
+                        let ledger_hash = *hdr.hash.as_uint256();
+                        match protocol::STValidation::new_signed(work.close_time.max(1), &pending.public_key, pending.node_id, &pending.secret_key, |v| {
+                            v.set_field_h256(protocol::get_field_by_symbol("sfLedgerHash"), ledger_hash);
+                            v.set_field_h256(protocol::get_field_by_symbol("sfConsensusHash"), pending.consensus_hash);
+                            v.set_field_u32(protocol::get_field_by_symbol("sfLedgerSequence"), closed_seq);
+                            if pending.proposing {
+                                v.set_flag(protocol::VF_FULL_VALIDATION);
+                            }
+                        }) {
+                            Ok(built_validation) => {
+                                self.adaptor.ledger_acceptor.publish_validation(Arc::new(built_validation));
+                            }
+                            Err(err) => {
+                                tracing::error!(target: "consensus", closed_seq, ?err, "synchronous accept: validation signing failed");
+                            }
+                        }
+                    }
+                }
+
+                // Phase 3: checkLastClosedLedger → beginConsensus (matches
+                // endConsensus). Determine if peers prefer a different
+                // closed ledger, then start the next round on the consensus
+                // state machine INLINE (the mutex is still held, so no
+                // proposal can slip in between acceptance and round start).
+                let closed = root.closed_ledger();
+                if let Some(closed) = closed {
+                    let closed_id = *closed.header().hash.as_uint256();
+                    let network_closed = if let Some(ort) = root.overlay_runtime() {
+                        use overlay::Overlay;
+                        let peers = ort.overlay().active_peers();
+                        if peers.len() >= 3 {
+                            let mut counts = std::collections::HashMap::<Uint256, u32>::new();
+                            *counts.entry(closed_id).or_insert(0) += 1;
+                            for peer in &peers {
+                                let h = peer.closed_ledger_hash();
+                                if !h.is_zero() {
+                                    *counts.entry(h).or_insert(0) += 1;
+                                }
+                            }
+                            let preferred = counts.iter()
+                                .max_by_key(|(_, c)| *c)
+                                .map(|(h, _)| *h)
+                                .unwrap_or(closed_id);
+                            if preferred != closed_id
+                                && preferred != *closed.header().parent_hash.as_uint256()
+                            {
+                                preferred
+                            } else {
+                                closed_id
+                            }
+                        } else {
+                            closed_id
+                        }
+                    } else {
+                        closed_id
+                    };
+
+                    let round_ledger = if network_closed != closed_id {
+                        tracing::info!(
+                            target: "consensus",
+                            %closed_id, %network_closed,
+                            "synchronous accept: checkLastClosedLedger: peers prefer different chain"
+                        );
+                        if let Some(lm_rt) = root.ledger_master_runtime() {
+                            if let Some(network_ledger) = lm_rt.ledger_master().get_ledger_by_hash(
+                                basics::sha_map_hash::SHAMapHash::new(network_closed)
+                            ) {
+                                tracing::info!(
+                                    target: "consensus",
+                                    seq = network_ledger.header().seq,
+                                    "synchronous accept: switching to network chain"
+                                );
+                                root.on_closed_ledger(Arc::clone(&network_ledger));
+                                Some(network_ledger)
+                            } else {
+                                // Ledger not locally available — acquire from peers.
+                                // Do NOT start next round on wrong ledger.
+                                if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
+                                    if let Some(shared) = guard.as_ref() {
+                                        shared.acquire(network_closed, 0);
+                                        tracing::info!(
+                                            target: "consensus",
+                                            %network_closed,
+                                            "synchronous accept: acquiring network ledger, suppressing round start"
+                                        );
+                                    }
+                                }
+                                let _ = root.set_network_ops_operating_mode(
+                                    crate::network::network_ops::NetworkOpsOperatingMode::Connected
+                                );
+                                root.set_need_network_ledger(true);
+                                None // Suppress round start
+                            }
+                        } else {
+                            Some(Arc::clone(&closed))
+                        }
+                    } else {
+                        Some(Arc::clone(&closed))
+                    };
+
+                    // beginConsensus: start the next round INLINE on the
+                    // already-held consensus state. No mutex re-acquisition
+                    // needed — we have &mut state from the caller.
+                    if let Some(round_ledger) = round_ledger {
+                        let proposing = self.adaptor.is_validator()
+                            && !self.adaptor.options.standalone
+                            && self.adaptor.network_ops_mode_owner.operating_mode()
+                                == crate::network::network_ops::NetworkOpsOperatingMode::Full;
+                        let prev_id = *round_ledger.header().hash.as_uint256();
+                        let prev_cx = crate::consensus_ledger_from_ledger(&round_ledger);
+
+                        if self.adaptor.validators.count() > 0 && self.adaptor.validators.unl_size() == 0 {
+                            self.adaptor.network_ops_mode_owner.set_unl_blocked(true);
+                        } else {
+                            self.adaptor.network_ops_mode_owner.set_unl_blocked(false);
+                        }
+
+                        state.start_round(
+                            &self.adaptor,
+                            now,
+                            prev_id,
+                            prev_cx,
+                            &HashSet::default(),
+                            proposing,
+                        );
+                        tracing::info!(
+                            target: "consensus",
+                            closed_seq,
+                            next_prev_ledger = %prev_id,
+                            "synchronous accept: started next round inline (no scheduling gap)"
+                        );
+                    }
+                } else {
+                    // No closed ledger available — wake bootstrap loop
+                    root.notify_tx_pending();
+                }
+            }
+            Err(err) => {
+                tracing::error!(target: "consensus", closed_seq, %err, "synchronous accept: accept_ledger_with_txns failed");
+            }
+        }
+    }
 }
 
 impl ConsensusRunner for AppConsensus {
@@ -896,6 +1124,23 @@ impl ConsensusRunner for AppConsensus {
         Box::pin(async move {
             let mut state = self.state.lock().expect("consensus state mutex must not be poisoned");
             state.timer_entry(&self.adaptor, now);
+
+            // Drain pending accept work synchronously while the consensus
+            // mutex is still held. This is the critical parity fix: in
+            // rippled, doAccept → endConsensus → beginConsensus all execute
+            // atomically on the same strand, so no proposal can arrive
+            // between round acceptance and next round start. Previously,
+            // accept was dispatched to a job queue thread, creating a
+            // 1-100ms gap where proposals were dropped (consensus saw
+            // Accepted phase). Now the full sequence runs inline.
+            let pending = {
+                self.adaptor.pending_accept.lock()
+                    .expect("pending_accept mutex must not be poisoned")
+                    .take()
+            };
+            if let Some(work) = pending {
+                self.execute_accept_and_start_next_round(&mut state, now, work);
+            }
         })
     }
 
