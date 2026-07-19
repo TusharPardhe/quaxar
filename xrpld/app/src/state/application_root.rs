@@ -4292,6 +4292,12 @@ impl ApplicationRoot {
         };
 
         if let Some(ledger) = ledger {
+            let val_count = self.validations().num_trusted_for_ledger(*ledger.header().hash.as_uint256());
+            let quorum = self.validators().quorum();
+            tracing::info!(target: "consensus",
+                seq = ledger.header().seq, val_count, quorum,
+                "check_accept_hash_seq: ledger found in history, checking quorum"
+            );
             self.check_accept_ledger(ledger);
         }
     }
@@ -4327,6 +4333,11 @@ impl ApplicationRoot {
             if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
                 if let Some(shared) = guard.as_ref() {
                     shared.mark_has_validated_ledger();
+                    // Remove this ledger's entry immediately so the slot is
+                    // freed for the next acquisition. Without this, completed
+                    // entries linger for SWEEP_INTERVAL (5s), blocking new
+                    // hashes from being tracked during that window.
+                    shared.remove(ledger.header().hash.as_uint256());
                 }
             }
         }
