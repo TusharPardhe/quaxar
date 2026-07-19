@@ -1390,6 +1390,71 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         // available for get_set lookups in the itype=3 handler.
         dispatch_get_ledger_requests(root, &overlay_rt);
 
+        // storeLedger: drain completed InboundLedger results into LedgerHistory
+        // and forward to the consensus event loop for checkAccept promotion.
+        // This MUST run unconditionally on every iteration (not gated behind
+        // consensus_started) — otherwise there is a deadlock: consensus_started
+        // requires closed_ledger.seq > 1, but closed_ledger only advances when
+        // this drain processes the acquired ledger and fires LedgerDone →
+        // check_accept → on_closed_ledger.
+        if let Some(lm_rt) = root.ledger_master_runtime() {
+            let rx_guard = lm_rt
+                .completed_ledgers_rx
+                .lock()
+                .expect("completed_ledgers_rx");
+            if let Some(rx) = rx_guard.as_ref() {
+                while let Ok(ledger) = rx.try_recv() {
+                    tracing::info!(
+                        target: "consensus",
+                        seq = ledger.header().seq,
+                        hash = %ledger.header().hash,
+                        "storeLedger: received completed ledger from completed_ledgers_rx"
+                    );
+                    let inserted = lm_rt
+                        .ledger_master()
+                        .ledger_history()
+                        .insert(std::sync::Arc::clone(&ledger), true);
+                    if !inserted {
+                        tracing::warn!(
+                            target: "consensus",
+                            seq = ledger.header().seq,
+                            hash = %ledger.header().hash,
+                            immutable = ledger.is_immutable(),
+                            "Rejected completed ledger insert from completed_ledgers_rx"
+                        );
+                    }
+                    let _ = event_tx.send(
+                        crate::consensus::driver::ConsensusEvent::LedgerDone(
+                            std::sync::Arc::clone(&ledger),
+                        ),
+                    );
+                }
+            }
+        }
+        while let Ok(ledger) = shared_completed_rx.try_recv() {
+            if let Some(lm_rt) = root.ledger_master_runtime() {
+                let lm = lm_rt.ledger_master();
+                let inserted = lm
+                    .ledger_history()
+                    .insert(std::sync::Arc::clone(&ledger), true);
+                if !inserted {
+                    tracing::debug!(
+                        target: "consensus",
+                        seq = ledger.header().seq,
+                        hash = %ledger.header().hash,
+                        "Ledger already in history (shared_completed_rx dedup)"
+                    );
+                }
+                let ledger_seq = ledger.header().seq;
+                if ledger_seq > 0 {
+                    lm.mark_ledger_complete(ledger_seq);
+                }
+            }
+            let _ = event_tx.send(
+                crate::consensus::driver::ConsensusEvent::LedgerDone(ledger),
+            );
+        }
+
         // Broadcast our closed ledger to peers via StatusChange so they
         // can detect whether we're at genesis or ahead. This replaces the
         // overlay timer StatusChange that doesn't run in --start mode.
@@ -1765,62 +1830,6 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             }
         }
         maybe_tick_consensus!();
-
-        // storeLedger: drain completed InboundLedger results into LedgerHistory
-        // and forward to the consensus event loop for checkAccept promotion.
-        if let Some(lm_rt) = root.ledger_master_runtime() {
-            let rx_guard = lm_rt
-                .completed_ledgers_rx
-                .lock()
-                .expect("completed_ledgers_rx");
-            if let Some(rx) = rx_guard.as_ref() {
-                while let Ok(ledger) = rx.try_recv() {
-                    let inserted = lm_rt
-                        .ledger_master()
-                        .ledger_history()
-                        .insert(std::sync::Arc::clone(&ledger), true);
-                    if !inserted {
-                        tracing::warn!(
-                            target: "consensus",
-                            seq = ledger.header().seq,
-                            hash = %ledger.header().hash,
-                            immutable = ledger.is_immutable(),
-                            "Rejected completed ledger insert from completed_ledgers_rx"
-                        );
-                    }
-                    let _ = event_tx.send(
-                        crate::consensus::driver::ConsensusEvent::LedgerDone(
-                            std::sync::Arc::clone(&ledger),
-                        ),
-                    );
-                }
-            }
-        }
-        while let Ok(ledger) = shared_completed_rx.try_recv() {
-            if let Some(lm_rt) = root.ledger_master_runtime() {
-                let lm = lm_rt.ledger_master();
-                let inserted = lm
-                    .ledger_history()
-                    .insert(std::sync::Arc::clone(&ledger), true);
-                if !inserted {
-                    tracing::debug!(
-                        target: "consensus",
-                        seq = ledger.header().seq,
-                        hash = %ledger.header().hash,
-                        "Ledger already in history (shared_completed_rx dedup)"
-                    );
-                }
-                // Always mark as complete — whether newly inserted or already
-                // present. The ledger was successfully acquired and verified.
-                let ledger_seq = ledger.header().seq;
-                if ledger_seq > 0 {
-                    lm.mark_ledger_complete(ledger_seq);
-                }
-            }
-            let _ = event_tx.send(
-                crate::consensus::driver::ConsensusEvent::LedgerDone(ledger),
-            );
-        }
 
         // checkAccept + tryAdvance burst catch-up (matching rippled LedgerMaster.cpp):
         // 1. First check if the closed ledger can be promoted to validated.
