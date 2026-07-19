@@ -2144,6 +2144,13 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 .expect("inbound_transactions mutex");
             guard.tick_pending_acquires();
             last_acquire_tick = std::time::Instant::now();
+
+            // Sweep stale SharedInboundLedgers entries so stuck InProgress
+            // workers (targeting ledgers the network has already moved past)
+            // don't permanently block new acquisitions. Without this, the
+            // entries map fills with stale InProgress entries and the node
+            // can never acquire new ledgers after ~20 minutes.
+            shared_inbound.sweep();
         }
 
         // Main loop polls at 50ms for proposal processing and ledger

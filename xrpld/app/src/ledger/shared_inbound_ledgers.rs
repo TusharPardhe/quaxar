@@ -192,7 +192,7 @@ const REACQUIRE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5
 /// Sweep timeout for completed entries (reference 1 minute after last action).
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Timeout for stuck InProgress entries (reference ~180s with no progress).
-const STUCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+const STUCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Maximum number of concurrent in-progress ledger acquisitions. Bounds
 /// resource usage when a node has diverged and is receiving a steady stream
 /// of validations/proposals referencing many distinct unfamiliar ledger
