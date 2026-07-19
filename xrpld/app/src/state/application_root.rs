@@ -1767,20 +1767,32 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                                                 network_ledger
                                             } else {
                                                 // Ledger not in local cache — acquire it from peers
-                                                // (matching rippled NetworkOPs.cpp:1974)
+                                                // (matching rippled NetworkOPs.cpp:1974).
+                                                // Do NOT start the next round on our own (wrong)
+                                                // ledger — that would produce another divergent
+                                                // close and perpetuate the fork. Instead, wait for
+                                                // the acquisition to complete: storeLedger drain →
+                                                // LedgerDone → check_accept → on_closed_ledger →
+                                                // next on_accept finds matching chain → starts round.
                                                 if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
                                                     if let Some(shared) = guard.as_ref() {
                                                         shared.acquire(network_closed, 0);
                                                         tracing::info!(
                                                             target: "consensus",
                                                             %network_closed,
-                                                            "checkLastClosedLedger: acquiring network ledger"
+                                                            "checkLastClosedLedger: acquiring network ledger, suppressing round start"
                                                         );
                                                     }
                                                 }
-                                                // Start round on own ledger for now; next tick
-                                                // will retry once acquisition completes
-                                                Arc::clone(&closed)
+                                                // Downgrade operating mode (matching rippled line 1993)
+                                                let _ = root.set_network_ops_operating_mode(
+                                                    crate::state::application_root::NetworkOpsOperatingMode::Connected
+                                                );
+                                                // Re-enable switchLastClosedLedger in bootstrap
+                                                // so it handles the acquired ledger when it arrives
+                                                root.set_need_network_ledger(true);
+                                                // Return without starting next round
+                                                return;
                                             }
                                         } else {
                                             Arc::clone(&closed)
