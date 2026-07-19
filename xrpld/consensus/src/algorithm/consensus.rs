@@ -415,6 +415,28 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             adaptor.next_ledger_time_resolution(self.previous_ledger.close_time_resolution(), self.previous_ledger.close_agree(), self.previous_ledger.seq() + 1);
 
         self.playback_proposals(adaptor);
+
+        // If the network has already validated a child of this ledger (i.e.,
+        // we're catching up through validated history, not participating in a
+        // live round), skip independent close entirely. Our timing would
+        // diverge (we acquired this ledger seconds after peers closed it, so
+        // our clock-based close_time would be wrong). Let the validation-driven
+        // advancement path (check_accept/tryAdvance in bootstrap) handle
+        // promotion of the already-validated next ledger instead.
+        // This matches rippled's behavior where a node catching up via
+        // switchLastClosedLedger rapidly advances through validated history
+        // without independently closing each intermediate ledger.
+        if mode == ConsensusMode::SwitchedLedger {
+            let finished = adaptor.proposers_finished(&self.previous_ledger, &self.prev_ledger_id);
+            if finished > 0 {
+                self.phase = ConsensusPhase::Accepted;
+                self.prev_proposers = self.curr_peer_positions.len();
+                self.prev_round_time = std::time::Duration::from_millis(100);
+                adaptor.on_mode_change(mode, ConsensusMode::SwitchedLedger);
+                return;
+            }
+        }
+
         if self.curr_peer_positions.len() > (self.prev_proposers / 2) {
             // We may be falling behind; don't wait for the timer, consider
             // closing the ledger immediately.
@@ -658,7 +680,20 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         debug_assert!(self.result.is_none(), "Consensus::close_ledger: result must not already be set");
 
         self.phase = ConsensusPhase::Establish;
-        self.raw_close_times.self_ = self.now;
+        // When recovering from a ledger switch, prefer the peer-reported
+        // close time over our local clock. Our local "now" may be several
+        // seconds past peers' actual close moment due to acquisition delay.
+        // This ensures our close_time matches what peers used, producing
+        // the same ledger hash after effective_close_time rounding.
+        if self.mode.get() == ConsensusMode::SwitchedLedger && !self.raw_close_times.peers.is_empty() {
+            let best_peer_time = self.raw_close_times.peers.iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(time, _)| *time)
+                .unwrap_or(self.now);
+            self.raw_close_times.self_ = best_peer_time;
+        } else {
+            self.raw_close_times.self_ = self.now;
+        }
         self.peer_unchanged_counter = 0;
         self.establish_counter = 0;
 

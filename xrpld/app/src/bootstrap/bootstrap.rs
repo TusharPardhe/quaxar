@@ -1404,7 +1404,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 .expect("completed_ledgers_rx");
             if let Some(rx) = rx_guard.as_ref() {
                 while let Ok(ledger) = rx.try_recv() {
-                    tracing::info!(
+                    tracing::debug!(
                         target: "consensus",
                         seq = ledger.header().seq,
                         hash = %ledger.header().hash,
