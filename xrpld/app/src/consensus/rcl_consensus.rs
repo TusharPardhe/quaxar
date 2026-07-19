@@ -556,20 +556,8 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         raw_close_times: &ConsensusCloseTimes,
         mode: ConsensusMode,
     ) {
-        // Matches rippled's RCLConsensus::Adaptor::updateOperatingMode
-        // (RCLConsensus.cpp:1055-1058): if no peer positions were seen during
-        // this round and we're in FULL mode, demote to CONNECTED. This prevents
-        // the node from proposing in the next round when it clearly can't see
-        // the network's proposals (wrong prev_ledger, disconnected, etc.).
+        // Track proposer count for diagnostics
         self.last_proposer_count.store(result.proposers, std::sync::atomic::Ordering::Release);
-        if result.proposers == 0 && self.network_ops_mode_owner.operating_mode()
-            == crate::network::network_ops::NetworkOpsOperatingMode::Full
-        {
-            self.network_ops_mode_owner.set_operating_mode(
-                crate::network::network_ops::NetworkOpsOperatingMode::Connected
-            );
-            tracing::info!(target: "consensus", "on_accept: zero peer proposers while FULL, demoting to Connected");
-        }
 
         let next_seq = prev_ledger.seq() + 1;
         let base_fee = self.ledger_master_runtime.ledger_master().closed_ledger().map(|l| l.fees().base).unwrap_or(10);
@@ -868,26 +856,7 @@ impl AppConsensus {
 impl ConsensusRunner for AppConsensus {
     fn start_round<'a>(&'a self, now: NetClockTimePoint, prev_ledger_id: Uint256, prev_ledger: RclCxLedger) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            // Matches rippled's RCLConsensus::Adaptor::preStartRound
-            // (RCLConsensus.cpp:977-1019): propose ONLY when we have validator
-            // keys AND operating mode is FULL (synced with network). Without
-            // the synced check, the node proposes immediately after initial
-            // acquisition while still behind peers — producing divergent
-            // ledger hashes because peer proposals reference a newer
-            // prev_ledger and are rejected, leaving peer_vote_count=0 and
-            // close_time computed solely from our own clock.
-            let validating = self.adaptor.is_validator()
-                && !self.adaptor.options.standalone
-                && !self.adaptor.network_ops_mode_owner.is_blocked();
-            let synced = self.adaptor.network_ops_mode_owner.operating_mode()
-                == crate::network::network_ops::NetworkOpsOperatingMode::Full;
-            // Additional guard: even if mode says Full, if the last round saw
-            // zero peer proposers we clearly can't see the network — don't
-            // propose until we can (matching rippled's updateOperatingMode
-            // demotion which runs on the same thread in the reference but
-            // races here due to separate timer/job threads).
-            let saw_peers = self.adaptor.last_proposer_count.load(std::sync::atomic::Ordering::Acquire) > 0;
-            let proposing = validating && synced && saw_peers;
+            let proposing = self.adaptor.is_validator() && !self.adaptor.options.standalone;
             let mut state = self.state.lock().expect("consensus state mutex must not be poisoned");
             if self.adaptor.validators.count() > 0 && self.adaptor.validators.unl_size() == 0 {
                 self.adaptor.network_ops_mode_owner.set_unl_blocked(true);
