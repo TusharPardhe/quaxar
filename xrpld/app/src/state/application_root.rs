@@ -4390,6 +4390,21 @@ impl ApplicationRoot {
             ));
             overlay_rt.overlay().broadcast(&status);
         }
+
+        // Immediately restart the consensus round on the newly validated
+        // ledger. Without this, the current round is stuck in a 15-second
+        // establish timeout (0 peer proposals match because we were behind).
+        // By the time it finishes, peers are 4-5 ledgers ahead again.
+        // Restarting here ensures our NEXT round's prev_ledger matches what
+        // peers are currently proposing on — so their proposals are accepted,
+        // proposers_closed > 0, fast close fires, close_time matches, and we
+        // produce a correct ledger hash independently.
+        // Matches rippled's switchLastClosedLedger → beginConsensus flow.
+        if let Some(nrt) = self.network_ops_runtime.as_ref() {
+            if let Some(crt) = self.consensus_runtime.as_ref() {
+                nrt.start_next_round(crt.as_ref(), Arc::clone(&validated));
+            }
+        }
     }
 
     /// Records the app-visible validated ledger without running heavier
