@@ -1748,10 +1748,40 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                                     };
 
                                     let round_ledger = if network_closed != closed_id {
+                                        tracing::info!(
+                                            target: "consensus",
+                                            %closed_id, %network_closed,
+                                            "checkLastClosedLedger: peers prefer different chain"
+                                        );
                                         if let Some(lm_rt) = root.ledger_master_runtime() {
-                                            lm_rt.ledger_master().get_ledger_by_hash(
+                                            if let Some(network_ledger) = lm_rt.ledger_master().get_ledger_by_hash(
                                                 basics::sha_map_hash::SHAMapHash::new(network_closed)
-                                            ).unwrap_or_else(|| Arc::clone(&closed))
+                                            ) {
+                                                // switchLastClosedLedger: adopt the network's chain
+                                                tracing::info!(
+                                                    target: "consensus",
+                                                    seq = network_ledger.header().seq,
+                                                    "checkLastClosedLedger: switching to network chain"
+                                                );
+                                                root.on_closed_ledger(Arc::clone(&network_ledger));
+                                                network_ledger
+                                            } else {
+                                                // Ledger not in local cache — acquire it from peers
+                                                // (matching rippled NetworkOPs.cpp:1974)
+                                                if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
+                                                    if let Some(shared) = guard.as_ref() {
+                                                        shared.acquire(network_closed, 0);
+                                                        tracing::info!(
+                                                            target: "consensus",
+                                                            %network_closed,
+                                                            "checkLastClosedLedger: acquiring network ledger"
+                                                        );
+                                                    }
+                                                }
+                                                // Start round on own ledger for now; next tick
+                                                // will retry once acquisition completes
+                                                Arc::clone(&closed)
+                                            }
                                         } else {
                                             Arc::clone(&closed)
                                         }
