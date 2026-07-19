@@ -10,9 +10,12 @@ use basics;
 use consensus;
 use ledger::LedgerCleaner;
 use perflog::{PerfLog, PerfLogImp};
-use protocol;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+
+// ---------------------------------------------------------------------------
+// AppNodeStoreRuntime (unchanged)
+// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct AppNodeStoreRuntime {
@@ -64,6 +67,10 @@ impl ManagedComponent for AppNodeStoreRuntime {
         self.node_store.fd_required().max(0) as usize
     }
 }
+
+// ---------------------------------------------------------------------------
+// AppLedgerRuntime (unchanged)
+// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct AppLedgerRuntime {
@@ -148,66 +155,107 @@ impl ManagedComponent for AppLedgerRuntime {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AppConsensusRuntime (rewritten for single-strand model)
+// ---------------------------------------------------------------------------
+
+/// Command sent from external code to the consensus strand thread.
+pub enum ConsensusCommand {
+    StartRound {
+        now: basics::chrono::NetClockTimePoint,
+        prev_ledger_id: basics::base_uint::Uint256,
+        prev_ledger: consensus::RclCxLedger,
+    },
+    Stop,
+}
+
+/// The consensus runtime for the single-strand model. The consensus runner
+/// (`AppConsensus`) lives directly on the strand thread's stack — it is NOT
+/// stored here. This struct only provides:
+/// - External accessors (phase, prev_ledger_id) via atomics/mutex
+/// - A command channel to the strand thread
+/// - The map_complete receiver handoff
+/// - Temporary storage of the runner during construction (before the strand
+///   thread takes ownership)
 #[derive(Clone)]
 pub struct AppConsensusRuntime {
-    network_ops_runtime: Arc<AppNetworkOpsRuntime>,
     started: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
-    runner:
-        Arc<tokio::sync::Mutex<Option<Box<dyn crate::consensus::rcl_consensus::ConsensusRunner>>>>,
-    /// Pending proposals queued by the bootstrap/main loop for processing
-    /// INSIDE timer_tick (before timer_entry runs). This ensures proposals
-    /// are in curr_peer_positions when shouldCloseLedger evaluates.
-    pending_proposals: Arc<std::sync::Mutex<Vec<PendingProposal>>>,
-    /// are acquired from peers. The validation thread consumes this and calls
-    /// got_tx_set on the consensus engine.
+    /// 0=Open, 1=Establish, 2=Accepted — updated by the strand thread
+    phase: Arc<AtomicU8>,
+    /// Updated by the strand thread after each state transition
+    prev_ledger_id: Arc<parking_lot::Mutex<basics::base_uint::Uint256>>,
+    /// Channel to send commands to the strand thread
+    cmd_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<ConsensusCommand>>>>,
+    /// Receiver for map-complete events (tx-set acquisitions)
     map_complete_rx: Arc<
-        std::sync::Mutex<
+        Mutex<
             Option<
                 std::sync::mpsc::Receiver<(
                     basics::base_uint::Uint256,
-                    std::sync::Arc<shamap::sync::SyncTree>,
+                    Arc<shamap::sync::SyncTree>,
                 )>,
             >,
         >,
     >,
-}
-
-/// A proposal queued for processing inside timer_tick.
-pub struct PendingProposal {
-    pub now: basics::chrono::NetClockTimePoint,
-    pub public_key: protocol::PublicKey,
-    pub signature: Vec<u8>,
-    pub suppression_id: basics::base_uint::Uint256,
-    pub proposal: consensus::ConsensusProposal<
-        protocol::PublicKey,
-        basics::base_uint::Uint256,
-        basics::base_uint::Uint256,
-    >,
+    /// Temporary storage for the runner before the strand thread takes it
+    runner_storage: Arc<Mutex<Option<crate::consensus::rcl_consensus::AppConsensus>>>,
 }
 
 impl std::fmt::Debug for AppConsensusRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppConsensusRuntime")
-            .field(
-                "pending_transactions",
-                &self.network_ops_runtime.pending_transaction_count(),
-            )
             .field("started", &self.started.load(Ordering::Acquire))
             .field("stopped", &self.stopped.load(Ordering::Acquire))
+            .field("phase", &self.phase.load(Ordering::Acquire))
             .finish()
     }
 }
 
 impl AppConsensusRuntime {
-    pub fn new(network_ops_runtime: Arc<AppNetworkOpsRuntime>) -> Self {
+    pub fn new() -> Self {
         Self {
-            network_ops_runtime,
             started: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
-            runner: Arc::new(tokio::sync::Mutex::new(None)),
-            pending_proposals: Arc::new(std::sync::Mutex::new(Vec::new())),
-            map_complete_rx: Arc::new(std::sync::Mutex::new(None)),
+            phase: Arc::new(AtomicU8::new(2)), // Accepted initially
+            prev_ledger_id: Arc::new(parking_lot::Mutex::new(basics::base_uint::Uint256::zero())),
+            cmd_tx: Arc::new(Mutex::new(None)),
+            map_complete_rx: Arc::new(Mutex::new(None)),
+            runner_storage: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Store the runner temporarily. The strand thread will take it via `take_runner`.
+    pub fn set_runner(&self, runner: crate::consensus::rcl_consensus::AppConsensus) {
+        *self.runner_storage.lock().expect("runner_storage mutex") = Some(runner);
+    }
+
+    /// Take the runner for the strand thread to own. Called exactly once.
+    pub fn take_runner(&self) -> Option<crate::consensus::rcl_consensus::AppConsensus> {
+        self.runner_storage.lock().expect("runner_storage mutex").take()
+    }
+
+    /// Set the command sender (strand thread provides this after starting).
+    pub fn set_cmd_sender(&self, tx: std::sync::mpsc::Sender<ConsensusCommand>) {
+        *self.cmd_tx.lock().expect("cmd_tx mutex") = Some(tx);
+    }
+
+    /// Send a start-round command to the strand thread.
+    pub fn send_start_round(
+        &self,
+        now: basics::chrono::NetClockTimePoint,
+        prev_ledger_id: basics::base_uint::Uint256,
+        prev_ledger: consensus::RclCxLedger,
+    ) {
+        if let Some(tx) = self.cmd_tx.lock().expect("cmd_tx mutex").as_ref() {
+            let _ = tx.send(ConsensusCommand::StartRound { now, prev_ledger_id, prev_ledger });
+        }
+    }
+
+    /// Send a stop command to the strand thread.
+    pub fn send_stop(&self) {
+        if let Some(tx) = self.cmd_tx.lock().expect("cmd_tx mutex").as_ref() {
+            let _ = tx.send(ConsensusCommand::Stop);
         }
     }
 
@@ -216,160 +264,51 @@ impl AppConsensusRuntime {
         &self,
         rx: std::sync::mpsc::Receiver<(
             basics::base_uint::Uint256,
-            std::sync::Arc<shamap::sync::SyncTree>,
+            Arc<shamap::sync::SyncTree>,
         )>,
     ) {
         *self.map_complete_rx.lock().expect("map_complete_rx mutex") = Some(rx);
     }
 
-    /// Take the map_complete receiver (for the validation thread to own).
+    /// Take the map_complete receiver (for the strand thread to own).
     pub fn take_map_complete_receiver(
         &self,
     ) -> Option<
         std::sync::mpsc::Receiver<(
             basics::base_uint::Uint256,
-            std::sync::Arc<shamap::sync::SyncTree>,
+            Arc<shamap::sync::SyncTree>,
         )>,
     > {
-        self.map_complete_rx
-            .lock()
-            .expect("map_complete_rx mutex")
-            .take()
+        self.map_complete_rx.lock().expect("map_complete_rx mutex").take()
     }
 
-    pub fn set_runner(&self, runner: Box<dyn crate::consensus::rcl_consensus::ConsensusRunner>) {
-        *self
-            .runner
-            .try_lock()
-            .expect("set_runner called during init without contention") = Some(runner);
-    }
-
-    pub async fn timer_tick(&self, now: basics::chrono::NetClockTimePoint, run_timer: bool) {
-        let runner_guard = self.runner.lock().await;
-        if let Some(runner) = runner_guard.as_ref() {
-            // Always drain pending proposals so they reach consensus within 50ms.
-            let proposals: Vec<PendingProposal> = {
-                let mut queue = self.pending_proposals.lock().expect("pending_proposals");
-                std::mem::take(&mut *queue)
-            };
-            if !proposals.is_empty() {
-                tracing::info!(target: "consensus", count = proposals.len(), "timer_tick: draining pending proposals");
-            }
-            for p in proposals {
-                runner
-                    .peer_proposal(
-                        p.now,
-                        p.public_key,
-                        p.signature,
-                        p.suppression_id,
-                        p.proposal,
-                    )
-                    .await;
-            }
-
-            // Only run the state machine on the 1s boundary.
-            if run_timer {
-                runner.timer_tick(now).await;
-
-                // Drain again after timer_tick in case a new round started
-                // (via pending_start_round) and proposals arrived during the tick.
-                let proposals2: Vec<PendingProposal> = {
-                    let mut queue = self.pending_proposals.lock().expect("pending_proposals");
-                    std::mem::take(&mut *queue)
-                };
-                for p in proposals2 {
-                    runner
-                        .peer_proposal(
-                            p.now,
-                            p.public_key,
-                            p.signature,
-                            p.suppression_id,
-                            p.proposal,
-                        )
-                        .await;
-                }
-            }
-        }
-    }
-
-    /// Queue a proposal for processing inside the next timer_tick.
-    /// This is thread-safe and non-blocking.
-    pub fn push_proposal(&self, proposal: PendingProposal) {
-        self.pending_proposals
-            .lock()
-            .expect("pending_proposals")
-            .push(proposal);
-    }
-
-    /// Start a consensus round with the given previous ledger.
-    pub async fn start_round(
-        &self,
-        now: basics::chrono::NetClockTimePoint,
-        prev_ledger_id: basics::base_uint::Uint256,
-        prev_ledger: consensus::RclCxLedger,
-    ) {
-        let runner_guard = self.runner.lock().await;
-        if let Some(runner) = runner_guard.as_ref() {
-            runner.start_round(now, prev_ledger_id, prev_ledger).await;
-        }
-    }
-
-    /// Get blocking access to the runner (for non-async contexts).
-    pub fn runner_blocking(
-        &self,
-    ) -> tokio::sync::MutexGuard<
-        '_,
-        Option<Box<dyn crate::consensus::rcl_consensus::ConsensusRunner>>,
-    > {
-        self.runner.blocking_lock()
-    }
-
-    /// The current round's phase, or `Open` if no runner is attached yet.
-    /// Matches the reference's `Consensus::phase()` accessor used by
-    /// `NetworkOPsImp` to detect phase transitions and to know when a
-    /// round has finished (`Accepted`) and needs restarting.
+    /// The current round's phase, readable from any thread.
     pub fn phase(&self) -> consensus::algorithm::ConsensusPhase {
-        self.runner_blocking().as_ref().map(|runner| runner.phase()).unwrap_or(consensus::algorithm::ConsensusPhase::Open)
+        match self.phase.load(Ordering::Acquire) {
+            0 => consensus::algorithm::ConsensusPhase::Open,
+            1 => consensus::algorithm::ConsensusPhase::Establish,
+            _ => consensus::algorithm::ConsensusPhase::Accepted,
+        }
+    }
+
+    /// Update phase from the strand thread.
+    pub fn update_phase(&self, phase: consensus::algorithm::ConsensusPhase) {
+        let val = match phase {
+            consensus::algorithm::ConsensusPhase::Open => 0,
+            consensus::algorithm::ConsensusPhase::Establish => 1,
+            consensus::algorithm::ConsensusPhase::Accepted => 2,
+        };
+        self.phase.store(val, Ordering::Release);
     }
 
     /// The previous ledger hash the current consensus round is building on.
-    /// Used to avoid redundant start_round calls when the round is already
-    /// on the correct ledger.
     pub fn prev_ledger_id(&self) -> basics::base_uint::Uint256 {
-        self.runner_blocking().as_ref().map(|runner| runner.prev_ledger_id()).unwrap_or_default()
+        *self.prev_ledger_id.lock()
     }
 
-    pub async fn peer_proposal(
-        &self,
-        now: basics::chrono::NetClockTimePoint,
-        public_key: protocol::PublicKey,
-        signature: Vec<u8>,
-        suppression_id: basics::base_uint::Uint256,
-        proposal: consensus::ConsensusProposal<
-            protocol::PublicKey,
-            basics::base_uint::Uint256,
-            basics::base_uint::Uint256,
-        >,
-    ) -> bool {
-        let runner_guard = self.runner.lock().await;
-        if let Some(runner) = runner_guard.as_ref() {
-            runner
-                .peer_proposal(now, public_key, signature, suppression_id, proposal)
-                .await
-        } else {
-            false
-        }
-    }
-
-    pub async fn got_tx_set(
-        &self,
-        now: basics::chrono::NetClockTimePoint,
-        txset: Vec<consensus::RclCxTx>,
-    ) {
-        let runner_guard = self.runner.lock().await;
-        if let Some(runner) = runner_guard.as_ref() {
-            runner.got_tx_set(now, txset).await;
-        }
+    /// Update prev_ledger_id from the strand thread.
+    pub fn update_prev_ledger_id(&self, id: basics::base_uint::Uint256) {
+        *self.prev_ledger_id.lock() = id;
     }
 }
 
@@ -384,8 +323,13 @@ impl ManagedComponent for AppConsensusRuntime {
 
     fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
+        self.send_stop();
     }
 }
+
+// ---------------------------------------------------------------------------
+// AppValidatorSiteRuntime (unchanged)
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default)]
 pub struct AppValidatorSiteRuntime {
@@ -406,6 +350,10 @@ impl ManagedComponent for AppValidatorSiteRuntime {
         self.stopped.store(true, Ordering::Release);
     }
 }
+
+// ---------------------------------------------------------------------------
+// AppPerfLogRuntime (unchanged)
+// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct AppPerfLogRuntime {

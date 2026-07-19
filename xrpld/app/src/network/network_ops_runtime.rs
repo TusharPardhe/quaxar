@@ -10,7 +10,6 @@
 //! separate slice, so this owner only claims the parts that are now backed by
 //! real Rust runtime state instead of detached helpers.
 
-use crate::consensus_ledger_from_ledger;
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::ledger::ledger_master_state::SharedLedgerMasterState;
 use crate::network::network_ops::{
@@ -27,14 +26,12 @@ use crate::network::network_ops::{
     run_networkops_set_current_ledger_state, run_networkops_submit_transaction,
     run_networkops_submit_transaction_gate,
 };
-use crate::runtime::component_runtime::AppConsensusRuntime;
 use crate::state::time_keeper::{SystemTimeKeeperClock, TimeKeeper};
 use crate::tx_queue::transaction::{CurrentLedgerState, SubmitResult, TransStatus, Transaction};
 use crate::tx_queue::transaction_master::{SharedTransaction, TransactionMaster};
 use basics::base_uint::Uint256;
 use basics::sha_map_hash::SHAMapHash;
-use consensus::RclCxTx;
-use ledger::{CanonicalTXSet, Ledger};
+use ledger::CanonicalTXSet;
 use protocol::{
     Rules, STTx, Ter, XRPAmount, get_field_by_symbol, passes_local_checks, tfInnerBatchTxn,
 };
@@ -123,17 +120,6 @@ pub struct AppNetworkOpsRuntime {
     ledger_master_state: Arc<SharedLedgerMasterState>,
     consensus_bootstrap_started: AtomicBool,
     time_keeper: Arc<TimeKeeper<SystemTimeKeeperClock>>,
-    /// Long-lived single-threaded Tokio runtime used exclusively by
-    /// `drain_proposals` to `block_on` `AppConsensusRuntime::timer_tick`.
-    /// Constructed once here instead of per-call: `drain_proposals` runs on
-    /// every iteration of the consensus loop's ~50ms cadence (see
-    /// `bootstrap::run_start_mode_consensus_loop`), and
-    /// `tokio::runtime::Builder::new_current_thread().build()` allocates a
-    /// fresh reactor/executor (real OS-level setup, not a cheap
-    /// allocation) on every call -- rebuilding it ~20 times a second adds
-    /// avoidable latency to the exact loop iteration that must stay
-    /// responsive to incoming peer proposals under load.
-    proposal_drain_runtime: tokio::runtime::Runtime,
 }
 
 impl std::fmt::Debug for AppNetworkOpsRuntime {
@@ -195,10 +181,6 @@ impl AppNetworkOpsRuntime {
             ledger_master_state,
             consensus_bootstrap_started: AtomicBool::new(false),
             time_keeper,
-            proposal_drain_runtime: tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("network ops proposal-drain runtime"),
         }
     }
 
@@ -292,137 +274,6 @@ impl AppNetworkOpsRuntime {
     pub fn reset_consensus_bootstrap(&self) {
         self.consensus_bootstrap_started
             .store(false, Ordering::Release);
-    }
-
-    /// Start a consensus round on `ledger` (its id is used as the new
-    /// round's previous-ledger id). Unlike
-    /// [`NetworkOpsRuntime::maybe_begin_consensus_from_validated`], this is
-    /// NOT gated by the one-shot `consensus_bootstrap_started` flag -- it
-    /// is meant to be called once per round, every time a ledger is
-    /// accepted, matching the reference's `NetworkOPsImp::endConsensus`
-    /// unconditionally calling `beginConsensus` (which in turn calls
-    /// `Consensus::startRound`) after `RCLConsensus::Adaptor::onAccept`
-    /// finishes building the new ledger. Without this repeated call,
-    /// `Consensus::timerEntry` would tick forever on a round already in
-    /// the `Accepted` phase (a no-op, per `timerEntry`'s early return) and
-    /// the chain would permanently stall after its first ledger.
-    pub fn start_next_round(&self, consensus_runtime: &AppConsensusRuntime, ledger: Arc<Ledger>) {
-        let now = self.current_net_time();
-        let prev_id = *ledger.header().hash.as_uint256();
-        let prev_cx = consensus_ledger_from_ledger(&ledger);
-        let runtime = consensus_runtime.clone();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("network ops start-next-round runtime");
-        rt.block_on(async {
-            runtime.start_round(now, prev_id, prev_cx).await;
-        });
-    }
-
-    pub fn maybe_begin_consensus_from_validated(
-        &self,
-        consensus_runtime: &AppConsensusRuntime,
-        ledger: Arc<Ledger>,
-    ) -> bool {
-        if self
-            .consensus_bootstrap_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return false;
-        }
-
-        let now = self.current_net_time();
-        let prev_id = *ledger.header().hash.as_uint256();
-        let prev_cx = consensus_ledger_from_ledger(&ledger);
-        let runtime = consensus_runtime.clone();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("network ops bootstrap consensus runtime");
-        rt.block_on(async {
-            runtime.start_round(now, prev_id, prev_cx).await;
-        });
-        true
-    }
-
-    pub fn handle_map_complete(
-        &self,
-        consensus_runtime: &AppConsensusRuntime,
-        map_hash: Uint256,
-        set: Arc<shamap::sync::SyncTree>,
-    ) {
-        let mut txs = Vec::<RclCxTx>::new();
-        let mut fetch = |_hash: basics::sha_map_hash::SHAMapHash| -> Option<
-            basics::memory::intrusive_pointer::SharedIntrusive<
-                shamap::nodes::tree_node::SHAMapTreeNode,
-            >,
-        > { None };
-        let _ = set.visit_leaves(&mut fetch, &mut |item: &shamap::item::SHAMapItem| {
-            txs.push(RclCxTx { id: item.key() });
-        });
-
-        let now = self.current_net_time();
-        let runtime = consensus_runtime.clone();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("network ops mapComplete runtime");
-        rt.block_on(async {
-            runtime.got_tx_set(now, txs).await;
-        });
-
-        tracing::debug!(target: "network",
-            "[mapComplete] gotTxSet hash={:02x}{:02x}{:02x}{:02x}",
-            map_hash.data()[0],
-            map_hash.data()[1],
-            map_hash.data()[2],
-            map_hash.data()[3],
-        );
-    }
-
-    pub fn handle_peer_proposal(
-        &self,
-        consensus_runtime: &AppConsensusRuntime,
-        public_key: protocol::PublicKey,
-        signature: Vec<u8>,
-        suppression_id: Uint256,
-        proposal: consensus::ConsensusProposal<protocol::PublicKey, Uint256, Uint256>,
-    ) -> bool {
-        let now = self.current_net_time();
-        let runtime = consensus_runtime.clone();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("network ops peer proposal runtime");
-        rt.block_on(async {
-            runtime
-                .peer_proposal(now, public_key, signature, suppression_id, proposal)
-                .await
-        })
-    }
-
-    pub fn handle_consensus_timer(&self, consensus_runtime: &AppConsensusRuntime) {
-        let now = self.current_net_time();
-        let runtime = consensus_runtime.clone();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("network ops consensus timer runtime");
-        rt.block_on(async {
-            runtime.timer_tick(now, true).await;
-        });
-    }
-
-    /// Drain pending proposals without running timer_entry.
-    /// Called on every 50ms bootstrap iteration for low-latency proposal feeding.
-    pub fn drain_proposals(&self, consensus_runtime: &AppConsensusRuntime) {
-        let now = self.current_net_time();
-        let runtime = consensus_runtime.clone();
-        self.proposal_drain_runtime.block_on(async {
-            runtime.timer_tick(now, false).await;
-        });
     }
 
     pub fn check_validity(&self, transaction: &STTx, rules: &Rules) -> CheckValidityResult {

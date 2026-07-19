@@ -1801,7 +1801,10 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                                         Arc::clone(&closed)
                                     };
 
-                                    nrt.start_next_round(crt.as_ref(), round_ledger);
+                                    let now = root.shared_time_keeper().close_time();
+                                    let prev_id = *round_ledger.header().hash.as_uint256();
+                                    let prev_cx = crate::consensus_ledger_from_ledger(&round_ledger);
+                                    crt.send_start_round(now, prev_id, prev_cx);
                                     true
                                 } else {
                                     false
@@ -3040,7 +3043,7 @@ impl ApplicationRoot {
             return Arc::clone(runtime);
         }
 
-        let network_ops_runtime = self.attach_default_network_ops_runtime();
+        let _network_ops_runtime = self.attach_default_network_ops_runtime();
         let ledger_master_runtime = self.attach_default_ledger_master_runtime();
 
         use crate::consensus::rcl_consensus::{
@@ -3048,12 +3051,14 @@ impl ApplicationRoot {
             NullRclConsensusJournal,
         };
 
+        let validator_token_lines: Option<&[String]> = self.config().validator_token.as_deref();
+
         let relay = AppRclConsensusRelay::from_application_root(
             self,
             self.registry.inbound_transactions.clone(),
             crate::validator::validator_keys::ValidatorKeys::from_sources(
                 self.config().validation_seed.as_deref(),
-                None,
+                validator_token_lines,
             ),
             NullRclConsensusJournal,
         );
@@ -3076,7 +3081,7 @@ impl ApplicationRoot {
             NullRclConsensusJournal,
             crate::validator::validator_keys::ValidatorKeys::from_sources(
                 self.config().validation_seed.as_deref(),
-                None,
+                validator_token_lines,
             ),
             None,
             Some(self.amendment_status.clone()),
@@ -3084,11 +3089,11 @@ impl ApplicationRoot {
             self.clone(),
         );
 
-        let runner = Box::new(AppConsensus::new(
+        let runner = AppConsensus::new(
             adaptor,
             consensus::ConsensusParms::default(),
-        ));
-        let runtime = Arc::new(AppConsensusRuntime::new(network_ops_runtime));
+        );
+        let runtime = Arc::new(AppConsensusRuntime::new());
         runtime.set_runner(runner);
 
         // to the consensus thread, which calls got_tx_set (event-driven, not polling).
@@ -4089,6 +4094,10 @@ impl ApplicationRoot {
         self.registry.config.validation_seed = Some(seed);
     }
 
+    pub fn set_validator_token(&mut self, token: Vec<String>) {
+        self.registry.config.validator_token = Some(token);
+    }
+
     pub fn runtime_bindings(&self) -> &RuntimeBindings {
         &self.runtime_bindings
     }
@@ -4393,77 +4402,37 @@ impl ApplicationRoot {
 
         // Advance the consensus round after validating a new ledger.
         //
-        // CRITICAL DESIGN: We must NOT unconditionally call start_next_round
-        // here. Each start_round resets the consensus state machine with
-        // mode=Observing, which requires 2s (ledger_min_close) + 1.95s
-        // (ledger_min_consensus) = 3.95s to complete. Since new validated
-        // ledgers arrive every ~3.5s, unconditional restarts prevent any
-        // round from EVER completing — causing permanent 15s timeouts.
+        // Rippled parity: checkAccept NEVER touches consensus state or calls
+        // startRound/beginConsensus. It ONLY promotes the validated ledger in
+        // LedgerMaster. The consensus state machine is exclusively driven by
+        // the timer thread (via timerEntry → checkLedger → handleWrongLedger).
         //
-        // Instead, we rely on the consensus state machine's own checkLedger
-        // (inside timer_entry, every 1s) to detect that the validation trie
-        // prefers a newer ledger. checkLedger → handleWrongLedger fires with
-        // ConsensusMode::SwitchedLedger, which has the critical fast-path:
-        // if proposers_finished > 0 (someone has already validated past our
-        // new prev_ledger), the round immediately moves to Accepted and
-        // restarts. This allows rapid advancement through validated history
-        // (one ledger per timer tick = 1s) without the 3.95s penalty.
+        // In rippled (LedgerMaster.cpp:946), checkAccept:
+        //   1. Validates quorum
+        //   2. Sets validated ledger (setValidLedger)
+        //   3. Calls tryAdvance() (publishes ledgers)
+        //   4. NEVER calls startRound or beginConsensus
         //
-        // We ONLY call start_next_round here when:
-        // 1. The state machine is stuck in Accepted phase (round completed
-        //    but next round hasn't started yet — bootstrap loop's Accepted
-        //    detection handles this, but for robustness we also trigger here)
-        // 2. The state machine is on a ledger that is MORE than one behind
-        //    the validated one AND not on the parent (which would indicate
-        //    a round actively trying to build the validated ledger). This
-        //    handles the initial bootstrap case where the very first
-        //    check_accept needs to kick-start consensus.
+        // The consensus timer's `checkLedger` (inside timerEntry, every 1s)
+        // detects that the validation trie prefers a newer ledger and triggers
+        // handleWrongLedger → SwitchedLedger mode, which advances the round.
+        // This is the ONLY correct path for consensus advancement.
         //
-        // When the state machine is already on the validated ledger's PARENT
-        // (meaning it's in a round trying to build the validated ledger),
-        // we DON'T restart — let timer_entry's checkLedger handle the
-        // advancement via the SwitchedLedger fast-path on the next tick.
+        // Previously this code called start_next_round here, which raced with
+        // execute_accept's own start_round on the timer thread, causing
+        // double-starts and skipped ledgers.
         if let Some(crt) = self.consensus_runtime.as_ref() {
             let current_phase = crt.phase();
             let current_prev = crt.prev_ledger_id();
             let validated_hash = *validated.header().hash.as_uint256();
-            let parent_hash = *validated.header().parent_hash.as_uint256();
-
-            // Determine if we should restart:
-            // - Phase Accepted: stuck, needs kick
-            // - current_prev == validated_hash: already on the right ledger,
-            //   round is building N+1. NO restart needed.
-            // - current_prev == parent_hash: round is building validated ledger.
-            //   Let checkLedger/handleWrongLedger advance via SwitchedLedger
-            //   on the next timer tick. NO restart.
-            // - Otherwise (current_prev is something older or unrelated):
-            //   restart to jump to the validated ledger.
-            let should_restart =
-                current_phase == consensus::algorithm::ConsensusPhase::Accepted
-                || (current_prev != validated_hash && current_prev != parent_hash);
-
-            if should_restart {
-                if let Some(nrt) = self.network_ops_runtime.as_ref() {
-                    nrt.start_next_round(crt.as_ref(), Arc::clone(&validated));
-                    tracing::info!(
-                        target: "consensus",
-                        seq = validated.header().seq,
-                        %validated_hash,
-                        %current_prev,
-                        ?current_phase,
-                        "check_accept: started new round (state machine behind or stuck)"
-                    );
-                }
-            } else {
-                tracing::debug!(
-                    target: "consensus",
-                    seq = validated.header().seq,
-                    %validated_hash,
-                    %current_prev,
-                    ?current_phase,
-                    "check_accept: skipping start_round — timer_entry/checkLedger will advance via SwitchedLedger"
-                );
-            }
+            tracing::debug!(
+                target: "consensus",
+                seq = validated.header().seq,
+                %validated_hash,
+                %current_prev,
+                ?current_phase,
+                "check_accept: validated ledger promoted (no round restart — timer drives consensus)"
+            );
         }
     }
 
@@ -4498,6 +4467,12 @@ impl ApplicationRoot {
         let close_time_resolution = u32::from(ledger.header().close_time_resolution);
         let current_ledger_fresh = now_close_time
             < last_closed_close_time.saturating_add(close_time_resolution.saturating_mul(2));
+
+        tracing::info!(target: "app",
+            ?current_mode, need_network_ledger, current_ledger_fresh,
+            now_close_time, last_closed_close_time, close_time_resolution,
+            "promote_operating_mode: evaluating"
+        );
 
         let mut next_mode = current_mode;
         if matches!(

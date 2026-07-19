@@ -730,6 +730,7 @@ pub struct AppConfig {
     pub do_import: bool,
     pub validation_quorum: usize,
     pub validation_seed: Option<String>,
+    pub validator_token: Option<Vec<String>>,
 }
 
 impl Default for AppConfig {
@@ -747,6 +748,7 @@ impl Default for AppConfig {
             do_import: false,
             validation_quorum: 1,
             validation_seed: None,
+            validator_token: None,
         }
     }
 }
@@ -1102,6 +1104,7 @@ impl ApplicationRegistryOwners {
                 do_import: false,
                 validation_quorum: 1,
                 validation_seed: None,
+                validator_token: None,
             },
         })
     }

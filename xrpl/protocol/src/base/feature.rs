@@ -57,12 +57,12 @@ impl RegisteredFeature {
 pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     RegisteredFeature::new(
         FEATURE_BATCH_V1_1_NAME,
-        false,
+        true,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new(
         "ConfidentialTransfer",
-        false,
+        true,
         RegisteredFeatureVote::DefaultNo,
     ),
     // release-3.1: cleanup for expired NFT offers, MPToken locked amount,
@@ -76,22 +76,22 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     ),
     RegisteredFeature::new(
         FIX_CLEANUP_3_3_0_NAME,
-        false,
+        true,
         RegisteredFeatureVote::DefaultNo,
     ),
-    RegisteredFeature::new("MPTokensV2", false, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("MPTokensV2", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("fixSecurity3_1_3", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "fixPermissionedDomainInvariant",
-        true,
+        false,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new("fixBatchInnerSigs", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("LendingProtocol", true, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("LendingProtocolV1_1", false, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("LendingProtocolV1_1", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "PermissionDelegationV1_1",
-        false,
+        true,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new("fixDirectoryLimit", true, RegisteredFeatureVote::DefaultNo),
@@ -100,7 +100,7 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
         true,
         RegisteredFeatureVote::DefaultNo,
     ),
-    RegisteredFeature::new("DynamicMPT", false, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("DynamicMPT", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("fixTokenEscrowV1", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "fixPriceOracleOrder",

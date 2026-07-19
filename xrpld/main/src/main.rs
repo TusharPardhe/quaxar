@@ -5545,21 +5545,12 @@ impl<D> BoundServerRuntime<D> {
                                                 tracing::info!(target: "bootstrap", seq = ledger.header().seq, "Accepted as validated ✓");
 
                                                 // Start first consensus round once we have a validated ledger.
-                                                if let (Some(cr), Some(network_ops_runtime)) =
-                                                    (app.consensus_runtime(), app.network_ops_runtime())
-                                                {
-                                                    if network_ops_runtime
-                                                        .maybe_begin_consensus_from_validated(
-                                                            cr.as_ref(),
-                                                            std::sync::Arc::clone(&ledger),
-                                                        )
-                                                    {
-                                                        tracing::info!(target: "consensus", seq = ledger.header().seq, "First round started from validated");
-                                                    } else {
-                                                        // Consensus will pick up the latest
-                                                        // validated ledger via end_consensus's
-                                                        // consensus_previous_ledger() call.
-                                                    }
+                                                if let Some(cr) = app.consensus_runtime() {
+                                                    let now = app.shared_time_keeper().close_time();
+                                                    let prev_id = *ledger.header().hash.as_uint256();
+                                                    let prev_cx = app::consensus_ledger_from_ledger(&ledger);
+                                                    cr.send_start_round(now, prev_id, prev_cx);
+                                                    tracing::info!(target: "consensus", seq = ledger.header().seq, "First round start command sent from validated");
                                                 }
 
                                                 advance_published_ledgers_after_validation(
