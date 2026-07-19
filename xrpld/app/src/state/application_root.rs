@@ -4391,18 +4391,78 @@ impl ApplicationRoot {
             overlay_rt.overlay().broadcast(&status);
         }
 
-        // Immediately restart the consensus round on the newly validated
-        // ledger. Without this, the current round is stuck in a 15-second
-        // establish timeout (0 peer proposals match because we were behind).
-        // By the time it finishes, peers are 4-5 ledgers ahead again.
-        // Restarting here ensures our NEXT round's prev_ledger matches what
-        // peers are currently proposing on — so their proposals are accepted,
-        // proposers_closed > 0, fast close fires, close_time matches, and we
-        // produce a correct ledger hash independently.
-        // Matches rippled's switchLastClosedLedger → beginConsensus flow.
-        if let Some(nrt) = self.network_ops_runtime.as_ref() {
-            if let Some(crt) = self.consensus_runtime.as_ref() {
-                nrt.start_next_round(crt.as_ref(), Arc::clone(&validated));
+        // Advance the consensus round after validating a new ledger.
+        //
+        // CRITICAL DESIGN: We must NOT unconditionally call start_next_round
+        // here. Each start_round resets the consensus state machine with
+        // mode=Observing, which requires 2s (ledger_min_close) + 1.95s
+        // (ledger_min_consensus) = 3.95s to complete. Since new validated
+        // ledgers arrive every ~3.5s, unconditional restarts prevent any
+        // round from EVER completing — causing permanent 15s timeouts.
+        //
+        // Instead, we rely on the consensus state machine's own checkLedger
+        // (inside timer_entry, every 1s) to detect that the validation trie
+        // prefers a newer ledger. checkLedger → handleWrongLedger fires with
+        // ConsensusMode::SwitchedLedger, which has the critical fast-path:
+        // if proposers_finished > 0 (someone has already validated past our
+        // new prev_ledger), the round immediately moves to Accepted and
+        // restarts. This allows rapid advancement through validated history
+        // (one ledger per timer tick = 1s) without the 3.95s penalty.
+        //
+        // We ONLY call start_next_round here when:
+        // 1. The state machine is stuck in Accepted phase (round completed
+        //    but next round hasn't started yet — bootstrap loop's Accepted
+        //    detection handles this, but for robustness we also trigger here)
+        // 2. The state machine is on a ledger that is MORE than one behind
+        //    the validated one AND not on the parent (which would indicate
+        //    a round actively trying to build the validated ledger). This
+        //    handles the initial bootstrap case where the very first
+        //    check_accept needs to kick-start consensus.
+        //
+        // When the state machine is already on the validated ledger's PARENT
+        // (meaning it's in a round trying to build the validated ledger),
+        // we DON'T restart — let timer_entry's checkLedger handle the
+        // advancement via the SwitchedLedger fast-path on the next tick.
+        if let Some(crt) = self.consensus_runtime.as_ref() {
+            let current_phase = crt.phase();
+            let current_prev = crt.prev_ledger_id();
+            let validated_hash = *validated.header().hash.as_uint256();
+            let parent_hash = *validated.header().parent_hash.as_uint256();
+
+            // Determine if we should restart:
+            // - Phase Accepted: stuck, needs kick
+            // - current_prev == validated_hash: already on the right ledger,
+            //   round is building N+1. NO restart needed.
+            // - current_prev == parent_hash: round is building validated ledger.
+            //   Let checkLedger/handleWrongLedger advance via SwitchedLedger
+            //   on the next timer tick. NO restart.
+            // - Otherwise (current_prev is something older or unrelated):
+            //   restart to jump to the validated ledger.
+            let should_restart =
+                current_phase == consensus::algorithm::ConsensusPhase::Accepted
+                || (current_prev != validated_hash && current_prev != parent_hash);
+
+            if should_restart {
+                if let Some(nrt) = self.network_ops_runtime.as_ref() {
+                    nrt.start_next_round(crt.as_ref(), Arc::clone(&validated));
+                    tracing::info!(
+                        target: "consensus",
+                        seq = validated.header().seq,
+                        %validated_hash,
+                        %current_prev,
+                        ?current_phase,
+                        "check_accept: started new round (state machine behind or stuck)"
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    target: "consensus",
+                    seq = validated.header().seq,
+                    %validated_hash,
+                    %current_prev,
+                    ?current_phase,
+                    "check_accept: skipping start_round — timer_entry/checkLedger will advance via SwitchedLedger"
+                );
             }
         }
     }

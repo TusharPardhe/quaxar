@@ -866,6 +866,11 @@ pub trait ConsensusRunner: Send + Sync {
     /// caller to know when a round has finished (`Accepted`) and a new one
     /// needs to be started.
     fn phase(&self) -> consensus::algorithm::ConsensusPhase;
+
+    /// The previous ledger hash the current consensus round is building on.
+    /// Used to avoid redundant start_round calls when the round is already
+    /// on the correct ledger.
+    fn prev_ledger_id(&self) -> Uint256;
 }
 
 /// Concrete [`ConsensusRunner`] wrapping Phase 3's
@@ -1116,7 +1121,23 @@ impl ConsensusRunner for AppConsensus {
                 return false;
             }
             let mut state = self.state.lock().expect("consensus state mutex must not be poisoned");
-            state.peer_proposal(&self.adaptor, now, &peer_pos)
+            let our_prev = *state.prev_ledger_id();
+            let their_prev = *peer_pos.proposal().prev_ledger();
+            let accepted = state.peer_proposal(&self.adaptor, now, &peer_pos);
+            if !accepted && our_prev != their_prev {
+                tracing::info!(target: "consensus",
+                    %our_prev, %their_prev,
+                    phase = ?state.phase(),
+                    "peer_proposal REJECTED: prev_ledger mismatch"
+                );
+            } else if !accepted {
+                tracing::info!(target: "consensus",
+                    %our_prev,
+                    phase = ?state.phase(),
+                    "peer_proposal REJECTED: prev_ledger MATCHES but still rejected (other reason)"
+                );
+            }
+            accepted
         })
     }
 
@@ -1183,6 +1204,10 @@ impl ConsensusRunner for AppConsensus {
 
     fn phase(&self) -> consensus::algorithm::ConsensusPhase {
         self.state.lock().expect("consensus state mutex must not be poisoned").phase()
+    }
+
+    fn prev_ledger_id(&self) -> Uint256 {
+        *self.state.lock().expect("consensus state mutex must not be poisoned").prev_ledger_id()
     }
 }
 

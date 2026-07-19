@@ -332,6 +332,13 @@ impl AppConsensusRuntime {
         self.runner_blocking().as_ref().map(|runner| runner.phase()).unwrap_or(consensus::algorithm::ConsensusPhase::Open)
     }
 
+    /// The previous ledger hash the current consensus round is building on.
+    /// Used to avoid redundant start_round calls when the round is already
+    /// on the correct ledger.
+    pub fn prev_ledger_id(&self) -> basics::base_uint::Uint256 {
+        self.runner_blocking().as_ref().map(|runner| runner.prev_ledger_id()).unwrap_or_default()
+    }
+
     pub async fn peer_proposal(
         &self,
         now: basics::chrono::NetClockTimePoint,

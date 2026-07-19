@@ -416,27 +416,6 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
 
         self.playback_proposals(adaptor);
 
-        // If the network has already validated a child of this ledger (i.e.,
-        // we're catching up through validated history, not participating in a
-        // live round), skip independent close entirely. Our timing would
-        // diverge (we acquired this ledger seconds after peers closed it, so
-        // our clock-based close_time would be wrong). Let the validation-driven
-        // advancement path (check_accept/tryAdvance in bootstrap) handle
-        // promotion of the already-validated next ledger instead.
-        // This matches rippled's behavior where a node catching up via
-        // switchLastClosedLedger rapidly advances through validated history
-        // without independently closing each intermediate ledger.
-        if mode == ConsensusMode::SwitchedLedger {
-            let finished = adaptor.proposers_finished(&self.previous_ledger, &self.prev_ledger_id);
-            if finished > 0 {
-                self.phase = ConsensusPhase::Accepted;
-                self.prev_proposers = self.curr_peer_positions.len();
-                self.prev_round_time = std::time::Duration::from_millis(100);
-                adaptor.on_mode_change(mode, ConsensusMode::SwitchedLedger);
-                return;
-            }
-        }
-
         if self.curr_peer_positions.len() > (self.prev_proposers / 2) {
             // We may be falling behind; don't wait for the timer, consider
             // closing the ledger immediately.
@@ -625,6 +604,9 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         let any_transactions = adaptor.has_open_transactions();
         let proposers_closed = self.curr_peer_positions.len();
         let proposers_validated = adaptor.proposers_validated(&self.prev_ledger_id);
+        if proposers_closed > 0 || self.prev_proposers > 0 {
+            tracing::info!(target: "consensus", proposers_closed, proposers_validated, prev_proposers = self.prev_proposers, "phase_open: proposer state");
+        }
 
         self.open_time.tick_to(self.clock.now());
 
