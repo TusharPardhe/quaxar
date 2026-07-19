@@ -4355,6 +4355,30 @@ impl ApplicationRoot {
         // because the closed-ledger slot never advances past genesis.
         self.on_closed_ledger(Arc::clone(&validated));
         self.promote_operating_mode_after_accepted_ledger(&validated);
+
+        // Broadcast our validated ledger to peers via TMStatusChange so they
+        // know we're on the same chain and continue relaying validations.
+        // Without this, after consensus_started=true the pre-consensus
+        // StatusChange broadcast stops, and our on_accept produces wrong
+        // hashes (close_time divergence) — peers see us as diverged and
+        // stop relaying validations, permanently stalling advancement.
+        if let Some(overlay_rt) = self.overlay_runtime() {
+            use overlay::Overlay;
+            let hdr = validated.header();
+            let status = overlay::ProtocolMessage::new(overlay::ProtocolPayload::StatusChange(
+                overlay::message::wire::TmStatusChange {
+                    new_status: Some(1),
+                    new_event: Some(1),
+                    ledger_seq: Some(hdr.seq),
+                    ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
+                    ledger_hash_previous: Some(hdr.parent_hash.as_uint256().data().to_vec()),
+                    network_time: None,
+                    first_seq: Some(1),
+                    last_seq: Some(hdr.seq),
+                },
+            ));
+            overlay_rt.overlay().broadcast(&status);
+        }
     }
 
     /// Records the app-visible validated ledger without running heavier
