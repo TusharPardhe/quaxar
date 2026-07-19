@@ -4606,10 +4606,13 @@ impl<D> BoundServerRuntime<D> {
                     shared_inbound.set_overlay_rt(ort);
                 }
                 if let Some(lm_rt) = app.ledger_master_runtime() {
-                    *lm_rt
+                    let mut guard = lm_rt
                         .shared_inbound_ledgers
                         .lock()
-                        .expect("shared_inbound_ledgers lock") = Some(Arc::clone(&shared_inbound));
+                        .expect("shared_inbound_ledgers lock");
+                    if guard.is_none() {
+                        *guard = Some(Arc::clone(&shared_inbound));
+                    }
                 }
 
                 let mut last_diag_at = Instant::now()
