@@ -830,6 +830,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         &mut self,
         message: &crate::message::TmValidation,
     ) -> crate::router::RouteAction {
+        tracing::info!(target: "overlay", peer_id = %self.peer.id(), len = message.validation.len(), "on_validation: received TMValidation from peer");
         if message.validation.len() < 50 {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Validation too short, ignoring");
             return crate::router::RouteAction::Continue;

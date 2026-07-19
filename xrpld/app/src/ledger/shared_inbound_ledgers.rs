@@ -190,7 +190,7 @@ impl RunDataLimiter {
 /// Reacquire interval for failed ledgers (reference kREACQUIRE_INTERVAL = 5 min).
 const REACQUIRE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// Sweep timeout for completed entries (reference 1 minute after last action).
-const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Timeout for stuck InProgress entries (reference ~180s with no progress).
 const STUCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 /// Maximum number of concurrent in-progress ledger acquisitions. Bounds
@@ -316,6 +316,7 @@ impl SharedInboundLedgers {
         if hash.is_zero() {
             return;
         }
+        tracing::info!(target: "inbound_ledger", %hash, seq, "SharedInboundLedgers::acquire called");
 
         let mut inner = self.inner.lock().expect("shared_inbound lock");
 
@@ -362,6 +363,7 @@ impl SharedInboundLedgers {
         // Check recent failures
         if let Some(failed_at) = inner.recent_failures.get(&hash) {
             if failed_at.elapsed() < REACQUIRE_INTERVAL {
+                tracing::debug!(target: "inbound_ledger", %hash, "acquire: skipped (recent failure)");
                 return;
             }
         }
@@ -372,6 +374,7 @@ impl SharedInboundLedgers {
         // Already tracked — touch and return
         if let Some(entry) = inner.entries.get_mut(&hash) {
             entry.last_touched = Instant::now();
+            tracing::debug!(target: "inbound_ledger", %hash, "acquire: already tracked, touching");
             return;
         }
 
