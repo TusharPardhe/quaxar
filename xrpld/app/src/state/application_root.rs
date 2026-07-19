@@ -4294,7 +4294,7 @@ impl ApplicationRoot {
         if let Some(ledger) = ledger {
             let val_count = self.validations().num_trusted_for_ledger(*ledger.header().hash.as_uint256());
             let quorum = self.validators().quorum();
-            tracing::info!(target: "consensus",
+            tracing::debug!(target: "consensus",
                 seq = ledger.header().seq, val_count, quorum,
                 "check_accept_hash_seq: ledger found in history, checking quorum"
             );

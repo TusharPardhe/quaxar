@@ -311,7 +311,6 @@ pub struct AppRclConsensusAdaptor {
     /// proposed last round (we can't see the network), we must not propose
     /// this round either (matching rippled's updateOperatingMode demotion).
     /// Atomic to avoid racing between on_accept (writer) and start_round (reader).
-    last_proposer_count: std::sync::atomic::AtomicUsize,
     ledger_acceptor: Arc<dyn LedgerAcceptor>,
     inbound_transactions: AppInboundTransactions,
     transaction_master: Arc<TransactionMaster>,
@@ -375,7 +374,6 @@ impl AppRclConsensusAdaptor {
             app_root,
             validators,
             network_ops_mode_owner,
-            last_proposer_count: std::sync::atomic::AtomicUsize::new(0),
             ledger_acceptor,
             inbound_transactions,
             transaction_master,
@@ -556,8 +554,6 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         raw_close_times: &ConsensusCloseTimes,
         mode: ConsensusMode,
     ) {
-        // Track proposer count for diagnostics
-        self.last_proposer_count.store(result.proposers, std::sync::atomic::Ordering::Release);
 
         let next_seq = prev_ledger.seq() + 1;
         let base_fee = self.ledger_master_runtime.ledger_master().closed_ledger().map(|l| l.fees().base).unwrap_or(10);
