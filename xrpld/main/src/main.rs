@@ -4278,7 +4278,7 @@ fn run_acquisition_thread(
                 tracing::warn!(target: "inbound_ledger", seq, "Failed to flush nodestore writes before completion");
                 break;
             }
-            tracing::info!(target: "inbound_ledger", seq, "LEDGER ACQUIRED");
+            tracing::info!(target: "inbound_ledger", seq = ledger.header().seq, "LEDGER ACQUIRED");
             counters.log_status(seq, inbound.stats(), true);
             full_sync_debug!(
                 "[full_debug][acq_worker] send_complete seq={} hash={} ledger_hash={} account_hash={} tx_hash={} fees_base={} fees_reserve={} fees_inc={} state_full={} tx_full={}",
@@ -4314,7 +4314,7 @@ fn run_acquisition_thread(
             }
             ledger.set_full();
             let _ = flush_nodestore_writes(&store.write_tx);
-            tracing::info!(target: "inbound_ledger", seq, "LEDGER ACQUIRED");
+            tracing::info!(target: "inbound_ledger", seq = ledger.header().seq, "LEDGER ACQUIRED");
             counters.log_status(seq, inbound.stats(), true);
             let _ = store_tx.send(Arc::new(ledger.clone()));
             if result_tx.send(AcqResult::Complete(ledger)).is_err() {

@@ -1376,7 +1376,7 @@ fn run_acquisition_worker(
                     ).ok()
                 }));
             }
-            tracing::info!(target: "inbound_ledger", seq, "SHARED LEDGER ACQUIRED");
+            tracing::info!(target: "inbound_ledger", seq = ledger.header().seq, "SHARED LEDGER ACQUIRED");
             // Release the in-memory tree nodes BEFORE sending. The nodes are
             // already in NuDB (written by store_object during acquisition).
             // Without this, the full tree (~34GB on testnet) transfers to the
@@ -1451,7 +1451,7 @@ fn run_acquisition_worker(
                     ).ok()
                 }));
             }
-            tracing::info!(target: "inbound_ledger", seq, "SHARED LEDGER ACQUIRED");
+            tracing::info!(target: "inbound_ledger", seq = ledger.header().seq, "SHARED LEDGER ACQUIRED");
             ledger.release_maps_to_disk();
             {
                 #[cfg(not(target_env = "msvc"))]
