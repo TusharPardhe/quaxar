@@ -852,7 +852,18 @@ impl AppConsensus {
 impl ConsensusRunner for AppConsensus {
     fn start_round<'a>(&'a self, now: NetClockTimePoint, prev_ledger_id: Uint256, prev_ledger: RclCxLedger) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            let proposing = self.adaptor.is_validator() && !self.adaptor.options.standalone;
+            // Matches rippled's RCLConsensus::Adaptor::preStartRound
+            // (RCLConsensus.cpp:998): propose only when operating mode is FULL
+            // (synced with network). Without this, the node proposes with
+            // potentially wrong close_time while catching up, wasting bandwidth.
+            // With the close_time parity fix (skip validated rounds + peer time),
+            // this is safe: the node reaches FULL quickly via
+            // promote_operating_mode_after_accepted_ledger, and once FULL its
+            // close_time is correct (from peer votes in SwitchedLedger mode).
+            let proposing = self.adaptor.is_validator()
+                && !self.adaptor.options.standalone
+                && self.adaptor.network_ops_mode_owner.operating_mode()
+                    == crate::network::network_ops::NetworkOpsOperatingMode::Full;
             let mut state = self.state.lock().expect("consensus state mutex must not be poisoned");
             if self.adaptor.validators.count() > 0 && self.adaptor.validators.unl_size() == 0 {
                 self.adaptor.network_ops_mode_owner.set_unl_blocked(true);
