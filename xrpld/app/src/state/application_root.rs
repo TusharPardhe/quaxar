@@ -4321,6 +4321,16 @@ impl ApplicationRoot {
         self.note_validated_ledger_for_sync(Arc::clone(&validated));
         self.set_need_network_ledger(false);
 
+        // Disable the cold-start single-worker gate so subsequent
+        // incremental acquisitions can proceed concurrently.
+        if let Some(lm_rt) = self.ledger_master_runtime() {
+            if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
+                if let Some(shared) = guard.as_ref() {
+                    shared.mark_has_validated_ledger();
+                }
+            }
+        }
+
         // Release in-memory tree nodes on the ORIGINAL ledger (the one held in
         // the closed_ledger slot and potentially in ledger_history/validations
         // caches). Since release_maps_to_disk takes &self, it operates in-place

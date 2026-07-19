@@ -241,6 +241,11 @@ pub struct SharedInboundLedgers {
     shared_stored: Arc<KeyCache<Uint256>>,
     overlay_rt: Arc<std::sync::RwLock<Option<Arc<AppOverlayRuntime>>>>,
     completed_ledgers_tx: Sender<Arc<Ledger>>,
+    /// Set to true once the first validated ledger is accepted. After this
+    /// point, the cold-start single-worker gate is disabled because all
+    /// subsequent acquisitions are incremental (only the delta from NuDB-
+    /// backed parent, typically <100 nodes per ledger, completing in <1s).
+    has_validated_ledger: std::sync::atomic::AtomicBool,
 }
 
 impl SharedInboundLedgers {
@@ -269,6 +274,7 @@ impl SharedInboundLedgers {
             shared_stored,
             overlay_rt: Arc::new(std::sync::RwLock::new(None)),
             completed_ledgers_tx,
+            has_validated_ledger: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -295,6 +301,13 @@ impl SharedInboundLedgers {
         *guard = Some(pending);
     }
 
+    /// Signal that the initial acquisition succeeded and a validated ledger
+    /// exists. After this, the cold-start single-worker gate is permanently
+    /// disabled — subsequent acquisitions are incremental (fast, NuDB-backed).
+    pub fn mark_has_validated_ledger(&self) {
+        self.has_validated_ledger.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Acquire a ledger by hash. Deduplicates requests. Spawns a worker if new.
     ///
     /// Called from the consensus-driver thread or the main catchup loop.
@@ -312,28 +325,37 @@ impl SharedInboundLedgers {
         // the near-identical full state tree independently (~8GB each, 13+
         // concurrent = 34 GB+ RAM). After the first completion, normal
         // concurrency limits apply for history backfill.
-        let has_any_complete = inner
-            .entries
-            .values()
-            .any(|e| matches!(e.state, EntryState::Complete));
-        if !has_any_complete {
-            let has_any_in_progress = inner
+        // Cold-start single-worker gate: during the very first acquisition
+        // (full state tree download, ~33GB), prevent multiple concurrent
+        // workers from each holding multi-GB partial trees. Once the node
+        // has at least one validated ledger (initial sync complete),
+        // subsequent acquisitions are INCREMENTAL (only fetching the delta
+        // from NuDB-backed parent — typically <100 nodes per ledger). The
+        // gate is only needed before the first validated ledger exists.
+        let has_validated = self.has_validated_ledger.load(std::sync::atomic::Ordering::Acquire);
+        if !has_validated {
+            let has_any_complete = inner
                 .entries
                 .values()
-                .any(|e| e.state == EntryState::InProgress);
-            if has_any_in_progress {
-                // Already have a worker running — just send it peers and return.
-                if let Some(overlay_rt) = {
-                    let guard = self.overlay_rt.read().expect("overlay_rt read");
-                    guard.as_ref().map(|rt| rt.clone())
-                } {
-                    use overlay::Overlay as _;
-                    let peers = overlay_rt.overlay().active_peers();
-                    if !peers.is_empty() {
-                        self.send_peers_locked(&inner, &peers);
+                .any(|e| matches!(e.state, EntryState::Complete));
+            if !has_any_complete {
+                let has_any_in_progress = inner
+                    .entries
+                    .values()
+                    .any(|e| e.state == EntryState::InProgress);
+                if has_any_in_progress {
+                    if let Some(overlay_rt) = {
+                        let guard = self.overlay_rt.read().expect("overlay_rt read");
+                        guard.as_ref().map(|rt| rt.clone())
+                    } {
+                        use overlay::Overlay as _;
+                        let peers = overlay_rt.overlay().active_peers();
+                        if !peers.is_empty() {
+                            self.send_peers_locked(&inner, &peers);
+                        }
                     }
+                    return;
                 }
-                return;
             }
         }
 
