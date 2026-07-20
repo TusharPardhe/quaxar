@@ -1780,13 +1780,28 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                                                 // next on_accept finds matching chain → starts round.
                                                 if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                                                     if let Some(shared) = guard.as_ref() {
+                                                        tracing::warn!(
+                                                            target: "consensus",
+                                                            %network_closed,
+                                                            "checkLastClosedLedger: CALLING acquire_async for network ledger"
+                                                        );
                                                         shared.acquire_async(network_closed, 0, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
                                                         tracing::info!(
                                                             target: "consensus",
                                                             %network_closed,
-                                                            "checkLastClosedLedger: acquiring network ledger, suppressing round start"
+                                                            "checkLastClosedLedger: acquire_async returned, suppressing round start"
+                                                        );
+                                                    } else {
+                                                        tracing::error!(
+                                                            target: "consensus",
+                                                            "checkLastClosedLedger: inbound_ledgers is None (not initialized)"
                                                         );
                                                     }
+                                                } else {
+                                                    tracing::error!(
+                                                        target: "consensus",
+                                                        "checkLastClosedLedger: inbound_ledgers lock POISONED"
+                                                    );
                                                 }
                                                 // Downgrade operating mode (matching rippled line 1993)
                                                 let _ = root.set_network_ops_operating_mode(

@@ -203,9 +203,11 @@ impl InboundLedgers {
         reason: AcquireReason,
     ) -> Option<Arc<Ledger>> {
         if hash.is_zero() {
+            tracing::warn!(target: "inbound_ledger", "acquire: REJECTED zero hash");
             return None;
         }
         if self.stopping.load(Ordering::Acquire) {
+            tracing::warn!(target: "inbound_ledger", %hash, "acquire: REJECTED stopping");
             return None;
         }
 
@@ -214,6 +216,7 @@ impl InboundLedgers {
         // Check recent failures (5-min cooldown)
         if let Some(failed_at) = inner.recent_failures.get(&hash) {
             if failed_at.elapsed() < FAILURE_COOLDOWN {
+                tracing::info!(target: "inbound_ledger", %hash, seq, "acquire: REJECTED recent failure");
                 return None;
             }
         }
@@ -226,15 +229,14 @@ impl InboundLedgers {
         if let Some(entry) = inner.entries.get_mut(&hash) {
             entry.last_touched = Instant::now();
             if entry.failed {
+                tracing::debug!(target: "inbound_ledger", %hash, seq, "acquire: already tracked (failed)");
                 return None;
             }
+            tracing::debug!(target: "inbound_ledger", %hash, seq, complete = entry.completed_ledger.is_some(), "acquire: already tracked");
             return entry.completed_ledger.clone();
         }
 
-        // Bound concurrent acquisitions: only evict if the new request has a
-        // known seq that is strictly higher than the lowest in-flight.
-        // With seq=0 (unknown) or equal priority, just wait for existing
-        // acquisitions to complete rather than thrashing.
+        // Bound concurrent acquisitions
         let in_progress_count = inner
             .entries
             .values()
@@ -251,12 +253,13 @@ impl InboundLedgers {
                 _ => false,
             };
             if !should_evict {
+                tracing::info!(target: "inbound_ledger", %hash, seq, in_progress_count, "acquire: REJECTED at capacity");
                 return None;
             }
             let evict_hash = lowest.map(|(h, _)| *h).unwrap();
             if let Some(evicted) = inner.entries.remove(&evict_hash) {
                 evicted.state.stopped.store(true, Ordering::Release);
-                tracing::debug!(target: "inbound_ledger",
+                tracing::info!(target: "inbound_ledger",
                     evicted_seq = evicted.seq,
                     new_seq = seq,
                     "Evicting lowest-seq acquisition to bound concurrency"
@@ -269,21 +272,30 @@ impl InboundLedgers {
             let guard = self.node_store.read().expect("node_store read");
             match guard.as_ref() {
                 Some(ns) => ns.clone(),
-                None => return None,
+                None => {
+                    tracing::warn!(target: "inbound_ledger", %hash, seq, "acquire: REJECTED node_store not attached");
+                    return None;
+                }
             }
         };
         let wt = {
             let guard = self.write_tx.read().expect("write_tx read");
             match guard.as_ref() {
                 Some(tx) => tx.clone(),
-                None => return None,
+                None => {
+                    tracing::warn!(target: "inbound_ledger", %hash, seq, "acquire: REJECTED write_tx not attached");
+                    return None;
+                }
             }
         };
         let pending = {
             let guard = self.pending_writes.read().expect("pending_writes read");
             match guard.as_ref() {
                 Some(p) => Arc::clone(p),
-                None => return None,
+                None => {
+                    tracing::warn!(target: "inbound_ledger", %hash, seq, "acquire: REJECTED pending_writes not attached");
+                    return None;
+                }
             }
         };
 
@@ -332,7 +344,7 @@ impl InboundLedgers {
             },
         );
 
-        tracing::debug!(target: "inbound_ledger", seq, %hash, "Acquisition started");
+        tracing::info!(target: "inbound_ledger", seq, %hash, "Acquisition started — new entry created");
 
         // Submit the first tick to kick off acquisition
         acq_state.submit_tick();
