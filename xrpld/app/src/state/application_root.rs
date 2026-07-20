@@ -4432,13 +4432,11 @@ impl ApplicationRoot {
         lm.mark_ledger_complete(validated.header().seq);
         self.note_validated_ledger_for_sync(Arc::clone(&validated));
 
-        // TODO(rippled-parity): Update fee tracker with the accepted ledger's
-        // median transaction fee. Rippled calls
-        // `app_.getFeeTrack().updateFeeAverage(fees.base)` after promoting a
-        // validated ledger. SharedLoadFeeTrack does not yet expose an
-        // `update_from_validated_ledger` method — add one that adjusts the
-        // remote fee based on the validated ledger's median fee once the fee
-        // escalation queue reports per-ledger statistics.
+        // Rippled parity: after promoting a validated ledger, update the fee
+        // tracker with the ledger's base fee so the fee escalation algorithm
+        // reflects current network conditions. In rippled this is:
+        //   app_.getFeeTrack().setClusterFee(ledger->fees().base)
+        self.load_fee_track.update_from_validated_ledger(validated.fees().base);
 
         // Disable the cold-start single-worker gate so subsequent
         // incremental acquisitions can proceed concurrently.
@@ -4578,7 +4576,7 @@ impl ApplicationRoot {
         let last_closed_close_time = ledger.header().close_time;
         let close_time_resolution = u32::from(ledger.header().close_time_resolution);
         let current_ledger_fresh = now_close_time
-            < last_closed_close_time.saturating_add(close_time_resolution.saturating_mul(2));
+            <= last_closed_close_time.saturating_add(close_time_resolution.saturating_mul(2));
 
         tracing::debug!(target: "app",
             ?current_mode, need_network_ledger, current_ledger_fresh,
