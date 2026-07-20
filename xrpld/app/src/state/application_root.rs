@@ -4354,7 +4354,7 @@ impl ApplicationRoot {
                 // ledger we don't have from peers rather than waiting.
                 if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
                     if let Some(shared) = guard.as_ref() {
-                        shared.acquire(hash, seq);
+                        shared.acquire_for_consensus(hash, seq);
                     }
                 }
                 None
