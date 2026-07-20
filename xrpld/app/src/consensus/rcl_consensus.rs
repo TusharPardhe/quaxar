@@ -405,6 +405,18 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             for tx in &txs {
                 editable.insert(&consensus::RclCxTxRef::from_transaction(tx));
             }
+
+            // TODO(rippled-parity): Inject pseudo-transactions (ttFEE, ttAMENDMENT,
+            // ttUNL_MODIFY) into the consensus transaction set on flag ledgers.
+            // Rippled calls FeeVote::doVoting, AmendmentTable::doVoting, and
+            // NegativeUNLVote::doVoting here. The vote helpers exist
+            // (crate::load::fee_vote::FeeVote, crate::amendments::amendment_status::AmendmentStatus,
+            // crate::amendments::negative_unl_vote::NegativeUNLVote) with VoteTxSet trait support,
+            // but require: (1) a FeeVote instance on the adaptor (not yet wired),
+            // (2) parent validated ledger's trusted validations for vote aggregation,
+            // (3) flag ledger detection. Wire these once FeeVote is instantiated at
+            // app startup and validation aggregation is accessible from here.
+
             set = editable.freeze();
         }
 
@@ -591,11 +603,41 @@ pub trait ConsensusRunner: Send {
 pub struct AppConsensus {
     pub(crate) adaptor: AppRclConsensusAdaptor,
     state: Consensus<AppRclConsensusAdaptor>,
+    /// Tracks the trusted validator keys from the previous round so we can
+    /// compute `now_untrusted` (keys removed since last round) for start_round.
+    /// Matches rippled's dynamic UNL update behavior.
+    last_trusted_keys: HashSet<PublicKey>,
 }
 
 impl AppConsensus {
     pub fn new(adaptor: AppRclConsensusAdaptor, _parms: ConsensusParms) -> Self {
-        Self { adaptor, state: Consensus::new() }
+        Self { adaptor, state: Consensus::new(), last_trusted_keys: HashSet::default() }
+    }
+
+    /// Compute the set of validator keys that were trusted in the previous
+    /// round but are no longer trusted (i.e. removed from UNL or added to
+    /// the negative UNL). Updates `last_trusted_keys` for the next call.
+    fn compute_now_untrusted(&mut self) -> HashSet<PublicKey> {
+        let current_trusted: HashSet<PublicKey> = self
+            .adaptor
+            .validators
+            .get_trusted_master_keys()
+            .into_iter()
+            .collect();
+        // Keys that were in last_trusted but not in current are now untrusted
+        let now_untrusted: HashSet<PublicKey> = self
+            .last_trusted_keys
+            .difference(&current_trusted)
+            .copied()
+            .collect();
+        // Also include keys on the negative UNL
+        let negative_unl = self.adaptor.validators.get_negative_unl();
+        let mut combined = now_untrusted;
+        for key in negative_unl {
+            combined.insert(key);
+        }
+        self.last_trusted_keys = current_trusted;
+        combined
     }
 
     /// Execute the accept-ledger work and start the next consensus round,
@@ -749,12 +791,13 @@ impl AppConsensus {
                             self.adaptor.network_ops_mode_owner.set_unl_blocked(false);
                         }
 
+                        let now_untrusted = self.compute_now_untrusted();
                         self.state.start_round(
                             &self.adaptor,
                             now,
                             prev_id,
                             prev_cx,
-                            &HashSet::default(),
+                            &now_untrusted,
                             proposing,
                         );
                         tracing::info!(
@@ -773,12 +816,13 @@ impl AppConsensus {
                         // is a no-op in Accepted).
                         let prev_id = *closed.header().hash.as_uint256();
                         let prev_cx = crate::consensus_ledger_from_ledger(&closed);
+                        let now_untrusted = self.compute_now_untrusted();
                         self.state.start_round(
                             &self.adaptor,
                             now,
                             prev_id,
                             prev_cx,
-                            &HashSet::default(),
+                            &now_untrusted,
                             false, // not proposing — we're on wrong chain
                         );
                         tracing::info!(
@@ -836,7 +880,8 @@ impl ConsensusRunner for AppConsensus {
             && !self.adaptor.options.standalone
             && self.adaptor.network_ops_mode_owner.operating_mode()
                 == crate::network::network_ops::NetworkOpsOperatingMode::Full;
-        self.state.start_round(&self.adaptor, now, prev_ledger_id, prev_ledger, &HashSet::default(), actual_proposing);
+        let now_untrusted = self.compute_now_untrusted();
+        self.state.start_round(&self.adaptor, now, prev_ledger_id, prev_ledger, &now_untrusted, actual_proposing);
     }
 
     fn got_tx_set(&mut self, now: NetClockTimePoint, tx_set: consensus::RclTxSet) {

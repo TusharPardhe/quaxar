@@ -63,8 +63,8 @@ use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::MonotonicClock;
 use ledger::OrderBookDB;
 use ledger::{
-    CanonicalTXSet, Ledger, LedgerMasterCaughtUp, LedgerNodeObjectType, OpenView, ReadView,
-    Sandbox, TxsRawView,
+    CanonicalTXSet, Ledger, LedgerMasterCaughtUp, LedgerNodeObjectType, NullLedgerJournal,
+    OpenView, ReadView, Sandbox, TxsRawView,
 };
 use overlay::Cluster;
 use overlay::{OverlayHandoff, OverlayImpl, PeerReservationSource};
@@ -4108,11 +4108,32 @@ impl ApplicationRoot {
                 if !report.published.is_empty() {
                     self.set_need_network_ledger(false);
                 }
-                // If there's a missing ledger, trigger acquisition
+                // If there's a missing ledger, trigger acquisition.
+                // Also pre-fetch the next few sequential ledgers to allow
+                // concurrent acquisition (rippled-parity: multi-ledger fetch
+                // up to ledger_fetch_limit during sequential catchup).
                 if let Some(missing) = report.missing {
                     if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
                         if let Some(shared) = guard.as_ref() {
                             shared.acquire(missing.hash, missing.seq);
+
+                            // Pre-fetch up to 7 additional sequential ledgers
+                            // beyond the first missing one (total up to 8,
+                            // matching default ledger_fetch_limit=8).
+                            if let Some(validated) = lm_rt.ledger_master().validated_ledger() {
+                                let valid_seq = validated.header().seq;
+                                for offset in 1..8u32 {
+                                    let next_seq = missing.seq.saturating_add(offset);
+                                    if next_seq > valid_seq {
+                                        break;
+                                    }
+                                    if let Some(hash) = validated.hash_of_seq(next_seq, &NullLedgerJournal) {
+                                        if !hash.is_zero() {
+                                            shared.acquire(*hash.as_uint256(), next_seq);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -4337,12 +4358,16 @@ impl ApplicationRoot {
                 return;
             }
             let quorum = self.validators().quorum();
+            // Rippled-parity: reduce effective quorum by half the negative UNL
+            // size, matching the nUNL filter applied during consensus.
+            let nunl_size = self.validators().get_negative_unl().len();
+            let effective_quorum = quorum.saturating_sub(nunl_size / 2);
             let val_count = self.validations().num_trusted_for_ledger(hash);
             // (rippled tracks lastValidLedger_ here even before acquiring;
             // we don't have an equivalent field yet, so this is a no-op
             // placeholder for that bookkeeping — the important side effect
             // below, active acquisition, still applies.)
-            if val_count < quorum {
+            if val_count < effective_quorum {
                 return;
             }
 
@@ -4391,8 +4416,12 @@ impl ApplicationRoot {
         }
 
         let quorum = self.validators().quorum();
+        // Rippled-parity: reduce effective quorum by half the negative UNL
+        // size, matching the nUNL filter applied during consensus.
+        let nunl_size = self.validators().get_negative_unl().len();
+        let effective_quorum = quorum.saturating_sub(nunl_size / 2);
         let val_count = self.validations().num_trusted_for_ledger(*ledger.header().hash.as_uint256());
-        if val_count < quorum {
+        if val_count < effective_quorum {
             return;
         }
 
@@ -4402,6 +4431,14 @@ impl ApplicationRoot {
         lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
         lm.mark_ledger_complete(validated.header().seq);
         self.note_validated_ledger_for_sync(Arc::clone(&validated));
+
+        // TODO(rippled-parity): Update fee tracker with the accepted ledger's
+        // median transaction fee. Rippled calls
+        // `app_.getFeeTrack().updateFeeAverage(fees.base)` after promoting a
+        // validated ledger. SharedLoadFeeTrack does not yet expose an
+        // `update_from_validated_ledger` method — add one that adjusts the
+        // remote fee based on the validated ledger's median fee once the fee
+        // escalation queue reports per-ledger statistics.
 
         // Disable the cold-start single-worker gate so subsequent
         // incremental acquisitions can proceed concurrently.
@@ -4431,7 +4468,7 @@ impl ApplicationRoot {
 
         tracing::info!(
             target: "consensus",
-            seq = validated.header().seq, val_count, quorum,
+            seq = validated.header().seq, val_count, quorum, effective_quorum, nunl_size,
             "check_accept: validated ledger advanced (synchronous, on validation receipt)"
         );
 
