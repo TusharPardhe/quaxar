@@ -508,6 +508,79 @@ impl SyncTree {
         );
     }
 
+    /// Progressively release "full below" subtrees to bound in-memory
+    /// node count during acquisition. Unlike `release_to_disk` (which
+    /// releases ALL children), this only releases children of inner nodes
+    /// whose subtrees are fully downloaded (marked `full_below`). The
+    /// released subtrees can be re-fetched from NuDB on demand via the
+    /// `node_fetcher` path.
+    ///
+    /// Returns the number of inner nodes whose children were released.
+    ///
+    /// # Preconditions
+    /// - `self.backed` must be true (reads after release go to NuDB).
+    /// - All "full below" nodes must already be persisted to NuDB.
+    pub fn spill_full_below_subtrees(&self, generation: u32) -> usize {
+        if !self.backed {
+            return 0;
+        }
+        if self.root.get_hash().is_zero() {
+            return 0;
+        }
+
+        // Walk top-down, collecting inner nodes that are full_below AND have
+        // loaded children. We release their children bottom-up to avoid
+        // holding references to nodes being freed.
+        //
+        // Strategy: we release children of nodes at depth >= 2 that are
+        // full_below. We keep depth-0 (root) and depth-1 children loaded
+        // so that `get_missing_nodes` traversal doesn't immediately need to
+        // re-fetch the top of the tree on the next tick.
+        let mut to_release: Vec<SharedIntrusive<SHAMapTreeNode>> = Vec::new();
+        let mut work_stack: Vec<(SharedIntrusive<SHAMapTreeNode>, usize)> =
+            vec![(self.root.clone(), 0)];
+
+        while let Some((node, depth)) = work_stack.pop() {
+            if !node.is_inner() {
+                continue;
+            }
+
+            if node.is_full_below(generation) && depth >= 2 {
+                // This subtree is complete — release its children.
+                to_release.push(node);
+                // Don't descend further; releasing this node's children
+                // will drop all transitive descendants.
+                continue;
+            }
+
+            // Not full below at this depth — descend into loaded children.
+            for branch in 0..BRANCH_FACTOR {
+                if !node.is_empty_branch(branch) {
+                    if let Some(child) = node.get_child(branch) {
+                        work_stack.push((child, depth + 1));
+                    }
+                }
+            }
+        }
+
+        let released = to_release.len();
+        // Release bottom-up (deepest first — since work_stack is DFS,
+        // to_release is already in a reasonable order but we reverse
+        // for safety).
+        for node in to_release.iter().rev() {
+            node.release_loaded_children();
+        }
+
+        if released > 0 {
+            tracing::debug!(
+                target: "shamap",
+                released_inner_nodes = released,
+                "spill_full_below_subtrees: evicted full-below subtrees"
+            );
+        }
+        released
+    }
+
     pub fn set_immutable(&mut self) {
         assert!(
             self.state != SyncState::Invalid,

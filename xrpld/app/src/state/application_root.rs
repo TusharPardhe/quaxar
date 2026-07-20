@@ -4468,8 +4468,8 @@ impl ApplicationRoot {
         //   app_.getFeeTrack().setClusterFee(ledger->fees().base)
         self.load_fee_track.update_from_validated_ledger(validated.fees().base);
 
-        // Disable the cold-start single-worker gate so subsequent
-        // incremental acquisitions can proceed concurrently.
+        // Mark that we have a validated ledger (informational; progressive
+        // memory spill now handles memory bounding during acquisition).
         if let Some(lm_rt) = self.ledger_master_runtime() {
             if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
                 if let Some(shared) = guard.as_ref() {

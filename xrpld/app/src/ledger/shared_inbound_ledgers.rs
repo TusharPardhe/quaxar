@@ -241,10 +241,9 @@ pub struct SharedInboundLedgers {
     shared_stored: Arc<KeyCache<Uint256>>,
     overlay_rt: Arc<std::sync::RwLock<Option<Arc<AppOverlayRuntime>>>>,
     completed_ledgers_tx: Sender<Arc<Ledger>>,
-    /// Set to true once the first validated ledger is accepted. After this
-    /// point, the cold-start single-worker gate is disabled because all
-    /// subsequent acquisitions are incremental (only the delta from NuDB-
-    /// backed parent, typically <100 nodes per ledger, completing in <1s).
+    /// Set to true once the first validated ledger is accepted. Used for
+    /// diagnostic logging. Previously gated cold-start acquisition blocking
+    /// but that is now handled by progressive memory spill instead.
     has_validated_ledger: std::sync::atomic::AtomicBool,
 }
 
@@ -302,8 +301,7 @@ impl SharedInboundLedgers {
     }
 
     /// Signal that the initial acquisition succeeded and a validated ledger
-    /// exists. After this, the cold-start single-worker gate is permanently
-    /// disabled — subsequent acquisitions are incremental (fast, NuDB-backed).
+    /// exists. Used for diagnostic logging.
     pub fn mark_has_validated_ledger(&self) {
         self.has_validated_ledger.store(true, std::sync::atomic::Ordering::Release);
     }
@@ -317,19 +315,15 @@ impl SharedInboundLedgers {
     }
 
     /// Called from consensus paths that MUST acquire a specific ledger to
-    /// continue (e.g. handleWrongLedger, checkLastClosedLedger). Bypasses
-    /// the cold-start single-worker gate by evicting stale in-progress
-    /// acquisitions. Matches rippled where Reason::CONSENSUS acquisitions
-    /// are never blocked by concurrent limits.
+    /// continue (e.g. handleWrongLedger, checkLastClosedLedger). Matches
+    /// rippled where Reason::CONSENSUS acquisitions are treated the same
+    /// as any other — no special gating since progressive memory spill
+    /// bounds each worker's footprint.
     pub fn acquire_for_consensus(&self, hash: Uint256, seq: u32) {
-        // Only bypass cold-start gate AFTER first validated ledger exists.
-        // Before that, the cold-start gate protects the one full-tree
-        // acquisition that must complete before anything else can work.
-        let has_validated = self.has_validated_ledger.load(std::sync::atomic::Ordering::Acquire);
-        self.acquire_inner(hash, seq, has_validated);
+        self.acquire_inner(hash, seq, true);
     }
 
-    fn acquire_inner(&self, hash: Uint256, seq: u32, force_bypass_cold_start: bool) {
+    fn acquire_inner(&self, hash: Uint256, seq: u32, _force_bypass_cold_start: bool) {
         if hash.is_zero() {
             return;
         }
@@ -337,45 +331,18 @@ impl SharedInboundLedgers {
 
         let mut inner = self.inner.lock().expect("shared_inbound lock");
 
-        // Cold start gate: only ONE acquisition at a time until the first
-        // ledger completes. Without this, consensus proposals trigger dozens
-        // of concurrent workers for different ledger hashes, each downloading
-        // the near-identical full state tree independently (~8GB each, 13+
-        // concurrent = 34 GB+ RAM). After the first completion, normal
-        // concurrency limits apply for history backfill.
-        // Cold-start single-worker gate: during the very first acquisition
-        // (full state tree download, ~33GB), prevent multiple concurrent
-        // workers from each holding multi-GB partial trees. Once the node
-        // has at least one validated ledger (initial sync complete),
-        // subsequent acquisitions are INCREMENTAL (only fetching the delta
-        // from NuDB-backed parent — typically <100 nodes per ledger). The
-        // gate is only needed before the first validated ledger exists.
-        let has_validated = self.has_validated_ledger.load(std::sync::atomic::Ordering::Acquire);
-        if !has_validated && !force_bypass_cold_start {
-            let has_any_complete = inner
-                .entries
-                .values()
-                .any(|e| matches!(e.state, EntryState::Complete));
-            if !has_any_complete {
-                let has_any_in_progress = inner
-                    .entries
-                    .values()
-                    .any(|e| e.state == EntryState::InProgress);
-                if has_any_in_progress {
-                    if let Some(overlay_rt) = {
-                        let guard = self.overlay_rt.read().expect("overlay_rt read");
-                        guard.as_ref().map(|rt| rt.clone())
-                    } {
-                        use overlay::Overlay as _;
-                        let peers = overlay_rt.overlay().active_peers();
-                        if !peers.is_empty() {
-                            self.send_peers_locked(&inner, &peers);
-                        }
-                    }
-                    return;
-                }
-            }
-        }
+        // NOTE: The cold-start single-worker gate has been removed. Each
+        // acquisition worker now uses progressive memory spill (see
+        // `spill_full_below_subtrees`) to bound its RSS to roughly
+        // SPILL_INTERVAL_NODES × avg_node_size rather than holding the
+        // entire state tree in memory. This matches rippled's architecture
+        // where multiple InboundLedger objects can be active concurrently
+        // — rippled relies on the SHAMap's `fetchNodeNT` → NuDB fallback
+        // to re-read evicted nodes, and quaxar now does the same via
+        // `release_loaded_children` + `node_fetcher` backed reads.
+        //
+        // The MAX_CONCURRENT_ACQUISITIONS limit (below) still provides an
+        // upper bound on total resource usage.
 
         // Check recent failures
         if let Some(failed_at) = inner.recent_failures.get(&hash) {
@@ -412,25 +379,8 @@ impl SharedInboundLedgers {
             .filter(|e| e.state == EntryState::InProgress)
             .count();
         if in_progress_count >= MAX_CONCURRENT_ACQUISITIONS {
-            // During cold start (no ledger completed yet), BLOCK entirely
-            // instead of evicting. Evict-and-replace causes 13+ concurrent
-            // workers each holding multi-GB trees (observed: 34 GB total from
-            // 13 concurrent workers each with 7.5M inner nodes). A cold node
-            // must finish ONE full state-tree acquisition before starting more.
-            let has_any_complete = inner
-                .entries
-                .values()
-                .any(|e| matches!(e.state, EntryState::Complete));
-            if !has_any_complete {
-                // Cold start: don't evict, just refuse. The existing worker
-                // will complete eventually and free its resources.
-                tracing::trace!(target: "inbound_ledger",
-                    in_progress_count, hash = %hash, seq,
-                    "acquire() blocked during cold start (waiting for first completion)"
-                );
-                return;
-            }
-
+            // At capacity: evict the lowest-sequence in-progress acquisition
+            // to make room for this newer (more relevant) one.
             let lowest_seq_hash = inner
                 .entries
                 .iter()
@@ -1238,6 +1188,41 @@ fn run_acquisition_worker(
             }
         } else {
             just_processed = false;
+        }
+
+        // Progressive memory spill: periodically flush persisted nodes from
+        // the in-memory tree to bound RSS during large state-tree downloads.
+        // Once a subtree is fully downloaded (marked "full below"), its nodes
+        // are already in NuDB and can be safely evicted from RAM. On the next
+        // `get_missing_nodes` traversal, evicted nodes are transparently re-
+        // fetched from NuDB via the `node_fetcher` path.
+        //
+        // This is the mechanism that makes concurrent acquisitions safe
+        // without a cold-start gate: each worker's memory is bounded to
+        // roughly (spill_threshold × avg_node_size) + the non-full-below
+        // frontier, rather than the entire state tree (~33GB on testnet).
+        const SPILL_INTERVAL_NODES: u64 = 50_000;
+        {
+            let current_writes = store.write_count.get();
+            if current_writes > 0
+                && current_writes % SPILL_INTERVAL_NODES == 0
+                && inbound.planner_state().have_header
+            {
+                // Ensure all queued writes are durable in NuDB before evicting
+                // the in-memory copies.
+                let _ = flush_writes(&store.write_tx);
+                let fb_gen = worker_full_below.generation();
+                if let Some(ledger) = inbound.ledger() {
+                    let released = ledger.state_map().spill_full_below_subtrees(fb_gen);
+                    if released > 0 {
+                        tracing::debug!(
+                            target: "inbound_ledger",
+                            seq, writes = current_writes, released,
+                            "Progressive spill: released full-below subtrees"
+                        );
+                    }
+                }
+            }
         }
 
         if !inbound.is_done()
