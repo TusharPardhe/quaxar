@@ -4342,7 +4342,9 @@ impl ApplicationRoot {
             // we don't have an equivalent field yet, so this is a no-op
             // placeholder for that bookkeeping — the important side effect
             // below, active acquisition, still applies.)
-            let _ = (quorum, val_count);
+            if val_count < quorum {
+                return;
+            }
 
             if seq == lm.valid_ledger_seq() {
                 return;

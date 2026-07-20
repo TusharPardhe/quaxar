@@ -763,6 +763,30 @@ impl AppConsensus {
                             next_prev_ledger = %prev_id,
                             "synchronous accept: started next round inline"
                         );
+                    } else {
+                        // Network ledger not available locally — start round
+                        // on our OWN closed ledger anyway. timer_entry's
+                        // checkLedger will detect the mismatch and trigger
+                        // handleWrongLedger → SwitchedLedger once the network
+                        // ledger is acquired. Without this, consensus stays
+                        // permanently stuck in Accepted phase (timer_entry
+                        // is a no-op in Accepted).
+                        let prev_id = *closed.header().hash.as_uint256();
+                        let prev_cx = crate::consensus_ledger_from_ledger(&closed);
+                        self.state.start_round(
+                            &self.adaptor,
+                            now,
+                            prev_id,
+                            prev_cx,
+                            &HashSet::default(),
+                            false, // not proposing — we're on wrong chain
+                        );
+                        tracing::info!(
+                            target: "consensus",
+                            closed_seq,
+                            next_prev_ledger = %prev_id,
+                            "synchronous accept: started round on own LCL (network ledger pending)"
+                        );
                     }
                 } else {
                     root.notify_tx_pending();
