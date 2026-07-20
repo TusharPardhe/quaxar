@@ -491,6 +491,275 @@ impl InboundLedgers {
 
         self.worker_pool.stop();
     }
+
+    // ─── Catchup loop compatibility API ──────────────────────────────────
+
+    /// Poll for completed acquisitions. Returns `(hash, ledger, skip_state)` tuples
+    /// for all entries whose underlying acquisition has finished. Removes those
+    /// entries from the registry.
+    ///
+    /// This is the catchup loop's primary mechanism for consuming results.
+    pub fn poll_results(&self) -> Vec<(Uint256, Ledger, bool)> {
+        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+        let mut completed = Vec::new();
+        let mut failed_hashes = Vec::new();
+        let mut done_hashes = Vec::new();
+
+        for (hash, entry) in inner.entries.iter_mut() {
+            if entry.completed_ledger.is_some() {
+                // Already extracted — skip
+                continue;
+            }
+            if entry.failed {
+                continue;
+            }
+            if entry.state.completed.load(Ordering::Acquire) {
+                // Acquisition finished — extract ledger from mutable state
+                let mutable = entry.state.mutable.lock().expect("acq mutable lock (poll)");
+                if let Some(ledger) = mutable.inbound.ledger().cloned() {
+                    completed.push((*hash, ledger, false));
+                    done_hashes.push(*hash);
+                } else {
+                    failed_hashes.push(*hash);
+                }
+            } else if entry.state.stopped.load(Ordering::Acquire) {
+                failed_hashes.push(*hash);
+            }
+        }
+
+        // Remove completed entries
+        for hash in &done_hashes {
+            if let Some(entry) = inner.entries.remove(hash) {
+                entry.state.stopped.store(true, Ordering::Release);
+            }
+        }
+
+        // Mark failed entries
+        for hash in &failed_hashes {
+            inner.recent_failures.insert(*hash, Instant::now());
+            if let Some(entry) = inner.entries.remove(hash) {
+                entry.state.stopped.store(true, Ordering::Release);
+            }
+        }
+
+        completed
+    }
+
+    /// Check if a specific hash is currently in-progress (not completed, not failed).
+    pub fn is_in_progress(&self, hash: &Uint256) -> bool {
+        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        inner.entries.get(hash).is_some_and(|e| {
+            !e.failed
+                && e.completed_ledger.is_none()
+                && !e.state.completed.load(Ordering::Acquire)
+        })
+    }
+
+    /// Remove non-in-progress entries with seq below `min_seq`.
+    /// Returns number of entries removed.
+    pub fn remove_in_progress_below_seq(&self, min_seq: u32) -> usize {
+        if min_seq <= 1 {
+            return 0;
+        }
+        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+        let stale: Vec<Uint256> = inner
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                (entry.completed_ledger.is_some() || entry.failed)
+                    && entry.seq > 1
+                    && entry.seq < min_seq
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+        let count = stale.len();
+        for hash in stale {
+            if let Some(entry) = inner.entries.remove(&hash) {
+                entry.state.stopped.store(true, Ordering::Release);
+            }
+        }
+        count
+    }
+
+    /// Log-visible summary shaped after reference InboundLedgers::getInfo.
+    pub fn info_summary(&self) -> String {
+        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        let active = inner
+            .entries
+            .values()
+            .filter(|e| {
+                !e.failed
+                    && e.completed_ledger.is_none()
+                    && !e.state.completed.load(Ordering::Acquire)
+            })
+            .count();
+        let complete = inner
+            .entries
+            .values()
+            .filter(|e| e.completed_ledger.is_some() || e.state.completed.load(Ordering::Acquire))
+            .count();
+        let failed = inner.recent_failures.len();
+        let mut entries: Vec<String> = inner
+            .entries
+            .iter()
+            .map(|(hash, entry)| {
+                let key = if entry.seq > 1 {
+                    entry.seq.to_string()
+                } else {
+                    hash.to_string()
+                };
+                let state_label = if entry.failed {
+                    "failed"
+                } else if entry.completed_ledger.is_some()
+                    || entry.state.completed.load(Ordering::Acquire)
+                {
+                    "complete"
+                } else {
+                    "in_progress"
+                };
+                format!("{}:{}", key, state_label)
+            })
+            .collect();
+        entries.sort();
+        format!(
+            "active={} complete={} failed={} entries=[{}]",
+            active,
+            complete,
+            failed,
+            entries.join(",")
+        )
+    }
+
+    /// Check if any tracked entry has the given seq or contains the hash.
+    /// Used by history planner to avoid duplicate acquires.
+    pub fn has_entry_for_seq_or_hash(&self, seq: u32, hash: &Uint256) -> bool {
+        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        inner.entries.contains_key(hash)
+            || inner.entries.values().any(|e| e.seq == seq)
+    }
+
+    /// Remove stale in-progress acquisitions that have had no progress.
+    /// Used during cold bootstrap to free slots for new targets.
+    /// Returns the number of entries removed.
+    pub fn remove_stale_no_progress(&self, idle_timeout: Duration) -> Vec<(Uint256, u32)> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+        let stale: Vec<(Uint256, u32)> = inner
+            .entries
+            .iter()
+            .filter(|(_, e)| {
+                !e.failed
+                    && e.completed_ledger.is_none()
+                    && !e.state.completed.load(Ordering::Acquire)
+                    && now.duration_since(e.last_touched) > idle_timeout
+            })
+            .map(|(hash, e)| (*hash, e.seq))
+            .collect();
+        for (hash, _) in &stale {
+            if let Some(entry) = inner.entries.remove(hash) {
+                entry.state.stopped.store(true, Ordering::Release);
+            }
+        }
+        stale
+    }
+
+    /// Look up a hash for a target sequence from completed (but not yet polled)
+    /// acquisitions' ledger skip lists.
+    pub fn hash_for_seq_from_completed(
+        &self,
+        target_seq: u32,
+    ) -> Option<basics::sha_map_hash::SHAMapHash> {
+        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        // Find completed entries with seq >= target_seq
+        let mut best: Option<(u32, basics::sha_map_hash::SHAMapHash)> = None;
+        for entry in inner.entries.values() {
+            if entry.failed {
+                continue;
+            }
+            let is_complete = entry.completed_ledger.is_some()
+                || entry.state.completed.load(Ordering::Acquire);
+            if !is_complete || entry.seq < target_seq {
+                continue;
+            }
+            // Try to get hash from the entry's ledger
+            if let Some(ledger) = &entry.completed_ledger {
+                if let Some(hash) = ledger
+                    .hash_of_seq(target_seq, &ledger::NullLedgerJournal)
+                    .filter(|h| !h.is_zero())
+                {
+                    if best.is_none() || entry.seq < best.unwrap().0 {
+                        best = Some((entry.seq, hash));
+                    }
+                }
+            } else {
+                // Try from mutable state
+                let mutable = entry.state.mutable.lock().expect("acq mutable (hash lookup)");
+                if let Some(ledger) = mutable.inbound.ledger() {
+                    if ledger.header().seq >= target_seq {
+                        if let Some(hash) = ledger
+                            .hash_of_seq(target_seq, &ledger::NullLedgerJournal)
+                            .filter(|h| !h.is_zero())
+                        {
+                            if best.is_none() || entry.seq < best.unwrap().0 {
+                                best = Some((entry.seq, hash));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(_, hash)| hash)
+    }
+
+    /// Find a candidate reference hash from completed acquisitions for hash
+    /// discovery when direct lookup fails.
+    pub fn candidate_reference_hash_from_completed(
+        &self,
+        target_seq: u32,
+    ) -> Option<(u32, basics::sha_map_hash::SHAMapHash)> {
+        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        let mut best: Option<(u32, basics::sha_map_hash::SHAMapHash)> = None;
+        for entry in inner.entries.values() {
+            if entry.failed {
+                continue;
+            }
+            let is_complete = entry.completed_ledger.is_some()
+                || entry.state.completed.load(Ordering::Acquire);
+            if !is_complete || entry.seq < target_seq {
+                continue;
+            }
+            // Use candidate_ledger_for_seq logic inline: round up to next 256 boundary
+            let candidate_seq = target_seq.saturating_add(255) & !255;
+            if candidate_seq <= target_seq {
+                continue;
+            }
+            if let Some(ledger) = &entry.completed_ledger {
+                if let Some(hash) = ledger
+                    .hash_of_seq(candidate_seq, &ledger::NullLedgerJournal)
+                    .filter(|h| !h.is_zero())
+                {
+                    if best.is_none() || entry.seq < best.unwrap().0 {
+                        best = Some((candidate_seq, hash));
+                    }
+                }
+            } else {
+                let mutable = entry.state.mutable.lock().expect("acq mutable (candidate)");
+                if let Some(ledger) = mutable.inbound.ledger() {
+                    if ledger.header().seq >= target_seq {
+                        if let Some(hash) = ledger
+                            .hash_of_seq(candidate_seq, &ledger::NullLedgerJournal)
+                            .filter(|h| !h.is_zero())
+                        {
+                            if best.is_none() || entry.seq < best.unwrap().0 {
+                                best = Some((candidate_seq, hash));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        best
+    }
 }
 
 impl std::fmt::Debug for InboundLedgers {
