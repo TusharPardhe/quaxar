@@ -322,7 +322,11 @@ impl SharedInboundLedgers {
     /// acquisitions. Matches rippled where Reason::CONSENSUS acquisitions
     /// are never blocked by concurrent limits.
     pub fn acquire_for_consensus(&self, hash: Uint256, seq: u32) {
-        self.acquire_inner(hash, seq, true);
+        // Only bypass cold-start gate AFTER first validated ledger exists.
+        // Before that, the cold-start gate protects the one full-tree
+        // acquisition that must complete before anything else can work.
+        let has_validated = self.has_validated_ledger.load(std::sync::atomic::Ordering::Acquire);
+        self.acquire_inner(hash, seq, has_validated);
     }
 
     fn acquire_inner(&self, hash: Uint256, seq: u32, force_bypass_cold_start: bool) {
