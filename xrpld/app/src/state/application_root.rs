@@ -1776,7 +1776,7 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                                                 // next on_accept finds matching chain → starts round.
                                                 if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
                                                     if let Some(shared) = guard.as_ref() {
-                                                        shared.acquire(network_closed, 0);
+                                                        shared.acquire_for_consensus(network_closed, 0);
                                                         tracing::info!(
                                                             target: "consensus",
                                                             %network_closed,

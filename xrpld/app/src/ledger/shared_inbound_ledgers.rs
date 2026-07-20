@@ -313,6 +313,19 @@ impl SharedInboundLedgers {
     /// Called from the consensus-driver thread or the main catchup loop.
     /// Worker completion sends to `completed_ledgers_tx`.
     pub fn acquire(&self, hash: Uint256, seq: u32) {
+        self.acquire_inner(hash, seq, false);
+    }
+
+    /// Called from consensus paths that MUST acquire a specific ledger to
+    /// continue (e.g. handleWrongLedger, checkLastClosedLedger). Bypasses
+    /// the cold-start single-worker gate by evicting stale in-progress
+    /// acquisitions. Matches rippled where Reason::CONSENSUS acquisitions
+    /// are never blocked by concurrent limits.
+    pub fn acquire_for_consensus(&self, hash: Uint256, seq: u32) {
+        self.acquire_inner(hash, seq, true);
+    }
+
+    fn acquire_inner(&self, hash: Uint256, seq: u32, force_bypass_cold_start: bool) {
         if hash.is_zero() {
             return;
         }
@@ -334,7 +347,7 @@ impl SharedInboundLedgers {
         // from NuDB-backed parent — typically <100 nodes per ledger). The
         // gate is only needed before the first validated ledger exists.
         let has_validated = self.has_validated_ledger.load(std::sync::atomic::Ordering::Acquire);
-        if !has_validated {
+        if !has_validated && !force_bypass_cold_start {
             let has_any_complete = inner
                 .entries
                 .values()

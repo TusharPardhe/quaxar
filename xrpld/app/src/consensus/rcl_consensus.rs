@@ -351,7 +351,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         if let Some(guard) = self.ledger_master_runtime.shared_inbound_ledgers.lock().ok()
             && let Some(shared) = guard.as_ref()
         {
-            shared.acquire(*ledger_id, 0);
+            shared.acquire_for_consensus(*ledger_id, 0);
         }
         None
     }
@@ -702,7 +702,7 @@ impl AppConsensus {
                                 // where doAccept never demotes the operating mode.
                                 if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
                                     if let Some(shared) = guard.as_ref() {
-                                        shared.acquire(network_closed, 0);
+                                        shared.acquire_for_consensus(network_closed, 0);
                                     }
                                 }
                                 None
