@@ -243,27 +243,43 @@ impl InboundLedgers {
             .filter(|e| !e.failed && e.completed_ledger.is_none())
             .count();
         if in_progress_count >= MAX_CONCURRENT {
-            let lowest = inner
+            // During cold start (all entries have seq=0), evict the OLDEST
+            // entry to make room for the latest network hash. Older hashes
+            // become stale as the network moves forward.
+            // With known seqs, only evict if new seq is higher priority.
+            let oldest_entry = inner
                 .entries
                 .iter()
                 .filter(|(_, e)| !e.failed && e.completed_ledger.is_none())
-                .min_by_key(|(_, e)| e.seq);
-            let should_evict = match lowest {
-                Some((_, e)) if seq > 0 && e.seq > 0 && seq > e.seq => true,
-                _ => false,
+                .min_by_key(|(_, e)| e.started_at);
+            let all_seq_zero = inner
+                .entries
+                .values()
+                .filter(|e| !e.failed && e.completed_ledger.is_none())
+                .all(|e| e.seq == 0);
+            let should_evict = if all_seq_zero && seq == 0 {
+                // Cold start: evict oldest to chase latest network hash
+                true
+            } else {
+                match oldest_entry {
+                    Some((_, e)) if seq > 0 && e.seq > 0 && seq > e.seq => true,
+                    _ => false,
+                }
             };
             if !should_evict {
                 tracing::info!(target: "inbound_ledger", %hash, seq, in_progress_count, "acquire: REJECTED at capacity");
                 return None;
             }
-            let evict_hash = lowest.map(|(h, _)| *h).unwrap();
-            if let Some(evicted) = inner.entries.remove(&evict_hash) {
-                evicted.state.stopped.store(true, Ordering::Release);
-                tracing::info!(target: "inbound_ledger",
-                    evicted_seq = evicted.seq,
-                    new_seq = seq,
-                    "Evicting lowest-seq acquisition to bound concurrency"
-                );
+            if let Some((evict_hash, _)) = oldest_entry {
+                let evict_hash = *evict_hash;
+                if let Some(evicted) = inner.entries.remove(&evict_hash) {
+                    evicted.state.stopped.store(true, Ordering::Release);
+                    tracing::debug!(target: "inbound_ledger",
+                        evicted_seq = evicted.seq,
+                        new_seq = seq,
+                        "Evicting oldest acquisition for latest network hash"
+                    );
+                }
             }
         }
 
