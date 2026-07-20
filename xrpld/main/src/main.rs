@@ -3282,10 +3282,17 @@ impl<D> BoundServerRuntime<D> {
                             }
                     }
 
-                    // Trigger parallel InboundLedger acquisitions for peer
-                    // hashes we don't have. Use the peer's max ledger seq
-                    // (from ledger_range) so the acquisition knows the
-                    // target ledger height — seq=0 causes infinite cycling.
+                    // Trigger InboundLedger acquisitions for peer hashes
+                    // we don't have. Use the peer's max ledger seq so the
+                    // acquisition knows the target ledger height.
+                    //
+                    // COLD BOOTSTRAP BUDGET: during cold catchup (validated<=1),
+                    // only allow ONE active acquisition at a time. Starting
+                    // several full-state ledgers splits peer/disk budget —
+                    // each ledger has 300K-600K state nodes and can't finish
+                    // before timing out when bandwidth is shared. This matches
+                    // bootstrap_acquire_budget_available() logic used in the
+                    // validated_hash_rx path (which is currently dead code).
                     if let Some(lm_rt) = app.ledger_master_runtime()
                         && let Some(overlay_rt) = app.overlay_runtime() {
                             use overlay::Overlay as _;
@@ -3297,9 +3304,15 @@ impl<D> BoundServerRuntime<D> {
                             for p in peers.iter() {
                                 let h = p.closed_ledger_hash();
                                 let (_, peer_max) = p.ledger_range();
+                                let active_count = shared_inbound.active_count();
                                 if !h.is_zero() && h != our_hash
                                     && peer_max > 1
                                     && !shared_inbound.contains(&h)
+                                    && bootstrap_acquire_budget_available(
+                                        validated, active_count,
+                                        catchup_profile.ledger_fetch_limit,
+                                        false,
+                                    )
                                 {
                                     shared_inbound.acquire(h, peer_max, app::ledger::inbound_ledgers::AcquireReason::Generic);
                                     triggered += 1;
