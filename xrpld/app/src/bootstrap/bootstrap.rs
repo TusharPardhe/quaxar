@@ -1757,6 +1757,16 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             shared_inbound.sweep();
         }
 
+        // Drain validator list messages so they don't accumulate unbounded.
+        // TODO(rippled-parity): Parse TmValidatorList blob fields and call
+        // root.validators().apply_lists(...) to apply received UNL updates
+        // from peers, matching rippled's ValidatorList::applyList path
+        // triggered by TMValidatorList messages. For now we just discard
+        // them to prevent memory growth.
+        {
+            let _discarded = overlay_rt.overlay().take_validator_lists();
+        }
+
         // Sleep remainder of ~50ms iteration
         std::thread::sleep(Duration::from_millis(50));
     }

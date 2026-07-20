@@ -351,7 +351,14 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         if let Some(guard) = self.ledger_master_runtime.shared_inbound_ledgers.lock().ok()
             && let Some(shared) = guard.as_ref()
         {
-            shared.acquire_for_consensus(*ledger_id, 0);
+            // Try to look up the seq from the ledger cache so the acquisition
+            // layer can prioritise correctly (0 = unknown).
+            let seq = self.ledger_master_runtime.ledger_master()
+                .ledger_history()
+                .get_cached_ledger_by_hash(hash)
+                .map(|l| l.header().seq)
+                .unwrap_or(0);
+            shared.acquire_for_consensus(*ledger_id, seq);
         }
         None
     }
@@ -406,16 +413,44 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 editable.insert(&consensus::RclCxTxRef::from_transaction(tx));
             }
 
-            // TODO(rippled-parity): Inject pseudo-transactions (ttFEE, ttAMENDMENT,
-            // ttUNL_MODIFY) into the consensus transaction set on flag ledgers.
-            // Rippled calls FeeVote::doVoting, AmendmentTable::doVoting, and
-            // NegativeUNLVote::doVoting here. The vote helpers exist
-            // (crate::load::fee_vote::FeeVote, crate::amendments::amendment_status::AmendmentStatus,
-            // crate::amendments::negative_unl_vote::NegativeUNLVote) with VoteTxSet trait support,
-            // but require: (1) a FeeVote instance on the adaptor (not yet wired),
-            // (2) parent validated ledger's trusted validations for vote aggregation,
-            // (3) flag ledger detection. Wire these once FeeVote is instantiated at
-            // app startup and validation aggregation is accessible from here.
+            // Inject pseudo-transactions on flag ledgers (every 256th).
+            // Rippled calls AmendmentTable::doVoting, FeeVote::doVoting, and
+            // NegativeUNLVote::doVoting here.
+            if (prev_ledger.seq() + 1) % 256 == 0 {
+                // Amendment voting — creates ttAMENDMENT pseudo-txs for
+                // amendments gaining/losing majority or activating.
+                if let Some(ref amendment_status) = self.amendment_status {
+                    let prev_id = prev_ledger.id();
+                    let parent_validations = self.validations.store().trusted_for_ledger_by_sequence(
+                        prev_id,
+                        prev_ledger.seq(),
+                    );
+                    let mut vote_set: Vec<protocol::STTx> = Vec::new();
+                    amendment_status.do_voting_for_ledger(
+                        &prev_ledger.ledger(),
+                        &parent_validations,
+                        &mut vote_set,
+                    );
+                    for pseudo_tx in &vote_set {
+                        editable.insert(&consensus::RclCxTxRef::from_transaction(pseudo_tx));
+                    }
+                    if !vote_set.is_empty() {
+                        tracing::info!(
+                            target: "consensus",
+                            count = vote_set.len(),
+                            "on_close: injected amendment pseudo-transactions"
+                        );
+                    }
+                }
+
+                // TODO(rippled-parity): FeeVote::do_voting — requires a FeeVote
+                // instance on the adaptor or app_root. Not yet wired at app startup.
+
+                // TODO(rippled-parity): NegativeUNLVote::do_voting — requires
+                // mutable access to the RclValidations inner (NegativeUNLVoteValidations)
+                // and the UNL key set. Wire once fee_vote is instantiated and the
+                // validation lock can be safely acquired here without deadlock risk.
+            }
 
             set = editable.freeze();
         }
@@ -765,7 +800,16 @@ impl AppConsensus {
                                 // where doAccept never demotes the operating mode.
                                 if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
                                     if let Some(shared) = guard.as_ref() {
-                                        shared.acquire_for_consensus(network_closed, 0);
+                                        // Try to resolve the seq for this hash from the
+                                        // ledger cache so acquisition can prioritise.
+                                        let seq = lm_rt.ledger_master()
+                                            .ledger_history()
+                                            .get_cached_ledger_by_hash(
+                                                basics::sha_map_hash::SHAMapHash::new(network_closed)
+                                            )
+                                            .map(|l| l.header().seq)
+                                            .unwrap_or(0);
+                                        shared.acquire_for_consensus(network_closed, seq);
                                     }
                                 }
                                 None
@@ -838,6 +882,28 @@ impl AppConsensus {
             }
             Err(err) => {
                 tracing::error!(target: "consensus", closed_seq, %err, "synchronous accept: accept_ledger_with_txns failed");
+                // Don't leave consensus stuck in Accepted phase — start a
+                // round on whatever closed ledger we have. timer_entry is a
+                // no-op in Accepted, so without this the node never recovers.
+                if let Some(closed) = root.closed_ledger() {
+                    let prev_id = *closed.header().hash.as_uint256();
+                    let prev_cx = crate::consensus_ledger_from_ledger(&closed);
+                    let now_untrusted = self.compute_now_untrusted();
+                    self.state.start_round(
+                        &self.adaptor,
+                        now,
+                        prev_id,
+                        prev_cx,
+                        &now_untrusted,
+                        false,
+                    );
+                    tracing::warn!(
+                        target: "consensus",
+                        closed_seq,
+                        next_prev_ledger = %prev_id,
+                        "synchronous accept: accept failed, started recovery round on LCL"
+                    );
+                }
             }
         }
     }

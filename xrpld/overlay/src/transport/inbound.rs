@@ -312,6 +312,11 @@ impl QueuedOverlayInboundHandler {
         std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").get_ledgers)
     }
 
+    /// Drain only validator list messages from the queue.
+    pub fn take_validator_lists(&self) -> Vec<PeerMessage<TmValidatorList>> {
+        std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").validator_lists)
+    }
+
     pub fn take_transactions(&self) -> Vec<QueuedTransaction> {
         std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").transactions)
     }

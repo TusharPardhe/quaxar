@@ -63,7 +63,7 @@ use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::MonotonicClock;
 use ledger::OrderBookDB;
 use ledger::{
-    CanonicalTXSet, Ledger, LedgerMasterCaughtUp, LedgerNodeObjectType, NullLedgerJournal,
+    CanonicalTXSet, Ledger, LedgerMasterCaughtUp, LedgerNodeObjectType,
     OpenView, ReadView, Sandbox, TxsRawView,
 };
 use overlay::Cluster;
@@ -4116,24 +4116,6 @@ impl ApplicationRoot {
                     if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
                         if let Some(shared) = guard.as_ref() {
                             shared.acquire(missing.hash, missing.seq);
-
-                            // Pre-fetch up to 7 additional sequential ledgers
-                            // beyond the first missing one (total up to 8,
-                            // matching default ledger_fetch_limit=8).
-                            if let Some(validated) = lm_rt.ledger_master().validated_ledger() {
-                                let valid_seq = validated.header().seq;
-                                for offset in 1..8u32 {
-                                    let next_seq = missing.seq.saturating_add(offset);
-                                    if next_seq > valid_seq {
-                                        break;
-                                    }
-                                    if let Some(hash) = validated.hash_of_seq(next_seq, &NullLedgerJournal) {
-                                        if !hash.is_zero() {
-                                            shared.acquire(*hash.as_uint256(), next_seq);
-                                        }
-                                    }
-                                }
-                            }
                         }
                     }
                 }

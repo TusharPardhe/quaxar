@@ -1757,6 +1757,10 @@ impl OverlayImpl {
         self.queued_inbound.take_proposals()
     }
 
+    pub fn take_validator_lists(&self) -> Vec<crate::PeerMessage<crate::TmValidatorList>> {
+        self.queued_inbound.take_validator_lists()
+    }
+
     pub fn take_ledger_data(&self) -> Vec<crate::PeerMessage<crate::TmLedgerData>> {
         self.queued_inbound.take_ledger_data()
     }
