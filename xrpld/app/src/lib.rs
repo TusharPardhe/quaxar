@@ -43,6 +43,7 @@ pub use consensus::{censorship_detector::*, fetch_pack::*, rcl_cx_peer_pos::*};
 pub use consensus::{consensus_trans_set_sf::*, driver::*, rcl_consensus::*, rcl_validations::*};
 pub use job::{job_queue::*, job_types::*};
 pub use ledger::{
+    inbound_ledgers::*,
     ledger_history::*, ledger_master_runtime::*, ledger_master_state::*,
     ledger_persistence_runtime::*, loaded_ledger_runtime::*, open_ledger::*,
     shared_inbound_ledgers::*,

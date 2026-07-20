@@ -445,7 +445,7 @@ fn spawn_overlay_timer(deps: OverlayTimerDeps) -> thread::JoinHandle<()> {
                             if message.message.r#type == 2
                                 && let Some((_, packet)) = parse_ledger_data_packet(&message.message) {
                                     let mut fp_store = SharedFetchPack::new(Arc::clone(&deps.shared_fetch_pack));
-                                    let _ = ledger::stash_stale_packet(&packet, &mut fp_store);
+                                    let _ = app::stash_stale_packet(&packet, &mut fp_store);
                                 }
                         }
                     }
@@ -470,7 +470,7 @@ fn spawn_overlay_timer(deps: OverlayTimerDeps) -> thread::JoinHandle<()> {
                             if message.message.r#type == 2
                                 && let Some((_, packet)) = parse_ledger_data_packet(&message.message) {
                                     let mut fp_store = SharedFetchPack::new(Arc::clone(&deps.shared_fetch_pack));
-                                    let _ = ledger::stash_stale_packet(&packet, &mut fp_store);
+                                    let _ = app::stash_stale_packet(&packet, &mut fp_store);
                                 }
                         }
                     }

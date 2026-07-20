@@ -10,9 +10,10 @@ use crate::validator::validator_site::ValidatorSite;
 use basics::base_uint::Uint256;
 use basics::tagged_cache::{MonotonicClock, TaggedCache};
 use ledger::{
-    AcceptedLedger, CachedSles, InboundLedgersLocal, InboundTransactions, LedgerCleaner,
+    AcceptedLedger, CachedSles, InboundTransactions, LedgerCleaner,
     LedgerReplayer, OrderBookDB, PendingSaves, ReadView,
 };
+use crate::ledger::inbound_ledgers::InboundLedgersLocal;
 use nodestore::{JournalLevel as NodeStoreJournalLevel, NodeStoreJournal};
 use overlay::Cluster;
 use overlay::SimplePeerSetBuilder;

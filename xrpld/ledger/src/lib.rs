@@ -12,8 +12,8 @@ pub mod views;
 
 pub use acquisition::delta_acquire;
 pub use acquisition::fetch_pack;
-pub use acquisition::inbound_ledger;
-pub use acquisition::inbound_ledgers;
+pub use acquisition::ledger_fetcher;
+// inbound_ledgers module removed — unified into app::ledger::inbound_ledgers
 pub use acquisition::inbound_transactions;
 pub use acquisition::skip_list_acquire;
 pub use acquisition::transaction_acquire;
@@ -138,7 +138,7 @@ pub use history_sync::{
     should_drop_fetch_pack_request,
 };
 pub use holder::LedgerHolder;
-pub use inbound_ledger::{
+pub use ledger_fetcher::{
     INBOUND_LEDGER_MAX_NEEDED_STATE_HASHES, INBOUND_LEDGER_MAX_NEEDED_TX_HASHES,
     INBOUND_LEDGER_MAX_USEFUL_PEERS, InboundLedgerCompletionDisposition, InboundLedgerDataType,
     InboundLedgerJournal, InboundLedgerLocal, InboundLedgerNodeData, InboundLedgerObjectType,
@@ -150,9 +150,8 @@ pub use inbound_ledger::{
     make_inbound_needed_by_hash_request, needed_hashes_with_family,
     needed_hashes_with_family_and_first_child,
 };
-pub use inbound_ledgers::{
-    INBOUND_LEDGERS_REACQUIRE_INTERVAL, InboundLedgerRoute, InboundLedgersLocal, stash_stale_packet,
-};
+// Removed: InboundLedgersLocal, InboundLedgerRoute, stash_stale_packet
+// These will be reimplemented in app::ledger::inbound_ledgers
 pub use inbound_transactions::{InboundTransactions, InboundTransactionsDataStatus};
 pub use ledger_to_json::{
     DEFAULT_LEDGER_JSON_API_VERSION, LedgerFill, LedgerFillOptions, add_json, add_json_with_family,
@@ -1109,7 +1108,7 @@ impl Ledger {
         F: SHAMapNodeFetcher,
         MR: MissingNodeReporter,
     {
-        inbound_ledger::needed_hashes_with_family(
+        ledger_fetcher::needed_hashes_with_family(
             self.header.tx_hash,
             &mut self.tx_map,
             max,
@@ -1131,7 +1130,7 @@ impl Ledger {
         F: SHAMapNodeFetcher,
         MR: MissingNodeReporter,
     {
-        inbound_ledger::needed_hashes_with_family(
+        ledger_fetcher::needed_hashes_with_family(
             self.header.account_hash,
             &mut self.state_map,
             max,
