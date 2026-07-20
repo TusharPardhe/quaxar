@@ -2736,11 +2736,10 @@ fn seed_startup_ledger_state(
     let backed = root.node_store().is_some();
 
     let closed = match options.start_type {
-        StartUpType::Fresh | StartUpType::Network | StartUpType::Snapshot => {
-            // Enable amendments at genesis matching reference rippled --start.
-            // If [amendments] is configured, use those IDs (matching rippled
-            // which reads its [amendments] section to determine getDesired()).
-            // Otherwise fall back to all supported + DefaultYes features.
+        StartUpType::Fresh | StartUpType::Normal | StartUpType::Network | StartUpType::Snapshot => {
+            // All these modes call startGenesisLedger() in rippled.
+            // Normal with no local DB, Fresh, Network, and Snapshot all
+            // create a proper genesis ledger with state tree and computed hash.
             let genesis_amendments = amendments_from_config(config, options.start_type);
             let genesis_config = LedgerConfig {
                 fees: ledger::CURRENT_DEFAULT_FEES,
@@ -2755,7 +2754,6 @@ fn seed_startup_ledger_state(
         StartUpType::Load | StartUpType::LoadFile => {
             Ledger::from_ledger_seq_and_close_time(seed_seq, 0, backed)
         }
-        StartUpType::Normal => Ledger::from_ledger_seq_and_close_time(seed_seq.max(1), 0, backed),
     };
     let closed = Arc::new(closed);
     tracing::info!(target: "bootstrap", ledger_seq = closed.header().seq, "Genesis ledger loaded");
