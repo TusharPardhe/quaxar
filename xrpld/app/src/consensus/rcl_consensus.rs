@@ -672,6 +672,10 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         let resolution = time::Duration::seconds(resolution.as_secs() as i64);
         consensus::algorithm::timing::round_close_time(raw, resolution)
     }
+
+    fn validators_count(&self) -> usize {
+        self.validators.unl_size()
+    }
 }
 
 // ---------------------------------------------------------------------------

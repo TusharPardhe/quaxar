@@ -240,6 +240,10 @@ pub struct ApplicationRoot {
     /// runs immediately. Our router notifies this condvar after process_transaction,
     /// waking the loop to drain+apply within <1ms instead of up to 50ms.
     tx_notify: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    /// Condvar to wake the consensus strand loop immediately when proposals
+    /// arrive from the overlay, removing the 50ms poll latency. Matches
+    /// rippled's strand-based immediate dispatch of proposals.
+    consensus_notify: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
 impl std::fmt::Debug for ApplicationRoot {
@@ -2074,6 +2078,7 @@ impl ApplicationRoot {
             open_ledger_sandbox: Arc::new(std::sync::Mutex::new(None)),
             close_gate: Arc::new(std::sync::Mutex::new(())),
             tx_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+            consensus_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
         });
 
         // TODO: Re-enable ConsensusTransSetSF filter once serialization is verified.
@@ -2133,6 +2138,31 @@ impl ApplicationRoot {
             return true;
         }
         let (mut guard, _timeout_result) = cvar.wait_timeout(pending, timeout).expect("tx_notify wait");
+        let was_notified = *guard;
+        *guard = false;
+        was_notified
+    }
+
+    /// Notify the consensus strand loop that proposals or other consensus-
+    /// relevant events are pending. Called by the overlay when proposals
+    /// arrive. Wakes the strand loop from its condvar wait immediately.
+    pub fn notify_consensus_event(&self) {
+        let (lock, cvar) = &*self.consensus_notify;
+        let mut pending = lock.lock().expect("consensus_notify lock");
+        *pending = true;
+        cvar.notify_one();
+    }
+
+    /// Wait for a consensus event notification or timeout. Returns true if
+    /// notified (proposals arrived), false on timeout.
+    pub fn wait_consensus_or_timeout(&self, timeout: std::time::Duration) -> bool {
+        let (lock, cvar) = &*self.consensus_notify;
+        let mut pending = lock.lock().expect("consensus_notify lock");
+        if *pending {
+            *pending = false;
+            return true;
+        }
+        let (mut guard, _timeout_result) = cvar.wait_timeout(pending, timeout).expect("consensus_notify wait");
         let was_notified = *guard;
         *guard = false;
         was_notified

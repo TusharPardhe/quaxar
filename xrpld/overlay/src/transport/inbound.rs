@@ -142,6 +142,10 @@ pub struct QueuedOverlayInboundHandler {
     /// arrives and no router is set. Matches rippled's doTransactionAsync
     /// scheduling a JtBatch job on first arrival.
     transaction_notify: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Notify callback to wake the consensus strand loop immediately when a
+    /// proposal arrives. Removes the 50ms poll latency, matching rippled's
+    /// strand-based immediate dispatch of proposals.
+    proposal_notify: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl Default for QueuedOverlayInboundHandler {
@@ -153,6 +157,7 @@ impl Default for QueuedOverlayInboundHandler {
             transaction_router: Mutex::new(None),
             validation_notify_tx: Mutex::new(None),
             transaction_notify: Mutex::new(None),
+            proposal_notify: Mutex::new(None),
         }
     }
 }
@@ -231,6 +236,13 @@ impl QueuedOverlayInboundHandler {
     /// Called by the batch-apply thread setup to get instant wake on relay arrival.
     pub fn set_transaction_notify(&self, notify: Box<dyn Fn() + Send + Sync>) {
         *self.transaction_notify.lock().expect("transaction_notify lock") = Some(notify);
+    }
+
+    /// Set a notify callback for when proposals arrive from peers. Called by
+    /// the consensus strand setup to get instant wake on proposal arrival,
+    /// removing the 50ms poll latency.
+    pub fn set_proposal_notify(&self, notify: Box<dyn Fn() + Send + Sync>) {
+        *self.proposal_notify.lock().expect("proposal_notify lock") = Some(notify);
     }
 
     /// Put validations back into the queue so they can be consumed by the
@@ -424,6 +436,12 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
             .expect("overlay inbound lock")
             .proposals
             .push(message);
+        // Wake the consensus strand loop immediately.
+        if let Ok(notify) = self.proposal_notify.lock() {
+            if let Some(ref f) = *notify {
+                f();
+            }
+        }
     }
 
     fn on_validation(&self, _peer: &Arc<PeerImp>, message: QueuedValidation) {

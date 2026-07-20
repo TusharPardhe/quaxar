@@ -191,6 +191,14 @@ pub trait ConsensusAdaptor {
     /// Round a raw close time to the given resolution. Adaptor-provided,
     /// same rationale as `next_ledger_time_resolution`.
     fn round_close_time(&self, raw: NetClockTimePoint, resolution: Duration) -> NetClockTimePoint;
+
+    /// Total number of trusted validators in the UNL. Used by
+    /// `should_pause` to determine the fraction of laggards. Defaults to
+    /// `0`, which disables the pause logic in the generic algorithm. The
+    /// RCL adaptor overrides this with the live UNL size.
+    fn validators_count(&self) -> usize {
+        0
+    }
 }
 
 /// Shorthand for the concrete [`ConsensusResult`] type produced by an
@@ -756,17 +764,31 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
     }
 
     /// Evaluate whether pausing increases the likelihood of validation.
-    /// Matches `shouldPause`. This is a stub returning `false` in the
-    /// generic algorithm: the reference's implementation depends entirely
-    /// on validator/UNL/laggard bookkeeping that lives at the RCL
-    /// adaptation layer (`getValidLedgerIndex`, `getQuorumKeys`,
-    /// `laggards`, `validator`, `haveValidated`), which is out of scope for
-    /// the generic, adaptor-agnostic state machine built in this phase. It
-    /// is intentionally left as a seam: Phase 5/6's `RclConsensusAdaptor`
-    /// can override this behavior once those data sources exist, either by
-    /// adding an adaptor method here or wrapping `Consensus` at that layer.
-    fn should_pause(&self, _adaptor: &A) -> bool {
-        false
+    /// Matches rippled's `shouldPause`: if we are a validator (Proposing
+    /// mode) and more than 20% of trusted validators have not yet validated
+    /// the previous ledger, pause to let them catch up. This prevents fast
+    /// validators from advancing too quickly and leaving slow validators
+    /// unable to participate in consensus.
+    fn should_pause(&self, adaptor: &A) -> bool {
+        // Only validators (Proposing mode) should ever pause.
+        if self.mode.get() != ConsensusMode::Proposing {
+            return false;
+        }
+
+        let total = adaptor.validators_count();
+        // If we don't know the UNL size, can't compute laggard fraction.
+        if total == 0 {
+            return false;
+        }
+
+        // Count validators who have validated the parent ledger.
+        let validated_parent = adaptor.proposers_validated(&self.prev_ledger_id);
+
+        // Laggards = validators who haven't validated the parent yet.
+        let laggards = total.saturating_sub(validated_parent);
+
+        // Pause if more than 20% of validators are lagging.
+        laggards > total / 5
     }
 
     /// Adjust our position to try to agree with other validators. Matches

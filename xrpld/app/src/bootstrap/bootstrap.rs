@@ -1232,6 +1232,15 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         }));
     }
 
+    // Wire instant-wake notification for proposals arriving from peers.
+    // This removes the 50ms poll latency in the consensus strand loop.
+    if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+        let notify_root = runtime.root().clone();
+        overlay_rt.overlay().queued_inbound().set_proposal_notify(Box::new(move || {
+            notify_root.notify_consensus_event();
+        }));
+    }
+
     // ===================================================================
     // SINGLE-STRAND CONSENSUS LOOP
     // ===================================================================
@@ -1789,8 +1798,11 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             }
         }
 
-        // Sleep remainder of ~50ms iteration
-        std::thread::sleep(Duration::from_millis(50));
+        // Wait for proposals or timeout. Wakes immediately when proposals
+        // arrive from the overlay (via proposal_notify), or after 50ms max.
+        // This removes the fixed 50ms poll latency for proposal processing,
+        // matching rippled's immediate strand dispatch.
+        root.wait_consensus_or_timeout(Duration::from_millis(50));
     }
 
     tracing::info!(target: "consensus", "Single-strand consensus event loop stopped");
