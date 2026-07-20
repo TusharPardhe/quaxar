@@ -838,6 +838,27 @@ impl SHAMapTreeNode {
         result
     }
 
+    /// Returns true if any non-empty branch has a loaded child pointer.
+    /// Used to avoid unnecessary release_loaded_children calls on nodes
+    /// that already have all children released.
+    pub fn has_any_loaded_child(&self) -> bool {
+        let Some(arrays) = self.inner_arrays.as_ref() else {
+            return false;
+        };
+        let is_branch = self.is_branch.load(Ordering::Relaxed);
+        if is_branch == 0 {
+            return false;
+        }
+        let tagged = arrays.tagged();
+        let num_children = is_branch.count_ones() as usize;
+        for index in 0..num_children {
+            if tagged.has_child_at_index(index) {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn canonicalize_child(
         &self,
         branch: usize,

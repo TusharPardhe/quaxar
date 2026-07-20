@@ -30,7 +30,7 @@ use super::worker_pool::JobQueue;
 
 const PEER_COUNT_START: usize = 5;
 const PEER_COUNT_ADD: usize = 3;
-const SPILL_INTERVAL_NODES: u64 = 50_000;
+const SPILL_INTERVAL_NODES: u64 = 2_048;
 
 // ─── Public types ────────────────────────────────────────────────────────────
 
@@ -729,7 +729,12 @@ fn process_acquisition_tick(state: &Arc<AcquisitionState>) {
         *just_processed = false;
     }
 
-    // Progressive memory spill
+    // Progressive memory spill — leveraging quaxar's release_loaded_children
+    // mechanism (which rippled lacks). After nodes are written to NuDB, we
+    // release loaded children at depth >= 3, bounding memory to the top 3
+    // levels (~4K inner nodes) + whatever frontier nodes getMissingNodes
+    // re-loads on the next tick. This is BETTER than rippled's TreeNodeCache
+    // TTL sweep because it's immediate and deterministic.
     {
         let current_writes = store.write_count;
         if current_writes > 0
@@ -737,14 +742,20 @@ fn process_acquisition_tick(state: &Arc<AcquisitionState>) {
             && inbound.planner_state().have_header
         {
             let _ = flush_writes(&store.write_tx);
-            let fb_gen = state.worker_full_below.generation();
             if let Some(ledger) = inbound.ledger() {
-                let released = ledger.state_map().spill_full_below_subtrees(fb_gen);
-                if released > 0 {
+                // First: release completed subtrees (free, no re-fetch needed for these)
+                let fb_gen = state.worker_full_below.generation();
+                let full_released = ledger.state_map().spill_full_below_subtrees(fb_gen);
+                // Second: aggressively release deep nodes regardless of completion.
+                // keep_depth=3 means we keep root + 2 levels (~272 inner nodes max)
+                // loaded, and release everything deeper. getMissingNodes will re-load
+                // only the frontier branches it needs from NuDB.
+                let deep_released = ledger.state_map().release_deep_children(3);
+                if full_released + deep_released > 0 {
                     tracing::debug!(
                         target: "inbound_ledger",
-                        seq, writes = current_writes, released,
-                        "Progressive spill: released full-below subtrees"
+                        seq, writes = current_writes, full_released, deep_released,
+                        "Progressive spill: released subtrees for memory bound"
                     );
                 }
             }

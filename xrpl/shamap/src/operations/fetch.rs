@@ -130,6 +130,8 @@ pub fn descend_async_with_family<CLOCK, S, FB, F, MR, NS, REQ>(
 where
     CLOCK: CacheClock,
     S: BuildHasher + Clone,
+    F: SHAMapNodeFetcher,
+    MR: MissingNodeReporter,
     REQ: FnMut(SHAMapHash, u32),
 {
     descend_async_raw(
@@ -163,6 +165,8 @@ pub fn descend_async_raw_nocopy<CLOCK, S, FB, F, MR, NS, REQ>(
 where
     CLOCK: CacheClock,
     S: BuildHasher + Clone,
+    F: SHAMapNodeFetcher,
+    MR: MissingNodeReporter,
     REQ: FnMut(SHAMapHash, u32),
 {
     // Fast path: child already loaded — raw pointer, no clone
@@ -190,6 +194,16 @@ where
         return AsyncDescendResultRaw::Ready(None);
     }
 
+    // NuDB read — matching rippled's fetchNodeNT which reads from DB before
+    // falling through to peer request. Without this, nodes released by
+    // release_deep_children() would be re-downloaded from peers instead of
+    // re-read from the local NuDB store where they were already persisted.
+    if let Some(found) = family.fetch_cached_node_or_acquire_by_seq(hash, ledger_seq) {
+        let canonical = parent.canonicalize_child(branch, found);
+        let ptr: *const SHAMapTreeNode = &*canonical;
+        return AsyncDescendResultRaw::Ready(Some(ptr));
+    }
+
     request_async_fetch(hash, ledger_seq);
     AsyncDescendResultRaw::Pending(hash)
 }
@@ -207,6 +221,8 @@ pub fn descend_async_raw<CLOCK, S, FB, F, MR, NS, REQ>(
 where
     CLOCK: CacheClock,
     S: BuildHasher + Clone,
+    F: SHAMapNodeFetcher,
+    MR: MissingNodeReporter,
     REQ: FnMut(SHAMapHash, u32),
 {
     assert!(
@@ -234,6 +250,13 @@ where
 
     if !backed {
         return AsyncDescendResult::Ready(None);
+    }
+
+    // NuDB read — matching rippled's fetchNodeNT chain: cache → DB → filter → peers.
+    // Without this, nodes released by release_deep_children() are re-downloaded
+    // from peers instead of re-read from NuDB where they already exist.
+    if let Some(found) = family.fetch_cached_node_or_acquire_by_seq(hash, ledger_seq) {
+        return AsyncDescendResult::Ready(Some(parent.canonicalize_child(branch, found)));
     }
 
     request_async_fetch(hash, ledger_seq);

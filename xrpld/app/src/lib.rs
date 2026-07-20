@@ -49,7 +49,7 @@ pub use ledger::{
 };
 pub use ledger_to_json::{ledger_to_json_context::*, ledger_to_json_entrypoint::*};
 pub use load::{deliver_max::*, fee_vote::*, load_fee_track::*, load_manager::*};
-pub use network::{network_ops::*, network_ops_runtime::*, network_ops_validation_runtime::*};
+pub use network::{network_ops::*, network_ops_runtime::*, network_ops_strand::*, network_ops_validation_runtime::*};
 pub use node_family::node_family::*;
 pub use paging::account_tx_paging::*;
 pub use runtime::component_runtime::*;

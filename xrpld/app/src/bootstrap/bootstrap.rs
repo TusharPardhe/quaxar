@@ -98,7 +98,7 @@ impl Default for AppBootstrapOptions {
             newnodeid: false,
             nodeid: None,
             definitions: false,
-            start_type: StartUpType::Fresh,
+            start_type: StartUpType::Normal,
             start_ledger: None,
             trap_tx_hash: None,
             force_ledger_present_range: None,
@@ -458,7 +458,6 @@ where
             }
             "--start" => {
                 options.start_type = StartUpType::Fresh;
-                options.start_valid = true;
             }
             "--vacuum" => {
                 options.vacuum = true;
@@ -871,29 +870,32 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
                 .expect("failed to spawn jobqueue worker thread");
         }
     }
-    let consensus_thread = if matches!(
-        bootstrap.report.startup_ledger_mode,
-        StartUpType::Fresh | StartUpType::Network
-    ) && bootstrap.report.has_overlay_runtime
-    {
-        // This thread exclusively drives consensus in --start mode.
-        // For genesis (seq=1), start immediately like rippled (no waiting).
-        // For joining an existing network (seq>1), wait for peer confirmation.
-        let is_genesis = runtime
-            .root()
-            .closed_ledger()
-            .map(|l| l.header().seq <= 1)
-            .unwrap_or(false);
-        if !is_genesis {
-            runtime.root().set_need_network_ledger(true);
-        }
+    let consensus_thread = if bootstrap.report.has_overlay_runtime {
+        // Unified consensus path for all startup modes (mirrors rippled's single
+        // Application::run() path). The strand drives consensus from whatever the
+        // current closed ledger is, regardless of how it was obtained.
+        //
+        // need_network_ledger control (matching rippled):
+        //   - Network mode: set true in initialize_startup_ledger_state.
+        //     The node still starts consensus immediately (rippled does too),
+        //     but mode promotion to TRACKING is blocked until a network ledger
+        //     is acquired and accepted.
+        //   - All other modes: stays false unless explicitly set.
+        //
+        // NOTE: rippled always calls beginConsensus() regardless of
+        // needNetworkLedger. The flag only gates mode promotion and tx
+        // submission — NOT consensus timer ticks or round starts.
         let stop_flag = Arc::clone(&consensus_stop);
         let rt = Arc::clone(&runtime);
         Some(
             std::thread::Builder::new()
                 .name("start-mode-consensus".into())
                 .spawn(move || {
-                    run_start_mode_consensus_loop(rt.clone(), stop_flag.clone());
+                    run_start_mode_consensus_loop(
+                        rt.clone(),
+                        stop_flag.clone(),
+                        bootstrap.report.ledger_history,
+                    );
                 })
                 .expect("failed to spawn start-mode-consensus thread"),
         )
@@ -917,91 +919,70 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
     Ok(())
 }
 
-/// Consensus event loop for --start mode private networks.
+/// Overlay service loop for --start mode private networks.
 ///
-/// Drains proposals and validations from the overlay, processes map-complete
-/// results, and ticks the consensus timer on a ~200ms cadence. This drives
-/// the consensus state machine that would otherwise only run inside the
-/// catchup loop (which is never entered in --start mode).
-/// Single-strand consensus event loop for --start mode private networks.
-///
-/// Matching rippled's single-strand model: ONE thread runs ALL consensus code.
-/// Proposals, timer_entry, doAccept, and startRound all execute on this thread
-/// in FIFO order. No mutex protects the consensus state machine because only
-/// this thread ever accesses it.
-fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool>) {
-    use crate::consensus::rcl_consensus::ConsensusRunner;
+/// Consensus is delegated to `NetworkOpsStrand` which owns the runner and
+/// drives proposals, timer ticks, accept, and mode promotion on a dedicated
+/// thread.  This loop handles the remaining overlay duties: serving
+/// GetLedger requests, draining completed ledger acquisitions, processing
+/// fetch packs, ticking inbound transactions, and draining validator lists.
+fn run_start_mode_consensus_loop(
+    runtime: Arc<MainRuntime>,
+    stop: Arc<AtomicBool>,
+    configured_ledger_history: u32,
+) {
+    use crate::network::network_ops_strand::{NetworkOpsStrand, NetworkOpsStrandDeps};
 
-    // Elevate thread priority — consensus must never be starved by RPC load.
-    #[cfg(unix)]
-    unsafe {
-        libc::setpriority(0, 0, -15);
-        #[cfg(target_os = "linux")]
-        {
-            let param = libc::sched_param { sched_priority: 10 };
-            libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_RR, &param);
-        }
-    }
+    tracing::info!(target: "consensus", "Overlay service loop starting (consensus delegated to NetworkOpsStrand)");
 
-    tracing::info!(target: "consensus", "Single-strand consensus event loop running (elevated priority)");
-
-    // Take the consensus runner from AppConsensusRuntime — it now lives
-    // exclusively on this thread's stack. No other thread can access it.
     let consensus_rt = match runtime.root().consensus_runtime() {
         Some(rt) => rt,
         None => {
-            tracing::error!(target: "consensus", "No consensus runtime available, exiting strand");
+            tracing::error!(target: "consensus", "No consensus runtime available, exiting");
             return;
         }
     };
 
-    let mut runner = match consensus_rt.take_runner() {
-        Some(r) => r,
-        None => {
-            tracing::error!(target: "consensus", "No consensus runner available, exiting strand");
-            return;
-        }
-    };
-
-    // Set up command channel so external code can send StartRound commands
-    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<crate::runtime::component_runtime::ConsensusCommand>();
-    consensus_rt.set_cmd_sender(cmd_tx);
-
-    // Take the map-complete receiver (tx-set acquisitions from peers)
+    // Take the map-complete receiver before spawning the strand (the strand
+    // will take its own copy if present; we forward completions via txset_tx).
     let map_complete_rx = consensus_rt.take_map_complete_receiver();
-
-    let is_genesis = !runtime.root().need_network_ledger();
-    let mut consensus_started = false;
-    let mut last_timer_tick = std::time::Instant::now();
-    let mut last_round_ledger_id: Option<Uint256> = None;
-    let mut last_acquire_tick = std::time::Instant::now();
-    let mut last_history_tick = std::time::Instant::now();
-
-    if is_genesis {
-        tracing::info!(target: "consensus", "Genesis mode: starting consensus immediately on the genesis ledger");
-    }
 
     // Consensus event channel for validations and ledger promotions
     let (event_tx, event_rx) = crate::consensus::driver::consensus_event_channel();
     let (shared_completed_tx, shared_completed_rx) = std::sync::mpsc::channel::<Arc<ledger::Ledger>>();
 
     let lm_rt_for_shared_inbound = runtime.root().ledger_master_runtime();
+    // Use the app's shared TreeNodeCache (properly sized per node_size profile,
+    // matching rippled's NodeFamily::tnCache_ which uses getValueFor(TreeCacheSize)).
+    // This is the key to bounded memory during acquisition — the cache evicts
+    // old entries via TTL sweep, and acquisitions re-read from NuDB on miss.
+    let node_size_profile = crate::NodeSizeResourceProfile::for_node_size(
+        runtime.root().status_rpc_node_size().as_deref(),
+    );
+    let app_tree_cache: Arc<shamap::tree_node_cache::TreeNodeCache> = runtime
+        .root()
+        .shared_tree_cache_arc()
+        .map(|arc| Arc::clone(arc))
+        .unwrap_or_else(|| {
+            Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
+                "acq-tc",
+                node_size_profile.tree_cache_size,
+                time::Duration::seconds(node_size_profile.tree_cache_age_seconds),
+                basics::tagged_cache::MonotonicClock::default(),
+            ))
+        });
+
     let shared_inbound = lm_rt_for_shared_inbound
         .as_ref()
         .and_then(|lm_rt| lm_rt.inbound_ledgers.lock().ok()?.clone())
         .unwrap_or_else(|| {
             Arc::new(crate::ledger::inbound_ledgers::InboundLedgers::new(
-                Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
-                    "driver-tc",
-                    1024,
-                    time::Duration::seconds(60),
-                    basics::tagged_cache::MonotonicClock::default(),
-                )),
+                Arc::clone(&app_tree_cache),
                 Arc::new(shamap::family::FullBelowCacheImpl::new(
                     0,
                     basics::tagged_cache::MonotonicClock::default(),
                     basics::hardened_hash::HardenedHashBuilder::default(),
-                    1024,
+                    node_size_profile.full_below_target_size,
                 )),
                 Arc::new(ledger::FetchPackCache::new(
                     256,
@@ -1011,7 +992,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 Arc::new(crate::ledger::inbound_ledgers::RunDataLimiter::new(4)),
                 Arc::new(basics::tagged_cache::KeyCache::new(
                     "driver-dedup",
-                    1024,
+                    node_size_profile.full_below_target_size,
                     time::Duration::seconds(30),
                     basics::tagged_cache::MonotonicClock::default(),
                 )),
@@ -1130,6 +1111,19 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         let router_shared_inbound = Arc::clone(&shared_inbound);
         overlay_rt.overlay().queued_inbound().set_ledger_data_router(Box::new(move |peer_id, message| {
             use overlay::Overlay;
+
+            // Request-cookie relay (matching rippled PeerImp::onMessage TMLedgerData)
+            if let Some(cookie) = message.request_cookie {
+                // Forward to the peer that originally requested this data
+                if let Some(requesting_peer) = router_overlay.find_peer_by_short_id(cookie) {
+                    let mut fwd = message.clone();
+                    fwd.request_cookie = None; // Clear cookie on relay
+                    let relay_msg = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(fwd));
+                    requesting_peer.send(overlay::Message::new(relay_msg, None));
+                }
+                return; // Don't process relayed responses locally
+            }
+
             let Some(hash) = Uint256::from_slice(&message.ledger_hash) else { return; };
             match message.r#type {
                 3 => {
@@ -1161,11 +1155,32 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                         ))
                         .collect();
                     let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
-                    router_shared_inbound.route_response(&hash, peer_id as u64, packet);
+                    let routed = router_shared_inbound.route_response_with_seq(
+                        &hash,
+                        peer_id as u64,
+                        Some(message.ledger_seq),
+                        packet,
+                    );
+                    if !routed {
+                        // Peer sent unsolicited ledger data — charge them
+                        if let Some(peer) = router_overlay.find_peer_by_short_id(peer_id) {
+                            peer.charge(
+                                resource::Charge::new(20, "unsolicited ledger data"),
+                                "Unsolicited TmLedgerData response".to_owned(),
+                            );
+                        }
+                    }
                 }
                 _ => {}
             }
         }));
+        let drained = overlay_rt
+            .overlay()
+            .queued_inbound()
+            .drain_ledger_data_to_router();
+        if drained > 0 {
+            tracing::info!(target: "consensus", drained, "Replayed buffered ledger-data packets after router installation");
+        }
     }
 
     // Batch apply thread (matches rippled's JtBatch worker)
@@ -1241,611 +1256,231 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
     }
 
     // ===================================================================
-    // SINGLE-STRAND CONSENSUS LOOP
+    // Spawn NetworkOpsStrand — it owns the ConsensusRunner and drives
+    // proposals, timer ticks, accept, checkAccept, tryAdvance, mode
+    // promotion, and history backfill on its own dedicated thread.
+    // The strand also now handles storeLedger drain and pending acquisition.
     // ===================================================================
-    // This is the heart of the single-strand model. ONE thread processes:
-    // 1. Proposals from overlay → peer_proposal() (immediate, same thread)
-    // 2. Timer tick every 1s → timer_entry() (same thread)
-    // 3. Accept work (if timer_tick returned Some) → execute_accept (same thread, blocks)
-    // 4. Tx-set completions → got_tx_set() (same thread)
-    // 5. External commands (StartRound from bootstrap)
+    let mut strand = NetworkOpsStrand::spawn(NetworkOpsStrandDeps {
+        root: runtime.root().clone(),
+        consensus_rt: Arc::clone(&consensus_rt),
+        shared_inbound: Arc::clone(&shared_inbound),
+        configured_ledger_history,
+        event_tx: Some(event_tx.clone()),
+        shared_completed_rx: Some(shared_completed_rx),
+    });
+
     // ===================================================================
+    // NEW: Wire proposal_router → strand.proposal_tx
+    // Proposals arriving from peers are sent directly to the strand's
+    // proposal channel, bypassing the polling loop entirely.
+    // ===================================================================
+    if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+        let prop_tx = strand.proposal_tx.clone();
+        overlay_rt.overlay().queued_inbound().set_proposal_router(Box::new(move |proposal| {
+            let _ = prop_tx.send(proposal);
+        }));
+    }
 
-    while !stop.load(Ordering::Acquire) {
-        let root = runtime.root();
-
-        let Some(overlay_rt) = root.overlay_runtime() else {
-            std::thread::sleep(Duration::from_millis(500));
-            continue;
-        };
-
-        // Process external commands (e.g. initial StartRound from check_accept)
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                crate::runtime::component_runtime::ConsensusCommand::StartRound { now, prev_ledger_id, prev_ledger } => {
-                    runner.start_round(now, prev_ledger_id, prev_ledger, true);
-                    consensus_rt.update_phase(runner.phase());
-                    consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-                    consensus_started = true;
-                    last_round_ledger_id = Some(runner.prev_ledger_id());
-                    last_timer_tick = std::time::Instant::now();
-                    tracing::info!(target: "consensus", "Consensus started via external command");
-                }
-                crate::runtime::component_runtime::ConsensusCommand::Stop => {
-                    tracing::info!(target: "consensus", "Received stop command");
-                    return;
-                }
-            }
-        }
-
-        // Genesis start: begin consensus immediately on genesis ledger
-        if is_genesis && !consensus_started {
-            if let Some(closed) = root.closed_ledger() {
-                let now = root.shared_time_keeper().close_time();
-                let prev_id = *closed.header().hash.as_uint256();
-                let prev_cx = crate::consensus_ledger_from_ledger(&closed);
-                runner.start_round(now, prev_id, prev_cx, true);
-                consensus_rt.update_phase(runner.phase());
-                consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-                consensus_started = true;
-                overlay_rt.overlay().queued_inbound().clear_transaction_router();
-                last_round_ledger_id = Some(prev_id);
-                last_timer_tick = std::time::Instant::now();
-                tracing::info!(target: "consensus", seq = closed.header().seq, "Consensus started on genesis ledger");
-            }
-        }
-
-        // === STEP 1: Poll proposals from overlay → feed to runner (IMMEDIATE) ===
-        if consensus_started {
-            let proposals = overlay_rt.overlay().take_proposals();
-            for proposal in &proposals {
-                // Trigger acquisition for unknown prev_ledgers
-                if let Some(lm_rt) = root.ledger_master_runtime() {
-                    let lm = lm_rt.ledger_master();
-                    if lm.get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(proposal.previous_ledger)).is_none() {
-                        let mut pending = lm_rt.pending_consensus_ledger.lock().expect("pending_consensus_ledger lock");
-                        if pending.is_none() {
-                            *pending = Some(proposal.previous_ledger);
-                        }
-                    }
-                }
-            }
-            for proposal in proposals {
-                let now = root.shared_time_keeper().close_time();
-                let peer_close_time = basics::chrono::NetClockTimePoint::new(proposal.message.close_time);
-                let prop = consensus::ConsensusProposal::new(
-                    proposal.previous_ledger,
-                    proposal.message.propose_seq,
-                    proposal.current_tx_hash,
-                    peer_close_time,
-                    now,
-                    proposal.public_key,
-                );
-                let peer_pos = crate::consensus::rcl_cx_peer_pos::RclCxPeerPos::new(
-                    proposal.public_key,
-                    proposal.message.signature.clone(),
-                    proposal.suppression,
-                    prop,
-                );
-                runner.peer_proposal(now, &peer_pos);
-            }
-            // Update external-visible state after processing proposals
-            consensus_rt.update_phase(runner.phase());
-            consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-        }
-
-        // === STEP 2: Timer tick every 1s ===
-        if consensus_started && last_timer_tick.elapsed() >= Duration::from_secs(1) {
-            let now = root.shared_time_keeper().close_time();
-            if let Some(work) = runner.timer_tick(now) {
-                // === STEP 3: Execute accept (BLOCKS the strand) ===
-                runner.execute_accept(now, work);
-                last_round_ledger_id = Some(runner.prev_ledger_id());
-            }
-            // Update external-visible state
-            consensus_rt.update_phase(runner.phase());
-            consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-            last_timer_tick = std::time::Instant::now();
-        }
-
-        // Handle Accepted phase: if consensus finished but execute_accept
-        // didn't fire (e.g. accept happened asynchronously), detect it here
-        if consensus_started && runner.phase() == consensus::algorithm::ConsensusPhase::Accepted {
-            if let Some(closed) = root.closed_ledger() {
-                let closed_id = *closed.header().hash.as_uint256();
-                if last_round_ledger_id != Some(closed_id) {
-                    let now = root.shared_time_keeper().close_time();
-                    let prev_cx = crate::consensus_ledger_from_ledger(&closed);
-                    runner.start_round(now, closed_id, prev_cx, true);
-                    consensus_rt.update_phase(runner.phase());
-                    consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-                    last_round_ledger_id = Some(closed_id);
-                    last_timer_tick = std::time::Instant::now();
-                    tracing::info!(target: "consensus", seq = closed.header().seq, "Consensus started next round on newly accepted ledger");
-                }
-            }
-        }
-
-        // === STEP 4: Handle tx-set completions ===
-        if let Some(ref rx) = map_complete_rx {
-            while let Ok((hash, set)) = rx.try_recv() {
-                let now = root.shared_time_keeper().close_time();
-                // Convert SyncTree to RclTxSet
-                let tx_set = consensus::RclTxSet::from_parts(
-                    set.root(),
-                    Arc::clone(runner.adaptor.tx_set_cache()),
-                    set.backed(),
-                    0,
-                );
-                runner.got_tx_set(now, tx_set);
-                consensus_rt.update_phase(runner.phase());
-                tracing::debug!(target: "consensus",
-                    %hash, "strand: got_tx_set processed");
-            }
-        }
-
-        // === STEP 5: Serve GetLedger requests ===
-        dispatch_get_ledger_requests(root, &overlay_rt);
-
-        // storeLedger: drain completed InboundLedger results into LedgerHistory
-        if let Some(lm_rt) = root.ledger_master_runtime() {
-            let rx_guard = lm_rt.completed_ledgers_rx.lock().expect("completed_ledgers_rx");
-            if let Some(rx) = rx_guard.as_ref() {
-                while let Ok(ledger) = rx.try_recv() {
-                    let inserted = lm_rt.ledger_master().ledger_history().insert(Arc::clone(&ledger), true);
-                    if inserted {
-                        let _ = event_tx.send(crate::consensus::driver::ConsensusEvent::LedgerDone(Arc::clone(&ledger)));
-                    }
-                }
-            }
-        }
-        while let Ok(ledger) = shared_completed_rx.try_recv() {
-            if let Some(lm_rt) = root.ledger_master_runtime() {
-                let lm = lm_rt.ledger_master();
-                lm.ledger_history().insert(Arc::clone(&ledger), true);
-                let ledger_seq = ledger.header().seq;
-                if ledger_seq > 0 {
-                    lm.mark_ledger_complete(ledger_seq);
-                }
-            }
-            let _ = event_tx.send(crate::consensus::driver::ConsensusEvent::LedgerDone(ledger));
-        }
-
-        // Broadcast status before consensus starts
-        if !consensus_started {
-            if let Some(closed) = root.closed_ledger() {
-                use overlay::Overlay;
-                let hdr = closed.header();
-                let status = overlay::ProtocolMessage::new(overlay::ProtocolPayload::StatusChange(
-                    overlay::message::wire::TmStatusChange {
-                        new_status: Some(1),
-                        new_event: Some(1),
-                        ledger_seq: Some(hdr.seq),
-                        ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
-                        ledger_hash_previous: Some(hdr.parent_hash.as_uint256().data().to_vec()),
-                        network_time: None,
-                        first_seq: Some(1),
-                        last_seq: Some(hdr.seq),
+    // ===================================================================
+    // NEW: Wire get_ledger_router → JobQueue dispatch
+    // GetLedger requests are dispatched directly to the job queue from the
+    // network thread, matching rippled's PeerImp::onMessage(TMGetLedger).
+    // ===================================================================
+    if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+        let router_root = runtime.root().clone();
+        let router_overlay_rt = Arc::clone(&overlay_rt);
+        overlay_rt.overlay().queued_inbound().set_get_ledger_router(Box::new(move |peer_id, message| {
+            let req = overlay::PeerMessage { peer_id, message };
+            if req.message.itype == 3 {
+                // liTS_CANDIDATE: serve inline for minimal latency
+                serve_one_get_ledger_request(&router_root, &router_overlay_rt, req);
+            } else {
+                let job_root = router_root.clone();
+                let job_overlay_rt = Arc::clone(&router_overlay_rt);
+                router_root.job_queue().add_job(
+                    crate::job::job_types::JobType::JtLedgerReq,
+                    "RcvGetLedger",
+                    move || {
+                        serve_one_get_ledger_request(&job_root, &job_overlay_rt, req);
                     },
-                ));
-                overlay_rt.overlay().broadcast(&status);
+                );
             }
-        }
+        }));
+    }
 
-        // Before consensus starts: acquire network's validated ledger (joining case)
-        if !consensus_started {
-            use overlay::Overlay;
-            let peers = overlay_rt.overlay().active_peers();
-            let any_ahead = peers.iter().find(|p| {
-                let h = p.closed_ledger_hash();
-                if h.is_zero() { return false; }
-                if let Some(lm_rt) = root.ledger_master_runtime() {
-                    lm_rt.ledger_master().get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(h)).is_none()
-                } else { false }
-            });
-            if let Some(peer) = any_ahead {
-                let closed_hash = peer.closed_ledger_hash();
-                if let Some(lm_rt) = root.ledger_master_runtime() {
-                    let mut pending = lm_rt.pending_consensus_ledger.lock().expect("pending_consensus_ledger lock");
-                    if pending.is_none() {
-                        *pending = Some(closed_hash);
-                    }
-                }
-            } else if let Some(closed) = root.closed_ledger() {
-                if root.need_network_ledger() {
-                    // Drain proposals into runner before starting
-                    let proposals = overlay_rt.overlay().take_proposals();
-                    for proposal in proposals {
-                        let now = root.shared_time_keeper().close_time();
-                        let peer_close_time = basics::chrono::NetClockTimePoint::new(proposal.message.close_time);
-                        let prop = consensus::ConsensusProposal::new(
-                            proposal.previous_ledger,
-                            proposal.message.propose_seq,
-                            proposal.current_tx_hash,
-                            peer_close_time,
-                            now,
-                            proposal.public_key,
-                        );
-                        let peer_pos = crate::consensus::rcl_cx_peer_pos::RclCxPeerPos::new(
-                            proposal.public_key,
-                            proposal.message.signature.clone(),
-                            proposal.suppression,
-                            prop,
-                        );
-                        runner.peer_proposal(now, &peer_pos);
-                    }
-                    let now = root.shared_time_keeper().close_time();
-                    let prev_id = *closed.header().hash.as_uint256();
-                    let prev_cx = crate::consensus_ledger_from_ledger(&closed);
-                    runner.start_round(now, prev_id, prev_cx, true);
-                    consensus_rt.update_phase(runner.phase());
-                    consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-                    consensus_started = true;
-                    overlay_rt.overlay().queued_inbound().clear_transaction_router();
-                    last_round_ledger_id = Some(prev_id);
-                    last_timer_tick = std::time::Instant::now();
-                    tracing::info!(target: "consensus", seq = closed.header().seq, "Consensus started — peers confirmed current ledger");
-                }
-            }
-            if !consensus_started {
-                if let Some(closed) = root.closed_ledger() {
-                    if closed.header().seq > 1 {
-                        let now = root.shared_time_keeper().close_time();
-                        let prev_id = *closed.header().hash.as_uint256();
-                        let prev_cx = crate::consensus_ledger_from_ledger(&closed);
-                        runner.start_round(now, prev_id, prev_cx, true);
-                        consensus_rt.update_phase(runner.phase());
-                        consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-                        consensus_started = true;
-                        last_round_ledger_id = Some(prev_id);
-                        last_timer_tick = std::time::Instant::now();
-                        tracing::info!(target: "consensus", seq = closed.header().seq, "Consensus started from acquired network ledger");
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
-        }
-
-        // Consume pending_consensus_ledger and trigger acquisition
-        if let Some(lm_rt) = root.ledger_master_runtime() {
-            let pending = lm_rt.take_pending_consensus_ledger();
-            if let Some(hash) = pending {
-                shared_inbound.acquire_async(hash, 0, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
-            }
-        }
-
-        // Process fetch pack / get-object-by-hash messages
-        {
-            let messages = overlay_rt.overlay().take_get_objects();
-            for msg_envelope in messages {
-                let msg = &msg_envelope.message;
-                if !msg.query {
-                    if msg.r#type != 6 { continue; }
-                    if let Some(lm_rt) = root.ledger_master_runtime() {
-                        let lm = lm_rt.ledger_master();
-                        let mut stored = 0;
-                        for obj in &msg.objects {
-                            if let (Some(hash_bytes), Some(data)) = (&obj.hash, &obj.data) {
-                                if let Some(hash) = Uint256::from_slice(hash_bytes) {
-                                    lm.fetch_pack_cache().add_fetch_pack(hash, data.clone());
-                                    stored += 1;
-                                }
-                            }
-                        }
-                        if stored > 0 {
-                            root.signal_fetch_pack_ready();
-                        }
-                    }
-                } else if msg.r#type == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32 {
-                    let job_root = root.clone();
-                    let job_overlay_rt = Arc::clone(&overlay_rt);
-                    root.job_queue().add_job(
-                        crate::job::job_types::JobType::JtLedgerReq,
-                        "RcvGetObjByHash",
-                        move || {
-                            serve_fetch_pack_request(&job_root, &job_overlay_rt, &msg_envelope);
-                        },
-                    );
-                } else {
-                    let job_root = root.clone();
-                    let job_overlay_rt = Arc::clone(&overlay_rt);
-                    root.job_queue().add_job(
-                        crate::job::job_types::JobType::JtLedgerReq,
-                        "RcvGetObjByHash",
-                        move || {
-                            serve_get_object_by_hash_request(&job_root, &job_overlay_rt, &msg_envelope);
-                        },
-                    );
-                }
-            }
-        }
-
-        // checkAccept + tryAdvance
-        if let Some(lm_rt) = root.ledger_master_runtime() {
-            let lm = lm_rt.ledger_master();
-            let quorum = root.validators().quorum();
-
-            // switchLastClosedLedger for joining nodes
-            if root.need_network_ledger() {
-                let our_closed_hash = root.closed_ledger()
-                    .map(|l| *l.header().hash.as_uint256())
-                    .unwrap_or_default();
-                let acquired_hashes: Vec<_> = {
-                    use overlay::Overlay;
-                    let peers = overlay_rt.overlay().active_peers();
-                    peers.iter()
-                        .map(|p| p.closed_ledger_hash())
-                        .filter(|h| !h.is_zero() && *h != our_closed_hash)
-                        .collect()
-                };
-                let mut best_validated: Option<Arc<ledger::Ledger>> = None;
-                for hash in &acquired_hashes {
-                    let candidate = lm.ledger_history().get_cached_ledger_by_hash(
-                        basics::sha_map_hash::SHAMapHash::new(*hash)
-                    );
-                    if let Some(candidate) = candidate {
-                        let candidate_hash = *candidate.header().hash.as_uint256();
-                        let val_count = root.validations().num_trusted_for_ledger(candidate_hash);
-                        if val_count > 0 {
-                            if best_validated.as_ref().map_or(true, |b| candidate.header().seq > b.header().seq) {
-                                best_validated = Some(candidate);
+    // ===================================================================
+    // NEW: Wire get_objects_router → JobQueue dispatch
+    // GetObjectByHash/FetchPack requests are dispatched directly to the job
+    // queue from the network thread.
+    // ===================================================================
+    if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+        let router_root = runtime.root().clone();
+        let router_overlay_rt = Arc::clone(&overlay_rt);
+        overlay_rt.overlay().queued_inbound().set_get_objects_router(Box::new(move |peer_id, message| {
+            let msg_envelope = overlay::PeerMessage { peer_id, message };
+            let msg = &msg_envelope.message;
+            if !msg.query {
+                // Response: fetch pack data to store
+                if msg.r#type != 6 { return; }
+                if let Some(lm_rt) = router_root.ledger_master_runtime() {
+                    let lm = lm_rt.ledger_master();
+                    let mut stored = 0;
+                    for obj in &msg.objects {
+                        if let (Some(hash_bytes), Some(data)) = (&obj.hash, &obj.data) {
+                            if let Some(hash) = Uint256::from_slice(hash_bytes) {
+                                lm.fetch_pack_cache().add_fetch_pack(hash, data.clone());
+                                stored += 1;
                             }
                         }
                     }
-                }
-                if let Some(network_ledger) = best_validated {
-                    let state_complete = !network_ledger.state_map().is_synching();
-                    let tx_complete = network_ledger.header().tx_hash.is_zero()
-                        || !network_ledger.tx_map().is_synching();
-                    if state_complete && tx_complete {
-                        let new_seq = network_ledger.header().seq;
-                        let new_hash = *network_ledger.header().hash.as_uint256();
-                        let mut l = (*network_ledger).clone();
-                        l.set_validated();
-                        let validated = Arc::new(l);
-                        lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
-                        lm.mark_ledger_complete(validated.header().seq);
-                        root.note_validated_ledger_for_sync(Arc::clone(&validated));
-                        root.on_closed_ledger(Arc::clone(&validated));
-                        root.set_need_network_ledger(false);
-                        // tryAdvance: publish the validated ledger
-                        root.try_advance_publication();
-                        root.promote_operating_mode_after_accepted_ledger(&validated);
-                        // Restart consensus on the new chain
-                        let now = root.shared_time_keeper().close_time();
-                        let prev_cx = crate::consensus_ledger_from_ledger(&validated);
-                        runner.start_round(now, new_hash, prev_cx, true);
-                        consensus_rt.update_phase(runner.phase());
-                        consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-                        last_round_ledger_id = Some(new_hash);
-                        tracing::info!(target: "consensus", new_seq, %new_hash, "Consensus restarted on network chain (switchLastClosedLedger)");
+                    if stored > 0 {
+                        router_root.signal_fetch_pack_ready();
                     }
                 }
+            } else if msg.r#type == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32 {
+                let job_root = router_root.clone();
+                let job_overlay_rt = Arc::clone(&router_overlay_rt);
+                router_root.job_queue().add_job(
+                    crate::job::job_types::JobType::JtLedgerReq,
+                    "RcvGetObjByHash",
+                    move || {
+                        serve_fetch_pack_request(&job_root, &job_overlay_rt, &msg_envelope);
+                    },
+                );
+            } else {
+                let job_root = router_root.clone();
+                let job_overlay_rt = Arc::clone(&router_overlay_rt);
+                router_root.job_queue().add_job(
+                    crate::job::job_types::JobType::JtLedgerReq,
+                    "RcvGetObjByHash",
+                    move || {
+                        serve_get_object_by_hash_request(&job_root, &job_overlay_rt, &msg_envelope);
+                    },
+                );
             }
+        }));
+    }
 
-            // checkAccept: promote closed ledger if it has quorum
-            if let Some(closed) = root.closed_ledger() {
-                let closed_seq = closed.header().seq;
-                if closed_seq > lm.valid_ledger_seq() {
-                    let closed_hash = *closed.header().hash.as_uint256();
-                    let val_count = root.validations().num_trusted_for_ledger(closed_hash);
-                    if val_count >= quorum {
-                        let mut l = (*closed).clone();
-                        l.set_validated();
-                        let validated = Arc::new(l);
-                        lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
-                        root.note_validated_ledger_for_sync(Arc::clone(&validated));
-                        lm.mark_ledger_complete(validated.header().seq);
-                        root.set_need_network_ledger(false);
+    // Forward map-complete (tx-set acquisition) results to the strand.
+    if let Some(rx) = map_complete_rx {
+        let txset_tx = strand.txset_tx.clone();
+        let fwd_stop = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name("map-complete-fwd".into())
+            .spawn(move || {
+                loop {
+                    match rx.recv() {
+                        Ok(item) => {
+                            if fwd_stop.load(Ordering::Acquire) {
+                                break;
+                            }
+                            let _ = txset_tx.send(item);
+                        }
+                        Err(_) => break,
                     }
                 }
-            }
+            })
+            .expect("spawn map-complete-fwd thread");
+    }
 
-            // tryAdvance: burst through consecutive ledgers in history
-            let mut advanced = 0u32;
-            loop {
-                let next_seq = lm.valid_ledger_seq() + 1;
-                let Some(candidate) = lm.ledger_history().get_cached_ledger_by_seq(next_seq) else { break; };
-                let candidate_hash = *candidate.header().hash.as_uint256();
-                let val_count = root.validations().num_trusted_for_ledger(candidate_hash);
-                if val_count < quorum { break; }
-                let mut l = (*candidate).clone();
-                l.set_validated();
-                let validated = Arc::new(l);
-                lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
-                root.note_validated_ledger_for_sync(Arc::clone(&validated));
-                lm.mark_ledger_complete(validated.header().seq);
-                root.set_need_network_ledger(false);
-                advanced += 1;
-            }
-            if advanced > 0 {
-                tracing::info!(target: "consensus", advanced, new_valid_seq = lm.valid_ledger_seq(), "tryAdvance burst");
-            }
-
-            // tryAdvance publication: publish validated ledgers so
-            // is_caught_up() returns true and mode can advance to FULL.
-            root.try_advance_publication();
-
-            // Update complete_ledgers display
-            let complete_range = lm.complete_ledgers();
-            let range_str = complete_range.to_string();
-            if !range_str.is_empty() {
-                root.set_status_rpc_complete_ledgers(Some(range_str));
-            }
-
-            // Operating mode promotion
-            //
-            // Matches rippled's mode advancement after tryAdvance publishes:
-            // - Connected/Syncing → Tracking: when need_network_ledger is false
-            // - Connected/Tracking → Full: when published ledger is fresh
-            //   (close_time within 2x close_time_resolution of current time)
-            {
-                use crate::network::network_ops::NetworkOpsOperatingMode;
-                let current_mode = root.network_ops_state().operating_mode();
-                let need_network = root.need_network_ledger();
-
-                let mut next_mode = current_mode;
-
-                // Connected/Syncing → Tracking
-                if matches!(next_mode, NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Syncing)
-                    && !need_network
-                {
-                    next_mode = NetworkOpsOperatingMode::Tracking;
-                }
-
-                // Connected/Tracking → Full when published ledger is fresh
-                if matches!(next_mode, NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Tracking)
-                    && !need_network
-                {
-                    let valid_seq = lm.valid_ledger_seq();
-                    // Use published ledger freshness (matching rippled's
-                    // promote logic) OR fall back to having the previous
-                    // ledger as a secondary check.
-                    let fresh = root.published_ledger().map_or(false, |pub_ledger| {
-                        let now_close = root.current_close_time_seconds();
-                        let pub_close = pub_ledger.header().close_time;
-                        let resolution = u32::from(pub_ledger.header().close_time_resolution);
-                        now_close < pub_close.saturating_add(resolution.saturating_mul(2))
-                    });
-                    let have_prev = valid_seq > 1 && lm.have_ledger(valid_seq - 1);
-                    if fresh || have_prev {
-                        next_mode = NetworkOpsOperatingMode::Full;
-                    }
-                }
-
-                if next_mode != current_mode {
-                    tracing::info!(target: "app",
-                        ?current_mode, ?next_mode,
-                        "strand: operating mode promoted"
-                    );
-                    root.set_network_ops_operating_mode(next_mode);
-                }
-            }
-        }
-
-        // History backfill
-        if let Some(lm_rt) = root.ledger_master_runtime() {
-            let lm = lm_rt.ledger_master();
-            let valid_seq = lm.valid_ledger_seq();
-            if valid_seq > 1 && last_history_tick.elapsed() >= Duration::from_secs(3) {
-                last_history_tick = std::time::Instant::now();
-                let ledger_history_limit = 512u32;
-                let earliest_wanted = valid_seq.saturating_sub(ledger_history_limit);
-                let complete = lm.complete_ledgers();
-                let mut missing_seq = None;
-                for seq in (earliest_wanted..valid_seq).rev() {
-                    if seq <= 1 { break; }
-                    if !complete.contains(seq) {
-                        missing_seq = Some(seq);
+    // ===================================================================
+    // NEW: Spawn housekeeping timer thread (1s interval)
+    // Handles validator list draining, inbound_transactions tick, and
+    // TreeNodeCache sweep — matching rippled's doSweep timer.
+    // ===================================================================
+    {
+        let hk_stop = Arc::clone(&stop);
+        let hk_runtime = Arc::clone(&runtime);
+        let hk_shared_inbound = Arc::clone(&shared_inbound);
+        let hk_tree_cache = Arc::clone(&app_tree_cache);
+        let hk_sweep_interval = node_size_profile.sweep_interval_seconds;
+        std::thread::Builder::new()
+            .name("housekeeping-timer".into())
+            .spawn(move || {
+                let mut last_acquire_tick = std::time::Instant::now();
+                // rippled sweeps TreeNodeCache every SweepInterval (60s for medium)
+                let mut last_cache_sweep = std::time::Instant::now();
+                while !hk_stop.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_secs(1));
+                    if hk_stop.load(Ordering::Acquire) {
                         break;
                     }
-                }
-                if let Some(missing) = missing_seq {
-                    let parent_hash = lm.ledger_history()
-                        .get_cached_ledger_by_seq(missing + 1)
-                        .map(|l| *l.header().parent_hash.as_uint256());
-                    if let Some(hash) = parent_hash {
-                        if !hash.is_zero() {
-                            let sha_hash = basics::sha_map_hash::SHAMapHash::new(hash);
-                            if lm.ledger_history().get_cached_ledger_by_hash(sha_hash).is_none() {
-                                shared_inbound.acquire_async(hash, missing, crate::ledger::inbound_ledgers::AcquireReason::History);
-                            }
+                    let root = hk_runtime.root();
+                    let Some(overlay_rt) = root.overlay_runtime() else {
+                        continue;
+                    };
+
+                    // Tick pending tx-set acquisitions (every ~1s now instead of 500ms)
+                    if last_acquire_tick.elapsed() >= Duration::from_millis(500) {
+                        let mut guard = root.inbound_transactions().lock().expect("inbound_transactions mutex");
+                        guard.tick_pending_acquires();
+                        last_acquire_tick = std::time::Instant::now();
+                        hk_shared_inbound.sweep();
+                    }
+
+                    // TreeNodeCache sweep — matching rippled's doSweep which calls
+                    // nodeFamily_.sweep() at SweepInterval cadence (config-based per node_size).
+                    // This evicts entries older than the TTL (config-based),
+                    // freeing memory from nodes that are no longer actively needed.
+                    if last_cache_sweep.elapsed() >= Duration::from_secs(hk_sweep_interval) {
+                        let before_size = hk_tree_cache.size();
+                        hk_tree_cache.sweep();
+                        let after_size = hk_tree_cache.size();
+                        if before_size != after_size {
+                            tracing::info!(target: "app",
+                                before_size, after_size,
+                                freed = before_size.saturating_sub(after_size),
+                                "TreeNodeCache sweep (matching rippled doSweep)"
+                            );
+                        }
+                        last_cache_sweep = std::time::Instant::now();
+                    }
+
+                    // Drain validator list messages and apply them to the local UNL
+                    let messages = overlay_rt.overlay().take_validator_lists();
+                    if !messages.is_empty() {
+                        let validators = root.validators();
+                        for msg in messages {
+                            let tm = &msg.message;
+                            let manifest_b64 = basics::base64::base64_encode(&tm.manifest);
+                            let blob_info = crate::validator::validator_list::ValidatorBlobInfo {
+                                blob: basics::base64::base64_encode(&tm.blob),
+                                signature: basics::base64::base64_encode(&tm.signature),
+                                manifest: None,
+                            };
+                            let stats = validators.apply_lists(
+                                &manifest_b64,
+                                tm.version,
+                                &[blob_info],
+                                String::new(),
+                                None,
+                            );
+                            tracing::trace!(
+                                target: "overlay",
+                                version = tm.version,
+                                ?stats,
+                                "applied TMValidatorList from peer"
+                            );
                         }
                     }
                 }
-            }
-        }
-
-        // Tick pending tx-set acquisitions
-        if last_acquire_tick.elapsed() >= Duration::from_millis(500) {
-            let mut guard = root.inbound_transactions().lock().expect("inbound_transactions mutex");
-            guard.tick_pending_acquires();
-            last_acquire_tick = std::time::Instant::now();
-            shared_inbound.sweep();
-        }
-
-        // Drain validator list messages and apply them to the local UNL,
-        // matching rippled's ValidatorList::applyList path triggered by
-        // TMValidatorList messages from peers.
-        {
-            let messages = overlay_rt.overlay().take_validator_lists();
-            if !messages.is_empty() {
-                let validators = root.validators();
-                for msg in messages {
-                    let tm = &msg.message;
-                    let manifest_b64 = basics::base64::base64_encode(&tm.manifest);
-                    let blob_info = crate::validator::validator_list::ValidatorBlobInfo {
-                        blob: basics::base64::base64_encode(&tm.blob),
-                        signature: basics::base64::base64_encode(&tm.signature),
-                        manifest: None,
-                    };
-                    let stats = validators.apply_lists(
-                        &manifest_b64,
-                        tm.version,
-                        &[blob_info],
-                        String::new(),
-                        None,
-                    );
-                    tracing::trace!(
-                        target: "overlay",
-                        version = tm.version,
-                        ?stats,
-                        "applied TMValidatorList from peer"
-                    );
-                }
-            }
-        }
-
-        // Wait for proposals or timeout. Wakes immediately when proposals
-        // arrive from the overlay (via proposal_notify), or after 50ms max.
-        // This removes the fixed 50ms poll latency for proposal processing,
-        // matching rippled's immediate strand dispatch.
-        root.wait_consensus_or_timeout(Duration::from_millis(50));
+            })
+            .expect("spawn housekeeping-timer thread");
     }
 
-    tracing::info!(target: "consensus", "Single-strand consensus event loop stopped");
+    // ===================================================================
+    // Wait for stop signal (replaces the polling while loop)
+    // All duties are now callback-driven or timer-driven.
+    // ===================================================================
+    while !stop.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    strand.stop();
+    tracing::info!(target: "consensus", "Overlay service loop stopped");
 }
 
-
-/// Drain queued `TMGetLedger` requests and dispatch each one onto the
-/// `JtLedgerReq` job queue, matching the reference's
-/// `PeerImp::onMessage(TMGetLedger)` calling
-/// `app_.getJobQueue().addJob(JtLedgerReq, "RcvGetLedger", ...)`. The actual
-/// SHAMap node walk (`serve_one_get_ledger_request`) runs entirely inside
-/// the dispatched job, on a `JobQueue` worker thread -- never on the
-/// caller's thread -- so a burst of peer catch-up requests cannot delay
-/// whatever the caller needs to do next (in particular, this loop's own
-/// `drain_proposals` call later in the same iteration).
-fn dispatch_get_ledger_requests(
-    root: &crate::ApplicationRoot,
-    overlay_rt: &Arc<crate::runtime::overlay_runtime::AppOverlayRuntime>,
-) {
-    let requests = overlay_rt.overlay().take_get_ledgers();
-    if requests.is_empty() {
-        return;
-    }
-
-    for req in requests {
-        if req.message.itype == 3 {
-            // liTS_CANDIDATE: serve inline for minimal latency. Tx-set
-            // lookups are just a HashMap get + serialize — fast enough to
-            // run synchronously, and time-critical for dispute resolution
-            // to complete within the consensus round.
-            serve_one_get_ledger_request(root, overlay_rt, req);
-        } else {
-            let job_root = root.clone();
-            let job_overlay_rt = Arc::clone(overlay_rt);
-            root.job_queue().add_job(
-                crate::job::job_types::JobType::JtLedgerReq,
-                "RcvGetLedger",
-                move || {
-                    serve_one_get_ledger_request(&job_root, &job_overlay_rt, req);
-                },
-            );
-        }
-    }
-}
 
 fn serve_one_get_ledger_request(
     root: &crate::ApplicationRoot,
@@ -3106,7 +2741,7 @@ fn seed_startup_ledger_state(
             // If [amendments] is configured, use those IDs (matching rippled
             // which reads its [amendments] section to determine getDesired()).
             // Otherwise fall back to all supported + DefaultYes features.
-            let genesis_amendments = amendments_from_config(config, options.standalone);
+            let genesis_amendments = amendments_from_config(config, options.start_type);
             let genesis_config = LedgerConfig {
                 fees: ledger::CURRENT_DEFAULT_FEES,
                 ..LedgerConfig::default()
@@ -3229,7 +2864,7 @@ fn seed_startup_ledger_state(
     Ok(())
 }
 
-fn amendments_from_config(config: &BasicConfig, standalone: bool) -> Vec<Uint256> {
+fn amendments_from_config(config: &BasicConfig, start_type: StartUpType) -> Vec<Uint256> {
     let section = config.section("amendments");
     let values = section.values();
     if !values.is_empty() {
@@ -3245,12 +2880,15 @@ fn amendments_from_config(config: &BasicConfig, standalone: bool) -> Vec<Uint256
             })
             .collect();
     }
-    // Standalone: enable ALL supported amendments (matching rippled standalone).
-    // Network mode (--start): enable ALL supported amendments that are not
-    // vetoed. Matches rippled's getDesired() which returns amendments where
-    // `supported && vote == AmendmentVote::Up`. Since nothing is vetoed at
-    // genesis startup, this is ALL supported amendments — identical to
-    // standalone mode. This ensures the genesis state tree matches rippled's.
+
+    // Rippled's network startup creates a local genesis ledger with no
+    // initial amendments. Fresh/private startup uses the desired supported
+    // amendments. Keeping this distinction is required for genesis hash
+    // parity between --net and --start.
+    if start_type == StartUpType::Network {
+        return Vec::new();
+    }
+
     REGISTERED_FEATURES
         .iter()
         .filter(|f| f.supported)

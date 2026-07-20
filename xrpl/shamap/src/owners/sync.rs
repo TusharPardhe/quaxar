@@ -581,6 +581,70 @@ impl SyncTree {
         released
     }
 
+    /// Aggressively release loaded children at depth >= `keep_depth`, regardless
+    /// of full_below status. This caps memory during active acquisition by
+    /// ensuring only the top N levels of the tree stay resident in RAM.
+    ///
+    /// Nodes at depth >= `keep_depth` have their children dropped. The next
+    /// `get_missing_nodes` traversal will re-fetch only the frontier nodes it
+    /// actually needs from NuDB via the backed `descend()` path.
+    ///
+    /// This leverages quaxar's `release_loaded_children()` mechanism (which
+    /// rippled lacks) to bound acquisition memory to approximately:
+    ///   top `keep_depth` levels × branch_factor nodes ≈ 16^keep_depth inner nodes
+    ///   + active frontier nodes loaded on-demand during getMissingNodes
+    ///
+    /// # Preconditions
+    /// - `self.backed` must be true (reads after release go to NuDB).
+    /// - Nodes must already be persisted to NuDB before calling this.
+    pub fn release_deep_children(&self, keep_depth: usize) -> usize {
+        if !self.backed {
+            return 0;
+        }
+        if self.root.get_hash().is_zero() {
+            return 0;
+        }
+
+        let mut released = 0usize;
+        let mut work_stack: Vec<(SharedIntrusive<SHAMapTreeNode>, usize)> =
+            vec![(self.root.clone(), 0)];
+
+        while let Some((node, depth)) = work_stack.pop() {
+            if !node.is_inner() {
+                continue;
+            }
+
+            if depth >= keep_depth {
+                // Release this node's children — they can be re-fetched from NuDB.
+                if node.has_any_loaded_child() {
+                    node.release_loaded_children();
+                    released += 1;
+                }
+                // Don't descend further — children are now released.
+                continue;
+            }
+
+            // Above keep_depth — descend into loaded children.
+            for branch in 0..BRANCH_FACTOR {
+                if !node.is_empty_branch(branch) {
+                    if let Some(child) = node.get_child(branch) {
+                        work_stack.push((child, depth + 1));
+                    }
+                }
+            }
+        }
+
+        if released > 0 {
+            tracing::debug!(
+                target: "shamap",
+                released_inner_nodes = released,
+                keep_depth,
+                "release_deep_children: evicted deep subtrees for memory bound"
+            );
+        }
+        released
+    }
+
     pub fn set_immutable(&mut self) {
         assert!(
             self.state != SyncState::Invalid,
@@ -772,6 +836,8 @@ impl SyncTree {
         CLOCK: CacheClock,
         S: BuildHasher + Clone,
         FB: FullBelowCache,
+        F: SHAMapNodeFetcher,
+        MR: MissingNodeReporter,
         REQ: FnMut(SHAMapHash, u32),
     {
         crate::fetch::descend_async_with_family(
@@ -1328,6 +1394,7 @@ impl SyncTree {
         S: BuildHasher + Clone,
         C: FullBelowCache,
         F: SHAMapNodeFetcher,
+        MR: MissingNodeReporter,
         R: FnMut() -> u8,
         REQ: FnMut(SHAMapHash, u32),
         COMPLETE:
@@ -2324,6 +2391,7 @@ impl DeferredMissingNodeScan {
         S: BuildHasher + Clone,
         FB: FullBelowCache,
         F: SHAMapNodeFetcher,
+        MR: MissingNodeReporter,
         R: FnMut() -> u8,
         REQ: FnMut(SHAMapHash, u32),
     {

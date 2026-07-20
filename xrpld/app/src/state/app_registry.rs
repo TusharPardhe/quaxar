@@ -98,6 +98,12 @@ use xrpld_core::{DatabaseCon, WALLET_DB_INIT, WALLET_DB_NAME};
 
 static WALLET_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// RPC-owned resumable-ledger-request cache. This is NOT the network
+/// acquisition registry (see `crate::ledger::inbound_ledgers::InboundLedgers`
+/// / `AppLedgerMasterRuntime.inbound_ledgers`, which is what the bootstrap
+/// consensus loop and catchup loop actually use to sync ledgers over the
+/// peer overlay). Only the RPC admin `ledger_data` resumption path
+/// (`rpc/src/state/context.rs`) reads or writes this type.
 pub type AppInboundLedgers = Arc<Mutex<InboundLedgersLocal<MonotonicClock>>>;
 pub type AppInboundTransactions = Arc<Mutex<InboundTransactions>>;
 pub type AppAcceptedLedgerCache = Arc<TaggedCache<Uint256, Arc<AcceptedLedger>>>;

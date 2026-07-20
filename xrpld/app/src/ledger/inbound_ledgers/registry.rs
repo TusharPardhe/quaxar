@@ -36,8 +36,14 @@ const FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 /// Entries idle longer than this are swept.
 const SWEEP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Maximum concurrent in-progress acquisitions.
-const MAX_CONCURRENT: usize = 8;
+/// Safety-valve maximum for concurrent in-progress acquisitions.
+/// rippled has NO capacity limit in InboundLedgers::acquire() — it creates
+/// entries for every unique hash requested. Memory is bounded by the
+/// TreeNodeCache TTL sweep. quaxar achieves the same bound (and better) via
+/// release_deep_children() which aggressively releases loaded tree nodes to
+/// NuDB after each batch. This high limit is only a safety valve; the real
+/// bound is memory, not concurrency.
+const MAX_CONCURRENT: usize = 64;
 
 /// Timer tick interval for submitting timer jobs to all active acquisitions.
 const TIMER_TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -261,44 +267,14 @@ impl InboundLedgers {
             .filter(|e| !e.failed && e.completed_ledger.is_none())
             .count();
         if in_progress_count >= MAX_CONCURRENT {
-            // During cold start (all entries have seq=0), evict the OLDEST
-            // entry to make room for the latest network hash. Older hashes
-            // become stale as the network moves forward.
-            // With known seqs, only evict if new seq is higher priority.
-            let oldest_entry = inner
-                .entries
-                .iter()
-                .filter(|(_, e)| !e.failed && e.completed_ledger.is_none())
-                .min_by_key(|(_, e)| e.started_at);
-            let all_seq_zero = inner
-                .entries
-                .values()
-                .filter(|e| !e.failed && e.completed_ledger.is_none())
-                .all(|e| e.seq == 0);
-            let should_evict = if all_seq_zero && seq == 0 {
-                // Cold start: evict oldest to chase latest network hash
-                true
-            } else {
-                match oldest_entry {
-                    Some((_, e)) if seq > 0 && e.seq > 0 && seq > e.seq => true,
-                    _ => false,
-                }
-            };
-            if !should_evict {
-                tracing::info!(target: "inbound_ledger", %hash, seq, in_progress_count, "acquire: REJECTED at capacity");
-                return None;
-            }
-            if let Some((evict_hash, _)) = oldest_entry {
-                let evict_hash = *evict_hash;
-                if let Some(evicted) = inner.entries.remove(&evict_hash) {
-                    evicted.state.stopped.store(true, Ordering::Release);
-                    tracing::debug!(target: "inbound_ledger",
-                        evicted_seq = evicted.seq,
-                        new_seq = seq,
-                        "Evicting oldest acquisition for latest network hash"
-                    );
-                }
-            }
+            // Matching rippled: do NOT evict actively-downloading entries.
+            // rippled's InboundLedgers simply rejects new acquisitions when
+            // at capacity. Entries are only removed via the 60s idle sweep.
+            // This prevents the OOM pattern where the network advances every
+            // 4s, causing repeated eviction of partially-downloaded ledgers
+            // that leave orphaned tree nodes in memory.
+            tracing::info!(target: "inbound_ledger", %hash, seq, in_progress_count, "acquire: REJECTED at capacity (no eviction)");
+            return None;
         }
 
         // Validate required resources
@@ -393,17 +369,53 @@ impl InboundLedgers {
 
     /// Route a TMLedgerData response to the correct acquisition.
     pub fn route_response(&self, hash: &Uint256, peer_id: u64, packet: InboundLedgerPacket) {
+        let _ = self.route_response_with_seq(hash, peer_id, None, packet);
+    }
+
+    /// Route a response while checking the sequence advertised on the wire.
+    ///
+    /// The ledger hash is the primary acquisition key. When a nonzero
+    /// sequence is available, it is also checked against the acquisition's
+    /// requested sequence so a peer cannot feed a response for another
+    /// ledger into an active acquisition.
+    pub fn route_response_with_seq(
+        &self,
+        hash: &Uint256,
+        peer_id: u64,
+        response_seq: Option<u32>,
+        packet: InboundLedgerPacket,
+    ) -> bool {
         let state = {
             let inner = self.inner.lock().expect("inbound_ledgers lock");
-            inner.entries.get(hash).map(|e| Arc::clone(&e.state))
-        };
-        if let Some(state) = state {
+            let Some(entry) = inner.entries.get(hash) else {
+                tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: registry miss");
+                return false;
+            };
+            if let Some(response_seq) = response_seq
+                && entry.seq != 0
+                && response_seq != 0
+                && entry.seq != response_seq
             {
-                let mut buf = state.data_buffer.lock().expect("data_buffer push lock");
-                buf.push((peer_id, packet));
+                tracing::warn!(
+                    target: "inbound_ledger",
+                    %hash,
+                    expected_seq = entry.seq,
+                    response_seq,
+                    peer_id,
+                    "route_response: sequence mismatch"
+                );
+                return false;
             }
-            state.submit_tick();
+            Arc::clone(&entry.state)
+        };
+
+        {
+            let mut buf = state.data_buffer.lock().expect("data_buffer push lock");
+            buf.push((peer_id, packet));
         }
+        state.submit_tick();
+        tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: registry hit");
+        true
     }
 
     /// Remove entries idle for >60s. Matches rippled's sweep().

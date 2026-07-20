@@ -24,9 +24,18 @@ pub use self::worker_pool::WorkerPool;
 
 // ─── Backward-compatible stub ────────────────────────────────────────────────
 //
-// `InboundLedgersLocal` was removed from the `ledger` crate. This minimal stub
-// keeps `AppInboundLedgers` and its callers compiling until they are rewired to
-// use the new `InboundLedgers` service directly.
+// NOTE: this is NOT the acquisition registry used to sync ledgers over the
+// network -- that is `InboundLedgers` above, owned by
+// `AppLedgerMasterRuntime.inbound_ledgers` and driven by the bootstrap
+// consensus loop / catchup loop.
+//
+// This type is a small resumable-request cache used exclusively by the RPC
+// layer (`rpc/src/state/context.rs`: `take_resumable_inbound_ledger` /
+// `persist_resumable_inbound_ledger`) to park a partially-fetched
+// `InboundLedgerLocal` between paginated admin `ledger_data` requests. It has
+// no relationship to peer acquisition and must not be treated as dead code
+// or merged with `InboundLedgers`; the historical name is kept only to avoid
+// an unrelated rename across its RPC call sites.
 
 use basics::tagged_cache::MonotonicClock;
 use basics::sha_map_hash::SHAMapHash;
@@ -34,8 +43,8 @@ use ledger::InboundLedgerLocal;
 use std::collections::BTreeMap;
 use basics::base_uint::Uint256;
 
-/// Minimal backward-compatible stub for the removed `ledger::InboundLedgersLocal`.
-/// Will be deleted once all callers are rewired to use `InboundLedgers`.
+/// RPC-owned resumable-ledger-request cache keyed by ledger hash. See the
+/// module-level note above for what this type actually does and does not do.
 #[derive(Debug)]
 pub struct InboundLedgersLocal<C = MonotonicClock> {
     _clock: std::marker::PhantomData<C>,

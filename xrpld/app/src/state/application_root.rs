@@ -2797,6 +2797,14 @@ impl ApplicationRoot {
         self.shared_tree_cache.as_deref()
     }
 
+    /// Returns the Arc to the shared tree-node cache, if attached.
+    /// Used by InboundLedgers to share the same bounded cache as the NodeFamily.
+    pub fn shared_tree_cache_arc(
+        &self,
+    ) -> Option<&Arc<TreeNodeCache<MonotonicClock, basics::hardened_hash::HardenedHashBuilder>>> {
+        self.shared_tree_cache.as_ref()
+    }
+
     pub fn attach_resolver_runtime(
         &mut self,
         resolver_runtime: Arc<AppResolverRuntime>,
@@ -4235,6 +4243,29 @@ impl ApplicationRoot {
 
     pub fn validated_ledger_age(&self) -> std::time::Duration {
         self.ledger_master_state.validated_ledger_age()
+    }
+
+    /// Returns the validated ledger age in seconds (convenience for shouldAcquire gating).
+    pub fn validated_ledger_age_seconds(&self) -> u64 {
+        self.ledger_master_state.validated_ledger_age().as_secs()
+    }
+
+    /// Returns true if the local fee track reports the node is overloaded.
+    /// Matches rippled's `app_.getFeeTrack().isLoadedLocal()`.
+    pub fn load_fee_track_loaded_local(&self) -> bool {
+        self.load_fee_track.is_loaded_local()
+    }
+
+    /// Returns the minimum ledger sequence that must remain online, matching
+    /// rippled's `app_.getSHAMapStore().minimumOnline()`.
+    ///
+    /// Returns `None` when SHAMapStore online deletion is not configured or
+    /// not yet fully ported.
+    pub fn minimum_online_seq(&self) -> Option<u32> {
+        // TODO: Wire through to SHAMapStore.minimum_online() once online
+        // deletion rotation is fully ported. For now return None (no lower
+        // bound enforced).
+        None
     }
 
     pub fn is_caught_up(&self) -> LedgerMasterCaughtUp {

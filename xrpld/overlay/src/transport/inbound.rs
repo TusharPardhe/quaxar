@@ -146,6 +146,19 @@ pub struct QueuedOverlayInboundHandler {
     /// proposal arrives. Removes the 50ms poll latency, matching rippled's
     /// strand-based immediate dispatch of proposals.
     proposal_notify: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Direct routing callback for proposals — sends directly to the strand's
+    /// proposal_tx channel instead of queuing. Matches rippled's event-driven
+    /// model where proposals are dispatched immediately to the strand.
+    #[allow(clippy::type_complexity)]
+    proposal_router: Mutex<Option<Box<dyn Fn(QueuedProposal) + Send + Sync>>>,
+    /// Direct routing callback for GetLedger requests — dispatches directly
+    /// to the JobQueue instead of queuing for the polling loop.
+    #[allow(clippy::type_complexity)]
+    get_ledger_router: Mutex<Option<Box<dyn Fn(PeerId, TmGetLedger) + Send + Sync>>>,
+    /// Direct routing callback for GetObjectByHash requests — dispatches
+    /// directly to the JobQueue instead of queuing for the polling loop.
+    #[allow(clippy::type_complexity)]
+    get_objects_router: Mutex<Option<Box<dyn Fn(PeerId, TmGetObjectByHash) + Send + Sync>>>,
 }
 
 impl Default for QueuedOverlayInboundHandler {
@@ -158,6 +171,9 @@ impl Default for QueuedOverlayInboundHandler {
             validation_notify_tx: Mutex::new(None),
             transaction_notify: Mutex::new(None),
             proposal_notify: Mutex::new(None),
+            proposal_router: Mutex::new(None),
+            get_ledger_router: Mutex::new(None),
+            get_objects_router: Mutex::new(None),
         }
     }
 }
@@ -211,6 +227,39 @@ impl QueuedOverlayInboundHandler {
             .is_some()
     }
 
+    /// Deliver packets that arrived before the direct router was installed.
+    ///
+    /// The overlay listener can begin receiving messages before bootstrap has
+    /// finished wiring the acquisition router. In that window `on_ledger_data`
+    /// stores packets in the fallback snapshot queue. Once a router exists,
+    /// those packets must be replayed instead of remaining invisible to the
+    /// acquisition registry.
+    pub fn drain_ledger_data_to_router(&self) -> usize {
+        let packets = self.take_ledger_data();
+        if packets.is_empty() {
+            return 0;
+        }
+
+        let router = self
+            .ledger_data_router
+            .lock()
+            .expect("ledger_data_router lock");
+        let Some(router) = router.as_ref() else {
+            self.inner
+                .lock()
+                .expect("overlay inbound lock")
+                .ledger_data
+                .extend(packets);
+            return 0;
+        };
+
+        let count = packets.len();
+        for packet in packets {
+            router(packet.peer_id, packet.message);
+        }
+        count
+    }
+
     /// Register the immediate transaction-dispatch callback. Matches
     /// reference PeerImp::handleTransaction, which calls
     /// JobQueue::addJob(JtTransaction, "RcvCheckTx", ...) synchronously on
@@ -243,6 +292,25 @@ impl QueuedOverlayInboundHandler {
     /// removing the 50ms poll latency.
     pub fn set_proposal_notify(&self, notify: Box<dyn Fn() + Send + Sync>) {
         *self.proposal_notify.lock().expect("proposal_notify lock") = Some(notify);
+    }
+
+    /// Set a direct routing callback for proposals. When set, `on_propose_ledger`
+    /// calls this instead of pushing to inner.proposals. This routes proposals
+    /// directly to the strand's proposal_tx channel.
+    pub fn set_proposal_router(&self, router: Box<dyn Fn(QueuedProposal) + Send + Sync>) {
+        *self.proposal_router.lock().expect("proposal_router lock") = Some(router);
+    }
+
+    /// Set a direct routing callback for GetLedger requests. When set,
+    /// `on_get_ledger` calls this instead of pushing to inner.get_ledgers.
+    pub fn set_get_ledger_router(&self, router: Box<dyn Fn(PeerId, TmGetLedger) + Send + Sync>) {
+        *self.get_ledger_router.lock().expect("get_ledger_router lock") = Some(router);
+    }
+
+    /// Set a direct routing callback for GetObjectByHash requests. When set,
+    /// `on_get_objects` calls this instead of pushing to inner.get_objects.
+    pub fn set_get_objects_router(&self, router: Box<dyn Fn(PeerId, TmGetObjectByHash) + Send + Sync>) {
+        *self.get_objects_router.lock().expect("get_objects_router lock") = Some(router);
     }
 
     /// Put validations back into the queue so they can be consumed by the
@@ -382,6 +450,14 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     }
 
     fn on_get_ledger(&self, peer: &Arc<PeerImp>, message: TmGetLedger) {
+        // Try direct router first — dispatches to JobQueue immediately
+        {
+            let guard = self.get_ledger_router.lock().expect("get_ledger_router lock");
+            if let Some(router) = guard.as_ref() {
+                router(peer.id(), message);
+                return;
+            }
+        }
         self.inner
             .lock()
             .expect("overlay inbound lock")
@@ -431,6 +507,20 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     }
 
     fn on_propose_ledger(&self, _peer: &Arc<PeerImp>, message: QueuedProposal) {
+        // Try direct router first — routes to strand's proposal_tx channel
+        {
+            let guard = self.proposal_router.lock().expect("proposal_router lock");
+            if let Some(router) = guard.as_ref() {
+                router(message);
+                // Still fire the notify so the strand wakes immediately
+                if let Ok(notify) = self.proposal_notify.lock() {
+                    if let Some(ref f) = *notify {
+                        f();
+                    }
+                }
+                return;
+            }
+        }
         self.inner
             .lock()
             .expect("overlay inbound lock")
@@ -488,6 +578,14 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     }
 
     fn on_get_objects(&self, peer: &Arc<PeerImp>, message: TmGetObjectByHash) {
+        // Try direct router first — dispatches to JobQueue immediately
+        {
+            let guard = self.get_objects_router.lock().expect("get_objects_router lock");
+            if let Some(router) = guard.as_ref() {
+                router(peer.id(), message);
+                return;
+            }
+        }
         self.inner
             .lock()
             .expect("overlay inbound lock")

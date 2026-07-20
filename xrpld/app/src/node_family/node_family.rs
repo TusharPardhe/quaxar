@@ -29,6 +29,12 @@ pub struct NodeSizeResourceProfile {
     pub tree_cache_size: usize,
     pub tree_cache_age_seconds: i64,
     pub ledger_fetch: usize,
+    /// rippled SizedItem::SweepInterval — how often doSweep runs (seconds).
+    pub sweep_interval_seconds: u64,
+    /// rippled kFullBelowTargetSize (constant 524288 in Tuning.h).
+    pub full_below_target_size: usize,
+    /// rippled kFullBelowExpiration (constant 10 minutes in Tuning.h).
+    pub full_below_expiration_seconds: i64,
 }
 
 impl NodeSizeResourceProfile {
@@ -43,26 +49,42 @@ impl NodeSizeResourceProfile {
                 tree_cache_size: 262_144,
                 tree_cache_age_seconds: 30,
                 ledger_fetch: 2,
+                sweep_interval_seconds: 10,
+                full_below_target_size: 524_288,
+                full_below_expiration_seconds: 600,
             },
             "small" => Self {
                 tree_cache_size: 524_288,
                 tree_cache_age_seconds: 60,
                 ledger_fetch: 3,
+                sweep_interval_seconds: 30,
+                full_below_target_size: 524_288,
+                full_below_expiration_seconds: 600,
             },
             "large" => Self {
                 tree_cache_size: 4_194_304,
                 tree_cache_age_seconds: 120,
                 ledger_fetch: 5,
+                sweep_interval_seconds: 90,
+                full_below_target_size: 524_288,
+                full_below_expiration_seconds: 600,
             },
             "huge" => Self {
                 tree_cache_size: 8_388_608,
                 tree_cache_age_seconds: 900,
                 ledger_fetch: 8,
+                sweep_interval_seconds: 120,
+                full_below_target_size: 524_288,
+                full_below_expiration_seconds: 600,
             },
             _ => Self {
+                // medium (default)
                 tree_cache_size: 2_097_152,
                 tree_cache_age_seconds: 90,
                 ledger_fetch: 4,
+                sweep_interval_seconds: 60,
+                full_below_target_size: 524_288,
+                full_below_expiration_seconds: 600,
             },
         }
     }
