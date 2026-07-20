@@ -3143,6 +3143,21 @@ fn seed_startup_ledger_state(
     root.on_closed_ledger(Arc::clone(&closed));
     root.on_published_ledger(Arc::clone(&closed));
 
+    // Persist genesis state nodes to NuDB so overlay sessions can serve them.
+    // Without this, release_maps_to_disk (called by on_closed_ledger) evicts
+    // the nodes from memory, and subsequent reads fail with MissingNode because
+    // the nodes were never written to the store.
+    if root.node_store().is_some() {
+        if let Some(writer) = root.node_writer_from_store() {
+            let mut genesis_copy = closed.as_ref().clone();
+            genesis_copy.set_node_writer(writer);
+            genesis_copy.state_map_mut().set_backed();
+            genesis_copy.tx_map_mut().set_backed();
+            genesis_copy.persist_dirty_nodes_to_store();
+            tracing::info!(target: "bootstrap", seq = closed.header().seq, "Genesis state nodes persisted to NuDB");
+        }
+    }
+
     // ledger header to SQLite so that subsequent loads can find it.
     if let Some(relational) = root.relational_database() {
         if let Ok(accepted) = ledger::AcceptedLedger::new(Arc::clone(&closed)) {
