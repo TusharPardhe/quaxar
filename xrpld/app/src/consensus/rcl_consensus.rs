@@ -379,7 +379,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 .get_cached_ledger_by_hash(hash)
                 .map(|l| l.header().seq)
                 .unwrap_or(0);
-            shared.acquire_for_consensus(*ledger_id, seq);
+            shared.acquire_async(*ledger_id, seq, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
         }
         None
     }
@@ -887,7 +887,7 @@ impl AppConsensus {
                                             )
                                             .map(|l| l.header().seq)
                                             .unwrap_or(0);
-                                        shared.acquire_for_consensus(network_closed, seq);
+                                        shared.acquire_async(network_closed, seq, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
                                     }
                                 }
                                 None

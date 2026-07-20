@@ -46,7 +46,6 @@ pub use ledger::{
     inbound_ledgers::*,
     ledger_history::*, ledger_master_runtime::*, ledger_master_state::*,
     ledger_persistence_runtime::*, loaded_ledger_runtime::*, open_ledger::*,
-    shared_inbound_ledgers::*,
 };
 pub use ledger_to_json::{ledger_to_json_context::*, ledger_to_json_entrypoint::*};
 pub use load::{deliver_max::*, fee_vote::*, load_fee_track::*, load_manager::*};

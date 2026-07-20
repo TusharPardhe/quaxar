@@ -990,8 +990,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         .as_ref()
         .and_then(|lm_rt| lm_rt.shared_inbound_ledgers.lock().ok()?.clone())
         .unwrap_or_else(|| {
-            Arc::new(crate::ledger::shared_inbound_ledgers::SharedInboundLedgers::new(
-                Arc::new(Mutex::new(std::collections::HashMap::new())),
+            Arc::new(crate::ledger::inbound_ledgers::InboundLedgers::new(
                 Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
                     "driver-tc",
                     1024,
@@ -1009,7 +1008,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                     time::Duration::seconds(120),
                     basics::tagged_cache::MonotonicClock::default(),
                 )),
-                Arc::new(crate::ledger::shared_inbound_ledgers::RunDataLimiter::new(4)),
+                Arc::new(crate::ledger::inbound_ledgers::RunDataLimiter::new(4)),
                 Arc::new(basics::tagged_cache::KeyCache::new(
                     "driver-dedup",
                     1024,
@@ -1031,7 +1030,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
     if let Some(ns) = runtime.root().node_store().as_ref() {
         shared_inbound.set_node_store(ns.clone());
         let pending_writes = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let (write_tx, _write_handle) = crate::ledger::shared_inbound_ledgers::spawn_nodestore_writer(ns.clone(), Arc::clone(&pending_writes));
+        let (write_tx, _write_handle) = crate::ledger::inbound_ledgers::spawn_nodestore_writer(ns.clone(), Arc::clone(&pending_writes));
         shared_inbound.set_write_tx(write_tx);
         shared_inbound.set_pending_writes(pending_writes);
     }
@@ -1512,7 +1511,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let pending = lm_rt.take_pending_consensus_ledger();
             if let Some(hash) = pending {
-                shared_inbound.acquire(hash, 0);
+                shared_inbound.acquire_async(hash, 0, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
             }
         }
 
@@ -1750,7 +1749,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                         if !hash.is_zero() {
                             let sha_hash = basics::sha_map_hash::SHAMapHash::new(hash);
                             if lm.ledger_history().get_cached_ledger_by_hash(sha_hash).is_none() {
-                                shared_inbound.acquire(hash, missing);
+                                shared_inbound.acquire_async(hash, missing, crate::ledger::inbound_ledgers::AcquireReason::History);
                             }
                         }
                     }

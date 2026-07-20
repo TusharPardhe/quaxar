@@ -21,7 +21,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use overlay::QueuedValidation;
 use protocol::STValidation;
 
-use crate::ledger::shared_inbound_ledgers::SharedInboundLedgers;
+use crate::ledger::inbound_ledgers::InboundLedgers;
 use crate::state::application_root::ApplicationRoot;
 
 /// An event fed into the consensus driver's event loop.
@@ -63,7 +63,7 @@ fn parse_validation(bytes: &[u8]) -> Option<STValidation> {
 /// [`ConsensusEvent`]s from `event_rx` until `stop` is set, dispatching
 /// validations into `NetworkOPs`-equivalent ingress and newly-completed
 /// ledgers into ledger-history bookkeeping.
-pub fn spawn_event_loop(app: ApplicationRoot, shared_inbound: Arc<SharedInboundLedgers>, event_rx: Receiver<ConsensusEvent>, stop: Arc<AtomicBool>) {
+pub fn spawn_event_loop(app: ApplicationRoot, shared_inbound: Arc<InboundLedgers>, event_rx: Receiver<ConsensusEvent>, stop: Arc<AtomicBool>) {
     std::thread::Builder::new()
         .name("consensus-event-loop".into())
         .spawn(move || {

@@ -30,7 +30,7 @@ pub struct AppLedgerMasterRuntime {
     pub(crate) completed_ledgers_rx:
         Arc<Mutex<Option<std::sync::mpsc::Receiver<Arc<ledger::Ledger>>>>>,
     pub shared_inbound_ledgers:
-        Arc<Mutex<Option<Arc<crate::ledger::shared_inbound_ledgers::SharedInboundLedgers>>>>,
+        Arc<Mutex<Option<Arc<crate::ledger::inbound_ledgers::InboundLedgers>>>>,
 }
 
 const APP_LEDGER_MASTER_MAX_PUBLISH_GAP: u32 = 100;

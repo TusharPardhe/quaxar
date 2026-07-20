@@ -4578,16 +4578,13 @@ impl<D> BoundServerRuntime<D> {
                 }
                 }
 
-                // Create SharedInboundLedgers for the consensus driver.
-                let shared_inbound_registry: app::ledger::shared_inbound_ledgers::AcqRegistry =
-                    Arc::new(Mutex::new(HashMap::new()));
+                // Create InboundLedgers for the consensus driver.
                 let shared_inbound = Arc::new(
-                    app::ledger::shared_inbound_ledgers::SharedInboundLedgers::new(
-                        Arc::clone(&shared_inbound_registry),
+                    app::ledger::inbound_ledgers::InboundLedgers::new(
                         Arc::clone(&shared_tree_cache),
                         Arc::clone(&shared_full_below),
                         Arc::clone(&shared_fetch_pack),
-                        Arc::new(app::ledger::shared_inbound_ledgers::RunDataLimiter::new(
+                        Arc::new(app::ledger::inbound_ledgers::RunDataLimiter::new(
                             catchup_profile.run_data_concurrency,
                         )),
                         Arc::new(basics::tagged_cache::KeyCache::new(
