@@ -709,13 +709,15 @@ impl Ledger {
                 ..LedgerHeader::default()
             },
             state_map: {
-                let mut sm = prev_ledger.state_map.share_root_snapshot();
-                // Mark unbacked so mutations traverse only in-memory nodes.
-                // All loaded nodes from the parent tree are reachable via the
-                // shared root. This prevents traversal failures when the
-                // node_fetcher can't resolve hash-only references during COW
-                // operations on the child tree.
-                sm.set_unbacked();
+                let sm = prev_ledger.state_map.share_root_snapshot();
+                // Inherit the parent's backed flag. When the parent is backed
+                // (nodes persisted to NuDB) and has a node_fetcher, the child
+                // must also be backed so that read operations (e.g.
+                // update_skip_list) can resolve nodes via the fetcher after
+                // release_maps_to_disk has evicted in-memory children.
+                // Mutations go through MutableTree which always passes
+                // backed=true and its own fetch callback independently of
+                // this flag, so COW is not affected.
                 sm
             },
             tx_map: SyncTree::new_with_type(SHAMapType::Transaction, true, 0),

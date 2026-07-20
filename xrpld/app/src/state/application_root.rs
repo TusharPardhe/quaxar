@@ -2573,7 +2573,16 @@ impl ApplicationRoot {
                 + Sync,
         >,
     > {
-        let ns = self.node_store().as_ref()?.clone();
+        // Try the local registry node_store first; fall back to the shared
+        // consensus node store (Arc<RwLock>) which is populated by
+        // attach_node_store after the consensus adaptor's ApplicationRoot
+        // clone was created.
+        let ns = self.node_store().as_ref().cloned().or_else(|| {
+            self.shared_consensus_node_store
+                .read()
+                .ok()
+                .and_then(|guard| guard.clone())
+        })?;
         let node_family = self.node_family();
         Some(std::sync::Arc::new(move |hash| {
             if let Some(family) = node_family.as_ref()
@@ -3882,9 +3891,7 @@ impl ApplicationRoot {
             ledger.state_map().backed(),
             ledger.tx_map().backed()
         );
-        if let Some(fetcher) = fetcher
-            && (has_shared_family || !ledger_with_fetcher.has_node_fetcher())
-        {
+        if let Some(fetcher) = fetcher {
             ledger_with_fetcher.set_node_fetcher(fetcher);
         }
         if let Some(writer) = writer
@@ -4877,6 +4884,15 @@ impl ApplicationRoot {
         txns: Vec<Arc<protocol::STTx>>,
     ) -> Result<u32, String> {
         let parent_ledger = self.closed_ledger().or_else(|| self.validated_ledger());
+        // Ensure the parent ledger has a node_fetcher attached. The
+        // closed_ledger slot may hold a ledger whose fetcher was not set
+        // (e.g. when check_accept_ledger promotes an acquired ledger via
+        // on_closed_ledger but ledger_with_node_fetcher skips re-attaching
+        // the store fetcher due to the existing acquisition-time fetcher
+        // being dropped). Without a fetcher, build_ledger_from_view's
+        // update_skip_list fails with MissingNode on the first traversal
+        // into a released subtree.
+        let parent_ledger = parent_ledger.map(|l| self.ledger_with_node_fetcher(l));
 
         let closed_seq = parent_ledger
             .as_ref()
