@@ -388,9 +388,17 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
     }
 
     fn on_close(&self, prev_ledger: &Self::Ledger, now: NetClockTimePoint, _mode: ConsensusMode) -> consensus::algorithm::consensus::ConsensusResultOf<Self> {
-        let _ = self.app_root.apply_network_ops_pending_to_open_ledger();
-
-        let txs = RclConsensusOpenLedgerSource::current_open_transactions(&self.open_ledger);
+        // Acquire the close gate to prevent the tx-batch-apply thread from
+        // applying transactions while we capture the open ledger's transaction
+        // set. This matches rippled's single-strand guarantee where timerEntry
+        // (which calls onClose) and the batch-apply path cannot interleave.
+        let txs = {
+            let _close_guard = self.app_root.close_gate().lock()
+                .expect("close_gate mutex must not be poisoned");
+            let _ = self.app_root.apply_network_ops_pending_to_open_ledger();
+            RclConsensusOpenLedgerSource::current_open_transactions(&self.open_ledger)
+        };
+        // close_gate released — batch-apply can resume while we build the set.
         let mut set = consensus::RclTxSet::new(Arc::clone(&self.tx_set_cache), prev_ledger.seq() + 1);
         {
             let mut editable = set.mutable_view();
@@ -607,6 +615,14 @@ impl AppConsensus {
             work.txns,
         ) {
             Ok(_) => {
+                // Clear pending transactions from the network ops queue to
+                // prevent stale txns from contaminating the next consensus
+                // round. Matches rippled's endConsensus which clears the
+                // submission queue after a successful accept.
+                if let Some(network_ops_rt) = root.network_ops_runtime() {
+                    network_ops_rt.clear_pending_transactions();
+                }
+
                 // Broadcast StatusChange (neACCEPTED_LEDGER) and sign/publish validation.
                 if let Some(closed) = root.closed_ledger() {
                     let hdr = closed.header();

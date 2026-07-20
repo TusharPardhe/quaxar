@@ -1204,7 +1204,15 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                             }
                         }
                     }
+                    // Acquire close_gate: if on_close is capturing the
+                    // transaction set for consensus, skip this iteration to
+                    // avoid racing the open ledger capture. Matches rippled's
+                    // single-strand guarantee where the batch-apply path and
+                    // timerEntry (which calls onClose) cannot interleave.
+                    let _close_guard = batch_root.close_gate().lock()
+                        .expect("close_gate mutex must not be poisoned");
                     let report = batch_root.apply_network_ops_pending_to_open_ledger();
+                    drop(_close_guard);
                     let applied = report.as_ref().map_or(0, |r| r.entries.len());
                     let overlay_empty = batch_overlay.as_ref()
                         .map_or(true, |o| o.queued_inbound().transaction_count() == 0);
