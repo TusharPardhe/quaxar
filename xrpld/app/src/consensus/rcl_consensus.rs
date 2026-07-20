@@ -667,34 +667,39 @@ impl AppConsensus {
                 let closed = root.closed_ledger();
                 if let Some(closed) = closed {
                     let closed_id = *closed.header().hash.as_uint256();
-                    let network_closed = if let Some(ort) = root.overlay_runtime() {
-                        use overlay::Overlay;
-                        let peers = ort.overlay().active_peers();
-                        if peers.len() >= 3 {
-                            let mut counts = std::collections::HashMap::<Uint256, u32>::new();
-                            *counts.entry(closed_id).or_insert(0) += 1;
+                    let network_closed = {
+                        // Build peer_counts from overlay peers (used as tie-breaker input).
+                        let mut peer_counts = std::collections::BTreeMap::<Uint256, u32>::new();
+                        if let Some(ort) = root.overlay_runtime() {
+                            use overlay::Overlay;
+                            let peers = ort.overlay().active_peers();
                             for peer in &peers {
                                 let h = peer.closed_ledger_hash();
                                 if !h.is_zero() {
-                                    *counts.entry(h).or_insert(0) += 1;
+                                    *peer_counts.entry(h).or_insert(0) += 1;
                                 }
                             }
-                            let preferred = counts.iter()
-                                .max_by_key(|(_, c)| *c)
-                                .map(|(h, _)| *h)
-                                .unwrap_or(closed_id);
-                            if preferred != closed_id
-                                && preferred != *closed.header().parent_hash.as_uint256()
-                            {
-                                preferred
-                            } else {
-                                closed_id
-                            }
+                        }
+
+                        // Use the validation trie to determine the preferred LCL.
+                        // This consults trusted validations first, using peer_counts
+                        // only as a tie-breaker — matching rippled's getPreferredLCL.
+                        let wrapped_lcl = crate::consensus::rcl_validation::RclValidatedLedger::from_ledger(&closed);
+                        let min_seq = self.adaptor.ledger_master_runtime.ledger_master().valid_ledger_seq();
+                        let preferred = RclConsensusValidationSource::preferred_lcl(
+                            &self.adaptor.validations,
+                            &wrapped_lcl,
+                            min_seq,
+                            &peer_counts,
+                        );
+
+                        if preferred != closed_id
+                            && preferred != *closed.header().parent_hash.as_uint256()
+                        {
+                            preferred
                         } else {
                             closed_id
                         }
-                    } else {
-                        closed_id
                     };
 
                     let round_ledger = if network_closed != closed_id {

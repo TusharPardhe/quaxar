@@ -300,14 +300,21 @@ pub fn handle_new_validation_with_store(
 
     let mut check_accept_args = None;
     if status == consensus::ValidationStatus::Current {
-        if !bypass_accept {
-            // Matches the reference: `validations.add()` fully returns
-            // (releasing its internal lock) BEFORE `checkAccept` runs --
-            // they are sequential, not nested. Returning the args here
-            // instead of invoking the sink directly lets the caller run
-            // it AFTER releasing the validations lock it's holding,
-            // avoiding a self-deadlock (num_trusted_for_ledger inside
-            // check_accept needs to re-lock the same mutex).
+        if !bypass_accept && validation.is_trusted() {
+            // Matches the reference (RCLValidations.cpp:193):
+            // `if (outcome == ValStatus::current && isTrusted)`
+            //     `app.getLedgerMaster().checkAccept(...)`.
+            // Only trusted current validations trigger checkAccept;
+            // untrusted validations are tracked but must not drive
+            // ledger acquisition or acceptance decisions.
+            //
+            // `validations.add()` fully returns (releasing its internal
+            // lock) BEFORE `checkAccept` runs -- they are sequential,
+            // not nested. Returning the args here instead of invoking
+            // the sink directly lets the caller run it AFTER releasing
+            // the validations lock it's holding, avoiding a
+            // self-deadlock (num_trusted_for_ledger inside check_accept
+            // needs to re-lock the same mutex).
             check_accept_args = Some((
                 validation.get_ledger_hash(),
                 validation.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence")),

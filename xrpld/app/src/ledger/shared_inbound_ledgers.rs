@@ -1005,13 +1005,6 @@ fn run_acquisition_worker(
                  // for the full state tree without eviction during a single acquisition
     );
 
-    let acquisition_cache = Arc::new(TreeNodeCache::new(
-        "acq-worker",
-        100_000_000,
-        time::Duration::seconds(3600),
-        basics::tagged_cache::MonotonicClock::default(),
-    ));
-
     loop {
         let msgs = {
             let mut queue = shared_queue.lock().expect("acq queue");
@@ -1093,7 +1086,7 @@ fn run_acquisition_worker(
         // explanation of the bug this previously caused.
 
         let family = SHAMapFamily::new(
-            acquisition_cache.clone(),
+            shared_tree_cache.clone(),
             &worker_full_below,
             WorkerNodeFetcher {
                 node_store: ns.clone(),
@@ -1347,7 +1340,7 @@ fn run_acquisition_worker(
             // All nodes are now persisted in NuDB. Clear pending_writes to
             // free RAM. The node_fetcher falls through to NuDB for reads.
             shared_pending_writes.lock().expect("pending writes lock").clear();
-            tracing::info!(target: "inbound_ledger", acq_cache_size = acquisition_cache.size(), "SHARED LEDGER ACQUIRED: acquisition complete, cache will drop on worker exit");
+            tracing::info!(target: "inbound_ledger", acq_cache_size = shared_tree_cache.size(), "SHARED LEDGER ACQUIRED: acquisition complete");
             // Attach a node_fetcher so reads can resolve nodes from NuDB.
             // Without this, any state/tx map traversal hits MissingNode
             // because the SyncTree only has root+inner nodes in memory but
@@ -1429,7 +1422,7 @@ fn run_acquisition_worker(
             // All nodes are now persisted in NuDB. Clear pending_writes to
             // free RAM. The node_fetcher falls through to NuDB for reads.
             shared_pending_writes.lock().expect("pending writes lock").clear();
-            tracing::info!(target: "inbound_ledger", acq_cache_size = acquisition_cache.size(), "SHARED LEDGER ACQUIRED: acquisition complete, cache will drop on worker exit");
+            tracing::info!(target: "inbound_ledger", acq_cache_size = shared_tree_cache.size(), "SHARED LEDGER ACQUIRED: acquisition complete");
             // Attach node_fetcher (same as primary path above)
             {
                 let fetcher_ns = ns.clone();

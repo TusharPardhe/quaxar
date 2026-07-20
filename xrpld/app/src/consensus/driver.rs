@@ -81,7 +81,24 @@ pub fn spawn_event_loop(app: ApplicationRoot, shared_inbound: Arc<SharedInboundL
                             tracing::warn!(target: "consensus", peer = ?queued.peer_id, "dropped malformed validation");
                             continue;
                         };
-                        let _ = app.receive_validation_to_network_ops_with_accept(&mut validation, "peer", &app);
+                        let report = app.receive_validation_to_network_ops_with_accept(&mut validation, "peer", &app);
+                        // Matches the reference's relay decision: after
+                        // processing, relay the validation to other peers
+                        // if the report indicates it should be relayed
+                        // (trusted validations are always relayed;
+                        // untrusted only when relay_untrusted_validations
+                        // is configured).
+                        if let Some(report) = report {
+                            if report.relay {
+                                if let Some(overlay_rt) = app.overlay_runtime() {
+                                    overlay_rt.overlay().relay_validation(
+                                        queued.message.clone(),
+                                        queued.suppression,
+                                        *validation.get_signer_public(),
+                                    );
+                                }
+                            }
+                        }
                     }
                     ConsensusEvent::LedgerDone(ledger) => {
                         if let Some(runtime) = app.ledger_master_runtime() {

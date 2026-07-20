@@ -4080,6 +4080,7 @@ impl ApplicationRoot {
                     );
                     self.on_published_ledger(Arc::clone(ledger));
                     lm_rt.ledger_master().set_pub_ledger(Arc::clone(ledger));
+                    self.set_need_network_ledger(false);
                 }
             }
             AppLedgerMasterPublishAdvance::GapTooLarge => {
@@ -4091,6 +4092,7 @@ impl ApplicationRoot {
                     );
                     self.on_published_ledger(Arc::clone(ledger));
                     lm_rt.ledger_master().set_pub_ledger(Arc::clone(ledger));
+                    self.set_need_network_ledger(false);
                 }
             }
             AppLedgerMasterPublishAdvance::Sequential => {
@@ -4102,6 +4104,9 @@ impl ApplicationRoot {
                     );
                     self.on_published_ledger(Arc::clone(ledger));
                     lm_rt.ledger_master().set_pub_ledger(Arc::clone(ledger));
+                }
+                if !report.published.is_empty() {
+                    self.set_need_network_ledger(false);
                 }
                 // If there's a missing ledger, trigger acquisition
                 if let Some(missing) = report.missing {
@@ -4395,7 +4400,6 @@ impl ApplicationRoot {
         lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
         lm.mark_ledger_complete(validated.header().seq);
         self.note_validated_ledger_for_sync(Arc::clone(&validated));
-        self.set_need_network_ledger(false);
 
         // Disable the cold-start single-worker gate so subsequent
         // incremental acquisitions can proceed concurrently.
