@@ -3282,10 +3282,10 @@ impl<D> BoundServerRuntime<D> {
                             }
                     }
 
-                    // Trigger parallel InboundLedger acquisitions for ALL unique
-                    // peer hashes we don't have (matching rippled which manages
-                    // many concurrent InboundLedgers). This enables catching up
-                    // at the rate peers advance rather than one-at-a-time.
+                    // Trigger parallel InboundLedger acquisitions for peer
+                    // hashes we don't have. Use the peer's max ledger seq
+                    // (from ledger_range) so the acquisition knows the
+                    // target ledger height — seq=0 causes infinite cycling.
                     if let Some(lm_rt) = app.ledger_master_runtime()
                         && let Some(overlay_rt) = app.overlay_runtime() {
                             use overlay::Overlay as _;
@@ -3293,14 +3293,15 @@ impl<D> BoundServerRuntime<D> {
                                 .map(|l| *l.header().hash.as_uint256())
                                 .unwrap_or_default();
                             let peers = overlay_rt.overlay().active_peers();
-                            // Acquire ALL unique peer hashes we don't already have
                             let mut triggered = 0usize;
                             for p in peers.iter() {
                                 let h = p.closed_ledger_hash();
+                                let (_, peer_max) = p.ledger_range();
                                 if !h.is_zero() && h != our_hash
+                                    && peer_max > 1
                                     && !shared_inbound.contains(&h)
                                 {
-                                    shared_inbound.acquire(h, 0, app::ledger::inbound_ledgers::AcquireReason::Generic);
+                                    shared_inbound.acquire(h, peer_max, app::ledger::inbound_ledgers::AcquireReason::Generic);
                                     triggered += 1;
                                 }
                             }

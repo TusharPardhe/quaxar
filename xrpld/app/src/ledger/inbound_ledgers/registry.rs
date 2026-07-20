@@ -83,7 +83,7 @@ struct RegistryInner {
 /// Matches rippled's InboundLedgers: one entry per hash, touch-on-access,
 /// sweep idle entries, route peer responses, fixed worker pool.
 pub struct InboundLedgers {
-    inner: Mutex<RegistryInner>,
+    inner: Arc<Mutex<RegistryInner>>,
     worker_pool: Arc<WorkerPool>,
     // Shared resources for creating acquisitions
     node_store: Arc<RwLock<Option<SHAMapStoreNodeStore>>>,
@@ -116,8 +116,17 @@ impl InboundLedgers {
         let timer_stop = Arc::new(AtomicBool::new(false));
         let pool = Arc::new(WorkerPool::new(MAX_CONCURRENT));
 
-        // Spawn timer thread: periodically submits tick jobs for all active
-        // acquisitions (drives re-requests for stalled fetches).
+        // Shared inner for the timer thread to iterate active entries.
+        let inner = Arc::new(Mutex::new(RegistryInner {
+            entries: HashMap::new(),
+            recent_failures: HashMap::new(),
+        }));
+        let inner_for_timer = Arc::clone(&inner);
+
+        // Spawn timer thread: iterates active acquisitions and submits tick
+        // jobs for each. This is critical: without it, idle acquisitions go
+        // permanently dormant because process_acquisition_tick only
+        // self-resubmits when data was processed.
         let timer_stop_clone = Arc::clone(&timer_stop);
         let timer_pool = Arc::clone(&pool);
         let timer_handle = thread::Builder::new()
@@ -128,25 +137,34 @@ impl InboundLedgers {
                     if timer_stop_clone.load(Ordering::Acquire) {
                         break;
                     }
-                    // Collect active states via the pool queue trick:
-                    // We can't access InboundLedgers inner from here, so we
-                    // rely on each AcquisitionState having a reference to the
-                    // pool queue. The timer just needs to wake the pool.
-                    // In practice, timer ticks work because acquire_inner
-                    // already started the first tick and process_acquisition_tick
-                    // re-submits if data was processed. For truly idle
-                    // acquisitions, the timer nudges via condvar wake.
-                    let (_, cvar) = &*timer_pool.queue();
-                    cvar.notify_all();
+                    // Submit a tick for each active acquisition so the timer
+                    // check inside process_acquisition_tick fires.
+                    // We clone the Arcs while holding inner, then release
+                    // inner before calling submit_tick (which acquires the
+                    // work pool lock — must not hold inner at the same time).
+                    let active_states: Vec<_> = {
+                        let inner = inner_for_timer.lock().expect("timer inner lock");
+                        inner
+                            .entries
+                            .values()
+                            .filter(|e| {
+                                !e.failed
+                                    && e.completed_ledger.is_none()
+                                    && !e.state.stopped.load(Ordering::Acquire)
+                                    && !e.state.completed.load(Ordering::Acquire)
+                            })
+                            .map(|e| Arc::clone(&e.state))
+                            .collect()
+                    };
+                    for state in &active_states {
+                        state.submit_tick();
+                    }
                 }
             })
             .expect("timer thread");
 
         Self {
-            inner: Mutex::new(RegistryInner {
-                entries: HashMap::new(),
-                recent_failures: HashMap::new(),
-            }),
+            inner,
             worker_pool: pool,
             node_store: Arc::new(RwLock::new(None)),
             tree_cache,
