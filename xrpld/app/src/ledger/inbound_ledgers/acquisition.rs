@@ -16,10 +16,10 @@ use ledger::{
 use overlay::Peer;
 use shamap::family::{FullBelowCache, FullBelowCacheImpl, NullMissingNodeReporter, SHAMapFamily};
 use shamap::tree_node_cache::TreeNodeCache;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
@@ -114,7 +114,7 @@ impl InboundLedgerJournal for WorkerJournal {
     }
 }
 
-struct WorkerFetchPack {
+pub(crate) struct WorkerFetchPack {
     cache: Arc<FetchPackCache>,
 }
 impl FetchPackContainer for WorkerFetchPack {
@@ -312,7 +312,7 @@ impl InboundLedgerStore for WorkerStore {
 pub struct AcqMutableState {
     pub inbound: InboundLedgerLocal,
     pub store: WorkerStore,
-    pub fetch_pack: WorkerFetchPack,
+    pub(crate) fetch_pack: WorkerFetchPack,
     pub first_add_peers: bool,
     pub last_timer: Instant,
     pub just_processed: bool,

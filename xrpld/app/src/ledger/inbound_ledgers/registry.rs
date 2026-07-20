@@ -63,6 +63,7 @@ struct Entry {
     reason: AcquireReason,
     state: Arc<AcquisitionState>,
     last_touched: Instant,
+    #[allow(dead_code)]
     started_at: Instant,
     completed_ledger: Option<Arc<Ledger>>,
     failed: bool,

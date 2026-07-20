@@ -21,7 +21,7 @@ use ledger::{
 };
 use nodestore::{FetchType, ManagerImp, NodeObjectType as NodeStoreObjectType};
 use protocol::{
-    JsonValue, REGISTERED_FEATURES, RegisteredFeatureVote, STLedgerEntry, STParsedJSONObject, STTx,
+    JsonValue, REGISTERED_FEATURES, STLedgerEntry, STParsedJSONObject, STTx,
     SerialIter, TxMeta, feature_id,
 };
 use rusqlite::{OptionalExtension, params};
