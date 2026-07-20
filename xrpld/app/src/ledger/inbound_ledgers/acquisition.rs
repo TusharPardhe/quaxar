@@ -616,7 +616,7 @@ fn process_acquisition_tick(state: &Arc<AcquisitionState>) {
         NullMissingNodeReporter,
     );
 
-    if fetch_pack_ready_flag {
+    if fetch_pack_ready_flag || *first_add_peers {
         inbound.check_local_with_family_and_config(
             &journal, &config, store, fetch_pack, &family,
         );
