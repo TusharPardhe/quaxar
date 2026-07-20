@@ -1225,25 +1225,38 @@ impl SharedInboundLedgers {
             .filter(|e| e.state_flag == EntryState::InProgress)
             .count();
         if in_progress_count >= MAX_CONCURRENT_ACQUISITIONS {
-            let lowest_seq_hash = inner
+            // Only evict if the new acquisition has a known seq that is
+            // higher priority than the lowest in-flight. With seq=0 (unknown)
+            // we cannot make a priority decision — just wait for existing
+            // acquisitions to finish rather than thrashing.
+            let lowest = inner
                 .entries
                 .iter()
                 .filter(|(_, e)| e.state_flag == EntryState::InProgress)
-                .min_by_key(|(_, e)| e.seq)
-                .map(|(h, _)| *h);
-            if let Some(evict_hash) = lowest_seq_hash {
-                if let Some(evicted) = inner.entries.remove(&evict_hash) {
-                    evicted.state.stopped.store(true, Ordering::Release);
-                    tracing::debug!(target: "inbound_ledger",
-                        evicted_seq = evicted.seq,
-                        evicted_hash = %evict_hash,
-                        new_seq = seq,
-                        new_hash = %hash,
-                        "Evicting lowest-seq acquisition to bound concurrency"
-                    );
-                }
-                self.registry.lock().expect("acq registry").remove(&evict_hash);
+                .min_by_key(|(_, e)| e.seq);
+            let should_evict = match lowest {
+                Some((_, e)) if seq > 0 && e.seq < seq => true,
+                _ => false,
+            };
+            if !should_evict {
+                tracing::trace!(target: "inbound_ledger",
+                    %hash, seq, in_progress_count,
+                    "acquire: at capacity, waiting for existing acquisitions"
+                );
+                return;
             }
+            let evict_hash = lowest.map(|(h, _)| *h).unwrap();
+            if let Some(evicted) = inner.entries.remove(&evict_hash) {
+                evicted.state.stopped.store(true, Ordering::Release);
+                tracing::debug!(target: "inbound_ledger",
+                    evicted_seq = evicted.seq,
+                    evicted_hash = %evict_hash,
+                    new_seq = seq,
+                    new_hash = %hash,
+                    "Evicting lowest-seq acquisition to bound concurrency"
+                );
+            }
+            self.registry.lock().expect("acq registry").remove(&evict_hash);
         }
 
         // Validate required resources

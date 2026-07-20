@@ -475,7 +475,7 @@ impl InboundLedgerLocal {
 
     pub fn new_with_reason(hash: SHAMapHash, seq: u32, reason: InboundLedgerReason) -> Self {
         let ledger_hash = hash;
-        tracing::info!(target: "ledger", seq, hash = %ledger_hash, "Ledger acquisition started");
+        tracing::debug!(target: "ledger", seq, hash = %ledger_hash, "Ledger acquisition started");
         Self {
             hash,
             seq,
