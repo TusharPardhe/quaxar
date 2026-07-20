@@ -274,7 +274,7 @@ impl Drop for AcquisitionWorkPool {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const REACQUIRE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 const STUCK_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_ACQUISITIONS: usize = 8;
 /// Timer tick interval for stall detection and re-requests.

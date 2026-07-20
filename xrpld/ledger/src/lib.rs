@@ -1848,7 +1848,7 @@ impl Ledger {
         {
             let seq = self.header.seq;
             let hash = self.header.account_hash;
-            tracing::info!(target: "ledger", seq, account_hash = %hash, tx_hash = %self.header.tx_hash, "Ledger immutable — hashes computed");
+            tracing::debug!(target: "ledger", seq, account_hash = %hash, tx_hash = %self.header.tx_hash, "Ledger immutable — hashes computed");
         }
     }
 
