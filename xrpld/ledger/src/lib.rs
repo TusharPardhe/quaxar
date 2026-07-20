@@ -2241,12 +2241,34 @@ impl Ledger {
             return Ok(());
         }
 
+        let seq = self.header.seq;
+        let backed = self.state_map.backed();
+        let has_fetcher = self.node_fetcher.is_some();
+        let has_mutable = self.mutable_state.is_some();
+        tracing::debug!(
+            target: "ledger",
+            seq,
+            backed,
+            has_fetcher,
+            has_mutable,
+            "[skip_list] update_skip_list enter"
+        );
+
         let prev_index = self.header.seq - 1;
 
         // Per-256 skip list (one per 256-ledger range)
         if (prev_index & 0xff) == 0 {
             let keylet = skip_keylet_for_ledger(prev_index);
-            if let Ok(Some(sle)) = self.peek(keylet) {
+            let peek_result = self.peek(keylet);
+            tracing::debug!(
+                target: "ledger",
+                seq,
+                key = %keylet.key,
+                found = peek_result.as_ref().map(|r| r.is_some()).unwrap_or(false),
+                err = peek_result.is_err(),
+                "[skip_list] per-256 skip list peek"
+            );
+            if let Ok(Some(sle)) = peek_result {
                 let mut hashes = sle.get_field_v256(get_field_by_symbol("sfHashes"));
                 assert!(hashes.value().len() <= 256);
                 hashes.push_back(*self.header.parent_hash.as_uint256());
@@ -2254,22 +2276,35 @@ impl Ledger {
                 obj.set_field_v256(get_field_by_symbol("sfHashes"), hashes);
                 obj.set_field_u32(get_field_by_symbol("sfLastLedgerSequence"), prev_index);
                 let updated = Arc::new(STLedgerEntry::from_stobject(obj, keylet.key));
-                self.raw_replace(updated)
-                    .map_err(|e| MutationError::Traversal(e.into()))?;
+                tracing::debug!(target: "ledger", seq, key = %keylet.key, "[skip_list] per-256: raw_replace");
+                let r = self.raw_replace(updated)
+                    .map_err(|e| { let te = e.into(); tracing::error!(target: "ledger", seq, ?te, "[skip_list] per-256 raw_replace failed: ViewError→TraversalError"); MutationError::Traversal(te) });
+                r?
             } else {
                 let mut sle = STLedgerEntry::new(keylet);
                 let mut hashes = protocol::STVector256::new();
                 hashes.push_back(*self.header.parent_hash.as_uint256());
                 sle.set_field_v256(get_field_by_symbol("sfHashes"), hashes);
                 sle.set_field_u32(get_field_by_symbol("sfLastLedgerSequence"), prev_index);
-                self.raw_insert(Arc::new(sle))
-                    .map_err(|e| MutationError::Traversal(e.into()))?;
+                tracing::debug!(target: "ledger", seq, key = %keylet.key, "[skip_list] per-256: raw_insert");
+                let r = self.raw_insert(Arc::new(sle))
+                    .map_err(|e| { let te = e.into(); tracing::error!(target: "ledger", seq, ?te, "[skip_list] per-256 raw_insert failed: ViewError→TraversalError"); MutationError::Traversal(te) });
+                r?
             }
         }
 
         // Global skip list (last 256 hashes)
         let keylet = skip_keylet();
-        if let Ok(Some(sle)) = self.peek(keylet) {
+        let peek_result = self.peek(keylet);
+        tracing::debug!(
+            target: "ledger",
+            seq,
+            key = %keylet.key,
+            found = peek_result.as_ref().map(|r| r.is_some()).unwrap_or(false),
+            err = peek_result.is_err(),
+            "[skip_list] global skip list peek"
+        );
+        if let Ok(Some(sle)) = peek_result {
             let old_hashes = sle.get_field_v256(get_field_by_symbol("sfHashes"));
             let mut new_values: Vec<Uint256> = old_hashes.value().to_vec();
             assert!(new_values.len() <= 256);
@@ -2283,18 +2318,23 @@ impl Ledger {
             obj.set_field_v256(get_field_by_symbol("sfHashes"), hashes);
             obj.set_field_u32(get_field_by_symbol("sfLastLedgerSequence"), prev_index);
             let updated = Arc::new(STLedgerEntry::from_stobject(obj, keylet.key));
-            self.raw_replace(updated)
-                .map_err(|e| MutationError::Traversal(e.into()))?;
+            tracing::debug!(target: "ledger", seq, key = %keylet.key, "[skip_list] global: raw_replace");
+            let r = self.raw_replace(updated)
+                .map_err(|e| { let te = e.into(); tracing::error!(target: "ledger", seq, ?te, "[skip_list] global raw_replace failed: ViewError→TraversalError"); MutationError::Traversal(te) });
+            r?
         } else {
             let mut sle = STLedgerEntry::new(keylet);
             let mut hashes = protocol::STVector256::new();
             hashes.push_back(*self.header.parent_hash.as_uint256());
             sle.set_field_v256(get_field_by_symbol("sfHashes"), hashes);
             sle.set_field_u32(get_field_by_symbol("sfLastLedgerSequence"), prev_index);
-            self.raw_insert(Arc::new(sle))
-                .map_err(|e| MutationError::Traversal(e.into()))?;
+            tracing::debug!(target: "ledger", seq, key = %keylet.key, "[skip_list] global: raw_insert");
+            let r = self.raw_insert(Arc::new(sle))
+                .map_err(|e| { let te = e.into(); tracing::error!(target: "ledger", seq, ?te, "[skip_list] global raw_insert failed: ViewError→TraversalError"); MutationError::Traversal(te) });
+            r?
         }
 
+        tracing::debug!(target: "ledger", seq, "[skip_list] update_skip_list OK");
         Ok(())
     }
 
@@ -2581,12 +2621,54 @@ impl Ledger {
         payload: Vec<u8>,
     ) -> Result<(), MutationError> {
         // Route through apply_state_batch to keep mutable_state in sync.
-        let exists = self.state_map.peek_item(key, &mut |_| None)?.is_some();
+        // Use the ledger's node_fetcher when checking whether the key already
+        // exists in the state map. Without this, nodes that were evicted from
+        // memory by `release_maps_to_disk` (backed=true but no in-memory
+        // children) cannot be resolved, causing TraversalError::MissingNode.
+        // That error propagates through ViewError::Mutation and then through
+        // the `From<ViewError> for TraversalError` catch-all arm into
+        // TraversalError::View, producing the `Mutation(Traversal(View))`
+        // error seen when building ledger N+1 from a released ledger N state.
+        let seq = self.header.seq;
+        let backed = self.state_map.backed();
+        let has_fetcher = self.node_fetcher.is_some();
+        let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| -> Option<
+            basics::memory::intrusive_pointer::SharedIntrusive<
+                shamap::nodes::tree_node::SHAMapTreeNode,
+            >,
+        > {
+            let fetcher = self.node_fetcher.as_ref()?;
+            fetcher(hash)
+        };
+        let peek_result = self.state_map.peek_item(key, &mut fetch_fn);
+        tracing::debug!(
+            target: "ledger",
+            seq,
+            %key,
+            backed,
+            has_fetcher,
+            exists = peek_result.as_ref().map(|r| r.is_some()).unwrap_or(false),
+            err = peek_result.is_err(),
+            "[replace_state_map] peek result"
+        );
+        if let Err(ref e) = peek_result {
+            tracing::error!(
+                target: "ledger",
+                seq,
+                %key,
+                backed,
+                has_fetcher,
+                ?e,
+                "[replace_state_map] peek FAILED — this is the Mutation(Traversal(View)) source"
+            );
+        }
+        let exists = peek_result?.is_some();
         let op = if exists {
             StateBatchOp::Update
         } else {
             StateBatchOp::Insert
         };
+        tracing::debug!(target: "ledger", seq, %key, ?op, "[replace_state_map] applying batch");
         self.apply_state_batch(&[(op, key, payload)])
     }
 

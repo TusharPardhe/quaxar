@@ -2643,7 +2643,16 @@ impl ApplicationRoot {
                 + Sync,
         >,
     > {
-        let ns = self.node_store().as_ref()?.clone();
+        // Try the local registry node_store first; fall back to the shared
+        // consensus node store (Arc<RwLock>) which is populated by
+        // attach_node_store after the consensus adaptor's ApplicationRoot
+        // clone was created. This mirrors node_fetcher_from_store's fallback.
+        let ns = self.node_store().as_ref().cloned().or_else(|| {
+            self.shared_consensus_node_store
+                .read()
+                .ok()
+                .and_then(|guard| guard.clone())
+        })?;
         Some(std::sync::Arc::new(
             move |object_type, hash, data, ledger_seq| match &ns {
                 crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => {
@@ -4894,6 +4903,34 @@ impl ApplicationRoot {
         // into a released subtree.
         let parent_ledger = parent_ledger.map(|l| self.ledger_with_node_fetcher(l));
 
+        // Diagnostic: log parent state before building child ledger
+        if let Some(ref parent) = parent_ledger {
+            let mut loaded = 0u32;
+            let mut non_empty = 0u32;
+            for branch in 0..16 {
+                if !parent.state_map().root().is_empty_branch(branch) {
+                    non_empty += 1;
+                    if parent.state_map().root().get_child(branch).is_some() {
+                        loaded += 1;
+                    }
+                }
+            }
+            tracing::info!(
+                target: "ledger",
+                parent_seq = parent.header().seq,
+                parent_hash = %parent.header().hash,
+                backed = parent.state_map().backed(),
+                has_fetcher = parent.has_node_fetcher(),
+                has_writer = parent.has_node_writer(),
+                root_non_empty_branches = non_empty,
+                root_loaded_children = loaded,
+                "[accept] parent ledger state before build"
+            );
+        } else {
+            tracing::info!(target: "ledger", "[accept] NO parent ledger — building genesis");
+        }
+
+
         let closed_seq = parent_ledger
             .as_ref()
             .map(|parent| parent.header().seq.saturating_add(1))
@@ -5044,6 +5081,38 @@ impl ApplicationRoot {
             // This ensures peers can serve this ledger via InboundLedger's
             // SHAMap-walk protocol. The in-memory tree stays intact for
             // immediate serving via get_node_fat.
+            //
+            // Ensure the ledger has both fetcher and writer before persist.
+            // Without the writer, persist_dirty_nodes_to_store silently
+            // does nothing (early-returns on writer.is_none()), leaving
+            // dirty nodes only in memory. When the next round builds from
+            // this ledger as parent, any evicted/released nodes become
+            // unreadable (MissingNode) because they were never flushed to
+            // NuDB. Similarly, without a fetcher, update_skip_list in
+            // build_ledger_from_view fails on the first traversal into a
+            // node not held in memory.
+            if !ledger.has_node_fetcher() {
+                if let Some(fetcher) = self.node_fetcher_from_store() {
+                    ledger.set_node_fetcher(fetcher);
+                }
+            }
+            if !ledger.has_node_writer() {
+                if let Some(writer) = self.node_writer_from_store() {
+                    ledger.set_node_writer(writer);
+                } else {
+                    tracing::error!(target: "app",
+                        seq = ledger.header().seq,
+                        node_store_available = self.node_store().is_some(),
+                        "[accept] CANNOT attach writer — node_store_from_store returned None"
+                    );
+                }
+            }
+            tracing::info!(target: "app",
+                seq = ledger.header().seq,
+                has_fetcher = ledger.has_node_fetcher(),
+                has_writer = ledger.has_node_writer(),
+                "[accept] post-attach state before persist"
+            );
             ledger.state_map_mut().set_backed();
             ledger.tx_map_mut().set_backed();
             ledger.persist_dirty_nodes_to_store();
