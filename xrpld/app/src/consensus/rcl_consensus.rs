@@ -48,6 +48,7 @@ use protocol::PublicKey;
 use crate::consensus::rcl_cx_peer_pos::{Proposal, RclCxPeerPos, sign_proposal};
 use crate::consensus::rcl_validations::SharedAppValidations;
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
+use crate::load::fee_vote::FeeVote;
 use crate::network::network_ops::AppNetworkOpsModeOwner;
 use crate::state::app_registry::{AppInboundTransactions, SharedAppOpenLedger};
 use crate::state::application_root::{ApplicationRoot, LedgerAcceptor};
@@ -233,7 +234,6 @@ pub struct AppRclConsensusAdaptor {
     open_ledger: SharedAppOpenLedger,
     validations: SharedAppValidations<SystemTimeKeeperClock>,
     app_root: crate::state::application_root::ApplicationRoot,
-    #[allow(dead_code)]
     pub(crate) validators: Arc<ValidatorList>,
     #[allow(dead_code)]
     pub(crate) network_ops_mode_owner: AppNetworkOpsModeOwner,
@@ -243,9 +243,8 @@ pub struct AppRclConsensusAdaptor {
     relay: AppRclConsensusRelay,
     journal: Arc<dyn RclConsensusJournal>,
     pub(crate) validator_keys: ValidatorKeys,
-    #[allow(dead_code)]
+    fee_vote: Option<Arc<FeeVote>>,
     negative_unl_vote: Option<Arc<crate::amendments::negative_unl_vote::NegativeUNLVote>>,
-    #[allow(dead_code)]
     amendment_status: Option<Arc<crate::amendments::amendment_status::AmendmentStatus>>,
     #[allow(dead_code)]
     overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
@@ -275,6 +274,7 @@ impl AppRclConsensusAdaptor {
         relay: AppRclConsensusRelay,
         journal: impl RclConsensusJournal + 'static,
         validator_keys: ValidatorKeys,
+        fee_vote: Option<Arc<FeeVote>>,
         negative_unl_vote: Option<Arc<crate::amendments::negative_unl_vote::NegativeUNLVote>>,
         amendment_status: Option<Arc<crate::amendments::amendment_status::AmendmentStatus>>,
         overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
@@ -301,6 +301,7 @@ impl AppRclConsensusAdaptor {
             relay,
             journal: Arc::new(journal),
             validator_keys,
+            fee_vote,
             negative_unl_vote,
             amendment_status,
             overlay,
@@ -334,6 +335,26 @@ impl AppRclConsensusAdaptor {
 
 fn sync_tree_to_rcl_tx_set(sync_tree: &shamap::sync::SyncTree, cache: &consensus::rcl::RclTxSetSharedCache) -> consensus::RclTxSet {
     consensus::RclTxSet::from_parts(sync_tree.root(), Arc::clone(cache), sync_tree.backed(), 0)
+}
+
+/// Thin adapter bridging `Validations<RclValidationsAdaptor>` (our inner type)
+/// to the `NegativeUNLVoteValidations` trait expected by
+/// `NegativeUNLVote::do_voting`. Acquires no additional locks — the caller
+/// must already hold the validations mutex.
+struct NegativeUNLValidationsAdapter<'a>(&'a mut crate::consensus::rcl_validations::RclValidationsInner);
+
+impl crate::amendments::negative_unl_vote::NegativeUNLVoteValidations for NegativeUNLValidationsAdapter<'_> {
+    fn set_seq_to_keep(&mut self, low: u32, high: u32) {
+        self.0.set_seq_to_keep(low, high);
+    }
+
+    fn trusted_keys_for_ledger(&mut self, ledger_id: Uint256, seq: u32) -> Vec<PublicKey> {
+        self.0
+            .get_trusted_for_ledger(&ledger_id, seq)
+            .into_iter()
+            .map(|wrapped| *wrapped.get_signer_public())
+            .collect()
+    }
 }
 
 impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
@@ -443,13 +464,66 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                     }
                 }
 
-                // TODO(rippled-parity): FeeVote::do_voting — requires a FeeVote
-                // instance on the adaptor or app_root. Not yet wired at app startup.
+                // FeeVote — injects a ttFEE pseudo-tx when the network
+                // should move to new fee parameters.
+                if let Some(ref fee_vote) = self.fee_vote {
+                    let prev_id = prev_ledger.id();
+                    let parent_validations = self.validations.store().trusted_for_ledger_by_sequence(
+                        prev_id,
+                        prev_ledger.seq(),
+                    );
+                    let mut fee_vote_set: Vec<protocol::STTx> = Vec::new();
+                    let ledger_ref = prev_ledger.ledger();
+                    fee_vote.do_voting(
+                        &*ledger_ref,
+                        &parent_validations,
+                        &mut fee_vote_set,
+                    );
+                    for pseudo_tx in &fee_vote_set {
+                        editable.insert(&consensus::RclCxTxRef::from_transaction(pseudo_tx));
+                    }
+                    if !fee_vote_set.is_empty() {
+                        tracing::info!(
+                            target: "consensus",
+                            count = fee_vote_set.len(),
+                            "on_close: injected fee pseudo-transactions"
+                        );
+                    }
+                }
 
-                // TODO(rippled-parity): NegativeUNLVote::do_voting — requires
-                // mutable access to the RclValidations inner (NegativeUNLVoteValidations)
-                // and the UNL key set. Wire once fee_vote is instantiated and the
-                // validation lock can be safely acquired here without deadlock risk.
+                // NegativeUNLVote — injects ttUNL_MODIFY pseudo-txs for
+                // validator disable/re-enable when reliability thresholds
+                // are crossed.
+                if let Some(ref neg_unl_vote) = self.negative_unl_vote {
+                    let unl_keys = self.validators.get_trusted_master_keys();
+                    let mut nunl_vote_set: Vec<protocol::STTx> = Vec::new();
+                    // Acquire the validations lock to get mutable access for
+                    // NegativeUNLVoteValidations::set_seq_to_keep and
+                    // trusted_keys_for_ledger, then release it immediately.
+                    {
+                        let mut validations_guard = self.validations.validations()
+                            .lock()
+                            .expect("shared app validations mutex must not be poisoned");
+                        let mut adapter = NegativeUNLValidationsAdapter(&mut *validations_guard);
+                        let ledger_ref = prev_ledger.ledger();
+                        neg_unl_vote.do_voting(
+                            &*ledger_ref,
+                            &unl_keys,
+                            &mut adapter,
+                            &mut nunl_vote_set,
+                        );
+                    }
+                    for pseudo_tx in &nunl_vote_set {
+                        editable.insert(&consensus::RclCxTxRef::from_transaction(pseudo_tx));
+                    }
+                    if !nunl_vote_set.is_empty() {
+                        tracing::info!(
+                            target: "consensus",
+                            count = nunl_vote_set.len(),
+                            "on_close: injected negative-UNL pseudo-transactions"
+                        );
+                    }
+                }
             }
 
             set = editable.freeze();

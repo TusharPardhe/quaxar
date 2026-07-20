@@ -1757,14 +1757,36 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             shared_inbound.sweep();
         }
 
-        // Drain validator list messages so they don't accumulate unbounded.
-        // TODO(rippled-parity): Parse TmValidatorList blob fields and call
-        // root.validators().apply_lists(...) to apply received UNL updates
-        // from peers, matching rippled's ValidatorList::applyList path
-        // triggered by TMValidatorList messages. For now we just discard
-        // them to prevent memory growth.
+        // Drain validator list messages and apply them to the local UNL,
+        // matching rippled's ValidatorList::applyList path triggered by
+        // TMValidatorList messages from peers.
         {
-            let _discarded = overlay_rt.overlay().take_validator_lists();
+            let messages = overlay_rt.overlay().take_validator_lists();
+            if !messages.is_empty() {
+                let validators = root.validators();
+                for msg in messages {
+                    let tm = &msg.message;
+                    let manifest_b64 = basics::base64::base64_encode(&tm.manifest);
+                    let blob_info = crate::validator::validator_list::ValidatorBlobInfo {
+                        blob: basics::base64::base64_encode(&tm.blob),
+                        signature: basics::base64::base64_encode(&tm.signature),
+                        manifest: None,
+                    };
+                    let stats = validators.apply_lists(
+                        &manifest_b64,
+                        tm.version,
+                        &[blob_info],
+                        String::new(),
+                        None,
+                    );
+                    tracing::trace!(
+                        target: "overlay",
+                        version = tm.version,
+                        ?stats,
+                        "applied TMValidatorList from peer"
+                    );
+                }
+            }
         }
 
         // Sleep remainder of ~50ms iteration

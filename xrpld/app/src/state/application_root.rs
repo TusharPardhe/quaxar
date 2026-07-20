@@ -72,8 +72,8 @@ use perflog::PerfLogImp;
 use protocol::{
     AccountID, BatchTransactionFlags, JsonOptions, JsonValue, NotTec, PublicKey, Rules, STAmount,
     STLedgerEntry, STTx, SecretKey, SeqProxy, Serializer, Ter, TxType, XRPAmount, account_keylet,
-    feature_xrp_fees, get_field_by_symbol, is_tec_claim, is_tef_failure, is_tem_malformed,
-    is_tes_success,
+    calc_node_id, feature_xrp_fees, get_field_by_symbol, is_tec_claim, is_tef_failure,
+    is_tem_malformed, is_tes_success,
 };
 use shamap::family::{NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
 use shamap::tree_node_cache::TreeNodeCache;
@@ -3083,7 +3083,25 @@ impl ApplicationRoot {
                 self.config().validation_seed.as_deref(),
                 validator_token_lines,
             ),
-            None,
+            Some(Arc::new(crate::load::fee_vote::FeeVote::new(
+                crate::load::fee_vote::FeeSetup::default(),
+                crate::load::fee_vote::NullFeeVoteJournal,
+            ))),
+            {
+                // Create NegativeUNLVote if we have validator keys (matching
+                // rippled's Application::setup which instantiates
+                // negativeUNLVote_ from the local validator identity).
+                let vk = crate::validator::validator_keys::ValidatorKeys::from_sources(
+                    self.config().validation_seed.as_deref(),
+                    validator_token_lines,
+                );
+                vk.keys.map(|keys| {
+                    Arc::new(crate::amendments::negative_unl_vote::NegativeUNLVote::new(
+                        calc_node_id(&keys.public_key),
+                        crate::amendments::negative_unl_vote::NullNegativeUNLVoteJournal,
+                    ))
+                })
+            },
             Some(self.amendment_status.clone()),
             self.overlay_runtime().map(|rt| rt.overlay().clone()),
             self.clone(),
