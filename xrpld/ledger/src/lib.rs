@@ -1957,14 +1957,34 @@ impl Ledger {
     }
 
     /// Persist dirty SHAMap nodes to the node store WITHOUT rebuilding
-    /// the in-memory tree. This matches rippled's BuildLedger.cpp
-    /// flushDirty() which writes to NuDB but keeps the full tree in
-    /// memory for immediate serving via get_node_fat.
+    /// the in-memory tree. Matches rippled's `BuildLedger.cpp` lines 69-73:
+    ///   built->stateMap().flushDirty(AccountNode)
+    ///   built->txMap().flushDirty(TransactionNode)
     ///
-    /// Unlike `flush_state_map_to_store` (which rebuilds from root, losing
-    /// in-memory children), this preserves the full tree structure so the
-    /// ledger can be served to peers via InboundLedger immediately.
-    pub fn persist_dirty_nodes_to_store(&mut self) {
+    /// For each flushed node this performs the two-step write that rippled's
+    /// `SHAMap::writeNode` (SHAMap.cpp:935-947) performs:
+    ///   1. **Canonicalize into the shared tree-node cache** — matches
+    ///      `canonicalize(node->getHash(), node)` which calls
+    ///      `f_.getTreeNodeCache()->canonicalizeReplaceClient()`. This ensures
+    ///      subsequent `cacheLookup()` calls return a hit instead of falling
+    ///      through to a NuDB round-trip (fixes Issue B: tree cache = 0).
+    ///   2. **Persist to NuDB** — matches `f_.db().store(t, data, hash, seq)`.
+    ///
+    /// # Parameters
+    /// - `tree_cache`: Shared tree-node cache (the single `TreeNodeCache`
+    ///   instance shared across all SHAMaps via `SHAMapFamily`). When `Some`,
+    ///   each flushed node is canonicalized into the cache before NuDB
+    ///   persistence. When `None`, only NuDB persistence occurs (backward
+    ///   compatible with callers that don't have a cache reference).
+    pub fn persist_dirty_nodes_to_store(
+        &mut self,
+        tree_cache: Option<
+            &shamap::tree_node_cache::TreeNodeCache<
+                basics::tagged_cache::MonotonicClock,
+                basics::hardened_hash::HardenedHashBuilder,
+            >,
+        >,
+    ) {
         let ledger_seq = self.header.seq;
         let writer = self.node_writer.clone();
         if writer.is_none() {
@@ -1982,6 +2002,19 @@ impl Ledger {
              -> basics::memory::intrusive_pointer::SharedIntrusive<
                 shamap::nodes::tree_node::SHAMapTreeNode,
             > {
+                // Step 1: Canonicalize into the shared tree-node cache.
+                // Matches rippled SHAMap::writeNode (SHAMap.cpp:941):
+                //   canonicalize(node->getHash(), node);
+                if let Some(cache) = tree_cache {
+                    let mut node_ref = node.clone();
+                    let key = *node.get_hash().as_uint256();
+                    cache.canonicalize_replace_client(&key, &mut node_ref);
+                }
+
+                // Step 2: Persist to NuDB.
+                // Matches rippled SHAMap::writeNode (SHAMap.cpp:944-945):
+                //   Serializer s; node->serializeWithPrefix(s);
+                //   f_.db().store(t, std::move(s.modData()), node->getHash().asUInt256(), ledgerSeq_);
                 if let Some(ref write_fn) = writer {
                     let hash = node.get_hash();
                     if let Ok(data) = node.serialize_with_prefix() {
@@ -2008,6 +2041,14 @@ impl Ledger {
              -> basics::memory::intrusive_pointer::SharedIntrusive<
                 shamap::nodes::tree_node::SHAMapTreeNode,
             > {
+                // Step 1: Canonicalize into the shared tree-node cache (same as above).
+                if let Some(cache) = tree_cache {
+                    let mut node_ref = node.clone();
+                    let key = *node.get_hash().as_uint256();
+                    cache.canonicalize_replace_client(&key, &mut node_ref);
+                }
+
+                // Step 2: Persist to NuDB (same as above).
                 if let Some(ref write_fn) = writer {
                     let hash = node.get_hash();
                     if let Ok(data) = node.serialize_with_prefix() {

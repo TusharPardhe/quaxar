@@ -2624,6 +2624,12 @@ impl<D> BoundServerRuntime<D> {
                     let node_family: Arc<dyn app::node_family::node_family::NodeFamilyRuntime> =
                         Arc::new(app::node_family::node_family::NodeFamily::new(family));
                     let _ = app.attach_node_family(node_family);
+
+                    // Attach the shared tree cache to ApplicationRoot so
+                    // persist_dirty_nodes_to_store can canonicalize nodes
+                    // into it (matching rippled's writeNode → canonicalize
+                    // + db().store() pattern).
+                    app.attach_shared_tree_cache(Arc::clone(&shared_tree_cache));
                 }
 
                 // After the first ledger completes, it may pursue a few more

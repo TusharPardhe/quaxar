@@ -3140,23 +3140,51 @@ fn seed_startup_ledger_state(
         return Ok(());
     }
 
-    root.on_closed_ledger(Arc::clone(&closed));
-    root.on_published_ledger(Arc::clone(&closed));
-
-    // Persist genesis state nodes to NuDB so overlay sessions can serve them.
-    // Without this, release_maps_to_disk (called by on_closed_ledger) evicts
-    // the nodes from memory, and subsequent reads fail with MissingNode because
-    // the nodes were never written to the store.
+    // =========================================================================
+    // GENESIS PERSISTENCE — MUST happen BEFORE on_closed_ledger.
+    //
+    // rippled parity: `Ledger::Ledger(kCreateGenesis, ...)` calls
+    //   stateMap_.flushDirty(AccountNode)   ← persists ALL nodes to NuDB + tree cache
+    //   setImmutable()
+    // BEFORE `switchLCL` / `storeLedger` ever touches the ledger.
+    //
+    // `on_closed_ledger` calls `release_maps_to_disk` which sets all child
+    // pointers to None on the SHARED root nodes (via SharedIntrusive refcount).
+    // Since `Ledger::clone()` is a shallow clone sharing the same root nodes,
+    // any clone made AFTER release will have an empty tree — only the root
+    // node can be persisted. The child nodes (account state, amendments, fee
+    // settings) would be lost.
+    //
+    // By persisting FIRST, the full tree is written to NuDB + tree cache while
+    // all nodes are still in memory. After this, `on_closed_ledger` can safely
+    // release the tree.
+    // =========================================================================
     if root.node_store().is_some() {
-        if let Some(writer) = root.node_writer_from_store() {
-            let mut genesis_copy = closed.as_ref().clone();
-            genesis_copy.set_node_writer(writer);
-            genesis_copy.state_map_mut().set_backed();
-            genesis_copy.tx_map_mut().set_backed();
-            genesis_copy.persist_dirty_nodes_to_store();
-            tracing::info!(target: "bootstrap", seq = closed.header().seq, "Genesis state nodes persisted to NuDB");
+        let writer = root.node_writer_from_store();
+        let tree_cache = root.shared_tree_cache();
+        if writer.is_some() || tree_cache.is_some() {
+            let mut genesis_for_persist = closed.as_ref().clone();
+            if let Some(w) = writer {
+                genesis_for_persist.set_node_writer(w);
+            }
+            genesis_for_persist.state_map_mut().set_backed();
+            genesis_for_persist.tx_map_mut().set_backed();
+            // Persist dirty nodes to NuDB + tree cache.
+            // Matches rippled's `stateMap_.flushDirty(AccountNode)` in
+            // Ledger::Ledger(kCreateGenesis, ...) constructor.
+            genesis_for_persist.persist_dirty_nodes_to_store(tree_cache);
+            tracing::info!(
+                target: "bootstrap",
+                seq = closed.header().seq,
+                has_writer = genesis_for_persist.has_node_writer(),
+                has_tree_cache = tree_cache.is_some(),
+                "Genesis state nodes persisted to NuDB (before on_closed_ledger)"
+            );
         }
     }
+
+    root.on_closed_ledger(Arc::clone(&closed));
+    root.on_published_ledger(Arc::clone(&closed));
 
     // ledger header to SQLite so that subsequent loads can find it.
     if let Some(relational) = root.relational_database() {

@@ -244,6 +244,13 @@ pub struct ApplicationRoot {
     /// arrive from the overlay, removing the 50ms poll latency. Matches
     /// rippled's strand-based immediate dispatch of proposals.
     consensus_notify: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    /// Shared tree-node cache — the single `TreeNodeCache` instance shared
+    /// across all SHAMaps via `SHAMapFamily`. Attached by main.rs after
+    /// creation. Used by `persist_dirty_nodes_to_store` to canonicalize
+    /// flushed nodes into the cache (matching rippled's `SHAMap::writeNode`
+    /// which calls `canonicalize` + `db().store()`).
+    shared_tree_cache:
+        Option<Arc<TreeNodeCache<MonotonicClock, basics::hardened_hash::HardenedHashBuilder>>>,
 }
 
 impl std::fmt::Debug for ApplicationRoot {
@@ -352,6 +359,10 @@ impl std::fmt::Debug for ApplicationRoot {
             .field(
                 "has_shamap_store_service",
                 &self.shamap_store_service.is_some(),
+            )
+            .field(
+                "has_shared_tree_cache",
+                &self.shared_tree_cache.is_some(),
             )
             .finish()
     }
@@ -2094,6 +2105,7 @@ impl ApplicationRoot {
             close_gate: Arc::new(std::sync::Mutex::new(())),
             tx_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             consensus_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+            shared_tree_cache: None,
         });
 
         // TODO: Re-enable ConsensusTransSetSF filter once serialization is verified.
@@ -2764,6 +2776,25 @@ impl ApplicationRoot {
         node_family: Arc<dyn NodeFamilyRuntime>,
     ) -> Option<Arc<dyn NodeFamilyRuntime>> {
         self.node_family.replace(node_family)
+    }
+
+    /// Attach the shared tree-node cache. Called by main.rs after creating
+    /// the cache that is shared between `SHAMapFamily` and `InboundLedgers`.
+    /// The cache reference is used by `persist_dirty_nodes_to_store` to
+    /// canonicalize flushed nodes (matching rippled's `SHAMap::writeNode`
+    /// → `canonicalize` + `db().store()` two-step pattern).
+    pub fn attach_shared_tree_cache(
+        &mut self,
+        cache: Arc<TreeNodeCache<MonotonicClock, basics::hardened_hash::HardenedHashBuilder>>,
+    ) {
+        self.shared_tree_cache = Some(cache);
+    }
+
+    /// Returns a reference to the shared tree-node cache, if attached.
+    pub fn shared_tree_cache(
+        &self,
+    ) -> Option<&TreeNodeCache<MonotonicClock, basics::hardened_hash::HardenedHashBuilder>> {
+        self.shared_tree_cache.as_deref()
     }
 
     pub fn attach_resolver_runtime(
@@ -5129,7 +5160,13 @@ impl ApplicationRoot {
             );
             ledger.state_map_mut().set_backed();
             ledger.tx_map_mut().set_backed();
-            ledger.persist_dirty_nodes_to_store();
+            // Persist dirty nodes to NuDB + tree cache.
+            // Matches rippled's BuildLedger.cpp lines 69-73:
+            //   built->stateMap().flushDirty(AccountNode)
+            //   built->txMap().flushDirty(TransactionNode)
+            // Passing the shared tree cache ensures canonicalize is called
+            // during flush (matching rippled's writeNode → canonicalize + db().store()).
+            ledger.persist_dirty_nodes_to_store(self.shared_tree_cache());
             Arc::new(ledger)
         };
 
