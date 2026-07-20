@@ -1593,6 +1593,9 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                         root.note_validated_ledger_for_sync(Arc::clone(&validated));
                         root.on_closed_ledger(Arc::clone(&validated));
                         root.set_need_network_ledger(false);
+                        // tryAdvance: publish the validated ledger
+                        root.try_advance_publication();
+                        root.promote_operating_mode_after_accepted_ledger(&validated);
                         // Restart consensus on the new chain
                         let now = root.shared_time_keeper().close_time();
                         let prev_cx = crate::consensus_ledger_from_ledger(&validated);
@@ -1644,6 +1647,10 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
                 tracing::info!(target: "consensus", advanced, new_valid_seq = lm.valid_ledger_seq(), "tryAdvance burst");
             }
 
+            // tryAdvance publication: publish validated ledgers so
+            // is_caught_up() returns true and mode can advance to FULL.
+            root.try_advance_publication();
+
             // Update complete_ledgers display
             let complete_range = lm.complete_ledgers();
             let range_str = complete_range.to_string();
@@ -1652,14 +1659,51 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
             }
 
             // Operating mode promotion
+            //
+            // Matches rippled's mode advancement after tryAdvance publishes:
+            // - Connected/Syncing → Tracking: when need_network_ledger is false
+            // - Connected/Tracking → Full: when published ledger is fresh
+            //   (close_time within 2x close_time_resolution of current time)
             {
                 use crate::network::network_ops::NetworkOpsOperatingMode;
                 let current_mode = root.network_ops_state().operating_mode();
-                if current_mode == NetworkOpsOperatingMode::Connected {
+                let need_network = root.need_network_ledger();
+
+                let mut next_mode = current_mode;
+
+                // Connected/Syncing → Tracking
+                if matches!(next_mode, NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Syncing)
+                    && !need_network
+                {
+                    next_mode = NetworkOpsOperatingMode::Tracking;
+                }
+
+                // Connected/Tracking → Full when published ledger is fresh
+                if matches!(next_mode, NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Tracking)
+                    && !need_network
+                {
                     let valid_seq = lm.valid_ledger_seq();
-                    if valid_seq > 1 && lm.have_ledger(valid_seq - 1) {
-                        root.set_network_ops_operating_mode(NetworkOpsOperatingMode::Full);
+                    // Use published ledger freshness (matching rippled's
+                    // promote logic) OR fall back to having the previous
+                    // ledger as a secondary check.
+                    let fresh = root.published_ledger().map_or(false, |pub_ledger| {
+                        let now_close = root.current_close_time_seconds();
+                        let pub_close = pub_ledger.header().close_time;
+                        let resolution = u32::from(pub_ledger.header().close_time_resolution);
+                        now_close < pub_close.saturating_add(resolution.saturating_mul(2))
+                    });
+                    let have_prev = valid_seq > 1 && lm.have_ledger(valid_seq - 1);
+                    if fresh || have_prev {
+                        next_mode = NetworkOpsOperatingMode::Full;
                     }
+                }
+
+                if next_mode != current_mode {
+                    tracing::info!(target: "app",
+                        ?current_mode, ?next_mode,
+                        "strand: operating mode promoted"
+                    );
+                    root.set_network_ops_operating_mode(next_mode);
                 }
             }
         }

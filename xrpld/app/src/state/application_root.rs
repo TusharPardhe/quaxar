@@ -4054,6 +4054,67 @@ impl ApplicationRoot {
         self.ledger_master_state.published_ledger_seq()
     }
 
+    /// Matches rippled's `tryAdvance()` → `doAdvance()` →
+    /// `findNewLedgersToPublish()`. After a ledger is validated (via
+    /// `check_accept_ledger` or the strand's tryAdvance burst), this
+    /// publishes it so that `is_caught_up()` returns true and the
+    /// operating mode can advance to FULL.
+    ///
+    /// The logic is:
+    /// - If no published ledger exists (first time): publish validated directly
+    /// - If gap > MAX_LEDGER_GAP (100): jump to validated directly
+    /// - Otherwise: walk sequentially (handled by plan_advance_publication)
+    pub fn try_advance_publication(&self) {
+        let Some(lm_rt) = self.ledger_master_runtime() else { return };
+        let report = lm_rt.plan_advance_publication();
+
+        use crate::ledger::ledger_master_runtime::AppLedgerMasterPublishAdvance;
+        match report.decision {
+            AppLedgerMasterPublishAdvance::NothingToPublish => {}
+            AppLedgerMasterPublishAdvance::FirstPublished => {
+                if let Some(ledger) = report.published.last() {
+                    tracing::info!(
+                        target: "ledger",
+                        seq = ledger.header().seq,
+                        "tryAdvance: publishing first validated ledger"
+                    );
+                    self.on_published_ledger(Arc::clone(ledger));
+                    lm_rt.ledger_master().set_pub_ledger(Arc::clone(ledger));
+                }
+            }
+            AppLedgerMasterPublishAdvance::GapTooLarge => {
+                if let Some(ledger) = report.published.last() {
+                    tracing::info!(
+                        target: "ledger",
+                        seq = ledger.header().seq,
+                        "tryAdvance: gap too large, jumping to validated ledger"
+                    );
+                    self.on_published_ledger(Arc::clone(ledger));
+                    lm_rt.ledger_master().set_pub_ledger(Arc::clone(ledger));
+                }
+            }
+            AppLedgerMasterPublishAdvance::Sequential => {
+                for ledger in &report.published {
+                    tracing::debug!(
+                        target: "ledger",
+                        seq = ledger.header().seq,
+                        "tryAdvance: publishing sequential ledger"
+                    );
+                    self.on_published_ledger(Arc::clone(ledger));
+                    lm_rt.ledger_master().set_pub_ledger(Arc::clone(ledger));
+                }
+                // If there's a missing ledger, trigger acquisition
+                if let Some(missing) = report.missing {
+                    if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
+                        if let Some(shared) = guard.as_ref() {
+                            shared.acquire(missing.hash, missing.seq);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn validated_ledger_age(&self) -> std::time::Duration {
         self.ledger_master_state.validated_ledger_age()
     }
@@ -4374,6 +4435,13 @@ impl ApplicationRoot {
         // validates the acquired ledger but stays at "connected" indefinitely
         // because the closed-ledger slot never advances past genesis.
         self.on_closed_ledger(Arc::clone(&validated));
+
+        // tryAdvance (rippled LedgerMaster.cpp:946 step 3): publish the
+        // validated ledger so that is_caught_up() returns true and the
+        // operating mode can advance to FULL. Without this, the node
+        // validates but never publishes, keeping it in TRACKING forever.
+        self.try_advance_publication();
+
         self.promote_operating_mode_after_accepted_ledger(&validated);
 
         // Broadcast our validated ledger to peers via TMStatusChange so they
@@ -4400,17 +4468,18 @@ impl ApplicationRoot {
             overlay_rt.overlay().broadcast(&status);
         }
 
-        // Advance the consensus round after validating a new ledger.
+        // Consensus advancement after validating a new ledger.
         //
         // Rippled parity: checkAccept NEVER touches consensus state or calls
-        // startRound/beginConsensus. It ONLY promotes the validated ledger in
-        // LedgerMaster. The consensus state machine is exclusively driven by
-        // the timer thread (via timerEntry → checkLedger → handleWrongLedger).
+        // startRound/beginConsensus. It promotes the validated ledger in
+        // LedgerMaster and calls tryAdvance() to publish it. The consensus
+        // state machine is exclusively driven by the timer thread (via
+        // timerEntry → checkLedger → handleWrongLedger).
         //
         // In rippled (LedgerMaster.cpp:946), checkAccept:
         //   1. Validates quorum
         //   2. Sets validated ledger (setValidLedger)
-        //   3. Calls tryAdvance() (publishes ledgers)
+        //   3. Calls tryAdvance() (publishes ledgers) ← done above
         //   4. NEVER calls startRound or beginConsensus
         //
         // The consensus timer's `checkLedger` (inside timerEntry, every 1s)
