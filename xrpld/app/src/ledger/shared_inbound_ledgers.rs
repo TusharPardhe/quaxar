@@ -274,7 +274,7 @@ impl Drop for AcquisitionWorkPool {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const REACQUIRE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const STUCK_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_ACQUISITIONS: usize = 8;
 /// Timer tick interval for stall detection and re-requests.
@@ -1411,8 +1411,7 @@ impl SharedInboundLedgers {
                     }
                 }
                 EntryState::Complete | EntryState::Failed => {
-                    let sweep_since = entry.completed_at.unwrap_or(entry.last_touched);
-                    if now.duration_since(sweep_since) > SWEEP_INTERVAL {
+                    if now.duration_since(entry.last_touched) > SWEEP_INTERVAL {
                         to_remove.push(*hash);
                     }
                 }
