@@ -13,10 +13,10 @@ use ledger::{FetchPackCache, InboundLedgerPacket, Ledger};
 use overlay::Peer;
 use shamap::family::FullBelowCacheImpl;
 use shamap::tree_node_cache::TreeNodeCache;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use crate::runtime::overlay_runtime::AppOverlayRuntime;
@@ -187,6 +187,96 @@ impl RunDataLimiter {
     }
 }
 
+/// A fixed-size thread pool for acquisition workers, matching rippled's job
+/// queue architecture.  Worker threads are spawned once on construction and
+/// pull jobs (closures) from a shared bounded queue.  When all workers are
+/// busy, new submissions block until a slot frees up, providing natural
+/// backpressure.
+struct AcquisitionWorkPool {
+    queue: Arc<(Mutex<VecDeque<Box<dyn FnOnce() + Send>>>, Condvar)>,
+    /// Flag signalling shutdown — workers check this when waking up and
+    /// exit cleanly once set.
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    _workers: Vec<JoinHandle<()>>,
+}
+
+impl AcquisitionWorkPool {
+    /// Create a pool with `size` worker threads.
+    fn new(size: usize) -> Self {
+        let queue: Arc<(Mutex<VecDeque<Box<dyn FnOnce() + Send>>>, Condvar)> =
+            Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut workers = Vec::with_capacity(size);
+        for i in 0..size {
+            let q = Arc::clone(&queue);
+            let s = Arc::clone(&stop);
+            let handle = thread::Builder::new()
+                .name(format!("xrpld-acq-pool-{i}"))
+                .spawn(move || {
+                    loop {
+                        let job = {
+                            let (lock, cvar) = &*q;
+                            let mut jobs = lock.lock().expect("work pool lock");
+                            // Wait until there is a job or shutdown is requested.
+                            while jobs.is_empty() {
+                                if s.load(std::sync::atomic::Ordering::Acquire) {
+                                    return;
+                                }
+                                jobs = cvar.wait(jobs).expect("work pool cvar wait");
+                            }
+                            // Re-check stop after waking — allows fast drain
+                            // on shutdown without executing stale jobs.
+                            if s.load(std::sync::atomic::Ordering::Acquire) {
+                                return;
+                            }
+                            jobs.pop_front()
+                        };
+                        if let Some(job) = job {
+                            job();
+                        }
+                    }
+                })
+                .expect("acquisition pool thread should spawn");
+            workers.push(handle);
+        }
+
+        Self {
+            queue,
+            stop,
+            _workers: workers,
+        }
+    }
+
+    /// Submit a job to the pool.  If all workers are busy the job is queued
+    /// and the next available worker will pick it up.
+    fn submit(&self, job: Box<dyn FnOnce() + Send>) {
+        let (lock, cvar) = &*self.queue;
+        let mut jobs = lock.lock().expect("work pool submit lock");
+        jobs.push_back(job);
+        cvar.notify_one();
+    }
+
+    /// Signal all workers to stop and wait for them to finish.
+    fn shutdown(&self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Wake all workers so they observe the stop flag.
+        let (_, cvar) = &*self.queue;
+        cvar.notify_all();
+    }
+}
+
+impl Drop for AcquisitionWorkPool {
+    fn drop(&mut self) {
+        self.shutdown();
+        // Join all worker threads for clean teardown.
+        for handle in self._workers.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Reacquire interval for failed ledgers (reference kREACQUIRE_INTERVAL = 5 min).
 const REACQUIRE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 /// Sweep timeout for completed entries (reference 1 minute after last action).
@@ -245,6 +335,10 @@ pub struct SharedInboundLedgers {
     /// diagnostic logging. Previously gated cold-start acquisition blocking
     /// but that is now handled by progressive memory spill instead.
     has_validated_ledger: std::sync::atomic::AtomicBool,
+    /// Fixed-size thread pool shared by all acquisition workers. Matches
+    /// rippled's job queue: when one acquisition finishes the thread becomes
+    /// available for the next queued acquisition.
+    work_pool: AcquisitionWorkPool,
 }
 
 impl SharedInboundLedgers {
@@ -274,6 +368,7 @@ impl SharedInboundLedgers {
             overlay_rt: Arc::new(std::sync::RwLock::new(None)),
             completed_ledgers_tx,
             has_validated_ledger: std::sync::atomic::AtomicBool::new(false),
+            work_pool: AcquisitionWorkPool::new(MAX_CONCURRENT_ACQUISITIONS),
         }
     }
 
@@ -442,14 +537,15 @@ impl SharedInboundLedgers {
             .expect("acq registry")
             .insert(hash, acq_tx.clone());
 
-        let _acq_handle = thread::Builder::new()
-            .name("xrpld-acq-process".to_owned())
-            .spawn(move || {
-                run_acquisition_worker(
-                    acq_rx, shamap_hash, seq, ns, tc, fb, fp, wt, pending, rl, ss, store_tx,
-                );
-            })
-            .expect("acquisition thread should spawn");
+        // Submit to the shared acquisition thread pool instead of spawning a
+        // dedicated thread.  The pool has MAX_CONCURRENT_ACQUISITIONS worker
+        // threads; when one acquisition completes, the thread picks up the
+        // next queued job — matching rippled's job queue architecture.
+        self.work_pool.submit(Box::new(move || {
+            run_acquisition_worker(
+                acq_rx, shamap_hash, seq, ns, tc, fb, fp, wt, pending, rl, ss, store_tx,
+            );
+        }));
 
         let now = Instant::now();
 
@@ -612,6 +708,9 @@ impl SharedInboundLedgers {
             self.registry.lock().expect("acq registry").remove(&hash);
         }
         inner.recent_failures.clear();
+        // Signal the work pool to stop — workers will exit after finishing
+        // their current job (if any).
+        self.work_pool.shutdown();
     }
 }
 
