@@ -2220,6 +2220,17 @@ fn initialize_startup_ledger_state(
             seed_startup_ledger_state(root, options, config)
         }
         StartUpType::Fresh | StartUpType::Normal | StartUpType::Snapshot => {
+            if matches!(options.start_type, StartUpType::Normal | StartUpType::Snapshot)
+                && !root.config().standalone
+            {
+                // A non-standalone Normal/Snapshot node must acquire the
+                // current network ledger before participating in consensus.
+                // Without this, the strand's switchLastClosedLedger block
+                // (gated on need_network_ledger) cannot run, and the node
+                // creates divergent acquisitions every round instead of
+                // switching to the network chain.
+                root.set_need_network_ledger(true);
+            }
             seed_startup_ledger_state(root, options, config)
         }
     }

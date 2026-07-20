@@ -871,11 +871,10 @@ impl AppConsensus {
                                 Some(network_ledger)
                             } else {
                                 // Network ledger not locally available — acquire from peers.
-                                // Do NOT demote operating mode or set need_network_ledger.
-                                // The consensus timer's checkLedger (inside timer_entry) will
-                                // detect the mismatch via handleWrongLedger on the next tick
-                                // and advance via SwitchedLedger mode. This matches rippled
-                                // where doAccept never demotes the operating mode.
+                                // Set need_network_ledger so the strand's switchLastClosedLedger
+                                // block handles the acquired ledger when it arrives, and
+                                // strand step 5 won't start a new round on our wrong ledger.
+                                // Demote to Connected matching rippled NetworkOPs.cpp:1997.
                                 if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                                     if let Some(shared) = guard.as_ref() {
                                         // Try to resolve the seq for this hash from the
@@ -890,6 +889,10 @@ impl AppConsensus {
                                         shared.acquire_async(network_closed, seq, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
                                     }
                                 }
+                                root.set_need_network_ledger(true);
+                                self.adaptor.network_ops_mode_owner.set_operating_mode_direct(
+                                    crate::network::network_ops::NetworkOpsOperatingMode::Connected
+                                );
                                 None
                             }
                         } else {

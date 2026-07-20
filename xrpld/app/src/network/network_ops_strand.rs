@@ -285,7 +285,12 @@ fn strand_loop(
         }
 
         // ─── 5. Handle Accepted phase → detect new closed and start_round ─
-        if runner.phase() == ConsensusPhase::Accepted {
+        //
+        // When need_network_ledger is true, the node is acquiring the network
+        // ledger and must NOT start new consensus rounds on our local (wrong)
+        // ledger. The switchLastClosedLedger block in step 6 handles starting
+        // a round on the correct chain once the acquisition completes.
+        if runner.phase() == ConsensusPhase::Accepted && !root.need_network_ledger() {
             if let Some(closed) = root.closed_ledger() {
                 let closed_id = *closed.header().hash.as_uint256();
                 if last_round_ledger_id != Some(closed_id) {
