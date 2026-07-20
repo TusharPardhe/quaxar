@@ -1778,7 +1778,7 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                                                 // the acquisition to complete: storeLedger drain →
                                                 // LedgerDone → check_accept → on_closed_ledger →
                                                 // next on_accept finds matching chain → starts round.
-                                                if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
+                                                if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                                                     if let Some(shared) = guard.as_ref() {
                                                         shared.acquire_async(network_closed, 0, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
                                                         tracing::info!(
@@ -4177,7 +4177,7 @@ impl ApplicationRoot {
                 // concurrent acquisition (rippled-parity: multi-ledger fetch
                 // up to ledger_fetch_limit during sequential catchup).
                 if let Some(missing) = report.missing {
-                    if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
+                    if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                         if let Some(shared) = guard.as_ref() {
                             shared.acquire_async(missing.hash, missing.seq, crate::ledger::inbound_ledgers::AcquireReason::Generic);
                         }
@@ -4430,7 +4430,7 @@ impl ApplicationRoot {
                 // Matches rippled's `app_.getInboundLedgers().acquire(hash,
                 // seq, InboundLedger::Reason::GENERIC)`: actively fetch the
                 // ledger we don't have from peers rather than waiting.
-                if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
+                if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                     if let Some(shared) = guard.as_ref() {
                         shared.acquire_async(hash, seq, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
                     }
@@ -4487,7 +4487,7 @@ impl ApplicationRoot {
         // Mark that we have a validated ledger (informational; progressive
         // memory spill now handles memory bounding during acquisition).
         if let Some(lm_rt) = self.ledger_master_runtime() {
-            if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
+            if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                 if let Some(shared) = guard.as_ref() {
                     // Remove this ledger's entry immediately so the slot is
                     // freed for the next acquisition. Without this, completed

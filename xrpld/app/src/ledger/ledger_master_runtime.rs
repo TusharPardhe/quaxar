@@ -29,7 +29,7 @@ pub struct AppLedgerMasterRuntime {
     pub(crate) pending_consensus_ledger: Arc<Mutex<Option<Uint256>>>,
     pub(crate) completed_ledgers_rx:
         Arc<Mutex<Option<std::sync::mpsc::Receiver<Arc<ledger::Ledger>>>>>,
-    pub shared_inbound_ledgers:
+    pub inbound_ledgers:
         Arc<Mutex<Option<Arc<crate::ledger::inbound_ledgers::InboundLedgers>>>>,
 }
 
@@ -75,7 +75,7 @@ impl AppLedgerMasterRuntime {
             ledger_master,
             pending_consensus_ledger: Arc::new(Mutex::new(None)),
             completed_ledgers_rx: Arc::new(Mutex::new(None)),
-            shared_inbound_ledgers: Arc::new(Mutex::new(None)),
+            inbound_ledgers: Arc::new(Mutex::new(None)),
         }
     }
 

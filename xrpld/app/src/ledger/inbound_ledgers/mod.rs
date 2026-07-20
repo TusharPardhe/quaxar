@@ -1,6 +1,6 @@
 //! Unified inbound ledger acquisition service.
 //!
-//! This module replaces the old `shared_inbound_ledgers.rs` and the legacy
+//! This module replaces the old `inbound_ledgers` field and the legacy
 //! `acquisition/inbound_ledgers.rs` with a single clean implementation
 //! matching rippled's InboundLedgers architecture:
 //!

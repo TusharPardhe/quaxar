@@ -254,7 +254,7 @@ impl consensus::rcl_support::ValidationsAdaptor for RclValidationsAdaptor {
             return Some(RclValidatedLedger::from_ledger(&ledger));
         }
 
-        if let Some(guard) = runtime.shared_inbound_ledgers.lock().ok()
+        if let Some(guard) = runtime.inbound_ledgers.lock().ok()
             && let Some(shared) = guard.as_ref()
         {
             shared.acquire_async(*ledger_id, 0, crate::ledger::inbound_ledgers::AcquireReason::Generic);

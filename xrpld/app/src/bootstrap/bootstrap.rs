@@ -988,7 +988,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
     let lm_rt_for_shared_inbound = runtime.root().ledger_master_runtime();
     let shared_inbound = lm_rt_for_shared_inbound
         .as_ref()
-        .and_then(|lm_rt| lm_rt.shared_inbound_ledgers.lock().ok()?.clone())
+        .and_then(|lm_rt| lm_rt.inbound_ledgers.lock().ok()?.clone())
         .unwrap_or_else(|| {
             Arc::new(crate::ledger::inbound_ledgers::InboundLedgers::new(
                 Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
@@ -1020,7 +1020,7 @@ fn run_start_mode_consensus_loop(runtime: Arc<MainRuntime>, stop: Arc<AtomicBool
         });
 
     if let Some(lm_rt) = lm_rt_for_shared_inbound.as_ref()
-        && let Ok(mut guard) = lm_rt.shared_inbound_ledgers.lock()
+        && let Ok(mut guard) = lm_rt.inbound_ledgers.lock()
         && guard.is_none()
     {
         *guard = Some(Arc::clone(&shared_inbound));

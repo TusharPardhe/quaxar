@@ -369,7 +369,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             return Some(RclCxLedger::new(ledger));
         }
 
-        if let Some(guard) = self.ledger_master_runtime.shared_inbound_ledgers.lock().ok()
+        if let Some(guard) = self.ledger_master_runtime.inbound_ledgers.lock().ok()
             && let Some(shared) = guard.as_ref()
         {
             // Try to look up the seq from the ledger cache so the acquisition
@@ -876,7 +876,7 @@ impl AppConsensus {
                                 // detect the mismatch via handleWrongLedger on the next tick
                                 // and advance via SwitchedLedger mode. This matches rippled
                                 // where doAccept never demotes the operating mode.
-                                if let Ok(guard) = lm_rt.shared_inbound_ledgers.lock() {
+                                if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                                     if let Some(shared) = guard.as_ref() {
                                         // Try to resolve the seq for this hash from the
                                         // ledger cache so acquisition can prioritise.
