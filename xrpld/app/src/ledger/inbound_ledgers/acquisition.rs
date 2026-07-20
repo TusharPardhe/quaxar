@@ -831,6 +831,19 @@ fn process_acquisition_tick(state: &Arc<AcquisitionState>) {
 
 /// Finalize a completed acquisition — publish the ledger.
 fn finalize_acquisition(state: &Arc<AcquisitionState>) {
+    // Check if actually complete BEFORE claiming the completed flag.
+    // This prevents the tick→finalize→reset→tick loop.
+    {
+        let mutable = state.mutable.lock().expect("acq mutable lock (pre-check)");
+        let ready = mutable.inbound.is_complete()
+            || (mutable.inbound.planner_state().have_header
+                && mutable.inbound.planner_state().have_state
+                && mutable.inbound.planner_state().have_transactions);
+        if !ready || mutable.inbound.is_failed() {
+            return;
+        }
+    }
+
     if state.completed.swap(true, Ordering::AcqRel) {
         return; // Already finalized
     }
@@ -857,7 +870,7 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
         {
             mutable.inbound.set_complete();
         } else {
-            state.completed.store(false, Ordering::Release);
+            // Pre-check should have caught this — should not reach here
             return;
         }
     }
@@ -876,7 +889,6 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
 
     let Some(mut ledger) = mutable.inbound.ledger().cloned() else {
         tracing::warn!(target: "inbound_ledger", seq, "Missing ledger on completion");
-        state.completed.store(false, Ordering::Release);
         return;
     };
 

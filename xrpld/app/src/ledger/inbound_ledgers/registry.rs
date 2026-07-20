@@ -231,28 +231,36 @@ impl InboundLedgers {
             return entry.completed_ledger.clone();
         }
 
-        // Bound concurrent acquisitions: evict lowest-seq if at limit
+        // Bound concurrent acquisitions: only evict if the new request has a
+        // known seq that is strictly higher than the lowest in-flight.
+        // With seq=0 (unknown) or equal priority, just wait for existing
+        // acquisitions to complete rather than thrashing.
         let in_progress_count = inner
             .entries
             .values()
             .filter(|e| !e.failed && e.completed_ledger.is_none())
             .count();
         if in_progress_count >= MAX_CONCURRENT {
-            let lowest_seq_hash = inner
+            let lowest = inner
                 .entries
                 .iter()
                 .filter(|(_, e)| !e.failed && e.completed_ledger.is_none())
-                .min_by_key(|(_, e)| e.seq)
-                .map(|(h, _)| *h);
-            if let Some(evict_hash) = lowest_seq_hash {
-                if let Some(evicted) = inner.entries.remove(&evict_hash) {
-                    evicted.state.stopped.store(true, Ordering::Release);
-                    tracing::debug!(target: "inbound_ledger",
-                        evicted_seq = evicted.seq,
-                        new_seq = seq,
-                        "Evicting lowest-seq acquisition to bound concurrency"
-                    );
-                }
+                .min_by_key(|(_, e)| e.seq);
+            let should_evict = match lowest {
+                Some((_, e)) if seq > 0 && e.seq > 0 && seq > e.seq => true,
+                _ => false,
+            };
+            if !should_evict {
+                return None;
+            }
+            let evict_hash = lowest.map(|(h, _)| *h).unwrap();
+            if let Some(evicted) = inner.entries.remove(&evict_hash) {
+                evicted.state.stopped.store(true, Ordering::Release);
+                tracing::debug!(target: "inbound_ledger",
+                    evicted_seq = evicted.seq,
+                    new_seq = seq,
+                    "Evicting lowest-seq acquisition to bound concurrency"
+                );
             }
         }
 
