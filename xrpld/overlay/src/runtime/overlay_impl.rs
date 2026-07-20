@@ -842,6 +842,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         .ok()
         .and_then(Result::ok);
         if parsed.is_none() {
+            tracing::warn!(target: "overlay", peer_id = %self.peer.id(), len = message.validation.len(), "on_validation: PARSE FAILED — dropping validation");
             return crate::router::RouteAction::Continue;
         }
 

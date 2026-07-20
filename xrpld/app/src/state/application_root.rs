@@ -4537,7 +4537,7 @@ impl ApplicationRoot {
         let current_ledger_fresh = now_close_time
             < last_closed_close_time.saturating_add(close_time_resolution.saturating_mul(2));
 
-        tracing::info!(target: "app",
+        tracing::debug!(target: "app",
             ?current_mode, need_network_ledger, current_ledger_fresh,
             now_close_time, last_closed_close_time, close_time_resolution,
             "promote_operating_mode: evaluating"
