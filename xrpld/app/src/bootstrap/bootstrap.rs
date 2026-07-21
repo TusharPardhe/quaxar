@@ -1437,6 +1437,56 @@ fn run_start_mode_consensus_loop(
                         last_cache_sweep = std::time::Instant::now();
                     }
 
+                    // ─── Overlay timer duties (matching rippled OverlayImpl::Timer) ───
+                    // Ping peers every 60s, check_tracking every 1s, delete_idle_peers every 4s
+                    {
+                        use overlay::Overlay;
+
+                        // check_tracking every tick (1s) — updates peer convergence state
+                        let valid_seq = root.ledger_master_runtime()
+                            .map(|lm_rt| lm_rt.ledger_master().valid_ledger_seq())
+                            .unwrap_or(0);
+                        overlay_rt.overlay().check_tracking(valid_seq);
+
+                        // delete_idle_peers every 4 ticks (matching CHECK_IDLE_PEERS = 4)
+                        static IDLE_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        let tick = IDLE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if tick % 4 == 0 {
+                            overlay_rt.overlay().delete_idle_peers();
+                        }
+
+                        // Ping every 60 seconds
+                        static LAST_PING_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let last_ping = LAST_PING_SECS.load(std::sync::atomic::Ordering::Relaxed);
+                        if now_secs.saturating_sub(last_ping) >= 60 {
+                            LAST_PING_SECS.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                            let peers = overlay_rt.overlay().active_peers();
+                            let ping_msg = overlay::ProtocolMessage::new(
+                                overlay::ProtocolPayload::Ping(overlay::message::wire::TmPing {
+                                    r#type: 0,
+                                    seq: Some(basics::random::rand_int_to(u32::MAX)),
+                                    ping_time: Some(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_millis() as u64,
+                                    ),
+                                    net_time: None,
+                                }),
+                            );
+                            let wire = overlay::Message::new(ping_msg, None);
+                            for p in &peers {
+                                p.send(wire.clone());
+                            }
+                            overlay_rt.overlay().delete_idle_peers();
+                            tracing::debug!(target: "overlay", peer_count = peers.len(), "Ping sent to all peers");
+                        }
+                    }
+
                     // Drain validator list messages and apply them to the local UNL
                     let messages = overlay_rt.overlay().take_validator_lists();
                     if !messages.is_empty() {
