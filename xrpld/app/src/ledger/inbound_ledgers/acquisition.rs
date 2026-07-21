@@ -187,7 +187,6 @@ pub struct WorkerStore {
     node_store: SHAMapStoreNodeStore,
     write_tx: Sender<NodeStoreWriteMsg>,
     write_count: u64,
-    dedup_skipped: u64,
     pending_writes: Arc<Mutex<HashMap<Uint256, PendingNodeStoreObject>>>,
     shared_stored: Arc<KeyCache<Uint256>>,
 }
@@ -200,12 +199,9 @@ impl WorkerStore {
         hash: Uint256,
         seq: u32,
     ) {
-        // No pre-store dedup gate here.  The SHAMap tree already deduplicates
-        // (addKnownNode returns duplicate if present), and NuDB handles
-        // on-disk dedup.  A shared_stored gate would race with
-        // release_deep_children: after a node is released from RAM but before
-        // the writer persists it, the peer resends the same hash — the gate
-        // would skip the re-send and the node would be permanently lost.
+        if !self.shared_stored.insert(hash) {
+            return;
+        }
         self.pending_writes
             .lock()
             .expect("pending writes lock")
@@ -217,15 +213,12 @@ impl WorkerStore {
                     hash,
                 },
             );
-        let send_result = self.write_tx.send(NodeStoreWriteMsg::Write {
+        let _ = self.write_tx.send(NodeStoreWriteMsg::Write {
             obj_type,
             data,
             hash,
             seq,
         });
-        if send_result.is_err() {
-            tracing::warn!(target: "inbound_ledger", "store_object: write_tx send FAILED (channel closed — writer thread may have panicked)");
-        }
         self.write_count += 1;
     }
 }
@@ -415,7 +408,6 @@ impl AcquisitionBuilder {
                     node_store: self.node_store.clone(),
                     write_tx: self.write_tx,
                     write_count: 0,
-                    dedup_skipped: 0,
                     pending_writes: Arc::clone(&self.pending_writes),
                     shared_stored: self.shared_stored,
                 },
@@ -452,7 +444,7 @@ fn flush_writes(write_tx: &Sender<NodeStoreWriteMsg>) -> bool {
     if write_tx.send(NodeStoreWriteMsg::Flush(ack_tx)).is_err() {
         return false;
     }
-    ack_rx.recv_timeout(Duration::from_secs(120)).is_ok()
+    ack_rx.recv_timeout(Duration::from_secs(30)).is_ok()
 }
 
 // ─── Spawn node-store writer ─────────────────────────────────────────────────
@@ -528,7 +520,7 @@ pub fn spawn_nodestore_writer(
                     } else {
                         0
                     };
-                    tracing::info!(target: "nodestore", total_writes, avg_us, "NuDB writer status");
+                    tracing::debug!(target: "nodestore", total_writes, avg_us, "NuDB writer status");
                     last_log = Instant::now();
                 }
             }
@@ -738,44 +730,34 @@ fn process_acquisition_tick(state: &Arc<AcquisitionState>) {
     }
 
     // Progressive memory spill — leveraging quaxar's release_loaded_children
-    // mechanism (which rippled lacks). We ONLY release nodes after the writer
-    // has confirmed they are on disk. If flush_writes fails, we must NOT
-    // release — otherwise nodes in the channel queue (not yet on disk) would
-    // be lost permanently (shared_stored was removed to fix this exact race).
+    // mechanism (which rippled lacks). After nodes are written to NuDB, we
+    // release loaded children at depth >= 3, bounding memory to the top 3
+    // levels (~4K inner nodes) + whatever frontier nodes getMissingNodes
+    // re-loads on the next tick. This is BETTER than rippled's TreeNodeCache
+    // TTL sweep because it's immediate and deterministic.
     {
         let current_writes = store.write_count;
         if current_writes > 0
             && current_writes % SPILL_INTERVAL_NODES == 0
             && inbound.planner_state().have_header
         {
-            tracing::info!(target: "inbound_ledger",
-                seq, writes = current_writes,
-                "Acquisition write stats"
-            );
-            let flushed = flush_writes(&store.write_tx);
-            if flushed {
-                if let Some(ledger) = inbound.ledger() {
-                    // First: release completed subtrees (free, no re-fetch needed for these)
-                    let fb_gen = state.worker_full_below.generation();
-                    let full_released = ledger.state_map().spill_full_below_subtrees(fb_gen);
-                    // Second: aggressively release deep nodes regardless of completion.
-                    // keep_depth=3 means we keep root + 2 levels (~272 inner nodes max)
-                    // loaded, and release everything deeper. getMissingNodes will re-load
-                    // only the frontier branches it needs from NuDB.
-                    let deep_released = ledger.state_map().release_deep_children(3);
-                    if full_released + deep_released > 0 {
-                        tracing::debug!(
-                            target: "inbound_ledger",
-                            seq, writes = current_writes, full_released, deep_released,
-                            "Progressive spill: released subtrees for memory bound"
-                        );
-                    }
+            let _ = flush_writes(&store.write_tx);
+            if let Some(ledger) = inbound.ledger() {
+                // First: release completed subtrees (free, no re-fetch needed for these)
+                let fb_gen = state.worker_full_below.generation();
+                let full_released = ledger.state_map().spill_full_below_subtrees(fb_gen);
+                // Second: aggressively release deep nodes regardless of completion.
+                // keep_depth=3 means we keep root + 2 levels (~272 inner nodes max)
+                // loaded, and release everything deeper. getMissingNodes will re-load
+                // only the frontier branches it needs from NuDB.
+                let deep_released = ledger.state_map().release_deep_children(3);
+                if full_released + deep_released > 0 {
+                    tracing::debug!(
+                        target: "inbound_ledger",
+                        seq, writes = current_writes, full_released, deep_released,
+                        "Progressive spill: released subtrees for memory bound"
+                    );
                 }
-            } else {
-                tracing::warn!(
-                    target: "inbound_ledger", seq, writes = current_writes,
-                    "Spill skipped: flush_writes failed (writer thread may be dead or backlogged)"
-                );
             }
         }
     }

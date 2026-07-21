@@ -2129,23 +2129,20 @@ impl Backend for NuDbBackend {
     }
 
     fn store(&self, object: Arc<NodeObject>) {
-        // NOTE: Removed find_bucket_entry pre-check (existence check before write).
-        //
-        // rippled's C++ DatabaseNodeImp::store() writes unconditionally —
-        // it never checks existence before writing to the backend. The
-        // SHAMap tree handles dedup at the in-memory level (addKnownNode
-        // returns "duplicate"), and the NuDB backend's own bucket index
-        // is the only persistence-level gate.
-        //
-        // Our find_bucket_entry implementation has a known bug that causes
-        // false positives on fresh databases (returns Some for hashes that
-        // were never written), which blocked ALL writes and prevented the
-        // node from ever persisting peer-received data to disk.
-        //
-        // Removing this check means duplicate writes may occur across
-        // concurrent acquisitions, but NuDB's append-only design handles
-        // this safely (slightly more disk usage, no correctness impact).
-        //
+        // Check existence OUTSIDE the store_mutex — pread is thread-safe.
+        // Skip during bulk import for massive speedup (no disk reads per node).
+        if !self.bulk_importing.load(Ordering::Acquire) {
+            match self.find_bucket_entry(object.hash().data()) {
+                Ok(Some(_)) => return,
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(target: "nodestore", error = %error, "Node store write failed");
+                    self.journal.log(JournalLevel::Error, &error);
+                    return;
+                }
+            }
+        }
+
         // Pre-compute the encoded+compressed record OUTSIDE the lock.
         // This is the most CPU-intensive part of store().
         let encoded = EncodedBlob::new(&object);
@@ -2256,7 +2253,17 @@ impl Backend for NuDbBackend {
 
         for object in batch {
             batch_size_bytes += object.data().len();
-            // NOTE: find_bucket_entry pre-check removed — same reason as store().
+            if !bulk_importing {
+                match self.find_bucket_entry(object.hash().data()) {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(target: "nodestore", error = %error, "Node store write failed");
+                        self.journal.log(JournalLevel::Error, &error);
+                        continue;
+                    }
+                }
+            }
             let encoded = EncodedBlob::new(object);
             let compressed = match nodeobject_compress(encoded.get_data()) {
                 Ok(c) => c,
