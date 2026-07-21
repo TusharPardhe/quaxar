@@ -1011,7 +1011,28 @@ fn run_start_mode_consensus_loop(
     if let Some(ns) = runtime.root().node_store().as_ref() {
         shared_inbound.set_node_store(ns.clone());
         let pending_writes = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let (write_tx, _write_handle) = crate::ledger::inbound_ledgers::spawn_nodestore_writer(ns.clone(), Arc::clone(&pending_writes));
+        let (write_tx, write_handle) = crate::ledger::inbound_ledgers::spawn_nodestore_writer(ns.clone(), Arc::clone(&pending_writes));
+        // Monitor the writer thread — if it panics, log it instead of silently swallowing.
+        std::thread::Builder::new()
+            .name("nudb-writer-watch".to_owned())
+            .spawn(move || {
+                match write_handle.join() {
+                    Ok(()) => {
+                        tracing::error!(target: "nodestore", "NuDB writer thread exited normally (unexpected — should run forever)");
+                    }
+                    Err(e) => {
+                        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        tracing::error!(target: "nodestore", error = %msg, "NuDB writer thread PANICKED — writes to disk will stop!");
+                    }
+                }
+            })
+            .expect("failed to spawn nudb-writer-watch thread");
         shared_inbound.set_write_tx(write_tx);
         shared_inbound.set_pending_writes(pending_writes);
     }
