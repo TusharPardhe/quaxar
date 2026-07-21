@@ -2770,7 +2770,7 @@ fn seed_startup_ledger_state(
     tracing::info!(target: "bootstrap", ledger_seq = closed.header().seq, "Genesis ledger loaded");
     let hydrate_seed_as_loaded = !matches!(
         options.start_type,
-        StartUpType::Fresh | StartUpType::Network
+        StartUpType::Fresh | StartUpType::Normal | StartUpType::Network
     );
     if hydrate_seed_as_loaded
         && closed.is_immutable()
