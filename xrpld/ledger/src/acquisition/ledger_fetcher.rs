@@ -56,9 +56,6 @@ fn next_missing_scan_first_child() -> u8 {
 const INBOUND_LEDGER_TIMEOUT_RETRIES_MAX: u32 = 6;
 const INBOUND_LEDGER_BECOME_AGGRESSIVE: u32 = 4;
 const MISSING_NODES_FIND: i32 = 256;
-/// During cold-start state acquisition, discover more missing nodes per cycle
-/// to supply work for parallel fan-out across multiple peers (6 peers × 128 nodes = 768).
-const MISSING_NODES_FIND_COLD_START: i32 = 1024;
 const REQ_NODES_REPLY: usize = 128;
 const REQ_NODES: usize = 12;
 
@@ -78,14 +75,6 @@ fn acq_packet_debug_verbose_enabled() -> bool {
     std::env::var("XRPLD_ACQ_PACKET_DEBUG_VERBOSE")
         .map(|value| value != "0")
         .unwrap_or(false)
-}
-
-fn inbound_ledger_timeout_retries_max() -> u32 {
-    std::env::var("XRPLD_INBOUND_LEDGER_TIMEOUT_RETRIES_MAX")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value >= INBOUND_LEDGER_TIMEOUT_RETRIES_MAX)
-        .unwrap_or(INBOUND_LEDGER_TIMEOUT_RETRIES_MAX)
 }
 
 fn log_acq_request_nodes(
@@ -320,6 +309,8 @@ pub struct InboundLedgerRunDataResult {
     pub processed_packets: usize,
     pub max_useful_count: i32,
     pub packet_stats: Vec<InboundLedgerPacketDebugStats>,
+    /// Packets that rippled charges as malformed, with their source peer.
+    pub malformed_packets: Vec<(u64, InboundLedgerDataType, InboundLedgerPacketError)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -343,6 +334,15 @@ pub enum InboundLedgerRequestTrigger {
     ReplyHighLatency,
     Timeout,
     Added,
+}
+
+/// Result of one `TimeoutCounter::invokeOnTimer` step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundLedgerTimerResult {
+    Progress,
+    NoProgress,
+    Done,
+    Failed,
 }
 
 pub trait InboundLedgerJournal {
@@ -595,6 +595,11 @@ impl InboundLedgerLocal {
 
     pub fn clear_progress(&mut self) {
         self.progress = false;
+    }
+
+    /// Enter the by-hash fallback mode used after a no-progress timeout.
+    pub fn set_by_hash(&mut self, by_hash: bool) {
+        self.by_hash = by_hash;
     }
 
     /// Clear recent_nodes filter — matches reference onTimer which always clears
@@ -957,7 +962,7 @@ impl InboundLedgerLocal {
         store: &mut DB,
         fetch_pack: &mut FP,
         family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-    ) -> Option<SHAMapAddNode>
+    ) -> Result<SHAMapAddNode, InboundLedgerPacketError>
     where
         CLOCK: CacheClock,
         S: BuildHasher + Clone,
@@ -968,11 +973,9 @@ impl InboundLedgerLocal {
         FP: FetchPackContainer,
         J: InboundLedgerJournal,
     {
-        let Ok(san) = self.process_packet_with_family_and_config(
+        let san = self.process_packet_with_family_and_config(
             packet, journal, config, store, fetch_pack, family,
-        ) else {
-            return None;
-        };
+        )?;
 
         if san.is_useful() {
             self.progress = true;
@@ -985,7 +988,7 @@ impl InboundLedgerLocal {
             tracing::debug!(target: "ledger", seq = self.seq, missing_nodes, total_nodes, pct = %progress, "Sync progress");
         }
         self.finish_if_done_with_family_and_config(journal, config, family);
-        Some(san)
+        Ok(san)
     }
 
     pub fn run_data_with_family_and_config_and_sampler<CLOCK, S, C, F, MR, NS, DB, FP, J, SAMPLE>(
@@ -1027,14 +1030,22 @@ impl InboundLedgerLocal {
                     None
                 };
                 let start = std::time::Instant::now();
-                let san = self.process_packet_and_update_stats_with_family_and_config(
+                let (san, error) = match self.process_packet_and_update_stats_with_family_and_config(
                     &entry.packet,
                     journal,
                     config,
                     store,
                     fetch_pack,
                     family,
-                );
+                ) {
+                    Ok(san) => (Some(san), None),
+                    Err(error) => (None, Some(error)),
+                };
+                if let (Some(peer_id), Some(error)) = (entry.peer_id, error) {
+                    result
+                        .malformed_packets
+                        .push((peer_id, packet_type, error));
+                }
                 let count = san.map(|san| san.get_good()).unwrap_or(-1);
                 {
                     let peer_id = entry.peer_id.unwrap_or(0);
@@ -1219,14 +1230,22 @@ impl InboundLedgerLocal {
                     None
                 };
                 let start = std::time::Instant::now();
-                let san = self.process_packet_and_update_stats_with_family_and_config(
+                let (san, error) = match self.process_packet_and_update_stats_with_family_and_config(
                     &entry.packet,
                     journal,
                     config,
                     store,
                     fetch_pack,
                     family,
-                );
+                ) {
+                    Ok(san) => (Some(san), None),
+                    Err(error) => (None, Some(error)),
+                };
+                if let (Some(peer_id), Some(error)) = (entry.peer_id, error) {
+                    result
+                        .malformed_packets
+                        .push((peer_id, packet_type, error));
+                }
                 let count = san.map(|san| san.get_good()).unwrap_or(-1);
                 {
                     let peer_id = entry.peer_id.unwrap_or(0);
@@ -2172,11 +2191,7 @@ impl InboundLedgerLocal {
                 );
                 send_fn(request);
             } else {
-                let missing_limit = if self.planner_state.have_state {
-                    MISSING_NODES_FIND
-                } else {
-                    MISSING_NODES_FIND_COLD_START
-                };
+                let missing_limit = MISSING_NODES_FIND;
                 let mut filter_ref: Option<&mut dyn shamap::fetch::SHAMapSyncFilter> =
                     Some(&mut filter);
                 let (missing, scan_stats) = if full_sync_debug_enabled() {
@@ -2459,72 +2474,34 @@ impl InboundLedgerLocal {
         }
     }
 
-    /// Timer callback — called every 3 seconds. Returns `true` if failed.
-    pub fn on_timer_with_family<CLOCK, S, C, F, MR, NS, DB, FP, J>(
-        &mut self,
-        journal: &J,
-        config: &LedgerConfig,
-        store: &mut DB,
-        fetch_pack: &mut FP,
-        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-        send_fn: &mut dyn FnMut(ProtocolMessage),
-    ) -> bool
-    where
-        CLOCK: basics::tagged_cache::CacheClock,
-        S: std::hash::BuildHasher + Clone,
-        C: shamap::family::FullBelowCache,
-        F: shamap::family::SHAMapNodeFetcher,
-        MR: shamap::family::MissingNodeReporter,
-        DB: InboundLedgerStore,
-        FP: FetchPackContainer,
-        J: InboundLedgerJournal,
-    {
+    /// Apply `TimeoutCounter::invokeOnTimer` bookkeeping.
+    ///
+    /// The caller owns the `InboundLedger::onTimer` policy: local checking,
+    /// peer addition, and request ordering. Keeping that policy outside this
+    /// primitive preserves the reference's History-specific ordering.
+    pub fn timeout_expired(&mut self) -> InboundLedgerTimerResult {
         self.recent_nodes.clear();
 
         if self.is_done() {
-            return self.failed;
+            return if self.failed {
+                InboundLedgerTimerResult::Failed
+            } else {
+                InboundLedgerTimerResult::Done
+            };
         }
 
-        let was_progress = self.progress;
-        self.progress = false;
-
-        if !was_progress {
-            self.timeouts = self.timeouts.saturating_add(1);
-            tracing::debug!(target: "ledger", seq = self.seq, peer_id = 0u64, "Ledger data request timeout");
-
-            // Fail after max timeouts
-            if self.timeouts > inbound_ledger_timeout_retries_max() {
-                journal.warn(&format!(
-                    "{} timeouts for ledger seq={} hash={}",
-                    self.timeouts, self.seq, self.hash
-                ));
-                tracing::debug!(target: "ledger", seq = self.seq, "Ledger acquisition failed — retrying");
-                self.failed = true;
-                return true;
-            }
-
-            // Re-check local DB
-            let _ =
-                self.check_local_with_family_and_config(journal, config, store, fetch_pack, family);
-            if self.is_done() {
-                return self.failed;
-            }
-
-            self.by_hash = true;
-
-            // Re-trigger
-            self.trigger_with_family(
-                InboundLedgerRequestTrigger::Timeout,
-                journal,
-                config,
-                store,
-                fetch_pack,
-                family,
-                send_fn,
-            );
+        if self.progress {
+            self.progress = false;
+            return InboundLedgerTimerResult::Progress;
         }
 
-        self.failed
+        self.timeouts = self.timeouts.saturating_add(1);
+        if self.timeouts > INBOUND_LEDGER_TIMEOUT_RETRIES_MAX {
+            self.failed = true;
+            return InboundLedgerTimerResult::Failed;
+        }
+
+        InboundLedgerTimerResult::NoProgress
     }
 }
 

@@ -434,10 +434,10 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 editable.insert(&consensus::RclCxTxRef::from_transaction(tx));
             }
 
-            // Inject pseudo-transactions on flag ledgers (every 256th).
-            // Rippled calls AmendmentTable::doVoting, FeeVote::doVoting, and
-            // NegativeUNLVote::doVoting here.
-            if (prev_ledger.seq() + 1) % 256 == 0 {
+            // Rippled injects amendment and fee pseudo-transactions after a
+            // flag LCL. Negative-UNL voting runs after the preceding voting
+            // LCL, for the consensus session that produces the flag ledger.
+            if prev_ledger.ledger().is_flag_ledger() {
                 // Amendment voting — creates ttAMENDMENT pseudo-txs for
                 // amendments gaining/losing majority or activating.
                 if let Some(ref amendment_status) = self.amendment_status {
@@ -490,7 +490,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                         );
                     }
                 }
-
+            } else if prev_ledger.ledger().is_voting_ledger() {
                 // NegativeUNLVote — injects ttUNL_MODIFY pseudo-txs for
                 // validator disable/re-enable when reliability thresholds
                 // are crossed.

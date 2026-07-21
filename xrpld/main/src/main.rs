@@ -2040,7 +2040,6 @@ fn set_consensus_thread_priority() {
 // Helper types for persistent ledger acquisition
 struct NodeStoreFetcher {
     node_store: app::SHAMapStoreNodeStore,
-    pending_writes: Arc<Mutex<HashMap<Uint256, app::ledger::inbound_ledgers::PendingNodeStoreObject>>>,
 }
 
 impl shamap::family::SHAMapNodeFetcher for NodeStoreFetcher {
@@ -2049,20 +2048,6 @@ impl shamap::family::SHAMapNodeFetcher for NodeStoreFetcher {
         hash: basics::sha_map_hash::SHAMapHash,
         ledger_seq: u32,
     ) -> Option<shamap::node_object::NodeObject> {
-        if let Some(pending) = self
-            .pending_writes
-            .lock()
-            .expect("pending node-store writes mutex")
-            .get(hash.as_uint256())
-            .cloned()
-        {
-            return Some(shamap::node_object::NodeObject::new(
-                pending.shamap_type(),
-                pending.data,
-                pending.hash,
-            ));
-        }
-
         let fetched = match &self.node_store {
             app::SHAMapStoreNodeStore::Single(db) => db.fetch_node_object(
                 hash.as_uint256(),

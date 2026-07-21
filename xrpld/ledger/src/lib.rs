@@ -146,9 +146,9 @@ pub use ledger_fetcher::{
     InboundLedgerPacketShape, InboundLedgerPeerScore, InboundLedgerPlannerState,
     InboundLedgerReason, InboundLedgerReceivedPacket, InboundLedgerRequest,
     InboundLedgerRequestTrigger, InboundLedgerRunDataResult, InboundLedgerStore,
-    NullInboundLedgerJournal, get_needed_hashes_with_family, make_inbound_get_ledger_request,
-    make_inbound_needed_by_hash_request, needed_hashes_with_family,
-    needed_hashes_with_family_and_first_child,
+    InboundLedgerTimerResult, NullInboundLedgerJournal, get_needed_hashes_with_family,
+    make_inbound_get_ledger_request, make_inbound_needed_by_hash_request,
+    needed_hashes_with_family, needed_hashes_with_family_and_first_child,
 };
 // Removed: InboundLedgersLocal, InboundLedgerRoute, stash_stale_packet
 // These will be reimplemented in app::ledger::inbound_ledgers
@@ -1185,7 +1185,18 @@ impl Ledger {
     /// Used by consensus to pin state map nodes in memory before building.
     pub fn node_fetcher_closure(
         &self,
-    ) -> Option<Arc<dyn Fn(basics::sha_map_hash::SHAMapHash) -> Option<basics::memory::intrusive_pointer::SharedIntrusive<shamap::nodes::tree_node::SHAMapTreeNode>> + Send + Sync>> {
+    ) -> Option<
+        Arc<
+            dyn Fn(
+                    basics::sha_map_hash::SHAMapHash,
+                ) -> Option<
+                    basics::memory::intrusive_pointer::SharedIntrusive<
+                        shamap::nodes::tree_node::SHAMapTreeNode,
+                    >,
+                > + Send
+                + Sync,
+        >,
+    > {
         self.node_fetcher.clone()
     }
 

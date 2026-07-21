@@ -174,12 +174,20 @@ fn needed_state_hashes_returns_missing_child_hashes_in_scan_order() {
         needed,
         vec![*missing_b.as_uint256(), *missing_a.as_uint256()]
     );
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![missing_b, missing_a]));
-    assert!(
-        reporter
-            .lock()
-            .by_seq
-            .is_empty()
+    // The family scan first observes each missing child, then performs its
+    // deferred completion lookup. Request hashes remain deduplicated above.
+    family.with_fetcher(|fetcher| {
+        assert_eq!(
+            fetcher.fetches.lock().clone(),
+            vec![missing_b, missing_a, missing_b, missing_a]
+        );
+    });
+    assert_eq!(
+        reporter.lock().by_seq,
+        vec![
+            (902, *missing_b.as_uint256()),
+            (902, *missing_a.as_uint256()),
+        ]
     );
 }
 

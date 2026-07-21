@@ -14,21 +14,26 @@
 //! accesses the consensus state machine. No mutex protects it because only
 //! this thread touches it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use basics::base_uint::Uint256;
 use consensus::algorithm::ConsensusPhase;
 
-use crate::consensus::rcl_consensus::ConsensusRunner;
+use crate::ApplicationRoot;
+use crate::consensus::rcl_consensus::{ConsensusRunner, RclConsensusValidationSource};
+use crate::consensus::rcl_validation::RclValidatedLedger;
 use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers};
 use crate::network::network_ops::NetworkOpsOperatingMode;
 use crate::runtime::component_runtime::{AppConsensusRuntime, ConsensusCommand};
-use crate::ApplicationRoot;
 
 use overlay::inbound::QueuedProposal;
+
+// History acquisition is retried promptly after the registry finishes a
+// ledger. InboundLedgers deduplicates by hash/sequence, as rippled does.
+const HISTORY_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Dependencies the strand needs (passed at construction).
 pub struct NetworkOpsStrandDeps {
@@ -144,9 +149,6 @@ fn strand_loop(
     let mut last_timer_tick = Instant::now();
     let mut last_round_ledger_id: Option<Uint256> = None;
     let mut last_history_tick = Instant::now();
-    // fillInProgress tracking: prevents starting a new history fill while one is
-    // active at the same or higher sequence (matching rippled LedgerMaster::mFillInProgress).
-    let mut fill_in_progress: Option<u32> = None;
 
     // Detect startup: always start consensus immediately on the closed
     // ledger, matching rippled's Application::run() which calls
@@ -316,7 +318,6 @@ fn strand_loop(
             &mut last_round_ledger_id,
             configured_ledger_history,
             &mut last_history_tick,
-            &mut fill_in_progress,
         );
 
         // ─── 6b. storeLedger drain — completed InboundLedger results ─────
@@ -324,13 +325,23 @@ fn strand_loop(
         // shared_completed_rx into LedgerHistory, matching rippled's
         // storeLedger path.
         if let Some(lm_rt) = root.ledger_master_runtime() {
-            let rx_guard = lm_rt.completed_ledgers_rx.lock().expect("completed_ledgers_rx");
+            let rx_guard = lm_rt
+                .completed_ledgers_rx
+                .lock()
+                .expect("completed_ledgers_rx");
             if let Some(rx) = rx_guard.as_ref() {
                 while let Ok(ledger) = rx.try_recv() {
-                    let inserted = lm_rt.ledger_master().ledger_history().insert(Arc::clone(&ledger), true);
+                    // The application-owned registry sends every completed
+                    // inbound ledger here, including History acquisitions.
+                    // `setFullLedger` in rippled makes this ledger part of
+                    // completeLedgers before doAdvance chooses the next gap.
+                    let lm = lm_rt.ledger_master();
+                    let inserted = record_completed_inbound_ledger(&lm, &ledger);
                     if inserted {
                         if let Some(ref tx) = event_tx {
-                            let _ = tx.send(crate::consensus::driver::ConsensusEvent::LedgerDone(Arc::clone(&ledger)));
+                            let _ = tx.send(crate::consensus::driver::ConsensusEvent::LedgerDone(
+                                Arc::clone(&ledger),
+                            ));
                         }
                     }
                 }
@@ -338,17 +349,9 @@ fn strand_loop(
         }
         if let Some(ref rx) = shared_completed_rx {
             while let Ok(ledger) = rx.try_recv() {
-                let ledger_seq = ledger.header().seq;
-                // Clear fillInProgress when the fill acquisition completes
-                if fill_in_progress == Some(ledger_seq) {
-                    fill_in_progress = None;
-                }
                 if let Some(lm_rt) = root.ledger_master_runtime() {
                     let lm = lm_rt.ledger_master();
-                    lm.ledger_history().insert(Arc::clone(&ledger), true);
-                    if ledger_seq > 0 {
-                        lm.mark_ledger_complete(ledger_seq);
-                    }
+                    record_completed_inbound_ledger(&lm, &ledger);
                 }
                 if let Some(ref tx) = event_tx {
                     let _ = tx.send(crate::consensus::driver::ConsensusEvent::LedgerDone(ledger));
@@ -381,7 +384,6 @@ fn check_accept_and_advance(
     last_round_ledger_id: &mut Option<Uint256>,
     configured_ledger_history: u32,
     last_history_tick: &mut Instant,
-    fill_in_progress: &mut Option<u32>,
 ) {
     let Some(lm_rt) = root.ledger_master_runtime() else {
         return;
@@ -390,89 +392,113 @@ fn check_accept_and_advance(
     let quorum = root.validators().quorum();
 
     // ── switchLastClosedLedger for joining nodes ──────────────────────────
-    if root.need_network_ledger() {
-        let our_closed_hash = root
-            .closed_ledger()
-            .map(|l| *l.header().hash.as_uint256())
-            .unwrap_or_default();
+    if root.need_network_ledger()
+        && let (Some(our_closed), Some(overlay_rt)) = (root.closed_ledger(), root.overlay_runtime())
+    {
+        use overlay::Overlay;
 
-        if let Some(overlay_rt) = root.overlay_runtime() {
-            use overlay::Overlay;
-            let peers = overlay_rt.overlay().active_peers();
-            let acquired_hashes: Vec<_> = peers
+        let our_closed_hash = *our_closed.header().hash.as_uint256();
+        let previous_closed_hash = *our_closed.header().parent_hash.as_uint256();
+        let peers = overlay_rt.overlay().active_peers();
+        let mut peer_counts = std::collections::BTreeMap::<Uint256, u32>::new();
+        for peer in &peers {
+            let hash = peer.closed_ledger_hash();
+            if !hash.is_zero() {
+                *peer_counts.entry(hash).or_default() += 1;
+            }
+        }
+
+        // `Validations::getPreferredLCL` is trusted-first, but deliberately
+        // falls back to peer LCL counts when no trusted validation exists.
+        // Requiring a quorum here stranded a cold node after it had acquired
+        // the peer ledger: no validator list meant its completed ledger could
+        // never be selected or installed. This is rippled's
+        // checkLastClosedLedger/switchLastClosedLedger decision, not a
+        // validation-quorum acceptance decision.
+        let preferred_hash = root.validations().preferred_lcl(
+            &RclValidatedLedger::from_ledger(&our_closed),
+            lm.valid_ledger_seq(),
+            &peer_counts,
+        );
+        let should_switch = !preferred_hash.is_zero()
+            && preferred_hash != our_closed_hash
+            && preferred_hash != previous_closed_hash;
+
+        if should_switch {
+            // Request only the preferred LCL, rather than an arbitrary
+            // highest-sequence peer report. This preserves trusted-validator
+            // preference when it exists and uses the peer-count fallback only
+            // when it does not.
+            let target = peers
                 .iter()
-                .map(|p| p.closed_ledger_hash())
-                .filter(|h| !h.is_zero() && *h != our_closed_hash)
-                .collect();
-
-            // Trigger acquisition for the highest-sequence peer hash we don't
-            // have locally. This matches rippled where InboundLedgers::acquire
-            // is called from checkLastClosedLedger when the network ledger
-            // differs from ours. We pick ONE target (highest seq) and stick
-            // with it until complete or swept.
-            if !acquired_hashes.is_empty() {
-                let target = peers
-                    .iter()
-                    .filter_map(|p| {
-                        let h = p.closed_ledger_hash();
-                        let (_, seq) = p.ledger_range();
-                        (!h.is_zero() && h != our_closed_hash && seq > 1)
-                            .then_some((seq, h))
-                    })
-                    .max_by_key(|(seq, _)| *seq);
-
-                if let Some((seq, hash)) = target {
-                    if !shared_inbound.contains(&hash) {
-                        shared_inbound.acquire_async(hash, seq, AcquireReason::Consensus);
-                    }
-                }
+                .filter_map(|peer| {
+                    let hash = peer.closed_ledger_hash();
+                    let (_, seq) = peer.ledger_range();
+                    (hash == preferred_hash && seq > 1).then_some((seq, hash))
+                })
+                .max_by_key(|(seq, _)| *seq);
+            if let Some((seq, hash)) = target
+                && !shared_inbound.contains(&hash)
+            {
+                shared_inbound.acquire_async(hash, seq, AcquireReason::Consensus);
             }
 
-            let mut best_validated: Option<Arc<ledger::Ledger>> = None;
-            for hash in &acquired_hashes {
-                let candidate = lm
-                    .ledger_history()
-                    .get_cached_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(*hash));
-                if let Some(candidate) = candidate {
-                    let candidate_hash = *candidate.header().hash.as_uint256();
-                    let val_count = root.validations().num_trusted_for_ledger(candidate_hash);
-                    if val_count >= quorum {
-                        if best_validated
-                            .as_ref()
-                            .map_or(true, |b| candidate.header().seq > b.header().seq)
-                        {
-                            best_validated = Some(candidate);
-                        }
-                    }
-                }
-            }
-
-            if let Some(network_ledger) = best_validated {
+            if let Some(network_ledger) = lm
+                .ledger_history()
+                .get_cached_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash))
+            {
                 let state_complete = !network_ledger.state_map().is_synching();
                 let tx_complete = network_ledger.header().tx_hash.is_zero()
                     || !network_ledger.tx_map().is_synching();
-                if state_complete && tx_complete {
+                let can_be_current =
+                    lm.can_be_current(network_ledger.as_ref(), root.current_close_time_seconds());
+                if state_complete && tx_complete && can_be_current {
                     let new_seq = network_ledger.header().seq;
                     let new_hash = *network_ledger.header().hash.as_uint256();
-                    let mut l = (*network_ledger).clone();
-                    l.set_validated();
-                    let validated = Arc::new(l);
-                    lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
-                    lm.mark_ledger_complete(validated.header().seq);
-                    root.note_validated_ledger_for_sync(Arc::clone(&validated));
-                    root.on_closed_ledger(Arc::clone(&validated));
+                    let trusted_validation_quorum =
+                        root.validations().num_trusted_for_ledger(new_hash) >= quorum;
+
+                    if trusted_validation_quorum {
+                        let mut ledger = (*network_ledger).clone();
+                        ledger.set_validated();
+                        let validated = Arc::new(ledger);
+                        lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
+                        lm.mark_ledger_complete(validated.header().seq);
+                        root.note_validated_ledger_for_sync(Arc::clone(&validated));
+                        root.on_closed_ledger(Arc::clone(&validated));
+                        root.try_advance_publication();
+                        root.promote_operating_mode_after_accepted_ledger(&validated);
+                    } else {
+                        // This is a peer-LCL fallback, not a claim that the
+                        // ledger is validated. Install it as the closed ledger
+                        // so consensus can resume; later trusted validations
+                        // still flow through checkAccept before advancing the
+                        // validated-ledger slot.
+                        root.on_closed_ledger(Arc::clone(&network_ledger));
+                        root.promote_operating_mode_after_accepted_ledger(&network_ledger);
+                    }
+
                     root.set_need_network_ledger(false);
-                    root.try_advance_publication();
-                    root.promote_operating_mode_after_accepted_ledger(&validated);
-                    // Restart consensus on the new chain
                     let now = root.shared_time_keeper().close_time();
-                    let prev_cx = crate::consensus_ledger_from_ledger(&validated);
+                    let prev_cx = crate::consensus_ledger_from_ledger(&network_ledger);
                     runner.start_round(now, new_hash, prev_cx, true);
                     consensus_rt.update_phase(runner.phase());
                     consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
                     *last_round_ledger_id = Some(new_hash);
-                    tracing::info!(target: "consensus", new_seq, %new_hash,
-                        "Consensus restarted on network chain (switchLastClosedLedger)");
+                    tracing::info!(
+                        target: "consensus",
+                        new_seq,
+                        %new_hash,
+                        trusted_validation_quorum,
+                        "Consensus restarted on network chain (switchLastClosedLedger)"
+                    );
+                } else if !can_be_current {
+                    tracing::warn!(
+                        target: "consensus",
+                        seq = network_ledger.header().seq,
+                        hash = %preferred_hash,
+                        "Rejected preferred peer LCL that cannot be current"
+                    );
                 }
             }
         }
@@ -586,13 +612,14 @@ fn check_accept_and_advance(
     //   7. currentLedger - candidateLedger <= ledgerHistory (within config range)
     //   8. candidateLedger >= minimumOnline (if known)
     //
-    // We also gate on fillInProgress (don't start a new fill if one is active
-    // at a lower sequence).
+    // InboundLedgers deduplicates active history requests by hash and
+    // sequence. rippled's fillInProgress_ is for local SQL tryFill work, not
+    // a lock held while a remote History acquisition is in flight.
 
     let valid_seq = lm.valid_ledger_seq();
     let pub_seq = lm
         .published_ledger()
-        .map(|l| l.header().seq)
+        .map(|ledger| ledger.header().seq)
         .unwrap_or(0);
 
     // Condition 1: not standalone (always true here — strand only spawns for overlay mode)
@@ -602,20 +629,20 @@ fn check_accept_and_advance(
     let publication_caught_up = valid_seq == pub_seq;
     // Condition 4: validated ledger age < 60s
     let validated_ledger_fresh = root.validated_ledger_age_seconds() < 60;
-    // Condition 5: NodeStore write pressure
-    // TODO(rippled-parity): Replace with `root.node_store_write_load() < 8192` once
-    // ApplicationRoot exposes `Database::get_write_load()` through a convenience method.
-    // The nodestore already implements get_write_load() but it is not yet wired through
-    // ApplicationRoot. For now we approximate using active acquisition count which
-    // correlates with write pressure during initial sync.
-    let write_pressure_ok = shared_inbound.active_count() < 8;
+    // Condition 5: NodeStore write pressure. This is the same persistence
+    // backlog metric and threshold as rippled's
+    // `app_.getNodeStore().getWriteLoad() < kMaxWriteLoadAcquire`.
+    let write_pressure_ok = root.node_store_write_load() < 8192;
 
-    let can_acquire_history = !fee_overloaded
+    // rippled's InboundLedgers::acquire rejects History while the node needs
+    // a network ledger. This strand is the sole History acquisition caller.
+    let can_acquire_history = !root.need_network_ledger()
+        && !fee_overloaded
         && publication_caught_up
         && validated_ledger_fresh
         && write_pressure_ok
         && valid_seq > 1
-        && last_history_tick.elapsed() >= Duration::from_secs(3);
+        && last_history_tick.elapsed() >= HISTORY_BACKFILL_RETRY_INTERVAL;
 
     if can_acquire_history {
         *last_history_tick = Instant::now();
@@ -641,31 +668,46 @@ fn check_accept_and_advance(
             );
 
             if should_acquire {
-                // fillInProgress gate: don't start a new fill if one is active
-                // at a lower or equal sequence (matching rippled mFillInProgress).
-                let fill_ok = fill_in_progress.map_or(true, |fip| missing > fip);
-                if fill_ok {
-                    let parent_hash = lm
-                        .ledger_history()
-                        .get_cached_ledger_by_seq(missing + 1)
-                        .map(|l| *l.header().parent_hash.as_uint256());
-                    if let Some(hash) = parent_hash {
-                        if !hash.is_zero() {
-                            let sha_hash = basics::sha_map_hash::SHAMapHash::new(hash);
-                            if lm
-                                .ledger_history()
-                                .get_cached_ledger_by_hash(sha_hash)
-                                .is_none()
-                            {
-                                *fill_in_progress = Some(missing);
-                                shared_inbound.acquire_async(hash, missing, AcquireReason::History);
-                            }
+                let parent_hash = lm
+                    .ledger_history()
+                    .get_cached_ledger_by_seq(missing + 1)
+                    .map(|l| *l.header().parent_hash.as_uint256());
+                if let Some(hash) = parent_hash {
+                    if !hash.is_zero() {
+                        let sha_hash = basics::sha_map_hash::SHAMapHash::new(hash);
+                        if lm
+                            .ledger_history()
+                            .get_cached_ledger_by_hash(sha_hash)
+                            .is_none()
+                            && !shared_inbound.has_entry_for_seq_or_hash(missing, &hash)
+                        {
+                            // Parent hashes permit a sequential walk when no
+                            // relational index is available for rippled-style
+                            // multi-ledger prefetch. The registry keeps this
+                            // bounded by deduplicating the active request.
+                            shared_inbound.acquire_async(hash, missing, AcquireReason::History);
                         }
                     }
                 }
             }
         }
     }
+}
+
+fn record_completed_inbound_ledger(
+    lm: &ledger::LedgerMaster,
+    ledger: &Arc<ledger::Ledger>,
+) -> bool {
+    // `LedgerMaster::setFullLedger` in rippled publishes the acquired object
+    // into both its history cache and completeLedgers. Both are required:
+    // cache lookup supplies the predecessor hash, while completeLedgers lets
+    // doAdvance select the next lower missing sequence.
+    let inserted = lm.ledger_history().insert(Arc::clone(ledger), true);
+    let ledger_seq = ledger.header().seq;
+    if ledger_seq > 0 {
+        lm.mark_ledger_complete(ledger_seq);
+    }
+    inserted
 }
 
 /// Matches rippled's static `shouldAcquire()` helper in LedgerMaster.cpp.
@@ -698,4 +740,52 @@ fn should_acquire_history(
     }
     // Otherwise don't acquire
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::record_completed_inbound_ledger;
+    use basics::base_uint::Uint256;
+    use basics::sha_map_hash::SHAMapHash;
+    use basics::tagged_cache::MonotonicClock;
+    use ledger::{Ledger, LedgerHeader, LedgerMaster, LedgerMasterConfig, calculate_ledger_hash};
+    use std::sync::Arc;
+
+    fn immutable_ledger(seq: u32, parent_fill: u8) -> Arc<Ledger> {
+        let mut header = LedgerHeader {
+            seq,
+            parent_hash: SHAMapHash::new(Uint256::from_array([parent_fill; 32])),
+            close_time: seq.saturating_add(100),
+            close_time_resolution: 30,
+            ..LedgerHeader::default()
+        };
+        header.hash = calculate_ledger_hash(&header);
+        let mut ledger = Ledger::new(header, true);
+        ledger.set_immutable(true);
+        Arc::new(ledger)
+    }
+
+    #[test]
+    fn completed_inbound_history_ledger_is_cached_and_marked_complete() {
+        let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
+        let newer = immutable_ledger(101, 0xA1);
+        let older = immutable_ledger(100, 0xA0);
+
+        assert!(record_completed_inbound_ledger(&master, &newer));
+        assert!(record_completed_inbound_ledger(&master, &older));
+
+        let complete = master.complete_ledgers();
+        assert!(complete.contains(100));
+        assert!(complete.contains(101));
+        assert_eq!(complete.to_string(), "100-101");
+        assert_eq!(
+            master
+                .ledger_history()
+                .get_cached_ledger_by_seq(100)
+                .expect("completed history ledger must be cached")
+                .header()
+                .hash,
+            older.header().hash
+        );
+    }
 }

@@ -4256,6 +4256,20 @@ impl ApplicationRoot {
         self.load_fee_track.is_loaded_local()
     }
 
+    /// Returns the active NodeStore write backlog. Before the store is
+    /// attached there is no pending persistence work, so return zero.
+    /// Matches rippled's `app_.getNodeStore().getWriteLoad()`.
+    pub fn node_store_write_load(&self) -> i32 {
+        self.node_store().as_ref().map_or(0, |node_store| match node_store {
+            crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(database) => {
+                database.get_write_load()
+            }
+            crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(database) => {
+                database.get_write_load()
+            }
+        })
+    }
+
     /// Returns the minimum ledger sequence that must remain online, matching
     /// rippled's `app_.getSHAMapStore().minimumOnline()`.
     ///
@@ -4552,8 +4566,30 @@ impl ApplicationRoot {
         l.set_validated();
         let validated = Arc::new(l);
         lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
+        // `setFullLedger` in rippled indexes validated ledgers in
+        // LedgerHistory. The history scheduler needs this by-sequence entry
+        // to retrieve the parent hash for its first predecessor request.
+        lm.ledger_history().insert(Arc::clone(&validated), true);
         lm.mark_ledger_complete(validated.header().seq);
         self.note_validated_ledger_for_sync(Arc::clone(&validated));
+
+        // Persist transaction and ledger indexes only after trusted
+        // validations promoted this exact network ledger. Persisting the
+        // locally closed candidate from `accept_ledger_with_txns` can index a
+        // transaction in the next local round when its actual network ledger
+        // has not yet been validated.
+        use ledger::LedgerPersistenceRuntime;
+        if !self
+            .build_ledger_persistence_runtime()
+            .save_validated_ledger(Arc::clone(&validated), true)
+        {
+            tracing::warn!(
+                target: "ledger",
+                seq = validated.header().seq,
+                hash = %validated.header().hash,
+                "failed to persist trusted validated ledger"
+            );
+        }
 
         // Rippled parity: after promoting a validated ledger, update the fee
         // tracker with the ledger's base fee so the fee escalation algorithm
@@ -5214,9 +5250,15 @@ impl ApplicationRoot {
         // next open ledger causing duplicate application on subsequent accepts.
         let _ = self.update_local_tx(closed.as_ref());
 
-        use ledger::LedgerPersistenceRuntime;
-        self.build_ledger_persistence_runtime()
-            .save_validated_ledger(Arc::clone(&closed), true);
+        // A live consensus close is a local candidate, not evidence that its
+        // transaction set entered the trusted network ledger. The validated
+        // promotion path (`check_accept_ledger`) persists the authoritative
+        // network ledger after quorum instead.
+        if self.standalone() {
+            use ledger::LedgerPersistenceRuntime;
+            self.build_ledger_persistence_runtime()
+                .save_validated_ledger(Arc::clone(&closed), true);
+        }
 
         let next_open_index = closed_seq.saturating_add(1);
         self.rebuild_open_ledger_after_close(

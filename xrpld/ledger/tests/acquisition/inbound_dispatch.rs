@@ -3,8 +3,10 @@ use basics::blob::Blob;
 use basics::tagged_cache::ManualClock;
 use ledger::{
     InboundLedgerCompletionDisposition, InboundLedgerDataType, InboundLedgerJournal,
-    InboundLedgerLocal, InboundLedgerNodeData, InboundLedgerPacket, InboundLedgerRunDataResult,
-    InboundLedgerStore, LedgerConfig, LedgerHeader, calculate_ledger_hash,
+    InboundLedgerLocal, InboundLedgerNodeData, InboundLedgerPacket, InboundLedgerPacketError,
+    InboundLedgerRunDataResult, InboundLedgerStore, InboundLedgerTimerResult, LedgerConfig,
+    LedgerHeader,
+    calculate_ledger_hash,
 };
 use shamap::family::{NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
 use shamap::storage::{NodeObjectType, StoredNode};
@@ -181,6 +183,9 @@ fn inbound_run_data_tracks_useful_peer_counts_and_resets_dispatch_latch() {
             processed_packets: 2,
             max_useful_count: 1,
             packet_stats: Vec::new(),
+            malformed_packets: vec![
+                (2, InboundLedgerDataType::TransactionNode, InboundLedgerPacketError::EmptyNodes),
+            ],
         }
     );
     assert!(!inbound.receive_dispatched());
@@ -237,4 +242,20 @@ fn inbound_got_data_rejects_new_packets_after_completion_is_observed() {
         Some(2),
         InboundLedgerPacket::new(InboundLedgerDataType::TransactionNode, vec![])
     ));
+}
+
+#[test]
+fn inbound_timeout_counter_fails_only_after_six_no_progress_retries() {
+    let mut inbound = InboundLedgerLocal::new(sample_hash(0x7F), 700);
+
+    for _ in 0..6 {
+        assert_eq!(
+            inbound.timeout_expired(),
+            InboundLedgerTimerResult::NoProgress
+        );
+        assert!(!inbound.is_failed());
+    }
+
+    assert_eq!(inbound.timeout_expired(), InboundLedgerTimerResult::Failed);
+    assert!(inbound.is_failed());
 }

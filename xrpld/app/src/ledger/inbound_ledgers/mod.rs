@@ -15,10 +15,7 @@ mod acquisition;
 mod registry;
 mod worker_pool;
 
-pub use self::acquisition::{
-    AcquisitionState, NodeStoreWriteMsg, PendingNodeStoreObject, RunDataLimiter,
-    spawn_nodestore_writer, stash_stale_packet,
-};
+pub use self::acquisition::{AcquisitionState, stash_stale_packet};
 pub use self::registry::{AcquireReason, InboundLedgers};
 pub use self::worker_pool::WorkerPool;
 
@@ -37,11 +34,11 @@ pub use self::worker_pool::WorkerPool;
 // or merged with `InboundLedgers`; the historical name is kept only to avoid
 // an unrelated rename across its RPC call sites.
 
-use basics::tagged_cache::MonotonicClock;
+use basics::base_uint::Uint256;
 use basics::sha_map_hash::SHAMapHash;
+use basics::tagged_cache::MonotonicClock;
 use ledger::InboundLedgerLocal;
 use std::collections::BTreeMap;
-use basics::base_uint::Uint256;
 
 /// RPC-owned resumable-ledger-request cache keyed by ledger hash. See the
 /// module-level note above for what this type actually does and does not do.

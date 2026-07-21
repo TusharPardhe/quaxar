@@ -40,7 +40,6 @@ use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use xrpl_core::{ServiceRegistry, StartUpType};
@@ -989,7 +988,6 @@ fn run_start_mode_consensus_loop(
                     time::Duration::seconds(120),
                     basics::tagged_cache::MonotonicClock::default(),
                 )),
-                Arc::new(crate::ledger::inbound_ledgers::RunDataLimiter::new(4)),
                 Arc::new(basics::tagged_cache::KeyCache::new(
                     "driver-dedup",
                     node_size_profile.full_below_target_size,
@@ -1007,13 +1005,9 @@ fn run_start_mode_consensus_loop(
         *guard = Some(Arc::clone(&shared_inbound));
     }
 
-    // Wire shared acquisition to node-store write pipeline and overlay
+    // Attach the synchronous SHAMap node store before acquisitions begin.
     if let Some(ns) = runtime.root().node_store().as_ref() {
         shared_inbound.set_node_store(ns.clone());
-        let pending_writes = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let (write_tx, _write_handle) = crate::ledger::inbound_ledgers::spawn_nodestore_writer(ns.clone(), Arc::clone(&pending_writes));
-        shared_inbound.set_write_tx(write_tx);
-        shared_inbound.set_pending_writes(pending_writes);
     }
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         {
@@ -1155,6 +1149,8 @@ fn run_start_mode_consensus_loop(
                         ))
                         .collect();
                     let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
+                    let stale_packet = (packet.packet_type == ledger::InboundLedgerDataType::StateNode)
+                        .then(|| packet.clone());
                     let routed = router_shared_inbound.route_response_with_seq(
                         &hash,
                         peer_id as u64,
@@ -1162,6 +1158,9 @@ fn run_start_mode_consensus_loop(
                         packet,
                     );
                     if !routed {
+                        if let Some(packet) = stale_packet {
+                            let _ = router_shared_inbound.stash_stale_packet(&packet);
+                        }
                         // Peer sent unsolicited ledger data — charge them
                         if let Some(peer) = router_overlay.find_peer_by_short_id(peer_id) {
                             peer.charge(
@@ -1317,6 +1316,7 @@ fn run_start_mode_consensus_loop(
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         let router_root = runtime.root().clone();
         let router_overlay_rt = Arc::clone(&overlay_rt);
+        let router_shared_inbound = Arc::clone(&shared_inbound);
         overlay_rt.overlay().queued_inbound().set_get_objects_router(Box::new(move |peer_id, message| {
             let msg_envelope = overlay::PeerMessage { peer_id, message };
             let msg = &msg_envelope.message;
@@ -1330,12 +1330,14 @@ fn run_start_mode_consensus_loop(
                         if let (Some(hash_bytes), Some(data)) = (&obj.hash, &obj.data) {
                             if let Some(hash) = Uint256::from_slice(hash_bytes) {
                                 lm.fetch_pack_cache().add_fetch_pack(hash, data.clone());
+                                router_shared_inbound.store_fetch_pack(hash, data.clone());
                                 stored += 1;
                             }
                         }
                     }
                     if stored > 0 {
                         router_root.signal_fetch_pack_ready();
+                        router_shared_inbound.notify_fetch_pack_ready();
                     }
                 }
             } else if msg.r#type == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32 {
