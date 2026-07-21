@@ -3,6 +3,7 @@ use basics::blob::Blob;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::ManualClock;
+use ledger::ledger_fetcher::INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP;
 use ledger::{
     InboundLedgerCompletionDisposition, InboundLedgerDataType, InboundLedgerJournal,
     InboundLedgerLocal, InboundLedgerNodeData, InboundLedgerPacket, InboundLedgerPacketError,
@@ -346,6 +347,179 @@ fn inbound_receive_state_root_packet_marks_completion_when_other_map_is_already_
             .expect("completed inbound ledger should remain available")
             .is_immutable()
     );
+}
+
+#[test]
+fn inbound_packet_steps_preserve_full_packet_stats_and_timer_progress() {
+    let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        SHAMapNodeType::AccountState,
+        SHAMapItem::new(Uint256::from_array([0x53; 32]), vec![1; 12]),
+        0,
+    ));
+    let state_root = SHAMapTreeNode::new_inner(0);
+    state_root.set_child_hash(3, state_leaf.get_hash());
+    state_root.update_hash();
+    let state_root = make_shared_intrusive(state_root);
+    let header = sample_header(603, state_root.get_hash(), SHAMapHash::default());
+    let wanted_hash = calculate_ledger_hash(&header);
+    let root = InboundLedgerNodeData::new(
+        Some(SHAMapNodeId::default().get_raw_string()),
+        state_root
+            .serialize_for_wire()
+            .expect("state root wire serialization should succeed"),
+    );
+    let packet = InboundLedgerPacket::new(
+        InboundLedgerDataType::StateNode,
+        vec![root; INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP * 2 + 1],
+    );
+    let journal = RecordingJournal::default();
+    let config = LedgerConfig::default();
+
+    let family_progress = family("inbound-step-progress");
+    let mut progress_inbound = InboundLedgerLocal::new(wanted_hash, 0);
+    let mut progress_store = RecordingInboundStore::default();
+    let mut progress_fetch_pack = RecordingFetchPack::default();
+    let header_packet = InboundLedgerPacket::new(
+        InboundLedgerDataType::Base,
+        vec![InboundLedgerNodeData::new(None, raw_header_bytes(&header))],
+    );
+    let header_step = progress_inbound
+        .process_packet_step_with_family_and_config(
+            &header_packet,
+            0,
+            INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP,
+            &journal,
+            &config,
+            &mut progress_store,
+            &mut progress_fetch_pack,
+            &family_progress,
+        )
+        .expect("header step should be accepted");
+    assert!(header_step.stats.is_useful());
+    progress_inbound.record_packet_progress(header_step.stats);
+    assert_eq!(
+        progress_inbound.timeout_expired(),
+        ledger::InboundLedgerTimerResult::Progress
+    );
+
+    let family_full = family("inbound-step-full");
+    let mut full = InboundLedgerLocal::new(wanted_hash, 0);
+    let mut full_store = RecordingInboundStore::default();
+    let mut full_fetch_pack = RecordingFetchPack::default();
+    assert!(full.take_header_with_config_and_store(
+        &raw_header_bytes(&header),
+        &config,
+        &mut full_store,
+        &journal,
+    ));
+    let full_stats = full
+        .process_packet_with_family_and_config(
+            &packet,
+            &journal,
+            &config,
+            &mut full_store,
+            &mut full_fetch_pack,
+            &family_full,
+        )
+        .expect("full packet should be accepted");
+    full.record_packet_stats_with_family_and_config(full_stats, &journal, &config, &family_full);
+
+    let family_steps = family("inbound-step-bounded");
+    let mut stepped = InboundLedgerLocal::new(wanted_hash, 0);
+    let mut stepped_store = RecordingInboundStore::default();
+    let mut stepped_fetch_pack = RecordingFetchPack::default();
+    assert!(stepped.take_header_with_config_and_store(
+        &raw_header_bytes(&header),
+        &config,
+        &mut stepped_store,
+        &journal,
+    ));
+
+    let mut next_node = 0;
+    let mut steps = 0;
+    let mut accumulated = SHAMapAddNode::default();
+    loop {
+        let step = stepped
+            .process_packet_step_with_family_and_config(
+                &packet,
+                next_node,
+                INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP,
+                &journal,
+                &config,
+                &mut stepped_store,
+                &mut stepped_fetch_pack,
+                &family_steps,
+            )
+            .expect("bounded packet step should be accepted");
+        stepped.record_packet_progress(step.stats);
+        accumulated += step.stats;
+        steps += 1;
+        if step.complete {
+            break;
+        }
+        next_node = step.next_node;
+    }
+    stepped.record_packet_stats_with_family_and_config(
+        accumulated,
+        &journal,
+        &config,
+        &family_steps,
+    );
+
+    assert_eq!(steps, 3);
+    assert_eq!(accumulated, full_stats);
+    assert_eq!(stepped.stats(), full.stats());
+    assert_eq!(
+        stepped_store.stored_nodes.borrow().len(),
+        full_store.stored_nodes.borrow().len()
+    );
+}
+
+#[test]
+fn inbound_packet_step_validates_the_original_packet_before_mutating() {
+    let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        SHAMapNodeType::AccountState,
+        SHAMapItem::new(Uint256::from_array([0x54; 32]), vec![1; 12]),
+        0,
+    ));
+    let header = sample_header(604, state_leaf.get_hash(), SHAMapHash::default());
+    let wanted_hash = calculate_ledger_hash(&header);
+    let valid = InboundLedgerNodeData::new(
+        Some(SHAMapNodeId::default().get_raw_string()),
+        state_leaf
+            .serialize_for_wire()
+            .expect("state root wire serialization should succeed"),
+    );
+    let mut nodes = vec![valid; INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP];
+    nodes.push(InboundLedgerNodeData::new(None, vec![1, 2, 3]));
+    let packet = InboundLedgerPacket::new(InboundLedgerDataType::StateNode, nodes);
+    let family = family("inbound-step-malformed");
+    let journal = RecordingJournal::default();
+    let mut inbound = InboundLedgerLocal::new(wanted_hash, 0);
+    let mut store = RecordingInboundStore::default();
+    let mut fetch_pack = RecordingFetchPack::default();
+
+    assert!(inbound.take_header_with_config_and_store(
+        &raw_header_bytes(&header),
+        &LedgerConfig::default(),
+        &mut store,
+        &journal,
+    ));
+    assert_eq!(
+        inbound.process_packet_step_with_family_and_config(
+            &packet,
+            0,
+            INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP,
+            &journal,
+            &LedgerConfig::default(),
+            &mut store,
+            &mut fetch_pack,
+            &family,
+        ),
+        Err(InboundLedgerPacketError::MissingNodeId)
+    );
+    assert!(!inbound.planner_state().have_state);
+    assert!(store.stored_nodes.borrow().is_empty());
 }
 
 #[test]

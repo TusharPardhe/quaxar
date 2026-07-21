@@ -89,6 +89,45 @@ fn nudb_for_each_visits_indexed_records_and_skips_orphan_data_file_rows() {
 }
 
 #[test]
+fn nudb_bulk_import_flushes_deferred_buckets_before_reopen() {
+    let temp = TempDir::new().expect("tempdir");
+    let backend = NuDbBackend::new(
+        nodestore::NodeObject::KEY_BYTES,
+        &nudb_section(temp.path()),
+        64,
+        Arc::new(QuietJournal),
+    )
+    .expect("nudb backend");
+    backend
+        .open_deterministic(true, NUDB_APPNUM, 7301, 8301)
+        .expect("open");
+
+    let first = object(0x71, b"bulk-first");
+    let second = object(0x72, b"bulk-second");
+    backend.bulk_import_start(2).expect("start bulk import");
+    backend.store(Arc::clone(&first));
+    backend.store(Arc::clone(&second));
+    backend.bulk_import_finish().expect("finish bulk import");
+    backend.close().expect("close");
+
+    let reopened = NuDbBackend::new(
+        nodestore::NodeObject::KEY_BYTES,
+        &nudb_section(temp.path()),
+        64,
+        Arc::new(QuietJournal),
+    )
+    .expect("reopen backend");
+    reopened
+        .open_deterministic(false, NUDB_APPNUM, 1, 1)
+        .expect("reopen");
+    for item in [&first, &second] {
+        let (fetched, status) = reopened.fetch(item.hash());
+        assert_eq!(status, Status::Ok);
+        assert_eq!(fetched.expect("bulk item").data(), item.data());
+    }
+}
+
+#[test]
 fn nudb_burst_size_changes_checkpoint_commit_policy_without_claiming_exact_cpp_crash_semantics() {
     let temp = TempDir::new().expect("tempdir");
     let backend = NuDbBackend::new(

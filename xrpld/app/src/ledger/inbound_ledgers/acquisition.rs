@@ -6,16 +6,20 @@
 
 use basics::base_uint::Uint256;
 use basics::hardened_hash::HardenedHashBuilder;
+use basics::random::rand_int_to;
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::{KeyCache, MonotonicClock};
+use ledger::ledger_fetcher::INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP;
 use ledger::{
-    FetchPackCache, FetchPackContainer, FetchPackStore, InboundLedgerJournal, InboundLedgerLocal,
-    InboundLedgerPacket, InboundLedgerReason, InboundLedgerReceivedPacket,
-    InboundLedgerRequestTrigger, InboundLedgerStore, InboundLedgerTimerResult, Ledger,
+    FetchPackCache, FetchPackContainer, FetchPackStore, INBOUND_LEDGER_MAX_USEFUL_PEERS,
+    InboundLedgerJournal, InboundLedgerLocal, InboundLedgerPacket, InboundLedgerPacketError,
+    InboundLedgerReason, InboundLedgerRequestTrigger, InboundLedgerStore, InboundLedgerTimerResult,
+    Ledger,
 };
 use overlay::{Peer, PeerSet as _};
 use shamap::family::{FullBelowCacheImpl, NullMissingNodeReporter, SHAMapFamily};
 use shamap::tree_node_cache::TreeNodeCache;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -199,9 +203,52 @@ pub struct AcqMutableState {
     pub(crate) fetch_pack: WorkerFetchPack,
 }
 
+struct ActivePacket {
+    peer_id: u64,
+    packet: InboundLedgerPacket,
+    next_node: usize,
+    stats: shamap::sync::SHAMapAddNode,
+}
+
+#[derive(Default)]
+struct ReceivedDataState {
+    active_packet: Option<ActivePacket>,
+    peer_counts: BTreeMap<u64, i32>,
+    max_useful_count: i32,
+}
+
+impl ReceivedDataState {
+    fn record_packet(&mut self, peer_id: u64, useful_count: i32) {
+        if useful_count <= 0 {
+            return;
+        }
+        self.max_useful_count = self.max_useful_count.max(useful_count);
+        self.peer_counts
+            .entry(peer_id)
+            .and_modify(|count| *count = (*count).max(useful_count))
+            .or_insert(useful_count);
+    }
+
+    fn take_reply_peers(&mut self) -> Vec<u64> {
+        let threshold = self.max_useful_count / 2;
+        let mut peers: Vec<_> = self
+            .peer_counts
+            .iter()
+            .filter_map(|(&peer_id, &count)| (count >= threshold).then_some(peer_id))
+            .collect();
+        while peers.len() > INBOUND_LEDGER_MAX_USEFUL_PEERS {
+            peers.swap_remove(rand_int_to(peers.len() - 1));
+        }
+        self.peer_counts.clear();
+        self.max_useful_count = 0;
+        peers
+    }
+}
+
 /// Per-ledger state owned by the registry.
 pub struct AcquisitionState {
     pub data_buffer: Mutex<Vec<(u64, InboundLedgerPacket)>>,
+    received_data: Mutex<ReceivedDataState>,
     pub mutable: Mutex<AcqMutableState>,
     pub hash: SHAMapHash,
     pub seq: u32,
@@ -285,6 +332,73 @@ impl AcquisitionState {
         self.stopped.store(true, Ordering::Release);
     }
 
+    fn take_next_packet(&self) -> Option<ActivePacket> {
+        let mut received = self
+            .received_data
+            .lock()
+            .expect("acquisition received data lock");
+        if let Some(packet) = received.active_packet.take() {
+            return Some(packet);
+        }
+        let mut buffer = self
+            .data_buffer
+            .lock()
+            .expect("acquisition data buffer lock");
+        let (peer_id, packet) = (!buffer.is_empty()).then(|| buffer.remove(0))?;
+        Some(ActivePacket {
+            peer_id,
+            packet,
+            next_node: 0,
+            stats: shamap::sync::SHAMapAddNode::default(),
+        })
+    }
+
+    fn resume_packet(&self, packet: ActivePacket) {
+        self.received_data
+            .lock()
+            .expect("acquisition received data lock")
+            .active_packet = Some(packet);
+    }
+
+    fn finish_packet(&self, packet: ActivePacket, useful_count: Option<i32>) -> Vec<u64> {
+        let mut received = self
+            .received_data
+            .lock()
+            .expect("acquisition received data lock");
+        if let Some(useful_count) = useful_count {
+            received.record_packet(packet.peer_id, useful_count);
+        }
+        if !self
+            .data_buffer
+            .lock()
+            .expect("acquisition data buffer lock")
+            .is_empty()
+        {
+            return Vec::new();
+        }
+        received.take_reply_peers()
+    }
+
+    fn has_pending_data(&self) -> bool {
+        self.received_data
+            .lock()
+            .expect("acquisition received data lock")
+            .active_packet
+            .is_some()
+            || !self
+                .data_buffer
+                .lock()
+                .expect("acquisition data buffer lock")
+                .is_empty()
+    }
+
+    fn finish_data_job(self: &Arc<Self>) {
+        self.data_job_queued.store(false, Ordering::Release);
+        if !self.is_done() && self.has_pending_data() {
+            self.submit_data_job();
+        }
+    }
+
     pub(crate) fn update_seq(&self, seq: u32) {
         let mut mutable = self.mutable.lock().expect("acquisition mutable lock");
         mutable.inbound.update(seq, time::Duration::ZERO);
@@ -324,6 +438,7 @@ impl AcquisitionBuilder {
         };
         Arc::new(AcquisitionState {
             data_buffer: Mutex::new(Vec::new()),
+            received_data: Mutex::new(ReceivedDataState::default()),
             mutable: Mutex::new(AcqMutableState {
                 inbound: InboundLedgerLocal::new_with_reason(self.hash, self.seq, reason),
                 store: WorkerStore {
@@ -465,81 +580,76 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         return;
     }
 
-    let packets = {
-        let mut buffer = state
-            .data_buffer
-            .lock()
-            .expect("acquisition data buffer lock");
-        std::mem::take(&mut *buffer)
-    };
     let mut mutable = state.mutable.lock().expect("acquisition mutable lock");
-    for (peer_id, packet) in packets {
-        mutable.inbound.got_data(Some(peer_id), packet);
-    }
-
     if state.fetch_pack_ready.swap(false, Ordering::AcqRel) {
         check_local(state, &mut mutable);
     }
     if mutable.inbound.is_failed() {
         drop(mutable);
         state.mark_failed();
-        state.data_job_queued.store(false, Ordering::Release);
+        state.finish_data_job();
         return;
     }
     if mutable.inbound.is_complete() {
         drop(mutable);
         finalize_acquisition(state);
-        state.data_job_queued.store(false, Ordering::Release);
+        state.finish_data_job();
         return;
     }
+
+    let Some(mut active) = state.take_next_packet() else {
+        drop(mutable);
+        state.finish_data_job();
+        return;
+    };
 
     let journal = WorkerJournal;
     let config = ledger::LedgerConfig::default();
     let family = family(state);
-    let data_buffer = &state.data_buffer;
-    let AcqMutableState {
-        inbound,
-        store,
-        fetch_pack,
-    } = &mut *mutable;
-    let result = inbound.run_data_with_family_and_config_and_refill(
-        &journal,
-        &config,
-        store,
-        fetch_pack,
-        &family,
-        &mut || {
-            let mut buffer = data_buffer.lock().expect("acquisition data refill lock");
-            std::mem::take(&mut *buffer)
-                .into_iter()
-                .map(|(peer_id, packet)| InboundLedgerReceivedPacket::new(Some(peer_id), packet))
-                .collect()
-        },
-    );
+    let step = {
+        let AcqMutableState {
+            inbound,
+            store,
+            fetch_pack,
+        } = &mut *mutable;
+        inbound.process_packet_step_with_family_and_config(
+            &active.packet,
+            active.next_node,
+            INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP,
+            &journal,
+            &config,
+            store,
+            fetch_pack,
+            &family,
+        )
+    };
 
-    // `InboundLedger::processData` charges only structurally malformed active
-    // packets. Invalid or duplicate SHAMap content remains uncharged.
-    for (peer_id, packet_type, error) in &result.malformed_packets {
-        let Some(peer) = state.peer_set.find_peer(*peer_id as u32) else {
-            continue;
-        };
-        let context = match (packet_type, error) {
-            (ledger::InboundLedgerDataType::Base, ledger::InboundLedgerPacketError::EmptyNodes) => {
-                "ledger_data empty header"
+    let reply_peers = match step {
+        Ok(step) => {
+            active.next_node = step.next_node;
+            mutable.inbound.record_packet_progress(step.stats);
+            active.stats += step.stats;
+            if step.complete {
+                let useful_count = active.stats.get_good();
+                mutable.inbound.record_packet_stats_with_family_and_config(
+                    active.stats,
+                    &journal,
+                    &config,
+                    &family,
+                );
+                state.finish_packet(active, Some(useful_count))
+            } else {
+                state.resume_packet(active);
+                Vec::new()
             }
-            (_, ledger::InboundLedgerPacketError::EmptyNodes) => "ledger_data no nodes",
-            (_, ledger::InboundLedgerPacketError::InvalidHeader) => "ledger_data invalid header",
-            (_, ledger::InboundLedgerPacketError::MissingNodeId) => "ledger_data bad node",
-        };
-        peer.charge(
-            (*resource::FEE_MALFORMED_REQUEST).clone(),
-            context.to_owned(),
-        );
-    }
+        }
+        Err(error) => {
+            charge_malformed_packet(state, active.peer_id, active.packet.packet_type, error);
+            state.finish_packet(active, None)
+        }
+    };
 
-    // `InboundLedger::runData` samples useful peers and immediately triggers
-    // each selected peer. It does not clear recentNodes here.
-    for peer_id in result.triggered_peer_ids {
+    for peer_id in reply_peers {
         let Some(peer) = state.peer_set.find_peer(peer_id as u32) else {
             continue;
         };
@@ -559,17 +669,30 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
     } else if complete {
         finalize_acquisition(state);
     }
+    state.finish_data_job();
+}
 
-    state.data_job_queued.store(false, Ordering::Release);
-    if !state.is_done()
-        && !state
-            .data_buffer
-            .lock()
-            .expect("acquisition data buffer lock")
-            .is_empty()
-    {
-        state.submit_data_job();
-    }
+fn charge_malformed_packet(
+    state: &AcquisitionState,
+    peer_id: u64,
+    packet_type: ledger::InboundLedgerDataType,
+    error: InboundLedgerPacketError,
+) {
+    let Some(peer) = state.peer_set.find_peer(peer_id as u32) else {
+        return;
+    };
+    let context = match (packet_type, error) {
+        (ledger::InboundLedgerDataType::Base, InboundLedgerPacketError::EmptyNodes) => {
+            "ledger_data empty header"
+        }
+        (_, InboundLedgerPacketError::EmptyNodes) => "ledger_data no nodes",
+        (_, InboundLedgerPacketError::InvalidHeader) => "ledger_data invalid header",
+        (_, InboundLedgerPacketError::MissingNodeId) => "ledger_data bad node",
+    };
+    peer.charge(
+        (*resource::FEE_MALFORMED_REQUEST).clone(),
+        context.to_owned(),
+    );
 }
 
 fn process_timeout_job(state: &Arc<AcquisitionState>) {

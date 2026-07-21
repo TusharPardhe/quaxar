@@ -41,6 +41,9 @@ use shamap::tree_node::SHAMapTreeNode;
 pub const INBOUND_LEDGER_MAX_NEEDED_STATE_HASHES: i32 = 4;
 pub const INBOUND_LEDGER_MAX_NEEDED_TX_HASHES: i32 = 4;
 pub const INBOUND_LEDGER_MAX_USEFUL_PEERS: usize = 6;
+/// Maximum node entries processed while an inbound-acquisition worker holds its
+/// per-ledger mutation lock.
+pub const INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP: usize = 128;
 const TM_GET_OBJECT_BY_HASH_LEDGER: i32 = 1;
 const TM_GET_OBJECT_BY_HASH_TRANSACTION_NODE: i32 = 3;
 const TM_GET_OBJECT_BY_HASH_STATE_NODE: i32 = 4;
@@ -224,6 +227,14 @@ pub enum InboundLedgerPacketError {
     EmptyNodes,
     InvalidHeader,
     MissingNodeId,
+}
+
+/// Result of processing a bounded contiguous range of an inbound packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboundLedgerPacketStep {
+    pub next_node: usize,
+    pub complete: bool,
+    pub stats: SHAMapAddNode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -976,11 +987,34 @@ impl InboundLedgerLocal {
         let san = self.process_packet_with_family_and_config(
             packet, journal, config, store, fetch_pack, family,
         )?;
+        self.record_packet_stats_with_family_and_config(san, journal, config, family);
+        Ok(san)
+    }
 
-        if san.is_useful() {
+    /// Mark useful work before the packet-level accounting is committed. This
+    /// lets timeout handling observe progress between bounded packet steps.
+    pub fn record_packet_progress(&mut self, stats: SHAMapAddNode) {
+        if stats.is_useful() {
             self.progress = true;
         }
-        self.stats += san;
+    }
+
+    pub fn record_packet_stats_with_family_and_config<CLOCK, S, C, F, MR, NS, J>(
+        &mut self,
+        stats: SHAMapAddNode,
+        journal: &J,
+        config: &LedgerConfig,
+        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
+    ) where
+        CLOCK: CacheClock,
+        S: BuildHasher + Clone,
+        C: FullBelowCache,
+        F: SHAMapNodeFetcher,
+        MR: MissingNodeReporter,
+        J: InboundLedgerJournal,
+    {
+        self.record_packet_progress(stats);
+        self.stats += stats;
         {
             let missing_nodes = 0u32; // exact count requires tree walk
             let total_nodes = self.stats.get_good().max(0) as u32;
@@ -988,7 +1022,6 @@ impl InboundLedgerLocal {
             tracing::debug!(target: "ledger", seq = self.seq, missing_nodes, total_nodes, pct = %progress, "Sync progress");
         }
         self.finish_if_done_with_family_and_config(journal, config, family);
-        Ok(san)
     }
 
     pub fn run_data_with_family_and_config_and_sampler<CLOCK, S, C, F, MR, NS, DB, FP, J, SAMPLE>(
@@ -1030,21 +1063,20 @@ impl InboundLedgerLocal {
                     None
                 };
                 let start = std::time::Instant::now();
-                let (san, error) = match self.process_packet_and_update_stats_with_family_and_config(
-                    &entry.packet,
-                    journal,
-                    config,
-                    store,
-                    fetch_pack,
-                    family,
-                ) {
+                let (san, error) = match self
+                    .process_packet_and_update_stats_with_family_and_config(
+                        &entry.packet,
+                        journal,
+                        config,
+                        store,
+                        fetch_pack,
+                        family,
+                    ) {
                     Ok(san) => (Some(san), None),
                     Err(error) => (None, Some(error)),
                 };
                 if let (Some(peer_id), Some(error)) = (entry.peer_id, error) {
-                    result
-                        .malformed_packets
-                        .push((peer_id, packet_type, error));
+                    result.malformed_packets.push((peer_id, packet_type, error));
                 }
                 let count = san.map(|san| san.get_good()).unwrap_or(-1);
                 {
@@ -1230,21 +1262,20 @@ impl InboundLedgerLocal {
                     None
                 };
                 let start = std::time::Instant::now();
-                let (san, error) = match self.process_packet_and_update_stats_with_family_and_config(
-                    &entry.packet,
-                    journal,
-                    config,
-                    store,
-                    fetch_pack,
-                    family,
-                ) {
+                let (san, error) = match self
+                    .process_packet_and_update_stats_with_family_and_config(
+                        &entry.packet,
+                        journal,
+                        config,
+                        store,
+                        fetch_pack,
+                        family,
+                    ) {
                     Ok(san) => (Some(san), None),
                     Err(error) => (None, Some(error)),
                 };
                 if let (Some(peer_id), Some(error)) = (entry.peer_id, error) {
-                    result
-                        .malformed_packets
-                        .push((peer_id, packet_type, error));
+                    result.malformed_packets.push((peer_id, packet_type, error));
                 }
                 let count = san.map(|san| san.get_good()).unwrap_or(-1);
                 {
@@ -1513,6 +1544,69 @@ impl InboundLedgerLocal {
             family,
             journal,
         );
+    }
+
+    /// Process one bounded range of an inbound packet. Base packets remain
+    /// atomic; node packets retain full-packet structural validation before the
+    /// first range can mutate either SHAMap.
+    pub fn process_packet_step_with_family_and_config<CLOCK, S, C, F, MR, NS, DB, FP, J>(
+        &mut self,
+        packet: &InboundLedgerPacket,
+        next_node: usize,
+        max_nodes: usize,
+        journal: &J,
+        config: &LedgerConfig,
+        store: &mut DB,
+        fetch_pack: &mut FP,
+        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
+    ) -> Result<InboundLedgerPacketStep, InboundLedgerPacketError>
+    where
+        CLOCK: CacheClock,
+        S: BuildHasher + Clone,
+        C: FullBelowCache,
+        F: SHAMapNodeFetcher,
+        MR: MissingNodeReporter,
+        DB: InboundLedgerStore,
+        FP: FetchPackContainer,
+        J: InboundLedgerJournal,
+    {
+        if matches!(packet.packet_type, InboundLedgerDataType::Base) {
+            let stats = self.process_packet_with_family_and_config(
+                packet, journal, config, store, fetch_pack, family,
+            )?;
+            return Ok(InboundLedgerPacketStep {
+                next_node: packet.nodes.len(),
+                complete: true,
+                stats,
+            });
+        }
+
+        if packet.nodes.is_empty() {
+            return Err(InboundLedgerPacketError::EmptyNodes);
+        }
+        if next_node == 0 && packet.nodes.iter().any(|node| node.node_id.is_none()) {
+            journal.warn("Got bad node");
+            return Err(InboundLedgerPacketError::MissingNodeId);
+        }
+        if next_node >= packet.nodes.len() {
+            return Ok(InboundLedgerPacketStep {
+                next_node: packet.nodes.len(),
+                complete: true,
+                stats: SHAMapAddNode::default(),
+            });
+        }
+
+        let end = (next_node + max_nodes.max(1)).min(packet.nodes.len());
+        let chunk =
+            InboundLedgerPacket::new(packet.packet_type, packet.nodes[next_node..end].to_vec());
+        let stats = self.process_packet_with_family_and_config(
+            &chunk, journal, config, store, fetch_pack, family,
+        )?;
+        Ok(InboundLedgerPacketStep {
+            next_node: end,
+            complete: end == packet.nodes.len() || !stats.is_good(),
+            stats,
+        })
     }
 
     pub fn process_packet_with_family_and_config<CLOCK, S, C, F, MR, NS, DB, FP, J>(
