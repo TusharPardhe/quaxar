@@ -877,14 +877,25 @@ impl AppConsensus {
                                 // Demote to Connected matching rippled NetworkOPs.cpp:1997.
                                 if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                                     if let Some(shared) = guard.as_ref() {
-                                        // Try to resolve the seq for this hash from the
-                                        // ledger cache so acquisition can prioritise.
+                                        // Resolve the seq from the ledger cache first,
+                                        // falling back to the peer that reports this hash.
                                         let seq = lm_rt.ledger_master()
                                             .ledger_history()
                                             .get_cached_ledger_by_hash(
                                                 basics::sha_map_hash::SHAMapHash::new(network_closed)
                                             )
                                             .map(|l| l.header().seq)
+                                            .or_else(|| {
+                                                // Ask peers for the seq of this hash.
+                                                if let Some(ort) = root.overlay_runtime() {
+                                                    use overlay::Overlay;
+                                                    ort.overlay().active_peers().iter()
+                                                        .find(|p| p.closed_ledger_hash() == network_closed)
+                                                        .map(|p| p.ledger_range().1)
+                                                } else {
+                                                    None
+                                                }
+                                            })
                                             .unwrap_or(0);
                                         shared.acquire_async(network_closed, seq, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
                                     }
@@ -931,14 +942,27 @@ impl AppConsensus {
                             next_prev_ledger = %prev_id,
                             "synchronous accept: started next round inline"
                         );
+                    } else if root.need_network_ledger() {
+                        // Network ledger not available locally AND we already
+                        // set need_network_ledger — do NOT start a round on the
+                        // wrong local ledger. This breaks the acrolytic loop:
+                        //   accept wrong ledger → detect peers disagree →
+                        //   acquire → still not found → start round on wrong
+                        //   ledger again → accept → detect → acquire → …
+                        //
+                        // The strand's switchLastClosedLedger block (step 6)
+                        // handles starting a round on the correct chain once
+                        // the acquisition completes and the ledger enters
+                        // ledger_history.
+                        tracing::info!(
+                            target: "consensus",
+                            closed_seq,
+                            "synchronous accept: network ledger pending — deferring round start to strand"
+                        );
                     } else {
-                        // Network ledger not available locally — start round
-                        // on our OWN closed ledger anyway. timer_entry's
-                        // checkLedger will detect the mismatch and trigger
-                        // handleWrongLedger → SwitchedLedger once the network
-                        // ledger is acquired. Without this, consensus stays
-                        // permanently stuck in Accepted phase (timer_entry
-                        // is a no-op in Accepted).
+                        // Network ledger not available locally but
+                        // need_network_ledger is false (shouldn't normally
+                        // happen). Start round on our ledger as a fallback.
                         let prev_id = *closed.header().hash.as_uint256();
                         let prev_cx = crate::consensus_ledger_from_ledger(&closed);
                         let now_untrusted = self.compute_now_untrusted();
@@ -948,13 +972,13 @@ impl AppConsensus {
                             prev_id,
                             prev_cx,
                             &now_untrusted,
-                            false, // not proposing — we're on wrong chain
+                            false,
                         );
-                        tracing::info!(
+                        tracing::warn!(
                             target: "consensus",
                             closed_seq,
                             next_prev_ledger = %prev_id,
-                            "synchronous accept: started round on own LCL (network ledger pending)"
+                            "synchronous accept: started round on own LCL (fallback, need_network_ledger=false)"
                         );
                     }
                 } else {
