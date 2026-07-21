@@ -452,7 +452,7 @@ fn flush_writes(write_tx: &Sender<NodeStoreWriteMsg>) -> bool {
     if write_tx.send(NodeStoreWriteMsg::Flush(ack_tx)).is_err() {
         return false;
     }
-    ack_rx.recv_timeout(Duration::from_secs(30)).is_ok()
+    ack_rx.recv_timeout(Duration::from_secs(120)).is_ok()
 }
 
 // ─── Spawn node-store writer ─────────────────────────────────────────────────
