@@ -3877,9 +3877,17 @@ impl ApplicationRoot {
     }
 
     pub fn network_ops_operating_mode_string(&self) -> &'static str {
-        let op_mode = self.network_ops_state.operating_mode();
-        if op_mode == crate::network::network_ops::NetworkOpsOperatingMode::Full
-            && self.validation_public_key.is_some()
+        self.network_ops_operating_mode_string_for_admin(false)
+    }
+
+    /// Match rippled `NetworkOPsImp::strOperatingMode`: only an admin view of
+    /// a full node whose consensus engine is actively proposing receives the
+    /// `proposing` presentation. Non-validator observers always remain `full`.
+    pub fn network_ops_operating_mode_string_for_admin(&self, admin: bool) -> &'static str {
+        if admin
+            && self.network_ops_state.operating_mode() == NetworkOpsOperatingMode::Full
+            && self.network_ops_state.consensus_mode()
+                == crate::network::network_ops::NetworkOpsConsensusMode::Proposing
         {
             return "proposing";
         }

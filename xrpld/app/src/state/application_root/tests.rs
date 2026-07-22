@@ -7,9 +7,9 @@ use crate::runtime::main_runtime::{GrpcRuntime, ManagedComponent};
 use crate::shamap::shamap_store_service::SHAMapStoreService;
 use crate::tx_queue::transaction::Transaction;
 use crate::{
-    AppOpenLedgerView, AppQueueApplyTxSource, AppTxQ, NetworkOpsOperatingMode,
-    NetworkOpsProcessSetOwnerSync, NetworkOpsTransactionSetOutcome, SHAMapStore,
-    SHAMapStoreCloseTimeProvider, SHAMapStoreComponent, SHAMapStoreComponentRuntime,
+    AppOpenLedgerView, AppQueueApplyTxSource, AppTxQ, NetworkOpsConsensusMode,
+    NetworkOpsOperatingMode, NetworkOpsProcessSetOwnerSync, NetworkOpsTransactionSetOutcome,
+    SHAMapStore, SHAMapStoreCloseTimeProvider, SHAMapStoreComponent, SHAMapStoreComponentRuntime,
     SHAMapStoreHealthRuntime, SHAMapStoreOperatingMode, SHAMapStoreRuntime, SharedAppTxQ,
     SharedSHAMapStoreHealthState,
 };
@@ -1329,6 +1329,45 @@ fn application_root_normalizes_connected_to_syncing_with_fresh_validated_ledger(
         NetworkOpsOperatingMode::Syncing
     );
     assert_eq!(app.network_ops_operating_mode_string(), "syncing");
+}
+
+#[test]
+fn application_root_matches_rippled_admin_proposing_presentation() {
+    let app = ApplicationRoot::with_options(super::ApplicationRootOptions {
+        start_valid: true,
+        ..super::ApplicationRootOptions::default()
+    })
+    .expect("root shell should build");
+
+    // A full observing node, including every non-validator stock node, is full
+    // to both public and admin RPC callers.
+    assert_eq!(
+        app.network_ops_operating_mode_string_for_admin(false),
+        "full"
+    );
+    assert_eq!(
+        app.network_ops_operating_mode_string_for_admin(true),
+        "full"
+    );
+
+    app.network_ops_state()
+        .set_consensus_mode(NetworkOpsConsensusMode::Proposing);
+    // rippled only applies the proposing presentation to admin responses.
+    assert_eq!(
+        app.network_ops_operating_mode_string_for_admin(false),
+        "full"
+    );
+    assert_eq!(
+        app.network_ops_operating_mode_string_for_admin(true),
+        "proposing"
+    );
+
+    app.network_ops_state()
+        .set_consensus_mode(NetworkOpsConsensusMode::WrongLedger);
+    assert_eq!(
+        app.network_ops_operating_mode_string_for_admin(true),
+        "full"
+    );
 }
 
 #[test]

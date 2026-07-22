@@ -1,19 +1,25 @@
 //! App-owned `LedgerToJson` wrapper above the landed `ledger` crate helpers.
 
 use basics::chrono::NetClockTimePoint;
+use basics::tagged_cache::CacheClock;
 use ledger::{
     DEFAULT_LEDGER_JSON_API_VERSION, Ledger, LedgerFill as LedgerCoreFill, LedgerFillOptions,
     copy_from as ledger_copy_from, fill_json as fill_ledger_json,
+    fill_json_with_family as fill_ledger_json_with_family,
 };
 use protocol::{AccountID, JsonValue, STTx, TxMeta};
+use shamap::family::{FullBelowCache, MissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher};
 use shamap::traversal::TraversalError;
 use std::collections::BTreeMap;
+use std::hash::BuildHasher;
 use std::sync::Arc;
 use tx::TxDetails;
 
 use crate::LedgerToJsonContext;
 use crate::ledger_to_json::ledger_to_json_queue::fill_json_queue;
-use crate::ledger_to_json::ledger_to_json_tx::fill_json_transactions;
+use crate::ledger_to_json::ledger_to_json_tx::{
+    fill_json_transactions, fill_json_transactions_with_family,
+};
 
 #[derive(Clone, Copy)]
 pub struct LedgerTxEntry<'a> {
@@ -101,6 +107,31 @@ pub fn fill_json(json: &mut JsonValue, fill: &AppLedgerFill<'_>) -> Result<(), T
     }
 
     Ok(())
+}
+
+pub fn get_json_with_family<CLOCK, S, C, F, MR, NS>(
+    fill: &AppLedgerFill<'_>,
+    family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
+) -> Result<JsonValue, TraversalError>
+where
+    CLOCK: CacheClock,
+    S: BuildHasher + Clone,
+    C: FullBelowCache,
+    F: SHAMapNodeFetcher,
+    MR: MissingNodeReporter,
+{
+    let core_fill = LedgerCoreFill::new(fill.ledger, fill.options)
+        .with_closed(fill.ledger.is_immutable())
+        .with_api_version(fill.api_version())
+        .with_close_time(fill.close_time);
+    let mut json = JsonValue::Null;
+    fill_ledger_json_with_family(&mut json, &core_fill, family)?;
+
+    if fill.is_full() || fill.options.contains(LedgerFillOptions::DUMP_TXRP) {
+        fill_json_transactions_with_family(&mut json, fill, family)?;
+    }
+
+    Ok(json)
 }
 
 pub fn add_json(json: &mut JsonValue, fill: &AppLedgerFill<'_>) -> Result<(), TraversalError> {

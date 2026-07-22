@@ -413,10 +413,16 @@ fn decode_tx_node(
     let Some(item) = node.peek_item() else {
         return Ok(None);
     };
-    Ok(Some(decode_tx_item(ledger_seq, &item)?))
+    Ok(Some(decode_transaction_md_item(ledger_seq, &item)?))
 }
 
-fn decode_tx_item(ledger_seq: u32, item: &SHAMapItem) -> Result<LedgerTxRead, LedgerTxReadError> {
+/// Decode a validated-ledger `TransactionMd` SHAMap leaf into its transaction
+/// and metadata.  Consumers traversing released acquired maps should use this
+/// rather than parsing the nested VL payload directly.
+pub fn decode_transaction_md_item(
+    ledger_seq: u32,
+    item: &SHAMapItem,
+) -> Result<LedgerTxRead, LedgerTxReadError> {
     let (tx_bytes, meta_bytes) = split_transaction_with_meta(item.data())?;
     let tx = parse_sttx(&tx_bytes)?;
     let meta = parse_tx_meta(item.key(), ledger_seq, &meta_bytes)?;
@@ -1340,7 +1346,7 @@ impl Ledger {
             let item = node
                 .peek_item()
                 .expect("ledger tx snapshot leaf nodes should carry an item");
-            snapshot.push(decode_tx_item(self.header.seq, &item)?);
+            snapshot.push(decode_transaction_md_item(self.header.seq, &item)?);
             current = self
                 .tx_map
                 .peek_next_item_with_family(item.key(), &mut stack, family)?;

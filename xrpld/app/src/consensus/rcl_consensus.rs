@@ -880,6 +880,18 @@ impl AppConsensus {
     /// Compute the set of validator keys that were trusted in the previous
     /// round but are no longer trusted (i.e. removed from UNL or added to
     /// the negative UNL). Updates `last_trusted_keys` for the next call.
+    fn publish_consensus_mode(&self) {
+        use crate::network::network_ops::NetworkOpsConsensusMode;
+
+        let mode = match self.state.mode() {
+            ConsensusMode::Observing => NetworkOpsConsensusMode::Observing,
+            ConsensusMode::Proposing => NetworkOpsConsensusMode::Proposing,
+            ConsensusMode::WrongLedger => NetworkOpsConsensusMode::WrongLedger,
+            ConsensusMode::SwitchedLedger => NetworkOpsConsensusMode::SwitchedLedger,
+        };
+        self.adaptor.network_ops_mode_owner.set_consensus_mode(mode);
+    }
+
     fn compute_now_untrusted(&mut self) -> HashSet<PublicKey> {
         let current_trusted: HashSet<PublicKey> = self
             .adaptor
@@ -1212,6 +1224,7 @@ impl ConsensusRunner for AppConsensus {
         let our_prev = *self.state.prev_ledger_id();
         let their_prev = *peer_pos.proposal().prev_ledger();
         let accepted = self.state.peer_proposal(&self.adaptor, now, peer_pos);
+        self.publish_consensus_mode();
         if !accepted && our_prev != their_prev {
             tracing::info!(target: "consensus",
                 %our_prev, %their_prev,
@@ -1224,6 +1237,7 @@ impl ConsensusRunner for AppConsensus {
 
     fn timer_tick(&mut self, now: NetClockTimePoint) -> Option<PendingAcceptWork> {
         self.state.timer_entry(&self.adaptor, now);
+        self.publish_consensus_mode();
         // If on_accept fired during timer_entry, pending_accept will be Some.
         self.adaptor
             .pending_accept
@@ -1258,14 +1272,17 @@ impl ConsensusRunner for AppConsensus {
             &now_untrusted,
             actual_proposing,
         );
+        self.publish_consensus_mode();
     }
 
     fn got_tx_set(&mut self, now: NetClockTimePoint, tx_set: consensus::RclTxSet) {
         self.state.got_tx_set(&self.adaptor, now, &tx_set);
+        self.publish_consensus_mode();
     }
 
     fn execute_accept(&mut self, now: NetClockTimePoint, work: PendingAcceptWork) {
         self.do_accept_and_start_next_round(now, work);
+        self.publish_consensus_mode();
     }
 
     fn phase(&self) -> consensus::algorithm::ConsensusPhase {

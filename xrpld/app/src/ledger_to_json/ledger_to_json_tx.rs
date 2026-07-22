@@ -2,11 +2,15 @@ use std::collections::BTreeMap;
 
 use basics::chrono::to_string_iso;
 use basics::str_hex::str_hex;
+use basics::tagged_cache::CacheClock;
 use ledger::Ledger;
 use protocol::{
     JsonOptions, JsonValue, LedgerEntryType, STTx, StBase, TxMeta, TxType, get_field_by_symbol,
     make_mpt_id,
 };
+use shamap::family::{FullBelowCache, MissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher};
+use shamap::traversal::TraversalError;
+use std::hash::BuildHasher;
 
 use crate::ledger_to_json::ledger_to_json_owner_funds::insert_owner_funds;
 use crate::{AppLedgerFill, LedgerTxEntry, copy_from, insert_deliver_max};
@@ -27,6 +31,44 @@ pub(crate) fn fill_json_transactions(json: &mut JsonValue, fill: &AppLedgerFill<
         .map(|entry| fill_json_tx_entry(fill, binary, expanded, entry.txn, entry.meta))
         .collect();
     root.insert("transactions".to_owned(), JsonValue::Array(txs));
+}
+
+pub(crate) fn fill_json_transactions_with_family<CLOCK, S, C, F, MR, NS>(
+    json: &mut JsonValue,
+    fill: &AppLedgerFill<'_>,
+    family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
+) -> Result<(), TraversalError>
+where
+    CLOCK: CacheClock,
+    S: BuildHasher + Clone,
+    C: FullBelowCache,
+    F: SHAMapNodeFetcher,
+    MR: MissingNodeReporter,
+{
+    let JsonValue::Object(root) = json else {
+        panic!("ledger json root must be an object");
+    };
+
+    let expanded = fill.is_expanded();
+    let binary = fill.is_binary();
+    let mut txs = Vec::new();
+    fill.ledger
+        .tx_map()
+        .visit_leaves_with_family(family, &mut |item| {
+            if let Ok((txn, meta)) =
+                ledger::decode_transaction_md_item(fill.ledger.header().seq, item)
+            {
+                txs.push(fill_json_tx_entry(
+                    fill,
+                    binary,
+                    expanded,
+                    txn.as_ref(),
+                    Some(&meta),
+                ));
+            }
+        })?;
+    root.insert("transactions".to_owned(), JsonValue::Array(txs));
+    Ok(())
 }
 
 pub(crate) fn fill_json_tx_entry(

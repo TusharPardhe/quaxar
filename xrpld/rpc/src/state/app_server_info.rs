@@ -187,7 +187,11 @@ impl<V: AppServerInfoView> ServerInfoSource for ApplicationServerInfo<V> {
 
         info.insert(
             "server_state".to_owned(),
-            JsonValue::String(self.view.network_ops_operating_mode_string().to_owned()),
+            JsonValue::String(
+                self.view
+                    .network_ops_operating_mode_string(admin)
+                    .to_owned(),
+            ),
         );
 
         if self.view.need_network_ledger() {
@@ -299,16 +303,9 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
             return true;
         }
 
-        // Syncing, Tracking, and Full all satisfy the condition.
-        let mode = self.view.network_ops_operating_mode_string();
-        if mode == NetworkOpsOperatingMode::Syncing.as_str()
-            || mode == NetworkOpsOperatingMode::Tracking.as_str()
-            || mode == NetworkOpsOperatingMode::Full.as_str()
-            || mode == "proposing"
-        {
-            return true;
-        }
-        false
+        // Syncing, Tracking, and Full all satisfy the condition. Use the
+        // underlying operating mode, not the admin-only presentation overlay.
+        self.view.network_ops_operating_mode() >= NetworkOpsOperatingMode::Syncing
     }
 
     fn path_search_max(&self) -> u32 {
@@ -1837,9 +1834,8 @@ impl<V: AppServerInfoView> LedgerSource for ApplicationServerInfo<V> {
             if let Some(app) = self.view.app()
                 && let Some(family) = build_rpc_state_family(app)
             {
-                let core_fill =
-                    ledger::LedgerFill::new(&ledger, options).with_closed(ledger.is_immutable());
-                return ledger::get_json_with_family(&core_fill, &family)
+                let app_fill = app::AppLedgerFill::new(&ledger, options);
+                return app::get_json_with_family(&app_fill, &family)
                     .map_err(|_| RpcStatus::new(RpcErrorCode::Internal));
             }
         }
