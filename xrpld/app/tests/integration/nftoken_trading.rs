@@ -12,7 +12,8 @@ use std::sync::Arc;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView};
 use protocol::{
-    AccountID, STAmount, STTx, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol,
+    AccountID, LedgerEntryType, STAmount, STLedgerEntry, STTx, STVector256, Ter, TxType, XRPAmount,
+    account_keylet, get_field_by_symbol, owner_dir_keylet,
 };
 
 use super::fixtures::*;
@@ -158,6 +159,89 @@ fn nftoken_create_buy_offer() {
     let result = full_apply(&mut view, &tx_offer, TxType::NFTOKEN_CREATE_OFFER);
     assert_eq!(result, Ter::TES_SUCCESS);
     assert_eq!(get_owner_count(&view, bob), 1); // offer
+}
+
+#[test]
+fn expired_nft_sell_offer_cleanup_tracks_fix_cleanup_3_1_3() {
+    let alice = acct(0x52);
+    let bob = acct(0x53);
+    let nft_id = Uint256::from_array([0xA5; 32]);
+    let offer_keylet = protocol::nft_offer_keylet_for_owner(acct_id(alice), 2);
+    let offer_dir_keylet = protocol::nft_sell_offers_keylet(nft_id);
+    let mut offer =
+        STLedgerEntry::from_type_and_key(LedgerEntryType::NFTokenOffer, offer_keylet.key);
+    offer.set_account_id(sf("sfOwner"), alice);
+    offer.set_field_h256(sf("sfNFTokenID"), nft_id);
+    offer.set_field_amount(sf("sfAmount"), xrp(1_000_000));
+    offer.set_field_u32(sf("sfFlags"), protocol::SELL_NF_TOKEN_LEDGER_FLAG);
+    offer.set_field_u32(sf("sfExpiration"), 999); // fixture close time is 1000
+    offer.set_field_u64(sf("sfOwnerNode"), 0);
+    offer.set_field_u64(sf("sfNFTokenOfferNode"), 0);
+
+    let owner_keylet = owner_dir_keylet(acct_id(alice));
+    let mut owner_dir = STLedgerEntry::new(owner_keylet.clone());
+    owner_dir.set_field_h256(sf("sfRootIndex"), owner_keylet.key);
+    owner_dir.set_field_v256(
+        sf("sfIndexes"),
+        STVector256::from_values(sf("sfIndexes"), vec![offer_keylet.key]),
+    );
+    owner_dir.set_field_u64(sf("sfIndexNext"), 0);
+    owner_dir.set_field_u64(sf("sfIndexPrevious"), 0);
+    let mut offer_dir = STLedgerEntry::new(offer_dir_keylet.clone());
+    offer_dir.set_field_h256(sf("sfRootIndex"), offer_dir_keylet.key);
+    offer_dir.set_field_v256(
+        sf("sfIndexes"),
+        STVector256::from_values(sf("sfIndexes"), vec![offer_keylet.key]),
+    );
+    offer_dir.set_field_u64(sf("sfIndexNext"), 0);
+    offer_dir.set_field_u64(sf("sfIndexPrevious"), 0);
+
+    for amendment_enabled in [false, true] {
+        let ledger = if amendment_enabled {
+            build_ledger_with_features(
+                vec![
+                    account_root(alice, 5_000_000_000, 1, 0),
+                    account_root(bob, 5_000_000_000, 0, 0),
+                    owner_dir.clone(),
+                    offer_dir.clone(),
+                    offer.clone(),
+                ],
+                vec!["fixCleanup3_1_3"],
+            )
+        } else {
+            build_ledger(vec![
+                account_root(alice, 5_000_000_000, 1, 0),
+                account_root(bob, 5_000_000_000, 0, 0),
+                owner_dir.clone(),
+                offer_dir.clone(),
+                offer.clone(),
+            ])
+        };
+        let mut view = new_view(ledger);
+        let owner_count_before_accept = get_owner_count(&view, alice);
+        let accept = accept_offer_tx(bob, Some(offer_keylet.key), None, 1);
+
+        assert_eq!(
+            full_apply(&mut view, &accept, TxType::NFTOKEN_ACCEPT_OFFER),
+            Ter::TEC_EXPIRED
+        );
+        assert_eq!(
+            view.read(offer_keylet.clone())
+                .expect("expired offer read")
+                .is_some(),
+            !amendment_enabled,
+            "legacy keeps an expired offer while fixCleanup3_1_3 removes it"
+        );
+        assert_eq!(
+            get_owner_count(&view, alice),
+            if amendment_enabled {
+                owner_count_before_accept - 1
+            } else {
+                owner_count_before_accept
+            },
+            "only amended cleanup may release the expired offer reserve"
+        );
+    }
 }
 
 /// C++ NFToken_test — accept sell offer transfers token.

@@ -106,6 +106,9 @@ fn check_invariants_inner<V: ApplyView>(
     fee: XRPAmount,
 ) -> Ter {
     let mut xrp_balance_change: i64 = 0;
+    let mut has_xrp_trust_line = false;
+    let mut deep_freeze_violation = false;
+    let mut mpt_issuance_locked_violation = false;
     let fix_cleanup_3_1_3 = sandbox
         .rules()
         .enabled(&protocol::feature_id("fixCleanup3_1_3"));
@@ -340,18 +343,34 @@ fn check_invariants_inner<V: ApplyView>(
             }
             LedgerEntryType::DirectoryNode => {}
             LedgerEntryType::RippleState => {
-                if let Some(a) = after_sle
-                    && !validate_ripple_state_entry(a)
-                {
-                    return Ter::TEC_INVARIANT_FAILED;
+                if let Some(a) = after_sle {
+                    has_xrp_trust_line = accumulate_invariant_violation(
+                        has_xrp_trust_line,
+                        is_xrp_trust_line(a),
+                        fix_cleanup_3_1_3,
+                    );
+                    deep_freeze_violation = accumulate_invariant_violation(
+                        deep_freeze_violation,
+                        has_deep_freeze_without_freeze(a),
+                        fix_cleanup_3_1_3,
+                    );
                 }
             }
             LedgerEntryType::MPTokenIssuance | LedgerEntryType::MPToken => {
-                if fix_cleanup_3_2_0
-                    && let Some(a) = after_sle
-                    && !validate_mpt_entry(a)
-                {
-                    return Ter::TEC_INVARIANT_FAILED;
+                if let Some(a) = after_sle {
+                    if a.get_type() == LedgerEntryType::MPTokenIssuance
+                        && a.is_field_present(sf("sfLockedAmount"))
+                    {
+                        mpt_issuance_locked_violation = accumulate_invariant_violation(
+                            mpt_issuance_locked_violation,
+                            a.get_field_u64(sf("sfOutstandingAmount"))
+                                < a.get_field_u64(sf("sfLockedAmount")),
+                            fix_cleanup_3_1_3,
+                        );
+                    }
+                    if fix_cleanup_3_2_0 && !validate_mpt_entry(a) {
+                        return Ter::TEC_INVARIANT_FAILED;
+                    }
                 }
             }
             LedgerEntryType::Vault => {
@@ -395,6 +414,10 @@ fn check_invariants_inner<V: ApplyView>(
             }
             _ => {}
         }
+    }
+
+    if has_xrp_trust_line || deep_freeze_violation || mpt_issuance_locked_violation {
+        return Ter::TEC_INVARIANT_FAILED;
     }
 
     if (fix_cleanup_3_1_3 || txn_type == protocol::TxType::PERMISSIONED_DOMAIN_SET)

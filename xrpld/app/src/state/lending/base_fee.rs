@@ -1,6 +1,6 @@
 use basics::number::{NumberParts as RuntimeNumber, RoundingMode};
 use ledger::{ReadView, has_expired};
-use protocol::{STTx, feature_id, lending::LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION};
+use protocol::{STTx, lending::LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION};
 
 use super::{common::*, helpers::*};
 
@@ -62,8 +62,8 @@ pub fn calculate_loan_pay_base_fee<V: ReadView>(view: &V, sttx: &STTx, normal_co
     }
 
     let payment_amount = amount_number(&amount);
-    let fix_security_3_1_3 = view.rules().enabled(&feature_id("fixSecurity3_1_3"));
-    if fix_security_3_1_3
+    let fix_cleanup_3_1_3 = view.rules().enabled(&protocol::fix_cleanup_3_1_3());
+    if fix_cleanup_3_1_3
         && payment_amount
             >= regular_payment
                 * RuntimeNumber::from_i64(i64::from(LOAN_MAXIMUM_PAYMENTS_PER_TRANSACTION))
@@ -79,7 +79,7 @@ pub fn calculate_loan_pay_base_fee<V: ReadView>(view: &V, sttx: &STTx, normal_co
     };
     let increments =
         tx::compute_loan_pay_fee_increments(i64::try_from(payment_estimate).unwrap_or(i64::MAX));
-    let increments = if fix_security_3_1_3 {
+    let increments = if fix_cleanup_3_1_3 {
         increments.min(tx::LOAN_MAXIMUM_FEE_INCREMENTS)
     } else {
         increments

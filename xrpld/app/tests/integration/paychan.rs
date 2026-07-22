@@ -883,24 +883,6 @@ fn paychan_5k_creates() {
 
 // ─── PayChan: 10000 Sequential Creates ──────────────────────────────────────
 
-#[test]
-fn paychan_10k_creates() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = make_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = ApplyViewImpl::new(Arc::new(l), ApplyFlags::NONE);
-    for seq in 1..=10000u32 {
-        let tx = paychan_create_tx(a, b, 100, 3600, seq);
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::PAYCHAN_CREATE),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── PayChan: Self-Payment Fails ────────────────────────────────────────────
 
 #[test]

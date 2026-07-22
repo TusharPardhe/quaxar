@@ -51,13 +51,24 @@ pub(super) fn validate_amm_entry(sle: &STLedgerEntry) -> bool {
     true
 }
 
-pub(super) fn validate_ripple_state_entry(sle: &STLedgerEntry) -> bool {
-    if sle.get_field_amount(sf("sfLowLimit")).asset().native()
-        || sle.get_field_amount(sf("sfHighLimit")).asset().native()
-    {
-        return false;
+pub(super) fn accumulate_invariant_violation(
+    previous: bool,
+    current: bool,
+    fix_cleanup_3_1_3: bool,
+) -> bool {
+    if fix_cleanup_3_1_3 {
+        previous || current
+    } else {
+        current
     }
+}
 
+pub(super) fn is_xrp_trust_line(sle: &STLedgerEntry) -> bool {
+    sle.get_field_amount(sf("sfLowLimit")).asset().native()
+        || sle.get_field_amount(sf("sfHighLimit")).asset().native()
+}
+
+pub(super) fn has_deep_freeze_without_freeze(sle: &STLedgerEntry) -> bool {
     let flags = if sle.is_field_present(sf("sfFlags")) {
         sle.get_field_u32(sf("sfFlags"))
     } else {
@@ -68,5 +79,22 @@ pub(super) fn validate_ripple_state_entry(sle: &STLedgerEntry) -> bool {
     let high_freeze = (flags & protocol::lsfHighFreeze) != 0;
     let high_deep_freeze = (flags & protocol::lsfHighDeepFreeze) != 0;
 
-    !(low_deep_freeze && !low_freeze || high_deep_freeze && !high_freeze)
+    low_deep_freeze && !low_freeze || high_deep_freeze && !high_freeze
+}
+
+pub(super) fn validate_ripple_state_entry(sle: &STLedgerEntry) -> bool {
+    !is_xrp_trust_line(sle) && !has_deep_freeze_without_freeze(sle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accumulate_invariant_violation;
+
+    #[test]
+    fn invariant_overwrite_tracks_fix_cleanup_3_1_3() {
+        assert!(!accumulate_invariant_violation(true, false, false));
+        assert!(accumulate_invariant_violation(true, false, true));
+        assert!(accumulate_invariant_violation(false, true, false));
+        assert!(accumulate_invariant_violation(false, true, true));
+    }
 }

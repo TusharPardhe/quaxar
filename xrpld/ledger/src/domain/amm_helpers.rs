@@ -59,7 +59,8 @@ fn asset_rounding(is_deposit: IsDeposit) -> RoundingMode {
 pub fn multiply(amount: &STAmount, frac: RuntimeNumber, mode: RoundingMode) -> STAmount {
     let _guard = NumberRoundModeGuard::new(mode);
     let product = stamount_as_number(amount) * frac;
-    to_st_amount(amount.issue(), product)
+    protocol::to_amount_from_number(amount.asset(), product, mode)
+        .expect("rounded AMM amount should remain representable")
 }
 
 fn solve_quadratic_eq(a: RuntimeNumber, b: RuntimeNumber, c: RuntimeNumber) -> RuntimeNumber {
@@ -120,10 +121,12 @@ pub fn amm_asset_in(
     let c = d * d - f2 * f2;
     let frac = solve_quadratic_eq(a, b, c);
     if !is_feature_enabled(&fix_ammv1_3()) {
-        return to_st_amount(
-            asset1_balance.issue(),
+        return protocol::to_amount_from_number(
+            asset1_balance.asset(),
             stamount_as_number(asset1_balance) * frac,
-        );
+            get_rounding_mode(),
+        )
+        .expect("legacy AMM asset amount should remain representable");
     }
 
     multiply(asset1_balance, frac, RoundingMode::Upward)
@@ -160,10 +163,12 @@ pub fn amm_asset_out(
     let t1 = stamount_as_number(lp_tokens) / stamount_as_number(lpt_amm_balance);
     let frac = (t1 * t1 - t1 * (number_from_i64(2) - f)) / (t1 * f - number_from_i64(1));
     if !is_feature_enabled(&fix_ammv1_3()) {
-        return to_st_amount(
-            asset_balance.issue(),
+        return protocol::to_amount_from_number(
+            asset_balance.asset(),
             stamount_as_number(asset_balance) * frac,
-        );
+            get_rounding_mode(),
+        )
+        .expect("legacy AMM asset amount should remain representable");
     }
 
     multiply(asset_balance, frac, RoundingMode::Downward)
@@ -252,16 +257,8 @@ pub fn adjust_lp_tokens(
 ) -> STAmount {
     let _saved = SaveNumberRoundMode::new(set_rounding_mode(RoundingMode::Downward));
     match is_deposit {
-        IsDeposit::Yes => {
-            let adjusted = stamount_as_number(lpt_amm_balance) + stamount_as_number(lp_tokens)
-                - stamount_as_number(lpt_amm_balance);
-            to_st_amount(lp_tokens.issue(), adjusted)
-        }
-        IsDeposit::No => {
-            let adjusted = stamount_as_number(lp_tokens) - stamount_as_number(lpt_amm_balance)
-                + stamount_as_number(lpt_amm_balance);
-            to_st_amount(lp_tokens.issue(), adjusted)
-        }
+        IsDeposit::Yes => lpt_amm_balance.clone() + lp_tokens.clone() - lpt_amm_balance.clone(),
+        IsDeposit::No => lp_tokens.clone() - lpt_amm_balance.clone() + lpt_amm_balance.clone(),
     }
 }
 
@@ -291,8 +288,18 @@ pub fn adjust_amounts_by_lp_tokens(
         let amm_rounding_enabled = is_amm_rounding_enabled();
         if let Some(amount2) = amount2 {
             let fr = stamount_as_number(&lp_tokens_actual) / stamount_as_number(lp_tokens);
-            let amount_actual = to_st_amount(amount.issue(), fr * stamount_as_number(amount));
-            let amount2_actual = to_st_amount(amount2.issue(), fr * stamount_as_number(amount2));
+            let amount_actual = protocol::to_amount_from_number(
+                amount.asset(),
+                fr * stamount_as_number(amount),
+                get_rounding_mode(),
+            )
+            .expect("legacy AMM asset amount should remain representable");
+            let amount2_actual = protocol::to_amount_from_number(
+                amount2.asset(),
+                fr * stamount_as_number(amount2),
+                get_rounding_mode(),
+            )
+            .expect("legacy AMM asset amount should remain representable");
             if !amm_rounding_enabled {
                 return (
                     std::cmp::min(amount_actual, amount.clone()),
@@ -334,7 +341,12 @@ pub fn get_rounded_asset(
     is_deposit: IsDeposit,
 ) -> STAmount {
     if !rules.enabled(&fix_ammv1_3()) {
-        return to_st_amount(balance.issue(), stamount_as_number(balance) * frac);
+        return protocol::to_amount_from_number(
+            balance.asset(),
+            stamount_as_number(balance) * frac,
+            get_rounding_mode(),
+        )
+        .expect("legacy AMM asset amount should remain representable");
     }
     multiply(balance, frac, asset_rounding(is_deposit))
 }
@@ -351,7 +363,12 @@ where
     G: FnOnce() -> RuntimeNumber,
 {
     if !rules.enabled(&fix_ammv1_3()) {
-        return to_st_amount(balance.issue(), no_round_cb());
+        return protocol::to_amount_from_number(
+            balance.asset(),
+            no_round_cb(),
+            get_rounding_mode(),
+        )
+        .expect("legacy AMM asset amount should remain representable");
     }
 
     let rm = asset_rounding(is_deposit);
@@ -360,7 +377,8 @@ where
     }
 
     let _guard = NumberRoundModeGuard::new(rm);
-    to_st_amount(balance.issue(), product_cb())
+    protocol::to_amount_from_number(balance.asset(), product_cb(), rm)
+        .expect("rounded AMM asset amount should remain representable")
 }
 
 pub fn get_rounded_lp_tokens(
@@ -417,10 +435,12 @@ pub fn adjust_asset_in_by_tokens(
     let mut asset_adj = amm_asset_in(balance, lpt_amm_balance, tokens, tfee);
     let mut tokens_adj = tokens.clone();
     if asset_adj > *amount {
-        let adj_amount = to_st_amount(
-            amount.issue(),
+        let adj_amount = protocol::to_amount_from_number(
+            amount.asset(),
             number_from_i64(2) * stamount_as_number(amount) - stamount_as_number(&asset_adj),
-        );
+            get_rounding_mode(),
+        )
+        .expect("AMM adjusted asset amount should remain representable");
         let t = lp_tokens_out(balance, &adj_amount, lpt_amm_balance, tfee);
         tokens_adj = adjust_lp_tokens(lpt_amm_balance, &t, IsDeposit::Yes);
         asset_adj = amm_asset_in(balance, lpt_amm_balance, &tokens_adj, tfee);
@@ -443,10 +463,12 @@ pub fn adjust_asset_out_by_tokens(
     let mut asset_adj = amm_asset_out(balance, lpt_amm_balance, tokens, tfee);
     let mut tokens_adj = tokens.clone();
     if asset_adj > *amount {
-        let adj_amount = to_st_amount(
-            amount.issue(),
+        let adj_amount = protocol::to_amount_from_number(
+            amount.asset(),
             number_from_i64(2) * stamount_as_number(amount) - stamount_as_number(&asset_adj),
-        );
+            get_rounding_mode(),
+        )
+        .expect("AMM adjusted asset amount should remain representable");
         let t = lp_tokens_in(balance, &adj_amount, lpt_amm_balance, tfee);
         tokens_adj = adjust_lp_tokens(lpt_amm_balance, &t, IsDeposit::No);
         asset_adj = amm_asset_out(balance, lpt_amm_balance, &tokens_adj, tfee);

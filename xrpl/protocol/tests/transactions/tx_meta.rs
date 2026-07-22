@@ -1,8 +1,9 @@
 use basics::base_uint::Uint256;
 use basics::string_utilities::sql_blob_literal;
 use protocol::{
-    AccountID, IOUAmount, Issue, JsonValue, LedgerEntryType, MPTIssue, STAmount, STLedgerEntry,
-    STObject, Serializer, StBase, TxMeta, currency_from_string, get_field_by_symbol, make_mpt_id,
+    AccountID, IOUAmount, Issue, JsonValue, LedgerEntryType, MPTAmount, MPTIssue, STAmount,
+    STLedgerEntry, STObject, Serializer, StBase, TxMeta, currency_from_string, get_field_by_symbol,
+    make_mpt_id,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -41,6 +42,29 @@ fn offer_payload(field: &'static protocol::SField, issuer: AccountID) -> STObjec
         make_mpt_id(9, account(0x55)),
     );
     payload
+}
+
+#[test]
+fn fix_mpt_delivered_amount_round_trips_canonical_metadata() {
+    let mpt_issue = MPTIssue::new(make_mpt_id(7, account(0x71)));
+    let delivered_amount = STAmount::from_mpt_amount(
+        get_field_by_symbol("sfDeliveredAmount"),
+        MPTAmount::from_value(800),
+        mpt_issue,
+    );
+    let mut meta = TxMeta::new(hash(0x72), 73);
+    meta.set_delivered_amount(Some(delivered_amount.clone()));
+
+    let mut serializer = Serializer::default();
+    meta.add_raw(&mut serializer, protocol::Ter::TES_SUCCESS, 3);
+    let reparsed = TxMeta::from_raw(hash(0x72), 73, serializer.data());
+
+    assert_eq!(reparsed.get_delivered_amount(), Some(&delivered_amount));
+    assert!(
+        reparsed
+            .get_as_object()
+            .is_field_present(get_field_by_symbol("sfDeliveredAmount"))
+    );
 }
 
 #[test]

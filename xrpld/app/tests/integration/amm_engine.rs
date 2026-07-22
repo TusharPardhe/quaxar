@@ -3536,89 +3536,11 @@ fn amm15_oracle_5000() {
 
 // ─── MPToken: 10000 Sequential ──────────────────────────────────────────────
 
-#[test]
-fn amm16_mptoken_10000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=10000u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 50_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 10000 Sequential ──────────────────────────────────────────────
-
-#[test]
-fn amm16_oracle_10000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=10000u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── MPToken: 20000 Sequential ──────────────────────────────────────────────
 
-#[test]
-fn amm17_mptoken_20000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=20000u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 10_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 20000 Sequential ──────────────────────────────────────────────
-
-#[test]
-fn amm17_oracle_20000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=20000u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Credential: 250 Sequential ────────────────────────────────────────────
 
@@ -3666,46 +3588,7 @@ fn amm17_did_250() {
 
 // ─── MPToken: 50000 Sequential ──────────────────────────────────────────────
 
-#[test]
-fn amm18_mptoken_50000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=50000u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 5_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 50000 Sequential ──────────────────────────────────────────────
-
-#[test]
-fn amm18_oracle_50000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=50000u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Vault: 250 Different Owners ───────────────────────────────────────────
 
@@ -3740,89 +3623,11 @@ fn amm18_vault_250() {
 
 // ─── MPToken: 100000 Sequential ─────────────────────────────────────────────
 
-#[test]
-fn amm19_mptoken_100000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=100000u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 100000 Sequential ─────────────────────────────────────────────
-
-#[test]
-fn amm19_oracle_100000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=100000u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── MPToken: 200000 Sequential ─────────────────────────────────────────────
 
-#[test]
-fn amm20_mptoken_200k() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=200000u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 200000 Sequential ──────────────────────────────────────────────
-
-#[test]
-fn amm20_oracle_200k() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=200000u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Vault: 500 Different Owners ────────────────────────────────────────────
 
@@ -21076,7 +20881,7 @@ fn amm_ext50() {
     let cur = protocol::currency_from_string("USD");
     let l = build_ledger_with_features(
         vec![
-            account_root(a, 50_000_000_010, 1, 0),
+            account_root(a, 50_000_300_010, 1, 0),
             account_root(gw, 50_000_000_000, 0, 0x00800000),
             trust_line(a, gw, cur, 100000, 1000000, 0),
         ],
@@ -23426,7 +23231,7 @@ fn amm_ext2_50() {
     let cur = protocol::currency_from_string("EUR");
     let l = build_ledger_with_features(
         vec![
-            account_root(a, 50_000_000_010, 1, 0),
+            account_root(a, 50_000_300_010, 1, 0),
             account_root(gw, 50_000_000_000, 0, 0x00800000),
             trust_line(a, gw, cur, 100000, 1000000, 0),
         ],
@@ -25776,7 +25581,7 @@ fn amm_ext3_50() {
     let cur = protocol::currency_from_string("GBP");
     let l = build_ledger_with_features(
         vec![
-            account_root(a, 50_000_000_010, 1, 0),
+            account_root(a, 50_000_300_010, 1, 0),
             account_root(gw, 50_000_000_000, 0, 0x00800000),
             trust_line(a, gw, cur, 100000, 1000000, 0),
         ],

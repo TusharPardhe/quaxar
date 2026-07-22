@@ -16,6 +16,9 @@ pub fn build_escrow_create_facts<V: ApplyView>(
 ) -> Result<EscrowCreateApplyFacts, ViewError> {
     let mut facts = EscrowCreateApplyFacts::default();
     facts.amount_is_xrp = amount.native();
+    facts.include_sequence_field = view
+        .rules()
+        .enabled(&protocol::feature_id("fixIncludeKeyletFields"));
 
     if let Some(src_sle) =
         view.peek(protocol::account_keylet(Uint160::from_void(account.data())))?
@@ -99,7 +102,18 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
         }
         let _ = self.view.insert(Arc::new(sle));
     }
-    fn set_sequence_field(&mut self) {}
+    fn set_sequence_field(&mut self) {
+        if let Ok(Some(sle)) = self.view.peek(protocol::escrow_keylet(
+            Uint160::from_void(self.account.data()),
+            self.escrow_seq,
+        )) {
+            let mut obj = sle.clone_as_object();
+            obj.set_field_u32(get_field_by_symbol("sfSequence"), self.escrow_seq);
+            let _ = self
+                .view
+                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
+        }
+    }
     fn set_transfer_rate(&mut self) {}
     fn insert_sender_owner_dir(&mut self) -> Option<u64> {
         let escrow_kl =

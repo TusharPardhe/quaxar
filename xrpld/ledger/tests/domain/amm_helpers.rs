@@ -1,3 +1,4 @@
+use basics::base_uint::Uint192;
 use basics::number::{NumberParts as RuntimeNumber, current_number_one};
 use ledger::{
     IsDeposit, adjust_amounts_by_lp_tokens, adjust_asset_in_by_tokens, adjust_asset_out_by_tokens,
@@ -6,9 +7,9 @@ use ledger::{
     within_relative_distance_quality,
 };
 use protocol::{
-    CurrentTransactionRulesGuard, IOUAmount, Issue, Quality, Rules, STAmount, XRPAmount,
-    currency_from_string, feature_amm, feature_universal_number, fix_ammv1_1, fix_ammv1_3,
-    sf_generic,
+    Asset, CurrentTransactionRulesGuard, IOUAmount, Issue, MPTAmount, MPTIssue, Quality, Rules,
+    STAmount, XRPAmount, currency_from_string, feature_amm, feature_universal_number, fix_ammv1_1,
+    fix_ammv1_3, sf_generic,
 };
 
 fn sample_issue(currency: &str, fill: u8) -> Issue {
@@ -192,6 +193,20 @@ fn rounded_asset_and_lp_tokens_match_cpp_fixammv13_gate() {
         post_fix_tokens.iou(),
         IOUAmount::from_parts(101, -1).expect("post tokens")
     );
+}
+
+#[test]
+fn rounded_asset_preserves_mpt_issue_in_every_ammv13_branch() {
+    let issue = MPTIssue::new(Uint192::from_array([0x6B; 24]));
+    let balance = STAmount::from_mpt_amount(sf_generic(), MPTAmount::from_value(101), issue);
+    let frac = RuntimeNumber::try_from_external_parts(1, 0, basics::number::get_mantissa_scale())
+        .expect("unit fraction");
+
+    for rules in [large_rules(false, false), large_rules(false, true)] {
+        let rounded = get_rounded_asset(&rules, &balance, frac, IsDeposit::No);
+        assert_eq!(rounded.asset(), Asset::MPTIssue(issue));
+        assert_eq!(rounded.mpt().value(), 101);
+    }
 }
 
 #[test]

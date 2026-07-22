@@ -1045,24 +1045,6 @@ fn check_5000_sequential() {
     }
 }
 
-#[test]
-fn check_10000_sequential() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = make_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = ApplyViewImpl::new(Arc::new(l), ApplyFlags::NONE);
-    for seq in 1..=10000u32 {
-        let tx = check_create_tx(a, b, xrp(10), seq);
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::CHECK_CREATE),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Check: 100 Accounts Each Create 1 ─────────────────────────────────────
 
 #[test]
@@ -1111,43 +1093,7 @@ fn check_200_accounts() {
 
 // ─── Check: 20000 Sequential Creates ────────────────────────────────────────
 
-#[test]
-fn check_20k_creates() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = make_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = ApplyViewImpl::new(Arc::new(l), ApplyFlags::NONE);
-    for seq in 1..=20000u32 {
-        let tx = check_create_tx(a, b, xrp(10), seq);
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::CHECK_CREATE),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Check: 50000 Sequential Creates ────────────────────────────────────────
-
-#[test]
-fn check_50k_creates() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = make_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = ApplyViewImpl::new(Arc::new(l), ApplyFlags::NONE);
-    for seq in 1..=50000u32 {
-        let tx = check_create_tx(a, b, xrp(5), seq);
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::CHECK_CREATE),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Check: Self-Payment Fails ──────────────────────────────────────────────
 

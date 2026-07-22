@@ -341,6 +341,87 @@ fn tx_renders_json_and_binary_shapes() {
 }
 
 #[test]
+fn fix_mpt_delivered_amount_tx_rpc_preserves_canonical_json_and_binary_meta() {
+    let mpt_issue = MPTIssue::new(protocol::make_mpt_id(1, account(3)));
+    let tx = Arc::new(STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), account(1));
+        tx.set_account_id(get_field_by_symbol("sfDestination"), account(2));
+        tx.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::from_mpt_amount(
+                get_field_by_symbol("sfAmount"),
+                MPTAmount::from_value(1_000),
+                mpt_issue,
+            ),
+        );
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(10, false),
+        );
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 5);
+    }));
+    let tx_id = tx.get_transaction_id();
+    let delivered = STAmount::from_mpt_amount(
+        get_field_by_symbol("sfDeliveredAmount"),
+        MPTAmount::from_value(800),
+        mpt_issue,
+    );
+    let mut meta = payment_meta(tx_id);
+    meta.set_delivered_amount(Some(delivered));
+    let source = FakeTxSource {
+        enabled: true,
+        synced: true,
+        network_id: 0,
+        by_hash: BTreeMap::from([(
+            tx_id.to_string(),
+            Ok(TxLookupOutcome::Found(found_record(
+                Arc::clone(&tx),
+                Some(meta.clone()),
+            ))),
+        )]),
+        by_ctid: BTreeMap::new(),
+    };
+
+    let json = do_tx(
+        &TxRequest {
+            params: &object([("transaction", JsonValue::String(tx_id.to_string()))]),
+            api_version: 2,
+        },
+        &source,
+    );
+    let JsonValue::Object(json) = json else {
+        panic!("tx response should be an object");
+    };
+    let JsonValue::Object(json_meta) = json.get("meta").expect("meta should be present") else {
+        panic!("metadata should be an object");
+    };
+    assert_eq!(
+        json_meta.get("DeliveredAmount"),
+        json_meta.get("delivered_amount")
+    );
+
+    let binary = do_tx(
+        &TxRequest {
+            params: &object([
+                ("transaction", JsonValue::String(tx_id.to_string())),
+                ("binary", JsonValue::Bool(true)),
+            ]),
+            api_version: 2,
+        },
+        &source,
+    );
+    let JsonValue::Object(binary) = binary else {
+        panic!("binary tx response should be an object");
+    };
+    assert_eq!(
+        binary.get("meta_blob"),
+        Some(&JsonValue::String(basics::str_hex::str_hex(
+            meta.get_as_object().get_serializer().data()
+        )))
+    );
+}
+
+#[test]
 fn tx_ctid_only_uses_explicit_lookup_network_id() {
     let tx = Arc::new(STTx::new(TxType::PAYMENT, |tx| {
         tx.set_account_id(get_field_by_symbol("sfAccount"), account(1));

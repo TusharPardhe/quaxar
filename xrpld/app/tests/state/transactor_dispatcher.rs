@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use app::state::application_root::apply_submit_transactor_shell;
+use app::state::application_root::{
+    apply_submit_transactor_shell, apply_submit_transactor_shell_with_delivered_amount,
+};
 use app::state::lending::calculate_loan_pay_base_fee;
 use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint192, Uint256};
@@ -8,11 +10,11 @@ use basics::number::NumberParts as RuntimeNumber;
 use ledger::{ApplyView, ApplyViewImpl, Ledger, LedgerHeader, ReadView, pseudo_account_address};
 use protocol::{
     AccountID, ApplyFlags, Asset, Currency, IOUAmount, Issue, Keylet, LedgerEntryType, MPTAmount,
-    MPTIssue, STAmount, STArray, STIssue, STLedgerEntry, STNumber, STObject, STTx, StBase, Ter,
-    TxType, XRPAmount, account_keylet, amm_lpt_currency, currency_from_string, get_field_by_symbol,
-    line, lsfDefaultRipple, lsfDisableMaster, lsfLoanImpaired, lsfLowDeepFreeze, owner_dir_keylet,
-    permissioned_domain_keylet, sf_generic, signers_keylet, tfLoanDefault, tfLoanImpair,
-    tfLoanUnimpair, xrp_issue,
+    MPTIssue, STAmount, STArray, STIssue, STLedgerEntry, STNumber, STObject, STTx, Serializer,
+    StBase, Ter, TxMeta, TxType, XRPAmount, account_keylet, amm_lpt_currency, currency_from_string,
+    get_field_by_symbol, line, lsfAllowTrustLineClawback, lsfDefaultRipple, lsfDisableMaster,
+    lsfLoanImpaired, lsfLowDeepFreeze, owner_dir_keylet, permissioned_domain_keylet, sf_generic,
+    signers_keylet, tfLoanDefault, tfLoanImpair, tfLoanUnimpair, xrp_issue,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -75,6 +77,17 @@ fn owner_dir_root(page_owner: AccountID, child: Uint256) -> STLedgerEntry {
     entry.set_field_v256(
         get_field_by_symbol("sfIndexes"),
         protocol::STVector256::from_values(get_field_by_symbol("sfIndexes"), vec![child]),
+    );
+    entry
+}
+
+fn owner_dir_root_with_children(page_owner: AccountID, children: Vec<Uint256>) -> STLedgerEntry {
+    let root = owner_dir_keylet(raw_account_id(page_owner));
+    let mut entry = STLedgerEntry::new(root);
+    entry.set_field_h256(get_field_by_symbol("sfRootIndex"), root.key);
+    entry.set_field_v256(
+        get_field_by_symbol("sfIndexes"),
+        protocol::STVector256::from_values(get_field_by_symbol("sfIndexes"), children),
     );
     entry
 }
@@ -341,6 +354,110 @@ fn signer_list_set_tx(account: AccountID, quorum: u32, signers: &[(AccountID, u1
             STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
         );
     })
+}
+
+fn escrow_create_tx(account: AccountID, destination: AccountID, sequence: u32) -> STTx {
+    STTx::new(TxType::ESCROW_CREATE, move |object| {
+        object.set_account_id(sf("sfAccount"), account);
+        object.set_account_id(sf("sfDestination"), destination);
+        object.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(1_000)),
+        );
+        object.set_field_u32(sf("sfFinishAfter"), 1);
+        object.set_field_u32(sf("sfSequence"), sequence);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+    })
+}
+
+fn paychan_create_ticket_tx(
+    account: AccountID,
+    destination: AccountID,
+    ticket_sequence: u32,
+) -> STTx {
+    STTx::new(TxType::PAYCHAN_CREATE, move |object| {
+        object.set_account_id(sf("sfAccount"), account);
+        object.set_account_id(sf("sfDestination"), destination);
+        object.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(1_000)),
+        );
+        object.set_field_u32(sf("sfSettleDelay"), 60);
+        object.set_field_vl(sf("sfPublicKey"), &[3; 33]);
+        object.set_field_u32(sf("sfSequence"), 0);
+        object.set_field_u32(sf("sfTicketSequence"), ticket_sequence);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+    })
+}
+
+fn oracle_price_data_with_currencies(
+    base: Currency,
+    quote: Currency,
+    price: u64,
+    scale: u8,
+) -> STObject {
+    let mut entry = STObject::make_inner_object(sf("sfPriceData"));
+    entry.set_field_currency(
+        sf("sfBaseAsset"),
+        protocol::STCurrency::new_with_currency(sf("sfBaseAsset"), base),
+    );
+    entry.set_field_currency(
+        sf("sfQuoteAsset"),
+        protocol::STCurrency::new_with_currency(sf("sfQuoteAsset"), quote),
+    );
+    entry.set_field_u64(sf("sfAssetPrice"), price);
+    entry.set_field_u8(sf("sfScale"), scale);
+    entry
+}
+
+fn oracle_price_data(base: &str, quote: &str, price: u64, scale: u8) -> STObject {
+    oracle_price_data_with_currencies(
+        currency_from_string(base),
+        currency_from_string(quote),
+        price,
+        scale,
+    )
+}
+
+fn oracle_set_tx(
+    account: AccountID,
+    document_id: u32,
+    last_update_time: u32,
+    entries: &[STObject],
+    include_create_fields: bool,
+) -> STTx {
+    let mut series = STArray::new(sf("sfPriceDataSeries"));
+    for entry in entries {
+        series.push_back(entry.clone());
+    }
+    STTx::new(TxType::ORACLE_SET, move |object| {
+        object.set_account_id(sf("sfAccount"), account);
+        object.set_field_u32(sf("sfOracleDocumentID"), document_id);
+        object.set_field_u32(sf("sfLastUpdateTime"), last_update_time);
+        object.set_field_array(sf("sfPriceDataSeries"), series);
+        object.set_field_u32(sf("sfSequence"), 1);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        if include_create_fields {
+            object.set_field_vl(sf("sfProvider"), b"provider");
+            object.set_field_vl(sf("sfAssetClass"), b"currency");
+        }
+    })
+}
+
+fn oracle_pair(entry: &STObject) -> (String, String) {
+    (
+        protocol::currency_to_string(entry.get_field_currency(sf("sfBaseAsset")).currency()),
+        protocol::currency_to_string(entry.get_field_currency(sf("sfQuoteAsset")).currency()),
+    )
 }
 
 fn delegate_permissions(permissions: &[u32]) -> STArray {
@@ -828,6 +945,258 @@ fn check_entry(
     entry.set_field_u64(get_field_by_symbol("sfOwnerNode"), 0);
     entry.set_field_u64(get_field_by_symbol("sfDestinationNode"), 0);
     entry
+}
+
+#[test]
+fn amm_clawback_last_lp_reconciliation_tracks_fix_amm_clawback_rounding() {
+    let issuer = sample_account(0x11);
+    let holder = sample_account(0x22);
+    let amm_account = sample_account(0x33);
+    let usd = Issue::new(currency_from_string("USD"), issuer);
+    let eur = Issue::new(currency_from_string("EUR"), issuer);
+    let lp_currency = amm_lpt_currency(usd.currency, eur.currency);
+
+    let build = |holder_lp: i64, rounding_enabled: bool| {
+        let amm = amm_entry(amm_account, usd, eur, 1_000_000, Vec::new(), 0);
+        let lp_line = trust_line_entry_iou(
+            holder,
+            amm_account,
+            lp_currency,
+            IOUAmount::from_parts(holder_lp, 0).expect("LP balance"),
+        );
+        let usd_pool_line = trust_line_entry_iou(
+            issuer,
+            amm_account,
+            usd.currency,
+            IOUAmount::from_parts(-1_000_000, 0).expect("USD pool balance"),
+        );
+        let eur_pool_line = trust_line_entry_iou(
+            issuer,
+            amm_account,
+            eur.currency,
+            IOUAmount::from_parts(-1_000_000, 0).expect("EUR pool balance"),
+        );
+        let mut ledger = empty_ledger(vec![
+            account_root(issuer, 0, lsfAllowTrustLineClawback),
+            account_root(holder, 0, 0),
+            account_root(amm_account, 0, 0),
+            owner_dir_root_with_children(
+                amm_account,
+                vec![
+                    *amm.key(),
+                    *lp_line.key(),
+                    *usd_pool_line.key(),
+                    *eur_pool_line.key(),
+                ],
+            ),
+            amm,
+            lp_line,
+            usd_pool_line,
+            eur_pool_line,
+            trust_line_entry_iou(
+                issuer,
+                holder,
+                usd.currency,
+                IOUAmount::from_parts(0, 0).expect("USD holder balance"),
+            ),
+            trust_line_entry_iou(
+                issuer,
+                holder,
+                eur.currency,
+                IOUAmount::from_parts(0, 0).expect("EUR holder balance"),
+            ),
+        ]);
+        let mut features = vec![protocol::feature_id("fixAMMv1_3")];
+        if rounding_enabled {
+            features.push(protocol::feature_id("fixAMMClawbackRounding"));
+        }
+        ledger.set_rules(protocol::Rules::new(features));
+        ledger
+    };
+
+    let clawback = || {
+        STTx::new(TxType::AMM_CLAWBACK, |tx| {
+            tx.set_account_id(sf("sfAccount"), issuer);
+            tx.set_account_id(sf("sfHolder"), holder);
+            tx.set_field_issue(
+                sf("sfAsset"),
+                STIssue::new_with_asset(sf("sfAsset"), Asset::Issue(usd)),
+            );
+            tx.set_field_issue(
+                sf("sfAsset2"),
+                STIssue::new_with_asset(sf("sfAsset2"), Asset::Issue(eur)),
+            );
+            tx.set_field_amount(
+                sf("sfFee"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+            );
+            tx.set_field_u32(sf("sfSequence"), 1);
+        })
+    };
+
+    let amm_keylet = protocol::keylet::amm(Asset::Issue(usd), Asset::Issue(eur));
+
+    // Before the amendment, the AMM's rounded LP total wins and a one-token
+    // dust balance survives even though this is the only liquidity provider.
+    let mut legacy_view = ApplyViewImpl::new(Arc::new(build(999_999, false)), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut legacy_view, &clawback(), TxType::AMM_CLAWBACK, None),
+        Ter::TES_SUCCESS
+    );
+    let legacy_amm = legacy_view
+        .read(amm_keylet)
+        .expect("legacy AMM read")
+        .expect("legacy AMM survives");
+    assert_eq!(
+        legacy_amm.get_field_amount(sf("sfLPTokenBalance")).iou(),
+        IOUAmount::from_parts(1, 0).expect("one LP dust token")
+    );
+
+    // With the fix, a mismatch strictly below 0.1% is reconciled to the
+    // holder's LP trust-line balance before withdrawal, so the AMM is empty.
+    let mut fixed_view = ApplyViewImpl::new(Arc::new(build(999_999, true)), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut fixed_view, &clawback(), TxType::AMM_CLAWBACK, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        fixed_view
+            .read(amm_keylet)
+            .expect("fixed AMM read")
+            .is_none(),
+        "the reconciled last-provider clawback must delete the empty AMM"
+    );
+
+    // Larger discrepancies are invalid rather than silently reconciling.
+    let mut invalid_view = ApplyViewImpl::new(Arc::new(build(990_000, true)), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut invalid_view, &clawback(), TxType::AMM_CLAWBACK, None),
+        Ter::TEC_AMM_INVALID_TOKENS
+    );
+}
+
+#[test]
+fn amm_clawback_matching_amount_rounds_only_with_fix_amm_clawback_rounding() {
+    let issuer = sample_account(0x41);
+    let holder = sample_account(0x42);
+    let amm_account = sample_account(0x43);
+    let usd = Issue::new(currency_from_string("USD"), issuer);
+    let eur = Issue::new(currency_from_string("EUR"), issuer);
+    let lp_currency = amm_lpt_currency(usd.currency, eur.currency);
+    let lp_before = IOUAmount::from_parts(2_795_084_971_874_737, -12).expect("LP before");
+
+    let build = |rounding_enabled: bool| {
+        let mut amm = amm_entry(amm_account, usd, eur, 1, Vec::new(), 0);
+        amm.set_field_amount(
+            sf("sfLPTokenBalance"),
+            STAmount::from_iou_amount(
+                sf("sfLPTokenBalance"),
+                lp_before,
+                Issue::new(lp_currency, amm_account),
+            ),
+        );
+        let lp_line = trust_line_entry_iou(holder, amm_account, lp_currency, lp_before);
+        let usd_pool_line = trust_line_entry_iou(
+            issuer,
+            amm_account,
+            usd.currency,
+            IOUAmount::from_parts(-2_500, 0).expect("USD pool balance"),
+        );
+        let eur_pool_line = trust_line_entry_iou(
+            issuer,
+            amm_account,
+            eur.currency,
+            IOUAmount::from_parts(-3_125, 0).expect("EUR pool balance"),
+        );
+        let mut ledger = empty_ledger(vec![
+            account_root(issuer, 0, lsfAllowTrustLineClawback),
+            account_root(holder, 0, 0),
+            account_root(amm_account, 0, 0),
+            owner_dir_root_with_children(
+                amm_account,
+                vec![
+                    *amm.key(),
+                    *lp_line.key(),
+                    *usd_pool_line.key(),
+                    *eur_pool_line.key(),
+                ],
+            ),
+            amm,
+            lp_line,
+            usd_pool_line,
+            eur_pool_line,
+            trust_line_entry_iou(
+                issuer,
+                holder,
+                usd.currency,
+                IOUAmount::from_parts(0, 0).expect("USD holder balance"),
+            ),
+            trust_line_entry_iou(
+                issuer,
+                holder,
+                eur.currency,
+                IOUAmount::from_parts(0, 0).expect("EUR holder balance"),
+            ),
+        ]);
+        let mut features = vec![protocol::feature_id("fixAMMv1_3")];
+        if rounding_enabled {
+            features.push(protocol::feature_id("fixAMMClawbackRounding"));
+        }
+        ledger.set_rules(protocol::Rules::new(features));
+        ledger
+    };
+
+    let clawback = STTx::new(TxType::AMM_CLAWBACK, |tx| {
+        tx.set_account_id(sf("sfAccount"), issuer);
+        tx.set_account_id(sf("sfHolder"), holder);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            STIssue::new_with_asset(sf("sfAsset"), Asset::Issue(usd)),
+        );
+        tx.set_field_issue(
+            sf("sfAsset2"),
+            STIssue::new_with_asset(sf("sfAsset2"), Asset::Issue(eur)),
+        );
+        tx.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_iou_amount(
+                sf("sfAmount"),
+                IOUAmount::from_parts(1, 0).expect("one USD"),
+                usd,
+            ),
+        );
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    let amm_keylet = protocol::keylet::amm(Asset::Issue(usd), Asset::Issue(eur));
+
+    for (rounding_enabled, expected_lp) in [
+        (
+            false,
+            IOUAmount::from_parts(2_793_966_937_885_987, -12).expect("legacy LP"),
+        ),
+        (
+            true,
+            IOUAmount::from_parts(2_793_966_937_885_988, -12).expect("amended LP"),
+        ),
+    ] {
+        let mut view = ApplyViewImpl::new(Arc::new(build(rounding_enabled)), ApplyFlags::NONE);
+        assert_eq!(
+            handle_real_dispatch(&mut view, &clawback, TxType::AMM_CLAWBACK, None),
+            Ter::TES_SUCCESS
+        );
+        let amm = view
+            .read(amm_keylet)
+            .expect("AMM read")
+            .expect("AMM remains after partial clawback");
+        assert_eq!(
+            amm.get_field_amount(sf("sfLPTokenBalance")).iou(),
+            expected_lp
+        );
+    }
 }
 
 #[test]
@@ -2054,6 +2423,94 @@ fn check_cash_transfers_mpt_without_requiring_dex_trading() {
 }
 
 #[test]
+fn fix_mpt_delivered_amount_records_actual_partial_mpt_delivery_only_when_enabled() {
+    let source = sample_account(0xDA);
+    let destination = sample_account(0xDB);
+    let issuer = sample_account(0xDC);
+    let mpt_id = share_id_for(issuer, 1);
+    let mpt_issue = MPTIssue::new(mpt_id);
+    let requested_amount =
+        STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(1_000), mpt_issue);
+    let expected_delivery =
+        STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(800), mpt_issue);
+
+    let expected_with_send_max =
+        STAmount::from_mpt_amount(sf("sfAmount"), MPTAmount::from_value(960), mpt_issue);
+    let partial_payment_cases = [
+        (None, expected_delivery),
+        (
+            Some(STAmount::from_mpt_amount(
+                sf("sfSendMax"),
+                MPTAmount::from_value(1_200),
+                mpt_issue,
+            )),
+            expected_with_send_max,
+        ),
+    ];
+
+    for (send_max, expected_delivery) in partial_payment_cases {
+        for amendment_enabled in [false, true] {
+            let mut issuance = mpt_issuance_entry_with_transfer_fee(
+                issuer,
+                1,
+                10_000,
+                protocol::lsfMPTCanTransfer,
+                25_000,
+            );
+            issuance.set_field_u64(sf("sfOutstandingAmount"), 10_000);
+            let mut ledger = empty_ledger(vec![
+                account_root_with_balance(source, 1, 0, 1_000_000_000),
+                account_root_with_balance(destination, 0, 0, 1_000_000_000),
+                account_root(issuer, 1, 0),
+                issuance,
+                mptoken_entry(source, mpt_id, 10_000),
+            ]);
+            if amendment_enabled {
+                ledger.set_rules(protocol::Rules::new([protocol::fix_mpt_delivered_amount()]));
+            }
+            let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+            let tx = STTx::new(TxType::PAYMENT, |object| {
+                object.set_account_id(sf("sfAccount"), source);
+                object.set_account_id(sf("sfDestination"), destination);
+                object.set_field_amount(sf("sfAmount"), requested_amount.clone());
+                if let Some(send_max) = send_max.clone() {
+                    object.set_field_amount(sf("sfSendMax"), send_max);
+                }
+                object.set_field_u32(sf("sfFlags"), 0x0002_0000); // tfPartialPayment
+                object.set_field_amount(
+                    sf("sfFee"),
+                    STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+                );
+                object.set_field_u32(sf("sfSequence"), 1);
+            });
+
+            let (result, delivered_amount) = apply_submit_transactor_shell_with_delivered_amount(
+                &mut view,
+                &tx,
+                TxType::PAYMENT,
+            );
+            assert_eq!(result, Ter::TES_SUCCESS);
+            assert_eq!(
+                delivered_amount,
+                amendment_enabled.then_some(expected_delivery.clone()),
+                "fixMPTDeliveredAmount must record the net MPT delivery only when enabled"
+            );
+
+            let mut meta = TxMeta::new(tx.get_transaction_id(), 1);
+            meta.set_delivered_amount(delivered_amount);
+            let mut serializer = Serializer::default();
+            meta.add_raw(&mut serializer, result, 0);
+            let reparsed = TxMeta::from_raw(tx.get_transaction_id(), 1, serializer.data());
+            assert_eq!(
+                reparsed.get_delivered_amount(),
+                amendment_enabled.then_some(&expected_delivery),
+                "sfDeliveredAmount presence must follow the amendment gate"
+            );
+        }
+    }
+}
+
+#[test]
 fn payment_transfers_mpt_without_rewriting_issue() {
     let source = sample_account(0xD7);
     let destination = sample_account(0xD8);
@@ -2768,6 +3225,476 @@ fn managed_loan_entry(
         asset_number(asset, 0),
     );
     entry
+}
+
+#[test]
+fn signer_list_set_owner_tracks_fix_include_keylet_fields() {
+    let account = sample_account(0x12);
+    let signer = sample_account(0x13);
+    let tx = signer_list_set_tx(account, 1, &[(signer, 1)]);
+
+    let legacy_ledger = empty_ledger(vec![account_root(account, 0, 0)]);
+    let mut legacy_view = ApplyViewImpl::new(Arc::new(legacy_ledger), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut legacy_view, &tx, TxType::SIGNER_LIST_SET, None),
+        Ter::TES_SUCCESS
+    );
+    let legacy = legacy_view
+        .read(signers_keylet(raw_account_id(account)))
+        .expect("legacy signer list read")
+        .expect("legacy signer list exists");
+    assert!(!legacy.is_field_present(sf("sfOwner")));
+
+    let mut amended_ledger = empty_ledger(vec![account_root(account, 0, 0)]);
+    amended_ledger.set_rules(protocol::Rules::new([protocol::feature_id(
+        "fixIncludeKeyletFields",
+    )]));
+    let mut amended_view = ApplyViewImpl::new(Arc::new(amended_ledger), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut amended_view, &tx, TxType::SIGNER_LIST_SET, None),
+        Ter::TES_SUCCESS
+    );
+    let amended = amended_view
+        .read(signers_keylet(raw_account_id(account)))
+        .expect("amended signer list read")
+        .expect("amended signer list exists");
+    assert_eq!(amended.get_account_id(sf("sfOwner")), account);
+}
+
+#[test]
+fn escrow_create_sequence_tracks_fix_include_keylet_fields() {
+    let account = sample_account(0x14);
+    let destination = sample_account(0x15);
+    let sequence = 9;
+    let tx = escrow_create_tx(account, destination, sequence);
+    let keylet = protocol::escrow_keylet(raw_account_id(account), sequence);
+
+    let legacy_ledger = empty_ledger(vec![
+        account_root(account, 0, 0),
+        account_root(destination, 0, 0),
+    ]);
+    let mut legacy_view = ApplyViewImpl::new(Arc::new(legacy_ledger), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut legacy_view, &tx, TxType::ESCROW_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        !legacy_view
+            .read(keylet.clone())
+            .expect("legacy escrow read")
+            .expect("legacy escrow exists")
+            .is_field_present(sf("sfSequence"))
+    );
+
+    let mut amended_ledger = empty_ledger(vec![
+        account_root(account, 0, 0),
+        account_root(destination, 0, 0),
+    ]);
+    amended_ledger.set_rules(protocol::Rules::new([protocol::feature_id(
+        "fixIncludeKeyletFields",
+    )]));
+    let mut amended_view = ApplyViewImpl::new(Arc::new(amended_ledger), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut amended_view, &tx, TxType::ESCROW_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        amended_view
+            .read(keylet)
+            .expect("amended escrow read")
+            .expect("amended escrow exists")
+            .get_field_u32(sf("sfSequence")),
+        sequence
+    );
+}
+
+#[test]
+fn paychan_create_sequence_uses_ticket_value_only_with_fix_include_keylet_fields() {
+    let account = sample_account(0x16);
+    let destination = sample_account(0x17);
+    let ticket_sequence = 11;
+    let tx = paychan_create_ticket_tx(account, destination, ticket_sequence);
+    let keylet = protocol::pay_channel_keylet(
+        raw_account_id(account),
+        raw_account_id(destination),
+        ticket_sequence,
+    );
+
+    let legacy_ledger = empty_ledger(vec![
+        account_root(account, 0, 0),
+        account_root(destination, 0, 0),
+    ]);
+    let mut legacy_view = ApplyViewImpl::new(Arc::new(legacy_ledger), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut legacy_view, &tx, TxType::PAYCHAN_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        !legacy_view
+            .read(keylet.clone())
+            .expect("legacy pay channel read")
+            .expect("legacy pay channel exists")
+            .is_field_present(sf("sfSequence"))
+    );
+
+    let mut amended_ledger = empty_ledger(vec![
+        account_root(account, 0, 0),
+        account_root(destination, 0, 0),
+    ]);
+    amended_ledger.set_rules(protocol::Rules::new([protocol::feature_id(
+        "fixIncludeKeyletFields",
+    )]));
+    let mut amended_view = ApplyViewImpl::new(Arc::new(amended_ledger), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut amended_view, &tx, TxType::PAYCHAN_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        amended_view
+            .read(keylet)
+            .expect("amended pay channel read")
+            .expect("amended pay channel exists")
+            .get_field_u32(sf("sfSequence")),
+        ticket_sequence
+    );
+}
+
+#[test]
+fn paychan_create_sequence_uses_normal_sequence_only_with_fix_include_keylet_fields() {
+    let account = sample_account(0x1A);
+    let destination = sample_account(0x1B);
+    let sequence = 9;
+    let tx = STTx::new(TxType::PAYCHAN_CREATE, |object| {
+        object.set_account_id(sf("sfAccount"), account);
+        object.set_account_id(sf("sfDestination"), destination);
+        object.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(1_000)),
+        );
+        object.set_field_u32(sf("sfSettleDelay"), 60);
+        object.set_field_vl(sf("sfPublicKey"), &[4; 33]);
+        object.set_field_u32(sf("sfSequence"), sequence);
+        object.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+    });
+    let keylet = protocol::pay_channel_keylet(
+        raw_account_id(account),
+        raw_account_id(destination),
+        sequence,
+    );
+
+    for amendment_enabled in [false, true] {
+        let mut ledger = empty_ledger(vec![
+            account_root(account, 0, 0),
+            account_root(destination, 0, 0),
+        ]);
+        if amendment_enabled {
+            ledger.set_rules(protocol::Rules::new([protocol::feature_id(
+                "fixIncludeKeyletFields",
+            )]));
+        }
+        let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+        assert_eq!(
+            handle_real_dispatch(&mut view, &tx, TxType::PAYCHAN_CREATE, None),
+            Ter::TES_SUCCESS
+        );
+        let channel = view
+            .read(keylet.clone())
+            .expect("pay channel read")
+            .expect("pay channel exists");
+        assert_eq!(
+            channel.is_field_present(sf("sfSequence")),
+            amendment_enabled,
+            "PayChan sfSequence must be feature-gated for ordinary Sequence transactions"
+        );
+        if amendment_enabled {
+            assert_eq!(channel.get_field_u32(sf("sfSequence")), sequence);
+        }
+    }
+}
+
+#[test]
+fn oracle_set_keylet_fields_and_creation_order_track_amendments() {
+    let account = sample_account(0x18);
+    let document_id = 7;
+    let high_currency = Currency::from_array([0xFF; 20]);
+    let high_currency_text = protocol::currency_to_string(high_currency);
+    let input_series = [
+        oracle_price_data_with_currencies(currency_from_string("XRP"), high_currency, 742, 2),
+        oracle_price_data("XRP", "USD", 711, 2),
+    ];
+    let create = oracle_set_tx(account, document_id, 1_000, &input_series, true);
+    let update = oracle_set_tx(account, document_id, 1_001, &input_series, false);
+    let keylet = protocol::oracle_keylet(raw_account_id(account), document_id);
+
+    let legacy_ledger = empty_ledger(vec![account_root(account, 0, 0)]);
+    let mut legacy_view = ApplyViewImpl::new(Arc::new(legacy_ledger), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut legacy_view, &create, TxType::ORACLE_SET, None),
+        Ter::TES_SUCCESS
+    );
+    let legacy_created = legacy_view
+        .read(keylet.clone())
+        .expect("legacy oracle read")
+        .expect("legacy oracle exists");
+    assert!(!legacy_created.is_field_present(sf("sfOracleDocumentID")));
+    let legacy_created_series = legacy_created.get_field_array(sf("sfPriceDataSeries"));
+    assert_eq!(
+        oracle_pair(legacy_created_series.get(0).expect("first legacy pair")),
+        ("XRP".to_owned(), high_currency_text.clone())
+    );
+    assert_eq!(
+        oracle_pair(legacy_created_series.get(1).expect("second legacy pair")),
+        ("XRP".to_owned(), "USD".to_owned())
+    );
+
+    assert_eq!(
+        handle_real_dispatch(&mut legacy_view, &update, TxType::ORACLE_SET, None),
+        Ter::TES_SUCCESS
+    );
+    let legacy_updated = legacy_view
+        .read(keylet.clone())
+        .expect("updated legacy oracle read")
+        .expect("updated legacy oracle exists");
+    assert!(!legacy_updated.is_field_present(sf("sfOracleDocumentID")));
+    let legacy_updated_series = legacy_updated.get_field_array(sf("sfPriceDataSeries"));
+    assert_eq!(
+        oracle_pair(
+            legacy_updated_series
+                .get(0)
+                .expect("first updated legacy pair")
+        ),
+        ("XRP".to_owned(), "USD".to_owned())
+    );
+    assert_eq!(
+        oracle_pair(
+            legacy_updated_series
+                .get(1)
+                .expect("second updated legacy pair")
+        ),
+        ("XRP".to_owned(), high_currency_text.clone())
+    );
+
+    let legacy_for_backfill =
+        STLedgerEntry::from_stobject(legacy_updated.clone_as_object(), *legacy_updated.key());
+    let mut backfill_ledger = empty_ledger(vec![account_root(account, 1, 0), legacy_for_backfill]);
+    backfill_ledger.set_rules(protocol::Rules::new([protocol::feature_id(
+        "fixIncludeKeyletFields",
+    )]));
+    let mut backfill_view = ApplyViewImpl::new(Arc::new(backfill_ledger), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut backfill_view, &update, TxType::ORACLE_SET, None),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        backfill_view
+            .read(keylet.clone())
+            .expect("backfilled oracle read")
+            .expect("backfilled oracle exists")
+            .get_field_u32(sf("sfOracleDocumentID")),
+        document_id
+    );
+
+    let mut amended_ledger = empty_ledger(vec![account_root(account, 0, 0)]);
+    amended_ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("fixIncludeKeyletFields"),
+        protocol::feature_id("fixPriceOracleOrder"),
+    ]));
+    let mut amended_view = ApplyViewImpl::new(Arc::new(amended_ledger), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut amended_view, &create, TxType::ORACLE_SET, None),
+        Ter::TES_SUCCESS
+    );
+    let amended_created = amended_view
+        .read(keylet.clone())
+        .expect("amended oracle read")
+        .expect("amended oracle exists");
+    assert_eq!(
+        amended_created.get_field_u32(sf("sfOracleDocumentID")),
+        document_id
+    );
+    let amended_created_series = amended_created.get_field_array(sf("sfPriceDataSeries"));
+    assert_eq!(
+        oracle_pair(amended_created_series.get(0).expect("first amended pair")),
+        ("XRP".to_owned(), "USD".to_owned())
+    );
+    assert_eq!(
+        oracle_pair(amended_created_series.get(1).expect("second amended pair")),
+        ("XRP".to_owned(), high_currency_text.clone())
+    );
+
+    assert_eq!(
+        handle_real_dispatch(&mut amended_view, &update, TxType::ORACLE_SET, None),
+        Ter::TES_SUCCESS
+    );
+    let amended_updated = amended_view
+        .read(keylet)
+        .expect("updated amended oracle read")
+        .expect("updated amended oracle exists");
+    assert_eq!(
+        amended_updated.get_field_u32(sf("sfOracleDocumentID")),
+        document_id
+    );
+    let amended_updated_series = amended_updated.get_field_array(sf("sfPriceDataSeries"));
+    assert_eq!(
+        oracle_pair(
+            amended_updated_series
+                .get(0)
+                .expect("first updated amended pair")
+        ),
+        ("XRP".to_owned(), "USD".to_owned())
+    );
+    assert_eq!(
+        oracle_pair(
+            amended_updated_series
+                .get(1)
+                .expect("second updated amended pair")
+        ),
+        ("XRP".to_owned(), high_currency_text)
+    );
+}
+
+#[test]
+fn oracle_price_series_reserve_tracks_five_to_six_and_delete() {
+    let account = sample_account(0x1C);
+    let document_id = 19;
+    let oracle_keylet = protocol::oracle_keylet(raw_account_id(account), document_id);
+    let owner_keylet = owner_dir_keylet(raw_account_id(account));
+    let five_pairs = [
+        oracle_price_data("XRP", "USD", 1, 0),
+        oracle_price_data("EUR", "USD", 2, 0),
+        oracle_price_data("GBP", "USD", 3, 0),
+        oracle_price_data("JPY", "USD", 4, 0),
+        oracle_price_data("AUD", "USD", 5, 0),
+    ];
+    let sixth_pair = oracle_price_data("CAD", "USD", 6, 0);
+    let mut remove_sixth_pair = sixth_pair.clone();
+    remove_sixth_pair.make_field_absent(sf("sfAssetPrice"));
+
+    let mut view = ApplyViewImpl::new(
+        Arc::new(empty_ledger(vec![account_root(account, 0, 0)])),
+        ApplyFlags::NONE,
+    );
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &oracle_set_tx(account, document_id, 1, &five_pairs, true),
+            TxType::ORACLE_SET,
+            None,
+        ),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        view.read(protocol::account_keylet(raw_account_id(account)))
+            .expect("owner account read")
+            .expect("owner account exists")
+            .get_field_u32(sf("sfOwnerCount")),
+        1
+    );
+
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &oracle_set_tx(account, document_id, 2, &[sixth_pair.clone()], false),
+            TxType::ORACLE_SET,
+            None,
+        ),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        view.read(oracle_keylet.clone())
+            .expect("oracle read")
+            .expect("oracle exists")
+            .get_field_array(sf("sfPriceDataSeries"))
+            .len(),
+        6
+    );
+    assert_eq!(
+        view.read(protocol::account_keylet(raw_account_id(account)))
+            .expect("owner account read")
+            .expect("owner account exists")
+            .get_field_u32(sf("sfOwnerCount")),
+        2
+    );
+
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &oracle_set_tx(account, document_id, 3, &[remove_sixth_pair], false),
+            TxType::ORACLE_SET,
+            None,
+        ),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        view.read(oracle_keylet.clone())
+            .expect("oracle read")
+            .expect("oracle exists")
+            .get_field_array(sf("sfPriceDataSeries"))
+            .len(),
+        5
+    );
+    assert_eq!(
+        view.read(protocol::account_keylet(raw_account_id(account)))
+            .expect("owner account read")
+            .expect("owner account exists")
+            .get_field_u32(sf("sfOwnerCount")),
+        1
+    );
+
+    assert_eq!(
+        handle_real_dispatch(
+            &mut view,
+            &oracle_set_tx(account, document_id, 4, &[sixth_pair], false),
+            TxType::ORACLE_SET,
+            None,
+        ),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        view.read(protocol::account_keylet(raw_account_id(account)))
+            .expect("owner account read")
+            .expect("owner account exists")
+            .get_field_u32(sf("sfOwnerCount")),
+        2
+    );
+
+    let delete = STTx::new(TxType::ORACLE_DELETE, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_u32(sf("sfOracleDocumentID"), document_id);
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 5);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut view, &delete, TxType::ORACLE_DELETE, None),
+        Ter::TES_SUCCESS
+    );
+    assert!(
+        view.read(oracle_keylet.clone())
+            .expect("deleted oracle read")
+            .is_none()
+    );
+    assert_eq!(
+        view.read(protocol::account_keylet(raw_account_id(account)))
+            .expect("owner account read")
+            .expect("owner account exists")
+            .get_field_u32(sf("sfOwnerCount")),
+        0
+    );
+    if let Some(owner_dir) = view.read(owner_keylet).expect("owner directory read") {
+        assert!(
+            !owner_dir
+                .get_field_v256(sf("sfIndexes"))
+                .value()
+                .contains(&oracle_keylet.key),
+            "OracleDelete must remove the six-pair oracle from its owner directory"
+        );
+    }
 }
 
 #[test]

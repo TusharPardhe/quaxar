@@ -6,7 +6,7 @@
 //! - amount asset mismatch,
 //! - transferability failure,
 //! - invalid withdrawal policy,
-//! - the post-`fixSecurity3_1_3` share-denominated conversion branch,
+//! - the post-`fixCleanup3_1_3` share-denominated conversion branch,
 //! - and the pre-amendment or asset-denominated direct `canWithdraw(...)`
 //!   branch.
 
@@ -17,7 +17,7 @@ pub struct VaultWithdrawPreclaimFrontFacts {
     pub vault_exists: bool,
     pub amount_asset_matches_vault_asset_or_share: bool,
     pub withdrawal_policy_is_first_come_first_serve: bool,
-    pub fix_security_3_1_3_enabled: bool,
+    pub fix_cleanup_3_1_3_enabled: bool,
     pub amount_asset_is_vault_share: bool,
     pub share_issuance_exists: bool,
 }
@@ -58,7 +58,7 @@ where
         return Ter::TEF_INTERNAL;
     }
 
-    if facts.fix_security_3_1_3_enabled && facts.amount_asset_is_vault_share {
+    if facts.fix_cleanup_3_1_3_enabled && facts.amount_asset_is_vault_share {
         if !facts.share_issuance_exists {
             return Ter::TEF_INTERNAL;
         }
@@ -186,7 +186,7 @@ mod tests {
                 vault_exists: true,
                 amount_asset_matches_vault_asset_or_share: true,
                 withdrawal_policy_is_first_come_first_serve: true,
-                fix_security_3_1_3_enabled: true,
+                fix_cleanup_3_1_3_enabled: true,
                 amount_asset_is_vault_share: true,
                 ..VaultWithdrawPreclaimFrontFacts::default()
             },
@@ -209,7 +209,7 @@ mod tests {
                 vault_exists: true,
                 amount_asset_matches_vault_asset_or_share: true,
                 withdrawal_policy_is_first_come_first_serve: true,
-                fix_security_3_1_3_enabled: true,
+                fix_cleanup_3_1_3_enabled: true,
                 amount_asset_is_vault_share: true,
                 share_issuance_exists: true,
             },
@@ -222,7 +222,7 @@ mod tests {
                 vault_exists: true,
                 amount_asset_matches_vault_asset_or_share: true,
                 withdrawal_policy_is_first_come_first_serve: true,
-                fix_security_3_1_3_enabled: true,
+                fix_cleanup_3_1_3_enabled: true,
                 amount_asset_is_vault_share: true,
                 share_issuance_exists: true,
             },
@@ -235,7 +235,7 @@ mod tests {
                 vault_exists: true,
                 amount_asset_matches_vault_asset_or_share: true,
                 withdrawal_policy_is_first_come_first_serve: true,
-                fix_security_3_1_3_enabled: true,
+                fix_cleanup_3_1_3_enabled: true,
                 amount_asset_is_vault_share: true,
                 share_issuance_exists: true,
             },
@@ -259,7 +259,7 @@ mod tests {
                 vault_exists: true,
                 amount_asset_matches_vault_asset_or_share: true,
                 withdrawal_policy_is_first_come_first_serve: true,
-                fix_security_3_1_3_enabled: true,
+                fix_cleanup_3_1_3_enabled: true,
                 ..VaultWithdrawPreclaimFrontFacts::default()
             },
             || Ter::TES_SUCCESS,
@@ -275,6 +275,36 @@ mod tests {
     }
 
     #[test]
+    fn vault_withdraw_share_limit_branch_tracks_fix_cleanup_3_1_3() {
+        let common = VaultWithdrawPreclaimFrontFacts {
+            vault_exists: true,
+            amount_asset_matches_vault_asset_or_share: true,
+            withdrawal_policy_is_first_come_first_serve: true,
+            amount_asset_is_vault_share: true,
+            share_issuance_exists: true,
+            ..VaultWithdrawPreclaimFrontFacts::default()
+        };
+        let legacy = run_vault_withdraw_preclaim_front(
+            common,
+            || Ter::TES_SUCCESS,
+            || VaultWithdrawShareBranchResult::Success,
+            || Ter::TEC_NO_PERMISSION,
+        );
+        let fixed = run_vault_withdraw_preclaim_front(
+            VaultWithdrawPreclaimFrontFacts {
+                fix_cleanup_3_1_3_enabled: true,
+                ..common
+            },
+            || Ter::TES_SUCCESS,
+            || VaultWithdrawShareBranchResult::Success,
+            || Ter::TEC_NO_PERMISSION,
+        );
+
+        assert_eq!(legacy, Ter::TEC_NO_PERMISSION);
+        assert_eq!(fixed, Ter::TES_SUCCESS);
+    }
+
+    #[test]
     fn vault_withdraw_preclaim_front_runs_share_branch_in_current_on_success() {
         let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
 
@@ -283,7 +313,7 @@ mod tests {
                 vault_exists: true,
                 amount_asset_matches_vault_asset_or_share: true,
                 withdrawal_policy_is_first_come_first_serve: true,
-                fix_security_3_1_3_enabled: true,
+                fix_cleanup_3_1_3_enabled: true,
                 amount_asset_is_vault_share: true,
                 share_issuance_exists: true,
             },

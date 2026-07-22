@@ -283,7 +283,12 @@ pub fn verify_valid_domain(
         {
             found_expired = true;
             let result = delete_sle(view, sle_cred)?;
-            if !protocol::is_tes_success(result) {
+            // Before fixCleanup3_1_3, removeExpired reported the expired
+            // credential even when deletion failed. Preserve that replay
+            // behavior; the amendment makes the deletion failure observable.
+            if view.rules().enabled(&protocol::fix_cleanup_3_1_3())
+                && !protocol::is_tes_success(result)
+            {
                 return Ok(result);
             }
         }
@@ -328,7 +333,11 @@ pub fn verify_deposit_preauth(
             {
                 found_expired = true;
                 let result = delete_sle(view, sle_cred)?;
-                if !protocol::is_tes_success(result) {
+                // See verify_valid_domain: deletion errors were ignored until
+                // fixCleanup3_1_3, even though the credential was expired.
+                if view.rules().enabled(&protocol::fix_cleanup_3_1_3())
+                    && !protocol::is_tes_success(result)
+                {
                     return Ok(result);
                 }
             }

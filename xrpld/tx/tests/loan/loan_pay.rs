@@ -41,7 +41,7 @@ fn base() -> LoanPayPreclaimFacts {
         submitter_is_borrower: true,
         tx_requests_overpayment: false,
         loan_allows_overpayment: true,
-        security_fix_3_1_3_enabled: true,
+        fix_cleanup_3_1_3_enabled: true,
         principal_outstanding_is_zero: false,
         payment_remaining_is_zero: false,
         broker_exists: true,
@@ -155,13 +155,13 @@ fn tx_loan_pay_preclaim_preserves_legacy_and_fixed_overpayment_modes() {
     let legacy = run_loan_pay_preclaim(LoanPayPreclaimFacts {
         tx_requests_overpayment: true,
         loan_allows_overpayment: false,
-        security_fix_3_1_3_enabled: false,
+        fix_cleanup_3_1_3_enabled: false,
         ..base()
     });
     let fixed = run_loan_pay_preclaim(LoanPayPreclaimFacts {
         tx_requests_overpayment: true,
         loan_allows_overpayment: false,
-        security_fix_3_1_3_enabled: true,
+        fix_cleanup_3_1_3_enabled: true,
         ..base()
     });
 

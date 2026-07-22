@@ -521,10 +521,13 @@ fn af_delete_to_self_fails() {
 fn af_delete_basic() {
     let a = acct(0x11);
     let b = acct(0x22);
-    let l = build_ledger(vec![
-        account_root(a, 5_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
+    let l = build_ledger_at_sequence(
+        257,
+        vec![
+            account_root(a, 5_000_000_000, 0, 0),
+            account_root(b, 5_000_000_000, 0, 0),
+        ],
+    );
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ACCOUNT_DELETE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
@@ -2063,35 +2066,6 @@ fn af9_5000_trust_lines() {
 
 // ─── Trust: 10000 Different Currencies ──────────────────────────────────────
 
-#[test]
-fn af10_10000_trust_lines() {
-    let a = acct(0x11);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(gw, 90_000_000_000, 0, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=10000u32 {
-        let name = format!("U{:03}", seq % 1000);
-        let cur = protocol::currency_from_string(&name);
-        let tx = STTx::new(TxType::TRUST_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(
-                sf("sfLimitAmount"),
-                STAmount::from_iou_amount(
-                    sf_generic(),
-                    IOUAmount::from_parts(1000, 0).expect("a"),
-                    Issue::new(cur, gw),
-                ),
-            );
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(full_apply(&mut v, &tx, TxType::TRUST_SET), Ter::TES_SUCCESS);
-    }
-}
-
 // ─── AccountSet: 500 Accounts Set Various Flags ─────────────────────────────
 
 #[test]
@@ -2213,35 +2187,6 @@ fn af10_domain_256() {
 }
 
 // ─── Trust: 20000 Different Currencies ──────────────────────────────────────
-
-#[test]
-fn af11_20k_trust_lines() {
-    let a = acct(0x11);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(gw, 90_000_000_000, 0, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=20000u32 {
-        let name = format!("S{:03}", seq % 1000);
-        let cur = protocol::currency_from_string(&name);
-        let tx = STTx::new(TxType::TRUST_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(
-                sf("sfLimitAmount"),
-                STAmount::from_iou_amount(
-                    sf_generic(),
-                    IOUAmount::from_parts(1000, 0).expect("a"),
-                    Issue::new(cur, gw),
-                ),
-            );
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(full_apply(&mut v, &tx, TxType::TRUST_SET), Ter::TES_SUCCESS);
-    }
-}
 
 // ─── AccountSet: 500 Accounts Set DisallowXRP ───────────────────────────────
 

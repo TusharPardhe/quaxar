@@ -12,12 +12,53 @@
 //! - Reserve checks
 //! - Pseudo-account rejection
 
+use std::{cell::RefCell, sync::Arc};
+
 use basics::math::base_uint::Uint160;
 use protocol::{
     AccountID, Asset, PARITY_RATE, STAmount, STLedgerEntry, STTx, Ter, XRPAmount, divide_rate,
     get_field_by_symbol, is_ter_retry, is_tes_success, multiply_rate,
 };
-use std::sync::Arc;
+thread_local! {
+    static MPT_DELIVERED_AMOUNT_CAPTURES: RefCell<Vec<Option<STAmount>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Scoped equivalent of rippled's `ApplyContext::deliver` handoff for direct
+/// MPT payment metadata. Transaction-shell callers that do not construct
+/// metadata safely discard the capture when their application returns.
+pub struct MptDeliveredAmountCapture {
+    active: bool,
+}
+
+impl MptDeliveredAmountCapture {
+    pub fn new() -> Self {
+        MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| captures.borrow_mut().push(None));
+        Self { active: true }
+    }
+
+    pub fn finish(mut self) -> Option<STAmount> {
+        self.active = false;
+        MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| captures.borrow_mut().pop().flatten())
+    }
+}
+
+impl Drop for MptDeliveredAmountCapture {
+    fn drop(&mut self) {
+        if self.active {
+            MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| {
+                let _ = captures.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+fn record_mpt_delivered_amount(amount: STAmount) {
+    MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| {
+        if let Some(delivered_amount) = captures.borrow_mut().last_mut() {
+            *delivered_amount = Some(amount);
+        }
+    });
+}
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
@@ -341,6 +382,14 @@ fn do_direct_mpt_payment<V: ledger::ApplyView>(
         ledger::ripple_state_helpers::account_send(view, account, dst_account_id, &amount_deliver);
     if matches!(result, Ter::TEC_INSUFFICIENT_FUNDS | Ter::TEC_PATH_DRY) {
         result = Ter::TEC_PATH_PARTIAL;
+    }
+    if is_tes_success(result)
+        && view.rules().enabled(&protocol::fix_mpt_delivered_amount())
+        && amount_deliver != *dst_amount
+    {
+        // Matches Payment.cpp: direct MPT payments use the actual net amount,
+        // not the requested destination amount, when the amendment is active.
+        record_mpt_delivered_amount(amount_deliver);
     }
     result
 }

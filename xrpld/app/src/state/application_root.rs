@@ -1017,8 +1017,24 @@ pub fn apply_submit_transactor_shell<V: ledger::ApplyView>(
     tx: &STTx,
     txn_type: TxType,
 ) -> Ter {
+    apply_submit_transactor_shell_with_delivered_amount(view, tx, txn_type).0
+}
+
+/// Applies a transaction and returns the actual MPT payment delivery recorded
+/// by the payment transactor for canonical metadata construction.
+pub fn apply_submit_transactor_shell_with_delivered_amount<V: ledger::ApplyView>(
+    view: &mut V,
+    tx: &STTx,
+    txn_type: TxType,
+) -> (Ter, Option<STAmount>) {
     let rules = view.rules();
     tx::with_transaction_apply_runtime(&rules, || {
+        // ApplyContext owns DeliveredAmount in rippled. Scope its Rust
+        // equivalent to this outer Payment only so batch inner payments cannot
+        // populate their parent Batch metadata.
+        let delivered_amount_capture = (txn_type == TxType::PAYMENT)
+            .then(crate::state::payment::MptDeliveredAmountCapture::new);
+
         // Match rippled's ApplyContext: every mutation, including the common
         // sequence/ticket and fee preamble, stays in a per-transaction view
         // until the final TER says the transaction is applied.
@@ -1027,7 +1043,10 @@ pub fn apply_submit_transactor_shell<V: ledger::ApplyView>(
         if is_tes_success(result) || is_tec_claim(result) {
             let _ = tx_view.apply();
         }
-        result
+        let delivered_amount = delivered_amount_capture
+            .map(crate::state::payment::MptDeliveredAmountCapture::finish)
+            .flatten();
+        (result, delivered_amount)
     })
 }
 
@@ -4982,10 +5001,15 @@ impl ApplicationRoot {
             let txn_type = st_tx.get_txn_type();
             // Use the full transactor lifecycle (preflight + sequence + fee + doApply)
             // matching what the open ledger does during submit.
-            let result = apply_submit_transactor_shell(&mut state_view, st_tx, txn_type);
+            let (result, delivered_amount) = apply_submit_transactor_shell_with_delivered_amount(
+                &mut state_view,
+                st_tx,
+                txn_type,
+            );
             let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
             if applied {
                 let mut meta = protocol::TxMeta::new(st_tx.get_transaction_id(), closed_seq);
+                meta.set_delivered_amount(delivered_amount);
                 let mut serializer = protocol::Serializer::default();
                 meta.add_raw(&mut serializer, result, accepted_entries.len() as u32);
 
@@ -5206,7 +5230,8 @@ impl ApplicationRoot {
             // earlier version of this function did) skipped that preamble
             // entirely, so successfully-applied transactions never
             // incremented their sender's sequence number.
-            let result = apply_submit_transactor_shell(&mut *view, sttx, txn_type);
+            let (result, delivered_amount) =
+                apply_submit_transactor_shell_with_delivered_amount(&mut *view, sttx, txn_type);
             drop(view);
             let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
             if !applied {
@@ -5222,6 +5247,7 @@ impl ApplicationRoot {
             );
 
             let mut meta = protocol::TxMeta::new(transaction_id, closed_seq);
+            meta.set_delivered_amount(delivered_amount);
             let mut serializer = protocol::Serializer::default();
             meta.add_raw(&mut serializer, result, index as u32);
 

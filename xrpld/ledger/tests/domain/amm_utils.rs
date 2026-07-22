@@ -412,3 +412,62 @@ fn is_only_liquidity_provider_matches_owner_dir_shape() {
     assert!(result.has_value());
     assert!(!*result.value());
 }
+
+#[test]
+fn is_only_liquidity_provider_accepts_two_mpt_pool_entries() {
+    let amm_account = sample_account(0x85);
+    let lp_account = sample_account(0x86);
+    let amm_issue = issue("LPT", amm_account);
+    let root = owner_root(amm_account);
+    let amm_key = sample_key(0x92);
+    let lp_line = line(lp_account, amm_account, amm_issue.currency).key;
+    let mptoken_entry = |id: basics::base_uint::Uint192| {
+        let keylet = protocol::mptoken_keylet_from_mptid(
+            id,
+            Uint160::from_slice(amm_account.data()).expect("AMM account width"),
+        );
+        let mut entry = STLedgerEntry::from_type_and_key(LedgerEntryType::MPToken, keylet.key);
+        entry.set_account_id(get_field_by_symbol("sfAccount"), amm_account);
+        entry.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), id);
+        entry.set_field_u64(get_field_by_symbol("sfMPTAmount"), 1);
+        (keylet.key, entry.get_serializer().data().to_vec())
+    };
+    let (first_mpt_key, first_mpt) =
+        mptoken_entry(basics::base_uint::Uint192::from_slice(&[0xA3; 24]).expect("first MPT id"));
+    let (second_mpt_key, second_mpt) =
+        mptoken_entry(basics::base_uint::Uint192::from_slice(&[0xA4; 24]).expect("second MPT id"));
+
+    let ledger = build_ledger(
+        LedgerHeader::default(),
+        &[
+            (
+                root.key,
+                directory_page_payload(
+                    root,
+                    0,
+                    &[amm_key, lp_line, first_mpt_key, second_mpt_key],
+                    0,
+                ),
+            ),
+            (
+                amm_key,
+                amm_entry(
+                    amm_account,
+                    amm_key,
+                    issue("USD", sample_account(0x87)),
+                    issue("EUR", sample_account(0x88)),
+                ),
+            ),
+            (
+                lp_line,
+                trustline_entry(lp_account, amm_account, "LPT", 10, 0),
+            ),
+            (first_mpt_key, first_mpt),
+            (second_mpt_key, second_mpt),
+        ],
+    );
+
+    let result = is_only_liquidity_provider(&ledger, amm_issue, lp_account);
+    assert!(result.has_value());
+    assert!(*result.value());
+}

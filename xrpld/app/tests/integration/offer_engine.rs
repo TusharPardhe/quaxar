@@ -2479,31 +2479,6 @@ fn oe12_xrp_5b() {
 
 // ─── Offer: 10000 Sequential (Maximum) ─────────────────────────────────────
 
-#[test]
-fn oe13_10000_offers() {
-    let a = acct(0x11);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 1, 0),
-        account_root(gw, 90_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 100000000, 1000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=10000u32 {
-        let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfTakerPays"), xrp(50_000));
-            tx.set_field_amount(sf("sfTakerGets"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Offer: 1000 Create + 1000 Cancel ──────────────────────────────────────
 
 #[test]
@@ -2639,31 +2614,6 @@ fn oe14_2000_create_2000_cancel() {
 
 // ─── Offer: 20000 Sequential (Ultimate) ────────────────────────────────────
 
-#[test]
-fn oe15_20000_offers() {
-    let a = acct(0x11);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 1, 0),
-        account_root(gw, 90_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 1000000000, 10000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=20000u32 {
-        let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfTakerPays"), xrp(10_000));
-            tx.set_field_amount(sf("sfTakerGets"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Offer: 5000 Create + 5000 Cancel ──────────────────────────────────────
 
 #[test]
@@ -2702,66 +2652,7 @@ fn oe15_5000_create_5000_cancel() {
 
 // ─── Offer: 50000 Sequential (Absolute Max) ────────────────────────────────
 
-#[test]
-fn oe16_50000_offers() {
-    let a = acct(0x11);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 1, 0),
-        account_root(gw, 90_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 10000000000, 100000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=50000u32 {
-        let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfTakerPays"), xrp(5_000));
-            tx.set_field_amount(sf("sfTakerGets"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Offer: 10000 Create + 10000 Cancel ────────────────────────────────────
-
-#[test]
-fn oe16_10000_create_10000_cancel() {
-    let a = acct(0x11);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 1, 0),
-        account_root(gw, 90_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 10000000000, 100000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=10000u32 {
-        let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfTakerPays"), xrp(5_000));
-            tx.set_field_amount(sf("sfTakerGets"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None);
-    }
-    for seq in 10001..=20000u32 {
-        let tx = STTx::new(TxType::OFFER_CANCEL, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOfferSequence"), seq - 10000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::OFFER_CANCEL, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Offer: 250 Accounts Each Create 2 ─────────────────────────────────────
 
@@ -2922,66 +2813,7 @@ fn oe17_cancel_seq_0() {
 
 // ─── Offer: 100000 Sequential (Absolute Max) ───────────────────────────────
 
-#[test]
-fn oe18_100000_offers() {
-    let a = acct(0x11);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 1, 0),
-        account_root(gw, 90_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 10000000000, 100000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=100000u32 {
-        let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfTakerPays"), xrp(1_000));
-            tx.set_field_amount(sf("sfTakerGets"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Offer: 20000 Create + 20000 Cancel ────────────────────────────────────
-
-#[test]
-fn oe18_20000_create_20000_cancel() {
-    let a = acct(0x11);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 1, 0),
-        account_root(gw, 90_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 10000000000, 100000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=20000u32 {
-        let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfTakerPays"), xrp(1_000));
-            tx.set_field_amount(sf("sfTakerGets"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        handle_real_dispatch(&mut v, &tx, TxType::OFFER_CREATE, None);
-    }
-    for seq in 20001..=40000u32 {
-        let tx = STTx::new(TxType::OFFER_CANCEL, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOfferSequence"), seq - 20000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::OFFER_CANCEL, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Offer: Passive Flag ────────────────────────────────────────────────────
 

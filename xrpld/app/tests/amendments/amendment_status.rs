@@ -169,6 +169,18 @@ fn amendment_table_validated_ledger_tracks_first_unsupported_expected_time() {
 }
 
 #[test]
+fn default_amendment_registry_keeps_unproven_public_testnet_fixes_unsupported() {
+    let table = AmendmentStatus::new();
+
+    assert!(!table.is_supported(feature_id("fixCleanup3_1_3")));
+    assert!(!table.is_supported(feature_id("fixIncludeKeyletFields")));
+    assert!(!table.is_supported(feature_id("fixTokenEscrowV1")));
+    assert!(!table.is_supported(feature_id("fixPriceOracleOrder")));
+    assert!(!table.is_supported(feature_id("fixMPTDeliveredAmount")));
+    assert!(!table.is_supported(feature_id("fixAMMClawbackRounding")));
+}
+
+#[test]
 fn default_amendment_registry_marks_current_mainnet_amendments_supported() {
     let table = AmendmentStatus::new();
     let enabled = BTreeSet::from([

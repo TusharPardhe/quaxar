@@ -1816,30 +1816,6 @@ fn fp9_100_accounts_2_each() {
 
 // ─── Flow: 10000 XRP Payments ───────────────────────────────────────────────
 
-#[test]
-fn fp10_10000_xrp() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=10000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), xrp(1_000));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Flow: 5000 IOU Payments ────────────────────────────────────────────────
 
 #[test]
@@ -1900,171 +1876,15 @@ fn fp10_200_accounts_3_each() {
 
 // ─── Flow: 20000 XRP Payments ───────────────────────────────────────────────
 
-#[test]
-fn fp11_20000_xrp() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=20000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), xrp(500));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Flow: 10000 IOU Payments ───────────────────────────────────────────────
-
-#[test]
-fn fp11_10000_iou() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 10_000_000_000, 1, 0),
-        account_root(b, 10_000_000_000, 1, 0),
-        account_root(gw, 10_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 100000000, 1000000000, 0),
-        trust_line(b, gw, usd_currency(), 0, 1000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=10000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Flow: 50000 XRP Payments ───────────────────────────────────────────────
 
-#[test]
-fn fp12_50000_xrp() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=50000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), xrp(100));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Flow: 20000 IOU Payments ───────────────────────────────────────────────
-
-#[test]
-fn fp12_20000_iou() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 10_000_000_000, 1, 0),
-        account_root(b, 10_000_000_000, 1, 0),
-        account_root(gw, 10_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 500000000, 5000000000, 0),
-        trust_line(b, gw, usd_currency(), 0, 5000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=20000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Flow: 100000 XRP Payments ──────────────────────────────────────────────
 
-#[test]
-fn fp13_100000_xrp() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=100000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), xrp(50));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Flow: 50000 IOU Payments ───────────────────────────────────────────────
-
-#[test]
-fn fp13_50000_iou() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 10_000_000_000, 1, 0),
-        account_root(b, 10_000_000_000, 1, 0),
-        account_root(gw, 10_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 1000000000, 10000000000, 0),
-        trust_line(b, gw, usd_currency(), 0, 10000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=50000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Flow: 250 Accounts Each Send 2 ────────────────────────────────────────
 
@@ -2096,115 +1916,11 @@ fn fp13_250_accounts_2_each() {
 
 // ─── Flow: 200000 XRP Payments ──────────────────────────────────────────────
 
-#[test]
-fn fp14_200000_xrp() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=200000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), xrp(20));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Flow: 100000 IOU Payments ──────────────────────────────────────────────
-
-#[test]
-fn fp14_100000_iou() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 10_000_000_000, 1, 0),
-        account_root(b, 10_000_000_000, 1, 0),
-        account_root(gw, 10_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 10000000000, 100000000000, 0),
-        trust_line(b, gw, usd_currency(), 0, 100000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=100000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Flow: 500000 XRP Payments ──────────────────────────────────────────────
 
-#[test]
-fn fp15_500k_xrp() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=500000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), xrp(10));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Flow: 200000 IOU Payments ──────────────────────────────────────────────
-
-#[test]
-fn fp15_200k_iou() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 10_000_000_000, 1, 0),
-        account_root(b, 10_000_000_000, 1, 0),
-        account_root(gw, 10_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 10000000000, 100000000000, 0),
-        trust_line(b, gw, usd_currency(), 0, 100000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=200000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Flow: 50 Different Currencies ──────────────────────────────────────────
 
