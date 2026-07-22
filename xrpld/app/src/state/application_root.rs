@@ -1019,7 +1019,15 @@ pub fn apply_submit_transactor_shell<V: ledger::ApplyView>(
 ) -> Ter {
     let rules = view.rules();
     tx::with_transaction_apply_runtime(&rules, || {
-        apply_submit_transactor_shell_impl(view, tx, txn_type, true)
+        // Match rippled's ApplyContext: every mutation, including the common
+        // sequence/ticket and fee preamble, stays in a per-transaction view
+        // until the final TER says the transaction is applied.
+        let mut tx_view = ledger::FlowSandbox::new(view);
+        let result = apply_submit_transactor_shell_impl(&mut tx_view, tx, txn_type, true);
+        if is_tes_success(result) || is_tec_claim(result) {
+            let _ = tx_view.apply();
+        }
+        result
     })
 }
 

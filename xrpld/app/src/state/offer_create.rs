@@ -184,14 +184,16 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
         if is_sell {
             // reference: saTakerPays = multiply(saTakerGets, rate, saTakerPays.asset())
-            if let Some(ref rate_amt) = rate_amount {
-                taker_pays = taker_gets.multiply(rate_amt, taker_pays.asset());
-            }
+            taker_pays = taker_gets.multiply(&rate_amount, taker_pays.asset());
         } else {
-            // reference: saTakerGets = divide(saTakerPays, rate, saTakerGets.asset())
-            if let Some(ref rate_amt) = rate_amount {
-                taker_gets = taker_pays.divide(rate_amt, taker_gets.asset());
+            // rippled invokes divide here; its zero-rate exception is mapped by
+            // doApply to tefEXCEPTION. Preserve that result without emitting a
+            // Rust unwind from the consensus strand.
+            if rate_amount.signum() == 0 {
+                return Ter::TEF_EXCEPTION;
             }
+            // reference: saTakerGets = divide(saTakerPays, rate, saTakerGets.asset())
+            taker_gets = taker_pays.divide(&rate_amount, taker_gets.asset());
         }
         if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
             return Ter::TES_SUCCESS; // Rounded to zero
@@ -917,27 +919,42 @@ fn round_quality(quality: u64, digits: u8) -> u64 {
 }
 
 /// Convert a quality (encoded u64) back to an STAmount rate for multiply/divide.
-fn quality_to_rate_amount(quality: u64, _pays: &STAmount, _gets: &STAmount) -> Option<STAmount> {
-    if quality == 0 {
-        return None;
-    }
-    let exponent = (quality >> 56) as i32 - 100;
+fn quality_to_rate_amount(quality: u64, _pays: &STAmount, _gets: &STAmount) -> STAmount {
     let mantissa = quality & 0x00ffffffffffffff;
     if mantissa == 0 {
-        return None;
+        // Quality::rate() returns a zero STAmount. Keep it as an amount rather
+        // than skipping arithmetic: multiply produces zero for a sell and
+        // divide maps to tefEXCEPTION for a buy, exactly as in rippled.
+        return STAmount::from_iou_amount(
+            sf("sfAmount"),
+            protocol::IOUAmount::new(),
+            protocol::Issue::default(),
+        );
     }
-    Some(STAmount::new_with_asset(
+    let exponent = (quality >> 56) as i32 - 100;
+    STAmount::new_with_asset(
         sf("sfAmount"),
         protocol::Asset::Issue(protocol::Issue::default()),
         mantissa,
         exponent,
         false,
-    ))
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quality_to_rate_amount_underflow_is_zero() {
+        let amount = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
+        let zero_rate = quality_to_rate_amount(0, &amount, &amount);
+        assert_eq!(zero_rate.signum(), 0);
+        // Encoded quality exponent 0 decodes to STAmount exponent -100,
+        // below the representable IOU range and therefore canonicalizes to zero.
+        let rate = quality_to_rate_amount(1_000_000_000_000_000, &amount, &amount);
+        assert_eq!(rate.signum(), 0);
+    }
 
     #[test]
     fn open_book_directory_metadata_can_keep_original_exchange_rate() {
