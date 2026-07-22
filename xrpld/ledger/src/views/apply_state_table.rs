@@ -468,42 +468,43 @@ impl ApplyStateTable {
         to.raw_destroy_xrp(self.drops_destroyed)?;
         Ok(())
     }
-    /// Generate simulation metadata in the AffectedNodes format.
-    pub fn to_simulation_metadata(&self) -> Vec<protocol::JsonValue> {
-        use protocol::JsonValue;
-        let mut nodes = Vec::new();
-        for (key, entry) in &self.items {
-            let type_str = JsonValue::String(format!("{:?}", entry.sle.get_type()));
-            let index_str = JsonValue::String(format!("{key}"));
-            match entry.action {
-                Action::Insert => {
-                    let mut fields = std::collections::BTreeMap::new();
-                    fields.insert("LedgerEntryType".to_owned(), type_str);
-                    fields.insert("LedgerIndex".to_owned(), index_str);
-                    let mut node = std::collections::BTreeMap::new();
-                    node.insert("CreatedNode".to_owned(), JsonValue::Object(fields));
-                    nodes.push(JsonValue::Object(node));
-                }
-                Action::Modify => {
-                    let mut fields = std::collections::BTreeMap::new();
-                    fields.insert("LedgerEntryType".to_owned(), type_str);
-                    fields.insert("LedgerIndex".to_owned(), index_str);
-                    let mut node = std::collections::BTreeMap::new();
-                    node.insert("ModifiedNode".to_owned(), JsonValue::Object(fields));
-                    nodes.push(JsonValue::Object(node));
-                }
-                Action::Erase => {
-                    let mut fields = std::collections::BTreeMap::new();
-                    fields.insert("LedgerEntryType".to_owned(), type_str);
-                    fields.insert("LedgerIndex".to_owned(), index_str);
-                    let mut node = std::collections::BTreeMap::new();
-                    node.insert("DeletedNode".to_owned(), JsonValue::Object(fields));
-                    nodes.push(JsonValue::Object(node));
-                }
-                Action::Cache => {}
-            }
+    /// Construct canonical transaction metadata from the state changes captured
+    /// while applying a transaction to this view. The payload is intentionally
+    /// derived from the same typed SLEs used for the dry run so JSON and binary
+    /// simulation responses cannot diverge.
+    pub fn to_tx_meta(
+        &self,
+        transaction_id: Uint256,
+        ledger_seq: u32,
+        delivered_amount: Option<protocol::STAmount>,
+    ) -> protocol::TxMeta {
+        let mut meta = protocol::TxMeta::new(transaction_id, ledger_seq);
+        meta.set_delivered_amount(delivered_amount);
+
+        for entry in self.items.values() {
+            let (node_field, payload_field) = match entry.action {
+                Action::Insert => (
+                    protocol::get_field_by_symbol("sfCreatedNode"),
+                    protocol::get_field_by_symbol("sfNewFields"),
+                ),
+                Action::Modify => (
+                    protocol::get_field_by_symbol("sfModifiedNode"),
+                    protocol::get_field_by_symbol("sfFinalFields"),
+                ),
+                Action::Erase => (
+                    protocol::get_field_by_symbol("sfDeletedNode"),
+                    protocol::get_field_by_symbol("sfFinalFields"),
+                ),
+                Action::Cache => continue,
+            };
+
+            let mut fields = entry.sle.clone_as_object();
+            fields.make_field_absent(protocol::get_field_by_symbol("sfLedgerEntryType"));
+            let node = meta.get_affected_node_for_sle(entry.sle.as_ref(), node_field);
+            node.set_field_object(payload_field, fields);
         }
-        nodes
+
+        meta
     }
 }
 

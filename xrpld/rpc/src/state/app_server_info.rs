@@ -261,6 +261,12 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
         self.view.app()
     }
 
+    fn current_ledger_for_simulation(&self) -> Option<std::sync::Arc<ledger::Ledger>> {
+        self.view
+            .closed_ledger()
+            .or_else(|| self.view.validated_ledger())
+    }
+
     fn peers_get(&self) -> JsonValue {
         self.view
             .app()

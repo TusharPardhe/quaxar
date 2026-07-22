@@ -1556,8 +1556,8 @@ fn invariant_allows_checkcash_single_mptoken_creation() {
 }
 
 #[test]
-fn invariant_allows_amm_clawback_two_mptoken_creations_with_mptokens_v2() {
-    let base = Arc::new(mpt_v2_ledger());
+fn invariant_rejects_amm_clawback_two_mptoken_creations_with_mptokens_v2() {
+    let base = Arc::new(mpt_v2_without_cleanup_ledger());
     let mut parent = Sandbox::new(base, ApplyFlags::default());
     let mut flow = FlowSandbox::new(&mut parent);
     let issuer = acct(0x1E);
@@ -1568,6 +1568,28 @@ fn invariant_allows_amm_clawback_two_mptoken_creations_with_mptokens_v2() {
         .expect("insert first token");
     flow.insert(Arc::new(mptoken_entry(holder_b, issuer, 1, 0)))
         .expect("insert second token");
+
+    assert_eq!(
+        check_invariants(
+            &flow,
+            TxType::AMM_CLAWBACK,
+            Ter::TES_SUCCESS,
+            XRPAmount::from_drops(10)
+        ),
+        Ter::TEC_INVARIANT_FAILED
+    );
+}
+
+#[test]
+fn invariant_allows_amm_clawback_one_mptoken_creation_with_mptokens_v2() {
+    let base = Arc::new(mpt_v2_without_cleanup_ledger());
+    let mut parent = Sandbox::new(base, ApplyFlags::default());
+    let mut flow = FlowSandbox::new(&mut parent);
+    let issuer = acct(0x1E);
+    let holder = acct(0x1F);
+
+    flow.insert(Arc::new(mptoken_entry(holder, issuer, 1, 0)))
+        .expect("insert token");
 
     assert_eq!(
         check_invariants(

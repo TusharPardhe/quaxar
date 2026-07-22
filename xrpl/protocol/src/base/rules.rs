@@ -159,7 +159,9 @@ mod tests {
         CurrentTransactionRulesGuard, Rules, get_current_transaction_rules, is_feature_enabled,
         make_rules_given_current, make_rules_given_ledger, set_current_transaction_rules,
     };
-    use crate::{feature_lending_protocol, feature_single_asset_vault, fix_cleanup_3_2_0};
+    use crate::{
+        feature_id, feature_lending_protocol, feature_single_asset_vault, fix_cleanup_3_2_0,
+    };
     use basics::base_uint::Uint256;
     use basics::local_value::{LocalSlotOwner, install_local_slot_owner};
     use basics::number::{MantissaScale, get_mantissa_scale};
@@ -213,6 +215,28 @@ mod tests {
         assert_eq!(rules, Rules::from_ledger([preset], digest, [amendment]));
         assert!(rules.enabled(&preset));
         assert!(rules.enabled(&amendment));
+    }
+
+    #[test]
+    fn public_testnet_amendment_activation_rules_replay_deterministically() {
+        let amendments = [
+            feature_id("fixCleanup3_1_3"),
+            feature_id("fixIncludeKeyletFields"),
+            feature_id("fixTokenEscrowV1"),
+            feature_id("fixPriceOracleOrder"),
+            feature_id("fixMPTDeliveredAmount"),
+            feature_id("fixAMMClawbackRounding"),
+        ];
+        let digest = sample_uint256(0x66);
+        let before = Rules::from_ledger([], digest, []);
+        let activated = Rules::from_ledger([], digest, amendments);
+        let replayed = Rules::from_ledger([], digest, amendments);
+
+        for amendment in amendments {
+            assert!(!before.enabled(&amendment));
+            assert!(activated.enabled(&amendment));
+        }
+        assert_eq!(activated, replayed);
     }
 
     #[test]

@@ -2440,6 +2440,10 @@ impl RpcRuntime for ApplicationRoot {
             .or_else(|| self.validated_ledger_seq().map(|seq| seq.saturating_add(1)))
     }
 
+    fn current_ledger_for_simulation(&self) -> Option<std::sync::Arc<ledger::Ledger>> {
+        self.closed_ledger().or_else(|| self.validated_ledger())
+    }
+
     fn standalone(&self) -> bool {
         self.standalone()
     }

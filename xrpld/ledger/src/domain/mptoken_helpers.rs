@@ -941,19 +941,29 @@ pub fn enforce_mp_token_authorization(
         None
     };
 
+    let mut expired_domain_credential = false;
     let authorized_by_domain = if let Some(domain_id) = maybe_domain_id {
         let result = super::credential_helpers::verify_valid_domain(view, account, domain_id)?;
+        expired_domain_credential = result == Ter::TEC_EXPIRED;
         result == Ter::TES_SUCCESS
     } else {
         false
     };
 
     if !authorized_by_domain && sle_token.is_none() {
-        return Ok(Ter::TEC_NO_AUTH);
+        return Ok(if expired_domain_credential {
+            Ter::TEC_EXPIRED
+        } else {
+            Ter::TEC_NO_AUTH
+        });
     }
 
     if !authorized_by_domain && maybe_domain_id.is_some() {
-        return Ok(Ter::TEC_NO_AUTH);
+        return Ok(if expired_domain_credential {
+            Ter::TEC_EXPIRED
+        } else {
+            Ter::TEC_NO_AUTH
+        });
     }
 
     if !authorized_by_domain {

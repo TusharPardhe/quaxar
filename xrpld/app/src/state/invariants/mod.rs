@@ -227,7 +227,7 @@ fn check_invariants_inner<V: ApplyView>(
             record_object_deletion_state(&mut object_deletion, is_delete, before_sle);
         }
 
-        if fix_cleanup_3_2_0 {
+        if fix_cleanup_3_2_0 || mptokens_v2_enabled {
             let deleted_sle = before_sle.unwrap_or(&entry.sle);
             record_mpt_issuance_lifecycle(
                 sandbox,
@@ -238,6 +238,9 @@ fn check_invariants_inner<V: ApplyView>(
                 after_sle,
                 deleted_sle,
             );
+        }
+
+        if fix_cleanup_3_2_0 {
             if !maybe_record_directory_root(&mut directory_roots, is_delete, before_sle, after_sle)
             {
                 return Ter::TEC_INVARIANT_FAILED;
@@ -453,7 +456,7 @@ fn check_invariants_inner<V: ApplyView>(
         return Ter::TEC_INVARIANT_FAILED;
     }
 
-    if fix_cleanup_3_2_0 {
+    if fix_cleanup_3_2_0 || mptokens_v2_enabled {
         if !validates_mpt_issuance_lifecycle(&mpt_issuance_lifecycle) {
             return Ter::TEC_INVARIANT_FAILED;
         }
@@ -468,6 +471,9 @@ fn check_invariants_inner<V: ApplyView>(
         ) {
             return Ter::TEC_INVARIANT_FAILED;
         }
+    }
+
+    if fix_cleanup_3_2_0 {
         for root_index in directory_roots {
             if !matches!(
                 sandbox.read(protocol::Keylet::new(

@@ -13,6 +13,7 @@ use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
 use shamap::sync::{SHAMapType, SyncState, SyncTree};
 use shamap::tree_node::SHAMapNodeType;
+use std::collections::{BTreeMap, BTreeSet};
 
 const OBJECT_END: u8 = 0xE1;
 
@@ -146,6 +147,114 @@ fn amendment_helpers_match_current_cpp_enabled_and_majority_rules() {
         .collect();
     assert_eq!(get_majority_amendments(&ledger), expected_majorities);
     assert_eq!(ledger.get_majority_amendments(), expected_majorities);
+}
+
+#[test]
+fn public_testnet_amendments_activate_from_typed_sle_and_replay_exact_bytes() {
+    let amendments = [
+        ("fixCleanup3_1_3", protocol::feature_id("fixCleanup3_1_3")),
+        (
+            "fixIncludeKeyletFields",
+            protocol::feature_id("fixIncludeKeyletFields"),
+        ),
+        ("fixTokenEscrowV1", protocol::feature_id("fixTokenEscrowV1")),
+        (
+            "fixPriceOracleOrder",
+            protocol::feature_id("fixPriceOracleOrder"),
+        ),
+        (
+            "fixMPTDeliveredAmount",
+            protocol::feature_id("fixMPTDeliveredAmount"),
+        ),
+        (
+            "fixAMMClawbackRounding",
+            protocol::feature_id("fixAMMClawbackRounding"),
+        ),
+    ];
+    let majority = sample_uint256(0xA6);
+    let expected_majorities = BTreeMap::from([(majority, NetClockTimePoint::from(9_999))]);
+    let config = sample_ledger_config([]);
+
+    let ledger_from_amendments_bytes = |payload: Vec<u8>, seq: u32| {
+        Ledger::from_maps(
+            LedgerHeader {
+                seq,
+                ..LedgerHeader::default()
+            },
+            build_state_map_with_items(&[(amendments_key(), payload)], false, seq),
+            SyncTree::new_with_type(SHAMapType::Transaction, false, seq),
+        )
+    };
+
+    for (name, target) in amendments {
+        let mut baseline = Ledger::from_maps(
+            LedgerHeader {
+                seq: 4_000,
+                ..LedgerHeader::default()
+            },
+            build_state_map_with_items(&[], false, 4_000),
+            SyncTree::new_with_type(SHAMapType::Transaction, false, 4_000),
+        );
+        assert!(
+            baseline
+                .setup_from_state_map_with_config(&config)
+                .expect("baseline setup should decode")
+        );
+        assert!(
+            !baseline.rules().enabled(&target),
+            "{name} must be disabled without an Amendments SLE"
+        );
+
+        let bytes = typed_amendments_entry_bytes(&[target], majority, 9_999);
+        let mut activated = ledger_from_amendments_bytes(bytes.clone(), 4_001);
+        assert!(
+            activated
+                .setup_from_state_map_with_config(&config)
+                .expect("activation setup should decode typed Amendments SLE")
+        );
+        let expected_enabled = BTreeSet::from([target]);
+        let expected_digest = activated
+            .state_map()
+            .peek_item_with_hash(amendments_key(), &mut |_| None)
+            .expect("activated Amendments lookup should succeed")
+            .expect("activated Amendments SLE should exist")
+            .1;
+        assert_eq!(
+            get_enabled_amendments(&activated),
+            expected_enabled,
+            "{name} must be the sole enabled amendment serialized in the SLE"
+        );
+        assert!(activated.rules().enabled(&target), "{name} must activate");
+        for (_, other) in amendments {
+            if other != target {
+                assert!(
+                    !activated.rules().enabled(&other),
+                    "{name} activation must not enable another public-Testnet amendment"
+                );
+            }
+        }
+        assert_eq!(
+            activated.rules().digest(),
+            Some(*expected_digest.as_uint256())
+        );
+        assert_eq!(get_majority_amendments(&activated), expected_majorities);
+
+        let mut replay = ledger_from_amendments_bytes(bytes, 4_002);
+        assert!(
+            replay
+                .setup_from_state_map_with_config(&config)
+                .expect("fresh replay setup should decode identical bytes")
+        );
+        assert_eq!(get_enabled_amendments(&replay), expected_enabled);
+        assert!(replay.rules().enabled(&target));
+        for (_, other) in amendments {
+            if other != target {
+                assert!(!replay.rules().enabled(&other));
+            }
+        }
+        assert_eq!(replay.rules().digest(), Some(*expected_digest.as_uint256()));
+        assert_eq!(get_majority_amendments(&replay), expected_majorities);
+    }
 }
 
 #[test]

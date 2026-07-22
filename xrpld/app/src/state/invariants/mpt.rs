@@ -419,7 +419,7 @@ pub(super) fn validates_mpt_lifecycle_counts(
             {
                 return false;
             }
-            return lifecycle.tokens_created <= 2 && lifecycle.tokens_deleted <= 2;
+            return lifecycle.tokens_created <= 1 && lifecycle.tokens_deleted <= 2;
         }
 
         if lending_protocol_enabled && lifecycle.tokens_created + lifecycle.tokens_deleted > 1 {

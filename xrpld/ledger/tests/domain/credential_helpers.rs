@@ -135,11 +135,21 @@ fn expired_credential_deletion_failure_tracks_fix_cleanup_3_1_3() {
         assert_eq!(
             result,
             if amendment_enabled {
-                Ter::TEF_BAD_LEDGER
+                Ter::TEC_INTERNAL
             } else {
                 Ter::TEC_EXPIRED
             },
             "fixCleanup3_1_3 must make expired-credential deletion failures observable"
+        );
+        let issuer_dir = view
+            .read(owner_dir_keylet(account_raw(issuer)))
+            .expect("issuer directory read")
+            .expect("issuer directory exists");
+        assert!(
+            issuer_dir
+                .get_field_v256(sf("sfIndexes"))
+                .value()
+                .contains(&credential_key)
         );
         assert!(
             view.read(credential_keylet(
@@ -172,7 +182,7 @@ fn delete_sle_rejects_missing_issuer_root_when_issuer_owner_count_must_change() 
         .expect("credential read should succeed")
         .expect("credential should exist");
 
-    assert_eq!(delete_sle(&mut view, credential), Ok(Ter::TEF_BAD_LEDGER));
+    assert_eq!(delete_sle(&mut view, credential), Ok(Ter::TEC_INTERNAL));
 }
 
 #[test]
@@ -193,5 +203,67 @@ fn delete_sle_rejects_missing_subject_root_when_accepted_subject_owner_count_mus
         .expect("credential read should succeed")
         .expect("credential should exist");
 
-    assert_eq!(delete_sle(&mut view, credential), Ok(Ter::TEF_BAD_LEDGER));
+    assert_eq!(delete_sle(&mut view, credential), Ok(Ter::TEC_INTERNAL));
+    assert!(
+        view.read(owner_dir_keylet(account_raw(issuer)))
+            .expect("issuer directory read")
+            .is_none_or(|directory| !directory
+                .get_field_v256(sf("sfIndexes"))
+                .value()
+                .contains(&keylet.key)),
+        "rippled removes the issuer directory entry before it discovers the missing accepted subject"
+    );
+}
+
+#[test]
+fn verify_valid_domain_rejects_missing_issuer_root_when_expired_cleanup_fails() {
+    use ledger::credential_helpers::verify_valid_domain;
+    let domain_id = Uint256::from_array([0xD1; 32]);
+    let subject = account(0x13);
+    let issuer = account(0x14);
+    let credential_type = b"domain_access";
+    let credential_key =
+        credential_keylet(account_raw(subject), account_raw(issuer), credential_type).key;
+
+    // Create an expired credential
+    let mut credential = credential_entry(subject, issuer, credential_type, false);
+    credential.set_field_u32(sf("sfExpiration"), 499);
+
+    let mut sle_pd = STLedgerEntry::from_type_and_key(
+        LedgerEntryType::PermissionedDomain,
+        protocol::permissioned_domain_keylet_from_id(domain_id).key,
+    );
+    let mut obj = protocol::STObject::new(sf("sfCredential"));
+    obj.set_account_id(sf("sfIssuer"), issuer);
+    obj.set_field_vl(sf("sfCredentialType"), credential_type);
+
+    let mut arr = protocol::STArray::new(sf("sfAcceptedCredentials"));
+    arr.push_back(obj);
+    sle_pd.set_field_array(sf("sfAcceptedCredentials"), arr);
+
+    for amendment_enabled in [false, true] {
+        let mut ledger = ledger_with([
+            account_entry(subject, 0),
+            owner_dir_entry(issuer, credential_key),
+            owner_dir_entry(subject, credential_key),
+            credential.clone(),
+            sle_pd.clone(),
+        ]);
+        if amendment_enabled {
+            ledger.set_rules(Rules::new([protocol::fix_cleanup_3_1_3()]));
+        }
+        let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+        let result = verify_valid_domain(&mut view, &subject, domain_id)
+            .expect("credential verification should return a TER");
+        assert_eq!(
+            result,
+            if amendment_enabled {
+                Ter::TEC_INTERNAL
+            } else {
+                Ter::TEC_EXPIRED
+            },
+            "fixCleanup3_1_3 must make expired-credential deletion failures observable in verify_valid_domain"
+        );
+    }
 }

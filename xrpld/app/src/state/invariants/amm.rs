@@ -6,12 +6,14 @@ use protocol::{AccountID, Asset, LedgerEntryType, STAmount, STLedgerEntry, Ter};
 #[derive(Default)]
 pub(super) struct AmmState {
     amm_after: bool,
+    amm_deleted: bool,
     amm_account: Option<AccountID>,
     asset: Option<Asset>,
     asset2: Option<Asset>,
     amount: Option<STAmount>,
     amount2: Option<STAmount>,
     lpt_balance_before: Option<STAmount>,
+    lpt_balance_before_deletion: Option<STAmount>,
     lpt_balance_after: Option<STAmount>,
     pool_changed: bool,
 }
@@ -22,6 +24,13 @@ pub(super) fn record_amm_state(
     after: Option<&STLedgerEntry>,
 ) {
     if is_delete {
+        if let Some(before) = before
+            && before.get_type() == LedgerEntryType::AMM
+        {
+            state.amm_deleted = true;
+            state.lpt_balance_before_deletion =
+                Some(before.get_field_amount(sf("sfLPTokenBalance")));
+        }
         return;
     }
 
@@ -160,6 +169,21 @@ pub(super) fn validates_amm_state<V: ApplyView>(
         return true;
     }
 
+    let enforce = sandbox.rules().enabled(&protocol::fix_ammv1_3());
+    let enforce_amm_delete = sandbox.rules().enabled(&protocol::fix_cleanup_3_3_0());
+
+    if enforce_amm_delete
+        && state.amm_deleted
+        && !matches!(
+            txn_type,
+            protocol::TxType::AMM_WITHDRAW
+                | protocol::TxType::AMM_CLAWBACK
+                | protocol::TxType::AMM_DELETE
+        )
+    {
+        return false;
+    }
+
     match txn_type {
         protocol::TxType::AMM_BID => {
             if state.pool_changed {
@@ -176,21 +200,35 @@ pub(super) fn validates_amm_state<V: ApplyView>(
         protocol::TxType::AMM_VOTE => {
             !state.pool_changed && state.lpt_balance_before == state.lpt_balance_after
         }
-        protocol::TxType::AMM_CREATE => state.amm_after && validates_amm_create(sandbox, state),
+        protocol::TxType::AMM_CREATE => {
+            state.amm_after && (validates_amm_create(sandbox, state) || !enforce)
+        }
         protocol::TxType::AMM_DEPOSIT => {
-            // Only enforce when fixAMMv1_3 amendment is enabled.
-            // Don't block valid deposits due to floating-point rounding.
-            true
+            state.amm_after && (validates_amm_general(sandbox, state, false) || !enforce)
         }
         protocol::TxType::AMM_WITHDRAW | protocol::TxType::AMM_CLAWBACK => {
-            // Withdraw/clawback invariant only enforces when fixAMMv1_3 is enabled.
-            // If the AMM was deleted during this tx (ammDeleted_), always pass.
-            // Otherwise run generalInvariant with ZeroAllowed::Yes but DON'T
-            // enforce (return true even if check fails) when amendment not enabled
-            // before fixAMMv1_3 amendment.
-            true
+            (enforce_amm_delete && state.amm_deleted)
+                || !state.amm_after
+                || validates_amm_general(sandbox, state, true)
+                || !enforce
         }
-        protocol::TxType::AMM_DELETE => !state.amm_after,
+        protocol::TxType::AMM_DELETE => {
+            if state.amm_after && enforce {
+                return false;
+            }
+            if !enforce_amm_delete {
+                return true;
+            }
+            if protocol::is_tes_success(result) {
+                state.amm_deleted
+                    && state
+                        .lpt_balance_before_deletion
+                        .as_ref()
+                        .is_some_and(|balance| balance.signum() == 0)
+            } else {
+                !state.amm_deleted
+            }
+        }
         protocol::TxType::CHECK_CASH
         | protocol::TxType::OFFER_CREATE
         | protocol::TxType::PAYMENT => {

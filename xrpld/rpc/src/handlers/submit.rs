@@ -737,6 +737,112 @@ use std::sync::{Arc, Mutex};
 
 pub struct SubmitSource;
 
+struct OracleSetReserveSink {
+    balance_drops: i64,
+    owner_count: u32,
+    fees: ledger::Fees,
+}
+
+impl tx::OracleSetReserveSink for OracleSetReserveSink {
+    fn is_reserve_sufficient(&mut self, adjust_reserve: i8) -> bool {
+        let owner_count = i64::from(self.owner_count) + i64::from(adjust_reserve);
+        owner_count >= 0
+            && self.balance_drops >= self.fees.account_reserve(owner_count as usize) as i64
+    }
+}
+
+fn oracle_set_series(st_object: &protocol::STObject) -> Vec<tx::OracleSetSeriesEntry> {
+    st_object
+        .get_field_array(get_field_by_symbol("sfPriceDataSeries"))
+        .iter()
+        .map(|entry| tx::OracleSetSeriesEntry {
+            pair: tx::OracleTokenPair {
+                base_asset: protocol::currency_to_string(
+                    entry
+                        .get_field_currency(get_field_by_symbol("sfBaseAsset"))
+                        .currency(),
+                ),
+                quote_asset: protocol::currency_to_string(
+                    entry
+                        .get_field_currency(get_field_by_symbol("sfQuoteAsset"))
+                        .currency(),
+                ),
+            },
+            asset_price: entry
+                .is_field_present(get_field_by_symbol("sfAssetPrice"))
+                .then(|| entry.get_field_u64(get_field_by_symbol("sfAssetPrice"))),
+            scale: entry
+                .is_field_present(get_field_by_symbol("sfScale"))
+                .then(|| u16::from(entry.get_field_u8(get_field_by_symbol("sfScale")))),
+        })
+        .collect()
+}
+
+fn run_oracle_set_preclaim_with_ledger(st_tx: &STTx, ledger: &Ledger) -> Ter {
+    let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
+    let Some(account_sle) = ledger_read_keylet(ledger, account_keylet_for(account)) else {
+        return Ter::TER_NO_ACCOUNT;
+    };
+    let oracle = ledger_read_keylet(
+        ledger,
+        oracle_keylet(
+            account_to_uint160(account),
+            st_tx.get_field_u32(get_field_by_symbol("sfOracleDocumentID")),
+        ),
+    );
+    let provider_present = st_tx.is_field_present(get_field_by_symbol("sfProvider"));
+    let asset_class_present = st_tx.is_field_present(get_field_by_symbol("sfAssetClass"));
+    let tx_provider = st_tx.get_field_vl(get_field_by_symbol("sfProvider"));
+    let tx_asset_class = st_tx.get_field_vl(get_field_by_symbol("sfAssetClass"));
+    let oracle_exists = oracle.is_some();
+    let (
+        tx_provider_matches_existing,
+        tx_asset_class_matches_existing,
+        previous_last_update_time_secs,
+        existing_pairs,
+    ) = if let Some(oracle) = oracle.as_ref() {
+        (
+            !provider_present
+                || tx_provider == oracle.get_field_vl(get_field_by_symbol("sfProvider")),
+            !asset_class_present
+                || tx_asset_class == oracle.get_field_vl(get_field_by_symbol("sfAssetClass")),
+            u64::from(oracle.get_field_u32(get_field_by_symbol("sfLastUpdateTime"))),
+            oracle_set_series(oracle)
+                .into_iter()
+                .map(|entry| entry.pair)
+                .collect(),
+        )
+    } else {
+        (false, false, 0, Vec::new())
+    };
+    let facts = tx::OracleSetPreclaimFacts {
+        front: tx::OracleSetPreclaimFrontFacts {
+            account_exists: true,
+            close_time_secs: u64::from(ledger.header().close_time),
+            last_update_time_secs: u64::from(
+                st_tx.get_field_u32(get_field_by_symbol("sfLastUpdateTime")),
+            ),
+        },
+        oracle_exists,
+        tx_provider_present: st_tx.is_field_present(get_field_by_symbol("sfProvider")),
+        tx_asset_class_present: st_tx.is_field_present(get_field_by_symbol("sfAssetClass")),
+        tx_provider_matches_existing,
+        tx_asset_class_matches_existing,
+        previous_last_update_time_secs,
+        tx_series: oracle_set_series(st_tx),
+        existing_pairs,
+    };
+    let mut reserve_sink = OracleSetReserveSink {
+        balance_drops: account_sle
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops(),
+        owner_count: account_sle.get_field_u32(get_field_by_symbol("sfOwnerCount")),
+        fees: ledger.fees(),
+    };
+    tx::run_oracle_set_preclaim(facts, &mut reserve_sink)
+}
+
 fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(message) => *message,
@@ -2001,19 +2107,9 @@ fn submit_semantic_preflight_with_ledger(
             }
 
             if let Some(ledger) = ledger {
-                let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-                let last_update_time_field = get_field_by_symbol("sfLastUpdateTime");
-                let front = tx::run_oracle_set_preclaim_front(tx::OracleSetPreclaimFrontFacts {
-                    account_exists: ledger_account_exists(ledger, account),
-                    close_time_secs: u64::from(ledger.header().close_time),
-                    last_update_time_secs: if st_tx.is_field_present(last_update_time_field) {
-                        u64::from(st_tx.get_field_u32(last_update_time_field))
-                    } else {
-                        Default::default()
-                    },
-                });
-                if front != Ter::TES_SUCCESS {
-                    return front;
+                let preclaim = run_oracle_set_preclaim_with_ledger(st_tx, ledger);
+                if preclaim != Ter::TES_SUCCESS {
+                    return preclaim;
                 }
             }
 

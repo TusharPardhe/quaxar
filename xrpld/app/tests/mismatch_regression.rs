@@ -283,34 +283,6 @@ const CASES: &[MismatchCase] = &[
         ter: "tesSUCCESS",
         cause: "P4_no_dst_insuf_xrp_false_positive",
     },
-    // ── P5: EscrowFinish IOU missing tecLIMIT_EXCEEDED (5 total) ─────────────
-    MismatchCase {
-        seq: 104115428,
-        txid: "2c03fdd5",
-        tx_type: "EscrowFinish",
-        flags: 0x00000000,
-        our_ter: "tesSUCCESS",
-        ter: "tecLIMIT_EXCEEDED",
-        cause: "P5_escrow_finish_iou_limit",
-    },
-    MismatchCase {
-        seq: 104115542,
-        txid: "b78df60d",
-        tx_type: "EscrowFinish",
-        flags: 0x00000000,
-        our_ter: "tesSUCCESS",
-        ter: "tecLIMIT_EXCEEDED",
-        cause: "P5_escrow_finish_iou_limit",
-    },
-    MismatchCase {
-        seq: 104115547,
-        txid: "8c64819d",
-        tx_type: "EscrowFinish",
-        flags: 0x00000000,
-        our_ter: "tesSUCCESS",
-        ter: "tecLIMIT_EXCEEDED",
-        cause: "P5_escrow_finish_iou_limit",
-    },
     // ── P6: tesSUCCESS when should fail (4 total) ────────────────────────────
     MismatchCase {
         seq: 104115547,
@@ -689,45 +661,6 @@ fn p4_no_dst_insuf_xrp_104115563_31e9ed36() {
         "tecNO_DST_INSUF_XRP",
         "tesSUCCESS",
         "P4_no_dst_insuf_xrp_false_positive",
-    );
-}
-
-// ── P5: EscrowFinish IOU missing tecLIMIT_EXCEEDED ───────────────────────────
-
-/// P5: EscrowFinish returns tesSUCCESS when C++ returns tecLIMIT_EXCEEDED.
-/// Root cause: IOU escrow finish doesn't check trust line limit.
-/// Ledger 104115428, txid 2c03fdd5 — EscrowFinish.
-#[test]
-fn p5_escrow_finish_iou_limit_104115428_2c03fdd5() {
-    assert_case(
-        "2c03fdd5",
-        "tesSUCCESS",
-        "tecLIMIT_EXCEEDED",
-        "P5_escrow_finish_iou_limit",
-    );
-}
-
-/// P5: EscrowFinish IOU limit check missing in ledger 104115542.
-/// Ledger 104115542, txid b78df60d — EscrowFinish.
-#[test]
-fn p5_escrow_finish_iou_limit_104115542_b78df60d() {
-    assert_case(
-        "b78df60d",
-        "tesSUCCESS",
-        "tecLIMIT_EXCEEDED",
-        "P5_escrow_finish_iou_limit",
-    );
-}
-
-/// P5: EscrowFinish IOU limit check missing in ledger 104115547.
-/// Ledger 104115547, txid 8c64819d — EscrowFinish.
-#[test]
-fn p5_escrow_finish_iou_limit_104115547_8c64819d() {
-    assert_case(
-        "8c64819d",
-        "tesSUCCESS",
-        "tecLIMIT_EXCEEDED",
-        "P5_escrow_finish_iou_limit",
     );
 }
 
