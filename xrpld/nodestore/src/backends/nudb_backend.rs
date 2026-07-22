@@ -976,14 +976,36 @@ impl NuDbBackend {
     }
 
     fn clear_log_file(&self) -> Result<(), String> {
+        // Do not truncate the active log inode in place. A stale descriptor can
+        // otherwise append at its former offset after the truncate, turning an
+        // empty log into a large zero-filled file that fails header validation
+        // on the next open. Replacing the pathname atomically leaves any such
+        // stale writer attached to the unlinked old inode instead.
+        let temporary_path = self
+            .config
+            .layout
+            .log_path
+            .with_extension(format!("log.clear-{}", std::process::id()));
         let file = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
+            .create_new(true)
             .write(true)
-            .truncate(true)
-            .open(&self.config.layout.log_path)
+            .open(&temporary_path)
             .map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())
+        file.sync_all().map_err(|error| error.to_string())?;
+        fs::rename(&temporary_path, &self.config.layout.log_path)
+            .map_err(|error| error.to_string())?;
+
+        // Persist the directory entry as well as the empty replacement file.
+        // Opening a directory is supported on the Unix deployment targets.
+        #[cfg(unix)]
+        {
+            fs::File::open(&self.config.layout.base_path)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| error.to_string())
+        }
+
+        #[cfg(not(unix))]
+        Ok(())
     }
 
     fn write_log_checkpoint(&self, key_header: &NuDbKeyFileHeader) -> Result<(), String> {

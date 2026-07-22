@@ -6,7 +6,7 @@ use nodestore::{
 };
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -86,6 +86,63 @@ fn nudb_for_each_visits_indexed_records_and_skips_orphan_data_file_rows() {
     let expected_set: BTreeSet<_> = [*first.hash(), *second.hash()].into_iter().collect();
     assert_eq!(seen_set, expected_set);
     assert!(!seen_set.contains(orphan.hash()));
+}
+
+#[test]
+fn nudb_sync_replaces_log_before_stale_writer_can_extend_it() {
+    let temp = TempDir::new().expect("tempdir");
+    let backend = NuDbBackend::new(
+        nodestore::NodeObject::KEY_BYTES,
+        &nudb_section(temp.path()),
+        4,
+        Arc::new(QuietJournal),
+    )
+    .expect("nudb backend");
+    backend
+        .open_deterministic(true, NUDB_APPNUM, 7401, 8401)
+        .expect("open");
+
+    let item = object(0x74, b"stale-log-descriptor");
+    backend.store(Arc::clone(&item));
+    assert!(
+        log_size(temp.path()) > 0,
+        "first burst write creates a checkpoint"
+    );
+
+    // Hold a descriptor to the checkpoint inode. This models the stale-offset
+    // writer that previously extended `nudb.log` with zeroes after sync.
+    let mut stale_log = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(temp.path().join("nudb.log"))
+        .expect("open checkpoint log");
+    backend.sync();
+    stale_log
+        .seek(SeekFrom::Start(128 * 1024 * 1024))
+        .expect("seek stale log");
+    stale_log.write_all(&[0]).expect("extend stale log");
+    stale_log.sync_all().expect("sync stale log");
+
+    assert_eq!(
+        log_size(temp.path()),
+        0,
+        "sync must replace the live log instead of truncating the stale inode"
+    );
+    backend.close().expect("close");
+
+    let reopened = NuDbBackend::new(
+        nodestore::NodeObject::KEY_BYTES,
+        &nudb_section(temp.path()),
+        4,
+        Arc::new(QuietJournal),
+    )
+    .expect("reopen backend");
+    reopened
+        .open_deterministic(false, NUDB_APPNUM, 1, 1)
+        .expect("reopen must ignore stale unlinked log writes");
+    let (fetched, status) = reopened.fetch(item.hash());
+    assert_eq!(status, Status::Ok);
+    assert_eq!(fetched.expect("reopened item").data(), item.data());
 }
 
 #[test]
