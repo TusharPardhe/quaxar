@@ -203,6 +203,32 @@ fn fill_json_tx_v1(
     }
 }
 
+pub(crate) fn transaction_subscription_event(
+    ledger: &Ledger,
+    txn: &STTx,
+    meta: &TxMeta,
+) -> JsonValue {
+    let mut meta_json = meta.get_json(JsonOptions::NONE);
+    insert_delivered_amount(&mut meta_json, ledger, txn, meta);
+    JsonValue::Object(BTreeMap::from([
+        (
+            "type".to_owned(),
+            JsonValue::String("transaction".to_owned()),
+        ),
+        ("transaction".to_owned(), txn.json(JsonOptions::NONE)),
+        ("meta".to_owned(), meta_json),
+        (
+            "ledger_index".to_owned(),
+            JsonValue::Unsigned(u64::from(ledger.header().seq)),
+        ),
+        (
+            "ledger_hash".to_owned(),
+            JsonValue::String(ledger.header().hash.to_string()),
+        ),
+        ("validated".to_owned(), JsonValue::Bool(true)),
+    ]))
+}
+
 fn insert_delivered_amount(meta_json: &mut JsonValue, ledger: &Ledger, txn: &STTx, meta: &TxMeta) {
     if !can_have_delivered_amount(txn, meta) {
         return;

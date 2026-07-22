@@ -38,7 +38,7 @@ pub use transport::{RpcDispatcher, RpcError, RpcReply, RpcRequest};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use protocol::JsonValue;
+use protocol::{JsonValue, StBase};
 
 use rpc::{
     AccountInfoRequest, AccountInfoSource, AccountLinesRequest, AccountLinesSource,
@@ -81,6 +81,49 @@ fn status_json(status: rpc::RpcStatus) -> JsonValue {
     let mut value = JsonValue::Object(BTreeMap::new());
     status.inject(&mut value);
     value
+}
+
+fn accepted_transaction_events<S: RpcRuntime>(source: &S) -> Vec<JsonValue> {
+    let Some(ledger) = source.current_ledger_for_simulation() else {
+        return Vec::new();
+    };
+    let Ok(transactions) = ledger.tx_snapshot() else {
+        return Vec::new();
+    };
+
+    transactions
+        .into_iter()
+        .map(|(transaction, meta)| {
+            let mut meta_json = meta.get_json(protocol::JsonOptions::NONE);
+            rpc::insert_delivered_amount(
+                &mut meta_json,
+                ledger.header().seq,
+                Some(ledger.header().close_time),
+                transaction.as_ref(),
+                &meta,
+            );
+            JsonValue::Object(BTreeMap::from([
+                (
+                    "type".to_owned(),
+                    JsonValue::String("transaction".to_owned()),
+                ),
+                (
+                    "transaction".to_owned(),
+                    transaction.json(protocol::JsonOptions::NONE),
+                ),
+                ("meta".to_owned(), meta_json),
+                (
+                    "ledger_index".to_owned(),
+                    JsonValue::Unsigned(u64::from(ledger.header().seq)),
+                ),
+                (
+                    "ledger_hash".to_owned(),
+                    JsonValue::String(ledger.header().hash.to_string()),
+                ),
+                ("validated".to_owned(), JsonValue::Bool(true)),
+            ]))
+        })
+        .collect()
 }
 
 fn command_params(method: &str, params: &JsonValue) -> Result<JsonValue, rpc::RpcStatus> {
@@ -368,6 +411,7 @@ where
                                 .unwrap_or(0);
                             if seq > 0 {
                                 let closed_seq = seq.saturating_sub(1);
+                                let transaction_events = accepted_transaction_events(&self.source);
                                 let mut notification = std::collections::BTreeMap::new();
                                 notification.insert(
                                     "type".to_owned(),
@@ -379,7 +423,7 @@ where
                                 );
                                 notification.insert(
                                     "txn_count".to_owned(),
-                                    protocol::JsonValue::Unsigned(0),
+                                    protocol::JsonValue::Unsigned(transaction_events.len() as u64),
                                 );
                                 notification.insert(
                                     "validated_ledgers".to_owned(),
@@ -390,35 +434,9 @@ where
                                     protocol::JsonValue::Object(notification),
                                 );
 
-                                // Also notify transaction subscribers. When a ledger
-                                // closes with transactions, subscribers expect a
-                                // notification. We can't access the actual transaction
-                                // list from the dispatch layer, so publish a summary
-                                // notification that the ledger closed with possible
-                                // transactions — the test only checks for 'type' field.
-                                {
-                                    let mut tx_notif = std::collections::BTreeMap::new();
-                                    tx_notif.insert(
-                                        "type".to_owned(),
-                                        protocol::JsonValue::String("transaction".to_owned()),
-                                    );
-                                    tx_notif.insert(
-                                        "status".to_owned(),
-                                        protocol::JsonValue::String("closed".to_owned()),
-                                    );
-                                    tx_notif.insert(
-                                        "ledger_index".to_owned(),
-                                        protocol::JsonValue::Unsigned(closed_seq),
-                                    );
-                                    tx_notif.insert(
-                                        "validated".to_owned(),
-                                        protocol::JsonValue::Bool(true),
-                                    );
-                                    self.subscriptions.publish_json(
-                                        crate::StreamKind::Transactions,
-                                        protocol::JsonValue::Object(tx_notif),
-                                    );
-                                }
+                                // Transaction notifications are emitted centrally by
+                                // ApplicationRoot::on_published_ledger through the runtime's
+                                // shared subscription publisher. Do not re-publish here.
                             }
                         }
                         RpcReply::result(value)
@@ -1085,4 +1103,71 @@ fn handle_unsubscribe(request: RpcRequest<'_>) -> RpcReply {
         "status".to_owned(),
         JsonValue::String("unsubscribed".to_owned()),
     )])))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ledger::{Ledger, TxsRawView};
+    use protocol::{STAmount, STTx, Serializer, Ter, TxMeta, TxType, get_field_by_symbol};
+
+    struct SnapshotRuntime(Arc<Ledger>);
+
+    impl RpcRuntime for SnapshotRuntime {
+        fn current_ledger_for_simulation(&self) -> Option<Arc<Ledger>> {
+            Some(Arc::clone(&self.0))
+        }
+    }
+
+    #[test]
+    fn accepted_transaction_events_publish_canonical_metadata_and_delivered_amount() {
+        let source = protocol::AccountID::from_array([0x11; 20]);
+        let destination = protocol::AccountID::from_array([0x22; 20]);
+        let tx = Arc::new(STTx::new(TxType::PAYMENT, |object| {
+            object.set_account_id(get_field_by_symbol("sfAccount"), source);
+            object.set_account_id(get_field_by_symbol("sfDestination"), destination);
+            object.set_field_amount(
+                get_field_by_symbol("sfAmount"),
+                STAmount::new_native(1_000, false),
+            );
+            object.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+            object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        }));
+
+        let mut meta = TxMeta::new(tx.get_transaction_id(), 500);
+        meta.set_delivered_amount(Some(STAmount::new_native(800, false)));
+        let mut raw_meta = Serializer::default();
+        meta.add_raw(&mut raw_meta, Ter::TES_SUCCESS, 0);
+
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(500, 500_000_000, false);
+        ledger
+            .raw_tx_insert(
+                tx.get_transaction_id(),
+                Arc::new(Serializer::from_bytes(tx.get_serializer().data())),
+                Some(Arc::new(raw_meta)),
+            )
+            .expect("accepted transaction should insert");
+
+        let events = accepted_transaction_events(&SnapshotRuntime(Arc::new(ledger)));
+        assert_eq!(events.len(), 1);
+        let JsonValue::Object(event) = &events[0] else {
+            panic!("transaction subscription event should be an object");
+        };
+        assert_eq!(
+            event.get("type"),
+            Some(&JsonValue::String("transaction".to_owned()))
+        );
+        assert_eq!(event.get("validated"), Some(&JsonValue::Bool(true)));
+        let JsonValue::Object(meta) = event.get("meta").expect("event metadata") else {
+            panic!("event metadata should be an object");
+        };
+        assert_eq!(meta.get("DeliveredAmount"), meta.get("delivered_amount"));
+        assert_eq!(
+            meta.get("DeliveredAmount"),
+            Some(&JsonValue::String("800".to_owned()))
+        );
+    }
 }

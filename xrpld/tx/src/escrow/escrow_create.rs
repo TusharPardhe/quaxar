@@ -163,10 +163,6 @@ pub fn run_escrow_create_preflight(facts: EscrowCreatePreflightFacts) -> NotTec 
         return Ter::TEM_BAD_EXPIRATION;
     }
 
-    if !facts.finish_after_present && !facts.condition_present {
-        return Ter::TEM_MALFORMED;
-    }
-
     if facts.condition_present && !facts.condition_valid {
         return Ter::TEM_MALFORMED;
     }

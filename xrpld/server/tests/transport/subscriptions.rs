@@ -425,9 +425,17 @@ fn builtin_dispatcher_routes_ping_and_server_info() {
         from_protocol_json(&server_info)["info"]["fetch_pack"],
         serde_json::Value::Number(1_u64.into())
     );
-    assert_eq!(
-        from_protocol_json(&server_info)["info"]["load"]["job_count"],
-        serde_json::Value::Number(0_u64.into())
+    assert!(
+        from_protocol_json(&server_info)["info"]["load"]
+            .get("jobs")
+            .is_some()
+            || from_protocol_json(&server_info)["info"]["load"]
+                .get("load_events")
+                .is_some()
+            || from_protocol_json(&server_info)["info"]["load"]
+                .get("threads")
+                .is_some(),
+        "server_info load must expose the application job-queue schema"
     );
     assert_eq!(
         from_protocol_json(&server_info)["info"]["last_close"]["converge_time_s"],
@@ -551,9 +559,17 @@ fn builtin_dispatcher_routes_ping_and_server_info() {
         from_protocol_json(&server_state)["state"]["fetch_pack"],
         serde_json::Value::Number(1_u64.into())
     );
-    assert_eq!(
-        from_protocol_json(&server_state)["state"]["load"]["job_count"],
-        serde_json::Value::Number(0_u64.into())
+    assert!(
+        from_protocol_json(&server_state)["state"]["load"]
+            .get("jobs")
+            .is_some()
+            || from_protocol_json(&server_state)["state"]["load"]
+                .get("load_events")
+                .is_some()
+            || from_protocol_json(&server_state)["state"]["load"]
+                .get("threads")
+                .is_some(),
+        "server_state load must expose the application job-queue schema"
     );
     assert_eq!(
         from_protocol_json(&server_state)["state"]["closed_ledger"]["close_time"],

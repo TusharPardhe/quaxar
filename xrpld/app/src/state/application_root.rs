@@ -946,6 +946,142 @@ fn queue_apply_preclaim_ter(view: &impl ReadView, tx: &STTx, current_ledger_seq:
     )
 }
 
+struct SubmitOracleSetReserveSink {
+    balance_drops: i64,
+    owner_count: u32,
+    fees: ledger::Fees,
+}
+
+impl tx::OracleSetReserveSink for SubmitOracleSetReserveSink {
+    fn is_reserve_sufficient(&mut self, adjust_reserve: i8) -> bool {
+        let owner_count = i64::from(self.owner_count) + i64::from(adjust_reserve);
+        owner_count >= 0
+            && self.balance_drops >= self.fees.account_reserve(owner_count as usize) as i64
+    }
+}
+
+fn oracle_set_series(st_tx: &STTx) -> Vec<tx::OracleSetSeriesEntry> {
+    st_tx
+        .get_field_array(get_field_by_symbol("sfPriceDataSeries"))
+        .iter()
+        .map(|entry| tx::OracleSetSeriesEntry {
+            pair: tx::OracleTokenPair {
+                base_asset: protocol::currency_to_string(
+                    entry
+                        .get_field_currency(get_field_by_symbol("sfBaseAsset"))
+                        .currency(),
+                ),
+                quote_asset: protocol::currency_to_string(
+                    entry
+                        .get_field_currency(get_field_by_symbol("sfQuoteAsset"))
+                        .currency(),
+                ),
+            },
+            asset_price: entry
+                .is_field_present(get_field_by_symbol("sfAssetPrice"))
+                .then(|| entry.get_field_u64(get_field_by_symbol("sfAssetPrice"))),
+            scale: entry
+                .is_field_present(get_field_by_symbol("sfScale"))
+                .then(|| u16::from(entry.get_field_u8(get_field_by_symbol("sfScale")))),
+        })
+        .collect()
+}
+
+fn run_oracle_set_preclaim_with_view<V: ReadView>(view: &V, st_tx: &STTx) -> Ter {
+    let price_data_series_field = get_field_by_symbol("sfPriceDataSeries");
+    let provider_field = get_field_by_symbol("sfProvider");
+    let uri_field = get_field_by_symbol("sfURI");
+    let asset_class_field = get_field_by_symbol("sfAssetClass");
+    if !st_tx.is_field_present(price_data_series_field) {
+        return Ter::TEM_MALFORMED;
+    }
+
+    let preflight = tx::run_oracle_set_preflight(tx::OracleSetPreflightFacts {
+        price_data_series_len: st_tx.get_field_array(price_data_series_field).len(),
+        provider_len: st_tx
+            .is_field_present(provider_field)
+            .then(|| st_tx.get_field_vl(provider_field).len()),
+        uri_len: st_tx
+            .is_field_present(uri_field)
+            .then(|| st_tx.get_field_vl(uri_field).len()),
+        asset_class_len: st_tx
+            .is_field_present(asset_class_field)
+            .then(|| st_tx.get_field_vl(asset_class_field).len()),
+    });
+    if preflight != Ter::TES_SUCCESS {
+        return preflight;
+    }
+
+    let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
+    let Some(account_sle) = view
+        .read(account_keylet(
+            Uint160::from_slice(account.data()).expect("account width should match Uint160"),
+        ))
+        .ok()
+        .flatten()
+    else {
+        return Ter::TER_NO_ACCOUNT;
+    };
+
+    let oracle = view
+        .read(protocol::oracle_keylet(
+            Uint160::from_slice(account.data()).expect("account width should match Uint160"),
+            st_tx.get_field_u32(get_field_by_symbol("sfOracleDocumentID")),
+        ))
+        .ok()
+        .flatten();
+    let provider_present = st_tx.is_field_present(provider_field);
+    let asset_class_present = st_tx.is_field_present(asset_class_field);
+    let oracle_exists = oracle.is_some();
+    let (
+        tx_provider_matches_existing,
+        tx_asset_class_matches_existing,
+        previous_last_update_time_secs,
+        existing_pairs,
+    ) = if let Some(oracle) = oracle.as_ref() {
+        (
+            !provider_present
+                || st_tx.get_field_vl(provider_field) == oracle.get_field_vl(provider_field),
+            !asset_class_present
+                || st_tx.get_field_vl(asset_class_field) == oracle.get_field_vl(asset_class_field),
+            u64::from(oracle.get_field_u32(get_field_by_symbol("sfLastUpdateTime"))),
+            oracle_set_series(&STTx::from_stobject(oracle.clone_as_object()))
+                .into_iter()
+                .map(|entry| entry.pair)
+                .collect(),
+        )
+    } else {
+        (false, false, 0, Vec::new())
+    };
+
+    let facts = tx::OracleSetPreclaimFacts {
+        front: tx::OracleSetPreclaimFrontFacts {
+            account_exists: true,
+            close_time_secs: u64::from(view.header().close_time),
+            last_update_time_secs: u64::from(
+                st_tx.get_field_u32(get_field_by_symbol("sfLastUpdateTime")),
+            ),
+        },
+        oracle_exists,
+        tx_provider_present: provider_present,
+        tx_asset_class_present: asset_class_present,
+        tx_provider_matches_existing,
+        tx_asset_class_matches_existing,
+        previous_last_update_time_secs,
+        tx_series: oracle_set_series(st_tx),
+        existing_pairs,
+    };
+    let mut reserve_sink = SubmitOracleSetReserveSink {
+        balance_drops: account_sle
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops(),
+        owner_count: account_sle.get_field_u32(get_field_by_symbol("sfOwnerCount")),
+        fees: view.fees(),
+    };
+    tx::run_oracle_set_preclaim(facts, &mut reserve_sink)
+}
+
 fn submit_confine_owner_count(current: u32, adjustment: i32) -> u32 {
     let result = current as i64 + adjustment as i64;
     if result < 0 {
@@ -976,7 +1112,7 @@ fn delete_submit_ticket<V: ledger::ApplyView>(
     };
 
     let Some(ticket) = ticket else {
-        return Ter::TEF_BAD_LEDGER;
+        return Ter::TEF_NO_TICKET;
     };
 
     if !ledger::dir_remove(
@@ -1114,6 +1250,15 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
         return Ter::TER_NO_ACCOUNT;
     };
 
+    let oracle_preclaim = if txn_type == TxType::ORACLE_SET {
+        run_oracle_set_preclaim_with_view(view, tx)
+    } else {
+        Ter::TES_SUCCESS
+    };
+    if !is_tes_success(oracle_preclaim) && !is_tec_claim(oracle_preclaim) {
+        return oracle_preclaim;
+    }
+
     let mut updated =
         STLedgerEntry::from_stobject(account_root.clone_as_object(), *account_root.key());
     let pre_fee_balance_drops = if updated.is_field_present(balance_field) {
@@ -1196,7 +1341,11 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
         // We achieve this by running handle_real_dispatch in a nested FlowSandbox and
         // only applying it to the outer view when the result is NOT tecKILLED.
         let mut inner = ledger::FlowSandbox::new(view);
-        let mut result = handle_real_dispatch(&mut inner, tx, txn_type, pre_fee_balance_drops);
+        let mut result = if is_tes_success(oracle_preclaim) {
+            handle_real_dispatch(&mut inner, tx, txn_type, pre_fee_balance_drops)
+        } else {
+            oracle_preclaim
+        };
 
         // tef* and tem* failures should NOT consume sequence or fee.
         // Revert the account root to its pre-apply state so the transaction
@@ -4250,7 +4399,26 @@ impl ApplicationRoot {
 
     pub fn on_published_ledger(&self, ledger: Arc<Ledger>) {
         self.ledger_master_state
-            .note_published_ledger(self.ledger_with_node_fetcher(ledger));
+            .note_published_ledger(self.ledger_with_node_fetcher(Arc::clone(&ledger)));
+        let Ok(transactions) = ledger.tx_snapshot() else {
+            return;
+        };
+        let Ok(guard) = self.shared_subscription_manager.read() else {
+            return;
+        };
+        let Some(publisher) = guard.as_ref() else {
+            return;
+        };
+        for (transaction, meta) in transactions {
+            publisher(
+                "transactions",
+                crate::ledger_to_json::ledger_to_json_tx::transaction_subscription_event(
+                    ledger.as_ref(),
+                    transaction.as_ref(),
+                    &meta,
+                ),
+            );
+        }
     }
 
     pub fn published_ledger(&self) -> Option<Arc<Ledger>> {

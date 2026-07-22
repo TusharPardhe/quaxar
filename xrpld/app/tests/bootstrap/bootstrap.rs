@@ -6,8 +6,8 @@ use basics::{base_uint::Uint256, intrusive_pointer::make_shared_intrusive, str_h
 use ledger::{Ledger, LedgerHeader, calculate_ledger_hash};
 use nodestore::{DummyScheduler, Manager, ManagerImp, NodeObjectType, NullJournal, Scheduler};
 use protocol::{
-    AccountID, LedgerEntryType, STAmount, STArray, STLedgerEntry, STObject, STTx, TxType,
-    account_keylet, get_field_by_symbol,
+    AccountID, LedgerEntryType, MPTAmount, MPTIssue, STAmount, STArray, STLedgerEntry, STObject,
+    STTx, TxType, account_keylet, get_field_by_symbol, make_mpt_id,
 };
 use shamap::{
     item::SHAMapItem,
@@ -779,10 +779,31 @@ fn app_bootstrap_loads_replay_parent_and_injects_replay_transactions() {
     let dir = TempDir::new().expect("tempdir");
     let parent = persisted_bootstrap_state_only_ledger(20);
     let replay_tx = payment_tx(1, 0x11, 0x21);
+    let delivered_amount = STAmount::from_mpt_amount(
+        get_field_by_symbol("sfDeliveredAmount"),
+        MPTAmount::from_value(800),
+        MPTIssue::new(make_mpt_id(7, account(0x71))),
+    );
+    let mut replay_meta = metadata(2, 0x92);
+    replay_meta.set_field_amount(
+        get_field_by_symbol("sfDeliveredAmount"),
+        delivered_amount.clone(),
+    );
     let replay = persisted_bootstrap_replay_ledger(
         21,
         *parent.header().hash.as_uint256(),
-        &[(Arc::clone(&replay_tx), metadata(2, 0x92))],
+        &[(Arc::clone(&replay_tx), replay_meta)],
+    );
+    let replay_snapshot = replay.tx_snapshot().expect("replay transaction metadata");
+    assert_eq!(replay_snapshot.len(), 1);
+    assert_eq!(
+        replay_snapshot[0].0.get_transaction_id(),
+        replay_tx.get_transaction_id()
+    );
+    assert_eq!(
+        replay_snapshot[0].1.get_delivered_amount(),
+        Some(&delivered_amount),
+        "serialized replay metadata must decode the exact MPT sfDeliveredAmount"
     );
     let (database_path, node_db_path, config_path) =
         persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "RocksDB");
