@@ -326,7 +326,11 @@ where
             };
 
             if entry.node.is_leaf() {
-                if entry.node.peek_item().is_some_and(|item| item.key() > start) {
+                if entry
+                    .node
+                    .peek_item()
+                    .is_some_and(|item| item.key() > start)
+                {
                     // Stack already ends with this leaf.
                     result = SeekResult::Found(entry.node);
                     break 'seek;
@@ -896,8 +900,7 @@ mod tests {
     fn iterate_from_returns_all_leaves_after_key_below_all() {
         // start key is below all leaves → should return all three in order
         let (root, low_leaf, mid_leaf, high_leaf, _, _, _) = build_three_leaf_root();
-        let below_all =
-            key("0000000000000000000000000000000000000000000000000000000000000001");
+        let below_all = key("0000000000000000000000000000000000000000000000000000000000000001");
 
         let results = iterate_from(&root, below_all, 10, false, &mut |_| None)
             .expect("iterate_from below all leaves should succeed");
@@ -911,8 +914,7 @@ mod tests {
     #[test]
     fn iterate_from_respects_limit() {
         let (root, low_leaf, mid_leaf, _, _, _, _) = build_three_leaf_root();
-        let below_all =
-            key("0000000000000000000000000000000000000000000000000000000000000001");
+        let below_all = key("0000000000000000000000000000000000000000000000000000000000000001");
 
         let results = iterate_from(&root, below_all, 2, false, &mut |_| None)
             .expect("iterate_from with limit 2 should succeed");
@@ -925,8 +927,7 @@ mod tests {
     #[test]
     fn iterate_from_skips_exact_start_key() {
         // start == low_key: low_leaf must NOT be included (strictly greater)
-        let (root, _low_leaf, mid_leaf, high_leaf, low_key, _, _) =
-            build_three_leaf_root();
+        let (root, _low_leaf, mid_leaf, high_leaf, low_key, _, _) = build_three_leaf_root();
 
         let results = iterate_from(&root, low_key, 10, false, &mut |_| None)
             .expect("iterate_from from exact low_key should succeed");
@@ -960,8 +961,7 @@ mod tests {
         assert!(at_last.is_empty(), "no leaves are strictly > high_key");
 
         // start past everything
-        let beyond_all =
-            key("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+        let beyond_all = key("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
         let past_all = iterate_from(&root, beyond_all, 10, false, &mut |_| None)
             .expect("iterate_from past all leaves should succeed");
         assert!(past_all.is_empty(), "no leaves exist past max key");
@@ -970,8 +970,7 @@ mod tests {
     #[test]
     fn iterate_from_limit_zero_returns_empty_without_traversal() {
         let (root, _, _, _, _, _, _) = build_three_leaf_root();
-        let below_all =
-            key("0000000000000000000000000000000000000000000000000000000000000001");
+        let below_all = key("0000000000000000000000000000000000000000000000000000000000000001");
 
         let results = iterate_from(&root, below_all, 0, false, &mut |_| None)
             .expect("iterate_from with limit 0 should succeed");
@@ -981,8 +980,7 @@ mod tests {
     #[test]
     fn iterate_from_limit_one_returns_single_leaf() {
         let (root, low_leaf, _, _, _, _, _) = build_three_leaf_root();
-        let below_all =
-            key("0000000000000000000000000000000000000000000000000000000000000001");
+        let below_all = key("0000000000000000000000000000000000000000000000000000000000000001");
 
         let results = iterate_from(&root, below_all, 1, false, &mut |_| None)
             .expect("iterate_from with limit 1 should succeed");

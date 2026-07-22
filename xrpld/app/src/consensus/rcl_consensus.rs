@@ -79,9 +79,22 @@ pub trait RclConsensusOpenLedgerSource {
 /// `proposers_validated`/`proposers_finished`/`get_prev_ledger`.
 pub trait RclConsensusValidationSource {
     fn num_trusted_for_ledger(&self, ledger_id: Uint256) -> usize;
-    fn get_nodes_after(&self, ledger: &crate::consensus::rcl_validation::RclValidatedLedger, ledger_id: &Uint256) -> usize;
-    fn preferred_lcl(&self, lcl: &crate::consensus::rcl_validation::RclValidatedLedger, min_seq: u32, peer_counts: &std::collections::BTreeMap<Uint256, u32>) -> Uint256;
-    fn preferred_min_seq(&self, curr: &crate::consensus::rcl_validation::RclValidatedLedger, min_valid_seq: u32) -> Uint256;
+    fn get_nodes_after(
+        &self,
+        ledger: &crate::consensus::rcl_validation::RclValidatedLedger,
+        ledger_id: &Uint256,
+    ) -> usize;
+    fn preferred_lcl(
+        &self,
+        lcl: &crate::consensus::rcl_validation::RclValidatedLedger,
+        min_seq: u32,
+        peer_counts: &std::collections::BTreeMap<Uint256, u32>,
+    ) -> Uint256;
+    fn preferred_min_seq(
+        &self,
+        curr: &crate::consensus::rcl_validation::RclValidatedLedger,
+        min_valid_seq: u32,
+    ) -> Uint256;
 }
 
 impl RclConsensusValidationSource for SharedAppValidations<SystemTimeKeeperClock> {
@@ -89,16 +102,38 @@ impl RclConsensusValidationSource for SharedAppValidations<SystemTimeKeeperClock
         SharedAppValidations::num_trusted_for_ledger(self, ledger_id)
     }
 
-    fn get_nodes_after(&self, ledger: &crate::consensus::rcl_validation::RclValidatedLedger, ledger_id: &Uint256) -> usize {
-        self.validations().lock().expect("shared app validations mutex must not be poisoned").get_nodes_after(ledger, ledger_id)
+    fn get_nodes_after(
+        &self,
+        ledger: &crate::consensus::rcl_validation::RclValidatedLedger,
+        ledger_id: &Uint256,
+    ) -> usize {
+        self.validations()
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .get_nodes_after(ledger, ledger_id)
     }
 
-    fn preferred_lcl(&self, lcl: &crate::consensus::rcl_validation::RclValidatedLedger, min_seq: u32, peer_counts: &std::collections::BTreeMap<Uint256, u32>) -> Uint256 {
-        self.validations().lock().expect("shared app validations mutex must not be poisoned").get_preferred_lcl(lcl, min_seq, peer_counts)
+    fn preferred_lcl(
+        &self,
+        lcl: &crate::consensus::rcl_validation::RclValidatedLedger,
+        min_seq: u32,
+        peer_counts: &std::collections::BTreeMap<Uint256, u32>,
+    ) -> Uint256 {
+        self.validations()
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .get_preferred_lcl(lcl, min_seq, peer_counts)
     }
 
-    fn preferred_min_seq(&self, curr: &crate::consensus::rcl_validation::RclValidatedLedger, min_valid_seq: u32) -> Uint256 {
-        self.validations().lock().expect("shared app validations mutex must not be poisoned").get_preferred_min_seq(curr, min_valid_seq)
+    fn preferred_min_seq(
+        &self,
+        curr: &crate::consensus::rcl_validation::RclValidatedLedger,
+        min_valid_seq: u32,
+    ) -> Uint256 {
+        self.validations()
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .get_preferred_min_seq(curr, min_valid_seq)
     }
 }
 
@@ -145,8 +180,18 @@ pub struct AppRclConsensusRelay {
 }
 
 impl AppRclConsensusRelay {
-    pub fn from_application_root(root: &ApplicationRoot, inbound_transactions: AppInboundTransactions, validator_keys: ValidatorKeys, journal: impl RclConsensusJournal + 'static) -> Self {
-        Self { overlay: root.overlay_runtime().map(|rt| rt.overlay()), inbound_transactions, validator_keys, journal: Arc::new(journal) }
+    pub fn from_application_root(
+        root: &ApplicationRoot,
+        inbound_transactions: AppInboundTransactions,
+        validator_keys: ValidatorKeys,
+        journal: impl RclConsensusJournal + 'static,
+    ) -> Self {
+        Self {
+            overlay: root.overlay_runtime().map(|rt| rt.overlay()),
+            inbound_transactions,
+            validator_keys,
+            journal: Arc::new(journal),
+        }
     }
 
     pub fn validator_keys(&self) -> &ValidatorKeys {
@@ -157,7 +202,8 @@ impl AppRclConsensusRelay {
 impl RclConsensusRelay for AppRclConsensusRelay {
     fn relay_proposal(&self, peer_pos: &RclCxPeerPos) {
         let Some(overlay) = self.overlay.as_ref() else {
-            self.journal.trace("relay_proposal: no overlay attached, skipping broadcast");
+            self.journal
+                .trace("relay_proposal: no overlay attached, skipping broadcast");
             return;
         };
 
@@ -181,25 +227,32 @@ impl RclConsensusRelay for AppRclConsensusRelay {
         let set_id = consensus::ConsensusTxSet::id(set);
         {
             let sync_tree = set.to_sync_tree();
-            let mut guard = self.inbound_transactions.lock().expect("inbound_transactions mutex");
+            let mut guard = self
+                .inbound_transactions
+                .lock()
+                .expect("inbound_transactions mutex");
             guard.give_set(set_id, std::sync::Arc::new(sync_tree), false);
         }
 
         let Some(overlay) = self.overlay.as_ref() else {
-            self.journal.trace("relay_tx_set: no overlay attached, skipping broadcast");
+            self.journal
+                .trace("relay_tx_set: no overlay attached, skipping broadcast");
             return;
         };
 
-        let message = overlay::ProtocolMessage::new(overlay::ProtocolPayload::HaveSet(overlay::TmHaveTransactionSet {
-            status: 1, // tsHAVE
-            hash: set_id.data().to_vec(),
-        }));
+        let message = overlay::ProtocolMessage::new(overlay::ProtocolPayload::HaveSet(
+            overlay::TmHaveTransactionSet {
+                status: 1, // tsHAVE
+                hash: set_id.data().to_vec(),
+            },
+        ));
         overlay.broadcast(&message);
     }
 
     fn relay_disputed_tx(&self, tx: &consensus::RclCxTxRef) {
         let Some(overlay) = self.overlay.as_ref() else {
-            self.journal.trace("relay_disputed_tx: no overlay attached, skipping broadcast");
+            self.journal
+                .trace("relay_disputed_tx: no overlay attached, skipping broadcast");
             return;
         };
 
@@ -280,12 +333,13 @@ impl AppRclConsensusAdaptor {
         overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
         app_root: crate::state::application_root::ApplicationRoot,
     ) -> Self {
-        let tx_set_cache: consensus::rcl::RclTxSetSharedCache = Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
-            "consensus-tx-set-cache",
-            256,
-            time::Duration::minutes(5),
-            basics::tagged_cache::MonotonicClock::default(),
-        ));
+        let tx_set_cache: consensus::rcl::RclTxSetSharedCache =
+            Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
+                "consensus-tx-set-cache",
+                256,
+                time::Duration::minutes(5),
+                basics::tagged_cache::MonotonicClock::default(),
+            ));
         Self {
             options,
             time_keeper,
@@ -320,7 +374,10 @@ impl AppRclConsensusAdaptor {
         self.validator_keys.keys.is_some()
     }
 
-    fn validated_view(&self, ledger: &RclCxLedger) -> crate::consensus::rcl_validation::RclValidatedLedger {
+    fn validated_view(
+        &self,
+        ledger: &RclCxLedger,
+    ) -> crate::consensus::rcl_validation::RclValidatedLedger {
         crate::consensus::rcl_validation::RclValidatedLedger::from_ledger(&ledger.ledger())
     }
 
@@ -333,7 +390,10 @@ impl AppRclConsensusAdaptor {
     }
 }
 
-fn sync_tree_to_rcl_tx_set(sync_tree: &shamap::sync::SyncTree, cache: &consensus::rcl::RclTxSetSharedCache) -> consensus::RclTxSet {
+fn sync_tree_to_rcl_tx_set(
+    sync_tree: &shamap::sync::SyncTree,
+    cache: &consensus::rcl::RclTxSetSharedCache,
+) -> consensus::RclTxSet {
     consensus::RclTxSet::from_parts(sync_tree.root(), Arc::clone(cache), sync_tree.backed(), 0)
 }
 
@@ -341,9 +401,13 @@ fn sync_tree_to_rcl_tx_set(sync_tree: &shamap::sync::SyncTree, cache: &consensus
 /// to the `NegativeUNLVoteValidations` trait expected by
 /// `NegativeUNLVote::do_voting`. Acquires no additional locks — the caller
 /// must already hold the validations mutex.
-struct NegativeUNLValidationsAdapter<'a>(&'a mut crate::consensus::rcl_validations::RclValidationsInner);
+struct NegativeUNLValidationsAdapter<'a>(
+    &'a mut crate::consensus::rcl_validations::RclValidationsInner,
+);
 
-impl crate::amendments::negative_unl_vote::NegativeUNLVoteValidations for NegativeUNLValidationsAdapter<'_> {
+impl crate::amendments::negative_unl_vote::NegativeUNLVoteValidations
+    for NegativeUNLValidationsAdapter<'_>
+{
     fn set_seq_to_keep(&mut self, low: u32, high: u32) {
         self.0.set_seq_to_keep(low, high);
     }
@@ -365,7 +429,12 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
 
     fn acquire_ledger(&self, ledger_id: &Uint256) -> Option<Self::Ledger> {
         let hash = basics::sha_map_hash::SHAMapHash::new(*ledger_id);
-        if let Some(ledger) = self.ledger_master_runtime.ledger_master().ledger_history().get_cached_ledger_by_hash(hash) {
+        if let Some(ledger) = self
+            .ledger_master_runtime
+            .ledger_master()
+            .ledger_history()
+            .get_cached_ledger_by_hash(hash)
+        {
             return Some(RclCxLedger::new(ledger));
         }
 
@@ -374,19 +443,28 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         {
             // Try to look up the seq from the ledger cache so the acquisition
             // layer can prioritise correctly (0 = unknown).
-            let seq = self.ledger_master_runtime.ledger_master()
+            let seq = self
+                .ledger_master_runtime
+                .ledger_master()
                 .ledger_history()
                 .get_cached_ledger_by_hash(hash)
                 .map(|l| l.header().seq)
                 .unwrap_or(0);
-            shared.acquire_async(*ledger_id, seq, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
+            shared.acquire_async(
+                *ledger_id,
+                seq,
+                crate::ledger::inbound_ledgers::AcquireReason::Consensus,
+            );
         }
         None
     }
 
     fn acquire_tx_set(&self, set_id: &Uint256) -> Option<Self::TxSet> {
         let sync_tree = {
-            let mut guard = self.inbound_transactions.lock().expect("inbound transactions mutex must not be poisoned");
+            let mut guard = self
+                .inbound_transactions
+                .lock()
+                .expect("inbound transactions mutex must not be poisoned");
             guard.get_set(*set_id, true)?
         };
         Some(self.sync_tree_to_rcl_tx_set(&sync_tree))
@@ -405,29 +483,47 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         RclConsensusValidationSource::get_nodes_after(&self.validations, &wrapped, prev_ledger_id)
     }
 
-    fn get_prev_ledger(&self, _prev_ledger_id: &Uint256, prev_ledger: &Self::Ledger, _mode: ConsensusMode) -> Uint256 {
-        let min_valid_seq = self.ledger_master_runtime.ledger_master().valid_ledger_seq();
+    fn get_prev_ledger(
+        &self,
+        _prev_ledger_id: &Uint256,
+        prev_ledger: &Self::Ledger,
+        _mode: ConsensusMode,
+    ) -> Uint256 {
+        let min_valid_seq = self
+            .ledger_master_runtime
+            .ledger_master()
+            .valid_ledger_seq();
         let wrapped = self.validated_view(prev_ledger);
         RclConsensusValidationSource::preferred_min_seq(&self.validations, &wrapped, min_valid_seq)
     }
 
     fn on_mode_change(&self, before: ConsensusMode, after: ConsensusMode) {
-        self.journal.info(&format!("Consensus mode change {before:?} -> {after:?}"));
+        self.journal
+            .info(&format!("Consensus mode change {before:?} -> {after:?}"));
     }
 
-    fn on_close(&self, prev_ledger: &Self::Ledger, now: NetClockTimePoint, _mode: ConsensusMode) -> consensus::algorithm::consensus::ConsensusResultOf<Self> {
+    fn on_close(
+        &self,
+        prev_ledger: &Self::Ledger,
+        now: NetClockTimePoint,
+        _mode: ConsensusMode,
+    ) -> consensus::algorithm::consensus::ConsensusResultOf<Self> {
         // Acquire the close gate to prevent the tx-batch-apply thread from
         // applying transactions while we capture the open ledger's transaction
         // set. This matches rippled's single-strand guarantee where timerEntry
         // (which calls onClose) and the batch-apply path cannot interleave.
         let txs = {
-            let _close_guard = self.app_root.close_gate().lock()
+            let _close_guard = self
+                .app_root
+                .close_gate()
+                .lock()
                 .expect("close_gate mutex must not be poisoned");
             let _ = self.app_root.apply_network_ops_pending_to_open_ledger();
             RclConsensusOpenLedgerSource::current_open_transactions(&self.open_ledger)
         };
         // close_gate released — batch-apply can resume while we build the set.
-        let mut set = consensus::RclTxSet::new(Arc::clone(&self.tx_set_cache), prev_ledger.seq() + 1);
+        let mut set =
+            consensus::RclTxSet::new(Arc::clone(&self.tx_set_cache), prev_ledger.seq() + 1);
         {
             let mut editable = set.mutable_view();
             for tx in &txs {
@@ -442,10 +538,10 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 // amendments gaining/losing majority or activating.
                 if let Some(ref amendment_status) = self.amendment_status {
                     let prev_id = prev_ledger.id();
-                    let parent_validations = self.validations.store().trusted_for_ledger_by_sequence(
-                        prev_id,
-                        prev_ledger.seq(),
-                    );
+                    let parent_validations = self
+                        .validations
+                        .store()
+                        .trusted_for_ledger_by_sequence(prev_id, prev_ledger.seq());
                     let mut vote_set: Vec<protocol::STTx> = Vec::new();
                     amendment_status.do_voting_for_ledger(
                         &prev_ledger.ledger(),
@@ -468,17 +564,13 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 // should move to new fee parameters.
                 if let Some(ref fee_vote) = self.fee_vote {
                     let prev_id = prev_ledger.id();
-                    let parent_validations = self.validations.store().trusted_for_ledger_by_sequence(
-                        prev_id,
-                        prev_ledger.seq(),
-                    );
+                    let parent_validations = self
+                        .validations
+                        .store()
+                        .trusted_for_ledger_by_sequence(prev_id, prev_ledger.seq());
                     let mut fee_vote_set: Vec<protocol::STTx> = Vec::new();
                     let ledger_ref = prev_ledger.ledger();
-                    fee_vote.do_voting(
-                        &*ledger_ref,
-                        &parent_validations,
-                        &mut fee_vote_set,
-                    );
+                    fee_vote.do_voting(&*ledger_ref, &parent_validations, &mut fee_vote_set);
                     for pseudo_tx in &fee_vote_set {
                         editable.insert(&consensus::RclCxTxRef::from_transaction(pseudo_tx));
                     }
@@ -501,7 +593,9 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                     // NegativeUNLVoteValidations::set_seq_to_keep and
                     // trusted_keys_for_ledger, then release it immediately.
                     {
-                        let mut validations_guard = self.validations.validations()
+                        let mut validations_guard = self
+                            .validations
+                            .validations()
                             .lock()
                             .expect("shared app validations mutex must not be poisoned");
                         let mut adapter = NegativeUNLValidationsAdapter(&mut *validations_guard);
@@ -530,12 +624,20 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         }
 
         let position_id = consensus::ConsensusTxSet::id(&set);
-        let node_id = self.validator_keys.keys.as_ref().map(|k| k.public_key).unwrap_or_else(|| PublicKey::from_bytes([0u8; 33]));
+        let node_id = self
+            .validator_keys
+            .keys
+            .as_ref()
+            .map(|k| k.public_key)
+            .unwrap_or_else(|| PublicKey::from_bytes([0u8; 33]));
         let position = Proposal::new(prev_ledger.id(), 0, position_id, now, now, node_id);
 
         {
             let sync_tree = set.to_sync_tree();
-            let mut guard = self.inbound_transactions.lock().expect("inbound_transactions mutex");
+            let mut guard = self
+                .inbound_transactions
+                .lock()
+                .expect("inbound_transactions mutex");
             guard.give_set(position_id, Arc::new(sync_tree), false);
             tracing::info!(target: "consensus", %position_id, "on_close: stored tx-set");
         }
@@ -552,7 +654,12 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         mode: ConsensusMode,
     ) {
         let next_seq = prev_ledger.seq() + 1;
-        let base_fee = self.ledger_master_runtime.ledger_master().closed_ledger().map(|l| l.fees().base).unwrap_or(10);
+        let base_fee = self
+            .ledger_master_runtime
+            .ledger_master()
+            .closed_ledger()
+            .map(|l| l.fees().base)
+            .unwrap_or(10);
 
         let txns: Vec<Arc<protocol::STTx>> = result
             .txns
@@ -566,7 +673,13 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         let accepted_ids: std::collections::HashSet<Uint256> =
             txns.iter().map(|tx| tx.get_transaction_id()).collect();
 
-        RclConsensusOpenLedgerSource::accept_consensus_ledger(&self.open_ledger, next_seq, base_fee, &prev_ledger.id(), &accepted_ids);
+        RclConsensusOpenLedgerSource::accept_consensus_ledger(
+            &self.open_ledger,
+            next_seq,
+            base_fee,
+            &prev_ledger.id(),
+            &accepted_ids,
+        );
 
         let raw_close_time = result.position.close_time();
         let close_time_correct = raw_close_time != NetClockTimePoint::default();
@@ -574,23 +687,30 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             NetClockTimePoint::new(prev_ledger.close_time().as_seconds().saturating_add(1))
         } else {
             let resolution = time::Duration::seconds(close_resolution.as_secs() as i64);
-            consensus::algorithm::timing::effective_close_time(raw_close_time, resolution, prev_ledger.close_time())
+            consensus::algorithm::timing::effective_close_time(
+                raw_close_time,
+                resolution,
+                prev_ledger.close_time(),
+            )
         };
         let close_time = effective_close_time.as_seconds();
         let close_resolution_secs = close_resolution.as_secs().min(u8::MAX as u64) as u8;
         let closed_seq = next_seq;
 
-        let pending_validation = self.validator_keys.keys.as_ref().map(|keys| crate::state::application_root::PendingValidation {
-            public_key: keys.public_key,
-            secret_key: keys.secret_key.clone(),
-            node_id: protocol::calc_node_id(&keys.public_key),
-            consensus_hash: result.txns.id(),
-            proposing: mode == ConsensusMode::Proposing,
+        let pending_validation = self.validator_keys.keys.as_ref().map(|keys| {
+            crate::state::application_root::PendingValidation {
+                public_key: keys.public_key,
+                secret_key: keys.secret_key.clone(),
+                node_id: protocol::calc_node_id(&keys.public_key),
+                consensus_hash: result.txns.id(),
+                proposing: mode == ConsensusMode::Proposing,
+            }
         });
 
         // Clock adjustment: converge toward network's observed close time
         let consensus_fail = result.state == consensus::algorithm::types::ConsensusState::MovedOn;
-        if (mode == ConsensusMode::Proposing || mode == ConsensusMode::Observing) && !consensus_fail {
+        if (mode == ConsensusMode::Proposing || mode == ConsensusMode::Observing) && !consensus_fail
+        {
             let close_time_val = raw_close_times.self_;
             let mut close_total: i64 = i64::from(close_time_val.as_seconds());
             let mut close_count: i64 = 1;
@@ -602,7 +722,9 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             close_total /= close_count;
 
             let offset_seconds = close_total - i64::from(close_time_val.as_seconds());
-            let new_offset = self.time_keeper.adjust_close_time(time::Duration::seconds(offset_seconds));
+            let new_offset = self
+                .time_keeper
+                .adjust_close_time(time::Duration::seconds(offset_seconds));
             tracing::debug!(
                 target: "consensus",
                 self_close_time = close_time_val.as_seconds(),
@@ -618,7 +740,9 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         // on the strand thread. The strand thread reads pending_accept
         // immediately after timer_entry returns.
         {
-            let mut pending = self.pending_accept.lock()
+            let mut pending = self
+                .pending_accept
+                .lock()
                 .expect("pending_accept mutex must not be poisoned");
             *pending = Some(PendingAcceptWork {
                 closed_seq,
@@ -639,10 +763,13 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         };
         match sign_proposal(&keys.secret_key, &keys.public_key, pos) {
             Ok((signature, suppression)) => {
-                let peer_pos = RclCxPeerPos::new(keys.public_key, signature, suppression, pos.clone());
+                let peer_pos =
+                    RclCxPeerPos::new(keys.public_key, signature, suppression, pos.clone());
                 self.relay.relay_proposal(&peer_pos);
             }
-            Err(err) => self.journal.error(&format!("propose: signing failed: {err:?}")),
+            Err(err) => self
+                .journal
+                .error(&format!("propose: signing failed: {err:?}")),
         }
     }
 
@@ -662,13 +789,26 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         &self.parms
     }
 
-    fn next_ledger_time_resolution(&self, previous_resolution: StdDuration, previous_agree: bool, ledger_seq: u32) -> StdDuration {
+    fn next_ledger_time_resolution(
+        &self,
+        previous_resolution: StdDuration,
+        previous_agree: bool,
+        ledger_seq: u32,
+    ) -> StdDuration {
         let previous = time::Duration::seconds(previous_resolution.as_secs() as i64);
-        let next = consensus::algorithm::timing::get_next_ledger_time_resolution(previous, previous_agree, ledger_seq);
+        let next = consensus::algorithm::timing::get_next_ledger_time_resolution(
+            previous,
+            previous_agree,
+            ledger_seq,
+        );
         StdDuration::from_secs(next.whole_seconds().max(0) as u64)
     }
 
-    fn round_close_time(&self, raw: NetClockTimePoint, resolution: StdDuration) -> NetClockTimePoint {
+    fn round_close_time(
+        &self,
+        raw: NetClockTimePoint,
+        resolution: StdDuration,
+    ) -> NetClockTimePoint {
         let resolution = time::Duration::seconds(resolution.as_secs() as i64);
         consensus::algorithm::timing::round_close_time(raw, resolution)
     }
@@ -695,7 +835,13 @@ pub trait ConsensusRunner: Send {
     fn timer_tick(&mut self, now: NetClockTimePoint) -> Option<PendingAcceptWork>;
 
     /// Start a round. Called after ledger build or by initial bootstrap.
-    fn start_round(&mut self, now: NetClockTimePoint, prev_ledger_id: Uint256, prev_ledger: RclCxLedger, proposing: bool);
+    fn start_round(
+        &mut self,
+        now: NetClockTimePoint,
+        prev_ledger_id: Uint256,
+        prev_ledger: RclCxLedger,
+        proposing: bool,
+    );
 
     /// Notify tx-set acquired.
     fn got_tx_set(&mut self, now: NetClockTimePoint, tx_set: consensus::RclTxSet);
@@ -724,7 +870,11 @@ pub struct AppConsensus {
 
 impl AppConsensus {
     pub fn new(adaptor: AppRclConsensusAdaptor, _parms: ConsensusParms) -> Self {
-        Self { adaptor, state: Consensus::new(), last_trusted_keys: HashSet::default() }
+        Self {
+            adaptor,
+            state: Consensus::new(),
+            last_trusted_keys: HashSet::default(),
+        }
     }
 
     /// Compute the set of validator keys that were trusted in the previous
@@ -783,32 +933,54 @@ impl AppConsensus {
                     let hdr = closed.header();
                     if let Some(overlay_rt) = root.overlay_runtime() {
                         use overlay::Overlay;
-                        let status = overlay::ProtocolMessage::new(overlay::ProtocolPayload::StatusChange(overlay::message::wire::TmStatusChange {
-                            new_status: None,
-                            new_event: Some(2), // neACCEPTED_LEDGER
-                            ledger_seq: Some(hdr.seq),
-                            ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
-                            ledger_hash_previous: Some(hdr.parent_hash.as_uint256().data().to_vec()),
-                            network_time: None,
-                            first_seq: Some(0),
-                            last_seq: Some(0),
-                        }));
+                        let status =
+                            overlay::ProtocolMessage::new(overlay::ProtocolPayload::StatusChange(
+                                overlay::message::wire::TmStatusChange {
+                                    new_status: None,
+                                    new_event: Some(2), // neACCEPTED_LEDGER
+                                    ledger_seq: Some(hdr.seq),
+                                    ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
+                                    ledger_hash_previous: Some(
+                                        hdr.parent_hash.as_uint256().data().to_vec(),
+                                    ),
+                                    network_time: None,
+                                    first_seq: Some(0),
+                                    last_seq: Some(0),
+                                },
+                            ));
                         overlay_rt.overlay().broadcast(&status);
                     }
 
                     if let Some(pending) = work.validation {
                         tracing::info!(target: "consensus", closed_seq, proposing = pending.proposing, "execute_accept: signing validation");
                         let ledger_hash = *hdr.hash.as_uint256();
-                        match protocol::STValidation::new_signed(work.close_time.max(1), &pending.public_key, pending.node_id, &pending.secret_key, |v| {
-                            v.set_field_h256(protocol::get_field_by_symbol("sfLedgerHash"), ledger_hash);
-                            v.set_field_h256(protocol::get_field_by_symbol("sfConsensusHash"), pending.consensus_hash);
-                            v.set_field_u32(protocol::get_field_by_symbol("sfLedgerSequence"), closed_seq);
-                            if pending.proposing {
-                                v.set_flag(protocol::VF_FULL_VALIDATION);
-                            }
-                        }) {
+                        match protocol::STValidation::new_signed(
+                            work.close_time.max(1),
+                            &pending.public_key,
+                            pending.node_id,
+                            &pending.secret_key,
+                            |v| {
+                                v.set_field_h256(
+                                    protocol::get_field_by_symbol("sfLedgerHash"),
+                                    ledger_hash,
+                                );
+                                v.set_field_h256(
+                                    protocol::get_field_by_symbol("sfConsensusHash"),
+                                    pending.consensus_hash,
+                                );
+                                v.set_field_u32(
+                                    protocol::get_field_by_symbol("sfLedgerSequence"),
+                                    closed_seq,
+                                );
+                                if pending.proposing {
+                                    v.set_flag(protocol::VF_FULL_VALIDATION);
+                                }
+                            },
+                        ) {
                             Ok(built_validation) => {
-                                self.adaptor.ledger_acceptor.publish_validation(Arc::new(built_validation));
+                                self.adaptor
+                                    .ledger_acceptor
+                                    .publish_validation(Arc::new(built_validation));
                                 tracing::info!(target: "consensus", closed_seq, "execute_accept: validation SIGNED and PUBLISHED");
                             }
                             Err(err) => {
@@ -839,8 +1011,15 @@ impl AppConsensus {
                         // Use the validation trie to determine the preferred LCL.
                         // This consults trusted validations first, using peer_counts
                         // only as a tie-breaker — matching rippled's getPreferredLCL.
-                        let wrapped_lcl = crate::consensus::rcl_validation::RclValidatedLedger::from_ledger(&closed);
-                        let min_seq = self.adaptor.ledger_master_runtime.ledger_master().valid_ledger_seq();
+                        let wrapped_lcl =
+                            crate::consensus::rcl_validation::RclValidatedLedger::from_ledger(
+                                &closed,
+                            );
+                        let min_seq = self
+                            .adaptor
+                            .ledger_master_runtime
+                            .ledger_master()
+                            .valid_ledger_seq();
                         let preferred = RclConsensusValidationSource::preferred_lcl(
                             &self.adaptor.validations,
                             &wrapped_lcl,
@@ -865,7 +1044,7 @@ impl AppConsensus {
                         );
                         if let Some(lm_rt) = root.ledger_master_runtime() {
                             if let Some(network_ledger) = lm_rt.ledger_master().get_ledger_by_hash(
-                                basics::sha_map_hash::SHAMapHash::new(network_closed)
+                                basics::sha_map_hash::SHAMapHash::new(network_closed),
                             ) {
                                 root.on_closed_ledger(Arc::clone(&network_ledger));
                                 Some(network_ledger)
@@ -879,18 +1058,25 @@ impl AppConsensus {
                                     if let Some(shared) = guard.as_ref() {
                                         // Resolve the seq from the ledger cache first,
                                         // falling back to the peer that reports this hash.
-                                        let seq = lm_rt.ledger_master()
+                                        let seq = lm_rt
+                                            .ledger_master()
                                             .ledger_history()
                                             .get_cached_ledger_by_hash(
-                                                basics::sha_map_hash::SHAMapHash::new(network_closed)
+                                                basics::sha_map_hash::SHAMapHash::new(
+                                                    network_closed,
+                                                ),
                                             )
                                             .map(|l| l.header().seq)
                                             .or_else(|| {
                                                 // Ask peers for the seq of this hash.
                                                 if let Some(ort) = root.overlay_runtime() {
                                                     use overlay::Overlay;
-                                                    ort.overlay().active_peers().iter()
-                                                        .find(|p| p.closed_ledger_hash() == network_closed)
+                                                    ort.overlay()
+                                                        .active_peers()
+                                                        .iter()
+                                                        .find(|p| {
+                                                            p.closed_ledger_hash() == network_closed
+                                                        })
                                                         .map(|p| p.ledger_range().1)
                                                 } else {
                                                     None
@@ -901,8 +1087,10 @@ impl AppConsensus {
                                     }
                                 }
                                 root.set_need_network_ledger(true);
-                                self.adaptor.network_ops_mode_owner.set_operating_mode_direct(
-                                    crate::network::network_ops::NetworkOpsOperatingMode::Connected
+                                self.adaptor
+                                    .network_ops_mode_owner
+                                    .set_operating_mode_direct(
+                                    crate::network::network_ops::NetworkOpsOperatingMode::Connected,
                                 );
                                 None
                             }
@@ -921,7 +1109,9 @@ impl AppConsensus {
                         let prev_id = *round_ledger.header().hash.as_uint256();
                         let prev_cx = crate::consensus_ledger_from_ledger(&round_ledger);
 
-                        if self.adaptor.validators.count() > 0 && self.adaptor.validators.unl_size() == 0 {
+                        if self.adaptor.validators.count() > 0
+                            && self.adaptor.validators.unl_size() == 0
+                        {
                             self.adaptor.network_ops_mode_owner.set_unl_blocked(true);
                         } else {
                             self.adaptor.network_ops_mode_owner.set_unl_blocked(false);
@@ -1035,12 +1225,20 @@ impl ConsensusRunner for AppConsensus {
     fn timer_tick(&mut self, now: NetClockTimePoint) -> Option<PendingAcceptWork> {
         self.state.timer_entry(&self.adaptor, now);
         // If on_accept fired during timer_entry, pending_accept will be Some.
-        self.adaptor.pending_accept.lock()
+        self.adaptor
+            .pending_accept
+            .lock()
             .expect("pending_accept mutex must not be poisoned")
             .take()
     }
 
-    fn start_round(&mut self, now: NetClockTimePoint, prev_ledger_id: Uint256, prev_ledger: RclCxLedger, proposing: bool) {
+    fn start_round(
+        &mut self,
+        now: NetClockTimePoint,
+        prev_ledger_id: Uint256,
+        prev_ledger: RclCxLedger,
+        proposing: bool,
+    ) {
         if self.adaptor.validators.count() > 0 && self.adaptor.validators.unl_size() == 0 {
             self.adaptor.network_ops_mode_owner.set_unl_blocked(true);
         } else {
@@ -1052,7 +1250,14 @@ impl ConsensusRunner for AppConsensus {
             && self.adaptor.network_ops_mode_owner.operating_mode()
                 == crate::network::network_ops::NetworkOpsOperatingMode::Full;
         let now_untrusted = self.compute_now_untrusted();
-        self.state.start_round(&self.adaptor, now, prev_ledger_id, prev_ledger, &now_untrusted, actual_proposing);
+        self.state.start_round(
+            &self.adaptor,
+            now,
+            prev_ledger_id,
+            prev_ledger,
+            &now_untrusted,
+            actual_proposing,
+        );
     }
 
     fn got_tx_set(&mut self, now: NetClockTimePoint, tx_set: consensus::RclTxSet) {
@@ -1096,21 +1301,36 @@ mod sync_tree_conversion_tests {
     fn payment(fill: u8) -> STTx {
         STTx::new(TxType::PAYMENT, |tx| {
             tx.set_field_u32(get_field_by_symbol("sfSequence"), u32::from(fill));
-            tx.set_field_amount(get_field_by_symbol("sfAmount"), STAmount::new_native(u64::from(fill), false));
-            tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(10, false));
+            tx.set_field_amount(
+                get_field_by_symbol("sfAmount"),
+                STAmount::new_native(u64::from(fill), false),
+            );
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
         })
     }
 
     fn completed_sync_tree(txs: &[STTx], cache: consensus::rcl::RclTxSetSharedCache) -> SyncTree {
-        let cache: Arc<shamap::tree_node_cache::TreeNodeCache<MonotonicClock, HardenedHashBuilder>> = cache;
+        let cache: Arc<
+            shamap::tree_node_cache::TreeNodeCache<MonotonicClock, HardenedHashBuilder>,
+        > = cache;
         let mut map = StorageTree::new(1, false, 1, cache);
         for tx in txs {
             let item = SHAMapItem::new(tx.get_transaction_id(), serialize_blob(tx));
-            map.add_item(SHAMapNodeType::TransactionNm, item).expect("insert into a fresh test tree should not need fetches");
+            map.add_item(SHAMapNodeType::TransactionNm, item)
+                .expect("insert into a fresh test tree should not need fetches");
         }
         map.unshare();
 
-        let tree = SyncTree::from_root_with_type(map.root(), SHAMapType::Transaction, false, 1, SyncState::Modifying);
+        let tree = SyncTree::from_root_with_type(
+            map.root(),
+            SHAMapType::Transaction,
+            false,
+            1,
+            SyncState::Modifying,
+        );
         tree.set_full();
         tree
     }

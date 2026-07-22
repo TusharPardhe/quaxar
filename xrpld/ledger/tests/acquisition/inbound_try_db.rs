@@ -7,6 +7,7 @@ use ledger::{
     InboundLedgerJournal, InboundLedgerLocal, InboundLedgerStore, LedgerConfig, LedgerHeader,
     deserialize_prefixed_ledger_header, serialize_prefixed_ledger_header,
 };
+use parking_lot::Mutex;
 use shamap::family::{
     NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily, SHAMapNodeFetcher,
 };
@@ -16,7 +17,6 @@ use shamap::tree_node_cache::TreeNodeCache;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use parking_lot::Mutex;
 use std::sync::Arc;
 use time::Duration;
 
@@ -454,5 +454,7 @@ fn inbound_try_db_keeps_synching_when_get_missing_nodes_reports_missing_hash() {
     );
     assert!(journal.warns.borrow().is_empty());
     assert_eq!(journal.debugs.borrow().len(), 1);
-    assert!(journal.debugs.borrow()[0].starts_with("AS map still missing hashes after local fetch"));
+    assert!(
+        journal.debugs.borrow()[0].starts_with("AS map still missing hashes after local fetch")
+    );
 }

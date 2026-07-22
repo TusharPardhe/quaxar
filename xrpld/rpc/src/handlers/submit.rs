@@ -727,9 +727,9 @@ use protocol::{
     credential_keylet, deposit_preauth_keylet, did_keylet, escrow_keylet, feature_amm, feature_id,
     feature_single_asset_vault, get_field_by_symbol, is_tec_claim, is_tes_success, jss, line,
     mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid, nft_offer_keylet_from_key,
-    nft_page_keylet, nft_page_max_keylet, nft_page_min_keylet, oracle_keylet, pay_channel_keylet_from_key,
-    permissioned_domain_keylet_from_id, trans_token, vault_keylet_from_key,
-    xchain_owned_claim_id_keylet_from_bridge,
+    nft_page_keylet, nft_page_max_keylet, nft_page_min_keylet, oracle_keylet,
+    pay_channel_keylet_from_key, permissioned_domain_keylet_from_id, trans_token,
+    vault_keylet_from_key, xchain_owned_claim_id_keylet_from_bridge,
 };
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -1483,7 +1483,7 @@ fn submit_semantic_preflight_with_ledger(
                 // If OwnerCount > 0, check if there are any NON-deletable items.
                 // For the simple case: trust lines with balance, escrows with
                 // pending funds, etc. are obligations.
-                // 
+                //
                 // NOTE: We don't do a full directory scan in the preflight
                 // (that happens in the transactor). Here we only do a quick
                 // reject for the common case of trust lines (RippleState).

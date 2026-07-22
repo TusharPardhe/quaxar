@@ -20,7 +20,12 @@ use std::collections::BTreeMap;
 /// cheaply-copyable type with a sequence number, an identity, and the
 /// ability to look up an ancestor's id at any earlier sequence.
 pub trait TrieLedger: Clone {
-    type Seq: Copy + Ord + Default + std::hash::Hash + std::ops::Add<u32, Output = Self::Seq> + std::ops::Sub<u32, Output = Self::Seq>;
+    type Seq: Copy
+        + Ord
+        + Default
+        + std::hash::Hash
+        + std::ops::Add<u32, Output = Self::Seq>
+        + std::ops::Sub<u32, Output = Self::Seq>;
     type Id: Copy + Eq + Ord + Default + std::hash::Hash;
 
     /// The genesis ledger: prefixes all other ledgers, at `Seq` zero.
@@ -270,7 +275,11 @@ impl<L: TrieLedger> LedgerTrie<L> {
     /// Find the node with an exact ledger-id match to `ledger`'s tip.
     /// O(n). Matches `findByLedgerID()`.
     fn find_by_ledger_id(&self, ledger_id: L::Id) -> Option<usize> {
-        self.nodes.iter().enumerate().find(|(_, n)| n.live && n.span.tip().id == ledger_id).map(|(idx, _)| idx)
+        self.nodes
+            .iter()
+            .enumerate()
+            .find(|(_, n)| n.live && n.span.tip().id == ledger_id)
+            .map(|(idx, _)| idx)
     }
 
     /// Insert and/or increment support for `ledger`. Matches `insert()`.
@@ -350,9 +359,15 @@ impl<L: TrieLedger> LedgerTrie<L> {
         }
 
         while self.nodes[loc].tip_support == 0 && loc != ROOT {
-            let parent = self.nodes[loc].parent.expect("non-root node must have a parent");
-            let live_children: Vec<usize> =
-                self.nodes[loc].children.iter().copied().filter(|&c| self.nodes[c].live).collect();
+            let parent = self.nodes[loc]
+                .parent
+                .expect("non-root node must have a parent");
+            let live_children: Vec<usize> = self.nodes[loc]
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| self.nodes[c].live)
+                .collect();
 
             if live_children.is_empty() {
                 self.erase_child(parent, loc);
@@ -374,7 +389,9 @@ impl<L: TrieLedger> LedgerTrie<L> {
     /// Tip support for the exact ledger identified by `ledger_id`.
     /// Matches `tipSupport()`.
     pub fn tip_support(&self, ledger_id: L::Id) -> u32 {
-        self.find_by_ledger_id(ledger_id).map(|idx| self.nodes[idx].tip_support).unwrap_or(0)
+        self.find_by_ledger_id(ledger_id)
+            .map(|idx| self.nodes[idx].tip_support)
+            .unwrap_or(0)
     }
 
     /// Branch support (this ledger or any descendant) for `ledger`.
@@ -407,7 +424,8 @@ impl<L: TrieLedger> LedgerTrie<L> {
         let mut curr = ROOT;
         let mut done = false;
         let mut uncommitted: u32 = 0;
-        let seq_support: Vec<(L::Seq, u32)> = self.seq_support.iter().map(|(k, v)| (*k, *v)).collect();
+        let seq_support: Vec<(L::Seq, u32)> =
+            self.seq_support.iter().map(|(k, v)| (*k, *v)).collect();
         let mut uncommitted_idx = 0usize;
 
         while !done {
@@ -423,7 +441,9 @@ impl<L: TrieLedger> LedgerTrie<L> {
                 }
 
                 while next_seq < span.end && self.nodes[curr].branch_support > uncommitted {
-                    if uncommitted_idx < seq_support.len() && seq_support[uncommitted_idx].0 < span.end {
+                    if uncommitted_idx < seq_support.len()
+                        && seq_support[uncommitted_idx].0 < span.end
+                    {
                         next_seq = seq_support[uncommitted_idx].0 + 1;
                         uncommitted += seq_support[uncommitted_idx].1;
                         uncommitted_idx += 1;
@@ -437,8 +457,12 @@ impl<L: TrieLedger> LedgerTrie<L> {
                 }
             }
 
-            let live_children: Vec<usize> =
-                self.nodes[curr].children.iter().copied().filter(|&c| self.nodes[c].live).collect();
+            let live_children: Vec<usize> = self.nodes[curr]
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| self.nodes[c].live)
+                .collect();
 
             let mut best: Option<usize> = None;
             let mut margin: u32 = 0;
@@ -485,7 +509,12 @@ impl<L: TrieLedger> LedgerTrie<L> {
             if !node.live && curr != ROOT {
                 continue;
             }
-            let live_children: Vec<usize> = node.children.iter().copied().filter(|&c| self.nodes[c].live).collect();
+            let live_children: Vec<usize> = node
+                .children
+                .iter()
+                .copied()
+                .filter(|&c| self.nodes[c].live)
+                .collect();
 
             if curr != ROOT && node.tip_support == 0 && live_children.len() < 2 {
                 return false;

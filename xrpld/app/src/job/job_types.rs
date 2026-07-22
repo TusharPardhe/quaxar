@@ -164,7 +164,9 @@ impl JobType {
     /// Static configuration for this job type. Matches
     /// `JobTypes::instance().get(jt)`.
     pub fn info(self) -> &'static JobTypeInfo {
-        registry().get(&self).expect("every JobType variant has a registered JobTypeInfo")
+        registry()
+            .get(&self)
+            .expect("every JobType variant has a registered JobTypeInfo")
     }
 
     /// Display name. Matches `JobTypes::name(jt)`.
@@ -209,8 +211,20 @@ fn build_registry() -> BTreeMap<JobType, JobTypeInfo> {
     const MAX: usize = usize::MAX;
     let entries: &[(JobType, &str, usize, u64, u64)] = &[
         (JobType::JtPack, "makeFetchPack", 1, 0, 0),
-        (JobType::JtPuboldledger, "publishAcqLedger", 2, 10_000, 15_000),
-        (JobType::JtValidationUt, "untrustedValidation", MAX, 2_000, 5_000),
+        (
+            JobType::JtPuboldledger,
+            "publishAcqLedger",
+            2,
+            10_000,
+            15_000,
+        ),
+        (
+            JobType::JtValidationUt,
+            "untrustedValidation",
+            MAX,
+            2_000,
+            5_000,
+        ),
         (JobType::JtManifest, "manifest", MAX, 2_000, 5_000),
         (JobType::JtTransactionL, "localTransaction", MAX, 100, 500),
         (JobType::JtReplayReq, "ledgerReplayRequest", 10, 250, 1_000),
@@ -219,12 +233,42 @@ fn build_registry() -> BTreeMap<JobType, JobTypeInfo> {
         (JobType::JtReplayTask, "ledgerReplayTask", MAX, 0, 0),
         (JobType::JtLedgerData, "ledgerData", 3, 0, 0),
         (JobType::JtClient, "clientCommand", MAX, 2_000, 5_000),
-        (JobType::JtClientSubscribe, "clientSubscribe", MAX, 2_000, 5_000),
-        (JobType::JtClientFeeChange, "clientFeeChange", MAX, 2_000, 5_000),
-        (JobType::JtClientConsensus, "clientConsensus", MAX, 2_000, 5_000),
-        (JobType::JtClientAcctHist, "clientAccountHistory", MAX, 2_000, 5_000),
+        (
+            JobType::JtClientSubscribe,
+            "clientSubscribe",
+            MAX,
+            2_000,
+            5_000,
+        ),
+        (
+            JobType::JtClientFeeChange,
+            "clientFeeChange",
+            MAX,
+            2_000,
+            5_000,
+        ),
+        (
+            JobType::JtClientConsensus,
+            "clientConsensus",
+            MAX,
+            2_000,
+            5_000,
+        ),
+        (
+            JobType::JtClientAcctHist,
+            "clientAccountHistory",
+            MAX,
+            2_000,
+            5_000,
+        ),
         (JobType::JtClientRpc, "clientRPC", MAX, 2_000, 5_000),
-        (JobType::JtClientWebsocket, "clientWebsocket", MAX, 2_000, 5_000),
+        (
+            JobType::JtClientWebsocket,
+            "clientWebsocket",
+            MAX,
+            2_000,
+            5_000,
+        ),
         (JobType::JtRpc, "RPC", MAX, 0, 0),
         (JobType::JtUpdatePf, "updatePaths", 1, 0, 0),
         (JobType::JtTransaction, "transaction", MAX, 250, 1_000),
@@ -306,9 +350,18 @@ mod tests {
 
     #[test]
     fn non_special_job_types_have_positive_limit() {
-        for jt in [JobType::JtPack, JobType::JtUpdatePf, JobType::JtSweep, JobType::JtNetopCluster, JobType::JtNetopTimer] {
+        for jt in [
+            JobType::JtPack,
+            JobType::JtUpdatePf,
+            JobType::JtSweep,
+            JobType::JtNetopCluster,
+            JobType::JtNetopTimer,
+        ] {
             assert!(!jt.is_special());
-            assert!(jt.limit() > 0 && jt.limit() < usize::MAX, "{jt:?} should have a finite positive limit");
+            assert!(
+                jt.limit() > 0 && jt.limit() < usize::MAX,
+                "{jt:?} should have a finite positive limit"
+            );
         }
     }
 
@@ -330,9 +383,18 @@ mod tests {
 
     #[test]
     fn latency_values_match_reference_table_spot_checks() {
-        assert_eq!(JobType::JtPuboldledger.info().avg_latency, Duration::from_secs(10));
-        assert_eq!(JobType::JtPuboldledger.info().peak_latency, Duration::from_secs(15));
-        assert_eq!(JobType::JtNetopCluster.info().avg_latency, Duration::from_millis(9_999));
+        assert_eq!(
+            JobType::JtPuboldledger.info().avg_latency,
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            JobType::JtPuboldledger.info().peak_latency,
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            JobType::JtNetopCluster.info().avg_latency,
+            Duration::from_millis(9_999)
+        );
         assert_eq!(JobType::JtMissingTxn.limit(), 1_200);
     }
 

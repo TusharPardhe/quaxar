@@ -375,12 +375,12 @@ pub fn require_auth_mpt_with_type(
         .enabled(&protocol::feature_id("SingleAssetVault"))
         || view.rules().enabled(&protocol::feature_id("MPTokensV2")))
         && let Some(account_root) = view.read(account_key)?
-            && (account_root.is_field_present(sf("sfVaultID"))
-                || account_root.is_field_present(sf("sfLoanBrokerID"))
-                || account_root.is_field_present(sf("sfAMMID")))
-        {
-            return Ok(Ter::TES_SUCCESS);
-        }
+        && (account_root.is_field_present(sf("sfVaultID"))
+            || account_root.is_field_present(sf("sfLoanBrokerID"))
+            || account_root.is_field_present(sf("sfAMMID")))
+    {
+        return Ok(Ter::TES_SUCCESS);
+    }
 
     let mptoken_key = mptoken_keylet_from_mptid(mpt_issue.mpt_id(), to_uint160(*account));
     let sle_token = view.read(mptoken_key)?;

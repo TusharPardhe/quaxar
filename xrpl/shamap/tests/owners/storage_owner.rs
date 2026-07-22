@@ -1,9 +1,9 @@
-use parking_lot::Mutex;
 use crate::support::sample_hash;
 use basics::base_uint::Uint256;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::ManualClock;
+use parking_lot::Mutex;
 use shamap::compare::Delta;
 use shamap::family::{
     JournalLevel, MissingNodeReporter, NullFullBelowCache, NullMissingNodeReporter,
@@ -29,17 +29,13 @@ struct RecordingJournal {
 
 impl RecordingJournal {
     fn entries(&self) -> Vec<(JournalLevel, String)> {
-        self.entries
-            .lock()
-            .clone()
+        self.entries.lock().clone()
     }
 }
 
 impl SHAMapJournal for RecordingJournal {
     fn log(&self, level: JournalLevel, message: &str) {
-        self.entries
-            .lock()
-            .push((level, message.to_owned()));
+        self.entries.lock().push((level, message.to_owned()));
     }
 }
 
@@ -53,10 +49,7 @@ struct SharedReporter(Arc<Mutex<RecordingMissingNodeReporter>>);
 
 impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_seq(&self, ref_num: u32, node_hash: Uint256) {
-        self.0
-            .lock()
-            .by_seq
-            .push((ref_num, node_hash));
+        self.0.lock().by_seq.push((ref_num, node_hash));
     }
 
     fn missing_node_acquire_by_hash(&self, _ref_hash: Uint256, _ref_num: u32) {}
@@ -322,8 +315,7 @@ fn shamap_storage_tree_walk_map_with_family_uses_owner_fetch_policy() {
     );
     assert!(!tree.is_full());
     assert!(root.get_child(2).is_none());
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(205, *missing_hash.as_uint256())]
@@ -506,8 +498,7 @@ fn shamap_storage_tree_reports_missing_backed_node_only_once_while_full() {
     assert_eq!(first, TraversalError::MissingNode(missing_hash));
     assert_eq!(second, TraversalError::MissingNode(missing_hash));
     assert!(!tree.is_full());
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert_eq!(reporter.by_seq, vec![(106, *missing_hash.as_uint256())]);
 }
 
@@ -555,8 +546,7 @@ fn shamap_storage_tree_owner_config_updates_fetch_policy() {
     family.with_fetcher(|fetcher| {
         assert_eq!(fetcher.fetches.lock().clone(), vec![missing_hash]);
     });
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(206, *missing_hash.as_uint256())]
@@ -575,8 +565,7 @@ fn shamap_storage_tree_owner_config_updates_fetch_policy() {
             "set_unbacked should stop later family fetch attempts"
         );
     });
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(206, *missing_hash.as_uint256())]

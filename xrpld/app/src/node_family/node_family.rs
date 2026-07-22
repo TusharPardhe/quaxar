@@ -348,6 +348,9 @@ mod tests {
                 tree_cache_size: 262_144,
                 tree_cache_age_seconds: 30,
                 ledger_fetch: 2,
+                sweep_interval_seconds: 10,
+                full_below_target_size: 524_288,
+                full_below_expiration_seconds: 600,
             }
         );
         assert_eq!(
@@ -356,6 +359,9 @@ mod tests {
                 tree_cache_size: 2_097_152,
                 tree_cache_age_seconds: 90,
                 ledger_fetch: 4,
+                sweep_interval_seconds: 60,
+                full_below_target_size: 524_288,
+                full_below_expiration_seconds: 600,
             }
         );
         assert_eq!(
@@ -364,6 +370,9 @@ mod tests {
                 tree_cache_size: 8_388_608,
                 tree_cache_age_seconds: 900,
                 ledger_fetch: 8,
+                sweep_interval_seconds: 120,
+                full_below_target_size: 524_288,
+                full_below_expiration_seconds: 600,
             }
         );
     }

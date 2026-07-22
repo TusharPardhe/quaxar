@@ -1,6 +1,4 @@
-use protocol::confidential_transfer::{
-    EC_GAMAL_ENCRYPTED_TOTAL_LENGTH, EC_SCHNORR_PROOF_LENGTH,
-};
+use protocol::confidential_transfer::{EC_GAMAL_ENCRYPTED_TOTAL_LENGTH, EC_SCHNORR_PROOF_LENGTH};
 use protocol::{NotTec, Ter};
 
 pub const MAX_MPTOKEN_AMOUNT_CONVERT: u64 = 0x7fff_ffff_ffff_ffff;
@@ -93,16 +91,12 @@ pub struct ConfidentialMPTConvertPreclaimFacts {
     pub revealed_amount_valid: bool,
 }
 
-pub fn run_confidential_mpt_convert_preclaim(
-    facts: &ConfidentialMPTConvertPreclaimFacts,
-) -> Ter {
+pub fn run_confidential_mpt_convert_preclaim(facts: &ConfidentialMPTConvertPreclaimFacts) -> Ter {
     if !facts.issuance_exists {
         return Ter::TEC_OBJECT_NOT_FOUND;
     }
 
-    if !facts.issuance_can_hold_confidential_balance
-        || !facts.issuance_has_issuer_encryption_key
-    {
+    if !facts.issuance_can_hold_confidential_balance || !facts.issuance_has_issuer_encryption_key {
         return Ter::TEC_NO_PERMISSION;
     }
 

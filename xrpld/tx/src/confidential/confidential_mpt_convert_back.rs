@@ -93,9 +93,7 @@ pub fn run_confidential_mpt_convert_back_preclaim(
         return Ter::TEC_OBJECT_NOT_FOUND;
     }
 
-    if !facts.issuance_can_hold_confidential_balance
-        || !facts.issuance_has_issuer_encryption_key
-    {
+    if !facts.issuance_can_hold_confidential_balance || !facts.issuance_has_issuer_encryption_key {
         return Ter::TEC_NO_PERMISSION;
     }
 

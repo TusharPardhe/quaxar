@@ -349,7 +349,11 @@ where
         params: JsonValue,
         metadata: RequestMetadata,
     ) -> RpcReply {
-        let hash_key = format!("{}:{}", method, sonic_rs::to_string(&params).unwrap_or_default());
+        let hash_key = format!(
+            "{}:{}",
+            method,
+            sonic_rs::to_string(&params).unwrap_or_default()
+        );
 
         // Atomically check-or-insert to prevent the race where two threads
         // both see an empty slot and both start computing.
@@ -361,9 +365,10 @@ where
 
         if let Some(mut rx) = rx_opt
             && rx.changed().await.is_ok()
-                && let Some(reply) = rx.borrow().clone() {
-                    return reply;
-                }
+            && let Some(reply) = rx.borrow().clone()
+        {
+            return reply;
+        }
 
         let (tx, rx) = tokio::sync::watch::channel(None);
         self.state.in_flight.insert(hash_key.clone(), rx);
@@ -382,15 +387,16 @@ where
                 || self.state.p2_pool.available_permits() == 0;
             if saturated
                 && let Some(status) = &self.config.status_source
-                    && status.server_okay().is_err() {
-                        let reply = RpcReply::error(
-                            rpc::RpcErrorCode::TooBusy,
-                            "Server is too busy. Try again later.",
-                        );
-                        let _ = tx.send(Some(reply.clone()));
-                        self.state.in_flight.remove(&hash_key);
-                        return reply;
-                    }
+                && status.server_okay().is_err()
+            {
+                let reply = RpcReply::error(
+                    rpc::RpcErrorCode::TooBusy,
+                    "Server is too busy. Try again later.",
+                );
+                let _ = tx.send(Some(reply.clone()));
+                self.state.in_flight.remove(&hash_key);
+                return reply;
+            }
         }
 
         let permit = match method.as_str() {
@@ -413,7 +419,7 @@ where
         .expect("dispatcher::dispatch panicked");
 
         drop(permit);
-        
+
         let _ = tx.send(Some(reply.clone()));
         self.state.in_flight.remove(&hash_key);
 
@@ -466,7 +472,10 @@ where
 
         // ETag derived from validated ledger hash — applied post-dispatch
         // only when the response is for the validated ledger.
-        let validated_etag = server.config.status_source.as_ref()
+        let validated_etag = server
+            .config
+            .status_source
+            .as_ref()
             .and_then(|s| s.validated_ledger_hash())
             .map(|h| format!("\"{}\"", h));
         let mut etag_val = None;
@@ -515,26 +524,37 @@ where
         // If ledger_index is absent or "validated", the response is cacheable.
         if let Some(ref etag) = validated_etag {
             let targets_validated = match &params {
-                JsonValue::Array(arr) => arr.first()
-                    .and_then(|p| if let JsonValue::Object(o) = p { o.get("ledger_index") } else { None })
+                JsonValue::Array(arr) => arr
+                    .first()
+                    .and_then(|p| {
+                        if let JsonValue::Object(o) = p {
+                            o.get("ledger_index")
+                        } else {
+                            None
+                        }
+                    })
                     .is_none_or(|v| matches!(v, JsonValue::String(s) if s == "validated")),
-                JsonValue::Object(o) => o.get("ledger_index")
+                JsonValue::Object(o) => o
+                    .get("ledger_index")
                     .is_none_or(|v| matches!(v, JsonValue::String(s) if s == "validated")),
                 _ => true,
             };
             if targets_validated {
                 etag_val = Some(etag.clone());
                 if let Some(if_none_match) = headers.get(axum::http::header::IF_NONE_MATCH)
-                    && if_none_match.as_bytes() == etag.as_bytes() {
-                        return StatusCode::NOT_MODIFIED.into_response();
-                    }
+                    && if_none_match.as_bytes() == etag.as_bytes()
+                {
+                    return StatusCode::NOT_MODIFIED.into_response();
+                }
             }
         }
 
         let method_owned = rpc_request.method.clone();
         let params_owned = params.clone();
         let metadata_owned = metadata.clone();
-        let reply = server.dispatch_async(method_owned, params_owned, metadata_owned).await;
+        let reply = server
+            .dispatch_async(method_owned, params_owned, metadata_owned)
+            .await;
         let body = match reply {
             RpcReply::PreRendered(bytes) => {
                 let mut prefix = Vec::new();
@@ -552,7 +572,7 @@ where
                     prefix.extend_from_slice(b"\"id\":null,");
                 }
                 prefix.extend_from_slice(b"\"result\":");
-                
+
                 let mut out = Vec::with_capacity(prefix.len() + bytes.len() + 1);
                 out.extend_from_slice(&prefix);
                 out.extend_from_slice(&bytes);
@@ -560,7 +580,8 @@ where
                 out
             }
             _ => {
-                let mut response = json_rpc_response(rpc_request.id, rpc_request.jsonrpc.as_deref(), reply);
+                let mut response =
+                    json_rpc_response(rpc_request.id, rpc_request.jsonrpc.as_deref(), reply);
                 // name included, matching the reference implementation behavior.
                 if let Value::Object(resp) = &mut response
                     && let Some(Value::Object(result)) = resp.get_mut("result")
@@ -601,9 +622,11 @@ where
             .into_response();
 
         if let Some(etag) = etag_val
-            && let Ok(etag_header) = axum::http::HeaderValue::from_str(&etag) {
-                res.headers_mut().insert(axum::http::header::ETAG, etag_header);
-            }
+            && let Ok(etag_header) = axum::http::HeaderValue::from_str(&etag)
+        {
+            res.headers_mut()
+                .insert(axum::http::header::ETAG, etag_header);
+        }
 
         res
     }
@@ -627,15 +650,19 @@ where
 
         // ETag derived from validated ledger hash — applied post-dispatch
         // only when the response is for the validated ledger.
-        let validated_etag = server.config.status_source.as_ref()
+        let validated_etag = server
+            .config
+            .status_source
+            .as_ref()
             .and_then(|s| s.validated_ledger_hash())
             .map(|h| format!("\"{}\"", h));
         let etag_val = validated_etag.clone();
         if let Some(ref etag) = validated_etag
             && let Some(if_none_match) = headers.get(axum::http::header::IF_NONE_MATCH)
-                && if_none_match.as_bytes() == etag.as_bytes() {
-                    return StatusCode::NOT_MODIFIED.into_response();
-                }
+            && if_none_match.as_bytes() == etag.as_bytes()
+        {
+            return StatusCode::NOT_MODIFIED.into_response();
+        }
 
         let requests: Vec<Value> = match sonic_rs::from_slice(&body) {
             Ok(v) => v,
@@ -699,7 +726,9 @@ where
             let method_owned = rpc_request.method.clone();
             let params_owned = params.clone();
             let req_metadata_owned = req_metadata.clone();
-            let reply = server.dispatch_async(method_owned, params_owned, req_metadata_owned).await;
+            let reply = server
+                .dispatch_async(method_owned, params_owned, req_metadata_owned)
+                .await;
             responses.push(json_rpc_response(
                 rpc_request.id,
                 rpc_request.jsonrpc.as_deref(),
@@ -716,9 +745,11 @@ where
             .into_response();
 
         if let Some(etag) = etag_val
-            && let Ok(etag_header) = axum::http::HeaderValue::from_str(&etag) {
-                res.headers_mut().insert(axum::http::header::ETAG, etag_header);
-            }
+            && let Ok(etag_header) = axum::http::HeaderValue::from_str(&etag)
+        {
+            res.headers_mut()
+                .insert(axum::http::header::ETAG, etag_header);
+        }
 
         res
     }
@@ -808,7 +839,8 @@ where
                                 rpc::RpcErrorCode::BadSyntax,
                                 rpc::RpcErrorCode::BadSyntax.message(),
                             );
-                            let _ = session.send_text(sonic_rs::to_string(&response).unwrap_or_default());
+                            let _ = session
+                                .send_text(sonic_rs::to_string(&response).unwrap_or_default());
                             continue;
                         }
                     };
@@ -841,8 +873,9 @@ where
                     let method_owned = envelope.method.clone();
                     let params_owned = params.clone();
                     let metadata_owned = metadata.clone();
-                    let is_subscription = method_owned == "subscribe" || method_owned == "unsubscribe";
-                    
+                    let is_subscription =
+                        method_owned == "subscribe" || method_owned == "unsubscribe";
+
                     let reply = if is_subscription {
                         dispatcher.dispatch(RpcRequest {
                             method: &method_owned,
@@ -857,7 +890,8 @@ where
                         // session are handled by the dispatcher synchronously before
                         // returning; passing session: None here is intentional for the
                         // blocking offload — the session ref is used post-dispatch.
-                        self.dispatch_async(method_owned, params_owned, metadata_owned).await
+                        self.dispatch_async(method_owned, params_owned, metadata_owned)
+                            .await
                     };
                     let reply_msg = match reply {
                         RpcReply::PreRendered(bytes) => {
@@ -872,18 +906,21 @@ where
                             }
                             if let Some(id_val) = &envelope.id {
                                 prefix.extend_from_slice(b"\"id\":");
-                                prefix.extend_from_slice(&sonic_rs::to_vec(id_val).unwrap_or_default());
+                                prefix.extend_from_slice(
+                                    &sonic_rs::to_vec(id_val).unwrap_or_default(),
+                                );
                                 prefix.extend_from_slice(b",");
                             } else {
                                 prefix.extend_from_slice(b"\"id\":null,");
                             }
                             if has_explicit_api_version(&params) {
                                 prefix.extend_from_slice(b"\"api_version\":");
-                                prefix.extend_from_slice(metadata.api_version.to_string().as_bytes());
+                                prefix
+                                    .extend_from_slice(metadata.api_version.to_string().as_bytes());
                                 prefix.extend_from_slice(b",");
                             }
                             prefix.extend_from_slice(b"\"result\":");
-                            
+
                             let mut out = Vec::with_capacity(prefix.len() + bytes.len() + 1);
                             out.extend_from_slice(&prefix);
                             out.extend_from_slice(&bytes);
@@ -1150,21 +1187,19 @@ fn websocket_response(
             rpc::RpcErrorCode::Internal,
             error.message,
         ),
-        RpcReply::PreRendered(bytes) => {
-            match sonic_rs::from_slice::<Value>(&bytes) {
-                Ok(mut v) => {
-                    if let Value::Object(obj) = &mut v {
-                        obj.insert("type".to_owned(), Value::String("response".to_owned()));
-                        obj.insert("status".to_owned(), Value::String("success".to_owned()));
-                        if let Some(id) = envelope.id.clone() {
-                            obj.insert("id".to_owned(), id);
-                        }
+        RpcReply::PreRendered(bytes) => match sonic_rs::from_slice::<Value>(&bytes) {
+            Ok(mut v) => {
+                if let Value::Object(obj) = &mut v {
+                    obj.insert("type".to_owned(), Value::String("response".to_owned()));
+                    obj.insert("status".to_owned(), Value::String("success".to_owned()));
+                    if let Some(id) = envelope.id.clone() {
+                        obj.insert("id".to_owned(), id);
                     }
-                    v
                 }
-                Err(_) => Value::Null
+                v
             }
-        }
+            Err(_) => Value::Null,
+        },
     }
 }
 

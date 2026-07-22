@@ -60,6 +60,14 @@ pub fn do_payment<V: ledger::ApplyView>(
         None
     };
 
+    // rippled Payment::preflight rejects a nonpositive destination amount and
+    // a present nonpositive SendMax before any path/flow arithmetic.  Without
+    // this boundary an invalid issuer-source partial payment can enter
+    // RippleCalc with a zero required input and reach a raw divide-by-zero.
+    if dst_amount.signum() <= 0 || send_max.as_ref().is_some_and(|amount| amount.signum() <= 0) {
+        return Ter::TEM_BAD_AMOUNT;
+    }
+
     let partial_payment_allowed = (tx_flags & TF_PARTIAL_PAYMENT) != 0;
     let limit_quality = (tx_flags & TF_LIMIT_QUALITY) != 0;
     let default_paths_allowed = (tx_flags & TF_NO_RIPPLE_DIRECT) == 0;
@@ -355,9 +363,8 @@ fn is_direct_iou_payment(
     if !one_is_issuer {
         return false;
     }
-    send_max.is_some_and(|send_max| {
-        send_max.asset() == dst_amount.asset() && send_max == dst_amount
-    })
+    send_max
+        .is_some_and(|send_max| send_max.asset() == dst_amount.asset() && send_max == dst_amount)
 }
 
 fn do_direct_iou_payment<V: ledger::ApplyView>(

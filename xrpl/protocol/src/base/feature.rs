@@ -88,7 +88,11 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     ),
     RegisteredFeature::new("fixBatchInnerSigs", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("LendingProtocol", false, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("LendingProtocolV1_1", false, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new(
+        "LendingProtocolV1_1",
+        false,
+        RegisteredFeatureVote::DefaultNo,
+    ),
     RegisteredFeature::new(
         "PermissionDelegationV1_1",
         false,

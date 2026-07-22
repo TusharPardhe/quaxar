@@ -43,7 +43,8 @@ where
     A: RclValidationsAdapter,
     A::Ledger: consensus::model::TrieLedger<Seq = u32, Id = Uint256>,
     A::Validation: consensus::rcl_support::ValidationT<NodeKey = PublicKey>,
-    <A::Validation as consensus::rcl_support::ValidationT>::Wrapped: consensus::rcl::AsValidationKey<A>,
+    <A::Validation as consensus::rcl_support::ValidationT>::Wrapped:
+        consensus::rcl::AsValidationKey<A>,
 {
     fn set_seq_to_keep(&mut self, low: u32, high: u32) {
         RclValidations::<A>::set_seq_to_keep(self, low, high);

@@ -554,13 +554,7 @@ const HANDLERS: &[RpcHandlerSpec] = &[
         1,
         u32::MAX,
     ),
-    RpcHandlerSpec::new(
-        "version",
-        Role::User,
-        HandlerCondition::None,
-        1,
-        u32::MAX,
-    ),
+    RpcHandlerSpec::new("version", Role::User, HandlerCondition::None, 1, u32::MAX),
 ];
 
 pub fn handler_specs() -> &'static [RpcHandlerSpec] {

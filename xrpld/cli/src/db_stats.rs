@@ -90,9 +90,10 @@ fn find_nudb_path(conf: Option<&str>) -> Option<String> {
         }
         if in_node_db
             && let Some(val) = trimmed.strip_prefix("path")
-                && let Some(val) = val.trim().strip_prefix('=') {
-                    return Some(val.trim().to_string());
-                }
+            && let Some(val) = val.trim().strip_prefix('=')
+        {
+            return Some(val.trim().to_string());
+        }
     }
     None
 }

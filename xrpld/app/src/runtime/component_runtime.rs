@@ -232,7 +232,10 @@ impl AppConsensusRuntime {
 
     /// Take the runner for the strand thread to own. Called exactly once.
     pub fn take_runner(&self) -> Option<crate::consensus::rcl_consensus::AppConsensus> {
-        self.runner_storage.lock().expect("runner_storage mutex").take()
+        self.runner_storage
+            .lock()
+            .expect("runner_storage mutex")
+            .take()
     }
 
     /// Set the command sender (strand thread provides this after starting).
@@ -248,7 +251,11 @@ impl AppConsensusRuntime {
         prev_ledger: consensus::RclCxLedger,
     ) {
         if let Some(tx) = self.cmd_tx.lock().expect("cmd_tx mutex").as_ref() {
-            let _ = tx.send(ConsensusCommand::StartRound { now, prev_ledger_id, prev_ledger });
+            let _ = tx.send(ConsensusCommand::StartRound {
+                now,
+                prev_ledger_id,
+                prev_ledger,
+            });
         }
     }
 
@@ -262,10 +269,7 @@ impl AppConsensusRuntime {
     /// Set the map_complete receiver (from InboundTransactions channel).
     pub fn set_map_complete_receiver(
         &self,
-        rx: std::sync::mpsc::Receiver<(
-            basics::base_uint::Uint256,
-            Arc<shamap::sync::SyncTree>,
-        )>,
+        rx: std::sync::mpsc::Receiver<(basics::base_uint::Uint256, Arc<shamap::sync::SyncTree>)>,
     ) {
         *self.map_complete_rx.lock().expect("map_complete_rx mutex") = Some(rx);
     }
@@ -273,13 +277,12 @@ impl AppConsensusRuntime {
     /// Take the map_complete receiver (for the strand thread to own).
     pub fn take_map_complete_receiver(
         &self,
-    ) -> Option<
-        std::sync::mpsc::Receiver<(
-            basics::base_uint::Uint256,
-            Arc<shamap::sync::SyncTree>,
-        )>,
-    > {
-        self.map_complete_rx.lock().expect("map_complete_rx mutex").take()
+    ) -> Option<std::sync::mpsc::Receiver<(basics::base_uint::Uint256, Arc<shamap::sync::SyncTree>)>>
+    {
+        self.map_complete_rx
+            .lock()
+            .expect("map_complete_rx mutex")
+            .take()
     }
 
     /// The current round's phase, readable from any thread.

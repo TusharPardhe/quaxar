@@ -507,9 +507,9 @@ mod tests {
     use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::ManualClock;
+    use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use parking_lot::Mutex;
     use time::Duration;
 
     #[derive(Debug, Default)]
@@ -525,9 +525,7 @@ mod tests {
 
     impl SHAMapJournal for RecordingJournal {
         fn log(&self, level: JournalLevel, message: &str) {
-            self.entries
-                .lock()
-                .push((level, message.to_owned()));
+            self.entries.lock().push((level, message.to_owned()));
         }
     }
 

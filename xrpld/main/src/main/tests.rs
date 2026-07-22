@@ -1,21 +1,18 @@
 use super::{
-    AcqMsg, AcqRegistry, CatchupResourceProfile, CompletedLedgerAcceptance,
-    LedgerPublishAdvance,
+    AcqMsg, AcqRegistry, CatchupResourceProfile, CompletedLedgerAcceptance, LedgerPublishAdvance,
     PEERFINDER_MAX_CONNECT_ATTEMPTS, PEERFINDER_MAX_HOPS, PEERFINDER_NUMBER_OF_ENDPOINTS,
-    PEERFINDER_RECENT_ATTEMPT_DURATION,
-    bind_server_runtime_into_root, bootstrap_acquire_budget_available, build_endpoint_broadcast,
-    candidate_ledger_for_seq, candidate_reference_hash_from_reference_ledger,
-    classify_completed_ledger_acceptance, classify_publish_advance,
-    cold_bootstrap_persisted_validated_target, command_suggestions, current_ledger_is_fresh,
-    first_command_like_arg, hash_for_seq_from_reference_ledger,
+    PEERFINDER_RECENT_ATTEMPT_DURATION, bind_server_runtime_into_root,
+    bootstrap_acquire_budget_available, build_endpoint_broadcast, candidate_ledger_for_seq,
+    candidate_reference_hash_from_reference_ledger, classify_completed_ledger_acceptance,
+    classify_publish_advance, cold_bootstrap_persisted_validated_target, command_suggestions,
+    current_ledger_is_fresh, first_command_like_arg, hash_for_seq_from_reference_ledger,
     ledger_fetch_limit_override, node_store_usage_path, path_size_bytes, peerfinder_canonical_ip,
     peerfinder_outbound_target, preferred_closed_ledger_hash,
     preferred_closed_ledger_hash_from_hashes, promote_current_ledger, prune_known_endpoints,
     prune_recent_connect_attempts, remember_known_endpoint, select_autoconnect_endpoints,
     select_bootcache_endpoints, select_consensus_acquisition_target,
     select_post_acquisition_operating_mode, select_target_seq,
-    should_attempt_completed_ledger_promotion,
-    should_retry_publish_after_completed_history,
+    should_attempt_completed_ledger_promotion, should_retry_publish_after_completed_history,
 };
 use app::{AppBootstrapOptions, build_bootstrap_root, load_basic_config_file};
 use basics::base_uint::Uint256;
@@ -385,7 +382,6 @@ fn select_consensus_acquisition_target_prefers_latest_seq_for_large_catchup_gaps
         Some((newer, 320))
     );
 }
-
 
 #[test]
 fn hash_for_seq_from_reference_ledger_walks_back_from_completed_higher_ledger() {
@@ -1041,4 +1037,3 @@ fn ledger_fetch_limit_override_parses_optional_expert_config() {
         "Configured ledger_acquisition.ledger_fetch_limit is invalid"
     );
 }
-

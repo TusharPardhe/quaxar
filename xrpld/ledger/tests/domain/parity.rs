@@ -1,4 +1,3 @@
-use parking_lot::Mutex;
 use basics::base_uint::{Uint160, Uint256};
 use basics::chrono::NetClockTimePoint;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
@@ -13,6 +12,7 @@ use ledger::{
     get_enabled_amendments, get_majority_amendments, get_next_ledger_time_resolution,
     is_flag_ledger, is_voting_ledger, round_close_time,
 };
+use parking_lot::Mutex;
 use protocol::{
     ConstructorAccountRootEntry, ConstructorAmendmentsEntry, ConstructorFeeSettingsEntry,
     DecodedDisabledValidator, DecodedNegativeUnlEntry, FeatureSet, Keylet, LedgerEntryType,
@@ -462,17 +462,11 @@ struct SharedReporter(Arc<Mutex<RecordingMissingNodeReporter>>);
 
 impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_seq(&self, ref_num: u32, node_hash: Uint256) {
-        self.0
-            .lock()
-            .by_seq
-            .push((ref_num, node_hash));
+        self.0.lock().by_seq.push((ref_num, node_hash));
     }
 
     fn missing_node_acquire_by_hash(&self, ref_hash: Uint256, ref_num: u32) {
-        self.0
-            .lock()
-            .by_hash
-            .push((ref_hash, ref_num));
+        self.0.lock().by_hash.push((ref_hash, ref_num));
     }
 }
 
@@ -484,29 +478,21 @@ struct RecordingLedgerJournal {
 
 impl RecordingLedgerJournal {
     fn infos(&self) -> Vec<String> {
-        self.infos
-            .lock()
-            .clone()
+        self.infos.lock().clone()
     }
 
     fn warns(&self) -> Vec<String> {
-        self.warns
-            .lock()
-            .clone()
+        self.warns.lock().clone()
     }
 }
 
 impl LedgerJournal for RecordingLedgerJournal {
     fn info(&self, message: &str) {
-        self.infos
-            .lock()
-            .push(message.to_owned());
+        self.infos.lock().push(message.to_owned());
     }
 
     fn warn(&self, message: &str) {
-        self.warns
-            .lock()
-            .push(message.to_owned());
+        self.warns.lock().push(message.to_owned());
     }
 }
 
@@ -684,11 +670,11 @@ fn ledger_walk_ledger_serial_matches_current_cpp_root_fetch_and_logging_roles() 
     ledger.set_full();
 
     assert!(!ledger.walk_ledger_with_family(&journal, false, &family));
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![account_hash, tx_hash]));
+    family.with_fetcher(|fetcher| {
+        assert_eq!(fetcher.fetches.lock().clone(), vec![account_hash, tx_hash])
+    });
     assert_eq!(
-        reporter
-            .lock()
-            .by_seq,
+        reporter.lock().by_seq,
         vec![
             (600, *account_hash.as_uint256()),
             (600, *tx_hash.as_uint256())
@@ -752,7 +738,9 @@ fn ledger_walk_ledger_parallel_returns_state_walk_result_and_skips_tx_tree() {
     let journal = RecordingLedgerJournal::default();
 
     assert!(ledger.walk_ledger_with_family(&journal, true, &family));
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![state_missing_hash]));
+    family.with_fetcher(|fetcher| {
+        assert_eq!(fetcher.fetches.lock().clone(), vec![state_missing_hash])
+    });
     assert!(journal.infos().is_empty());
     assert!(journal.warns().is_empty());
 }
@@ -797,7 +785,9 @@ fn ledger_walk_ledger_serial_checks_tx_tree_after_missing_account_root() {
     let journal = RecordingLedgerJournal::default();
 
     assert!(!ledger.walk_ledger_with_family(&journal, false, &family));
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![account_hash, tx_hash]));
+    family.with_fetcher(|fetcher| {
+        assert_eq!(fetcher.fetches.lock().clone(), vec![account_hash, tx_hash])
+    });
     assert_eq!(
         journal.infos(),
         vec![format!(
@@ -1586,7 +1576,9 @@ fn ledger_load_immutable_with_family_warns_and_acquires_by_hash_only_after_faile
     assert_eq!(ledger.tx_map().state(), SyncState::Immutable);
     assert_eq!(ledger.state_map().state(), SyncState::Immutable);
     assert_eq!(ledger.header().hash, expected_header_hash);
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![tx_hash, account_hash]));
+    family.with_fetcher(|fetcher| {
+        assert_eq!(fetcher.fetches.lock().clone(), vec![tx_hash, account_hash])
+    });
     assert_eq!(
         journal.warns(),
         vec![
@@ -1594,8 +1586,7 @@ fn ledger_load_immutable_with_family_warns_and_acquires_by_hash_only_after_faile
             "Don't have state data root for ledger801".to_owned(),
         ]
     );
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert_eq!(reporter.by_seq, Vec::<(u32, Uint256)>::new());
     assert_eq!(
         reporter.by_hash,
@@ -1897,8 +1888,7 @@ fn ledger_load_immutable_with_family_and_config_or_none_returns_none_for_failed_
     .expect("option load wrapper should preserve decode errors only");
 
     assert!(ledger.is_none());
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert_eq!(
         reporter.by_hash,
         vec![(*expected_header_hash.as_uint256(), 806)]
@@ -2685,8 +2675,7 @@ fn ledger_load_immutable_with_family_and_setup_marks_failed_setup_ctor() {
         );
     });
     assert!(journal.warns().is_empty());
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert_eq!(reporter.by_seq, Vec::<(u32, Uint256)>::new());
     assert_eq!(
         reporter.by_hash,

@@ -50,7 +50,10 @@ pub trait AccountLinesSource: LedgerLookupSource {
         ledger: &LedgerLookupLedger,
         entries: &[Uint256],
     ) -> Vec<Option<STLedgerEntry>> {
-        entries.iter().map(|e| self.read_child_entry(ledger, *e)).collect()
+        entries
+            .iter()
+            .map(|e| self.read_child_entry(ledger, *e))
+            .collect()
     }
 }
 

@@ -342,13 +342,12 @@ pub fn run(url: &str) {
                         }
                     }
                     KeyCode::Down => {
-                        if !matches.is_empty()
-                            && selected + 1 < matches.len() {
-                                selected += 1;
-                                if selected >= scroll_offset + MAX_VISIBLE {
-                                    scroll_offset = selected + 1 - MAX_VISIBLE;
-                                }
+                        if !matches.is_empty() && selected + 1 < matches.len() {
+                            selected += 1;
+                            if selected >= scroll_offset + MAX_VISIBLE {
+                                scroll_offset = selected + 1 - MAX_VISIBLE;
                             }
+                        }
                     }
                     KeyCode::Up => {
                         if !matches.is_empty() {

@@ -513,7 +513,10 @@ pub fn get_mpt_issuance_create_flags() -> &'static FlagMap {
             ("tfMPTCanTrade", tfMPTCanTrade),
             ("tfMPTCanTransfer", tfMPTCanTransfer),
             ("tfMPTCanClawback", tfMPTCanClawback),
-            ("tfMPTCanHoldConfidentialBalance", tfMPTCanHoldConfidentialBalance),
+            (
+                "tfMPTCanHoldConfidentialBalance",
+                tfMPTCanHoldConfidentialBalance,
+            ),
         ])
     })
 }

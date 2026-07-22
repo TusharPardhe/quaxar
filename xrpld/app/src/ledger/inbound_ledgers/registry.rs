@@ -177,15 +177,29 @@ impl InboundLedgers {
             return entry.completed_ledger.clone();
         }
 
-        // rippled has NO capacity limit on InboundLedgers — it creates entries
-        // for every unique hash requested. Memory is bounded by the 60s sweep
-        // (entries go idle when no longer touched). The only backpressure is
-        // indirect via job queue limits and peer capacity.
-        //
-        // Previously quaxar had a MAX_CONCURRENT=64 cap here which caused
-        // permanent stalls: entries got keep-alived by the timer thread,
-        // never went idle, filled the cap, and new consensus-requested
-        // ledgers were rejected indefinitely.
+        // Cold bootstrap must complete one account-state acquisition before
+        // following later validation tips. Without this admission guard, every
+        // newly validated hash starts another full-state download while the
+        // node has no completed ledger, splitting the same peers and store
+        // across moving targets indefinitely. Once any ledger is complete,
+        // normal hash-deduplicated consensus acquisition resumes.
+        let has_completed_ledger = inner
+            .entries
+            .values()
+            .any(|entry| entry.state.completed.load(Ordering::Acquire));
+        let has_active_acquisition = inner.entries.values().any(|entry| {
+            !entry.failed
+                && !entry.state.failed.load(Ordering::Acquire)
+                && !entry.state.completed.load(Ordering::Acquire)
+        });
+        if reason == AcquireReason::Consensus && !has_completed_ledger && has_active_acquisition {
+            tracing::debug!(
+                target: "inbound_ledger",
+                %hash,
+                "acquire: deferred moving consensus target during cold bootstrap"
+            );
+            return None;
+        }
 
         // Validate required resources
         let ns = {
@@ -270,8 +284,8 @@ impl InboundLedgers {
         packet: InboundLedgerPacket,
     ) -> bool {
         let state = {
-            let inner = self.inner.lock().expect("inbound_ledgers lock");
-            let Some(entry) = inner.entries.get(hash) else {
+            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let Some(entry) = inner.entries.get_mut(hash) else {
                 tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: registry miss");
                 return false;
             };
@@ -290,6 +304,10 @@ impl InboundLedgers {
                 );
                 return false;
             }
+            // An accepted response proves this acquisition remains active.
+            // Keep it through the sweep window while its potentially long
+            // account-state download is making progress.
+            entry.last_touched = Instant::now();
             Arc::clone(&entry.state)
         };
 

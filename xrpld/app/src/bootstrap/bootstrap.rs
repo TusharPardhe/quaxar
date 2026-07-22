@@ -7,9 +7,9 @@
 
 use crate::{
     ApplicationRoot, ApplicationRootOptions, BootstrapOverlayHandoff, DescriptorLimitProvider,
-    LedgerReplay, MainRuntime, SHAMapStoreComponent,
-    SHAMapStoreComponentRuntime, SHAMapStoreHealthRuntime, SHAMapStoreOperatingMode,
-    SHAMapStoreRuntime, adjust_descriptor_limit, bootstrap_shamap_store,
+    LedgerReplay, MainRuntime, SHAMapStoreComponent, SHAMapStoreComponentRuntime,
+    SHAMapStoreHealthRuntime, SHAMapStoreOperatingMode, SHAMapStoreRuntime,
+    adjust_descriptor_limit, bootstrap_shamap_store,
 };
 use basics::base_uint::Uint256;
 use basics::basic_config::{BasicConfig, IniFileSections};
@@ -21,8 +21,8 @@ use ledger::{
 };
 use nodestore::{FetchType, ManagerImp, NodeObjectType as NodeStoreObjectType};
 use protocol::{
-    JsonValue, REGISTERED_FEATURES, STLedgerEntry, STParsedJSONObject, STTx,
-    SerialIter, TxMeta, feature_id,
+    JsonValue, REGISTERED_FEATURES, STLedgerEntry, STParsedJSONObject, STTx, SerialIter, TxMeta,
+    feature_id,
 };
 use rusqlite::{OptionalExtension, params};
 use shamap::family::{
@@ -826,8 +826,7 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
         );
 
         let stop_requested = Arc::new(AtomicBool::new(false));
-        let stop_thread =
-            spawn_shutdown_watcher(Arc::clone(&runtime), Arc::clone(&stop_requested));
+        let stop_thread = spawn_shutdown_watcher(Arc::clone(&runtime), Arc::clone(&stop_requested));
 
         runtime.run();
 
@@ -948,7 +947,8 @@ fn run_start_mode_consensus_loop(
 
     // Consensus event channel for validations and ledger promotions
     let (event_tx, event_rx) = crate::consensus::driver::consensus_event_channel();
-    let (shared_completed_tx, shared_completed_rx) = std::sync::mpsc::channel::<Arc<ledger::Ledger>>();
+    let (shared_completed_tx, shared_completed_rx) =
+        std::sync::mpsc::channel::<Arc<ledger::Ledger>>();
 
     let lm_rt_for_shared_inbound = runtime.root().ledger_master_runtime();
     // Use the app's shared TreeNodeCache (properly sized per node_size profile,
@@ -1016,9 +1016,9 @@ fn run_start_mode_consensus_loop(
                 .inbound_transactions()
                 .lock()
                 .expect("inbound_transactions mutex");
-            guard.set_peer_set_builder(Arc::new(
-                overlay::OverlayPeerSetBuilder::new(overlay_rt.overlay()),
-            ));
+            guard.set_peer_set_builder(Arc::new(overlay::OverlayPeerSetBuilder::new(
+                overlay_rt.overlay(),
+            )));
         }
         shared_inbound.set_overlay_rt(overlay_rt);
     }
@@ -1054,7 +1054,9 @@ fn run_start_mode_consensus_loop(
                         break;
                     }
                     let root = fwd_runtime.root();
-                    let Some(overlay_rt) = root.overlay_runtime() else { continue; };
+                    let Some(overlay_rt) = root.overlay_runtime() else {
+                        continue;
+                    };
                     let validations = overlay_rt.overlay().take_validations();
                     for queued in validations {
                         if fwd_event_tx
@@ -1072,30 +1074,33 @@ fn run_start_mode_consensus_loop(
     // Transaction relay router
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         let router_root = runtime.root().clone();
-        overlay_rt.overlay().queued_inbound().set_transaction_router(Box::new(move |_peer_id, message| {
-            let mut serial = protocol::SerialIter::new(&message.message.raw_transaction);
-            let st_tx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                protocol::STTx::from_serial_iter(&mut serial)
-            })) {
-                Ok(tx) => tx,
-                Err(_) => return,
-            };
-            let st_tx = Arc::new(st_tx);
-            let mut transaction: crate::SharedTransaction = Arc::new(std::sync::Mutex::new(
-                crate::tx_queue::transaction::Transaction::new(Arc::clone(&st_tx)),
-            ));
-            if let Some(network_ops_runtime) = router_root.network_ops_runtime() {
-                let _ = network_ops_runtime.process_transaction(
-                    &mut transaction,
-                    false,
-                    false,
-                    false,
-                    || false,
-                    || {},
-                );
-                router_root.notify_tx_pending();
-            }
-        }));
+        overlay_rt
+            .overlay()
+            .queued_inbound()
+            .set_transaction_router(Box::new(move |_peer_id, message| {
+                let mut serial = protocol::SerialIter::new(&message.message.raw_transaction);
+                let st_tx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    protocol::STTx::from_serial_iter(&mut serial)
+                })) {
+                    Ok(tx) => tx,
+                    Err(_) => return,
+                };
+                let st_tx = Arc::new(st_tx);
+                let mut transaction: crate::SharedTransaction = Arc::new(std::sync::Mutex::new(
+                    crate::tx_queue::transaction::Transaction::new(Arc::clone(&st_tx)),
+                ));
+                if let Some(network_ops_runtime) = router_root.network_ops_runtime() {
+                    let _ = network_ops_runtime.process_transaction(
+                        &mut transaction,
+                        false,
+                        false,
+                        false,
+                        || false,
+                        || {},
+                    );
+                    router_root.notify_tx_pending();
+                }
+            }));
     }
 
     // LedgerData router
@@ -1103,76 +1108,86 @@ fn run_start_mode_consensus_loop(
         let router_root = runtime.root().clone();
         let router_overlay = overlay_rt.overlay();
         let router_shared_inbound = Arc::clone(&shared_inbound);
-        overlay_rt.overlay().queued_inbound().set_ledger_data_router(Box::new(move |peer_id, message| {
-            use overlay::Overlay;
+        overlay_rt
+            .overlay()
+            .queued_inbound()
+            .set_ledger_data_router(Box::new(move |peer_id, message| {
+                use overlay::Overlay;
 
-            // Request-cookie relay (matching rippled PeerImp::onMessage TMLedgerData)
-            if let Some(cookie) = message.request_cookie {
-                // Forward to the peer that originally requested this data
-                if let Some(requesting_peer) = router_overlay.find_peer_by_short_id(cookie) {
-                    let mut fwd = message.clone();
-                    fwd.request_cookie = None; // Clear cookie on relay
-                    let relay_msg = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(fwd));
-                    requesting_peer.send(overlay::Message::new(relay_msg, None));
+                // Request-cookie relay (matching rippled PeerImp::onMessage TMLedgerData)
+                if let Some(cookie) = message.request_cookie {
+                    // Forward to the peer that originally requested this data
+                    if let Some(requesting_peer) = router_overlay.find_peer_by_short_id(cookie) {
+                        let mut fwd = message.clone();
+                        fwd.request_cookie = None; // Clear cookie on relay
+                        let relay_msg = overlay::ProtocolMessage::new(
+                            overlay::ProtocolPayload::LedgerData(fwd),
+                        );
+                        requesting_peer.send(overlay::Message::new(relay_msg, None));
+                    }
+                    return; // Don't process relayed responses locally
                 }
-                return; // Don't process relayed responses locally
-            }
 
-            let Some(hash) = Uint256::from_slice(&message.ledger_hash) else { return; };
-            match message.r#type {
-                3 => {
-                    let peer = router_overlay.find_peer_by_short_id(peer_id);
-                    let mut guard = router_root
-                        .inbound_transactions()
-                        .lock()
-                        .expect("inbound_transactions mutex");
-                    let _status = guard.got_data(hash, peer, &message);
-                    if let Some(acquire) = guard.acquire(hash) {
-                        if acquire.is_complete() {
-                            let set = Arc::new(acquire.map().clone());
-                            guard.give_set(hash, set, true);
+                let Some(hash) = Uint256::from_slice(&message.ledger_hash) else {
+                    return;
+                };
+                match message.r#type {
+                    3 => {
+                        let peer = router_overlay.find_peer_by_short_id(peer_id);
+                        let mut guard = router_root
+                            .inbound_transactions()
+                            .lock()
+                            .expect("inbound_transactions mutex");
+                        let _status = guard.got_data(hash, peer, &message);
+                        if let Some(acquire) = guard.acquire(hash) {
+                            if acquire.is_complete() {
+                                let set = Arc::new(acquire.map().clone());
+                                guard.give_set(hash, set, true);
+                            }
                         }
                     }
-                }
-                0 | 1 | 2 => {
-                    let packet_type = match message.r#type {
-                        0 => ledger::InboundLedgerDataType::Base,
-                        1 => ledger::InboundLedgerDataType::TransactionNode,
-                        _ => ledger::InboundLedgerDataType::StateNode,
-                    };
-                    let nodes: Vec<ledger::InboundLedgerNodeData> = message
-                        .nodes
-                        .iter()
-                        .map(|n| ledger::InboundLedgerNodeData::new(
-                            n.nodeid.clone(),
-                            n.nodedata.clone(),
-                        ))
-                        .collect();
-                    let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
-                    let stale_packet = (packet.packet_type == ledger::InboundLedgerDataType::StateNode)
-                        .then(|| packet.clone());
-                    let routed = router_shared_inbound.route_response_with_seq(
-                        &hash,
-                        peer_id as u64,
-                        Some(message.ledger_seq),
-                        packet,
-                    );
-                    if !routed {
-                        if let Some(packet) = stale_packet {
-                            let _ = router_shared_inbound.stash_stale_packet(&packet);
-                        }
-                        // Peer sent unsolicited ledger data — charge them
-                        if let Some(peer) = router_overlay.find_peer_by_short_id(peer_id) {
-                            peer.charge(
-                                resource::Charge::new(20, "unsolicited ledger data"),
-                                "Unsolicited TmLedgerData response".to_owned(),
-                            );
+                    0 | 1 | 2 => {
+                        let packet_type = match message.r#type {
+                            0 => ledger::InboundLedgerDataType::Base,
+                            1 => ledger::InboundLedgerDataType::TransactionNode,
+                            _ => ledger::InboundLedgerDataType::StateNode,
+                        };
+                        let nodes: Vec<ledger::InboundLedgerNodeData> = message
+                            .nodes
+                            .iter()
+                            .map(|n| {
+                                ledger::InboundLedgerNodeData::new(
+                                    n.nodeid.clone(),
+                                    n.nodedata.clone(),
+                                )
+                            })
+                            .collect();
+                        let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
+                        let stale_packet = (packet.packet_type
+                            == ledger::InboundLedgerDataType::StateNode)
+                            .then(|| packet.clone());
+                        let routed = router_shared_inbound.route_response_with_seq(
+                            &hash,
+                            peer_id as u64,
+                            Some(message.ledger_seq),
+                            packet,
+                        );
+                        if !routed {
+                            if let Some(packet) = stale_packet {
+                                let _ = router_shared_inbound.stash_stale_packet(&packet);
+                            }
+                            // Peer sent unsolicited ledger data — charge them
+                            if let Some(peer) = router_overlay.find_peer_by_short_id(peer_id) {
+                                peer.charge(
+                                    resource::Charge::new(20, "unsolicited ledger data"),
+                                    "Unsolicited TmLedgerData response".to_owned(),
+                                );
+                            }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
-            }
-        }));
+            }));
         let drained = overlay_rt
             .overlay()
             .queued_inbound()
@@ -1184,8 +1199,12 @@ fn run_start_mode_consensus_loop(
 
     // Batch apply thread (matches rippled's JtBatch worker)
     let batch_root = runtime.root().clone();
-    let batch_overlay = runtime.root().overlay_runtime().map(|rt| rt.overlay().clone());
-    let batch_network_ops: Option<Arc<crate::network::network_ops_runtime::AppNetworkOpsRuntime>> = runtime.root().network_ops_runtime();
+    let batch_overlay = runtime
+        .root()
+        .overlay_runtime()
+        .map(|rt| rt.overlay().clone());
+    let batch_network_ops: Option<Arc<crate::network::network_ops_runtime::AppNetworkOpsRuntime>> =
+        runtime.root().network_ops_runtime();
     let batch_stop = Arc::clone(&stop);
     let _batch_thread = std::thread::Builder::new()
         .name("tx-batch-apply".to_string())
@@ -1200,19 +1219,29 @@ fn run_start_mode_consensus_loop(
                         let relayed = overlay.take_transactions();
                         if let Some(ref network_ops_rt) = batch_network_ops {
                             for message in relayed {
-                                let mut serial = protocol::SerialIter::new(&message.message.raw_transaction);
-                                let st_tx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    protocol::STTx::from_serial_iter(&mut serial)
-                                })) {
-                                    Ok(tx) => tx,
-                                    Err(_) => continue,
-                                };
+                                let mut serial =
+                                    protocol::SerialIter::new(&message.message.raw_transaction);
+                                let st_tx =
+                                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                        || protocol::STTx::from_serial_iter(&mut serial),
+                                    )) {
+                                        Ok(tx) => tx,
+                                        Err(_) => continue,
+                                    };
                                 let st_tx = Arc::new(st_tx);
-                                let mut transaction: crate::SharedTransaction = Arc::new(std::sync::Mutex::new(
-                                    crate::tx_queue::transaction::Transaction::new(Arc::clone(&st_tx)),
-                                ));
+                                let mut transaction: crate::SharedTransaction =
+                                    Arc::new(std::sync::Mutex::new(
+                                        crate::tx_queue::transaction::Transaction::new(Arc::clone(
+                                            &st_tx,
+                                        )),
+                                    ));
                                 let _ = network_ops_rt.process_transaction(
-                                    &mut transaction, false, false, false, || false, || {},
+                                    &mut transaction,
+                                    false,
+                                    false,
+                                    false,
+                                    || false,
+                                    || {},
                                 );
                             }
                         }
@@ -1222,12 +1251,15 @@ fn run_start_mode_consensus_loop(
                     // avoid racing the open ledger capture. Matches rippled's
                     // single-strand guarantee where the batch-apply path and
                     // timerEntry (which calls onClose) cannot interleave.
-                    let _close_guard = batch_root.close_gate().lock()
+                    let _close_guard = batch_root
+                        .close_gate()
+                        .lock()
                         .expect("close_gate mutex must not be poisoned");
                     let report = batch_root.apply_network_ops_pending_to_open_ledger();
                     drop(_close_guard);
                     let applied = report.as_ref().map_or(0, |r| r.entries.len());
-                    let overlay_empty = batch_overlay.as_ref()
+                    let overlay_empty = batch_overlay
+                        .as_ref()
                         .map_or(true, |o| o.queued_inbound().transaction_count() == 0);
                     if applied == 0 && overlay_empty {
                         break;
@@ -1240,18 +1272,24 @@ fn run_start_mode_consensus_loop(
     // Wire instant-wake notification for relay
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         let notify_root = runtime.root().clone();
-        overlay_rt.overlay().queued_inbound().set_transaction_notify(Box::new(move || {
-            notify_root.notify_tx_pending();
-        }));
+        overlay_rt
+            .overlay()
+            .queued_inbound()
+            .set_transaction_notify(Box::new(move || {
+                notify_root.notify_tx_pending();
+            }));
     }
 
     // Wire instant-wake notification for proposals arriving from peers.
     // This removes the 50ms poll latency in the consensus strand loop.
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         let notify_root = runtime.root().clone();
-        overlay_rt.overlay().queued_inbound().set_proposal_notify(Box::new(move || {
-            notify_root.notify_consensus_event();
-        }));
+        overlay_rt
+            .overlay()
+            .queued_inbound()
+            .set_proposal_notify(Box::new(move || {
+                notify_root.notify_consensus_event();
+            }));
     }
 
     // ===================================================================
@@ -1276,9 +1314,12 @@ fn run_start_mode_consensus_loop(
     // ===================================================================
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         let prop_tx = strand.proposal_tx.clone();
-        overlay_rt.overlay().queued_inbound().set_proposal_router(Box::new(move |proposal| {
-            let _ = prop_tx.send(proposal);
-        }));
+        overlay_rt
+            .overlay()
+            .queued_inbound()
+            .set_proposal_router(Box::new(move |proposal| {
+                let _ = prop_tx.send(proposal);
+            }));
     }
 
     // ===================================================================
@@ -1289,23 +1330,26 @@ fn run_start_mode_consensus_loop(
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         let router_root = runtime.root().clone();
         let router_overlay_rt = Arc::clone(&overlay_rt);
-        overlay_rt.overlay().queued_inbound().set_get_ledger_router(Box::new(move |peer_id, message| {
-            let req = overlay::PeerMessage { peer_id, message };
-            if req.message.itype == 3 {
-                // liTS_CANDIDATE: serve inline for minimal latency
-                serve_one_get_ledger_request(&router_root, &router_overlay_rt, req);
-            } else {
-                let job_root = router_root.clone();
-                let job_overlay_rt = Arc::clone(&router_overlay_rt);
-                router_root.job_queue().add_job(
-                    crate::job::job_types::JobType::JtLedgerReq,
-                    "RcvGetLedger",
-                    move || {
-                        serve_one_get_ledger_request(&job_root, &job_overlay_rt, req);
-                    },
-                );
-            }
-        }));
+        overlay_rt
+            .overlay()
+            .queued_inbound()
+            .set_get_ledger_router(Box::new(move |peer_id, message| {
+                let req = overlay::PeerMessage { peer_id, message };
+                if req.message.itype == 3 {
+                    // liTS_CANDIDATE: serve inline for minimal latency
+                    serve_one_get_ledger_request(&router_root, &router_overlay_rt, req);
+                } else {
+                    let job_root = router_root.clone();
+                    let job_overlay_rt = Arc::clone(&router_overlay_rt);
+                    router_root.job_queue().add_job(
+                        crate::job::job_types::JobType::JtLedgerReq,
+                        "RcvGetLedger",
+                        move || {
+                            serve_one_get_ledger_request(&job_root, &job_overlay_rt, req);
+                        },
+                    );
+                }
+            }));
     }
 
     // ===================================================================
@@ -1317,51 +1361,62 @@ fn run_start_mode_consensus_loop(
         let router_root = runtime.root().clone();
         let router_overlay_rt = Arc::clone(&overlay_rt);
         let router_shared_inbound = Arc::clone(&shared_inbound);
-        overlay_rt.overlay().queued_inbound().set_get_objects_router(Box::new(move |peer_id, message| {
-            let msg_envelope = overlay::PeerMessage { peer_id, message };
-            let msg = &msg_envelope.message;
-            if !msg.query {
-                // Response: fetch pack data to store
-                if msg.r#type != 6 { return; }
-                if let Some(lm_rt) = router_root.ledger_master_runtime() {
-                    let lm = lm_rt.ledger_master();
-                    let mut stored = 0;
-                    for obj in &msg.objects {
-                        if let (Some(hash_bytes), Some(data)) = (&obj.hash, &obj.data) {
-                            if let Some(hash) = Uint256::from_slice(hash_bytes) {
-                                lm.fetch_pack_cache().add_fetch_pack(hash, data.clone());
-                                router_shared_inbound.store_fetch_pack(hash, data.clone());
-                                stored += 1;
+        overlay_rt
+            .overlay()
+            .queued_inbound()
+            .set_get_objects_router(Box::new(move |peer_id, message| {
+                let msg_envelope = overlay::PeerMessage { peer_id, message };
+                let msg = &msg_envelope.message;
+                if !msg.query {
+                    // Response: fetch pack data to store
+                    if msg.r#type != 6 {
+                        return;
+                    }
+                    if let Some(lm_rt) = router_root.ledger_master_runtime() {
+                        let lm = lm_rt.ledger_master();
+                        let mut stored = 0;
+                        for obj in &msg.objects {
+                            if let (Some(hash_bytes), Some(data)) = (&obj.hash, &obj.data) {
+                                if let Some(hash) = Uint256::from_slice(hash_bytes) {
+                                    lm.fetch_pack_cache().add_fetch_pack(hash, data.clone());
+                                    router_shared_inbound.store_fetch_pack(hash, data.clone());
+                                    stored += 1;
+                                }
                             }
                         }
+                        if stored > 0 {
+                            router_root.signal_fetch_pack_ready();
+                            router_shared_inbound.notify_fetch_pack_ready();
+                        }
                     }
-                    if stored > 0 {
-                        router_root.signal_fetch_pack_ready();
-                        router_shared_inbound.notify_fetch_pack_ready();
-                    }
+                } else if msg.r#type
+                    == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32
+                {
+                    let job_root = router_root.clone();
+                    let job_overlay_rt = Arc::clone(&router_overlay_rt);
+                    router_root.job_queue().add_job(
+                        crate::job::job_types::JobType::JtLedgerReq,
+                        "RcvGetObjByHash",
+                        move || {
+                            serve_fetch_pack_request(&job_root, &job_overlay_rt, &msg_envelope);
+                        },
+                    );
+                } else {
+                    let job_root = router_root.clone();
+                    let job_overlay_rt = Arc::clone(&router_overlay_rt);
+                    router_root.job_queue().add_job(
+                        crate::job::job_types::JobType::JtLedgerReq,
+                        "RcvGetObjByHash",
+                        move || {
+                            serve_get_object_by_hash_request(
+                                &job_root,
+                                &job_overlay_rt,
+                                &msg_envelope,
+                            );
+                        },
+                    );
                 }
-            } else if msg.r#type == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32 {
-                let job_root = router_root.clone();
-                let job_overlay_rt = Arc::clone(&router_overlay_rt);
-                router_root.job_queue().add_job(
-                    crate::job::job_types::JobType::JtLedgerReq,
-                    "RcvGetObjByHash",
-                    move || {
-                        serve_fetch_pack_request(&job_root, &job_overlay_rt, &msg_envelope);
-                    },
-                );
-            } else {
-                let job_root = router_root.clone();
-                let job_overlay_rt = Arc::clone(&router_overlay_rt);
-                router_root.job_queue().add_job(
-                    crate::job::job_types::JobType::JtLedgerReq,
-                    "RcvGetObjByHash",
-                    move || {
-                        serve_get_object_by_hash_request(&job_root, &job_overlay_rt, &msg_envelope);
-                    },
-                );
-            }
-        }));
+            }));
     }
 
     // Forward map-complete (tx-set acquisition) results to the strand.
@@ -1533,7 +1588,6 @@ fn run_start_mode_consensus_loop(
     tracing::info!(target: "consensus", "Overlay service loop stopped");
 }
 
-
 fn serve_one_get_ledger_request(
     root: &crate::ApplicationRoot,
     overlay_rt: &Arc<crate::runtime::overlay_runtime::AppOverlayRuntime>,
@@ -1598,7 +1652,8 @@ fn serve_one_get_ledger_request(
         // Check if this is a root-only request (first request from TransactionAcquire).
         // If so, serve ALL nodes at once for 1-round-trip acquisition (matching rxrpl).
         let is_root_request = requested_node_ids.len() == 1
-            && requested_node_ids[0] == shamap::nodes::node_id::SHAMapNodeId::default().get_raw_string();
+            && requested_node_ids[0]
+                == shamap::nodes::node_id::SHAMapNodeId::default().get_raw_string();
 
         if is_root_request {
             // Serve the entire tree in one response: root + all inner + all leaves.
@@ -1674,7 +1729,8 @@ fn serve_one_get_ledger_request(
             first_node_data_len = response_data.nodes.first().map(|n| n.nodedata.len()).unwrap_or(0),
             "liTS_CANDIDATE: sending response (as type 3)"
         );
-        let response = overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(response_data));
+        let response =
+            overlay::ProtocolMessage::new(overlay::ProtocolPayload::LedgerData(response_data));
         let message = overlay::Message::new(response, None);
         if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
             peer.send(message);
@@ -2272,8 +2328,10 @@ fn initialize_startup_ledger_state(
             seed_startup_ledger_state(root, options, config)
         }
         StartUpType::Fresh | StartUpType::Normal | StartUpType::Snapshot => {
-            if matches!(options.start_type, StartUpType::Normal | StartUpType::Snapshot)
-                && !root.config().standalone
+            if matches!(
+                options.start_type,
+                StartUpType::Normal | StartUpType::Snapshot
+            ) && !root.config().standalone
             {
                 // A non-standalone Normal/Snapshot node must acquire the
                 // current network ledger before participating in consensus.
@@ -2998,25 +3056,39 @@ fn parse_txq_setup(config: &BasicConfig) -> tx::TxQSetup {
     for (key, value) in &section_values {
         match key.as_str() {
             "ledgers_in_queue" => {
-                if let Ok(v) = value.parse::<usize>() { setup.ledgers_in_queue = v; }
+                if let Ok(v) = value.parse::<usize>() {
+                    setup.ledgers_in_queue = v;
+                }
             }
             "minimum_queue_size" => {
-                if let Ok(v) = value.parse::<usize>() { setup.queue_size_min = v; }
+                if let Ok(v) = value.parse::<usize>() {
+                    setup.queue_size_min = v;
+                }
             }
             "retry_sequence_percent" => {
-                if let Ok(v) = value.parse::<u32>() { setup.retry_sequence_percent = v; }
+                if let Ok(v) = value.parse::<u32>() {
+                    setup.retry_sequence_percent = v;
+                }
             }
             "minimum_txn_in_ledger" => {
-                if let Ok(v) = value.parse::<usize>() { setup.minimum_txn_in_ledger = v; }
+                if let Ok(v) = value.parse::<usize>() {
+                    setup.minimum_txn_in_ledger = v;
+                }
             }
             "minimum_txn_in_ledger_standalone" => {
-                if let Ok(v) = value.parse::<usize>() { setup.minimum_txn_in_ledger_standalone = v; }
+                if let Ok(v) = value.parse::<usize>() {
+                    setup.minimum_txn_in_ledger_standalone = v;
+                }
             }
             "target_txn_in_ledger" => {
-                if let Ok(v) = value.parse::<usize>() { setup.target_txn_in_ledger = v; }
+                if let Ok(v) = value.parse::<usize>() {
+                    setup.target_txn_in_ledger = v;
+                }
             }
             "maximum_txn_in_ledger" => {
-                if let Ok(v) = value.parse::<usize>() { setup.maximum_txn_in_ledger = Some(v); }
+                if let Ok(v) = value.parse::<usize>() {
+                    setup.maximum_txn_in_ledger = Some(v);
+                }
             }
             "normal_consensus_increase_percent" => {
                 if let Ok(v) = value.parse::<u32>() {
@@ -3029,10 +3101,14 @@ fn parse_txq_setup(config: &BasicConfig) -> tx::TxQSetup {
                 }
             }
             "maximum_txn_per_account" => {
-                if let Ok(v) = value.parse::<u32>() { setup.maximum_txn_per_account = v; }
+                if let Ok(v) = value.parse::<u32>() {
+                    setup.maximum_txn_per_account = v;
+                }
             }
             "minimum_last_ledger_buffer" => {
-                if let Ok(v) = value.parse::<u32>() { setup.minimum_last_ledger_buffer = v; }
+                if let Ok(v) = value.parse::<u32>() {
+                    setup.minimum_last_ledger_buffer = v;
+                }
             }
             _ => {
                 tracing::warn!(target: "bootstrap", key, "Unknown [transaction_queue] config key");

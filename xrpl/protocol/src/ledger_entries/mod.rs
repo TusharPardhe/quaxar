@@ -57,8 +57,8 @@ pub use permissioned_domain::{PermissionedDomain, PermissionedDomainBuilder};
 pub use ripple_state::{RippleState, RippleStateBuilder};
 pub use signer_list::{SignerList, SignerListBuilder};
 pub use sponsorship::{
-    Sponsorship, SponsorshipBuilder, LSF_SPONSORSHIP_REQUIRE_SIGN_FOR_FEE,
-    LSF_SPONSORSHIP_REQUIRE_SIGN_FOR_RESERVE,
+    LSF_SPONSORSHIP_REQUIRE_SIGN_FOR_FEE, LSF_SPONSORSHIP_REQUIRE_SIGN_FOR_RESERVE, Sponsorship,
+    SponsorshipBuilder,
 };
 pub use ticket::{Ticket, TicketBuilder};
 pub use vault::{Vault, VaultBuilder};

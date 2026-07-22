@@ -1,4 +1,3 @@
-use parking_lot::Mutex;
 use crate::support::{sample_hash, sample_uint256};
 use basics::base_uint::Uint256;
 use basics::blob::Blob;
@@ -6,6 +5,7 @@ use basics::hardened_hash::HardenedHashBuilder;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::ManualClock;
+use parking_lot::Mutex;
 use shamap::compare::Delta;
 use shamap::family::{
     FullBelowCache, JournalLevel, MissingNodeReporter, NullFullBelowCache, NullMissingNodeReporter,
@@ -89,17 +89,13 @@ struct RecordingJournal {
 
 impl RecordingJournal {
     fn entries(&self) -> Vec<(JournalLevel, String)> {
-        self.entries
-            .lock()
-            .clone()
+        self.entries.lock().clone()
     }
 }
 
 impl SHAMapJournal for RecordingJournal {
     fn log(&self, level: JournalLevel, message: &str) {
-        self.entries
-            .lock()
-            .push((level, message.to_owned()));
+        self.entries.lock().push((level, message.to_owned()));
     }
 }
 
@@ -113,10 +109,7 @@ struct SharedReporter(Arc<Mutex<RecordingMissingNodeReporter>>);
 
 impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_seq(&self, ref_num: u32, node_hash: Uint256) {
-        self.0
-            .lock()
-            .by_seq
-            .push((ref_num, node_hash));
+        self.0.lock().by_seq.push((ref_num, node_hash));
     }
 
     fn missing_node_acquire_by_hash(&self, _ref_hash: Uint256, _ref_num: u32) {}
@@ -481,12 +474,7 @@ fn shamap_sync_tree_full_gate_survives_invalid_blob_and_reports_only_true_miss_o
 
     assert!(!tree.fetch_root_with_family(requested, &mut no_filter, &family));
     assert!(tree.is_full());
-    assert!(
-        reporter
-            .lock()
-            .by_seq
-            .is_empty()
-    );
+    assert!(reporter.lock().by_seq.is_empty());
     let entries = journal.entries();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].0, JournalLevel::Trace);
@@ -494,14 +482,12 @@ fn shamap_sync_tree_full_gate_survives_invalid_blob_and_reports_only_true_miss_o
     assert_eq!(entries[1].0, JournalLevel::Warn);
     assert!(entries[1].1.contains("invalid fetched node blob"));
 
-    *mode
-        .lock() = BlobFetchMode::Missing;
+    *mode.lock() = BlobFetchMode::Missing;
 
     assert!(!tree.fetch_root_with_family(requested, &mut no_filter, &family));
     assert!(!tree.fetch_root_with_family(requested, &mut no_filter, &family));
     assert!(!tree.is_full());
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert_eq!(reporter.by_seq, vec![(95, *requested.as_uint256())]);
 }
 
@@ -541,8 +527,7 @@ fn shamap_sync_tree_owner_config_updates_fetch_policy() {
     family.with_fetcher(|fetcher| {
         assert_eq!(fetcher.fetches.lock().clone(), vec![requested]);
     });
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(reporter_state.by_seq, vec![(205, *requested.as_uint256())]);
     drop(reporter_state);
 
@@ -555,8 +540,7 @@ fn shamap_sync_tree_owner_config_updates_fetch_policy() {
             "set_unbacked should stop later family fetch attempts"
         );
     });
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(reporter_state.by_seq, vec![(205, *requested.as_uint256())]);
 }
 
@@ -741,8 +725,7 @@ fn shamap_sync_tree_direct_read_wrappers_report_missing_once_while_full() {
     assert_eq!(first, TraversalError::MissingNode(missing_hash));
     assert_eq!(second, TraversalError::MissingNode(missing_hash));
     assert!(!tree.is_full());
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert_eq!(reporter.by_seq, vec![(108, *missing_hash.as_uint256())]);
 }
 
@@ -790,8 +773,7 @@ fn shamap_sync_tree_owner_fetch_wrappers_preserve_backed_miss_then_filter_fallba
         vec![(true, leaf.get_hash(), 220, SHAMapNodeType::AccountState)]
     );
     assert!(!tree.is_full());
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert_eq!(reporter.by_seq, vec![(220, *leaf.get_hash().as_uint256())]);
 }
 
@@ -829,8 +811,7 @@ fn shamap_sync_tree_owner_fetch_node_reports_shamap_missing_node_once() {
         SHAMapMissingNode::from_hash(SHAMapType::State, missing_hash)
     );
     assert!(!tree.is_full());
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert_eq!(reporter.by_seq, vec![(221, *missing_hash.as_uint256())]);
 }
 
@@ -906,8 +887,7 @@ fn shamap_sync_tree_owner_throw_and_async_descend_wrappers_match_cpp_roles() {
         SHAMapMissingNode::from_hash(SHAMapType::Transaction, missing_hash)
     );
     assert!(!throw_tree.is_full());
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert_eq!(reporter.by_seq, vec![(223, *missing_hash.as_uint256())]);
     drop(reporter);
 
@@ -1379,8 +1359,7 @@ fn shamap_sync_tree_get_missing_nodes_with_family_reports_deferred_backed_miss_o
     );
     assert!(tree.is_synching());
     assert!(!tree.is_full());
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert_eq!(reporter.by_seq, vec![(109, *missing_hash.as_uint256())]);
 }
 
@@ -1689,8 +1668,7 @@ fn shamap_sync_tree_walk_map_with_family_uses_owner_fetch_policy() {
     );
     assert!(!tree.is_full());
     assert!(root.get_child(2).is_none());
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(207, *missing_hash.as_uint256())]
@@ -1789,8 +1767,7 @@ fn shamap_sync_tree_walk_map_parallel_with_family_uses_owner_fetch_policy() {
     );
     assert!(!tree.is_full());
     assert!(root.get_child(2).is_none());
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(208, *missing_hash.as_uint256())]

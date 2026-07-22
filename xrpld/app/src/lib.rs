@@ -43,13 +43,15 @@ pub use consensus::{censorship_detector::*, fetch_pack::*, rcl_cx_peer_pos::*};
 pub use consensus::{consensus_trans_set_sf::*, driver::*, rcl_consensus::*, rcl_validations::*};
 pub use job::{job_queue::*, job_types::*};
 pub use ledger::{
-    inbound_ledgers::*,
-    ledger_history::*, ledger_master_runtime::*, ledger_master_state::*,
+    inbound_ledgers::*, ledger_history::*, ledger_master_runtime::*, ledger_master_state::*,
     ledger_persistence_runtime::*, loaded_ledger_runtime::*, open_ledger::*,
 };
 pub use ledger_to_json::{ledger_to_json_context::*, ledger_to_json_entrypoint::*};
 pub use load::{deliver_max::*, fee_vote::*, load_fee_track::*, load_manager::*};
-pub use network::{network_ops::*, network_ops_runtime::*, network_ops_strand::*, network_ops_validation_runtime::*};
+pub use network::{
+    network_ops::*, network_ops_runtime::*, network_ops_strand::*,
+    network_ops_validation_runtime::*,
+};
 pub use node_family::node_family::*;
 pub use paging::account_tx_paging::*;
 pub use runtime::component_runtime::*;
@@ -93,7 +95,9 @@ pub fn reload_log_filter(filter: &str) -> Result<(), String> {
 /// `Consensus<Adaptor>` state machine and the `ConsensusRunner` trait use.
 /// Matches the reference's implicit `RCLCxLedger{ledger}` construction at
 /// each `startRound`/`gotTxSet` call site.
-pub fn consensus_ledger_from_ledger(ledger_arc: &std::sync::Arc<::ledger::Ledger>) -> ::consensus::RclCxLedger {
+pub fn consensus_ledger_from_ledger(
+    ledger_arc: &std::sync::Arc<::ledger::Ledger>,
+) -> ::consensus::RclCxLedger {
     ::consensus::RclCxLedger::new(std::sync::Arc::clone(ledger_arc))
 }
 
@@ -109,6 +113,9 @@ pub use ::ledger::NullLedgerJournal as NullRclValidationJournal;
 /// `get_preferred`/`get_preferred_lcl` queries (see `xrpld/main`'s
 /// `preferred_closed_ledger_hash`-adjacent catch-up logic). Matches the
 /// reference's implicit `RCLValidatedLedger{ledger}` construction.
-pub fn validated_ledger_from_ledger(ledger: &::ledger::Ledger, journal: &impl ::ledger::LedgerJournal) -> consensus::rcl_validation::RclValidatedLedger {
+pub fn validated_ledger_from_ledger(
+    ledger: &::ledger::Ledger,
+    journal: &impl ::ledger::LedgerJournal,
+) -> consensus::rcl_validation::RclValidatedLedger {
     consensus::rcl_validation::RclValidatedLedger::from_ledger_with_journal(ledger, journal)
 }

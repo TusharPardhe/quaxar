@@ -96,8 +96,12 @@ fn server_state_admin_includes_validator_expiry_and_load_queue() {
     };
     // Our load object uses "jobs", "load_events", "threads" fields
     // (matching our JobQueue reporting), not rippled's job_count/process_count.
-    assert!(load.contains_key("jobs") || load.contains_key("load_events") || load.contains_key("threads"),
-        "load object should contain at least one known field, got: {load:?}");
+    assert!(
+        load.contains_key("jobs")
+            || load.contains_key("load_events")
+            || load.contains_key("threads"),
+        "load object should contain at least one known field, got: {load:?}"
+    );
 }
 
 #[test]

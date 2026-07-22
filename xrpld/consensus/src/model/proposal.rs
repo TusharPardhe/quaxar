@@ -150,7 +150,14 @@ mod tests {
     }
 
     fn sample() -> ConsensusProposal<u32, u32, u32> {
-        ConsensusProposal::new(100, ConsensusProposal::<u32, u32, u32>::SEQ_JOIN, 200, t(10), t(10), 7)
+        ConsensusProposal::new(
+            100,
+            ConsensusProposal::<u32, u32, u32>::SEQ_JOIN,
+            200,
+            t(10),
+            t(10),
+            7,
+        )
     }
 
     #[test]
@@ -178,7 +185,10 @@ mod tests {
         assert!(!p.is_bow_out());
         p.bow_out(t(20));
         assert!(p.is_bow_out());
-        assert_eq!(p.propose_seq(), ConsensusProposal::<u32, u32, u32>::SEQ_LEAVE);
+        assert_eq!(
+            p.propose_seq(),
+            ConsensusProposal::<u32, u32, u32>::SEQ_LEAVE
+        );
     }
 
     #[test]
@@ -206,13 +216,19 @@ mod tests {
     fn change_position_after_bow_out_does_not_resume_sequence() {
         let mut p = sample();
         p.bow_out(t(20));
-        assert_eq!(p.propose_seq(), ConsensusProposal::<u32, u32, u32>::SEQ_LEAVE);
+        assert_eq!(
+            p.propose_seq(),
+            ConsensusProposal::<u32, u32, u32>::SEQ_LEAVE
+        );
         // Reference: changePosition only increments "if not already bowed
         // out" -- once at kSeqLeave, further changePosition calls leave the
         // sequence at kSeqLeave (still bowed out), matching the C++ guard
         // `if (proposeSeq_ != kSeqLeave) ++proposeSeq_;`.
         p.change_position(400, t(21), t(21));
-        assert_eq!(p.propose_seq(), ConsensusProposal::<u32, u32, u32>::SEQ_LEAVE);
+        assert_eq!(
+            p.propose_seq(),
+            ConsensusProposal::<u32, u32, u32>::SEQ_LEAVE
+        );
         assert!(p.is_bow_out());
     }
 
@@ -220,7 +236,10 @@ mod tests {
     fn bow_out_sets_seq_leave_and_updates_seen_time() {
         let mut p = sample();
         p.bow_out(t(99));
-        assert_eq!(p.propose_seq(), ConsensusProposal::<u32, u32, u32>::SEQ_LEAVE);
+        assert_eq!(
+            p.propose_seq(),
+            ConsensusProposal::<u32, u32, u32>::SEQ_LEAVE
+        );
         assert_eq!(p.seen_time(), t(99));
     }
 

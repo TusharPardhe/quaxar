@@ -1910,7 +1910,6 @@ impl SyncTree {
         )
     }
 
-
     /// Collect strong references to ALL nodes in this tree, loading from the
     /// family's fetcher if needed. Returns a Vec of SharedIntrusive refs that
     /// pin every node in memory — as long as the Vec is alive, no node can be

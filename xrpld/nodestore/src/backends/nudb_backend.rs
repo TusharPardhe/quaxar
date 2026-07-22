@@ -13,7 +13,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use xxhash_rust::xxh64::xxh64;
 
@@ -30,6 +30,14 @@ pub const NUDB_DATA_FILE_HEADER_SIZE: usize = 92;
 /// Max buckets to keep in the in-memory bucket cache.
 /// Each bucket is ~4KB; 4096 entries = ~16MB. Prevents OOM on large NuDB.
 const MAX_BUCKET_CACHE_ENTRIES: usize = 4096;
+
+fn evict_one_cached_bucket<V>(bucket_cache: &DashMap<u32, V>) {
+    let evict_key = bucket_cache.iter().next().map(|entry| *entry.key());
+    if let Some(evict_key) = evict_key {
+        bucket_cache.remove(&evict_key);
+    }
+}
+
 pub const NUDB_KEY_FILE_HEADER_SIZE: usize = 104;
 pub const NUDB_LOG_FILE_HEADER_SIZE: usize = 62;
 const NUDB_BUCKET_COUNT_SIZE: usize = 2;
@@ -712,6 +720,8 @@ pub struct NuDbBackend {
     journal: Arc<dyn NodeStoreJournal>,
     runtime: Mutex<NuDbBackendRuntime>,
     store_mutex: Mutex<()>,
+    /// Prevent readers from observing a partially rewritten on-disk key bucket.
+    key_bucket_io: RwLock<()>,
     default_open_args: Option<NuDbOpenArgs>,
     persistent_fds: ArcSwapOption<NuDbPersistentFds>,
     /// Bucket cache matching reference NuDB's detail::cache. Clean entries
@@ -793,6 +803,7 @@ impl NuDbBackend {
             journal,
             runtime: Mutex::new(NuDbBackendRuntime::new(initial_header)),
             store_mutex: Mutex::new(()),
+            key_bucket_io: RwLock::new(()),
             default_open_args,
             persistent_fds: ArcSwapOption::empty(),
             bucket_cache: DashMap::new(),
@@ -1423,19 +1434,20 @@ impl NuDbBackend {
         }
         let offset = u64::from(bucket_index + 1) * u64::from(key_header.block_size);
         let mut bytes = vec![0u8; usize::from(key_header.block_size)];
+        let _read_guard = self
+            .key_bucket_io
+            .read()
+            .expect("nudb key bucket read lock");
         self.pread_key(offset, &mut bytes)?;
+        drop(_read_guard);
         let bucket = NuDbBucket::read_full_block(
             usize::from(key_header.block_size),
             usize::from(key_header.capacity),
             &bytes,
         )?;
         if self.bucket_cache.len() >= MAX_BUCKET_CACHE_ENTRIES {
-            // Evict one entry — DashMap iter picks an arbitrary shard entry
-            if let Some(entry) = self.bucket_cache.iter().next() {
-                let evict_key = *entry.key();
-                drop(entry);
-                self.bucket_cache.remove(&evict_key);
-            }
+            // Drop both the DashMap iterator and its shard guard before remove.
+            evict_one_cached_bucket(&self.bucket_cache);
         }
         self.bucket_cache.insert(
             bucket_index,
@@ -1469,13 +1481,9 @@ impl NuDbBackend {
         let bulk_importing = self.bulk_importing.load(Ordering::Acquire);
         // Cap cache size to prevent unbounded RAM growth (each bucket ~4KB).
         // During bulk import, keep all buckets in memory — flush handles persistence.
-        if !bulk_importing
-            && self.bucket_cache.len() >= MAX_BUCKET_CACHE_ENTRIES
-            && let Some(entry) = self.bucket_cache.iter().next()
-        {
-            let evict_key = *entry.key();
-            drop(entry);
-            self.bucket_cache.remove(&evict_key);
+        if !bulk_importing && self.bucket_cache.len() >= MAX_BUCKET_CACHE_ENTRIES {
+            // Drop both the DashMap iterator and its shard guard before remove.
+            evict_one_cached_bucket(&self.bucket_cache);
         }
         // Write-through keeps normal acquisition data immediately visible and
         // leaves the cache clean. Bulk import intentionally defers the write.
@@ -1491,7 +1499,12 @@ impl NuDbBackend {
         }
         let offset = u64::from(bucket_index + 1) * u64::from(key_header.block_size);
         let bytes = bucket.encode_key_block()?;
+        let _write_guard = self
+            .key_bucket_io
+            .write()
+            .expect("nudb key bucket write lock");
         self.pwrite_key(offset, &bytes)?;
+        drop(_write_guard);
         self.bucket_cache.insert(
             bucket_index,
             CachedBucket {
@@ -3131,6 +3144,7 @@ mod tests {
     };
     use crate::{JournalLevel, NodeStoreJournal};
     use basics::basic_config::Section;
+    use dashmap::DashMap;
     use std::fs;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -3156,6 +3170,18 @@ mod tests {
                 .expect("recording journal mutex must not be poisoned")
                 .push((level, message.to_owned()));
         }
+    }
+
+    #[test]
+    fn nudb_cache_eviction_releases_the_dashmap_iterator_guard() {
+        let cache = DashMap::new();
+        for index in 0..super::MAX_BUCKET_CACHE_ENTRIES as u32 {
+            cache.insert(index, ());
+        }
+
+        super::evict_one_cached_bucket(&cache);
+
+        assert_eq!(cache.len(), super::MAX_BUCKET_CACHE_ENTRIES - 1);
     }
 
     #[test]

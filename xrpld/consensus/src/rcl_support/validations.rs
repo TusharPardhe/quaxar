@@ -78,7 +78,10 @@ pub struct SeqEnforcer<Seq> {
 
 impl<Seq: Copy + Default + PartialOrd> Default for SeqEnforcer<Seq> {
     fn default() -> Self {
-        Self { seq: Seq::default(), when: None }
+        Self {
+            seq: Seq::default(),
+            when: None,
+        }
     }
 }
 
@@ -115,7 +118,12 @@ impl<Seq: Copy + Default + PartialOrd> SeqEnforcer<Seq> {
 /// could overflow/underflow an unsigned time value: `NetClockTimePoint`
 /// arithmetic here uses `time::Duration` (signed, seconds-granularity),
 /// matching the reference's "promoted to signed 64-bit" comment.
-pub fn is_current(p: &ValidationParms, now: NetClockTimePoint, sign_time: NetClockTimePoint, seen_time: NetClockTimePoint) -> bool {
+pub fn is_current(
+    p: &ValidationParms,
+    now: NetClockTimePoint,
+    sign_time: NetClockTimePoint,
+    seen_time: NetClockTimePoint,
+) -> bool {
     let early = time::Duration::seconds(p.validation_current_early.as_secs() as i64);
     let wall = time::Duration::seconds(p.validation_current_wall.as_secs() as i64);
     let local = time::Duration::seconds(p.validation_current_local.as_secs() as i64);
@@ -126,7 +134,8 @@ pub fn is_current(p: &ValidationParms, now: NetClockTimePoint, sign_time: NetClo
 
     (sign_secs > now_secs - early.whole_seconds())
         && (sign_secs < now_secs + wall.whole_seconds())
-        && (seen_time == NetClockTimePoint::default() || seen_secs < now_secs + local.whole_seconds())
+        && (seen_time == NetClockTimePoint::default()
+            || seen_secs < now_secs + local.whole_seconds())
 }
 
 /// Outcome of attempting to add a validation. Matches `ValStatus`.
@@ -206,7 +215,10 @@ pub trait ValidationsLedger: TrieLedger {
 /// reference's `Adaptor` concept.
 pub trait ValidationsAdaptor {
     type Ledger: ValidationsLedger;
-    type Validation: ValidationT<LedgerId = <Self::Ledger as TrieLedger>::Id, Seq = <Self::Ledger as TrieLedger>::Seq>;
+    type Validation: ValidationT<
+            LedgerId = <Self::Ledger as TrieLedger>::Id,
+            Seq = <Self::Ledger as TrieLedger>::Seq,
+        >;
 
     /// The current network time, used to determine staleness.
     fn now(&self) -> NetClockTimePoint;
@@ -232,7 +244,10 @@ struct AgedMap<K: Eq + std::hash::Hash + Clone, V> {
 
 impl<K: Eq + std::hash::Hash + Clone, V> AgedMap<K, V> {
     fn new() -> Self {
-        Self { entries: HashMap::new(), last_touched: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+            last_touched: HashMap::new(),
+        }
     }
 
     fn touch(&mut self, key: &K, now: Instant) {
@@ -358,7 +373,11 @@ impl<A: ValidationsAdaptor> Inner<A> {
         for key in pending {
             let (_, ledger_id) = &key;
             if let Some(ledger) = adaptor.acquire(ledger_id) {
-                let nodes: Vec<NodeIdOf<A>> = self.acquiring.get(&key).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+                let nodes: Vec<NodeIdOf<A>> = self
+                    .acquiring
+                    .get(&key)
+                    .map(|s| s.iter().cloned().collect())
+                    .unwrap_or_default();
                 for node_id in nodes {
                     self.update_trie_ledger(&node_id, ledger.clone());
                 }
@@ -380,8 +399,17 @@ impl<A: ValidationsAdaptor> Inner<A> {
     /// Process a new trusted validation, updating the trie once its ledger
     /// is acquired (or queuing the acquisition). Matches the four-argument
     /// `updateTrie(lock, nodeID, val, prior)` overload.
-    fn update_trie_validation(&mut self, adaptor: &A, node_id: &NodeIdOf<A>, val: &A::Validation, prior: Option<(SeqOf<A>, LedgerIdOf<A>)>) {
-        debug_assert!(val.trusted(), "update_trie_validation: input validation must be trusted");
+    fn update_trie_validation(
+        &mut self,
+        adaptor: &A,
+        node_id: &NodeIdOf<A>,
+        val: &A::Validation,
+        prior: Option<(SeqOf<A>, LedgerIdOf<A>)>,
+    ) {
+        debug_assert!(
+            val.trusted(),
+            "update_trie_validation: input validation must be trusted"
+        );
 
         if let Some(prior_key) = prior
             && let Some(set) = self.acquiring.get_mut(&prior_key)
@@ -400,13 +428,20 @@ impl<A: ValidationsAdaptor> Inner<A> {
         } else if let Some(ledger) = adaptor.acquire(&val.ledger_id()) {
             self.update_trie_ledger(node_id, ledger);
         } else {
-            self.acquiring.entry(val_key).or_default().insert(node_id.clone());
+            self.acquiring
+                .entry(val_key)
+                .or_default()
+                .insert(node_id.clone());
         }
     }
 
     /// Iterate current validations, evicting stale ones first. Matches
     /// `current(lock, pre, f)`.
-    fn current_live(&mut self, adaptor: &A, parms: &ValidationParms) -> Vec<(NodeIdOf<A>, A::Validation)> {
+    fn current_live(
+        &mut self,
+        adaptor: &A,
+        parms: &ValidationParms,
+    ) -> Vec<(NodeIdOf<A>, A::Validation)> {
         let now = adaptor.now();
         let stale: Vec<NodeIdOf<A>> = self
             .current
@@ -420,12 +455,20 @@ impl<A: ValidationsAdaptor> Inner<A> {
             }
             self.current.remove(node_id);
         }
-        self.current.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.current
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Access the trie after flushing stale validations and checking
     /// pending acquisitions. Matches `withTrie`.
-    fn with_trie<R>(&mut self, adaptor: &A, parms: &ValidationParms, f: impl FnOnce(&LedgerTrie<A::Ledger>) -> R) -> R {
+    fn with_trie<R>(
+        &mut self,
+        adaptor: &A,
+        parms: &ValidationParms,
+        f: impl FnOnce(&LedgerTrie<A::Ledger>) -> R,
+    ) -> R {
         let _ = self.current_live(adaptor, parms);
         self.check_acquired(adaptor);
         f(&self.trie)
@@ -438,7 +481,11 @@ impl<A: ValidationsAdaptor> Validations<A> {
     /// expiry, which this port derives from `Instant::now()` directly at
     /// each call site rather than threading a clock object through).
     pub fn new(parms: ValidationParms, adaptor: A) -> Self {
-        Self { parms, adaptor, inner: Mutex::new(Inner::new()) }
+        Self {
+            parms,
+            adaptor,
+            inner: Mutex::new(Inner::new()),
+        }
     }
 
     pub fn adaptor(&self) -> &A {
@@ -453,24 +500,37 @@ impl<A: ValidationsAdaptor> Validations<A> {
     /// Matches `canValidateSeq`.
     pub fn can_validate_seq(&self, s: SeqOf<A>) -> bool {
         let mut inner = self.inner.lock();
-        inner.local_seq_enforcer.try_advance(Instant::now(), s, &self.parms)
+        inner
+            .local_seq_enforcer
+            .try_advance(Instant::now(), s, &self.parms)
     }
 
     /// Attempt to add a new validation. Matches `add`.
     pub fn add(&self, node_id: NodeIdOf<A>, val: A::Validation) -> ValStatus {
-        if !is_current(&self.parms, self.adaptor.now(), val.sign_time(), val.seen_time()) {
+        if !is_current(
+            &self.parms,
+            self.adaptor.now(),
+            val.sign_time(),
+            val.seen_time(),
+        ) {
             return ValStatus::Stale;
         }
 
         let mut inner = self.inner.lock();
         let now = Instant::now();
 
-        let seq_entry = inner.by_sequence.get_or_insert_with(val.seq(), now, HashMap::new);
+        let seq_entry = inner
+            .by_sequence
+            .get_or_insert_with(val.seq(), now, HashMap::new);
         let seq_inserted = !seq_entry.contains_key(&node_id);
         if !seq_inserted {
             let existing = seq_entry.get(&node_id).expect("checked contains_key above");
-            let diff_secs = (existing.sign_time().as_seconds() as i64 - val.sign_time().as_seconds() as i64).unsigned_abs();
-            if Duration::from_secs(diff_secs) > self.parms.validation_current_wall && val.sign_time() > existing.sign_time() {
+            let diff_secs = (existing.sign_time().as_seconds() as i64
+                - val.sign_time().as_seconds() as i64)
+                .unsigned_abs();
+            if Duration::from_secs(diff_secs) > self.parms.validation_current_wall
+                && val.sign_time() > existing.sign_time()
+            {
                 seq_entry.insert(node_id.clone(), val.clone());
             }
         } else {
@@ -479,7 +539,10 @@ impl<A: ValidationsAdaptor> Validations<A> {
 
         let enforcer = inner.seq_enforcers.entry(node_id.clone()).or_default();
         if !enforcer.try_advance(now, val.seq(), &self.parms) {
-            let seq_entry = inner.by_sequence.get(&val.seq()).expect("just inserted above");
+            let seq_entry = inner
+                .by_sequence
+                .get(&val.seq())
+                .expect("just inserted above");
             if let Some(existing) = seq_entry.get(&node_id)
                 && existing.seq() == val.seq()
             {
@@ -496,7 +559,10 @@ impl<A: ValidationsAdaptor> Validations<A> {
             return ValStatus::BadSeq;
         }
 
-        inner.by_ledger.get_or_insert_with(val.ledger_id(), now, HashMap::new).insert(node_id.clone(), val.clone());
+        inner
+            .by_ledger
+            .get_or_insert_with(val.ledger_id(), now, HashMap::new)
+            .insert(node_id.clone(), val.clone());
 
         match inner.current.get(&node_id).cloned() {
             None => {
@@ -555,11 +621,19 @@ impl<A: ValidationsAdaptor> Validations<A> {
                 }
 
                 let seq_keep = |seq: &SeqOf<A>| low <= *seq && *seq < high;
-                inner.by_ledger.expire(now, self.parms.validation_set_expires, None);
-                inner.by_sequence.expire(now, self.parms.validation_set_expires, Some(&seq_keep));
+                inner
+                    .by_ledger
+                    .expire(now, self.parms.validation_set_expires, None);
+                inner
+                    .by_sequence
+                    .expire(now, self.parms.validation_set_expires, Some(&seq_keep));
             } else {
-                inner.by_ledger.expire(now, self.parms.validation_set_expires, None);
-                inner.by_sequence.expire(now, self.parms.validation_set_expires, None);
+                inner
+                    .by_ledger
+                    .expire(now, self.parms.validation_set_expires, None);
+                inner
+                    .by_sequence
+                    .expire(now, self.parms.validation_set_expires, None);
             }
         }
         tracing::debug!(elapsed = ?start.elapsed(), "Validations sets sweep lock duration");
@@ -607,7 +681,10 @@ impl<A: ValidationsAdaptor> Validations<A> {
     pub fn get_preferred(&self, curr: &A::Ledger) -> Option<(SeqOf<A>, LedgerIdOf<A>)> {
         let mut inner = self.inner.lock();
         let largest = inner.local_seq_enforcer.largest();
-        let preferred: Option<SpanTip<A::Ledger>> = inner.with_trie(&self.adaptor, &self.parms, |trie| trie.get_preferred(largest));
+        let preferred: Option<SpanTip<A::Ledger>> =
+            inner.with_trie(&self.adaptor, &self.parms, |trie| {
+                trie.get_preferred(largest)
+            });
 
         let Some(preferred) = preferred else {
             // No trusted validations; fall back to majority over acquiring
@@ -641,7 +718,11 @@ impl<A: ValidationsAdaptor> Validations<A> {
     /// The id of the preferred working ledger, only if its sequence is at
     /// least `min_valid_seq`; otherwise `curr`'s id. Matches the
     /// `(curr, minValidSeq)` overload of `getPreferred`.
-    pub fn get_preferred_min_seq(&self, curr: &A::Ledger, min_valid_seq: SeqOf<A>) -> LedgerIdOf<A> {
+    pub fn get_preferred_min_seq(
+        &self,
+        curr: &A::Ledger,
+        min_valid_seq: SeqOf<A>,
+    ) -> LedgerIdOf<A> {
         match self.get_preferred(curr) {
             Some((seq, id)) if seq >= min_valid_seq => id,
             _ => curr.id(),
@@ -651,12 +732,21 @@ impl<A: ValidationsAdaptor> Validations<A> {
     /// The preferred last-closed-ledger id for the next consensus round,
     /// falling back to the dominant peer-reported LCL if no trusted
     /// validations exist. Matches `getPreferredLCL`.
-    pub fn get_preferred_lcl(&self, lcl: &A::Ledger, min_seq: SeqOf<A>, peer_counts: &BTreeMap<LedgerIdOf<A>, u32>) -> LedgerIdOf<A> {
+    pub fn get_preferred_lcl(
+        &self,
+        lcl: &A::Ledger,
+        min_seq: SeqOf<A>,
+        peer_counts: &BTreeMap<LedgerIdOf<A>, u32>,
+    ) -> LedgerIdOf<A> {
         if let Some((seq, id)) = self.get_preferred(lcl) {
             return if seq >= min_seq { id } else { lcl.id() };
         }
 
-        peer_counts.iter().max_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0))).map(|(id, _)| *id).unwrap_or_else(|| lcl.id())
+        peer_counts
+            .iter()
+            .max_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)))
+            .map(|(id, _)| *id)
+            .unwrap_or_else(|| lcl.id())
     }
 
     /// The number of current trusted validators working on a descendant of
@@ -669,21 +759,34 @@ impl<A: ValidationsAdaptor> Validations<A> {
                 trie.branch_support(ledger) as usize - trie.tip_support(ledger.id()) as usize
             });
         }
-        inner.last_ledger.values().filter(|l| l.seq() > SeqOf::<A>::default() && l.ancestor(l.seq() - 1) == *ledger_id).count()
+        inner
+            .last_ledger
+            .values()
+            .filter(|l| l.seq() > SeqOf::<A>::default() && l.ancestor(l.seq() - 1) == *ledger_id)
+            .count()
     }
 
     /// Trusted, full validations from currently-current validators.
     /// Matches `currentTrusted`.
     pub fn current_trusted(&self) -> Vec<<A::Validation as ValidationT>::Wrapped> {
         let mut inner = self.inner.lock();
-        inner.current_live(&self.adaptor, &self.parms).into_iter().filter(|(_, v)| v.trusted() && v.full()).map(|(_, v)| v.unwrap()).collect()
+        inner
+            .current_live(&self.adaptor, &self.parms)
+            .into_iter()
+            .filter(|(_, v)| v.trusted() && v.full())
+            .map(|(_, v)| v.unwrap())
+            .collect()
     }
 
     /// Node ids associated with current validations. Matches
     /// `getCurrentNodeIDs`.
     pub fn get_current_node_ids(&self) -> HashSet<NodeIdOf<A>> {
         let mut inner = self.inner.lock();
-        inner.current_live(&self.adaptor, &self.parms).into_iter().map(|(k, _)| k).collect()
+        inner
+            .current_live(&self.adaptor, &self.parms)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
     }
 
     /// Count of trusted full validations for `ledger_id`. Matches
@@ -691,18 +794,32 @@ impl<A: ValidationsAdaptor> Validations<A> {
     pub fn num_trusted_for_ledger(&self, ledger_id: &LedgerIdOf<A>) -> usize {
         let mut inner = self.inner.lock();
         inner.by_ledger.touch(ledger_id, Instant::now());
-        inner.by_ledger.get(ledger_id).map(|m| m.values().filter(|v| v.trusted() && v.full()).count()).unwrap_or(0)
+        inner
+            .by_ledger
+            .get(ledger_id)
+            .map(|m| m.values().filter(|v| v.trusted() && v.full()).count())
+            .unwrap_or(0)
     }
 
     /// Trusted full validations for `ledger_id` at sequence `seq`. Matches
     /// `getTrustedForLedger`.
-    pub fn get_trusted_for_ledger(&self, ledger_id: &LedgerIdOf<A>, seq: SeqOf<A>) -> Vec<<A::Validation as ValidationT>::Wrapped> {
+    pub fn get_trusted_for_ledger(
+        &self,
+        ledger_id: &LedgerIdOf<A>,
+        seq: SeqOf<A>,
+    ) -> Vec<<A::Validation as ValidationT>::Wrapped> {
         let mut inner = self.inner.lock();
         inner.by_ledger.touch(ledger_id, Instant::now());
         inner
             .by_ledger
             .get(ledger_id)
-            .map(|m| m.values().filter(|v| v.trusted() && v.full() && v.seq() == seq).cloned().map(|v| v.unwrap()).collect())
+            .map(|m| {
+                m.values()
+                    .filter(|v| v.trusted() && v.full() && v.seq() == seq)
+                    .cloned()
+                    .map(|v| v.unwrap())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -714,7 +831,12 @@ impl<A: ValidationsAdaptor> Validations<A> {
         inner
             .by_ledger
             .get(ledger_id)
-            .map(|m| m.values().filter(|v| v.trusted() && v.full()).map(|v| v.load_fee().unwrap_or(base_fee)).collect())
+            .map(|m| {
+                m.values()
+                    .filter(|v| v.trusted() && v.full())
+                    .map(|v| v.load_fee().unwrap_or(base_fee))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -733,8 +855,11 @@ impl<A: ValidationsAdaptor> Validations<A> {
 
         let mut laggards = 0usize;
         for (_, v) in live {
-            let seen_plus_freshness =
-                basics::chrono::NetClockTimePoint::new(v.seen_time().as_seconds().saturating_add(self.parms.validation_freshness.as_secs() as u32));
+            let seen_plus_freshness = basics::chrono::NetClockTimePoint::new(
+                v.seen_time()
+                    .as_seconds()
+                    .saturating_add(self.parms.validation_freshness.as_secs() as u32),
+            );
             if now < seen_plus_freshness && trusted_keys.remove(&v.key()) && seq > v.seq() {
                 laggards += 1;
             }
@@ -878,7 +1003,10 @@ mod tests {
 
     impl MockAdaptor {
         fn new(now: u32) -> Self {
-            Self { now: RefCell::new(NetClockTimePoint::new(now)), ledgers: RefCell::new(HashMap::new()) }
+            Self {
+                now: RefCell::new(NetClockTimePoint::new(now)),
+                ledgers: RefCell::new(HashMap::new()),
+            }
         }
         fn set_now(&self, now: u32) {
             *self.now.borrow_mut() = NetClockTimePoint::new(now);
@@ -900,7 +1028,13 @@ mod tests {
         }
     }
 
-    fn val(ledger_id: LedgerId, seq: u32, now: u32, node_id: NodeId, key: NodeKey) -> MockValidation {
+    fn val(
+        ledger_id: LedgerId,
+        seq: u32,
+        now: u32,
+        node_id: NodeId,
+        key: NodeKey,
+    ) -> MockValidation {
         MockValidation {
             ledger_id,
             seq,
@@ -925,10 +1059,12 @@ mod tests {
     fn is_current_rejects_validation_signed_too_far_in_past_or_future() {
         let p = ValidationParms::default();
         let now = NetClockTimePoint::new(10_000);
-        let too_early = NetClockTimePoint::new(10_000 - p.validation_current_early.as_secs() as u32 - 1);
+        let too_early =
+            NetClockTimePoint::new(10_000 - p.validation_current_early.as_secs() as u32 - 1);
         assert!(!is_current(&p, now, too_early, now));
 
-        let too_late = NetClockTimePoint::new(10_000 + p.validation_current_wall.as_secs() as u32 + 1);
+        let too_late =
+            NetClockTimePoint::new(10_000 + p.validation_current_wall.as_secs() as u32 + 1);
         assert!(!is_current(&p, now, too_late, now));
     }
 
@@ -996,9 +1132,15 @@ mod tests {
         adaptor.register_ledger(child.clone());
         let validations = Validations::new(ValidationParms::default(), adaptor);
 
-        assert_eq!(validations.add(1, val(child.id(), 5, 1000, 1, 100)), ValStatus::Current);
+        assert_eq!(
+            validations.add(1, val(child.id(), 5, 1000, 1, 100)),
+            ValStatus::Current
+        );
         // A lower sequence from the same node violates the invariant.
-        assert_eq!(validations.add(1, val(genesis.id(), 3, 1000, 1, 100)), ValStatus::BadSeq);
+        assert_eq!(
+            validations.add(1, val(genesis.id(), 3, 1000, 1, 100)),
+            ValStatus::BadSeq
+        );
     }
 
     #[test]
@@ -1012,7 +1154,10 @@ mod tests {
         adaptor.register_ledger(child_b.clone());
         let validations = Validations::new(ValidationParms::default(), adaptor);
 
-        assert_eq!(validations.add(1, val(child_a.id(), 5, 1000, 1, 100)), ValStatus::Current);
+        assert_eq!(
+            validations.add(1, val(child_a.id(), 5, 1000, 1, 100)),
+            ValStatus::Current
+        );
         // Same node, same sequence, different ledger id -> Byzantine signal.
         let status = validations.add(1, val(child_b.id(), 5, 1000, 1, 100));
         assert_eq!(status, ValStatus::Conflicting);
@@ -1106,7 +1251,9 @@ mod tests {
         // actual branch-preference comparison, query branch_support
         // directly via the trie instead of get_preferred's curr-relative
         // logic.
-        let preferred = validations.get_preferred(&child_a).expect("trusted validations exist");
+        let preferred = validations
+            .get_preferred(&child_a)
+            .expect("trusted validations exist");
         assert_eq!(preferred.1, child_a.id());
         assert_eq!(preferred.0, child_a.seq());
     }

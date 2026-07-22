@@ -121,7 +121,8 @@ impl SharedLoadFeeTrack {
     /// cluster fee factor accordingly.
     pub fn update_from_validated_ledger(&self, base_fee_drops: u64) {
         // Store the raw base fee for use by RPC and server_info reporting.
-        self.network_base_fee.store(base_fee_drops, Ordering::Release);
+        self.network_base_fee
+            .store(base_fee_drops, Ordering::Release);
 
         // Rippled sets cluster_fee = base fee from the validated ledger as a
         // load factor signal. When the network base fee is the default (10

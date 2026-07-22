@@ -117,9 +117,8 @@ pub fn transaction_sign<Runtime: RpcRuntime, Source>(
     if st_tx.get_seq_value() == 0 {
         if let Some(app) = ctx.runtime.app() {
             let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-            let account_keylet = protocol::account_keylet(
-                basics::base_uint::Uint160::from_void(account.data()),
-            );
+            let account_keylet =
+                protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
             // Try open ledger first (has latest state including pending txs)
             let seq = app
                 .network_ops_current_account_seq(&account)
@@ -135,7 +134,11 @@ pub fn transaction_sign<Runtime: RpcRuntime, Source>(
     }
     // Auto-fill Fee if not set (default to base fee)
     if !st_tx.is_field_present(get_field_by_symbol("sfFee"))
-        || st_tx.get_field_amount(get_field_by_symbol("sfFee")).xrp().drops() == 0
+        || st_tx
+            .get_field_amount(get_field_by_symbol("sfFee"))
+            .xrp()
+            .drops()
+            == 0
     {
         st_tx.set_field_amount(
             get_field_by_symbol("sfFee"),
@@ -566,7 +569,9 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
         ret.insert(jss::engine_result_code.to_string(), JsonValue::Signed(0));
         ret.insert(
             "engine_result_message".to_string(),
-            JsonValue::String("The transaction was applied. Only final in a validated ledger.".to_string()),
+            JsonValue::String(
+                "The transaction was applied. Only final in a validated ledger.".to_string(),
+            ),
         );
     }
 

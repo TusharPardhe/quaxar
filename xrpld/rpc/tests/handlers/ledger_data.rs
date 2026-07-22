@@ -8,8 +8,8 @@ use basics::base_uint::Uint256;
 use protocol::{JsonValue, LedgerEntryType};
 use rpc::RpcRole;
 use rpc::{
-    LedgerDataEntry, LedgerDataRequest, LedgerDataResolved, LedgerDataResponse, LedgerDataSource, do_ledger_data,
-    ledger_data::choose_ledger_entry_type,
+    LedgerDataEntry, LedgerDataRequest, LedgerDataResolved, LedgerDataResponse, LedgerDataSource,
+    do_ledger_data, ledger_data::choose_ledger_entry_type,
 };
 use std::collections::BTreeMap;
 
@@ -180,7 +180,10 @@ fn ledger_data_filters_limits_and_emits_marker() {
             role: RpcRole::User,
         },
         &source,
-    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
+    ) {
+        LedgerDataResponse::Json(j) => j,
+        _ => panic!("expected json"),
+    };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -263,7 +266,10 @@ fn ledger_data_binary_uses_hex_and_skips_ledger_on_marker() {
             role: RpcRole::Admin,
         },
         &source,
-    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
+    ) {
+        LedgerDataResponse::Json(j) => j,
+        _ => panic!("expected json"),
+    };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -297,7 +303,10 @@ fn ledger_data_reports_input_errors() {
             role: RpcRole::User,
         },
         &source,
-    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
+    ) {
+        LedgerDataResponse::Json(j) => j,
+        _ => panic!("expected json"),
+    };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -317,7 +326,10 @@ fn ledger_data_reports_input_errors() {
             role: RpcRole::User,
         },
         &source,
-    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
+    ) {
+        LedgerDataResponse::Json(j) => j,
+        _ => panic!("expected json"),
+    };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -339,7 +351,10 @@ fn ledger_data_reports_input_errors() {
             role: RpcRole::User,
         },
         &source,
-    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
+    ) {
+        LedgerDataResponse::Json(j) => j,
+        _ => panic!("expected json"),
+    };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -417,7 +432,10 @@ fn ledger_data_response_structure_fields() {
             role: RpcRole::User,
         },
         &source,
-    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
+    ) {
+        LedgerDataResponse::Json(j) => j,
+        _ => panic!("expected json"),
+    };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -500,7 +518,10 @@ fn ledger_data_type_filter_account_root_only() {
             role: RpcRole::User,
         },
         &source,
-    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
+    ) {
+        LedgerDataResponse::Json(j) => j,
+        _ => panic!("expected json"),
+    };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };
@@ -557,7 +578,10 @@ fn ledger_data_limit_zero_returns_all() {
             role: RpcRole::Admin,
         },
         &source,
-    ) { LedgerDataResponse::Json(j) => j, _ => panic!("expected json") };
+    ) {
+        LedgerDataResponse::Json(j) => j,
+        _ => panic!("expected json"),
+    };
     let JsonValue::Object(object) = result else {
         panic!("result must be an object");
     };

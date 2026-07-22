@@ -116,8 +116,7 @@ pub fn execute_book_step<V: ApplyView>(
         // domain book. Hybrid offers in the open book are not evicted on
         // credential expiry. Pre-fix: always validate.
         if offer_sle.is_field_present(sf("sfDomainID"))
-            && (!view.rules().enabled(&protocol::fix_cleanup_3_3_0())
-                || book.domain.is_some())
+            && (!view.rules().enabled(&protocol::fix_cleanup_3_3_0()) || book.domain.is_some())
         {
             let offer_domain = offer_sle.get_field_h256(sf("sfDomainID"));
             if !crate::permissioned_dex_helpers::offer_in_domain(

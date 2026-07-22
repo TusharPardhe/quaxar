@@ -1271,7 +1271,9 @@ mod tests {
 
         assert_eq!(first.get_hash(), fetched.get_hash());
         assert!(std::ptr::eq(&*first, &*second));
-        family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![fetched.get_hash()]));
+        family.with_fetcher(|fetcher| {
+            assert_eq!(fetcher.fetches.lock().clone(), vec![fetched.get_hash()])
+        });
         let cached = cache
             .fetch(fetched.get_hash().as_uint256())
             .expect("decoded node should be present in the cache");
@@ -1318,7 +1320,12 @@ mod tests {
 
         assert_eq!(first.get_hash(), fetched.get_hash());
         assert!(std::ptr::eq(&*first, &*second));
-        family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![(fetched.get_hash(), 0)]));
+        family.with_fetcher(|fetcher| {
+            assert_eq!(
+                fetcher.fetches.lock().clone(),
+                vec![(fetched.get_hash(), 0)]
+            )
+        });
         let cached = cache
             .fetch(fetched.get_hash().as_uint256())
             .expect("decoded node should be present in the cache");
@@ -1402,7 +1409,12 @@ mod tests {
             .fetch_cached_node_or_acquire_by_seq(fetched.get_hash(), 601)
             .expect("node object should decode through the ledger-seq path");
         assert_eq!(resolved.get_hash(), fetched.get_hash());
-        family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![(fetched.get_hash(), 601)]));
+        family.with_fetcher(|fetcher| {
+            assert_eq!(
+                fetcher.fetches.lock().clone(),
+                vec![(fetched.get_hash(), 601)]
+            )
+        });
     }
 
     #[test]

@@ -264,7 +264,10 @@ impl QueuedOverlayInboundHandler {
     /// reference PeerImp::handleTransaction, which calls
     /// JobQueue::addJob(JtTransaction, "RcvCheckTx", ...) synchronously on
     /// receipt from the network thread, instead of waiting for a timer tick.
-    pub fn set_transaction_router(&self, router: Box<dyn Fn(PeerId, QueuedTransaction) + Send + Sync>) {
+    pub fn set_transaction_router(
+        &self,
+        router: Box<dyn Fn(PeerId, QueuedTransaction) + Send + Sync>,
+    ) {
         *self
             .transaction_router
             .lock()
@@ -284,7 +287,10 @@ impl QueuedOverlayInboundHandler {
     /// Set a notify callback for when relay transactions are queued (no router set).
     /// Called by the batch-apply thread setup to get instant wake on relay arrival.
     pub fn set_transaction_notify(&self, notify: Box<dyn Fn() + Send + Sync>) {
-        *self.transaction_notify.lock().expect("transaction_notify lock") = Some(notify);
+        *self
+            .transaction_notify
+            .lock()
+            .expect("transaction_notify lock") = Some(notify);
     }
 
     /// Set a notify callback for when proposals arrive from peers. Called by
@@ -304,13 +310,22 @@ impl QueuedOverlayInboundHandler {
     /// Set a direct routing callback for GetLedger requests. When set,
     /// `on_get_ledger` calls this instead of pushing to inner.get_ledgers.
     pub fn set_get_ledger_router(&self, router: Box<dyn Fn(PeerId, TmGetLedger) + Send + Sync>) {
-        *self.get_ledger_router.lock().expect("get_ledger_router lock") = Some(router);
+        *self
+            .get_ledger_router
+            .lock()
+            .expect("get_ledger_router lock") = Some(router);
     }
 
     /// Set a direct routing callback for GetObjectByHash requests. When set,
     /// `on_get_objects` calls this instead of pushing to inner.get_objects.
-    pub fn set_get_objects_router(&self, router: Box<dyn Fn(PeerId, TmGetObjectByHash) + Send + Sync>) {
-        *self.get_objects_router.lock().expect("get_objects_router lock") = Some(router);
+    pub fn set_get_objects_router(
+        &self,
+        router: Box<dyn Fn(PeerId, TmGetObjectByHash) + Send + Sync>,
+    ) {
+        *self
+            .get_objects_router
+            .lock()
+            .expect("get_objects_router lock") = Some(router);
     }
 
     /// Put validations back into the queue so they can be consumed by the
@@ -394,15 +409,31 @@ impl QueuedOverlayInboundHandler {
 
     /// Drain only validator list messages from the queue.
     pub fn take_validator_lists(&self) -> Vec<PeerMessage<TmValidatorList>> {
-        std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").validator_lists)
+        std::mem::take(
+            &mut self
+                .inner
+                .lock()
+                .expect("overlay inbound lock")
+                .validator_lists,
+        )
     }
 
     pub fn take_transactions(&self) -> Vec<QueuedTransaction> {
-        std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").transactions)
+        std::mem::take(
+            &mut self
+                .inner
+                .lock()
+                .expect("overlay inbound lock")
+                .transactions,
+        )
     }
 
     pub fn transaction_count(&self) -> usize {
-        self.inner.lock().expect("overlay inbound lock").transactions.len()
+        self.inner
+            .lock()
+            .expect("overlay inbound lock")
+            .transactions
+            .len()
     }
 
     pub fn take_get_objects(&self) -> Vec<PeerMessage<TmGetObjectByHash>> {
@@ -431,7 +462,10 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     }
 
     fn on_transaction(&self, peer: &Arc<PeerImp>, message: QueuedTransaction) {
-        let router_guard = self.transaction_router.lock().expect("transaction_router lock");
+        let router_guard = self
+            .transaction_router
+            .lock()
+            .expect("transaction_router lock");
         if let Some(router) = router_guard.as_ref() {
             router(peer.id(), message);
             return;
@@ -452,7 +486,10 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     fn on_get_ledger(&self, peer: &Arc<PeerImp>, message: TmGetLedger) {
         // Try direct router first — dispatches to JobQueue immediately
         {
-            let guard = self.get_ledger_router.lock().expect("get_ledger_router lock");
+            let guard = self
+                .get_ledger_router
+                .lock()
+                .expect("get_ledger_router lock");
             if let Some(router) = guard.as_ref() {
                 router(peer.id(), message);
                 return;
@@ -580,7 +617,10 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     fn on_get_objects(&self, peer: &Arc<PeerImp>, message: TmGetObjectByHash) {
         // Try direct router first — dispatches to JobQueue immediately
         {
-            let guard = self.get_objects_router.lock().expect("get_objects_router lock");
+            let guard = self
+                .get_objects_router
+                .lock()
+                .expect("get_objects_router lock");
             if let Some(router) = guard.as_ref() {
                 router(peer.id(), message);
                 return;

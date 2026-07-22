@@ -23,9 +23,22 @@ pub struct RclCxPeerPos {
 }
 
 impl RclCxPeerPos {
-    pub fn new(public_key: PublicKey, signature: Vec<u8>, suppression: Uint256, proposal: Proposal) -> Self {
-        assert!(!signature.is_empty() && signature.len() <= MAX_SIGNATURE_SIZE, "RclCxPeerPos::new: invalid signature length");
-        Self { public_key, suppression, proposal, signature }
+    pub fn new(
+        public_key: PublicKey,
+        signature: Vec<u8>,
+        suppression: Uint256,
+        proposal: Proposal,
+    ) -> Self {
+        assert!(
+            !signature.is_empty() && signature.len() <= MAX_SIGNATURE_SIZE,
+            "RclCxPeerPos::new: invalid signature length"
+        );
+        Self {
+            public_key,
+            suppression,
+            proposal,
+            signature,
+        }
     }
 
     pub fn signature(&self) -> &[u8] {
@@ -49,14 +62,24 @@ impl RclCxPeerPos {
     }
 
     fn signing_hash(&self) -> Uint256 {
-        proposal_signing_hash(self.proposal.propose_seq(), self.proposal.close_time(), self.proposal.prev_ledger(), self.proposal.position())
+        proposal_signing_hash(
+            self.proposal.propose_seq(),
+            self.proposal.close_time(),
+            self.proposal.prev_ledger(),
+            self.proposal.position(),
+        )
     }
 }
 
 /// The signing hash for a proposal's `(seq, close_time, prev_ledger,
 /// position)` tuple, matching `RCLCxPeerPos::hash_append`'s field order
 /// (prefixed with the `HashPrefix::Proposal` equivalent).
-fn proposal_signing_hash(propose_seq: u32, close_time: NetClockTimePoint, prev_ledger: &Uint256, position: &Uint256) -> Uint256 {
+fn proposal_signing_hash(
+    propose_seq: u32,
+    close_time: NetClockTimePoint,
+    prev_ledger: &Uint256,
+    position: &Uint256,
+) -> Uint256 {
     let mut data = Vec::with_capacity(4 + 4 + 4 + 32 + 32);
     data.extend_from_slice(&0x5052_4F50u32.to_be_bytes());
     data.extend_from_slice(&propose_seq.to_be_bytes());
@@ -71,16 +94,39 @@ fn proposal_signing_hash(propose_seq: u32, close_time: NetClockTimePoint, prev_l
 /// Matches the reference's `proposalUniqueId` (used as the suppression id)
 /// plus the actual signing step performed at the call site in the C++
 /// consensus adaptor.
-pub fn sign_proposal(secret_key: &protocol::SecretKey, public_key: &PublicKey, proposal: &Proposal) -> Result<(Vec<u8>, Uint256), protocol::SignError> {
-    let signing_hash = proposal_signing_hash(proposal.propose_seq(), proposal.close_time(), proposal.prev_ledger(), proposal.position());
+pub fn sign_proposal(
+    secret_key: &protocol::SecretKey,
+    public_key: &PublicKey,
+    proposal: &Proposal,
+) -> Result<(Vec<u8>, Uint256), protocol::SignError> {
+    let signing_hash = proposal_signing_hash(
+        proposal.propose_seq(),
+        proposal.close_time(),
+        proposal.prev_ledger(),
+        proposal.position(),
+    );
     let signature = sign_digest(public_key, secret_key, signing_hash)?;
-    let suppression = proposal_unique_id(proposal.position(), proposal.prev_ledger(), proposal.propose_seq(), proposal.close_time(), public_key.as_bytes(), &signature);
+    let suppression = proposal_unique_id(
+        proposal.position(),
+        proposal.prev_ledger(),
+        proposal.propose_seq(),
+        proposal.close_time(),
+        public_key.as_bytes(),
+        &signature,
+    );
     Ok((signature, suppression))
 }
 
 /// Calculate a unique identifier for a signed proposal, used for hash
 /// router suppression of duplicate relays. Matches `proposalUniqueId`.
-pub fn proposal_unique_id(propose_hash: &Uint256, previous_ledger: &Uint256, propose_seq: u32, close_time: NetClockTimePoint, public_key: &[u8], signature: &[u8]) -> Uint256 {
+pub fn proposal_unique_id(
+    propose_hash: &Uint256,
+    previous_ledger: &Uint256,
+    propose_seq: u32,
+    close_time: NetClockTimePoint,
+    public_key: &[u8],
+    signature: &[u8],
+) -> Uint256 {
     let mut data = Vec::with_capacity(32 + 32 + 4 + 4 + 1 + public_key.len() + 1 + signature.len());
     data.extend_from_slice(propose_hash.data());
     data.extend_from_slice(previous_ledger.data());
@@ -106,14 +152,23 @@ mod tests {
 
     fn keypair() -> (protocol::SecretKey, PublicKey) {
         let seed = random_seed();
-        let secret_key = generate_secret_key(KeyType::Secp256k1, &seed).expect("secret key generation should succeed");
-        let public_key = derive_public_key(KeyType::Secp256k1, &secret_key).expect("public key derivation should succeed");
+        let secret_key = generate_secret_key(KeyType::Secp256k1, &seed)
+            .expect("secret key generation should succeed");
+        let public_key = derive_public_key(KeyType::Secp256k1, &secret_key)
+            .expect("public key derivation should succeed");
         (secret_key, public_key)
     }
 
     fn sample_proposal(node_id: PublicKey) -> Proposal {
         let now = NetClockTimePoint::new(1000);
-        Proposal::new(Uint256::from_slice(&[1; 32]).unwrap(), 1, Uint256::from_slice(&[2; 32]).unwrap(), now, now, node_id)
+        Proposal::new(
+            Uint256::from_slice(&[1; 32]).unwrap(),
+            1,
+            Uint256::from_slice(&[2; 32]).unwrap(),
+            now,
+            now,
+            node_id,
+        )
     }
 
     #[test]
@@ -121,7 +176,8 @@ mod tests {
         let (secret_key, public_key) = keypair();
         let proposal = sample_proposal(public_key);
 
-        let (signature, suppression) = sign_proposal(&secret_key, &public_key, &proposal).expect("signing should succeed");
+        let (signature, suppression) =
+            sign_proposal(&secret_key, &public_key, &proposal).expect("signing should succeed");
         let peer_pos = RclCxPeerPos::new(public_key, signature, suppression, proposal);
 
         assert!(peer_pos.check_sign());
@@ -132,7 +188,8 @@ mod tests {
         let (secret_key, public_key) = keypair();
         let proposal = sample_proposal(public_key);
 
-        let (mut signature, suppression) = sign_proposal(&secret_key, &public_key, &proposal).expect("signing should succeed");
+        let (mut signature, suppression) =
+            sign_proposal(&secret_key, &public_key, &proposal).expect("signing should succeed");
         *signature.last_mut().unwrap() ^= 0xFF;
         let peer_pos = RclCxPeerPos::new(public_key, signature, suppression, proposal);
 
@@ -144,7 +201,11 @@ mod tests {
         let (secret_key, public_key) = keypair();
         let proposal_a = sample_proposal(public_key);
         let mut proposal_b = sample_proposal(public_key);
-        proposal_b.change_position(Uint256::from_slice(&[9; 32]).unwrap(), NetClockTimePoint::new(1001), NetClockTimePoint::new(1001));
+        proposal_b.change_position(
+            Uint256::from_slice(&[9; 32]).unwrap(),
+            NetClockTimePoint::new(1001),
+            NetClockTimePoint::new(1001),
+        );
 
         let (_, suppression_a) = sign_proposal(&secret_key, &public_key, &proposal_a).unwrap();
         let (_, suppression_b) = sign_proposal(&secret_key, &public_key, &proposal_b).unwrap();

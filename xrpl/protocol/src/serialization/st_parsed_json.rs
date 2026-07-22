@@ -7,12 +7,13 @@ use basics::{
 };
 
 use crate::{
-    JsonValue, LedgerFormats, Permission, SOEStyle, STAccount, STAmount, STArray, STBlob, STCurrency,
-    STInt32, STIssue, STNumber, STObject, STUInt8, STUInt16, STUInt32, STUInt64, STUInt128,
-    STUInt160, STUInt192, STUInt256, STVector256, STXChainBridge, SerializedTypeId, TxFormats,
-    TxType, asset_from_json, currency_from_string, get_field_by_name, get_field_by_symbol,
-    make_param_error, normalized_parts_from_json_input, normalized_parts_from_string,
-    parse_base58_account_id, st_issue_from_json, st_path_set_from_json,
+    JsonValue, LedgerFormats, Permission, SOEStyle, STAccount, STAmount, STArray, STBlob,
+    STCurrency, STInt32, STIssue, STNumber, STObject, STUInt8, STUInt16, STUInt32, STUInt64,
+    STUInt128, STUInt160, STUInt192, STUInt256, STVector256, STXChainBridge, SerializedTypeId,
+    TxFormats, TxType, asset_from_json, currency_from_string, get_field_by_name,
+    get_field_by_symbol, make_param_error, normalized_parts_from_json_input,
+    normalized_parts_from_string, parse_base58_account_id, st_issue_from_json,
+    st_path_set_from_json,
 };
 
 #[derive(Debug, Clone)]
@@ -98,9 +99,7 @@ fn parse_object(
                         | "OperationLimit"
                 );
                 if !is_common && !entries.contains_key(field_name) {
-                    return Err(format!(
-                        "Field '{name}.{field_name}' is required.",
-                    ));
+                    return Err(format!("Field '{name}.{field_name}' is required.",));
                 }
             }
         }

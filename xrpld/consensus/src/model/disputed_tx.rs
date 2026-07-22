@@ -78,8 +78,12 @@ where
         self.our_vote
     }
 
-    pub fn yays(&self) -> i32 { self.yays }
-    pub fn nays(&self) -> i32 { self.nays }
+    pub fn yays(&self) -> i32 {
+        self.yays
+    }
+    pub fn nays(&self) -> i32 {
+        self.nays
+    }
 
     /// The disputed transaction. `tx()`.
     pub fn tx(&self) -> &Tx {
@@ -176,8 +180,8 @@ where
             return false;
         }
         let weight = support / total;
-        let min_pct = i32::try_from(parms.min_consensus_pct)
-            .expect("min_consensus_pct must fit in i32");
+        let min_pct =
+            i32::try_from(parms.min_consensus_pct).expect("min_consensus_pct must fit in i32");
         weight > min_pct || weight < (100 - min_pct)
     }
 
@@ -186,7 +190,12 @@ where
     ///
     /// `percent_time` is the percentage progress through the current round
     /// (e.g. 50, 90); `proposing` is whether we're proposing this round.
-    pub fn update_vote(&mut self, percent_time: i32, proposing: bool, parms: &ConsensusParms) -> bool {
+    pub fn update_vote(
+        &mut self,
+        percent_time: i32,
+        proposing: bool,
+        parms: &ConsensusParms,
+    ) -> bool {
         if self.our_vote && self.nays == 0 {
             return false;
         }
@@ -211,8 +220,7 @@ where
             // Give ourselves full weight.
             let weight =
                 (self.yays * 100 + i32::from(self.our_vote) * 100) / (self.nays + self.yays + 1);
-            weight
-                > i32::try_from(required_pct).expect("required percent must fit in i32")
+            weight > i32::try_from(required_pct).expect("required percent must fit in i32")
         } else {
             // Don't let us outweigh a proposing node -- just recognize
             // consensus.

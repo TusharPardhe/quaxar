@@ -1,11 +1,11 @@
 //! Integration tests for the narrowed `xrpl/shamap` migration slice.
 
-use parking_lot::Mutex;
 use basics::base_uint::Uint256;
 use basics::blob::Blob;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::ManualClock;
+use parking_lot::Mutex;
 use shamap::compare::{Delta, compare, deep_compare};
 use shamap::difference::visit_differences;
 use shamap::family::{
@@ -61,10 +61,7 @@ struct SharedReporter(Arc<Mutex<RecordingMissingNodeReporter>>);
 
 impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_seq(&self, ref_num: u32, node_hash: Uint256) {
-        self.0
-            .lock()
-            .by_seq
-            .push((ref_num, node_hash));
+        self.0.lock().by_seq.push((ref_num, node_hash));
     }
 
     fn missing_node_acquire_by_hash(&self, _ref_hash: Uint256, _ref_num: u32) {}
@@ -77,17 +74,13 @@ struct RecordingJournal {
 
 impl RecordingJournal {
     fn entries(&self) -> Vec<(JournalLevel, String)> {
-        self.entries
-            .lock()
-            .clone()
+        self.entries.lock().clone()
     }
 }
 
 impl SHAMapJournal for RecordingJournal {
     fn log(&self, level: JournalLevel, message: &str) {
-        self.entries
-            .lock()
-            .push((level, message.to_owned()));
+        self.entries.lock().push((level, message.to_owned()));
     }
 }
 
@@ -1652,8 +1645,7 @@ fn shamap_sync_tree_walk_map_with_family_matches_owner_fetch_roles() {
     );
     assert!(root.get_child(2).is_none());
     assert!(!tree.is_full());
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(209, *missing_hash.as_uint256())]
@@ -1750,8 +1742,7 @@ fn shamap_sync_tree_walk_map_parallel_with_family_matches_owner_fetch_roles() {
     );
     assert!(root.get_child(2).is_none());
     assert!(!tree.is_full());
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(210, *missing_hash.as_uint256())]
@@ -1964,10 +1955,7 @@ fn shamap_sync_tree_owner_full_gate_matches_narrow_cpp_fetch_roles() {
 
     impl SHAMapNodeFetcher for SharedBlobFetcher {
         fn fetch_node_blob(&self, _hash: SHAMapHash) -> Option<Blob> {
-            match *self
-                .0
-                .lock()
-            {
+            match *self.0.lock() {
                 BlobFetchMode::InvalidBlob => Some(vec![0x00, 0xAB, 0xCD]),
                 BlobFetchMode::Missing => None,
             }
@@ -1996,12 +1984,7 @@ fn shamap_sync_tree_owner_full_gate_matches_narrow_cpp_fetch_roles() {
 
     assert!(!tree.fetch_root_with_family(requested, &mut no_filter, &family));
     assert!(tree.is_full());
-    assert!(
-        reporter
-            .lock()
-            .by_seq
-            .is_empty()
-    );
+    assert!(reporter.lock().by_seq.is_empty());
     assert_eq!(journal.entries()[0].0, JournalLevel::Trace);
     assert_eq!(
         journal.entries()[0].1,
@@ -2010,14 +1993,12 @@ fn shamap_sync_tree_owner_full_gate_matches_narrow_cpp_fetch_roles() {
     assert_eq!(journal.entries()[1].0, JournalLevel::Warn);
     assert!(journal.entries()[1].1.contains("invalid fetched node blob"));
 
-    *mode
-        .lock() = BlobFetchMode::Missing;
+    *mode.lock() = BlobFetchMode::Missing;
 
     assert!(!tree.fetch_root_with_family(requested, &mut no_filter, &family));
     assert!(!tree.fetch_root_with_family(requested, &mut no_filter, &family));
     assert!(!tree.is_full());
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert_eq!(reporter.by_seq, vec![(95, *requested.as_uint256())]);
 }
 
@@ -2057,8 +2038,7 @@ fn shamap_sync_tree_owner_config_matches_narrow_cpp_roles() {
     family.with_fetcher(|fetcher| {
         assert_eq!(fetcher.fetches.lock().clone(), vec![requested]);
     });
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(reporter_state.by_seq, vec![(205, *requested.as_uint256())]);
     drop(reporter_state);
 
@@ -2067,8 +2047,7 @@ fn shamap_sync_tree_owner_config_matches_narrow_cpp_roles() {
     family.with_fetcher(|fetcher| {
         assert_eq!(fetcher.fetches.lock().clone(), vec![requested]);
     });
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(reporter_state.by_seq, vec![(205, *requested.as_uint256())]);
 }
 
@@ -3174,8 +3153,7 @@ fn shamap_storage_tree_walk_map_with_family_matches_owner_fetch_roles() {
     );
     assert!(root.get_child(2).is_none());
     assert!(!tree.is_full());
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(207, *missing_hash.as_uint256())]
@@ -3300,8 +3278,7 @@ fn shamap_storage_tree_owner_full_gate_matches_narrow_cpp_fetch_roles() {
     assert_eq!(first, TraversalError::MissingNode(missing_hash));
     assert_eq!(second, TraversalError::MissingNode(missing_hash));
     assert!(!tree.is_full());
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert_eq!(reporter.by_seq, vec![(106, *missing_hash.as_uint256())]);
 }
 
@@ -3349,8 +3326,7 @@ fn shamap_storage_tree_owner_config_matches_narrow_cpp_roles() {
     family.with_fetcher(|fetcher| {
         assert_eq!(fetcher.fetches.lock().clone(), vec![missing_hash]);
     });
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(206, *missing_hash.as_uint256())]
@@ -3365,8 +3341,7 @@ fn shamap_storage_tree_owner_config_matches_narrow_cpp_roles() {
     family.with_fetcher(|fetcher| {
         assert_eq!(fetcher.fetches.lock().clone(), vec![missing_hash]);
     });
-    let reporter_state = reporter
-        .lock();
+    let reporter_state = reporter.lock();
     assert_eq!(
         reporter_state.by_seq,
         vec![(206, *missing_hash.as_uint256())]

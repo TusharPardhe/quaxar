@@ -12,8 +12,14 @@ use time::Duration;
 /// Possible ledger close-time resolutions. Values must not be duplicated
 /// and must be in strictly increasing order (both invariants the
 /// reference documents on `kLedgerPossibleTimeResolutions`).
-pub const LEDGER_POSSIBLE_TIME_RESOLUTIONS: [Duration; 6] =
-    [Duration::seconds(10), Duration::seconds(20), Duration::seconds(30), Duration::seconds(60), Duration::seconds(90), Duration::seconds(120)];
+pub const LEDGER_POSSIBLE_TIME_RESOLUTIONS: [Duration; 6] = [
+    Duration::seconds(10),
+    Duration::seconds(20),
+    Duration::seconds(30),
+    Duration::seconds(60),
+    Duration::seconds(90),
+    Duration::seconds(120),
+];
 
 /// Initial resolution of ledger close time. Matches `kLedgerDefaultTimeResolution`.
 pub const LEDGER_DEFAULT_TIME_RESOLUTION: Duration = LEDGER_POSSIBLE_TIME_RESOLUTIONS[2];
@@ -44,10 +50,20 @@ pub const DECREASE_LEDGER_TIME_RESOLUTION_EVERY: u32 = 1;
 /// `previous_resolution` must be one of [`LEDGER_POSSIBLE_TIME_RESOLUTIONS`];
 /// if it is not (should never happen in practice), this returns it
 /// unchanged, matching the reference's own defensive fallback.
-pub fn get_next_ledger_time_resolution(previous_resolution: Duration, previous_agree: bool, ledger_seq: u32) -> Duration {
-    debug_assert_ne!(ledger_seq, 0, "get_next_ledger_time_resolution: valid ledger sequence");
+pub fn get_next_ledger_time_resolution(
+    previous_resolution: Duration,
+    previous_agree: bool,
+    ledger_seq: u32,
+) -> Duration {
+    debug_assert_ne!(
+        ledger_seq, 0,
+        "get_next_ledger_time_resolution: valid ledger sequence"
+    );
 
-    let Some(index) = LEDGER_POSSIBLE_TIME_RESOLUTIONS.iter().position(|&r| r == previous_resolution) else {
+    let Some(index) = LEDGER_POSSIBLE_TIME_RESOLUTIONS
+        .iter()
+        .position(|&r| r == previous_resolution)
+    else {
         return previous_resolution;
     };
 
@@ -98,7 +114,11 @@ pub fn round_close_time(close_time: NetClockTimePoint, resolution: Duration) -> 
 ///
 /// A zero `close_time` is returned unchanged, matching `roundCloseTime`'s
 /// own special case (which this function delegates to first).
-pub fn effective_close_time(close_time: NetClockTimePoint, resolution: Duration, prior_close_time: NetClockTimePoint) -> NetClockTimePoint {
+pub fn effective_close_time(
+    close_time: NetClockTimePoint,
+    resolution: Duration,
+    prior_close_time: NetClockTimePoint,
+) -> NetClockTimePoint {
     if close_time == NetClockTimePoint::default() {
         return close_time;
     }
@@ -128,33 +148,72 @@ mod tests {
 
     #[test]
     fn next_resolution_decreases_on_disagreement_every_ledger() {
-        assert_eq!(get_next_ledger_time_resolution(Duration::seconds(30), false, 1).whole_seconds(), 60);
-        assert_eq!(get_next_ledger_time_resolution(Duration::seconds(30), false, 2).whole_seconds(), 60);
+        assert_eq!(
+            get_next_ledger_time_resolution(Duration::seconds(30), false, 1).whole_seconds(),
+            60
+        );
+        assert_eq!(
+            get_next_ledger_time_resolution(Duration::seconds(30), false, 2).whole_seconds(),
+            60
+        );
     }
 
     #[test]
     fn next_resolution_increases_on_agreement_every_eighth_ledger_only() {
-        assert_eq!(get_next_ledger_time_resolution(Duration::seconds(30), true, 8).whole_seconds(), 20);
-        assert_eq!(get_next_ledger_time_resolution(Duration::seconds(30), true, 1).whole_seconds(), 30);
-        assert_eq!(get_next_ledger_time_resolution(Duration::seconds(30), true, 16).whole_seconds(), 20);
+        assert_eq!(
+            get_next_ledger_time_resolution(Duration::seconds(30), true, 8).whole_seconds(),
+            20
+        );
+        assert_eq!(
+            get_next_ledger_time_resolution(Duration::seconds(30), true, 1).whole_seconds(),
+            30
+        );
+        assert_eq!(
+            get_next_ledger_time_resolution(Duration::seconds(30), true, 16).whole_seconds(),
+            20
+        );
     }
 
     #[test]
     fn next_resolution_clamps_at_the_ends_of_the_ladder() {
-        assert_eq!(get_next_ledger_time_resolution(Duration::seconds(10), true, 8).whole_seconds(), 10);
-        assert_eq!(get_next_ledger_time_resolution(Duration::seconds(120), false, 1).whole_seconds(), 120);
+        assert_eq!(
+            get_next_ledger_time_resolution(Duration::seconds(10), true, 8).whole_seconds(),
+            10
+        );
+        assert_eq!(
+            get_next_ledger_time_resolution(Duration::seconds(120), false, 1).whole_seconds(),
+            120
+        );
     }
 
     #[test]
     fn round_close_time_zero_stays_zero() {
-        assert_eq!(round_close_time(NetClockTimePoint::default(), Duration::seconds(30)), NetClockTimePoint::default());
+        assert_eq!(
+            round_close_time(NetClockTimePoint::default(), Duration::seconds(30)),
+            NetClockTimePoint::default()
+        );
     }
 
     #[test]
     fn round_close_time_rounds_up_on_ties_and_to_nearest_otherwise() {
-        assert_eq!(round_close_time(NetClockTimePoint::new(45), Duration::seconds(30)).time_since_epoch().whole_seconds(), 60);
-        assert_eq!(round_close_time(NetClockTimePoint::new(60), Duration::seconds(30)).time_since_epoch().whole_seconds(), 60);
-        assert_eq!(round_close_time(NetClockTimePoint::new(15), Duration::seconds(10)).time_since_epoch().whole_seconds(), 20);
+        assert_eq!(
+            round_close_time(NetClockTimePoint::new(45), Duration::seconds(30))
+                .time_since_epoch()
+                .whole_seconds(),
+            60
+        );
+        assert_eq!(
+            round_close_time(NetClockTimePoint::new(60), Duration::seconds(30))
+                .time_since_epoch()
+                .whole_seconds(),
+            60
+        );
+        assert_eq!(
+            round_close_time(NetClockTimePoint::new(15), Duration::seconds(10))
+                .time_since_epoch()
+                .whole_seconds(),
+            20
+        );
     }
 
     #[test]
@@ -167,6 +226,13 @@ mod tests {
 
     #[test]
     fn effective_close_time_zero_stays_zero() {
-        assert_eq!(effective_close_time(NetClockTimePoint::default(), Duration::seconds(30), NetClockTimePoint::new(100)), NetClockTimePoint::default());
+        assert_eq!(
+            effective_close_time(
+                NetClockTimePoint::default(),
+                Duration::seconds(30),
+                NetClockTimePoint::new(100)
+            ),
+            NetClockTimePoint::default()
+        );
     }
 }

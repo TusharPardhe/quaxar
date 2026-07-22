@@ -138,9 +138,7 @@ fn check_invariants_inner<V: ApplyView>(
     let mut lending = LendingState::default();
     let mut clawback = ClawbackState::default();
     let mut object_deletion = ObjectDeletionState::default();
-    let fix_cleanup_3_3_0 = sandbox
-        .rules()
-        .enabled(&protocol::fix_cleanup_3_3_0());
+    let fix_cleanup_3_3_0 = sandbox.rules().enabled(&protocol::fix_cleanup_3_3_0());
 
     for (index, entry) in sandbox.items() {
         let is_delete = entry.action == Action::Erase;

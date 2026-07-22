@@ -1,4 +1,3 @@
-use parking_lot::Mutex;
 use basics::base_uint::Uint256;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
@@ -7,6 +6,7 @@ use ledger::{
     Fees, Ledger, LedgerHeader, LedgerJournal, amendments_key, calculate_ledger_hash,
     encode_fee_settings_entry, fees_key,
 };
+use parking_lot::Mutex;
 use protocol::{LedgerEntryType, STAmount, STLedgerEntry, feature_xrp_fees, get_field_by_symbol};
 use shamap::family::{MissingNodeReporter, NullFullBelowCache, SHAMapFamily, SHAMapNodeFetcher};
 use shamap::item::SHAMapItem;
@@ -83,17 +83,11 @@ struct SharedReporter(Arc<Mutex<RecordingMissingNodeReporter>>);
 
 impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_seq(&self, ref_num: u32, node_hash: Uint256) {
-        self.0
-            .lock()
-            .by_seq
-            .push((ref_num, node_hash));
+        self.0.lock().by_seq.push((ref_num, node_hash));
     }
 
     fn missing_node_acquire_by_hash(&self, ref_hash: Uint256, ref_num: u32) {
-        self.0
-            .lock()
-            .by_hash
-            .push((ref_hash, ref_num));
+        self.0.lock().by_hash.push((ref_hash, ref_num));
     }
 }
 
@@ -105,23 +99,17 @@ struct RecordingLedgerJournal {
 
 impl RecordingLedgerJournal {
     fn warns(&self) -> Vec<String> {
-        self.warns
-            .lock()
-            .clone()
+        self.warns.lock().clone()
     }
 }
 
 impl LedgerJournal for RecordingLedgerJournal {
     fn info(&self, message: &str) {
-        self.infos
-            .lock()
-            .push(message.to_owned());
+        self.infos.lock().push(message.to_owned());
     }
 
     fn warn(&self, message: &str) {
-        self.warns
-            .lock()
-            .push(message.to_owned());
+        self.warns.lock().push(message.to_owned());
     }
 }
 
@@ -215,8 +203,7 @@ fn ledger_load_immutable_with_family_and_setup_marks_failed_setup_ctor() {
         );
     });
     assert!(journal.warns().is_empty());
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert_eq!(reporter.by_seq, Vec::<(u32, Uint256)>::new());
     assert_eq!(
         reporter.by_hash,
@@ -313,8 +300,7 @@ fn ledger_load_immutable_with_family_and_setup_decodes_typed_singleton_payloads(
         assert!(fetches.contains(&fee_leaf.get_hash()));
     });
     assert!(journal.warns().is_empty());
-    let reporter = reporter
-        .lock();
+    let reporter = reporter.lock();
     assert!(reporter.by_seq.is_empty());
     assert!(reporter.by_hash.is_empty());
 }

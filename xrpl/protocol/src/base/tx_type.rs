@@ -263,8 +263,16 @@ const DISPATCHABLE_TX_TYPES: &[(u16, &str, &str)] = &[
     (82, "ttLOAN_MANAGE", "LoanManage"),
     (84, "ttLOAN_PAY", "LoanPay"),
     (85, "ttCONFIDENTIAL_MPT_CONVERT", "ConfidentialMPTConvert"),
-    (86, "ttCONFIDENTIAL_MPT_MERGE_INBOX", "ConfidentialMPTMergeInbox"),
-    (87, "ttCONFIDENTIAL_MPT_CONVERT_BACK", "ConfidentialMPTConvertBack"),
+    (
+        86,
+        "ttCONFIDENTIAL_MPT_MERGE_INBOX",
+        "ConfidentialMPTMergeInbox",
+    ),
+    (
+        87,
+        "ttCONFIDENTIAL_MPT_CONVERT_BACK",
+        "ConfidentialMPTConvertBack",
+    ),
     (88, "ttCONFIDENTIAL_MPT_SEND", "ConfidentialMPTSend"),
     (89, "ttCONFIDENTIAL_MPT_CLAWBACK", "ConfidentialMPTClawback"),
     (100, "ttAMENDMENT", "EnableAmendment"),
@@ -397,7 +405,11 @@ const TX_TYPE_TAGS: &[(u16, &str, Option<&str>)] = &[
     (81, "ttLOAN_DELETE", Some("LoanDelete")),
     (82, "ttLOAN_MANAGE", Some("LoanManage")),
     (84, "ttLOAN_PAY", Some("LoanPay")),
-    (85, "ttCONFIDENTIAL_MPT_CONVERT", Some("ConfidentialMPTConvert")),
+    (
+        85,
+        "ttCONFIDENTIAL_MPT_CONVERT",
+        Some("ConfidentialMPTConvert"),
+    ),
     (
         86,
         "ttCONFIDENTIAL_MPT_MERGE_INBOX",

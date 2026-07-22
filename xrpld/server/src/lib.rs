@@ -356,17 +356,39 @@ where
                     Ok(value) => {
                         // Notify ledger stream subscribers about the closed ledger.
                         if let protocol::JsonValue::Object(ref obj) = value {
-                            let seq = obj.get("ledger_current_index")
-                                .and_then(|v| if let protocol::JsonValue::Unsigned(n) = v { Some(*n) } else { None })
+                            let seq = obj
+                                .get("ledger_current_index")
+                                .and_then(|v| {
+                                    if let protocol::JsonValue::Unsigned(n) = v {
+                                        Some(*n)
+                                    } else {
+                                        None
+                                    }
+                                })
                                 .unwrap_or(0);
                             if seq > 0 {
                                 let closed_seq = seq.saturating_sub(1);
                                 let mut notification = std::collections::BTreeMap::new();
-                                notification.insert("type".to_owned(), protocol::JsonValue::String("ledgerClosed".to_owned()));
-                                notification.insert("ledger_index".to_owned(), protocol::JsonValue::Unsigned(closed_seq));
-                                notification.insert("txn_count".to_owned(), protocol::JsonValue::Unsigned(0));
-                                notification.insert("validated_ledgers".to_owned(), protocol::JsonValue::String(format!("2-{}", closed_seq)));
-                                self.subscriptions.publish_json(crate::StreamKind::Ledger, protocol::JsonValue::Object(notification));
+                                notification.insert(
+                                    "type".to_owned(),
+                                    protocol::JsonValue::String("ledgerClosed".to_owned()),
+                                );
+                                notification.insert(
+                                    "ledger_index".to_owned(),
+                                    protocol::JsonValue::Unsigned(closed_seq),
+                                );
+                                notification.insert(
+                                    "txn_count".to_owned(),
+                                    protocol::JsonValue::Unsigned(0),
+                                );
+                                notification.insert(
+                                    "validated_ledgers".to_owned(),
+                                    protocol::JsonValue::String(format!("2-{}", closed_seq)),
+                                );
+                                self.subscriptions.publish_json(
+                                    crate::StreamKind::Ledger,
+                                    protocol::JsonValue::Object(notification),
+                                );
 
                                 // Also notify transaction subscribers. When a ledger
                                 // closes with transactions, subscribers expect a
@@ -376,11 +398,26 @@ where
                                 // transactions — the test only checks for 'type' field.
                                 {
                                     let mut tx_notif = std::collections::BTreeMap::new();
-                                    tx_notif.insert("type".to_owned(), protocol::JsonValue::String("transaction".to_owned()));
-                                    tx_notif.insert("status".to_owned(), protocol::JsonValue::String("closed".to_owned()));
-                                    tx_notif.insert("ledger_index".to_owned(), protocol::JsonValue::Unsigned(closed_seq));
-                                    tx_notif.insert("validated".to_owned(), protocol::JsonValue::Bool(true));
-                                    self.subscriptions.publish_json(crate::StreamKind::Transactions, protocol::JsonValue::Object(tx_notif));
+                                    tx_notif.insert(
+                                        "type".to_owned(),
+                                        protocol::JsonValue::String("transaction".to_owned()),
+                                    );
+                                    tx_notif.insert(
+                                        "status".to_owned(),
+                                        protocol::JsonValue::String("closed".to_owned()),
+                                    );
+                                    tx_notif.insert(
+                                        "ledger_index".to_owned(),
+                                        protocol::JsonValue::Unsigned(closed_seq),
+                                    );
+                                    tx_notif.insert(
+                                        "validated".to_owned(),
+                                        protocol::JsonValue::Bool(true),
+                                    );
+                                    self.subscriptions.publish_json(
+                                        crate::StreamKind::Transactions,
+                                        protocol::JsonValue::Object(tx_notif),
+                                    );
                                 }
                             }
                         }
@@ -804,9 +841,9 @@ where
                 &self.source,
             )),
             "blacklist" => RpcReply::result(rpc::do_black_list(&params, &self.source)),
-            "get_aggregate_price" => {
-                RpcReply::result(rpc::handlers::get_aggregate_price::do_get_aggregate_price(&params, &self.source))
-            }
+            "get_aggregate_price" => RpcReply::result(
+                rpc::handlers::get_aggregate_price::do_get_aggregate_price(&params, &self.source),
+            ),
             "stop" => {
                 let context = rpc::RpcRequestContext {
                     params: &params,

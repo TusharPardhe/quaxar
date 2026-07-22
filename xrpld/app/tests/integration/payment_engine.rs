@@ -31165,3 +31165,29 @@ fn pf10_amm_claw() {
         Ter::TEM_MALFORMED
     );
 }
+
+#[test]
+fn pe_iou_issuer_rejects_negative_sendmax_before_ripple_calc() {
+    let issuer = acct(0x33);
+    let destination = acct(0x22);
+    let l = build_ledger(vec![
+        account_root(issuer, 5_000_000_000, 1, 0),
+        account_root(destination, 5_000_000_000, 1, 0),
+        trust_line(destination, issuer, usd_currency(), 0, 10_000, 0),
+    ]);
+    let mut v = new_view(l);
+    let tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), issuer);
+        tx.set_account_id(sf("sfDestination"), destination);
+        tx.set_field_amount(sf("sfAmount"), iou(issuer, usd_currency(), 100));
+        tx.set_field_amount(sf("sfSendMax"), iou(issuer, usd_currency(), -1));
+        tx.set_field_u32(sf("sfFlags"), 0x0002_0000); // tfPartialPayment
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
+        Ter::TEM_BAD_AMOUNT
+    );
+}

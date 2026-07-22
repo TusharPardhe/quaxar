@@ -5,8 +5,7 @@ use ledger::{
     InboundLedgerCompletionDisposition, InboundLedgerDataType, InboundLedgerJournal,
     InboundLedgerLocal, InboundLedgerNodeData, InboundLedgerPacket, InboundLedgerPacketError,
     InboundLedgerRunDataResult, InboundLedgerStore, InboundLedgerTimerResult, LedgerConfig,
-    LedgerHeader,
-    calculate_ledger_hash,
+    LedgerHeader, calculate_ledger_hash,
 };
 use shamap::family::{NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
 use shamap::storage::{NodeObjectType, StoredNode};
@@ -183,9 +182,11 @@ fn inbound_run_data_tracks_useful_peer_counts_and_resets_dispatch_latch() {
             processed_packets: 2,
             max_useful_count: 1,
             packet_stats: Vec::new(),
-            malformed_packets: vec![
-                (2, InboundLedgerDataType::TransactionNode, InboundLedgerPacketError::EmptyNodes),
-            ],
+            malformed_packets: vec![(
+                2,
+                InboundLedgerDataType::TransactionNode,
+                InboundLedgerPacketError::EmptyNodes
+            ),],
         }
     );
     assert!(!inbound.receive_dispatched());

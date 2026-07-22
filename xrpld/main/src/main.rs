@@ -14,13 +14,14 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[allow(non_upper_case_globals)]
 #[unsafe(no_mangle)]
 pub static _rjem_malloc_conf: Option<&'static libc::c_char> = Some(unsafe {
-    &*b"dirty_decay_ms:0,muzzy_decay_ms:0\0".as_ptr().cast::<libc::c_char>()
+    &*b"dirty_decay_ms:0,muzzy_decay_ms:0\0"
+        .as_ptr()
+        .cast::<libc::c_char>()
 });
 
 use app::{
-    AppBootstrapOptions, AppBootstrapRuntime, MainRuntime, ManagedComponent,
-    build_bootstrap_root, load_basic_config_file,
-    parse_bootstrap_args, run_bootstrap_runtime,
+    AppBootstrapOptions, AppBootstrapRuntime, MainRuntime, ManagedComponent, build_bootstrap_root,
+    load_basic_config_file, parse_bootstrap_args, run_bootstrap_runtime,
 };
 use basics::base_uint::Uint256;
 use basics::basic_config::BasicConfig;
@@ -61,7 +62,6 @@ fn full_sync_debug_enabled() -> bool {
             .unwrap_or(false)
     })
 }
-
 
 fn debug_hash8(hash: &Uint256) -> String {
     format!(
@@ -159,7 +159,8 @@ impl PeerfinderState {
 /// into the spawned thread.
 struct OverlayTimerDeps {
     app: app::ApplicationRoot,
-    ledger_data_rx: Arc<Mutex<Option<std::sync::mpsc::Receiver<overlay::PeerMessage<overlay::TmLedgerData>>>>>,
+    ledger_data_rx:
+        Arc<Mutex<Option<std::sync::mpsc::Receiver<overlay::PeerMessage<overlay::TmLedgerData>>>>>,
     acq_registry: AcqRegistry,
     shared_fetch_pack: Arc<ledger::FetchPackCache>,
     loaded_ledger_runtime: Option<app::AppLoadedLedgerRuntime>,
@@ -545,7 +546,10 @@ fn process_inbound_transaction(app: &app::ApplicationRoot, raw_transaction: &[u8
 /// Per-60s ping tick tracked via a thread-local-style static using an atomic
 /// timestamp, since the overlay-timer thread owns its own 1s loop and has no
 /// access to the main loop's `last_ping_at` local variable.
-fn static_ping_tick(overlay_runtime: &Arc<app::runtime::overlay_runtime::AppOverlayRuntime>, peers: &[Arc<dyn overlay::Peer>]) {
+fn static_ping_tick(
+    overlay_runtime: &Arc<app::runtime::overlay_runtime::AppOverlayRuntime>,
+    peers: &[Arc<dyn overlay::Peer>],
+) {
     use std::sync::atomic::AtomicU64;
     static LAST_PING_SECS: AtomicU64 = AtomicU64::new(0);
     let now_secs = std::time::SystemTime::now()
@@ -557,8 +561,8 @@ fn static_ping_tick(overlay_runtime: &Arc<app::runtime::overlay_runtime::AppOver
         return;
     }
     LAST_PING_SECS.store(now_secs, Ordering::Relaxed);
-    let ping_msg = overlay::ProtocolMessage::new(
-        overlay::ProtocolPayload::Ping(overlay::message::wire::TmPing {
+    let ping_msg = overlay::ProtocolMessage::new(overlay::ProtocolPayload::Ping(
+        overlay::message::wire::TmPing {
             r#type: 0,
             seq: Some(basics::random::rand_int_to(u32::MAX)),
             ping_time: Some(
@@ -568,8 +572,8 @@ fn static_ping_tick(overlay_runtime: &Arc<app::runtime::overlay_runtime::AppOver
                     .as_millis() as u64,
             ),
             net_time: None,
-        }),
-    );
+        },
+    ));
     let wire = overlay::Message::new(ping_msg, None);
     for p in peers {
         p.send(wire.clone());
@@ -952,9 +956,10 @@ fn resolve_rpc_url(parsed: &xrpld_cli::Cli) -> String {
 
     if !conf_path.is_empty()
         && let Ok(content) = std::fs::read_to_string(conf_path)
-            && let Some(url) = parse_rpc_url_from_config(&content) {
-                return url;
-            }
+        && let Some(url) = parse_rpc_url_from_config(&content)
+    {
+        return url;
+    }
 
     parsed.rpc_url.clone()
 }
@@ -980,21 +985,25 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
         }
         if trimmed.starts_with("[port_") {
             // Save previous section if it was HTTP
-            if in_port_section && is_http
-                && let Some(p) = port {
-                    let host = rpc_host(ip.as_deref());
-                    return Some(format!("http://{}:{}", host, p));
-                }
+            if in_port_section
+                && is_http
+                && let Some(p) = port
+            {
+                let host = rpc_host(ip.as_deref());
+                return Some(format!("http://{}:{}", host, p));
+            }
             in_port_section = true;
             port = None;
             ip = None;
             is_http = false;
         } else if trimmed.starts_with('[') {
-            if in_port_section && is_http
-                && let Some(p) = port {
-                    let host = rpc_host(ip.as_deref());
-                    return Some(format!("http://{}:{}", host, p));
-                }
+            if in_port_section
+                && is_http
+                && let Some(p) = port
+            {
+                let host = rpc_host(ip.as_deref());
+                return Some(format!("http://{}:{}", host, p));
+            }
             in_port_section = false;
         } else if in_port_section {
             if let Some(val) = trimmed.strip_prefix("port") {
@@ -1006,18 +1015,21 @@ fn parse_rpc_url_from_config(content: &str) -> Option<String> {
                     ip = Some(val.trim().to_string());
                 }
             } else if let Some(val) = trimmed.strip_prefix("protocol")
-                && let Some(val) = val.trim().strip_prefix('=') {
-                    is_http = val.trim().contains("http");
-                }
+                && let Some(val) = val.trim().strip_prefix('=')
+            {
+                is_http = val.trim().contains("http");
+            }
         }
     }
 
     // Check last section
-    if in_port_section && is_http
-        && let Some(p) = port {
-            let host = rpc_host(ip.as_deref());
-            return Some(format!("http://{}:{}", host, p));
-        }
+    if in_port_section
+        && is_http
+        && let Some(p) = port
+    {
+        let host = rpc_host(ip.as_deref());
+        return Some(format!("http://{}:{}", host, p));
+    }
 
     None
 }
@@ -1859,93 +1871,90 @@ fn update_operating_mode_after_accepted_ledger(
     // rippled: switchLastClosedLedger — when peers/validations prefer a
     // different ledger, JUMP to it. This is the critical recovery path that
     // prevents the node from getting stuck on a stale chain.
-    if ledger_change
-        && let Some(lm_rt) = app.ledger_master_runtime() {
-            let our_closed_hash = *accepted_ledger.header().hash.as_uint256();
-            let trusted_preferred = app
-                .validations()
-                .validations()
-                .lock()
-                .expect("validations lock")
-                .get_preferred(&app::validated_ledger_from_ledger(
-                    accepted_ledger,
-                    &app::NullRclValidationJournal,
-                ));
-            let peer_hashes: Vec<Uint256> = peers.iter()
-                .map(|p| p.closed_ledger_hash())
-                .collect();
-            let preferred_hash = preferred_closed_ledger_hash(
-                trusted_preferred,
-                app.validated_ledger_seq().unwrap_or(0),
-                peer_hashes,
-                our_closed_hash,
-                *accepted_ledger.header().parent_hash.as_uint256(),
-                true,
-            );
+    if ledger_change && let Some(lm_rt) = app.ledger_master_runtime() {
+        let our_closed_hash = *accepted_ledger.header().hash.as_uint256();
+        let trusted_preferred = app
+            .validations()
+            .validations()
+            .lock()
+            .expect("validations lock")
+            .get_preferred(&app::validated_ledger_from_ledger(
+                accepted_ledger,
+                &app::NullRclValidationJournal,
+            ));
+        let peer_hashes: Vec<Uint256> = peers.iter().map(|p| p.closed_ledger_hash()).collect();
+        let preferred_hash = preferred_closed_ledger_hash(
+            trusted_preferred,
+            app.validated_ledger_seq().unwrap_or(0),
+            peer_hashes,
+            our_closed_hash,
+            *accepted_ledger.header().parent_hash.as_uint256(),
+            true,
+        );
 
-            if preferred_hash != our_closed_hash && !preferred_hash.is_zero() {
-                // Try to get the preferred ledger from history or inbound
-                let ledger_master = lm_rt.ledger_master();
-                if let Some(target) = ledger_master.get_ledger_by_hash(
-                    basics::sha_map_hash::SHAMapHash::new(preferred_hash),
-                ) {
-                    tracing::warn!(target: "consensus",
-                        our_seq = accepted_ledger.header().seq,
-                        target_seq = target.header().seq,
-                        "JUMP: switchLastClosedLedger to peer-preferred ledger"
-                    );
-                    // Promote: set as valid if quorum is met
-                    let target_seq = target.header().seq;
-                    let validations = app
-                        .validations()
-                        .store()
-                        .trusted_for_ledger_by_sequence(preferred_hash, target_seq);
-                    let val_count = app
-                        .validators()
-                        .negative_unl_filter_validations(validations)
-                        .len();
-                    let quorum = app.validators().quorum();
-                    if val_count >= quorum {
-                        let mut promoted = app.ledger_with_node_fetcher(
-                            std::sync::Arc::clone(&target),
-                        );
-                        {
-                            let l = std::sync::Arc::make_mut(&mut promoted);
-                            l.set_validated();
-                            l.set_full();
-                            l.finalize_immutable_no_setup();
-                        }
-                        ledger_master.ledger_history().insert(
-                            std::sync::Arc::clone(&promoted), true,
-                        );
-                        ledger_master.mark_ledger_complete(target_seq);
-                        ledger_master.set_valid_ledger_no_sweep(
-                            std::sync::Arc::clone(&promoted), None, None,
-                        );
-                        app.note_validated_ledger_for_sync(std::sync::Arc::clone(&promoted));
-                        app.set_need_network_ledger(false);
-                        tracing::info!(target: "consensus",
-                            seq = target_seq,
-                            validations = val_count,
-                            "JUMP: validated ledger promoted (switchLastClosedLedger)"
-                        );
-                    } else {
-                        tracing::debug!(target: "consensus",
-                            seq = target_seq,
-                            val_count,
-                            quorum,
-                            "JUMP: preferred ledger acquired but quorum not met yet"
-                        );
+        if preferred_hash != our_closed_hash && !preferred_hash.is_zero() {
+            // Try to get the preferred ledger from history or inbound
+            let ledger_master = lm_rt.ledger_master();
+            if let Some(target) = ledger_master
+                .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash))
+            {
+                tracing::warn!(target: "consensus",
+                    our_seq = accepted_ledger.header().seq,
+                    target_seq = target.header().seq,
+                    "JUMP: switchLastClosedLedger to peer-preferred ledger"
+                );
+                // Promote: set as valid if quorum is met
+                let target_seq = target.header().seq;
+                let validations = app
+                    .validations()
+                    .store()
+                    .trusted_for_ledger_by_sequence(preferred_hash, target_seq);
+                let val_count = app
+                    .validators()
+                    .negative_unl_filter_validations(validations)
+                    .len();
+                let quorum = app.validators().quorum();
+                if val_count >= quorum {
+                    let mut promoted = app.ledger_with_node_fetcher(std::sync::Arc::clone(&target));
+                    {
+                        let l = std::sync::Arc::make_mut(&mut promoted);
+                        l.set_validated();
+                        l.set_full();
+                        l.finalize_immutable_no_setup();
                     }
-                } else {
-                    // Don't have it — request acquisition (non-blocking)
+                    ledger_master
+                        .ledger_history()
+                        .insert(std::sync::Arc::clone(&promoted), true);
+                    ledger_master.mark_ledger_complete(target_seq);
+                    ledger_master.set_valid_ledger_no_sweep(
+                        std::sync::Arc::clone(&promoted),
+                        None,
+                        None,
+                    );
+                    app.note_validated_ledger_for_sync(std::sync::Arc::clone(&promoted));
+                    app.set_need_network_ledger(false);
                     tracing::info!(target: "consensus",
-                        hash = %format!("{:016x}", preferred_hash.data()[0] as u64),
-                        "JUMP: requesting preferred ledger acquisition"
+                        seq = target_seq,
+                        validations = val_count,
+                        "JUMP: validated ledger promoted (switchLastClosedLedger)"
+                    );
+                } else {
+                    tracing::debug!(target: "consensus",
+                        seq = target_seq,
+                        val_count,
+                        quorum,
+                        "JUMP: preferred ledger acquired but quorum not met yet"
                     );
                 }
+            } else {
+                // Don't have it — request acquisition (non-blocking)
+                tracing::info!(target: "consensus",
+                    hash = %format!("{:016x}", preferred_hash.data()[0] as u64),
+                    "JUMP: requesting preferred ledger acquisition"
+                );
             }
         }
+    }
 
     let next_mode = select_post_acquisition_operating_mode(
         current_mode,
@@ -2114,7 +2123,6 @@ enum AcqMsg {
     /// Shutdown
     Stop,
 }
-
 
 /// Shared registry of active acquisition channels, keyed by ledger hash.
 /// The overlay direct-channel router thread uses this to route TmLedgerData
@@ -2482,13 +2490,14 @@ fn run_export_snapshot(url: &str, output: &str) -> bool {
             let text = response.text().unwrap_or_default();
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                 if let Some(status) = json["result"]["status"].as_str()
-                    && status == "started" {
-                        let seq = json["result"]["ledger_seq"].as_u64().unwrap_or(0);
-                        println!("  ✓ Export started (ledger seq: {})", seq);
-                        println!("  → Output: {}", output);
-                        println!("  → Monitor progress: grep snapshot ~/quaxar.log");
-                        return true;
-                    }
+                    && status == "started"
+                {
+                    let seq = json["result"]["ledger_seq"].as_u64().unwrap_or(0);
+                    println!("  ✓ Export started (ledger seq: {})", seq);
+                    println!("  → Output: {}", output);
+                    println!("  → Monitor progress: grep snapshot ~/quaxar.log");
+                    return true;
+                }
                 if let Some(error) = json["result"]["error_message"].as_str() {
                     eprintln!("  ✗ {}", error);
                     return false;

@@ -1,5 +1,6 @@
 use crate::BuildLedgerJournal;
 use crate::consensus::rcl_validations::RclValidationJournal;
+use crate::ledger::inbound_ledgers::InboundLedgersLocal;
 use crate::ledger::open_ledger::{OpenLedger, OpenLedgerTx, OpenLedgerView};
 use crate::load::load_manager::LoadManagerJournal;
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
@@ -10,10 +11,9 @@ use crate::validator::validator_site::ValidatorSite;
 use basics::base_uint::Uint256;
 use basics::tagged_cache::{MonotonicClock, TaggedCache};
 use ledger::{
-    AcceptedLedger, CachedSles, InboundTransactions, LedgerCleaner,
-    LedgerReplayer, OrderBookDB, PendingSaves, ReadView,
+    AcceptedLedger, CachedSles, InboundTransactions, LedgerCleaner, LedgerReplayer, OrderBookDB,
+    PendingSaves, ReadView,
 };
-use crate::ledger::inbound_ledgers::InboundLedgersLocal;
 use nodestore::{JournalLevel as NodeStoreJournalLevel, NodeStoreJournal};
 use overlay::Cluster;
 use overlay::SimplePeerSetBuilder;

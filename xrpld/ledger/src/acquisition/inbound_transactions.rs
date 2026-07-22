@@ -207,7 +207,11 @@ impl InboundTransactions {
     }
 
     pub fn stored_hashes(&self) -> Vec<Uint256> {
-        self.sets.iter().filter(|(_, v)| v.set.is_some()).map(|(h, _)| *h).collect()
+        self.sets
+            .iter()
+            .filter(|(_, v)| v.set.is_some())
+            .map(|(h, _)| *h)
+            .collect()
     }
 
     /// Drive pending TransactionAcquire objects forward. Each pending

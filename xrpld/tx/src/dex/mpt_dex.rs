@@ -7,10 +7,9 @@ use basics::base_uint::Uint160;
 use ledger::views::apply_view::ApplyView;
 use ledger::views::read_view::ReadView;
 use protocol::{
-    Asset, Keylet, LedgerEntryType, MPTIssue, STLedgerEntry, Ter,
-    get_field_by_symbol, is_tes_success,
-    lsfMPTAuthorized, lsfMPTCanTrade, lsfMPTCanTransfer, lsfMPTLocked, lsfMPTRequireAuth,
-    mpt_issuance_keylet_from_mptid, mptoken_keylet,
+    Asset, Keylet, LedgerEntryType, MPTIssue, STLedgerEntry, Ter, get_field_by_symbol,
+    is_tes_success, lsfMPTAuthorized, lsfMPTCanTrade, lsfMPTCanTransfer, lsfMPTLocked,
+    lsfMPTRequireAuth, mpt_issuance_keylet_from_mptid, mptoken_keylet,
 };
 use std::sync::Arc;
 

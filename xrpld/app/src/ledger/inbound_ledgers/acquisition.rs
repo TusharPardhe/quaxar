@@ -495,15 +495,15 @@ fn family<'a>(
 
 fn trigger(
     state: &AcquisitionState,
-    mutable: &mut AcqMutableState,
     reason: InboundLedgerRequestTrigger,
     peer: Option<Arc<dyn Peer>>,
 ) {
+    let mut mutable = state.mutable.lock().expect("acquisition mutable lock");
     let AcqMutableState {
         inbound,
         store,
         fetch_pack,
-    } = mutable;
+    } = &mut *mutable;
     let journal = WorkerJournal;
     let config = ledger::LedgerConfig::default();
     let mut send = |message: overlay::ProtocolMessage| {
@@ -515,7 +515,7 @@ fn trigger(
     );
 }
 
-fn add_peers(state: &AcquisitionState, mutable: &mut AcqMutableState) {
+fn add_peers(state: &AcquisitionState) -> Vec<Arc<dyn Peer>> {
     let limit = if state.peer_set.peer_count() == 0 {
         PEER_COUNT_START
     } else {
@@ -528,17 +528,7 @@ fn add_peers(state: &AcquisitionState, mutable: &mut AcqMutableState) {
         &mut |peer| peer.has_ledger(hash, state.seq),
         &mut |peer| added.push(Arc::clone(peer)),
     );
-    if state.reason == AcquireReason::History {
-        return;
-    }
-    for peer in added {
-        trigger(
-            state,
-            mutable,
-            InboundLedgerRequestTrigger::Added,
-            Some(peer),
-        );
-    }
+    added
 }
 
 fn check_local(state: &AcquisitionState, mutable: &mut AcqMutableState) {
@@ -557,20 +547,26 @@ fn process_init(state: &Arc<AcquisitionState>) {
     if state.is_done() {
         return;
     }
-    let mut mutable = state.mutable.lock().expect("acquisition mutable lock");
-    check_local(state, &mut mutable);
-    if mutable.inbound.is_failed() {
-        drop(mutable);
-        state.mark_failed();
-        return;
+    let added = {
+        let mut mutable = state.mutable.lock().expect("acquisition mutable lock");
+        check_local(state, &mut mutable);
+        if mutable.inbound.is_failed() {
+            drop(mutable);
+            state.mark_failed();
+            return;
+        }
+        if mutable.inbound.is_complete() {
+            drop(mutable);
+            finalize_acquisition(state);
+            return;
+        }
+        add_peers(state)
+    };
+    if state.reason != AcquireReason::History {
+        for peer in added {
+            trigger(state, InboundLedgerRequestTrigger::Added, Some(peer));
+        }
     }
-    if mutable.inbound.is_complete() {
-        drop(mutable);
-        finalize_acquisition(state);
-        return;
-    }
-    add_peers(state, &mut mutable);
-    drop(mutable);
     state.queue_timeout_job();
 }
 
@@ -649,18 +645,18 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         }
     };
 
-    for peer_id in reply_peers {
-        let Some(peer) = state.peer_set.find_peer(peer_id as u32) else {
-            continue;
-        };
-        let reason = if peer.is_high_latency() {
-            InboundLedgerRequestTrigger::ReplyHighLatency
-        } else {
-            InboundLedgerRequestTrigger::Reply
-        };
-        trigger(state, &mut mutable, reason, Some(peer));
-    }
-
+    let reply_requests: Vec<_> = reply_peers
+        .into_iter()
+        .filter_map(|peer_id| {
+            let peer = state.peer_set.find_peer(peer_id as u32)?;
+            let reason = if peer.is_high_latency() {
+                InboundLedgerRequestTrigger::ReplyHighLatency
+            } else {
+                InboundLedgerRequestTrigger::Reply
+            };
+            Some((reason, peer))
+        })
+        .collect();
     let complete = mutable.inbound.is_complete();
     let failed = mutable.inbound.is_failed();
     drop(mutable);
@@ -670,6 +666,9 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         finalize_acquisition(state);
     }
     state.finish_data_job();
+    for (reason, peer) in reply_requests {
+        trigger(state, reason, Some(peer));
+    }
 }
 
 fn charge_malformed_packet(
@@ -700,55 +699,49 @@ fn process_timeout_job(state: &Arc<AcquisitionState>) {
         return;
     }
 
-    let mut mutable = state.mutable.lock().expect("acquisition mutable lock");
-    let timer_result = mutable.inbound.timeout_expired();
-    match timer_result {
-        InboundLedgerTimerResult::Progress => {}
-        InboundLedgerTimerResult::Done => {
-            drop(mutable);
-            finalize_acquisition(state);
-            return;
-        }
-        InboundLedgerTimerResult::Failed => {
-            drop(mutable);
-            state.mark_failed();
-            return;
-        }
-        InboundLedgerTimerResult::NoProgress => {
-            check_local(state, &mut mutable);
-            if mutable.inbound.is_failed() {
-                drop(mutable);
-                state.mark_failed();
-                return;
-            }
-            if mutable.inbound.is_complete() {
-                drop(mutable);
-                finalize_acquisition(state);
-                return;
-            }
-
-            mutable.inbound.set_by_hash(true);
-            if state.reason != AcquireReason::History {
-                trigger(
-                    state,
-                    &mut mutable,
-                    InboundLedgerRequestTrigger::Timeout,
-                    None,
-                );
-            }
-            add_peers(state, &mut mutable);
-            if state.reason == AcquireReason::History {
-                trigger(
-                    state,
-                    &mut mutable,
-                    InboundLedgerRequestTrigger::Timeout,
-                    None,
-                );
+    let mut added = Vec::new();
+    let mut retry = false;
+    let mut finalize = false;
+    let mut failed = false;
+    {
+        let mut mutable = state.mutable.lock().expect("acquisition mutable lock");
+        match mutable.inbound.timeout_expired() {
+            InboundLedgerTimerResult::Progress => {}
+            InboundLedgerTimerResult::Done => finalize = true,
+            InboundLedgerTimerResult::Failed => failed = true,
+            InboundLedgerTimerResult::NoProgress => {
+                check_local(state, &mut mutable);
+                if mutable.inbound.is_failed() {
+                    failed = true;
+                } else if mutable.inbound.is_complete() {
+                    finalize = true;
+                } else {
+                    mutable.inbound.set_by_hash(true);
+                    added = add_peers(state);
+                    retry = true;
+                }
             }
         }
     }
 
-    drop(mutable);
+    if failed {
+        state.mark_failed();
+        return;
+    }
+    if finalize {
+        finalize_acquisition(state);
+        return;
+    }
+    if retry {
+        if state.reason != AcquireReason::History {
+            trigger(state, InboundLedgerRequestTrigger::Timeout, None);
+            for peer in added {
+                trigger(state, InboundLedgerRequestTrigger::Added, Some(peer));
+            }
+        } else {
+            trigger(state, InboundLedgerRequestTrigger::Timeout, None);
+        }
+    }
     state.arm_timer();
 }
 

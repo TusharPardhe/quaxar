@@ -29,8 +29,7 @@ pub struct AppLedgerMasterRuntime {
     pub(crate) pending_consensus_ledger: Arc<Mutex<Option<Uint256>>>,
     pub(crate) completed_ledgers_rx:
         Arc<Mutex<Option<std::sync::mpsc::Receiver<Arc<ledger::Ledger>>>>>,
-    pub inbound_ledgers:
-        Arc<Mutex<Option<Arc<crate::ledger::inbound_ledgers::InboundLedgers>>>>,
+    pub inbound_ledgers: Arc<Mutex<Option<Arc<crate::ledger::inbound_ledgers::InboundLedgers>>>>,
 }
 
 const APP_LEDGER_MASTER_MAX_PUBLISH_GAP: u32 = 100;
