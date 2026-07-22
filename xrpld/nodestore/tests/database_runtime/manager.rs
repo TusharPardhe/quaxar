@@ -194,6 +194,13 @@ fn manager_nudb_deterministic_entrypoint_uses_native_nudb_storage_policy() {
     let hash = basics::base_uint::Uint256::from_array([0xDD; 32]);
     database.store(NodeObjectType::Ledger, vec![1, 3, 5, 7], hash, 0);
     database.sync();
+    assert_eq!(
+        std::fs::metadata(backend_path.join("nudb.log"))
+            .expect("NuDB log metadata after sync")
+            .len(),
+        0,
+        "sync must commit the active NuDB burst before an acquired ledger is published"
+    );
 
     let fetched = database.fetch_batch(&[hash]);
     assert_eq!(fetched.len(), 1);

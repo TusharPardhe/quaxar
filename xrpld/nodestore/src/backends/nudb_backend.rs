@@ -2492,7 +2492,10 @@ impl Backend for NuDbBackend {
     }
 
     fn sync(&self) {
-        if let Err(error) = self.sync_data_files() {
+        if let Err(error) = self
+            .commit_active_burst_if_needed()
+            .and_then(|()| self.sync_data_files())
+        {
             self.journal.log(JournalLevel::Error, &error);
         }
     }

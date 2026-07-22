@@ -117,6 +117,13 @@ pub struct WorkerStore {
 }
 
 impl WorkerStore {
+    fn sync(&self) {
+        match &self.node_store {
+            SHAMapStoreNodeStore::Single(db) => db.sync(),
+            SHAMapStoreNodeStore::Rotating(db) => db.sync(),
+        }
+    }
+
     fn store_object(
         &mut self,
         object_type: nodestore::NodeObjectType,
@@ -768,6 +775,12 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
     let Some(mut ledger) = mutable.inbound.ledger().cloned() else {
         return;
     };
+    // All SHAMap nodes arrived through `WorkerStore`, but NuDB can keep their
+    // bucket metadata in its active burst until a checkpoint. Commit that
+    // burst before publishing this ledger's SQL header through `setFullLedger`.
+    // Otherwise a graceful restart can see the header while neither map root
+    // is findable by hash in the NodeStore.
+    mutable.store.sync();
     if !ledger.is_immutable() {
         ledger.set_immutable(true);
     }
