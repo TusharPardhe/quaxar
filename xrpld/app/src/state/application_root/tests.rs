@@ -15,7 +15,9 @@ use crate::{
 };
 use basics::base_uint::{Uint160, Uint256};
 use basics::sha_map_hash::SHAMapHash;
-use ledger::{LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader, ReadView, Sandbox};
+use ledger::{
+    LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader, ReadView, Sandbox, calculate_ledger_hash,
+};
 use protocol::{
     AccountID, KeyType, LedgerEntryType, Rules, STAmount, STLedgerEntry, STTx, SecretKey, SeqProxy,
     Ter, TxType, account_keylet, calc_account_id, derive_public_key, get_field_by_symbol,
@@ -545,6 +547,48 @@ fn apply_submit_tx_for_test(
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     );
     runtime.direct_apply()
+}
+
+#[test]
+fn closed_ledger_transition_rebases_persistent_submit_state() {
+    fn immutable_ledger(seq: u32, parent: u8) -> Arc<Ledger> {
+        let mut header = LedgerHeader {
+            seq,
+            parent_hash: SHAMapHash::new(Uint256::from_array([parent; 32])),
+            close_time: seq.saturating_add(10),
+            close_time_resolution: LEDGER_DEFAULT_TIME_RESOLUTION,
+            ..LedgerHeader::default()
+        };
+        header.hash = calculate_ledger_hash(&header);
+        let mut ledger = Ledger::new(header, true);
+        ledger.set_immutable(true);
+        Arc::new(ledger)
+    }
+
+    let root = ApplicationRoot::new(0).expect("root should build");
+    let first = immutable_ledger(100, 0x11);
+    let second = immutable_ledger(101, 0x22);
+    let account = AccountID::from_array([0xA5; 20]);
+
+    root.on_closed_ledger(Arc::clone(&first));
+    *root.open_ledger_sandbox.lock().expect("sandbox mutex") =
+        Some(Sandbox::new(first, ApplyFlags::NONE));
+    root.note_open_ledger_tx(&account, 7);
+
+    root.on_closed_ledger(second);
+
+    assert!(
+        root.open_ledger_sandbox
+            .lock()
+            .expect("sandbox mutex")
+            .is_none(),
+        "a submit sandbox cannot outlive its parent closed ledger"
+    );
+    assert_eq!(
+        root.network_ops_current_account_seq(&account),
+        None,
+        "per-account submit sequence state must be rebased with the sandbox"
+    );
 }
 
 #[test]

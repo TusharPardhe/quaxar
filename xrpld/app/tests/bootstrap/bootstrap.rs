@@ -1253,3 +1253,63 @@ path = {}
 
     bootstrap.runtime.shutdown();
 }
+
+#[test]
+fn app_bootstrap_normal_restores_latest_and_configured_history() {
+    let dir = TempDir::new().expect("tempdir");
+    let parent = persisted_bootstrap_state_only_ledger(20);
+    let latest = persisted_bootstrap_replay_ledger(21, *parent.header().hash.as_uint256(), &[]);
+    let (database_path, node_db_path, config_path) =
+        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&latest)], "RocksDB");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+
+[ledger_history]
+2
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let bootstrap = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Normal,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("Normal startup should restore durable storage");
+
+    assert_eq!(bootstrap.root.closed_ledger_seq(), Some(21));
+    assert_eq!(bootstrap.root.validated_ledger_seq(), Some(21));
+    assert_eq!(bootstrap.root.published_ledger_seq(), Some(21));
+    let master = bootstrap
+        .root
+        .ledger_master_runtime()
+        .expect("ledger master runtime")
+        .ledger_master();
+    assert!(master.have_ledger(20));
+    assert!(master.have_ledger(21));
+    assert_eq!(master.complete_ledgers().to_string(), "20-21");
+}

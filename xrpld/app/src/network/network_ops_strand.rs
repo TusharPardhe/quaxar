@@ -336,7 +336,7 @@ fn strand_loop(
                     // `setFullLedger` in rippled makes this ledger part of
                     // completeLedgers before doAdvance chooses the next gap.
                     let lm = lm_rt.ledger_master();
-                    let inserted = record_completed_inbound_ledger(&lm, &ledger);
+                    let inserted = persist_completed_inbound_ledger(&root, &lm, &ledger);
                     if inserted {
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(crate::consensus::driver::ConsensusEvent::LedgerDone(
@@ -349,12 +349,15 @@ fn strand_loop(
         }
         if let Some(ref rx) = shared_completed_rx {
             while let Ok(ledger) = rx.try_recv() {
-                if let Some(lm_rt) = root.ledger_master_runtime() {
+                let persisted = root.ledger_master_runtime().is_some_and(|lm_rt| {
                     let lm = lm_rt.ledger_master();
-                    record_completed_inbound_ledger(&lm, &ledger);
-                }
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(crate::consensus::driver::ConsensusEvent::LedgerDone(ledger));
+                    persist_completed_inbound_ledger(&root, &lm, &ledger)
+                });
+                if persisted {
+                    if let Some(ref tx) = event_tx {
+                        let _ =
+                            tx.send(crate::consensus::driver::ConsensusEvent::LedgerDone(ledger));
+                    }
                 }
             }
         }
@@ -694,6 +697,58 @@ fn check_accept_and_advance(
     }
 }
 
+fn persist_completed_inbound_ledger(
+    root: &ApplicationRoot,
+    lm: &ledger::LedgerMaster,
+    ledger: &Arc<ledger::Ledger>,
+) -> bool {
+    // rippled's `LedgerMaster::setFullLedger` is the ownership boundary for
+    // a completed inbound ledger.  It validates and marks the complete map,
+    // but critically also schedules `pendSaveValidated`, which records the
+    // header and accepted TransactionMd entries for restart-safe RPC lookup.
+    //
+    // The old Rust path only populated the TaggedCache/RangeSet.  Raw SHAMap
+    // nodes then survived in NuDB, while headers, transaction rows and the
+    // transaction-master committed state were never persisted.
+    let normalized = root.ledger_with_node_fetcher(Arc::clone(ledger));
+    let was_complete = lm.have_ledger(normalized.header().seq);
+    let persistence =
+        ledger::LedgerPersistence::new(Arc::new(root.build_ledger_persistence_runtime()));
+    let saved = match lm.set_full_ledger(
+        &persistence,
+        Arc::clone(&normalized),
+        true,
+        false,
+        None,
+        None,
+    ) {
+        Ok(saved) => saved,
+        Err(error) => {
+            tracing::warn!(
+                target: "ledger",
+                seq = normalized.header().seq,
+                hash = %normalized.header().hash,
+                ?error,
+                "completed inbound ledger was not persisted"
+            );
+            false
+        }
+    };
+
+    if !saved {
+        // `set_full_ledger` marks the range before its persistence result is
+        // returned.  Do not expose a ledger as retained history when its
+        // metadata/transaction records failed to save.
+        if !was_complete {
+            lm.clear_ledger(normalized.header().seq);
+        }
+        return false;
+    }
+
+    let _ = record_completed_inbound_ledger(lm, &normalized);
+    !was_complete
+}
+
 fn record_completed_inbound_ledger(
     lm: &ledger::LedgerMaster,
     ledger: &Arc<ledger::Ledger>,
@@ -702,12 +757,13 @@ fn record_completed_inbound_ledger(
     // into both its history cache and completeLedgers. Both are required:
     // cache lookup supplies the predecessor hash, while completeLedgers lets
     // doAdvance select the next lower missing sequence.
-    let inserted = lm.ledger_history().insert(Arc::clone(ledger), true);
     let ledger_seq = ledger.header().seq;
+    let was_complete = ledger_seq > 0 && lm.have_ledger(ledger_seq);
+    let _ = lm.ledger_history().insert(Arc::clone(ledger), true);
     if ledger_seq > 0 {
         lm.mark_ledger_complete(ledger_seq);
     }
-    inserted
+    !was_complete
 }
 
 /// Matches rippled's static `shouldAcquire()` helper in LedgerMaster.cpp.
@@ -760,7 +816,31 @@ mod tests {
             ..LedgerHeader::default()
         };
         header.hash = calculate_ledger_hash(&header);
-        let mut ledger = Ledger::new(header, true);
+        let mut state_tree = shamap::mutation::MutableTree::new(seq);
+        state_tree
+            .add_item(
+                shamap::tree_node::SHAMapNodeType::AccountState,
+                shamap::item::SHAMapItem::new(
+                    Uint256::from_u64(u64::from(seq)),
+                    vec![parent_fill; 128],
+                ),
+            )
+            .expect("state entry should insert");
+        let mut ledger = Ledger::from_maps(
+            header,
+            shamap::sync::SyncTree::from_root_with_type(
+                state_tree.root(),
+                shamap::sync::SHAMapType::State,
+                false,
+                seq,
+                shamap::sync::SyncState::Immutable,
+            ),
+            shamap::sync::SyncTree::new_with_type(
+                shamap::sync::SHAMapType::Transaction,
+                false,
+                seq,
+            ),
+        );
         ledger.set_immutable(true);
         Arc::new(ledger)
     }

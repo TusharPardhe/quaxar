@@ -4071,6 +4071,21 @@ impl ApplicationRoot {
         }
 
         let normalized = self.ledger_with_node_fetcher(ledger);
+        let closed_ledger_changed = self
+            .closed_ledger()
+            .is_none_or(|previous| previous.header().hash != normalized.header().hash);
+        if closed_ledger_changed {
+            // A Sandbox owns its parent view. Reusing one after a LCL switch
+            // makes submit preclaim read the old state and can turn an account
+            // that is visible through validated RPC into a false terNO_ACCOUNT.
+            // Serialize against direct submit application; consensus on_close
+            // already uses this same gate while it captures its tx set.
+            let _close_guard = self
+                .close_gate
+                .lock()
+                .expect("close_gate mutex must not be poisoned");
+            self.clear_open_ledger_account_seqs();
+        }
         self.ledger_master_state
             .note_closed_ledger(Arc::clone(&normalized));
 
@@ -4079,6 +4094,11 @@ impl ApplicationRoot {
         // root node as the original via SharedIntrusive refcount. Releasing here
         // frees the full tree (~33GB on testnet) from ALL holders at once since
         // they share the same underlying nodes. Future reads go to NuDB on demand.
+        // Release only maps that can be fetched back. Releasing an unbacked
+        // in-memory ledger (for example standalone tests and local builds)
+        // destroys its only state copy and turns subsequent reads into
+        // MissingNode errors.
+        let may_release_maps = normalized.state_map().backed() && normalized.has_node_fetcher();
         {
             // Log jemalloc stats before/after release to verify memory is freed
             #[cfg(not(target_env = "msvc"))]
@@ -4088,7 +4108,9 @@ impl ApplicationRoot {
                 let before_allocated = stats::allocated::read().unwrap_or(0);
                 let before_resident = stats::resident::read().unwrap_or(0);
 
-                normalized.release_maps_to_disk();
+                if may_release_maps {
+                    normalized.release_maps_to_disk();
+                }
 
                 epoch::advance().ok();
                 let after_allocated = stats::allocated::read().unwrap_or(0);
@@ -4103,12 +4125,15 @@ impl ApplicationRoot {
                     before_resident_mb = before_resident / 1024 / 1024,
                     after_resident_mb = after_resident / 1024 / 1024,
                     freed_resident_mb = freed_resident / 1024 / 1024,
+                    released_maps = may_release_maps,
                     "on_closed_ledger: jemalloc stats after release_maps_to_disk"
                 );
             }
             #[cfg(target_env = "msvc")]
             {
-                normalized.release_maps_to_disk();
+                if may_release_maps {
+                    normalized.release_maps_to_disk();
+                }
             }
         }
         // `SharedLedgerMasterState` (behind `ledger_master_state`) is this

@@ -640,3 +640,40 @@ fn ledger_data_no_type_filter_returns_all_types() {
     // No type specified should return a "no filter" result
     assert!(result.is_ok() || result.is_err());
 }
+
+#[test]
+fn ledger_data_rejects_non_boolean_binary() {
+    let source = FakeLedgerDataSource {
+        ledger: ledger_lookup::LedgerLookupLedger {
+            hash: Uint256::from_array([0x99; 32]),
+            seq: 77,
+            open: false,
+        },
+        responses: BTreeMap::from([(false, resolved_for_errors())]),
+    };
+    let params = JsonValue::Object(BTreeMap::from([(
+        "binary".to_owned(),
+        JsonValue::String("true".to_owned()),
+    )]));
+
+    let result = match do_ledger_data(
+        &LedgerDataRequest {
+            params: &params,
+            api_version: 1,
+            role: RpcRole::User,
+        },
+        &source,
+    ) {
+        LedgerDataResponse::Json(j) => j,
+        _ => panic!("expected JSON error"),
+    };
+    let JsonValue::Object(object) = result else {
+        panic!("result must be an object");
+    };
+    assert_eq!(
+        object.get("error_message"),
+        Some(&JsonValue::String(
+            "Invalid field 'binary', not boolean.".to_owned()
+        ))
+    );
+}

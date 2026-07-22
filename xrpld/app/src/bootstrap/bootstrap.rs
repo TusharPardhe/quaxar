@@ -2327,23 +2327,107 @@ fn initialize_startup_ledger_state(
             }
             seed_startup_ledger_state(root, options, config)
         }
-        StartUpType::Fresh | StartUpType::Normal | StartUpType::Snapshot => {
-            if matches!(
-                options.start_type,
-                StartUpType::Normal | StartUpType::Snapshot
-            ) && !root.config().standalone
-            {
-                // A non-standalone Normal/Snapshot node must acquire the
-                // current network ledger before participating in consensus.
-                // Without this, the strand's switchLastClosedLedger block
-                // (gated on need_network_ledger) cannot run, and the node
-                // creates divergent acquisitions every round instead of
-                // switching to the network chain.
+        StartUpType::Normal => {
+            if !root.config().standalone {
+                // Start from the newest durable local ledger just as rippled's
+                // getLastFullLedger() does, then let switchLCL catch up to the
+                // network.  Falling back to genesis is only correct when this
+                // is genuinely the first startup or the local store is empty.
+                root.set_need_network_ledger(true);
+            }
+            match load_startup_ledger_from_storage(root, options) {
+                Ok(()) => {
+                    let history_depth = config_legacy_u32(config, "ledger_history").unwrap_or(0);
+                    rehydrate_configured_history(root, history_depth)
+                }
+                Err(error) => {
+                    tracing::info!(target: "bootstrap", %error,
+                        "No usable durable startup ledger; seeding genesis ledger");
+                    seed_startup_ledger_state(root, options, config)
+                }
+            }
+        }
+        StartUpType::Fresh | StartUpType::Snapshot => {
+            if options.start_type == StartUpType::Snapshot && !root.config().standalone {
                 root.set_need_network_ledger(true);
             }
             seed_startup_ledger_state(root, options, config)
         }
     }
+}
+
+fn rehydrate_configured_history(root: &ApplicationRoot, history_depth: u32) -> Result<(), String> {
+    if history_depth == 0 {
+        return Ok(());
+    }
+
+    let Some(latest) = root.closed_ledger().or_else(|| root.validated_ledger()) else {
+        return Ok(());
+    };
+    let latest_seq = latest.header().seq;
+    if latest_seq <= 1 {
+        return Ok(());
+    }
+    let Some(relational) = root.relational_database().as_ref().map(Arc::clone) else {
+        return Ok(());
+    };
+    let Some(node_store) = root.node_store().clone() else {
+        return Ok(());
+    };
+    let Some(ledger_master_runtime) = root.ledger_master_runtime() else {
+        return Ok(());
+    };
+
+    let provider = BootstrapLedgerDbProvider::new(relational);
+    let family = SHAMapFamily::new(
+        Arc::new(TreeNodeCache::new(
+            "app-bootstrap-history-loader",
+            256,
+            time::Duration::seconds(30),
+            MonotonicClock::default(),
+        )),
+        NullFullBelowCache::new(0),
+        BootstrapNodeStoreFetcher::new(node_store),
+        NullMissingNodeReporter,
+    );
+    let journal = NullLedgerJournal;
+    let config = LedgerConfig::default();
+    let earliest = if history_depth == u32::MAX {
+        1
+    } else {
+        latest_seq.saturating_sub(history_depth).max(1)
+    };
+
+    let master = ledger_master_runtime.ledger_master();
+    let mut child = latest;
+    for seq in (earliest..latest_seq).rev() {
+        let Some(mut ledger) = load_by_index(seq, false, &journal, &config, &family, &provider)
+            .map_err(|error| format!("history ledger {seq} load failed: {error:?}"))?
+        else {
+            break;
+        };
+        ledger
+            .finish_load_by_index_or_hash(&journal)
+            .map_err(|error| format!("history ledger {seq} setup failed: {error:?}"))?;
+        if ledger.header().hash != child.header().parent_hash {
+            tracing::warn!(target: "bootstrap", seq,
+                expected = %child.header().parent_hash,
+                actual = %ledger.header().hash,
+                "stopping history rehydration at a non-contiguous persisted ledger");
+            break;
+        }
+
+        let ledger = root.ledger_with_node_fetcher(Arc::new(ledger));
+        master.ledger_history().insert(Arc::clone(&ledger), true);
+        master.mark_ledger_complete(seq);
+        child = ledger;
+    }
+
+    let range = master.complete_ledgers();
+    if !range.empty() {
+        root.set_status_rpc_complete_ledgers(Some(range.to_string()));
+    }
+    Ok(())
 }
 
 fn load_startup_ledger_from_storage(

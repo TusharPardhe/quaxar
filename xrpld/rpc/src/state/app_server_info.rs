@@ -1827,10 +1827,12 @@ impl<V: AppServerInfoView> LedgerSource for ApplicationServerInfo<V> {
         let ledger = get_ledger_obj(&self.view, ledger_lookup.seq, ledger_lookup.hash)
             .ok_or_else(|| RpcStatus::new(RpcErrorCode::LedgerNotFound))?;
 
-        // For full/state dumps, use the family-aware path so visit_leaves
-        // can fetch tree nodes from the nodestore (not just in-memory nodes).
+        // For full/state/transaction dumps, use the family-aware path so
+        // traversal can fetch released nodes from the NodeStore rather than
+        // rendering an empty TransactionMd map.
         if options.contains(LedgerFillOptions::FULL)
             || options.contains(LedgerFillOptions::DUMP_STATE)
+            || options.contains(LedgerFillOptions::DUMP_TXRP)
         {
             if let Some(app) = self.view.app()
                 && let Some(family) = build_rpc_state_family(app)
@@ -2670,120 +2672,55 @@ impl<V: AppServerInfoView + Sync> crate::handlers::ledger_data::LedgerDataSource
         let mut entries = Vec::new();
         let remaining = limit;
 
-        let resolved_ledger = match resolve_lookup_ledger(&self.view, ledger) {
-            Some(l) => l,
-            None => {
-                return Err(crate::status::RpcStatus::new(
-                    crate::status::RpcErrorCode::LedgerNotFound,
-                ));
-            }
-        };
-        let ledger_seq = resolved_ledger.header().seq;
-        let ledger_hash = *resolved_ledger.header().hash.as_uint256();
-
-        let cache = crate::state::ledger_state_index::get_global_state_index_cache();
-        let index_arc = cache.get_or_build(ledger_seq, || {
-            use rayon::prelude::*;
-
-            let keys = std::iter::successors(
-                succ_lookup_ledger_key(&self.view, ledger, Uint256::default(), None),
-                |&k| succ_lookup_ledger_key(&self.view, ledger, k, None),
-            );
-
-            let build_entries: Vec<_> = keys
-                .par_bridge()
-                .filter_map(|next_key| {
-                    if let Some(sle) =
-                        read_lookup_ledger_entry(&self.view, ledger, unchecked_keylet(next_key))
-                    {
-                        let mut serializer = Serializer::new(256);
-                        sle.add(&mut serializer);
-                        Some(crate::state::ledger_state_index::StateIndexEntry {
-                            key: next_key,
-                            raw_data: Arc::from(serializer.data().to_vec()),
-                            entry_type: sle.get_type(),
-                            json_cache: std::sync::OnceLock::new(),
-                            binary_hex_cache: std::sync::OnceLock::new(),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let index = Arc::new(
-                crate::state::ledger_state_index::LedgerStateIndex::build_from_iter(
-                    ledger_seq,
-                    ledger_hash,
-                    build_entries.iter().cloned(),
-                ),
-            );
-
-            let page_cache = crate::state::ledger_data_page_cache::LedgerDataPageCache::build(
-                ledger_seq,
-                ledger_hash,
-                build_entries.into_iter().map(|e| {
-                    let mut sit = protocol::SerialIter::new(e.raw_data.as_ref());
-                    let sle = protocol::STLedgerEntry::from_serial_iter(&mut sit, e.key);
-                    (
-                        e.key,
-                        e.raw_data.to_vec(),
-                        sle.json(protocol::JsonOptions::NONE),
-                    )
-                }),
-                crate::state::ledger_data_page_cache::DEFAULT_PAGE_SIZE,
-            );
-            crate::state::ledger_data_page_cache::get_global_page_cache()
-                .insert(Arc::new(page_cache));
-            index
-        });
-
-        // Try to hit the page cache first
-        let limit = if remaining < 0 {
-            usize::MAX
-        } else {
-            remaining as usize
-        };
-        if type_filter == LedgerEntryType::Any {
-            if let Some(cache) =
-                crate::state::ledger_data_page_cache::get_global_page_cache().get(ledger_seq)
-            {
-                if let Some(page) = cache.find_page_for_marker(marker) {
-                    // Only use cache if the requested marker is EXACTLY the page start
-                    // AND the user's limit is large enough to consume the whole page
-                    // AND this is not the first page (since first page needs ledger_json which we aren't caching inside the page bytes yet, wait, we DO need to handle it)
-                    let matches_start = marker.is_none() || marker.unwrap() == page.start_key;
-                    if matches_start && limit >= page.entry_count && marker.is_some() {
-                        return Ok(crate::handlers::ledger_data::LedgerDataResolved {
-                            base_json: JsonValue::Object(BTreeMap::new()),
-                            ledger_json: JsonValue::Null,
-                            entries: vec![],
-                            marker: page.next_marker,
-                            pre_rendered: Some(if binary {
-                                page.binary_state_bytes.clone()
-                            } else {
-                                page.json_state_bytes.clone()
-                            }),
-                        });
-                    }
-                }
-            }
+        if resolve_lookup_ledger(&self.view, ledger).is_none() {
+            return Err(crate::status::RpcStatus::new(
+                crate::status::RpcErrorCode::LedgerNotFound,
+            ));
         }
+        // `doLedgerData` in rippled walks `sles.upperBound(marker)` and stops
+        // before the first node beyond the requested page.  Do the same here.
+        // Building an index/cache of every SLE before applying `limit` made a
+        // cold `limit: 1` request scan and serialize the entire ledger.
+        //
+        // The page budget intentionally decrements *before* applying the type
+        // filter.  That seemingly unusual ordering is rippled's observable
+        // cursor contract: type-filtered queries advance through ledger keys,
+        // not just matching entries.
+        let mut cursor = marker.unwrap_or_default();
+        let mut remaining = remaining;
+        let mut next_marker = None;
 
-        let query = index_arc.query(marker, limit, type_filter);
-        let (page_entries, next_marker) = query.collect_entries();
-        let page_marker = next_marker;
-
-        for entry in page_entries {
-            let mut sit = protocol::SerialIter::new(entry.raw_data.as_ref());
-            let sle = STLedgerEntry::from_serial_iter(&mut sit, entry.key);
-
-            let binary_data = if binary {
-                entry.raw_data.clone()
-            } else {
-                std::sync::Arc::new([])
+        while let Some(next_key) = succ_lookup_ledger_key(&self.view, ledger, cursor, None) {
+            let Some(sle) =
+                read_lookup_ledger_entry(&self.view, ledger, unchecked_keylet(next_key))
+            else {
+                // A successor returned by a complete ledger must be readable.
+                // Preserve the old tolerant behavior for a transient missing
+                // node, but never advance past it: otherwise a page could
+                // silently omit state.
+                break;
             };
 
+            if remaining <= 0 {
+                let mut resume_before = next_key;
+                resume_before.decrement();
+                next_marker = Some(resume_before);
+                break;
+            }
+            remaining -= 1;
+            cursor = next_key;
+
+            if type_filter != LedgerEntryType::Any && sle.get_type() != type_filter {
+                continue;
+            }
+
+            let binary_data = if binary {
+                let mut serializer = Serializer::new(256);
+                sle.add(&mut serializer);
+                Arc::<[u8]>::from(serializer.data().to_vec())
+            } else {
+                Arc::<[u8]>::from([])
+            };
             let json = if binary {
                 JsonValue::Null
             } else {
@@ -2791,8 +2728,8 @@ impl<V: AppServerInfoView + Sync> crate::handlers::ledger_data::LedgerDataSource
             };
 
             entries.push(crate::handlers::ledger_data::LedgerDataEntry {
-                key: entry.key,
-                entry_type: entry.entry_type,
+                key: next_key,
+                entry_type: sle.get_type(),
                 json,
                 binary: binary_data,
             });
@@ -2802,7 +2739,7 @@ impl<V: AppServerInfoView + Sync> crate::handlers::ledger_data::LedgerDataSource
             base_json: JsonValue::Object(BTreeMap::new()),
             ledger_json,
             entries,
-            marker: page_marker,
+            marker: next_marker,
             pre_rendered: None,
         })
     }
