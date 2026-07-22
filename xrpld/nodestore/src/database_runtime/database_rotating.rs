@@ -132,7 +132,7 @@ pub struct DatabaseRotatingImp {
 
 impl Drop for DatabaseRotatingImp {
     fn drop(&mut self) {
-        self.database.stop();
+        self.stop();
     }
 }
 
@@ -293,6 +293,21 @@ impl DatabaseRotatingImp {
 
     pub fn stop(&self) {
         self.database.stop();
+        let (writable, archive) = {
+            let state = self
+                .state
+                .lock()
+                .expect("rotating backend mutex must not be poisoned");
+            (
+                Arc::clone(&state.writable_backend),
+                Arc::clone(&state.archive_backend),
+            )
+        };
+        for (role, backend) in [("writable", writable), ("archive", archive)] {
+            if let Err(error) = backend.close() {
+                tracing::error!(target: "nodestore", %error, role, "Rotating NodeStore backend close failed");
+            }
+        }
     }
 
     pub fn is_stopping(&self) -> bool {

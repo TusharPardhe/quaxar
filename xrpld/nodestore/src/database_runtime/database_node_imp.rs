@@ -81,7 +81,7 @@ pub struct DatabaseNodeImp {
 
 impl Drop for DatabaseNodeImp {
     fn drop(&mut self) {
-        self.database.stop();
+        self.stop();
     }
 }
 
@@ -178,6 +178,9 @@ impl DatabaseNodeImp {
 
     pub fn stop(&self) {
         self.database.stop();
+        if let Err(error) = self.backend.close() {
+            tracing::error!(target: "nodestore", %error, "NodeStore backend close failed");
+        }
     }
 
     pub fn is_stopping(&self) -> bool {

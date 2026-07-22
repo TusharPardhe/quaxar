@@ -203,6 +203,26 @@ fn manager_nudb_deterministic_entrypoint_uses_native_nudb_storage_policy() {
     );
 
     database.stop();
+    drop(database);
+
+    let reopened = manager
+        .make_database_deterministic(
+            0,
+            scheduler,
+            1,
+            &config,
+            nodestore::NUDB_APPNUM,
+            0x1234,
+            0x5678,
+            journal,
+        )
+        .expect("stopped NuDB database should reopen");
+    let restored = reopened
+        .fetch_node_object(&hash, 0, nodestore::FetchType::Synchronous, false)
+        .expect("single buffered NuDB object must survive stop and reopen");
+    assert_eq!(restored.data(), &[1, 3, 5, 7]);
+    reopened.stop();
+
     assert!(backend_path.join("nudb.dat").exists());
     assert!(backend_path.join("nudb.key").exists());
     assert!(backend_path.join("nudb.log").exists());
