@@ -276,6 +276,9 @@ where
 struct ValueEntry<T, P, SP> {
     ptr: P,
     last_access: Duration,
+    /// When true, this entry is protected from eviction during sweep.
+    /// Used for inner SHAMap nodes that should remain permanently cached.
+    never_evict: bool,
     marker: std::marker::PhantomData<(T, SP)>,
 }
 
@@ -287,6 +290,7 @@ where
         Self {
             ptr: P::from_strong(ptr),
             last_access,
+            never_evict: false,
             marker: std::marker::PhantomData,
         }
     }
@@ -756,6 +760,21 @@ where
         self.canonicalize_with(key, data, |_| false)
     }
 
+    /// Same as `canonicalize_replace_client` but marks the entry as permanently
+    /// protected from sweep eviction. Used for inner SHAMap nodes.
+    pub fn canonicalize_replace_client_protected(&self, key: &K, data: &mut SP) -> bool {
+        let result = self.canonicalize_with(key, data, |_| false);
+        // Mark as protected after insertion
+        let mut state = self
+            .state
+            .lock()
+            .expect("TaggedCache mutex must not be poisoned");
+        if let Some(entry) = state.cache.get_mut(key) {
+            entry.never_evict = true;
+        }
+        result
+    }
+
     pub fn canonicalize_with<R>(&self, key: &K, data: &mut SP, replace_callback: R) -> bool
     where
         R: FnOnce(Option<SP>) -> bool,
@@ -1052,6 +1071,9 @@ where
     let mut swept = Vec::new();
 
     for (key, entry) in partition.iter_mut() {
+        if entry.never_evict {
+            continue;
+        }
         if entry.ptr.is_weak() {
             if entry.ptr.expired() {
                 counts.map_removals += 1;

@@ -528,8 +528,13 @@ impl<C, S, FB, F, MR, NS> SHAMapFamily<C, S, FB, F, MR, NS> {
         C: CacheClock,
         S: BuildHasher + Clone,
     {
-        self.tree_node_cache
-            .canonicalize_replace_client(hash.as_uint256(), node);
+        if node.is_inner() {
+            self.tree_node_cache
+                .canonicalize_replace_client_protected(hash.as_uint256(), node);
+        } else {
+            self.tree_node_cache
+                .canonicalize_replace_client(hash.as_uint256(), node);
+        }
     }
 
     pub fn fetch_cached_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>>
