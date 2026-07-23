@@ -319,6 +319,10 @@ impl DatabaseTrait for DatabaseNodeImp {
     fn export_backend(&self) -> Option<Arc<dyn Backend>> {
         Some(Arc::clone(&self.backend))
     }
+
+    fn get_fetch_latency_histogram(&self) -> [u64; 6] {
+        self.database.get_fetch_latency_histogram()
+    }
 }
 
 fn panic_message(payload: &(dyn Any + Send)) -> String {

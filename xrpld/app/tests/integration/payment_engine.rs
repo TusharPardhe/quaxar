@@ -21872,7 +21872,7 @@ fn pe_ai50() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2A-P1: Direct ports from C++ Payment/AccountSet tests
+// Direct ports from C++ Payment/AccountSet tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// C++: Payment to self -> temREDUNDANT
@@ -22030,7 +22030,7 @@ fn cpp_trust_set_to_self() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2A-P2: Direct ports from C++ Batch_test.cpp / MultiSign_test.cpp
+// Direct ports from C++ Batch_test.cpp / MultiSign_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// C++: Batch testcase("preflight") — invalid flags -> temINVALID_FLAG
@@ -22116,7 +22116,7 @@ fn cpp_regular_key_set() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2A-P3: Direct ports from C++ Vault_test.cpp / Delegate_test.cpp / Credentials_test.cpp
+// Direct ports from C++ Vault_test.cpp / Delegate_test.cpp / Credentials_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // --- From Delegate_test.cpp ---

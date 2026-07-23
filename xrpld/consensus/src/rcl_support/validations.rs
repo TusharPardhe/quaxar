@@ -20,7 +20,7 @@
 //! - The reference threads a `beast::Journal` through `expire()` purely
 //!   for a debug timing log; this port uses `tracing::debug!` instead.
 //! - `getJsonTrie()` is omitted (RPC-facing presentation concern, per the
-//!   same rationale as `Consensus::getJson` in Phase 3).
+//!   same rationale as `Consensus::getJson`).
 //! - The `Adaptor::MutexType` customization point is dropped: the
 //!   reference allows swapping the mutex type but always uses
 //!   `std::mutex` in practice. This port uses `parking_lot::Mutex`
@@ -37,9 +37,9 @@ use crate::model::ledger_trie::{LedgerTrie, SpanTip, TrieLedger};
 /// Timing parameters controlling validation staleness and expiration.
 /// Matches `ValidationParms`.
 ///
-/// Deferred here from Phase 1 (`ConsensusParms`) after discovering during
+/// Deferred here from `ConsensusParms` after discovering during
 /// that phase's rewrite that these fields belong to a *separate* struct in
-/// the reference, not `ConsensusParms` -- see Phase 1's design-decision
+/// the reference, not `ConsensusParms` -- see the design-decision
 /// notes.
 #[derive(Debug, Clone, Copy)]
 pub struct ValidationParms {

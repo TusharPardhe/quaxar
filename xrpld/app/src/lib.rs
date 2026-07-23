@@ -91,7 +91,7 @@ pub fn reload_log_filter(filter: &str) -> Result<(), String> {
     f(filter)
 }
 
-/// Wrap a real `Arc<Ledger>` as the `consensus::RclCxLedger` view Phase 3's
+/// Wrap a real `Arc<Ledger>` as the `consensus::RclCxLedger` view the
 /// `Consensus<Adaptor>` state machine and the `ConsensusRunner` trait use.
 /// Matches the reference's implicit `RCLCxLedger{ledger}` construction at
 /// each `startRound`/`gotTxSet` call site.
@@ -109,7 +109,7 @@ pub fn consensus_ledger_from_ledger(
 pub use ::ledger::NullLedgerJournal as NullRclValidationJournal;
 
 /// Wrap a real `&ledger::Ledger` as the ancestor-trie-carrying
-/// `RclValidatedLedger` Phase 5's validations tracker needs for
+/// `RclValidatedLedger` the validations tracker needs for
 /// `get_preferred`/`get_preferred_lcl` queries (see `xrpld/main`'s
 /// `preferred_closed_ledger_hash`-adjacent catch-up logic). Matches the
 /// reference's implicit `RCLValidatedLedger{ledger}` construction.

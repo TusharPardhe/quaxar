@@ -70,6 +70,11 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
 
     fn fd_required(&self) -> i32;
 
+    /// Returns the NuDB read latency histogram: [<100us, 100us-1ms, 1ms-10ms, 10ms-100ms, 100ms-1s, >1s].
+    fn get_fetch_latency_histogram(&self) -> [u64; 6] {
+        [0; 6]
+    }
+
     /// Returns the primary backend for snapshot export.
     fn export_backend(&self) -> Option<Arc<dyn Backend>> {
         None
@@ -128,7 +133,7 @@ struct DatabaseInner {
     fetch_size: AtomicU64,
     fetch_duration_us: AtomicU64,
     store_duration_us: AtomicU64,
-    /// Phase 3.3: NuDB read latency histogram buckets (microseconds).
+    /// NuDB read latency histogram buckets (microseconds).
     /// Buckets: <100us, 100us-1ms, 1ms-10ms, 10ms-100ms, 100ms-1s, >1s
     fetch_latency_bucket: [AtomicU64; 6],
 }
@@ -194,7 +199,7 @@ impl DatabaseInner {
         self.fetch_duration_us
             .fetch_add(elapsed_us, Ordering::Relaxed);
 
-        // Phase 3.3: Record latency histogram bucket
+        // Record latency histogram bucket
         let bucket = if elapsed_us < 100 {
             0
         } else if elapsed_us < 1_000 {
@@ -445,7 +450,7 @@ impl DatabaseRuntime {
         self.inner.fetch_hit_count.load(Ordering::Relaxed)
     }
 
-    /// Phase 3.3: Returns the NuDB read latency histogram.
+    /// Returns the NuDB read latency histogram.
     pub fn get_fetch_latency_histogram(&self) -> [u64; 6] {
         std::array::from_fn(|i| self.inner.fetch_latency_bucket[i].load(Ordering::Relaxed))
     }
@@ -509,7 +514,7 @@ impl DatabaseRuntime {
                     .to_string(),
             ),
         );
-        // Phase 3.3: NuDB read latency histogram
+        // NuDB read latency histogram
         let hist = self.get_fetch_latency_histogram();
         let hist_json: Vec<JsonValue> = hist.iter().map(|&v| JsonValue::Unsigned(v)).collect();
         obj.insert(

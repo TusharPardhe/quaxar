@@ -34,7 +34,7 @@ pub struct NodeSizeResourceProfile {
     pub full_below_target_size: usize,
     /// rippled kFullBelowExpiration (constant 10 minutes in Tuning.h).
     pub full_below_expiration_seconds: i64,
-    // Phase 3.5: Memory optimization config
+    // Memory optimization config
     /// Tier 2 enablement: 0 = auto, 1 = true, 2 = false.
     pub tier2_mode: u8,
     /// RSS hard limit in bytes. 0 = 80% system RAM.
@@ -103,6 +103,33 @@ impl NodeSizeResourceProfile {
                 min_keep_depth: 2,
             },
         }
+    }
+
+    /// Apply overrides from `[memory_optimization]` config section if present.
+    pub fn with_memory_optimization_config(
+        mut self,
+        config: &basics::basic_config::BasicConfig,
+    ) -> Self {
+        if !config.exists("memory_optimization") {
+            return self;
+        }
+        let section = config.section("memory_optimization");
+        if let Ok(Some(val)) = section.get::<String>("tier2") {
+            self.tier2_mode = match val.as_str() {
+                "true" => 1,
+                "false" => 2,
+                _ => 0, // "auto" or unrecognized
+            };
+        }
+        if let Ok(Some(val)) = section.get::<u64>("rss_hard_limit") {
+            self.rss_hard_limit = val;
+        }
+        if let Ok(Some(val)) = section.get::<usize>("min_keep_depth") {
+            if val >= 1 && val <= 8 {
+                self.min_keep_depth = val;
+            }
+        }
+        self
     }
 }
 

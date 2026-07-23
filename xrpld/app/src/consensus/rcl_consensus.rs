@@ -1,4 +1,4 @@
-//! App-level wiring of Phase 3's generic `Consensus<Adaptor>` state machine
+//! App-level wiring of the generic `Consensus<Adaptor>` state machine
 //! against real `Ledger`/`SHAMap`/`STValidation`/`ValidatorList` types.
 //! Ported from `RCLConsensus.h`/`RCLConsensus.cpp`.
 //!
@@ -27,10 +27,10 @@
 //!
 //! ## `Ledger` associated type: `RclCxLedger` vs `RclValidatedLedger`
 //!
-//! Phase 3's `Consensus<Adaptor>::Ledger` associated type must implement
+//! The `Consensus<Adaptor>::Ledger` associated type must implement
 //! `consensus::ConsensusLedger` (id/seq/close-time accessors only) --
 //! that's [`consensus::RclCxLedger`], a thin wrapper over `Arc<Ledger>`.
-//! Phase 5's validation tracker instead needs `ValidationsLedger`
+//! The validation tracker instead needs `ValidationsLedger`
 //! (ancestor-trie lookups for Byzantine-safe preference resolution) --
 //! that's [`crate::consensus::rcl_validation::RclValidatedLedger`], a
 //! *different* concrete type with its own eagerly-cached ancestor vector.

@@ -522,7 +522,7 @@ where
         self.hard_max_entries.store(max, Ordering::Relaxed);
     }
 
-    /// Phase 3.2: Set an optional TTL cap (in seconds). When > 0, the effective
+    /// Set an optional TTL cap (in seconds). When > 0, the effective
     /// target age becomes `min(target_age, cap)`. 0 = no cap (use target_age).
     pub fn set_target_age_cap_secs(&self, cap_secs: u64) {
         self.target_age_cap_ns
@@ -820,7 +820,7 @@ where
             .lock()
             .expect("TaggedCache mutex must not be poisoned");
 
-        // Phase 3.1: Hard cap — if exceeded, sweep synchronously before inserting.
+        // Hard cap — if exceeded, sweep synchronously before inserting.
         let hard_max = self.hard_max_entries.load(Ordering::Relaxed);
         if hard_max > 0 && state.cache_count as u64 >= hard_max {
             let before = state.cache_count;

@@ -265,6 +265,12 @@ pub struct ApplicationRoot {
             >,
         >,
     >,
+    /// Memory optimization: tier2 mode (0=auto, 1=force-on, 2=force-off).
+    tier2_mode: Arc<std::sync::atomic::AtomicU8>,
+    /// Memory optimization: RSS hard limit in bytes (0 = 80% system RAM).
+    rss_hard_limit: Arc<std::sync::atomic::AtomicU64>,
+    /// Memory optimization: minimum keep_depth for release_deep_children.
+    min_keep_depth: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for ApplicationRoot {
@@ -1919,7 +1925,6 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                         // ATOMICALLY from within the same JtAccept job.
                         // This eliminates the timing window where peer
                         // proposals arrive while we're still in Accepted
-                        // phase (the root cause of the post-stress stall).
                         let started_next = {
                             let consensus_rt = root.shared_consensus_rt.read().ok().and_then(|g| g.clone());
                             let network_ops_rt = root.shared_network_ops_rt.read().ok().and_then(|g| g.clone());
@@ -2314,6 +2319,9 @@ impl ApplicationRoot {
             consensus_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             shared_tree_cache: std::sync::OnceLock::new(),
             shared_full_below_cache: std::sync::OnceLock::new(),
+            tier2_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            rss_hard_limit: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            min_keep_depth: Arc::new(std::sync::atomic::AtomicUsize::new(2)),
         });
 
         // TODO: Re-enable ConsensusTransSetSF filter once serialization is verified.
@@ -2685,7 +2693,7 @@ impl ApplicationRoot {
         &self.registry.inbound_ledgers
     }
 
-    /// Phase 0.1: Returns current process RSS in bytes (from jemalloc).
+    /// Returns current process RSS in bytes (from jemalloc).
     pub fn process_rss_bytes(&self) -> u64 {
         #[cfg(not(target_env = "msvc"))]
         {
@@ -2698,14 +2706,14 @@ impl ApplicationRoot {
         }
     }
 
-    /// Phase 0.2: Returns the TreeNodeCache high-water-mark.
+    /// Returns the TreeNodeCache high-water-mark.
     pub fn treenode_cache_hwm(&self) -> u64 {
         self.shared_tree_cache()
             .map(|c| c.get_max_track_size())
             .unwrap_or(0)
     }
 
-    /// Phase 0.4: Returns fetch_info data for active ledger acquisitions.
+    /// Returns fetch_info data for active ledger acquisitions.
     pub fn ledger_fetch_info(&self) -> std::collections::BTreeMap<String, protocol::JsonValue> {
         self.ledger_master_runtime()
             .and_then(|lm_rt| {
@@ -2716,6 +2724,67 @@ impl ApplicationRoot {
                     .and_then(|guard| guard.as_ref().map(|il| il.fetch_info_json()))
             })
             .unwrap_or_default()
+    }
+
+    /// Returns true if NuDB read latency indicates SSD/NVMe
+    /// (p50 < 1ms). Returns false on HDD or when insufficient data exists.
+    /// Respects tier2_mode config: 0=auto (latency check), 1=force-on, 2=force-off.
+    pub fn tier2_release_safe(&self) -> bool {
+        let mode = self.tier2_mode.load(std::sync::atomic::Ordering::Relaxed);
+        if mode == 2 {
+            return false;
+        }
+        if mode == 1 {
+            return true;
+        }
+        // Auto: check latency histogram
+        let histogram = match self.node_store().as_ref() {
+            Some(crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db)) => {
+                db.get_fetch_latency_histogram()
+            }
+            Some(crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db)) => {
+                db.get_fetch_latency_histogram()
+            }
+            None => return false,
+        };
+        let total: u64 = histogram.iter().sum();
+        if total < 100 {
+            return false;
+        }
+        let fast_reads = histogram[0] + histogram[1];
+        fast_reads * 2 > total
+    }
+
+    /// Set memory optimization tier2 mode: 0=auto, 1=force-on, 2=force-off.
+    pub fn set_tier2_mode(&self, mode: u8) {
+        self.tier2_mode
+            .store(mode, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the RSS hard limit for emergency eviction (0 = 80% system RAM).
+    pub fn set_rss_hard_limit(&self, limit: u64) {
+        self.rss_hard_limit
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set minimum keep_depth for release_deep_children.
+    pub fn set_min_keep_depth(&self, depth: usize) {
+        self.min_keep_depth
+            .store(depth, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Get the configured min_keep_depth (defaults to 2 if not set).
+    pub fn min_keep_depth(&self) -> usize {
+        let d = self
+            .min_keep_depth
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if d == 0 { 2 } else { d }
+    }
+
+    /// Get the configured RSS hard limit.
+    pub fn rss_hard_limit_bytes(&self) -> u64 {
+        self.rss_hard_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn inbound_transactions(&self) -> &AppInboundTransactions {

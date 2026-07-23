@@ -385,19 +385,19 @@ impl Default for RclCxLedger {
     }
 }
 
-/// Alias for Phase 5's [`crate::rcl_support::ValidationsAdaptor`], used as
+/// Alias for [`crate::rcl_support::ValidationsAdaptor`], used as
 /// the trait bound for [`RclValidations`]. Kept as a distinct name (rather
 /// than requiring callers to spell out the full `rcl_support` path) since
 /// `xrpld/app`'s `negative_unl_vote.rs` refers to it as
 /// `consensus::RclValidationsAdapter`.
 pub use crate::rcl_support::ValidationsAdaptor as RclValidationsAdapter;
 
-/// Alias for Phase 5's [`crate::rcl_support::ValStatus`], used at the
+/// Alias for [`crate::rcl_support::ValStatus`], used at the
 /// crate root as `consensus::ValidationStatus` by
 /// `network_ops_validation_runtime.rs`.
 pub use crate::rcl_support::ValStatus as ValidationStatus;
 
-/// A thin ergonomic wrapper around Phase 5's [`crate::rcl_support::Validations`]
+/// A thin ergonomic wrapper around [`crate::rcl_support::Validations`]
 /// exposing a couple of `&mut self`-shaped convenience methods that
 /// `xrpld/app`'s `negative_unl_vote.rs` expects (mirroring the reference's
 /// `RCLValidations` type alias, which in the C++ code is simply

@@ -479,7 +479,7 @@ impl SHAMapTreeNode {
     }
 
     pub fn get_type(&self) -> SHAMapNodeType {
-        // Phase 3 optimization: the Inner arm never needs the lock — inner_arrays
+        // optimization: the Inner arm never needs the lock — inner_arrays
         // is Some for every inner node and None for every leaf, set once at
         // construction and never mutated thereafter.  Only leaf nodes must enter
         // the lock to read the concrete SHAMapNodeType variant.
@@ -1062,7 +1062,7 @@ impl IntrusiveObject for SHAMapTreeNode {
     }
 
     fn partial_destructor(&self) {
-        // Phase 3 optimization: use the lock-free inner_arrays check instead of
+        // optimization: use the lock-free inner_arrays check instead of
         // acquiring the kind RwLock just to distinguish node type.
         if self.inner_arrays.is_some() {
             let is_branch = self.is_branch.load(Ordering::Relaxed);

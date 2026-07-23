@@ -203,7 +203,7 @@ pub struct RclValidationsAdaptor {
 
 impl RclValidationsAdaptor {
     /// Construct an adaptor with the given network-time source. The caller
-    /// supplies this because `Validations` (Phase 5) has no way to derive
+    /// supplies this because `Validations` has no way to derive
     /// "now" itself: rippled's `Application`-backed `RCLValidationsAdaptor`
     /// reads the same clock the rest of the node's networking layer uses,
     /// which this crate does not own.

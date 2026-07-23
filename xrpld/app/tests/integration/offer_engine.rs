@@ -11224,7 +11224,7 @@ fn oe_w20() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2A-P1: Direct ports from C++ Offer_test.cpp
+// Direct ports from C++ Offer_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // --- testcase("Malformed Detection") ---
@@ -11359,7 +11359,7 @@ fn cpp_offer_create_bad_expiration() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2A-P2: Direct ports from C++ OfferMPT_test.cpp
+// Direct ports from C++ OfferMPT_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// C++: testcase("Malformed Detection") — OfferCreate with same currency both sides

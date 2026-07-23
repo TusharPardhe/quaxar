@@ -1,4 +1,4 @@
-// Phase 5: Legacy catchup loop removed; NetworkOpsStrand handles all duties.
+// Legacy catchup loop removed; NetworkOpsStrand handles all duties.
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -2183,6 +2183,27 @@ fn build_composed_runtime_from_path(
     let bootstrap = build_bootstrap_root(&config, &options)?;
     let mut report = bootstrap.report;
     let mut root = bootstrap.root;
+
+    // Parse [memory_optimization] config and apply to ApplicationRoot.
+    if config.exists("memory_optimization") {
+        let section = config.section("memory_optimization");
+        if let Ok(Some(val)) = section.get::<String>("tier2") {
+            let mode = match val.as_str() {
+                "true" => 1u8,
+                "false" => 2u8,
+                _ => 0u8,
+            };
+            root.set_tier2_mode(mode);
+        }
+        if let Ok(Some(val)) = section.get::<u64>("rss_hard_limit") {
+            root.set_rss_hard_limit(val);
+        }
+        if let Ok(Some(val)) = section.get::<usize>("min_keep_depth") {
+            if (1..=8).contains(&val) {
+                root.set_min_keep_depth(val);
+            }
+        }
+    }
 
     if let Ok(server_build) = ServerRuntime::from_application_root_with_report(&root) {
         if let Some(overlay_runtime) = root.overlay_runtime() {

@@ -31047,7 +31047,7 @@ fn xchain_dis50() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2A-P1: Direct ports from C++ AMM_test.cpp
+// Direct ports from C++ AMM_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // --- testcase("Invalid Instance") ---
@@ -31140,7 +31140,7 @@ fn cpp_amm_create_invalid_trading_fee() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2A-P1: Direct ports from C++ MPToken_test.cpp
+// Direct ports from C++ MPToken_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // --- testcase("Create Validate") ---
@@ -31252,7 +31252,7 @@ fn cpp_mptoken_create_success() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2A-P2: Direct ports from C++ AMMExtended_test.cpp / AMMClawback_test.cpp
+// Direct ports from C++ AMMExtended_test.cpp / AMMClawback_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// C++: AMM Deposit with zero amount -> temBAD_AMOUNT

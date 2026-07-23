@@ -23,8 +23,8 @@
 //!   signaling shutdown and draining the queue, rather than via a separate
 //!   counter object.
 //! - `Coro`/`postCoro` (the boost::coroutines2-based suspend/resume
-//!   mechanism for RPC handlers) is out of scope for this phase. Nothing
-//!   in the consensus/RCL rewrite path (Phases 5-7) requires coroutine
+//!   mechanism for RPC handlers) is out of scope currently. Nothing
+//!   in the consensus/RCL rewrite path requires coroutine
 //!   support; it is deferred to whenever RPC handler code needs it.
 //! - `LoadMonitor`/`PerfLog`/`beast::insight::Collector` integration
 //!   (latency histograms, overload detection, metrics hooks) is omitted.
@@ -32,7 +32,7 @@
 //!   working scheduler, not part of the scheduling algorithm itself, and
 //!   are deferred to whenever the app wires up its metrics story.
 //! - `getJson`/`isOverloaded` diagnostic surfaces are omitted for the same
-//!   reason `Consensus::getJson` was omitted in Phase 3: presentation
+//!   reason `Consensus::getJson` was omitted: presentation
 //!   concerns belong at a higher layer once the underlying data exists.
 
 use std::cmp::Ordering;

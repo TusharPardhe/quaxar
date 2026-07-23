@@ -462,6 +462,10 @@ impl DatabaseTrait for DatabaseRotatingImp {
             .expect("rotating backend mutex must not be poisoned");
         Some(Arc::clone(&state.writable_backend))
     }
+
+    fn get_fetch_latency_histogram(&self) -> [u64; 6] {
+        self.database.get_fetch_latency_histogram()
+    }
 }
 
 impl DatabaseRotatingTrait for DatabaseRotatingImp {

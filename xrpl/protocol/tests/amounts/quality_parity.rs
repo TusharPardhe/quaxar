@@ -137,10 +137,6 @@ fn quality_ceil_and_round_examples_match_cpp() {
     assert_eq!(q.round(16).rate().text(), "57719.63525051682");
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2C-P1: Direct ports from C++ Quality_test.cpp
-// ═══════════════════════════════════════════════════════════════════════════════
-
 // --- testcase("comparisons") ---
 
 #[test]

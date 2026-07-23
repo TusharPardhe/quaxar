@@ -127,7 +127,7 @@ impl<NodeId, LedgerId, Position> ConsensusProposal<NodeId, LedgerId, Position> {
         // Written as an explicit guard (rather than `saturating_add`) to
         // match the reference's `if (proposeSeq_ != kSeqLeave)
         // ++proposeSeq_;` literally, since this method's exact bow-out
-        // guard behavior is part of what Phase 2's tests verify parity on.
+        // guard behavior is part of what tests verify parity on.
         #[allow(clippy::implicit_saturating_add)]
         if self.propose_seq != Self::SEQ_LEAVE {
             self.propose_seq += 1;

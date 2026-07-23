@@ -269,7 +269,6 @@ pub struct AcquisitionState {
     pub completed: AtomicBool,
     pub failed: AtomicBool,
     pub fetch_pack_ready: AtomicBool,
-    /// Phase 0.3: Per-acquisition counter of accepted nodes.
     pub nodes_accepted: AtomicU64,
     data_job_queued: AtomicBool,
     timer_armed: AtomicBool,
@@ -630,17 +629,13 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         )
     };
 
-    // Phase 1: Spill non-critical subtree branches after each packet step.
+    // Spill non-critical subtree branches after each packet step.
     {
         let generation = state.worker_full_below.generation();
         if let Ok(mut mutable) = state.mutable.lock() {
             if let Some(ledger) = mutable.inbound.ledger_mut() {
-                let state_spilled = ledger
-                    .state_map_mut()
-                    .spill_full_below_subtrees(generation);
-                let tx_spilled = ledger
-                    .tx_map_mut()
-                    .spill_full_below_subtrees(generation);
+                let state_spilled = ledger.state_map_mut().spill_full_below_subtrees(generation);
+                let tx_spilled = ledger.tx_map_mut().spill_full_below_subtrees(generation);
                 if state_spilled + tx_spilled > 0 {
                     tracing::debug!(
                         target: "acquisition",

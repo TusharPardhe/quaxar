@@ -1504,7 +1504,7 @@ fn run_start_mode_consensus_loop(
                         last_cache_sweep = std::time::Instant::now();
                     }
 
-                    // Phase 0.5 + 3.2: FullBelowCache sweep + TTL cap during acquisition
+                    // FullBelowCache sweep + TTL cap during acquisition
                     {
                         if let Some(lm_rt) = root.ledger_master_runtime() {
                             if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
@@ -1517,12 +1517,13 @@ fn run_start_mode_consensus_loop(
                         }
                     }
 
-                    // Phase 2: Periodic release of deep subtree branches
-                    if hk_sweep_interval > 0 {
+                    // Periodic release of deep subtree branches (NVMe-only)
+                    if hk_sweep_interval > 0 && root.tier2_release_safe() {
+                        let keep_depth = root.min_keep_depth();
                         if let Some(lm_rt) = root.ledger_master_runtime() {
                             if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                                 if let Some(ref il) = *guard {
-                                    il.release_deep_children_all(2);
+                                    il.release_deep_children_all(keep_depth);
                                 }
                             }
                         }

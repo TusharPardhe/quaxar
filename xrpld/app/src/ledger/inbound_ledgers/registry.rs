@@ -320,7 +320,7 @@ impl InboundLedgers {
 
         {
             let mut buf = state.data_buffer.lock().expect("data_buffer push lock");
-            // Phase 3.4: Soft cap — drop oldest packets when buffer exceeds limit.
+            // Soft cap — drop oldest packets when buffer exceeds limit.
             const DATA_BUFFER_SOFT_CAP: usize = 1024;
             if buf.len() >= DATA_BUFFER_SOFT_CAP {
                 let dropped = buf.remove(0);
@@ -628,7 +628,7 @@ impl InboundLedgers {
         )
     }
 
-    /// Phase 0.4: Returns acquisition info as a JSON-compatible map for the `fetch_info` RPC.
+    /// Returns acquisition info as a JSON-compatible map for the `fetch_info` RPC.
     pub fn fetch_info_json(&self) -> std::collections::BTreeMap<String, protocol::JsonValue> {
         let inner = self.inner.lock().expect("inbound_ledgers lock");
         let mut result = std::collections::BTreeMap::new();
@@ -669,9 +669,7 @@ impl InboundLedgers {
             );
             obj.insert(
                 "nodes_accepted".to_owned(),
-                protocol::JsonValue::Unsigned(
-                    entry.state.nodes_accepted.load(Ordering::Relaxed),
-                ),
+                protocol::JsonValue::Unsigned(entry.state.nodes_accepted.load(Ordering::Relaxed)),
             );
             obj.insert(
                 "age_secs".to_owned(),
@@ -690,13 +688,11 @@ impl InboundLedgers {
     pub fn has_active_acquisitions(&self) -> bool {
         let inner = self.inner.lock().expect("inbound_ledgers lock");
         inner.entries.values().any(|e| {
-            !e.failed
-                && e.completed_ledger.is_none()
-                && !e.state.completed.load(Ordering::Acquire)
+            !e.failed && e.completed_ledger.is_none() && !e.state.completed.load(Ordering::Acquire)
         })
     }
 
-    /// Phase 0.5: Sweep per-acquisition `worker_full_below` caches.
+    /// Sweep per-acquisition `worker_full_below` caches.
     pub fn sweep_full_below_caches(&self) {
         let inner = self.inner.lock().expect("inbound_ledgers lock");
         for entry in inner.entries.values() {
@@ -706,7 +702,7 @@ impl InboundLedgers {
         }
     }
 
-    /// Phase 2: Release deep subtree branches for all active acquisitions.
+    /// Release deep subtree branches for all active acquisitions.
     pub fn release_deep_children_all(&self, keep_depth: usize) {
         let inner = self.inner.lock().expect("inbound_ledgers lock");
         let mut released = 0usize;
