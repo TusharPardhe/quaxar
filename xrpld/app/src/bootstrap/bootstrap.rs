@@ -687,6 +687,29 @@ pub fn build_bootstrap_root(
     root.set_status_rpc_node_size(configured_node_size.clone());
     attach_bootstrap_node_family(&mut root, configured_node_size.as_deref());
     initialize_startup_ledger_state(&root, options, config)?;
+
+    // Phase 2 extension: after validating the startup ledger's state tree,
+    // release it from memory. The tree is fully persisted in NuDB; subsequent
+    // access reloads nodes on demand via the TreeNodeCache (same as Tier 2).
+    // Also sweep the TreeNodeCache to free entries accumulated during the walk,
+    // and enable the hard cap to prevent future unbounded growth.
+    if let Some(tree_cache) = root.shared_tree_cache() {
+        let before = tree_cache.get_track_size();
+        tree_cache.sweep();
+        let after = tree_cache.get_track_size();
+        // Enable hard cap at 2× the profile target_size
+        let node_size_profile =
+            crate::NodeSizeResourceProfile::for_node_size(configured_node_size.as_deref());
+        tree_cache.set_hard_max_entries((node_size_profile.tree_cache_size * 2) as u64);
+        tracing::info!(
+            target: "bootstrap",
+            before,
+            after,
+            hard_max = node_size_profile.tree_cache_size * 2,
+            "Post-startup TreeNodeCache sweep + hard cap enabled"
+        );
+    }
+
     root.bind_default_component_runtimes();
 
     // Wire up node identity (pubkey_node in server_info) from wallet DB,
