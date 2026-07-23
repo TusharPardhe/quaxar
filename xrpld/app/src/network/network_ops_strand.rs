@@ -745,6 +745,15 @@ fn persist_completed_inbound_ledger(
         return false;
     }
 
+    // `set_full_ledger` may advance LedgerMaster's validated ledger directly.
+    // Mirror its authoritative result into ApplicationRoot before exposing the
+    // completed ledger to RPC consumers. Without this, server_info and
+    // snapshot export can observe no validated ledger even though LedgerMaster
+    // has already logged and retained one.
+    if let Some(validated) = lm.validated_ledger() {
+        root.note_validated_ledger_for_sync(validated);
+    }
+
     let _ = record_completed_inbound_ledger(lm, &normalized);
     !was_complete
 }
@@ -800,7 +809,8 @@ fn should_acquire_history(
 
 #[cfg(test)]
 mod tests {
-    use super::record_completed_inbound_ledger;
+    use super::{persist_completed_inbound_ledger, record_completed_inbound_ledger};
+    use crate::ApplicationRoot;
     use basics::base_uint::Uint256;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::MonotonicClock;
@@ -843,6 +853,31 @@ mod tests {
         );
         ledger.set_immutable(true);
         Arc::new(ledger)
+    }
+
+    #[test]
+    fn completed_inbound_current_ledger_publishes_application_validated_slot() {
+        let root = ApplicationRoot::new(0).expect("root should build");
+        let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
+        let current = immutable_ledger(101, 0xA1);
+
+        assert!(root.validated_ledger().is_none());
+        assert!(persist_completed_inbound_ledger(&root, &master, &current));
+        assert_eq!(
+            master
+                .validated_ledger()
+                .expect("LedgerMaster should retain the completed ledger")
+                .header()
+                .seq,
+            101
+        );
+        assert_eq!(
+            root.validated_ledger()
+                .expect("ApplicationRoot must mirror LedgerMaster validation for RPC")
+                .header()
+                .seq,
+            101
+        );
     }
 
     #[test]

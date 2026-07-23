@@ -62,7 +62,8 @@ configuration may still change as parity work continues.
 
 **macOS / Linux:**
 ```bash
-curl -sSf https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.sh | bash
+curl -sSf https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.sh -o install.sh
+bash install.sh
 ```
 
 **Windows (PowerShell):**
@@ -78,7 +79,8 @@ applies defaults when non interactive mode is requested.
 For unattended installation with defaults:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.sh | bash -s -- -y
+curl -sSf https://raw.githubusercontent.com/TusharPardhe/quaxar/main/install.sh -o install.sh
+bash install.sh -y
 ```
 
 ```powershell
@@ -92,7 +94,7 @@ Install Rust `1.90` or newer and the required native dependencies.
 Linux:
 
 ```bash
-sudo apt install build-essential pkg-config libssl-dev librocksdb-dev clang cmake
+sudo apt install build-essential pkg-config libssl-dev librocksdb-dev clang cmake git
 ```
 
 macOS:
@@ -105,8 +107,8 @@ Build and install from source:
 
 ```bash
 git clone https://github.com/TusharPardhe/quaxar.git
-cd xrpld
-cargo install --path xrpld/main
+cd quaxar
+CC=clang CXX=clang++ cargo install --path xrpld/main
 ```
 
 Run with an explicit configuration file:

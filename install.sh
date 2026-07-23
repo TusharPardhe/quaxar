@@ -273,6 +273,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Interactive input must come from the operator's terminal rather than the
+# script stream, so `curl ... | bash` remains usable from an interactive shell.
+if [ "$AUTO_YES" = false ]; then
+    if ! { : </dev/tty; }; then
+        fail "Interactive setup requires a terminal. Download the script first or re-run with -y."
+        exit 1
+    fi
+    read() {
+        if ! builtin read "$@" </dev/tty; then
+            fail "Unable to read from the terminal. Download the script first or re-run with -y."
+            exit 1
+        fi
+    }
+fi
+
 # ── Banner ───────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${ORANGE}  ██╗  ██╗██████╗ ██████╗ ██╗     ██████╗ ${RESET}"
@@ -453,6 +468,8 @@ check_pkg() {
     fi
 }
 
+check_pkg "Git" "git" "git"
+
 if [ "$PKG_MGR" = "apt" ]; then
     check_pkg "OpenSSL" "openssl" "libssl-dev"
     check_pkg "RocksDB" "" "librocksdb-dev"
@@ -529,10 +546,14 @@ if [ "$PKG_MGR" = "apt" ] && dpkg -s librocksdb-dev &>/dev/null 2>&1; then
 fi
 
 info "Building quaxar (this may take a few minutes)..."
+if command -v clang &>/dev/null && command -v clang++ &>/dev/null; then
+    export CC=clang CXX=clang++
+    info "Using clang and clang++ for native dependencies"
+fi
 if [ "$RAM_GB" -le 16 ]; then
-    CARGO_BUILD_JOBS=2 cargo install --path xrpld/main --force 2>&1 | tail -1
+    CARGO_BUILD_JOBS=2 cargo install --path xrpld/main --locked --force 2>&1 | tail -1
 else
-    cargo install --path xrpld/main --force 2>&1 | tail -1
+    cargo install --path xrpld/main --locked --force 2>&1 | tail -1
 fi
 
 ok "quaxar installed to $(which quaxar || echo ~/.cargo/bin/quaxar)"
@@ -569,7 +590,7 @@ if [ "$GENERATE_CONF" = true ]; then
     WS_SECURE_GATEWAY=""
     WS_SEND_QUEUE_LIMIT="500"
     DB_TYPE="NuDB"
-    DATA_DIR="$HOME/.local/share/xrpld"
+    DATA_DIR="$HOME/.local/share/quaxar"
     DB_PATH="$DATA_DIR/db/nudb"
     SQLITE_PATH="$DATA_DIR/db"
     NUDB_BLOCK_SIZE="4096"
@@ -596,11 +617,25 @@ if [ "$GENERATE_CONF" = true ]; then
     REDUCE_RELAY_TX_ENABLE="0"
     REDUCE_RELAY_TX_MIN_PEERS="20"
     REDUCE_RELAY_TX_RELAY_PERCENTAGE="25"
-    LOG_FILE="$HOME/.local/share/xrpld/xrpld.log"
+    LOG_FILE="$HOME/.local/share/quaxar/quaxar.log"
     LOG_LEVEL="info"
 
     if [ "$AUTO_YES" = false ]; then
-        echo -e "  ${DIM}Configure your node (press Enter for defaults):${RESET}"
+        echo -e "  ${DIM}Configure the essential node settings (press Enter for defaults):${RESET}"
+        echo ""
+        ask_choice "Network" "$NETWORK" NETWORK "mainnet testnet devnet"
+        ask "Data directory" "$DATA_DIR" DATA_DIR
+        DB_PATH="$DATA_DIR/db/nudb"
+        SQLITE_PATH="$DATA_DIR/db"
+        ask_choice "Node size" "$NODE_SIZE" NODE_SIZE "tiny small medium large huge"
+        ask_ledger_history "Ledger history" "$LEDGER_HISTORY" LEDGER_HISTORY
+        ensure_history_not_above_online_delete
+    fi
+
+    # The installer intentionally emits the documented minimal configuration.
+    # Keep the old exhaustive prompt flow available only for explicit debugging.
+    if [ "$AUTO_YES" = false ] && [ "${QUAXAR_ADVANCED_CONFIG:-0}" = "1" ]; then
+        echo -e "  ${DIM}Configure advanced runtime settings (press Enter for defaults):${RESET}"
         echo ""
 
         echo -e "  ${BOLD}── Ports ──${RESET}"
@@ -705,7 +740,7 @@ if [ "$GENERATE_CONF" = true ]; then
         NETWORK_ID="$NETWORK"
     fi
 
-    if [ "$AUTO_YES" = false ]; then
+    if [ "$AUTO_YES" = false ] && [ "${QUAXAR_ADVANCED_CONFIG:-0}" = "1" ]; then
         echo ""
         echo -e "  ${BOLD}── Validators and Peers ──${RESET}"
         ask "Validators file" "$VALIDATORS_FILE" VALIDATORS_FILE
@@ -738,27 +773,17 @@ $NETWORK_ID
 [server]
 port_rpc_admin_local
 port_peer
-port_ws_admin_local
 
 [port_rpc_admin_local]
 port = $RPC_PORT
-ip = $RPC_IP
-admin = $RPC_ADMIN
-$RPC_SECURE_GATEWAY_LINE
-protocol = http
+ip = 127.0.0.1
+admin = 127.0.0.1
+protocol = http,ws
 
 [port_peer]
 port = $PEER_PORT
 ip = $PEER_IP
 protocol = peer
-
-[port_ws_admin_local]
-port = $WS_PORT
-ip = $WS_IP
-admin = $WS_ADMIN
-$WS_SECURE_GATEWAY_LINE
-protocol = ws
-send_queue_limit = $WS_SEND_QUEUE_LIMIT
 
 [node_size]
 $NODE_SIZE
@@ -784,39 +809,8 @@ $LEDGER_HISTORY
 $VALIDATORS_FILE
 
 $NETWORK_ID_SECTION
-[overlay]
-$OVERLAY_PUBLIC_IP_LINE
-ip_limit = $OVERLAY_IP_LIMIT
-verify_endpoints = $OVERLAY_VERIFY_ENDPOINTS
-
-[crawl]
-$CRAWL_ENABLED
-overlay = $CRAWL_OVERLAY
-server = $CRAWL_SERVER
-counts = $CRAWL_COUNTS
-unl = $CRAWL_UNL
-
-[vl]
-enabled = $VL_ENABLED
-
-[reduce_relay]
-vp_base_squelch_enable = $REDUCE_RELAY_VP_ENABLE
-vp_base_squelch_max_selected_peers = $REDUCE_RELAY_VP_MAX_SELECTED_PEERS
-tx_enable = $REDUCE_RELAY_TX_ENABLE
-tx_min_peers = $REDUCE_RELAY_TX_MIN_PEERS
-tx_relay_percentage = $REDUCE_RELAY_TX_RELAY_PERCENTAGE
-
-[debug_logfile]
-$LOG_FILE
-
 [ips]
 $(as_lines "$PEERS")
-
-[rpc_startup]
-{"command": "log_level", "severity": "$LOG_LEVEL"}
-
-[ssl_verify]
-$SSL_VERIFY
 EOF
 
     # Write validators.txt
@@ -870,11 +864,11 @@ EOF
     if ask_yn "Start quaxar now?" "Y"; then
         sudo systemctl start quaxar
         sleep 3
-        ok "xrpld started"
+        ok "quaxar started"
     fi
 elif [ "$INSTALL_SERVICE" = true ]; then
     warn "systemd not available — skipping service setup"
-    info "Start manually: RUST_LOG=$LOG_LEVEL xrpld --conf $CONF_FILE"
+    info "Start manually: RUST_LOG=$LOG_LEVEL quaxar --conf $CONF_FILE"
 fi
 
 # ── Verification ─────────────────────────────────────────────────────────────
@@ -890,7 +884,7 @@ else
     fail "Binary not found"
 fi
 
-if systemctl is-active xrpld &>/dev/null 2>&1; then
+if systemctl is-active quaxar &>/dev/null 2>&1; then
     sleep 2
     "$XRPLD_BIN" health --rpc-url "http://127.0.0.1:${RPC_PORT:-5005}" 2>/dev/null || true
 fi
@@ -906,8 +900,8 @@ echo -e "  RPC:        ${BOLD}http://${RPC_IP:-127.0.0.1}:${RPC_PORT:-5005}${RES
 echo -e "  Peer:       ${BOLD}${PEER_IP:-0.0.0.0}:${PEER_PORT:-51235}${RESET}"
 echo ""
 echo -e "  ${BOLD}Next steps:${RESET}"
-echo -e "    xrpld status          ${DIM}Check node status${RESET}"
-echo -e "    xrpld cli             ${DIM}Interactive mode${RESET}"
-echo -e "    xrpld peers           ${DIM}View connected peers${RESET}"
-echo -e "    journalctl -u xrpld   ${DIM}Follow logs${RESET}"
+echo -e "    quaxar status          ${DIM}Check node status${RESET}"
+echo -e "    quaxar cli             ${DIM}Interactive mode${RESET}"
+echo -e "    quaxar peers           ${DIM}View connected peers${RESET}"
+echo -e "    journalctl -u quaxar   ${DIM}Follow logs${RESET}"
 echo ""
