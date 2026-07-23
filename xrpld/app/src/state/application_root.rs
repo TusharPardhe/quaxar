@@ -47,6 +47,7 @@ use crate::state::collector_manager::{CollectorManager, CollectorParams};
 use crate::state::manifest::ManifestCache;
 use crate::state::node_store_scheduler::NodeStoreScheduler;
 use crate::state::overlay_status::OverlayStatusSource;
+use crate::state::snapshot_export_state::{SnapshotExportState, SnapshotExportStatus};
 use crate::state::status_metrics::StatusMetricsSource;
 use crate::state::status_rpc_state::{StatusRpcGitInfo, StatusRpcLastClose, StatusRpcState};
 use crate::state::stop_tree::{StopTree, StopTreeNode};
@@ -201,6 +202,7 @@ pub struct ApplicationRoot {
     validations: SharedAppValidations<SystemTimeKeeperClock>,
     validators: Arc<ValidatorList>,
     status_rpc_state: Arc<StatusRpcState>,
+    snapshot_export_state: Arc<SnapshotExportState>,
     amendment_status: Arc<AmendmentStatus>,
     elb_support: bool,
     node_identity: Option<(PublicKey, SecretKey)>,
@@ -246,12 +248,23 @@ pub struct ApplicationRoot {
     /// rippled's strand-based immediate dispatch of proposals.
     consensus_notify: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     /// Shared tree-node cache — the single `TreeNodeCache` instance shared
-    /// across all SHAMaps via `SHAMapFamily`. Attached by main.rs after
+    /// across all SHAMaps via `SHAMapFamily`. Attached by bootstrap after
     /// creation. Used by `persist_dirty_nodes_to_store` to canonicalize
     /// flushed nodes into the cache (matching rippled's `SHAMap::writeNode`
     /// which calls `canonicalize` + `db().store()`).
-    shared_tree_cache:
-        Option<Arc<TreeNodeCache<MonotonicClock, basics::hardened_hash::HardenedHashBuilder>>>,
+    shared_tree_cache: std::sync::OnceLock<
+        Arc<TreeNodeCache<MonotonicClock, basics::hardened_hash::HardenedHashBuilder>>,
+    >,
+    /// Shared full-below cache — tracks SHAMap subtrees that are fully
+    /// downloaded.  Attached during bootstrap alongside the tree cache.
+    shared_full_below_cache: std::sync::OnceLock<
+        Arc<
+            shamap::family::FullBelowCacheImpl<
+                MonotonicClock,
+                basics::hardened_hash::HardenedHashBuilder,
+            >,
+        >,
+    >,
 }
 
 impl std::fmt::Debug for ApplicationRoot {
@@ -361,7 +374,10 @@ impl std::fmt::Debug for ApplicationRoot {
                 "has_shamap_store_service",
                 &self.shamap_store_service.is_some(),
             )
-            .field("has_shared_tree_cache", &self.shared_tree_cache.is_some())
+            .field(
+                "has_shared_tree_cache",
+                &self.shared_tree_cache.get().is_some(),
+            )
             .finish()
     }
 }
@@ -2275,6 +2291,7 @@ impl ApplicationRoot {
             validations,
             validators,
             status_rpc_state: Arc::new(StatusRpcState::new()),
+            snapshot_export_state: Arc::new(SnapshotExportState::default()),
             amendment_status: Arc::new(AmendmentStatus::new()),
             elb_support,
             node_identity: None,
@@ -2295,7 +2312,8 @@ impl ApplicationRoot {
             close_gate: Arc::new(std::sync::Mutex::new(())),
             tx_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             consensus_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
-            shared_tree_cache: None,
+            shared_tree_cache: std::sync::OnceLock::new(),
+            shared_full_below_cache: std::sync::OnceLock::new(),
         });
 
         // TODO: Re-enable ConsensusTransSetSF filter once serialization is verified.
@@ -2977,17 +2995,17 @@ impl ApplicationRoot {
     /// canonicalize flushed nodes (matching rippled's `SHAMap::writeNode`
     /// → `canonicalize` + `db().store()` two-step pattern).
     pub fn attach_shared_tree_cache(
-        &mut self,
+        &self,
         cache: Arc<TreeNodeCache<MonotonicClock, basics::hardened_hash::HardenedHashBuilder>>,
     ) {
-        self.shared_tree_cache = Some(cache);
+        let _ = self.shared_tree_cache.set(cache);
     }
 
     /// Returns a reference to the shared tree-node cache, if attached.
     pub fn shared_tree_cache(
         &self,
     ) -> Option<&TreeNodeCache<MonotonicClock, basics::hardened_hash::HardenedHashBuilder>> {
-        self.shared_tree_cache.as_deref()
+        self.shared_tree_cache.get().map(|arc| arc.as_ref())
     }
 
     /// Returns the Arc to the shared tree-node cache, if attached.
@@ -2996,7 +3014,28 @@ impl ApplicationRoot {
         &self,
     ) -> Option<&Arc<TreeNodeCache<MonotonicClock, basics::hardened_hash::HardenedHashBuilder>>>
     {
-        self.shared_tree_cache.as_ref()
+        self.shared_tree_cache.get()
+    }
+
+    /// Attach the shared full-below cache so `get_counts` can report its size.
+    pub fn attach_shared_full_below_cache(
+        &self,
+        cache: Arc<
+            shamap::family::FullBelowCacheImpl<
+                MonotonicClock,
+                basics::hardened_hash::HardenedHashBuilder,
+            >,
+        >,
+    ) {
+        let _ = self.shared_full_below_cache.set(cache);
+    }
+
+    /// Returns the current entry count of the shared full-below cache.
+    pub fn full_below_cache_size(&self) -> usize {
+        self.shared_full_below_cache
+            .get()
+            .map(|c| c.size())
+            .unwrap_or(0)
     }
 
     pub fn attach_resolver_runtime(
@@ -3963,6 +4002,19 @@ impl ApplicationRoot {
 
     pub fn set_status_rpc_server_domain(&self, server_domain: Option<String>) -> Option<String> {
         self.status_rpc_state.set_server_domain(server_domain)
+    }
+
+    pub fn begin_snapshot_export(
+        &self,
+        output: String,
+        ledger_seq: u32,
+    ) -> Result<Arc<SnapshotExportState>, String> {
+        self.snapshot_export_state.begin(output, ledger_seq)?;
+        Ok(Arc::clone(&self.snapshot_export_state))
+    }
+
+    pub fn snapshot_export_status(&self) -> SnapshotExportStatus {
+        self.snapshot_export_state.snapshot()
     }
 
     pub fn status_rpc_node_size(&self) -> Option<String> {

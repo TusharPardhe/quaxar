@@ -25,6 +25,7 @@ use app::{
 };
 use basics::base_uint::Uint256;
 use basics::basic_config::BasicConfig;
+use indicatif::{ProgressBar, ProgressStyle};
 use overlay::Overlay;
 use overlay::Peer as _;
 // Import PeerSet trait for method access on SimplePeerSet
@@ -2465,51 +2466,163 @@ mod tests;
 
 // ─── Snapshot CLI handlers ───────────────────────────────────────────────────
 
-fn run_export_snapshot(url: &str, output: &str) -> bool {
-    println!("Requesting snapshot export to {}...", output);
+fn snapshot_spinner(message: impl Into<String>) -> ProgressBar {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner} {msg}")
+            .expect("snapshot spinner template should be valid"),
+    );
+    spinner.set_message(message.into());
+    spinner.enable_steady_tick(Duration::from_millis(80));
+    spinner
+}
 
+fn snapshot_status_request(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<serde_json::Value, String> {
+    let request_json = serde_json::json!({
+        "method": "snapshot_status",
+        "params": [{}]
+    });
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(request_json.to_string())
+        .send()
+        .map_err(|error| format!("snapshot status request failed: {error}"))?;
+    let text = response
+        .text()
+        .map_err(|error| format!("snapshot status response failed: {error}"))?;
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("invalid snapshot status response: {error}"))?;
+    let result = json["result"].clone();
+    if result["status"].as_str() == Some("error") {
+        let message = result["error_message"]
+            .as_str()
+            .or_else(|| result["error"].as_str())
+            .unwrap_or("unknown snapshot status error");
+        return Err(message.to_owned());
+    }
+    Ok(result)
+}
+
+fn run_export_snapshot(url: &str, output: &str) -> bool {
+    let spinner = snapshot_spinner(format!("Requesting snapshot export to {output}..."));
     let request_json = serde_json::json!({
         "method": "export_snapshot",
         "params": [{"output": output}]
     });
-
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(Duration::from_secs(30))
         .build()
-        .unwrap();
+        .expect("snapshot RPC client should build");
 
-    let body = serde_json::to_string(&request_json).unwrap();
-
-    match client
+    let response = match client
         .post(url)
         .header("Content-Type", "application/json")
-        .body(body)
+        .body(request_json.to_string())
         .send()
     {
-        Ok(response) => {
-            let text = response.text().unwrap_or_default();
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(status) = json["result"]["status"].as_str()
-                    && status == "started"
-                {
-                    let seq = json["result"]["ledger_seq"].as_u64().unwrap_or(0);
-                    println!("  ✓ Export started (ledger seq: {})", seq);
-                    println!("  → Output: {}", output);
-                    println!("  → Monitor progress: grep snapshot ~/quaxar.log");
-                    return true;
-                }
-                if let Some(error) = json["result"]["error_message"].as_str() {
-                    eprintln!("  ✗ {}", error);
-                    return false;
+        Ok(response) => response,
+        Err(error) => {
+            spinner.finish_and_clear();
+            eprintln!("Failed to connect to node at {url}: {error}");
+            eprintln!("Make sure the node is running and the RPC port is accessible.");
+            return false;
+        }
+    };
+
+    let text = response.text().unwrap_or_default();
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        spinner.finish_and_clear();
+        eprintln!("{text}");
+        return false;
+    };
+    let result = &json["result"];
+    if result["status"].as_str() != Some("started") {
+        spinner.finish_and_clear();
+        if let Some(error) = result["error_message"].as_str() {
+            eprintln!("  ✗ {error}");
+        } else {
+            eprintln!("{text}");
+        }
+        return false;
+    }
+
+    let ledger_seq = result["ledger_seq"].as_u64().unwrap_or_default();
+    spinner.set_message(format!("Exporting snapshot (ledger seq: {ledger_seq})..."));
+    let mut poll_failures = 0_u8;
+    loop {
+        thread::sleep(Duration::from_secs(1));
+        match snapshot_status_request(&client, url) {
+            Ok(status) => {
+                poll_failures = 0;
+                match status["state"].as_str().unwrap_or("unavailable") {
+                    "running" => {
+                        let sequence = status["ledger_seq"].as_u64().unwrap_or(ledger_seq);
+                        spinner
+                            .set_message(format!("Exporting snapshot (ledger seq: {sequence})..."));
+                    }
+                    "completed" => {
+                        spinner.finish_with_message("✓ Snapshot export complete");
+                        println!(
+                            "  → Output: {}",
+                            status["output"].as_str().unwrap_or(output)
+                        );
+                        if let Some(bytes) = status["file_size"].as_u64() {
+                            println!("  → Size: {bytes} bytes");
+                        }
+                        return true;
+                    }
+                    "failed" => {
+                        spinner.finish_and_clear();
+                        eprintln!(
+                            "  ✗ Snapshot export failed: {}",
+                            status["error"].as_str().unwrap_or("unknown error")
+                        );
+                        return false;
+                    }
+                    "idle" => {
+                        spinner.finish_and_clear();
+                        eprintln!("  ✗ Snapshot export status was reset before completion.");
+                        return false;
+                    }
+                    _ => {
+                        spinner.finish_and_clear();
+                        println!("  ✓ Export started (ledger seq: {ledger_seq})");
+                        println!("  → Output: {output}");
+                        println!(
+                            "  → This node does not expose export progress; monitor its snapshot logs."
+                        );
+                        return true;
+                    }
                 }
             }
-            eprintln!("{}", text);
-            false
-        }
-        Err(error) => {
-            eprintln!("Failed to connect to node at {}: {}", url, error);
-            eprintln!("Make sure the node is running and the RPC port is accessible.");
-            false
+            Err(error) => {
+                poll_failures = poll_failures.saturating_add(1);
+                if error.contains("Unknown command") || error.contains("unknownCmd") {
+                    spinner.finish_and_clear();
+                    println!("  ✓ Export started (ledger seq: {ledger_seq})");
+                    println!("  → Output: {output}");
+                    println!(
+                        "  → This node does not expose export progress; monitor its snapshot logs."
+                    );
+                    return true;
+                }
+                if poll_failures < 3 {
+                    spinner.set_message("Waiting to reconnect for snapshot status...".to_owned());
+                    continue;
+                }
+                spinner.finish_and_clear();
+                println!("  ✓ Export started (ledger seq: {ledger_seq})");
+                println!("  → Output: {output}");
+                println!(
+                    "  → Lost progress polling ({error}); the background export may still be running."
+                );
+                return true;
+            }
         }
     }
 }
@@ -2561,20 +2674,25 @@ fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
     }
 
     let input_path = Path::new(input);
-    println!("Loading snapshot from {}...", input_path.display());
+    let spinner = snapshot_spinner(format!(
+        "Importing snapshot from {}...",
+        input_path.display()
+    ));
 
     match load_snapshot(backend.as_ref(), input_path) {
         Ok(manifest) => {
+            backend.sync();
+            let _ = backend.close();
+            spinner.finish_with_message("✓ Snapshot import complete and integrity verified");
             println!(
-                "Snapshot loaded successfully: ledger_seq={}, chunks={}",
+                "  → Ledger seq: {}, chunks: {}",
                 manifest.ledger_seq,
                 manifest.chunks.len()
             );
-            backend.sync();
-            let _ = backend.close();
             true
         }
         Err(e) => {
+            spinner.finish_and_clear();
             eprintln!("Snapshot load failed: {e}");
             let _ = backend.close();
             false

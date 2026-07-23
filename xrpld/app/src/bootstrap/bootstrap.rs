@@ -998,6 +998,16 @@ fn run_start_mode_consensus_loop(
             ))
         });
 
+    // Attach the shared tree cache and full-below cache on ApplicationRoot
+    // so get_counts can report live treenode_cache_size, treenode_track_size,
+    // and fullbelow_size values.
+    runtime
+        .root()
+        .attach_shared_tree_cache(Arc::clone(&app_tree_cache));
+    runtime
+        .root()
+        .attach_shared_full_below_cache(Arc::clone(shared_inbound.full_below_cache()));
+
     if let Some(lm_rt) = lm_rt_for_shared_inbound.as_ref()
         && let Ok(mut guard) = lm_rt.inbound_ledgers.lock()
         && guard.is_none()

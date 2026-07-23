@@ -118,6 +118,13 @@ impl InboundLedgers {
 
     // ─── Configuration setters (called during app startup) ───────────────
 
+    /// Returns the shared full-below cache Arc for metrics attachment.
+    pub fn full_below_cache(
+        &self,
+    ) -> &Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>> {
+        &self.full_below
+    }
+
     pub fn set_overlay_rt(&self, rt: Arc<AppOverlayRuntime>) {
         let mut guard = self.overlay_rt.write().expect("overlay_rt write");
         *guard = Some(rt);

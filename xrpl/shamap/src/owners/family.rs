@@ -95,6 +95,11 @@ where
     C: CacheClock,
     S: BuildHasher + Clone,
 {
+    /// Returns the current number of entries held in the full-below cache.
+    pub fn size(&self) -> usize {
+        self.cache.get_cache_size()
+    }
+
     pub fn new(generation: u32, clock: C, hasher: S, target_size: usize) -> Self {
         Self::new_with_expiration(
             generation,

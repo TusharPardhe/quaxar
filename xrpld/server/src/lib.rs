@@ -896,6 +896,7 @@ where
             | "log_level"
             | "can_delete"
             | "export_snapshot"
+            | "snapshot_status"
             | "ledger_cleaner"
             | "peer_reservations_list"
             | "peer_reservations_add"
@@ -933,6 +934,9 @@ where
                     "can_delete" => dispatch_ctx!(rpc::CanDeleteSource, rpc::do_can_delete),
                     "export_snapshot" => {
                         dispatch_ctx!(rpc::ExportSnapshotSource, rpc::do_export_snapshot)
+                    }
+                    "snapshot_status" => {
+                        dispatch_ctx!(rpc::SnapshotStatusSource, rpc::do_snapshot_status)
                     }
                     "ledger_cleaner" => {
                         dispatch_ctx!(rpc::LedgerCleanerSource, rpc::do_ledger_cleaner)

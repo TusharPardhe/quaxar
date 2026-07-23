@@ -310,10 +310,14 @@ existing synced node. This bypasses the multi-hour network sync entirely.
 **On the source node (online):**
 
 ```bash
-quaxar rpc export_snapshot
+quaxar export-snapshot --output /var/lib/quaxar/snapshots/bootstrap.xrpls
 ```
 
-The export runs in a background thread. On NVMe, 26.5M nodes export in ~3
+The node exports in a background job and remains online. The CLI displays a
+spinner while it polls the admin `snapshot_status` RPC, then reports completion
+or failure and the resulting file size. On an older node without
+`snapshot_status`, the CLI reports that export was started and instructs the
+operator to monitor snapshot logs instead. On NVMe, 26.5M nodes export in ~3
 minutes. The snapshot file uses LZ4 compressed chunks with SHA-256 integrity
 verification.
 
@@ -323,8 +327,9 @@ verification.
 quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/xrpld/xrpld.cfg
 ```
 
-After import completes, start the node normally. It will resume from the
-snapshot state and catch up to the network tip within minutes.
+The CLI displays a spinner while it imports and verifies all chunk and final
+file hashes. After it reports completion, start the node normally. It will
+resume from the snapshot state and catch up to the network tip within minutes.
 
 See [CLI.md](CLI.md) for command details and [SYNCING.md](SYNCING.md) for
 alternative sync methods.

@@ -370,6 +370,13 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
         )
     }
 
+    fn snapshot_status(&self) -> protocol::JsonValue {
+        self.app().map_or_else(
+            || protocol::json!({ "status": "success", "state": "unavailable" }),
+            |app| <ApplicationRoot as RpcRuntime>::snapshot_status(app),
+        )
+    }
+
     fn log_level_set(&self, partition: String, level: String) -> crate::status::Status {
         self.app().map_or_else(
             || crate::status::Status::new(crate::status::RpcErrorCode::NotImplemented),
@@ -2357,19 +2364,33 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
         JsonValue::Null
     }
     fn accepted_ledger_cache_size(&self) -> u64 {
-        0
+        self.view
+            .app()
+            .map(|app| app.accepted_ledger_cache().get_cache_size() as u64)
+            .unwrap_or(0)
     }
     fn accepted_ledger_cache_hit_rate(&self) -> JsonValue {
         JsonValue::Null
     }
     fn fullbelow_size(&self) -> i64 {
-        0
+        self.view
+            .app()
+            .map(|app| app.full_below_cache_size() as i64)
+            .unwrap_or(0)
     }
     fn treenode_cache_size(&self) -> u64 {
-        0
+        self.view
+            .app()
+            .and_then(|app| app.shared_tree_cache())
+            .map(|cache| cache.get_cache_size() as u64)
+            .unwrap_or(0)
     }
     fn treenode_track_size(&self) -> u64 {
-        0
+        self.view
+            .app()
+            .and_then(|app| app.shared_tree_cache())
+            .map(|cache| cache.get_track_size() as u64)
+            .unwrap_or(0)
     }
     fn add_node_store_counts(&self, json: &mut BTreeMap<String, JsonValue>) {
         let Some(app) = self.view.app() else {

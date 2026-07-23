@@ -4344,6 +4344,7 @@ dependencies = [
  "console",
  "futures",
  "hex",
+ "indicatif",
  "ledger",
  "libc",
  "nodestore",
