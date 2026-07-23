@@ -819,123 +819,6 @@ fn peerfinder_outbound_target(peer_limit: usize, want_incoming: bool) -> usize {
     peer_limit.min(computed.max(PEERFINDER_MIN_OUTBOUND))
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CatchupResourceProfile {
-    run_data_concurrency: usize,
-    acq_tree_cache_size: usize,
-    acq_tree_cache_age_seconds: i64,
-    acq_full_below_size: usize,
-    acq_fetch_pack_size: usize,
-    write_dedup_size: usize,
-    ledger_fetch_limit: usize,
-}
-
-impl CatchupResourceProfile {
-    fn for_node_size(node_size: Option<&str>) -> Self {
-        let node_profile = app::NodeSizeResourceProfile::for_node_size(node_size);
-        match node_size.unwrap_or("medium") {
-            "tiny" => Self {
-                run_data_concurrency: 2,
-                acq_tree_cache_size: node_profile.tree_cache_size,
-                acq_tree_cache_age_seconds: node_profile.tree_cache_age_seconds,
-                acq_full_below_size: 524_288,
-                acq_fetch_pack_size: 8_192,
-                write_dedup_size: 131_072,
-                ledger_fetch_limit: node_profile.ledger_fetch,
-            },
-            "small" => Self {
-                run_data_concurrency: 3,
-                acq_tree_cache_size: node_profile.tree_cache_size,
-                acq_tree_cache_age_seconds: node_profile.tree_cache_age_seconds,
-                acq_full_below_size: 524_288,
-                acq_fetch_pack_size: 16_384,
-                write_dedup_size: 262_144,
-                ledger_fetch_limit: node_profile.ledger_fetch,
-            },
-            "large" => Self {
-                run_data_concurrency: 6,
-                acq_tree_cache_size: node_profile.tree_cache_size,
-                acq_tree_cache_age_seconds: node_profile.tree_cache_age_seconds,
-                acq_full_below_size: 524_288,
-                acq_fetch_pack_size: 49_152,
-                write_dedup_size: 786_432,
-                ledger_fetch_limit: node_profile.ledger_fetch,
-            },
-            "huge" => Self {
-                run_data_concurrency: 8,
-                acq_tree_cache_size: node_profile.tree_cache_size,
-                acq_tree_cache_age_seconds: node_profile.tree_cache_age_seconds,
-                acq_full_below_size: 524_288,
-                acq_fetch_pack_size: 65_536,
-                write_dedup_size: 1_048_576,
-                ledger_fetch_limit: node_profile.ledger_fetch,
-            },
-            _ => Self {
-                run_data_concurrency: 6,
-                acq_tree_cache_size: node_profile.tree_cache_size,
-                acq_tree_cache_age_seconds: node_profile.tree_cache_age_seconds,
-                acq_full_below_size: 524_288,
-                acq_fetch_pack_size: 32_768,
-                write_dedup_size: 524_288,
-                ledger_fetch_limit: node_profile.ledger_fetch,
-            },
-        }
-    }
-
-    fn with_ledger_fetch_limit_override(mut self, ledger_fetch_limit: Option<usize>) -> Self {
-        if let Some(ledger_fetch_limit) = ledger_fetch_limit {
-            self.ledger_fetch_limit = ledger_fetch_limit;
-        }
-        self
-    }
-}
-
-fn bootstrap_acquire_budget_available(
-    validated: u32,
-    active_count: usize,
-    ledger_fetch_limit: usize,
-    already_tracked: bool,
-) -> bool {
-    if already_tracked {
-        return true;
-    }
-
-    if validated <= 1 {
-        // A cold node must finish one full account-state acquisition before
-        // run-ahead can help. Starting several full-state ledgers here only
-        // splits peer/disk budget and delays the first accepted ledger.
-        return active_count == 0;
-    }
-
-    active_count < ledger_fetch_limit.max(1)
-}
-
-fn ledger_fetch_limit_override(config: &BasicConfig) -> Result<Option<usize>, String> {
-    if !config.exists("ledger_acquisition") {
-        return Ok(None);
-    }
-
-    let Some(limit) = config
-        .section("ledger_acquisition")
-        .get::<usize>("ledger_fetch_limit")
-        .map_err(|_| "Configured ledger_acquisition.ledger_fetch_limit is invalid".to_owned())?
-    else {
-        return Ok(None);
-    };
-
-    if !(xrpld_cli::LEDGER_FETCH_LIMIT_OVERRIDE_MIN..=xrpld_cli::LEDGER_FETCH_LIMIT_OVERRIDE_MAX)
-        .contains(&limit)
-    {
-        return Err(format!(
-            "Configured ledger_acquisition.ledger_fetch_limit must be between {} and {}",
-            xrpld_cli::LEDGER_FETCH_LIMIT_OVERRIDE_MIN,
-            xrpld_cli::LEDGER_FETCH_LIMIT_OVERRIDE_MAX
-        ));
-    }
-
-    Ok(Some(limit))
-}
-
 /// Try to parse CLI subcommands. Returns Some(ExitCode) if a subcommand was
 /// handled, None if the node should start normally.
 /// Resolve the RPC URL: if user passed --url explicitly, use it.
@@ -1423,7 +1306,6 @@ struct BoundServerRuntime<D> {
     catch_up_state: Arc<CatchUpState>,
     node_store_usage_path: Option<PathBuf>,
     peerfinder_bootcache_path: Option<PathBuf>,
-    ledger_fetch_limit_override: Option<usize>,
 }
 
 fn select_target_seq(
@@ -2237,7 +2119,6 @@ impl<D> BoundServerRuntime<D> {
         app: app::ApplicationRoot,
         node_store_usage_path: Option<PathBuf>,
         peerfinder_bootcache_path: Option<PathBuf>,
-        ledger_fetch_limit_override: Option<usize>,
     ) -> Self {
         Self {
             runtime,
@@ -2246,7 +2127,6 @@ impl<D> BoundServerRuntime<D> {
             catch_up_state: Arc::new(CatchUpState::default()),
             node_store_usage_path,
             peerfinder_bootcache_path,
-            ledger_fetch_limit_override,
         }
     }
 
@@ -2300,7 +2180,6 @@ fn build_composed_runtime_from_path(
     let config = load_basic_config_file(&options.config_path)?;
     let node_store_usage_path = node_store_usage_path(&config);
     let peerfinder_bootcache_path = peerfinder_bootcache_path(&config);
-    let ledger_fetch_limit_override = ledger_fetch_limit_override(&config)?;
     let bootstrap = build_bootstrap_root(&config, &options)?;
     let mut report = bootstrap.report;
     let mut root = bootstrap.root;
@@ -2351,7 +2230,6 @@ fn build_composed_runtime_from_path(
             server_build,
             node_store_usage_path,
             peerfinder_bootcache_path,
-            ledger_fetch_limit_override,
         );
     }
 
@@ -2367,7 +2245,6 @@ fn bind_server_runtime_into_root<D>(
     server_build: ServerRuntimeBuildReport<D>,
     node_store_usage_path: Option<PathBuf>,
     peerfinder_bootcache_path: Option<PathBuf>,
-    ledger_fetch_limit_override: Option<usize>,
 ) where
     D: server::RpcDispatcher + Clone + Send + Sync + 'static,
 {
@@ -2389,7 +2266,6 @@ fn bind_server_runtime_into_root<D>(
         app_for_runtime,
         node_store_usage_path,
         peerfinder_bootcache_path,
-        ledger_fetch_limit_override,
     ));
     let _ = root.bind_server(runtime);
     report.has_server_runtime = true;

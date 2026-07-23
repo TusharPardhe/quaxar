@@ -197,30 +197,6 @@ ensure_history_not_above_online_delete() {
     done
 }
 
-warn_for_aggressive_fetch_limit() {
-    if [ -z "$LEDGER_FETCH_LIMIT" ]; then
-        return
-    fi
-
-    local recommended_max
-    case "$NODE_SIZE" in
-        tiny) recommended_max=2 ;;
-        small) recommended_max=3 ;;
-        medium) recommended_max=4 ;;
-        large) recommended_max=5 ;;
-        huge) recommended_max=8 ;;
-        *) recommended_max=4 ;;
-    esac
-
-    if [ "$LEDGER_FETCH_LIMIT" -gt "$recommended_max" ]; then
-        warn "ledger_fetch_limit=$LEDGER_FETCH_LIMIT is above the $NODE_SIZE profile default ($recommended_max)."
-        warn "This can increase peer requests, memory pressure, disk IO, and sync instability."
-        if [ "$AUTO_YES" = false ]; then
-            ask_yn "Keep this expert override?" "N" || LEDGER_FETCH_LIMIT=""
-        fi
-    fi
-}
-
 validate_config_inputs() {
     local failed=false
 
@@ -597,7 +573,6 @@ if [ "$GENERATE_CONF" = true ]; then
     ONLINE_DELETE="512"
     ADVISORY_DELETE="0"
     NODE_SIZE="medium"
-    LEDGER_FETCH_LIMIT=""
     LEDGER_HISTORY="256"
     NETWORK="mainnet"
     NETWORK_ID=""
@@ -672,10 +647,8 @@ if [ "$GENERATE_CONF" = true ]; then
         info "Node size determines memory usage:"
         info "  tiny=4GB  small=8GB  medium=16GB  large=32GB  huge=64GB"
         ask_choice "Node size" "$NODE_SIZE" NODE_SIZE "tiny small medium large huge"
-        ask_optional_int_range "Ledger fetch limit override (blank uses node_size)" "$LEDGER_FETCH_LIMIT" LEDGER_FETCH_LIMIT 1 8
         ask_ledger_history "Ledger history" "$LEDGER_HISTORY" LEDGER_HISTORY
         ensure_history_not_above_online_delete
-        warn_for_aggressive_fetch_limit
 
         echo ""
         echo -e "  ${BOLD}── Network ──${RESET}"
@@ -710,7 +683,6 @@ if [ "$GENERATE_CONF" = true ]; then
     fi
 
     ensure_history_not_above_online_delete
-    warn_for_aggressive_fetch_limit
     validate_config_inputs
 
     # Network-specific settings
@@ -753,8 +725,6 @@ if [ "$GENERATE_CONF" = true ]; then
     [ -n "$RPC_SECURE_GATEWAY" ] && RPC_SECURE_GATEWAY_LINE="secure_gateway = $RPC_SECURE_GATEWAY"
     WS_SECURE_GATEWAY_LINE=""
     [ -n "$WS_SECURE_GATEWAY" ] && WS_SECURE_GATEWAY_LINE="secure_gateway = $WS_SECURE_GATEWAY"
-    LEDGER_FETCH_LINE="# ledger_fetch_limit = 8"
-    [ -n "$LEDGER_FETCH_LIMIT" ] && LEDGER_FETCH_LINE="ledger_fetch_limit = $LEDGER_FETCH_LIMIT"
     NETWORK_ID_SECTION=""
     if [ -n "$NETWORK_ID" ]; then
         NETWORK_ID_SECTION="[network_id]
@@ -787,10 +757,6 @@ protocol = peer
 
 [node_size]
 $NODE_SIZE
-
-[ledger_acquisition]
-# Optional cold-bootstrap acquisition override. Omit to use [node_size].
-$LEDGER_FETCH_LINE
 
 [node_db]
 type = $DB_TYPE

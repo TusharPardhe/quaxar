@@ -1,8 +1,5 @@
 use clap::{Parser, Subcommand};
 
-pub const LEDGER_FETCH_LIMIT_OVERRIDE_MIN: usize = 1;
-pub const LEDGER_FETCH_LIMIT_OVERRIDE_MAX: usize = 8;
-
 pub mod account;
 pub mod amendments;
 pub mod benchmark;

@@ -228,11 +228,6 @@ protocol = peer
 [node_size]
 medium
 
-[ledger_acquisition]
-# Optional expert override. Valid range: 1 through 8.
-# If omitted, node_size selects the default.
-# ledger_fetch_limit = 8
-
 [node_db]
 type = NuDB
 path = /var/lib/xrpld/db/nudb
@@ -246,10 +241,6 @@ validators.txt
 
 `node_size` is the recommended primary tuning setting. It controls the default
 resource profile for acquisition, cache sizing, and runtime concurrency.
-`ledger_fetch_limit` is an expert override for active inbound ledger
-acquisitions during cold bootstrap. Use `1` for conservative operation and up
-to `8` on strong machines with enough memory, disk throughput, and peer
-capacity.
 
 The repository includes a small runnable `xrpld.cfg`. See
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the complete configuration
@@ -259,7 +250,7 @@ reference and [docs/RUNNING.md](docs/RUNNING.md) for operational guidance.
 
 | Topic | Guidance |
 | --- | --- |
-| Testnet operation | A medium node with NuDB and `ledger_fetch_limit = 8` has been validated on public testnet. |
+| Testnet operation | A medium node with NuDB has been validated on public testnet. |
 | Full history | Use `ledger_history = full` and provision storage accordingly. Full history requires significantly more disk and time. |
 | NuDB | Recommended for node store operation and used by the validated testnet deployment. |
 | RocksDB | Available where the Rust storage path exposes the matching backend. Use only when the target deployment requires it. |

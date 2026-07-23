@@ -136,10 +136,6 @@ protocol = peer
 [node_size]
 medium
 
-[ledger_acquisition]
-# Optional cold-bootstrap acquisition override. Omit to use [node_size].
-# ledger_fetch_limit = 8
-
 [node_db]
 type = NuDB
 path = /var/lib/xrpld/db/nudb
@@ -179,14 +175,12 @@ Alternatively, place these sections directly in `xrpld.cfg`.
 | `[port_*]` | Port binding: port number, IP, protocol (http/ws/peer) |
 | `[node_db]` | Database backend (NuDB), path, deletion policy |
 | `[node_size]` | Memory tuning: tiny, small, medium, large, huge |
-| `[ledger_acquisition]` | Optional expert override for cold-bootstrap active ledger acquisition count |
 | `[validators_file]` | Path to file with validator list sites and keys |
 | `[validator_list_sites]` | URLs to fetch trusted validator lists |
 | `[validator_list_keys]` | Public keys of validator list publishers |
 | `[ips]` | Peer endpoints to connect to on startup |
 
-See [CONFIGURATION.md](CONFIGURATION.md) for every supported config section and
-for guidance on `ledger_fetch_limit` tuning.
+See [CONFIGURATION.md](CONFIGURATION.md) for every supported config section.
 
 ## Starting the Node
 

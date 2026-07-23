@@ -4571,9 +4571,6 @@ impl ApplicationRoot {
                     self.set_need_network_ledger(false);
                 }
                 // If there's a missing ledger, trigger acquisition.
-                // Also pre-fetch the next few sequential ledgers to allow
-                // concurrent acquisition (rippled-parity: multi-ledger fetch
-                // up to ledger_fetch_limit during sequential catchup).
                 if let Some(missing) = report.missing {
                     if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                         if let Some(shared) = guard.as_ref() {
