@@ -1004,6 +1004,11 @@ fn run_start_mode_consensus_loop(
     runtime
         .root()
         .attach_shared_tree_cache(Arc::clone(&app_tree_cache));
+
+    // Dual-priority: cap evictable (leaf) entries at 2× tree_cache_size.
+    // Inner nodes are protected (never_evict) and don't count toward this cap.
+    app_tree_cache.set_leaf_hard_cap((node_size_profile.tree_cache_size * 2) as u64);
+
     runtime
         .root()
         .attach_shared_full_below_cache(Arc::clone(shared_inbound.full_below_cache()));

@@ -381,6 +381,8 @@ pub struct TaggedCache<
     instrumentation: TaggedCacheInstrumentation,
     fast_map: DashMap<K, SP, S>,
     fast_hits: AtomicU64,
+    /// Maximum number of evictable (non-protected) entries. 0 = no limit.
+    leaf_hard_cap: AtomicU64,
     state: RecursiveMutex<TaggedCacheState<K, T, P, SP, S>>,
 }
 
@@ -439,6 +441,7 @@ where
             instrumentation: TaggedCacheInstrumentation::default(),
             fast_map: DashMap::with_hasher(hasher.clone()),
             fast_hits: AtomicU64::new(0),
+            leaf_hard_cap: AtomicU64::new(0),
             state: RecursiveMutex::new(TaggedCacheState {
                 cache_count: 0,
                 cache: PartitionedUnorderedMap::with_hasher(None, hasher),
@@ -465,6 +468,7 @@ where
             instrumentation: TaggedCacheInstrumentation { metrics, logger },
             fast_map: DashMap::with_hasher(hasher.clone()),
             fast_hits: AtomicU64::new(0),
+            leaf_hard_cap: AtomicU64::new(0),
             state: RecursiveMutex::new(TaggedCacheState {
                 cache_count: 0,
                 cache: PartitionedUnorderedMap::with_hasher(None, hasher),
@@ -505,6 +509,13 @@ where
             .expect("TaggedCache mutex must not be poisoned")
             .cache
             .len()
+    }
+
+    /// Set the maximum number of evictable (non-protected) entries.
+    /// When exceeded, the oldest non-protected entry is evicted on each insert.
+    /// 0 = no limit (default).
+    pub fn set_leaf_hard_cap(&self, cap: u64) {
+        self.leaf_hard_cap.store(cap, Ordering::Relaxed);
     }
 
     pub fn get_hit_rate(&self) -> f32 {
@@ -836,6 +847,27 @@ where
             .insert(key.clone(), ValueEntry::new(self.clock.now(), data.clone()));
         state.cache_count += 1;
         self.fast_map.insert(key.clone(), data.clone());
+
+        // Enforce leaf hard cap: if too many evictable entries, remove the oldest one.
+        let cap = self.leaf_hard_cap.load(Ordering::Relaxed);
+        if cap > 0 && state.cache_count as u64 > cap {
+            let mut oldest_key: Option<K> = None;
+            let mut oldest_time = Duration::MAX;
+            for partition in state.cache.map() {
+                for (k, entry) in partition.iter() {
+                    if !entry.never_evict && entry.last_access < oldest_time {
+                        oldest_time = entry.last_access;
+                        oldest_key = Some(k.clone());
+                    }
+                }
+            }
+            if let Some(evict_key) = oldest_key {
+                state.cache.remove(&evict_key);
+                state.cache_count = state.cache_count.saturating_sub(1);
+                self.fast_map.remove(&evict_key);
+            }
+        }
+
         false
     }
 
