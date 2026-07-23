@@ -648,6 +648,33 @@ where
             }
 
             state.cache_count = state.cache_count.saturating_sub(all_removals);
+
+            // Enforce leaf hard cap: if still over limit after TTL eviction,
+            // force-evict the oldest non-protected entries.
+            let cap = self.leaf_hard_cap.load(Ordering::Relaxed);
+            if cap > 0 && state.cache_count as u64 > cap {
+                let mut evictable: Vec<(Duration, K)> = Vec::new();
+                for partition in state.cache.map() {
+                    for (k, entry) in partition.iter() {
+                        if !entry.never_evict && entry.ptr.is_strong() {
+                            evictable.push((entry.last_access, k.clone()));
+                        }
+                    }
+                }
+                evictable.sort_by_key(|(time, _)| *time);
+                let to_evict = (state.cache_count as u64).saturating_sub(cap) as usize;
+                for (_, key) in evictable.into_iter().take(to_evict) {
+                    if let Some(entry) = state.cache.get_mut(&key) {
+                        if entry.ptr.use_count() == 1 {
+                            state.cache.remove(&key);
+                        } else {
+                            entry.ptr.convert_to_weak();
+                        }
+                        state.cache_count = state.cache_count.saturating_sub(1);
+                        self.fast_map.remove(&key);
+                    }
+                }
+            }
         }
         // Match the reference `stuffToSweep` lifetime: removed values are destroyed
         // after the cache lock is released, but before the final duration log.
