@@ -4,8 +4,6 @@ use std::{collections::HashSet, net::IpAddr};
 use basics::basic_config::{BasicConfig, IniFileSections};
 use ipnet::IpNet;
 
-use crate::{LEDGER_FETCH_LIMIT_OVERRIDE_MAX, LEDGER_FETCH_LIMIT_OVERRIDE_MIN};
-
 pub fn run(conf_path: Option<&str>) {
     let path = conf_path.unwrap_or("/etc/xrpld/xrpld.cfg");
     println!("Checking config: {path}");
@@ -113,7 +111,6 @@ fn validate_config_content(content: &str) -> ConfigValidationReport {
 
     validate_server_ports(&config, &mut report);
     validate_node_size(&config, &mut report);
-    validate_ledger_acquisition(&config, &mut report);
     validate_node_db_and_history(&config, &mut report);
     validate_network_id(&config, &mut report);
     validate_overlay(&config, &mut report);
@@ -123,34 +120,6 @@ fn validate_config_content(content: &str) -> ConfigValidationReport {
     validate_ssl_verify(&config, &mut report);
 
     report
-}
-
-#[cfg(test)]
-fn validate_ledger_fetch_limit(content: &str) -> Result<Option<usize>, String> {
-    let config = parse_basic_config_text(content);
-    ledger_fetch_limit(&config)
-}
-
-fn ledger_fetch_limit(config: &BasicConfig) -> Result<Option<usize>, String> {
-    if !config.exists("ledger_acquisition") {
-        return Ok(None);
-    }
-
-    let Some(limit) = config
-        .section("ledger_acquisition")
-        .get::<usize>("ledger_fetch_limit")
-        .map_err(|_| "Configured ledger_acquisition.ledger_fetch_limit is invalid".to_owned())?
-    else {
-        return Ok(None);
-    };
-
-    if !(LEDGER_FETCH_LIMIT_OVERRIDE_MIN..=LEDGER_FETCH_LIMIT_OVERRIDE_MAX).contains(&limit) {
-        return Err(format!(
-            "Configured ledger_acquisition.ledger_fetch_limit must be between {LEDGER_FETCH_LIMIT_OVERRIDE_MIN} and {LEDGER_FETCH_LIMIT_OVERRIDE_MAX}"
-        ));
-    }
-
-    Ok(Some(limit))
 }
 
 fn validate_server_ports(config: &BasicConfig, report: &mut ConfigValidationReport) {
@@ -257,16 +226,6 @@ fn validate_node_size(config: &BasicConfig, report: &mut ConfigValidationReport)
             "[node_size] invalid value '{}'; allowed: tiny, small, medium, large, huge",
             value.trim()
         ));
-    }
-}
-
-fn validate_ledger_acquisition(config: &BasicConfig, report: &mut ConfigValidationReport) {
-    match ledger_fetch_limit(config) {
-        Ok(Some(limit)) => report
-            .ok
-            .push(format!("[ledger_acquisition] ledger_fetch_limit = {limit}")),
-        Ok(None) => {}
-        Err(error) => report.errors.push(error),
     }
 }
 
@@ -576,24 +535,7 @@ fn parse_basic_config_text(text: &str) -> BasicConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_config_content, validate_ledger_fetch_limit};
-
-    #[test]
-    fn ledger_fetch_limit_check_rejects_values_above_supported_max() {
-        let error = validate_ledger_fetch_limit("[ledger_acquisition]\nledger_fetch_limit = 9\n")
-            .expect_err("limit above huge profile should be rejected");
-
-        assert!(error.contains("between 1 and 8"));
-    }
-
-    #[test]
-    fn ledger_fetch_limit_check_accepts_huge_profile_limit() {
-        assert_eq!(
-            validate_ledger_fetch_limit("[ledger_acquisition]\nledger_fetch_limit = 8\n")
-                .expect("limit should parse"),
-            Some(8)
-        );
-    }
+    use super::validate_config_content;
 
     #[test]
     fn config_validation_rejects_installer_edge_cases() {
@@ -617,9 +559,6 @@ protocol = peer
 
 [node_size]
 massive
-
-[ledger_acquisition]
-ledger_fetch_limit = 9
 
 [node_db]
 type = BadDb
@@ -666,7 +605,6 @@ maybe
             "send_queue_limit",
             "ip is invalid",
             "[node_size] invalid",
-            "between 1 and 8",
             "[node_db] type is invalid",
             "[node_db] missing required field: path",
             "nudb_block_size",
@@ -723,9 +661,6 @@ send_queue_limit = 500
 
 [node_size]
 medium
-
-[ledger_acquisition]
-ledger_fetch_limit = 8
 
 [node_db]
 type = NuDB

@@ -1,16 +1,15 @@
 use super::{
-    AcqMsg, AcqRegistry, CatchupResourceProfile, CompletedLedgerAcceptance, LedgerPublishAdvance,
+    AcqMsg, AcqRegistry, CompletedLedgerAcceptance, LedgerPublishAdvance,
     PEERFINDER_MAX_CONNECT_ATTEMPTS, PEERFINDER_MAX_HOPS, PEERFINDER_NUMBER_OF_ENDPOINTS,
-    PEERFINDER_RECENT_ATTEMPT_DURATION, bind_server_runtime_into_root,
-    bootstrap_acquire_budget_available, build_endpoint_broadcast, candidate_ledger_for_seq,
-    candidate_reference_hash_from_reference_ledger, classify_completed_ledger_acceptance,
-    classify_publish_advance, cold_bootstrap_persisted_validated_target, command_suggestions,
-    current_ledger_is_fresh, first_command_like_arg, hash_for_seq_from_reference_ledger,
-    ledger_fetch_limit_override, node_store_usage_path, path_size_bytes, peerfinder_canonical_ip,
-    peerfinder_outbound_target, preferred_closed_ledger_hash,
-    preferred_closed_ledger_hash_from_hashes, promote_current_ledger, prune_known_endpoints,
-    prune_recent_connect_attempts, remember_known_endpoint, select_autoconnect_endpoints,
-    select_bootcache_endpoints, select_consensus_acquisition_target,
+    PEERFINDER_RECENT_ATTEMPT_DURATION, bind_server_runtime_into_root, build_endpoint_broadcast,
+    candidate_ledger_for_seq, candidate_reference_hash_from_reference_ledger,
+    classify_completed_ledger_acceptance, classify_publish_advance,
+    cold_bootstrap_persisted_validated_target, command_suggestions, current_ledger_is_fresh,
+    first_command_like_arg, hash_for_seq_from_reference_ledger, node_store_usage_path,
+    path_size_bytes, peerfinder_canonical_ip, peerfinder_outbound_target,
+    preferred_closed_ledger_hash, preferred_closed_ledger_hash_from_hashes, promote_current_ledger,
+    prune_known_endpoints, prune_recent_connect_attempts, remember_known_endpoint,
+    select_autoconnect_endpoints, select_bootcache_endpoints, select_consensus_acquisition_target,
     select_post_acquisition_operating_mode, select_target_seq,
     should_attempt_completed_ledger_promotion, should_retry_publish_after_completed_history,
 };
@@ -168,7 +167,6 @@ path = {}
                 reason: "test handoff".to_owned(),
             }],
         },
-        None,
         None,
         None,
     );
@@ -959,81 +957,4 @@ fn peerfinder_outbound_target_percent_and_minimum_shape() {
     assert_eq!(peerfinder_outbound_target(100, true), 15);
     assert_eq!(peerfinder_outbound_target(8, true), 8);
     assert_eq!(peerfinder_outbound_target(21, false), 21);
-}
-
-#[test]
-fn catchup_resource_profile_tiny_keeps_local_worker_limits_conservative() {
-    let profile = CatchupResourceProfile::for_node_size(Some("tiny"));
-    assert_eq!(profile.run_data_concurrency, 2);
-    assert_eq!(profile.acq_tree_cache_size, 262_144);
-    assert_eq!(profile.acq_tree_cache_age_seconds, 30);
-    assert_eq!(profile.ledger_fetch_limit, 2);
-    assert!(profile.acq_fetch_pack_size < 10_000);
-}
-
-#[test]
-fn catchup_resource_profile_defaults_to_medium_when_missing() {
-    let profile = CatchupResourceProfile::for_node_size(None);
-    assert_eq!(profile.run_data_concurrency, 6);
-    assert_eq!(profile.acq_tree_cache_size, 2_097_152);
-    assert_eq!(profile.acq_tree_cache_age_seconds, 90);
-    assert_eq!(profile.ledger_fetch_limit, 4);
-}
-
-#[test]
-fn catchup_resource_profile_applies_ledger_fetch_limit_override() {
-    let tiny = CatchupResourceProfile::for_node_size(Some("tiny"))
-        .with_ledger_fetch_limit_override(Some(8));
-    assert_eq!(tiny.run_data_concurrency, 2);
-    assert_eq!(tiny.acq_tree_cache_size, 262_144);
-    assert_eq!(tiny.ledger_fetch_limit, 8);
-
-    let medium =
-        CatchupResourceProfile::for_node_size(None).with_ledger_fetch_limit_override(Some(1));
-    assert_eq!(medium.run_data_concurrency, 6);
-    assert_eq!(medium.ledger_fetch_limit, 1);
-}
-
-#[test]
-fn bootstrap_acquire_budget_ledger_fetch_shape() {
-    assert!(bootstrap_acquire_budget_available(0, 0, 5, false));
-    assert!(!bootstrap_acquire_budget_available(0, 1, 5, false));
-    assert!(bootstrap_acquire_budget_available(0, 5, 5, true));
-    assert!(bootstrap_acquire_budget_available(2, 1, 2, false));
-    assert!(!bootstrap_acquire_budget_available(2, 2, 2, false));
-}
-
-#[test]
-fn ledger_fetch_limit_override_parses_optional_expert_config() {
-    assert_eq!(
-        ledger_fetch_limit_override(&config("")).expect("missing section"),
-        None
-    );
-    assert_eq!(
-        ledger_fetch_limit_override(&config("[ledger_acquisition]\nledger_fetch_limit = 8\n"))
-            .expect("valid override"),
-        Some(8)
-    );
-    assert_eq!(
-        ledger_fetch_limit_override(&config("[ledger_acquisition]\n")).expect("missing key"),
-        None
-    );
-
-    let zero =
-        ledger_fetch_limit_override(&config("[ledger_acquisition]\nledger_fetch_limit = 0\n"))
-            .expect_err("zero rejected");
-    assert!(zero.contains("between 1 and 8"));
-
-    let high =
-        ledger_fetch_limit_override(&config("[ledger_acquisition]\nledger_fetch_limit = 9\n"))
-            .expect_err("too high rejected");
-    assert!(high.contains("between 1 and 8"));
-
-    let invalid =
-        ledger_fetch_limit_override(&config("[ledger_acquisition]\nledger_fetch_limit = many\n"))
-            .expect_err("invalid rejected");
-    assert_eq!(
-        invalid,
-        "Configured ledger_acquisition.ledger_fetch_limit is invalid"
-    );
 }

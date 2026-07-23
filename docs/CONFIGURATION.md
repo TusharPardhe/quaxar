@@ -63,26 +63,6 @@ The profile also influences SHAMap tree cache size, cache age, fetch-pack cache
 size, write-dedup size, and run-data concurrency. Prefer changing `node_size`
 before using expert overrides.
 
-### `[ledger_acquisition]`
-
-Optional expert tuning for cold-bootstrap ledger acquisition.
-
-```ini
-[ledger_acquisition]
-ledger_fetch_limit = 8
-```
-
-| Key | Meaning |
-|-----|---------|
-| `ledger_fetch_limit` | Overrides the `[node_size]` cold-bootstrap active inbound-ledger acquisition limit. Valid range: `1..8`. |
-
-If omitted, `node_size` decides the limit. Set `ledger_fetch_limit = 1` for the
-most conservative cold-bootstrap behavior. Raising the value can improve
-bootstrap throughput, but it increases memory, disk, CPU, and peer request
-pressure. This override does not resize caches or change post-bootstrap
-validated-ledger/history behavior; use a larger `node_size` when running high
-values for long periods.
-
 ### `[node_db]`
 
 Configures persistent ledger object storage.
@@ -205,9 +185,6 @@ High-throughput machine:
 ```ini
 [node_size]
 large
-
-[ledger_acquisition]
-ledger_fetch_limit = 8
 ```
 
 Conservative catchup:
@@ -215,7 +192,4 @@ Conservative catchup:
 ```ini
 [node_size]
 medium
-
-[ledger_acquisition]
-ledger_fetch_limit = 1
 ```
