@@ -629,22 +629,20 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         )
     };
 
-    // Spill non-critical subtree branches after each packet step.
+    // Phase 1: Spill completed subtree branches after each packet step.
     {
         let generation = state.worker_full_below.generation();
-        if let Ok(mut mutable) = state.mutable.lock() {
-            if let Some(ledger) = mutable.inbound.ledger_mut() {
-                let state_spilled = ledger.state_map_mut().spill_full_below_subtrees(generation);
-                let tx_spilled = ledger.tx_map_mut().spill_full_below_subtrees(generation);
-                if state_spilled + tx_spilled > 0 {
-                    tracing::debug!(
-                        target: "acquisition",
-                        state_spilled,
-                        tx_spilled,
-                        seq = state.seq,
-                        "spill_full_below_subtrees released full-below subtrees"
-                    );
-                }
+        if let Some(ledger) = mutable.inbound.ledger_mut() {
+            let state_spilled = ledger.state_map_mut().spill_full_below_subtrees(generation);
+            let tx_spilled = ledger.tx_map_mut().spill_full_below_subtrees(generation);
+            if state_spilled + tx_spilled > 0 {
+                tracing::debug!(
+                    target: "acquisition",
+                    state_spilled,
+                    tx_spilled,
+                    seq = state.seq,
+                    "spill_full_below_subtrees released full-below subtrees"
+                );
             }
         }
     }
