@@ -22,6 +22,8 @@ struct FakeGetCountsSource {
     fullbelow_size: i64,
     treenode_cache_size: u64,
     treenode_track_size: u64,
+    process_rss_bytes: u64,
+    treenode_cache_hwm: u64,
     node_store_counts: BTreeMap<String, JsonValue>,
 }
 
@@ -82,6 +84,14 @@ impl GetCountsSource for FakeGetCountsSource {
         self.treenode_track_size
     }
 
+    fn process_rss_bytes(&self) -> u64 {
+        self.process_rss_bytes
+    }
+
+    fn treenode_cache_hwm(&self) -> u64 {
+        self.treenode_cache_hwm
+    }
+
     fn add_node_store_counts(&self, json: &mut BTreeMap<String, JsonValue>) {
         json.extend(self.node_store_counts.clone());
     }
@@ -104,6 +114,8 @@ impl Default for FakeGetCountsSource {
             fullbelow_size: 2,
             treenode_cache_size: 11,
             treenode_track_size: 13,
+            process_rss_bytes: 0,
+            treenode_cache_hwm: 0,
             node_store_counts: BTreeMap::from([(
                 "node_reads_total".to_owned(),
                 JsonValue::Unsigned(99),

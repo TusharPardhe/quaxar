@@ -128,6 +128,9 @@ struct DatabaseInner {
     fetch_size: AtomicU64,
     fetch_duration_us: AtomicU64,
     store_duration_us: AtomicU64,
+    /// Phase 3.3: NuDB read latency histogram buckets (microseconds).
+    /// Buckets: <100us, 100us-1ms, 1ms-10ms, 10ms-100ms, 100ms-1s, >1s
+    fetch_latency_bucket: [AtomicU64; 6],
 }
 
 struct WorkerExitGuard {
@@ -190,6 +193,22 @@ impl DatabaseInner {
 
         self.fetch_duration_us
             .fetch_add(elapsed_us, Ordering::Relaxed);
+
+        // Phase 3.3: Record latency histogram bucket
+        let bucket = if elapsed_us < 100 {
+            0
+        } else if elapsed_us < 1_000 {
+            1
+        } else if elapsed_us < 10_000 {
+            2
+        } else if elapsed_us < 100_000 {
+            3
+        } else if elapsed_us < 1_000_000 {
+            4
+        } else {
+            5
+        };
+        self.fetch_latency_bucket[bucket].fetch_add(1, Ordering::Relaxed);
         if let Some(node_object) = &node_object {
             self.fetch_hit_count.fetch_add(1, Ordering::Relaxed);
             self.fetch_size
@@ -250,6 +269,7 @@ impl DatabaseRuntime {
             fetch_size: AtomicU64::new(0),
             fetch_duration_us: AtomicU64::new(0),
             store_duration_us: AtomicU64::new(0),
+            fetch_latency_bucket: Default::default(),
         });
 
         let mut read_handles: Vec<JoinHandle<()>> = Vec::with_capacity(read_threads.max(1));
@@ -425,6 +445,11 @@ impl DatabaseRuntime {
         self.inner.fetch_hit_count.load(Ordering::Relaxed)
     }
 
+    /// Phase 3.3: Returns the NuDB read latency histogram.
+    pub fn get_fetch_latency_histogram(&self) -> [u64; 6] {
+        std::array::from_fn(|i| self.inner.fetch_latency_bucket[i].load(Ordering::Relaxed))
+    }
+
     pub fn get_store_size(&self) -> u64 {
         self.inner.store_size.load(Ordering::Relaxed)
     }
@@ -483,6 +508,13 @@ impl DatabaseRuntime {
                     .load(Ordering::Relaxed)
                     .to_string(),
             ),
+        );
+        // Phase 3.3: NuDB read latency histogram
+        let hist = self.get_fetch_latency_histogram();
+        let hist_json: Vec<JsonValue> = hist.iter().map(|&v| JsonValue::Unsigned(v)).collect();
+        obj.insert(
+            "node_reads_latency_histogram".to_owned(),
+            JsonValue::Array(hist_json),
         );
     }
 

@@ -35,6 +35,13 @@ pub struct NodeSizeResourceProfile {
     pub full_below_target_size: usize,
     /// rippled kFullBelowExpiration (constant 10 minutes in Tuning.h).
     pub full_below_expiration_seconds: i64,
+    // Phase 3.5: Memory optimization config
+    /// Tier 2 enablement: 0 = auto, 1 = true, 2 = false.
+    pub tier2_mode: u8,
+    /// RSS hard limit in bytes. 0 = 80% system RAM.
+    pub rss_hard_limit: u64,
+    /// Minimum retained tree depth for release_deep_children.
+    pub min_keep_depth: usize,
 }
 
 impl NodeSizeResourceProfile {
@@ -52,6 +59,9 @@ impl NodeSizeResourceProfile {
                 sweep_interval_seconds: 10,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
+                tier2_mode: 0,
+                rss_hard_limit: 0,
+                min_keep_depth: 2,
             },
             "small" => Self {
                 tree_cache_size: 524_288,
@@ -60,6 +70,9 @@ impl NodeSizeResourceProfile {
                 sweep_interval_seconds: 30,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
+                tier2_mode: 0,
+                rss_hard_limit: 0,
+                min_keep_depth: 2,
             },
             "large" => Self {
                 tree_cache_size: 4_194_304,
@@ -68,6 +81,9 @@ impl NodeSizeResourceProfile {
                 sweep_interval_seconds: 90,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
+                tier2_mode: 0,
+                rss_hard_limit: 0,
+                min_keep_depth: 2,
             },
             "huge" => Self {
                 tree_cache_size: 8_388_608,
@@ -76,6 +92,9 @@ impl NodeSizeResourceProfile {
                 sweep_interval_seconds: 120,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
+                tier2_mode: 0,
+                rss_hard_limit: 0,
+                min_keep_depth: 2,
             },
             _ => Self {
                 // medium (default)
@@ -85,6 +104,9 @@ impl NodeSizeResourceProfile {
                 sweep_interval_seconds: 60,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
+                tier2_mode: 0,
+                rss_hard_limit: 0,
+                min_keep_depth: 2,
             },
         }
     }
@@ -351,6 +373,9 @@ mod tests {
                 sweep_interval_seconds: 10,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
+                tier2_mode: 0,
+                rss_hard_limit: 0,
+                min_keep_depth: 2,
             }
         );
         assert_eq!(
@@ -362,6 +387,9 @@ mod tests {
                 sweep_interval_seconds: 60,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
+                tier2_mode: 0,
+                rss_hard_limit: 0,
+                min_keep_depth: 2,
             }
         );
         assert_eq!(
@@ -373,6 +401,9 @@ mod tests {
                 sweep_interval_seconds: 120,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
+                tier2_mode: 0,
+                rss_hard_limit: 0,
+                min_keep_depth: 2,
             }
         );
     }

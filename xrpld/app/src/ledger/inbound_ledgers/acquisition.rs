@@ -17,10 +17,10 @@ use ledger::{
     Ledger,
 };
 use overlay::{Peer, PeerSet as _};
-use shamap::family::{FullBelowCacheImpl, NullMissingNodeReporter, SHAMapFamily};
+use shamap::family::{FullBelowCache, FullBelowCacheImpl, NullMissingNodeReporter, SHAMapFamily};
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -269,6 +269,8 @@ pub struct AcquisitionState {
     pub completed: AtomicBool,
     pub failed: AtomicBool,
     pub fetch_pack_ready: AtomicBool,
+    /// Phase 0.3: Per-acquisition counter of accepted nodes.
+    pub nodes_accepted: AtomicU64,
     data_job_queued: AtomicBool,
     timer_armed: AtomicBool,
     worker_pool: Arc<WorkerPool>,
@@ -473,6 +475,7 @@ impl AcquisitionBuilder {
             completed: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             fetch_pack_ready: AtomicBool::new(false),
+            nodes_accepted: AtomicU64::new(0),
             data_job_queued: AtomicBool::new(false),
             timer_armed: AtomicBool::new(false),
             worker_pool: self.worker_pool,
@@ -627,11 +630,39 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         )
     };
 
+    // Phase 1: Spill non-critical subtree branches after each packet step.
+    {
+        let generation = state.worker_full_below.generation();
+        if let Ok(mut mutable) = state.mutable.lock() {
+            if let Some(ledger) = mutable.inbound.ledger_mut() {
+                let state_spilled = ledger
+                    .state_map_mut()
+                    .spill_full_below_subtrees(generation);
+                let tx_spilled = ledger
+                    .tx_map_mut()
+                    .spill_full_below_subtrees(generation);
+                if state_spilled + tx_spilled > 0 {
+                    tracing::debug!(
+                        target: "acquisition",
+                        state_spilled,
+                        tx_spilled,
+                        seq = state.seq,
+                        "spill_full_below_subtrees released full-below subtrees"
+                    );
+                }
+            }
+        }
+    }
+
     let reply_peers = match step {
         Ok(step) => {
             active.next_node = step.next_node;
             mutable.inbound.record_packet_progress(step.stats);
             active.stats += step.stats;
+            let good = step.stats.get_good() as u64;
+            if good > 0 {
+                state.nodes_accepted.fetch_add(good, Ordering::Relaxed);
+            }
             if step.complete {
                 let useful_count = active.stats.get_good();
                 mutable.inbound.record_packet_stats_with_family_and_config(

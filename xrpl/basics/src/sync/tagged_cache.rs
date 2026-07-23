@@ -377,6 +377,9 @@ pub struct TaggedCache<
     instrumentation: TaggedCacheInstrumentation,
     fast_map: DashMap<K, SP, S>,
     fast_hits: AtomicU64,
+    max_track_size: AtomicU64,
+    hard_max_entries: AtomicU64,
+    target_age_cap_ns: AtomicU64,
     state: RecursiveMutex<TaggedCacheState<K, T, P, SP, S>>,
 }
 
@@ -435,6 +438,9 @@ where
             instrumentation: TaggedCacheInstrumentation::default(),
             fast_map: DashMap::with_hasher(hasher.clone()),
             fast_hits: AtomicU64::new(0),
+            max_track_size: AtomicU64::new(0),
+            hard_max_entries: AtomicU64::new(0),
+            target_age_cap_ns: AtomicU64::new(0),
             state: RecursiveMutex::new(TaggedCacheState {
                 cache_count: 0,
                 cache: PartitionedUnorderedMap::with_hasher(None, hasher),
@@ -461,6 +467,9 @@ where
             instrumentation: TaggedCacheInstrumentation { metrics, logger },
             fast_map: DashMap::with_hasher(hasher.clone()),
             fast_hits: AtomicU64::new(0),
+            max_track_size: AtomicU64::new(0),
+            hard_max_entries: AtomicU64::new(0),
+            target_age_cap_ns: AtomicU64::new(0),
             state: RecursiveMutex::new(TaggedCacheState {
                 cache_count: 0,
                 cache: PartitionedUnorderedMap::with_hasher(None, hasher),
@@ -501,6 +510,38 @@ where
             .expect("TaggedCache mutex must not be poisoned")
             .cache
             .len()
+    }
+
+    pub fn get_max_track_size(&self) -> u64 {
+        self.max_track_size.load(Ordering::Relaxed)
+    }
+
+    /// Set the hard maximum number of entries. When exceeded, the next insert
+    /// triggers a synchronous sweep. 0 = disabled (default).
+    pub fn set_hard_max_entries(&self, max: u64) {
+        self.hard_max_entries.store(max, Ordering::Relaxed);
+    }
+
+    /// Phase 3.2: Set an optional TTL cap (in seconds). When > 0, the effective
+    /// target age becomes `min(target_age, cap)`. 0 = no cap (use target_age).
+    pub fn set_target_age_cap_secs(&self, cap_secs: u64) {
+        self.target_age_cap_ns
+            .store(cap_secs * 1_000_000_000, Ordering::Relaxed);
+    }
+
+    fn effective_target_age(&self) -> Duration {
+        let cap_ns = self.target_age_cap_ns.load(Ordering::Relaxed);
+        if cap_ns == 0 {
+            return self.target_age;
+        }
+        let cap_secs = cap_ns / 1_000_000_000;
+        let cap_nanos = (cap_ns % 1_000_000_000) as i32;
+        let cap = Duration::new(cap_secs as i64, cap_nanos);
+        if cap < self.target_age {
+            cap
+        } else {
+            self.target_age
+        }
     }
 
     pub fn get_hit_rate(&self) -> f32 {
@@ -592,48 +633,17 @@ where
     }
 
     pub fn sweep(&self) {
-        let now = self.clock.now();
         let start = Instant::now();
         // Clear the fast_map before sweep so use_count checks are accurate
         self.fast_map.clear();
-        let mut swept_pointers = Vec::new();
-        {
+        let swept_pointers = {
             let mut state = self
                 .state
                 .lock()
                 .expect("TaggedCache mutex must not be poisoned");
-            let when_expire =
-                expiration_cutoff(now, self.target_age, self.target_size, state.cache.len());
 
-            if self.target_size != 0 && state.cache.len() > self.target_size {
-                self.instrumentation.logger.trace(&format!(
-                    "{} is growing fast {} of {} aging at {:?} of {:?}",
-                    self.name,
-                    state.cache.len(),
-                    self.target_size,
-                    now - when_expire,
-                    self.target_age
-                ));
-            }
-
-            let mut all_removals = 0usize;
-            for partition in state.cache.map_mut() {
-                let (counts, mut removed, _keys) = sweep_value_partition(partition, when_expire);
-                if counts.cache_removals != 0 || counts.map_removals != 0 {
-                    self.instrumentation.logger.debug(&format!(
-                        "TaggedCache partition sweep {}: cache = {}-{}, map-={}",
-                        self.name,
-                        partition.len(),
-                        counts.cache_removals,
-                        counts.map_removals
-                    ));
-                }
-                all_removals += counts.cache_removals;
-                swept_pointers.append(&mut removed);
-            }
-
-            state.cache_count = state.cache_count.saturating_sub(all_removals);
-        }
+            self.sweep_inner(&mut state)
+        };
         // Match the reference `stuffToSweep` lifetime: removed values are destroyed
         // after the cache lock is released, but before the final duration log.
         drop(swept_pointers);
@@ -642,6 +652,51 @@ where
             self.name,
             start.elapsed().as_millis()
         ));
+    }
+
+    /// Inner sweep logic — caller must already hold `self.state` lock.
+    /// Returns swept pointers for deferred drop.
+    fn sweep_inner(&self, state: &mut TaggedCacheState<K, T, P, SP, S>) -> Vec<P> {
+        let now = self.clock.now();
+
+        // Record high-water-mark before evicting
+        let current = state.cache.len() as u64;
+        self.max_track_size.fetch_max(current, Ordering::Relaxed);
+
+        let effective_age = self.effective_target_age();
+        let when_expire =
+            expiration_cutoff(now, effective_age, self.target_size, state.cache.len());
+
+        if self.target_size != 0 && state.cache.len() > self.target_size {
+            self.instrumentation.logger.trace(&format!(
+                "{} is growing fast {} of {} aging at {:?} of {:?}",
+                self.name,
+                state.cache.len(),
+                self.target_size,
+                now - when_expire,
+                effective_age
+            ));
+        }
+
+        let mut all_removals = 0usize;
+        let mut swept_pointers = Vec::new();
+        for partition in state.cache.map_mut() {
+            let (counts, mut removed, _keys) = sweep_value_partition(partition, when_expire);
+            if counts.cache_removals != 0 || counts.map_removals != 0 {
+                self.instrumentation.logger.debug(&format!(
+                    "TaggedCache partition sweep {}: cache = {}-{}, map-={}",
+                    self.name,
+                    partition.len(),
+                    counts.cache_removals,
+                    counts.map_removals
+                ));
+            }
+            all_removals += counts.cache_removals;
+            swept_pointers.append(&mut removed);
+        }
+
+        state.cache_count = state.cache_count.saturating_sub(all_removals);
+        swept_pointers
     }
 
     pub fn del<Q>(&self, key: &Q, valid: bool) -> bool
@@ -764,6 +819,26 @@ where
             .state
             .lock()
             .expect("TaggedCache mutex must not be poisoned");
+
+        // Phase 3.1: Hard cap — if exceeded, sweep synchronously before inserting.
+        let hard_max = self.hard_max_entries.load(Ordering::Relaxed);
+        if hard_max > 0 && state.cache_count as u64 >= hard_max {
+            let before = state.cache_count;
+            let swept = self.sweep_inner(&mut state);
+            let freed = before.saturating_sub(state.cache_count);
+            if freed > 0 {
+                tracing::warn!(
+                    target: "tagged_cache",
+                    name = %self.name,
+                    before,
+                    after = state.cache_count,
+                    hard_max,
+                    freed,
+                    "Hard cap exceeded — synchronous sweep triggered"
+                );
+            }
+            drop(swept);
+        }
 
         let mut replace_callback = Some(replace_callback);
         if let Some(entry) = state.cache.get_mut(key) {

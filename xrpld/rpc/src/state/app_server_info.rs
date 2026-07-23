@@ -2392,6 +2392,18 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
             .map(|cache| cache.get_track_size() as u64)
             .unwrap_or(0)
     }
+    fn process_rss_bytes(&self) -> u64 {
+        self.view
+            .app()
+            .map(|app| app.process_rss_bytes())
+            .unwrap_or(0)
+    }
+    fn treenode_cache_hwm(&self) -> u64 {
+        self.view
+            .app()
+            .map(|app| app.treenode_cache_hwm())
+            .unwrap_or(0)
+    }
     fn add_node_store_counts(&self, json: &mut BTreeMap<String, JsonValue>) {
         let Some(app) = self.view.app() else {
             return;
@@ -2795,15 +2807,6 @@ impl<V: AppServerInfoView> crate::state::feature::FeatureSource for ApplicationS
     }
 }
 
-impl<V: AppServerInfoView> crate::commands::fetch_info::FetchInfoSource
-    for ApplicationServerInfo<V>
-{
-    fn clear_ledger_fetch(&self) {}
-    fn get_ledger_fetch_info(&self) -> JsonValue {
-        JsonValue::Object(BTreeMap::new())
-    }
-}
-
 impl<V: AppServerInfoView> crate::amm::amm_info::AmmInfoSource for ApplicationServerInfo<V> {
     fn read_account_root(
         &self,
@@ -2897,6 +2900,20 @@ impl<V: AppServerInfoView> crate::handlers::get_aggregate_price::AggregatePriceS
             last_update_time,
             price_data_series: entries,
         })
+    }
+}
+
+impl<V: AppServerInfoView> crate::commands::fetch_info::FetchInfoSource
+    for ApplicationServerInfo<V>
+{
+    fn clear_ledger_fetch(&self) {}
+    fn get_ledger_fetch_info(&self) -> JsonValue {
+        let info = self
+            .view
+            .app()
+            .map(|app| app.ledger_fetch_info())
+            .unwrap_or_default();
+        JsonValue::Object(info)
     }
 }
 

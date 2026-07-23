@@ -2685,6 +2685,39 @@ impl ApplicationRoot {
         &self.registry.inbound_ledgers
     }
 
+    /// Phase 0.1: Returns current process RSS in bytes (from jemalloc).
+    pub fn process_rss_bytes(&self) -> u64 {
+        #[cfg(not(target_env = "msvc"))]
+        {
+            tikv_jemalloc_ctl::epoch::advance().ok();
+            tikv_jemalloc_ctl::stats::resident::read().unwrap_or(0) as u64
+        }
+        #[cfg(target_env = "msvc")]
+        {
+            0
+        }
+    }
+
+    /// Phase 0.2: Returns the TreeNodeCache high-water-mark.
+    pub fn treenode_cache_hwm(&self) -> u64 {
+        self.shared_tree_cache()
+            .map(|c| c.get_max_track_size())
+            .unwrap_or(0)
+    }
+
+    /// Phase 0.4: Returns fetch_info data for active ledger acquisitions.
+    pub fn ledger_fetch_info(&self) -> std::collections::BTreeMap<String, protocol::JsonValue> {
+        self.ledger_master_runtime()
+            .and_then(|lm_rt| {
+                lm_rt
+                    .inbound_ledgers
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|il| il.fetch_info_json()))
+            })
+            .unwrap_or_default()
+    }
+
     pub fn inbound_transactions(&self) -> &AppInboundTransactions {
         &self.registry.inbound_transactions
     }

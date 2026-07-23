@@ -44,6 +44,10 @@ pub trait GetCountsSource {
 
     fn treenode_track_size(&self) -> u64;
 
+    fn process_rss_bytes(&self) -> u64;
+
+    fn treenode_cache_hwm(&self) -> u64;
+
     fn add_node_store_counts(&self, json: &mut BTreeMap<String, JsonValue>);
 }
 
@@ -177,6 +181,14 @@ pub fn get_counts_json<S: GetCountsSource>(source: &S, min_count: u32) -> JsonVa
     result.insert(
         "treenode_track_size".to_owned(),
         JsonValue::Unsigned(source.treenode_track_size()),
+    );
+    result.insert(
+        "process_rss_bytes".to_owned(),
+        JsonValue::Unsigned(source.process_rss_bytes()),
+    );
+    result.insert(
+        "treenode_cache_hwm".to_owned(),
+        JsonValue::Unsigned(source.treenode_cache_hwm()),
     );
     result.insert(
         "uptime".to_owned(),

@@ -320,6 +320,18 @@ impl InboundLedgers {
 
         {
             let mut buf = state.data_buffer.lock().expect("data_buffer push lock");
+            // Phase 3.4: Soft cap — drop oldest packets when buffer exceeds limit.
+            const DATA_BUFFER_SOFT_CAP: usize = 1024;
+            if buf.len() >= DATA_BUFFER_SOFT_CAP {
+                let dropped = buf.remove(0);
+                tracing::warn!(
+                    target: "inbound_ledgers",
+                    %hash,
+                    peer_id = dropped.0,
+                    buffer_len = buf.len(),
+                    "data_buffer soft cap reached — dropping oldest packet"
+                );
+            }
             buf.push((peer_id, packet));
         }
         state.submit_data_job();
@@ -614,6 +626,108 @@ impl InboundLedgers {
             failed,
             entries.join(",")
         )
+    }
+
+    /// Phase 0.4: Returns acquisition info as a JSON-compatible map for the `fetch_info` RPC.
+    pub fn fetch_info_json(&self) -> std::collections::BTreeMap<String, protocol::JsonValue> {
+        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        let mut result = std::collections::BTreeMap::new();
+        let active_count = inner
+            .entries
+            .values()
+            .filter(|e| {
+                !e.failed
+                    && e.completed_ledger.is_none()
+                    && !e.state.completed.load(Ordering::Acquire)
+            })
+            .count();
+        result.insert(
+            "active_count".to_owned(),
+            protocol::JsonValue::Unsigned(active_count as u64),
+        );
+
+        let mut acquisitions = Vec::new();
+        for (hash, entry) in &inner.entries {
+            if entry.failed || entry.state.failed.load(Ordering::Acquire) {
+                continue;
+            }
+            if entry.completed_ledger.is_some() || entry.state.completed.load(Ordering::Acquire) {
+                continue;
+            }
+            let mut obj = std::collections::BTreeMap::new();
+            obj.insert(
+                "hash".to_owned(),
+                protocol::JsonValue::String(hash.to_string()),
+            );
+            obj.insert(
+                "seq".to_owned(),
+                protocol::JsonValue::Unsigned(entry.seq as u64),
+            );
+            obj.insert(
+                "reason".to_owned(),
+                protocol::JsonValue::String(format!("{:?}", entry.reason)),
+            );
+            obj.insert(
+                "nodes_accepted".to_owned(),
+                protocol::JsonValue::Unsigned(
+                    entry.state.nodes_accepted.load(Ordering::Relaxed),
+                ),
+            );
+            obj.insert(
+                "age_secs".to_owned(),
+                protocol::JsonValue::Unsigned(entry.started_at.elapsed().as_secs()),
+            );
+            acquisitions.push(protocol::JsonValue::Object(obj));
+        }
+        result.insert(
+            "acquisitions".to_owned(),
+            protocol::JsonValue::Array(acquisitions),
+        );
+        result
+    }
+
+    /// Returns true if any acquisition is currently in progress.
+    pub fn has_active_acquisitions(&self) -> bool {
+        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        inner.entries.values().any(|e| {
+            !e.failed
+                && e.completed_ledger.is_none()
+                && !e.state.completed.load(Ordering::Acquire)
+        })
+    }
+
+    /// Phase 0.5: Sweep per-acquisition `worker_full_below` caches.
+    pub fn sweep_full_below_caches(&self) {
+        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        for entry in inner.entries.values() {
+            if !entry.failed && !entry.state.completed.load(Ordering::Acquire) {
+                entry.state.worker_full_below.sweep();
+            }
+        }
+    }
+
+    /// Phase 2: Release deep subtree branches for all active acquisitions.
+    pub fn release_deep_children_all(&self, keep_depth: usize) {
+        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        let mut released = 0usize;
+        for entry in inner.entries.values() {
+            if entry.failed || entry.state.completed.load(Ordering::Acquire) {
+                continue;
+            }
+            if let Ok(mut mutable) = entry.state.mutable.lock() {
+                if let Some(ledger) = mutable.inbound.ledger_mut() {
+                    released += ledger.state_map_mut().release_deep_children(keep_depth);
+                    released += ledger.tx_map_mut().release_deep_children(keep_depth);
+                }
+            }
+        }
+        if released > 0 {
+            tracing::info!(target: "inbound_ledgers",
+                released_nodes = released,
+                keep_depth,
+                "release_deep_children freed deep subtree branches"
+            );
+        }
     }
 
     /// Check whether an in-progress acquisition has the given sequence or hash.

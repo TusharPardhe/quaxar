@@ -1504,6 +1504,30 @@ fn run_start_mode_consensus_loop(
                         last_cache_sweep = std::time::Instant::now();
                     }
 
+                    // Phase 0.5 + 3.2: FullBelowCache sweep + TTL cap during acquisition
+                    {
+                        if let Some(lm_rt) = root.ledger_master_runtime() {
+                            if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
+                                if let Some(ref il) = *guard {
+                                    il.sweep_full_below_caches();
+                                    let cap = if il.has_active_acquisitions() { 180 } else { 0 };
+                                    hk_tree_cache.set_target_age_cap_secs(cap);
+                                }
+                            }
+                        }
+                    }
+
+                    // Phase 2: Periodic release of deep subtree branches
+                    if hk_sweep_interval > 0 {
+                        if let Some(lm_rt) = root.ledger_master_runtime() {
+                            if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
+                                if let Some(ref il) = *guard {
+                                    il.release_deep_children_all(2);
+                                }
+                            }
+                        }
+                    }
+
                     // ─── Overlay timer duties (matching rippled OverlayImpl::Timer) ───
                     // Ping peers every 60s, check_tracking every 1s, delete_idle_peers every 4s
                     {
