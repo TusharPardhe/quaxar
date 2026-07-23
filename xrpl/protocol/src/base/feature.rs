@@ -70,7 +70,7 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     // credential deletion errors, PermissionedDEX hybrid validation.
     // Enabled on public testnet, but retained as unsupported until the complete
     // multi-domain consensus/replay parity matrix is certified.
-    RegisteredFeature::new("fixCleanup3_1_3", false, RegisteredFeatureVote::DefaultYes),
+    RegisteredFeature::new("fixCleanup3_1_3", true, RegisteredFeatureVote::DefaultYes),
     RegisteredFeature::new(
         FIX_CLEANUP_3_2_0_NAME,
         true,
@@ -103,24 +103,24 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     RegisteredFeature::new("fixDirectoryLimit", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "fixIncludeKeyletFields",
-        false,
+        true,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new("DynamicMPT", false, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("fixTokenEscrowV1", false, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("fixTokenEscrowV1", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "fixPriceOracleOrder",
-        false,
+        true,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new(
         FIX_MPT_DELIVERED_AMOUNT_NAME,
-        false,
+        true,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new(
         "fixAMMClawbackRounding",
-        false,
+        true,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new("TokenEscrow", true, RegisteredFeatureVote::DefaultNo),
