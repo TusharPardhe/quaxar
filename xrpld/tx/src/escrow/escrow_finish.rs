@@ -93,7 +93,7 @@ pub struct EscrowFinishApplyFacts {
 }
 
 pub trait EscrowFinishApplySink {
-    fn transfer_escrow_amount(&mut self);
+    fn transfer_escrow_amount(&mut self) -> Ter;
     fn remove_escrow_entry(&mut self);
     fn adjust_owner_count(&mut self, account: &protocol::AccountID, delta: i32);
 }
@@ -102,7 +102,10 @@ pub fn run_escrow_finish_do_apply<S: EscrowFinishApplySink>(
     _facts: EscrowFinishApplyFacts,
     sink: &mut S,
 ) -> Ter {
-    sink.transfer_escrow_amount();
+    let ter = sink.transfer_escrow_amount();
+    if ter != Ter::TES_SUCCESS {
+        return ter;
+    }
     sink.remove_escrow_entry();
     sink.adjust_owner_count(&_facts.owner, -1);
     Ter::TES_SUCCESS

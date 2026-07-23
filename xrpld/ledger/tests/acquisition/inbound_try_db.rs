@@ -7,6 +7,7 @@ use ledger::{
     InboundLedgerJournal, InboundLedgerLocal, InboundLedgerStore, LedgerConfig, LedgerHeader,
     deserialize_prefixed_ledger_header, serialize_prefixed_ledger_header,
 };
+use parking_lot::Mutex;
 use shamap::family::{
     NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily, SHAMapNodeFetcher,
 };
@@ -16,7 +17,6 @@ use shamap::tree_node_cache::TreeNodeCache;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use parking_lot::Mutex;
 use std::sync::Arc;
 use time::Duration;
 
@@ -379,7 +379,7 @@ fn inbound_try_db_keeps_synching_when_get_missing_nodes_reports_missing_hash() {
         SHAMapNodeType::AccountState,
         shamap::item::SHAMapItem::new(
             Uint256::from_array([0x61; 32]),
-            vec![9, 8, 7, 6, 5, 4, 3, 2],
+            vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 9, 8, 7, 6, 5, 4],
         ),
         0,
     ));
@@ -411,7 +411,9 @@ fn inbound_try_db_keeps_synching_when_get_missing_nodes_reports_missing_hash() {
                 (state_root.get_hash(), state_root),
                 (state_leaf.get_hash(), state_leaf.clone()),
             ]),
-            delayed_once: Mutex::new(HashMap::from([(state_leaf.get_hash(), 1)])),
+            // The family scan performs an initial and a deferred completion
+            // read before it records a missing child.
+            delayed_once: Mutex::new(HashMap::from([(state_leaf.get_hash(), 2)])),
         },
         NullMissingNodeReporter,
     );
@@ -450,7 +452,9 @@ fn inbound_try_db_keeps_synching_when_get_missing_nodes_reports_missing_hash() {
             ),
         ]
     );
-    assert_eq!(journal.warns.borrow().len(), 1);
-    assert!(journal.warns.borrow()[0].starts_with("AS map still missing hashes after local fetch"));
-    assert!(journal.debugs.borrow().is_empty());
+    assert!(journal.warns.borrow().is_empty());
+    assert_eq!(journal.debugs.borrow().len(), 1);
+    assert!(
+        journal.debugs.borrow()[0].starts_with("AS map still missing hashes after local fetch")
+    );
 }

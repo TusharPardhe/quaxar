@@ -1,9 +1,9 @@
-use parking_lot::Mutex;
 use basics::base_uint::Uint256;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::ManualClock;
 use ledger::{Ledger, LedgerHeader, LedgerJournal, calculate_ledger_hash};
+use parking_lot::Mutex;
 use shamap::family::{MissingNodeReporter, NullFullBelowCache, SHAMapFamily, SHAMapNodeFetcher};
 use shamap::item::SHAMapItem;
 use shamap::sync::{SHAMapType, SyncState, SyncTree};
@@ -44,10 +44,7 @@ struct SharedReporter(Arc<Mutex<RecordingMissingNodeReporter>>);
 
 impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_seq(&self, ref_num: u32, node_hash: Uint256) {
-        self.0
-            .lock()
-            .by_seq
-            .push((ref_num, node_hash));
+        self.0.lock().by_seq.push((ref_num, node_hash));
     }
 
     fn missing_node_acquire_by_hash(&self, _ref_hash: Uint256, _ref_num: u32) {}
@@ -61,29 +58,21 @@ struct RecordingLedgerJournal {
 
 impl RecordingLedgerJournal {
     fn infos(&self) -> Vec<String> {
-        self.infos
-            .lock()
-            .clone()
+        self.infos.lock().clone()
     }
 
     fn warns(&self) -> Vec<String> {
-        self.warns
-            .lock()
-            .clone()
+        self.warns.lock().clone()
     }
 }
 
 impl LedgerJournal for RecordingLedgerJournal {
     fn info(&self, message: &str) {
-        self.infos
-            .lock()
-            .push(message.to_owned());
+        self.infos.lock().push(message.to_owned());
     }
 
     fn warn(&self, message: &str) {
-        self.warns
-            .lock()
-            .push(message.to_owned());
+        self.warns.lock().push(message.to_owned());
     }
 }
 
@@ -118,11 +107,11 @@ fn ledger_walk_ledger_serial_reports_missing_account_and_tx_roots() {
     ledger.set_full();
 
     assert!(!ledger.walk_ledger_with_family(&journal, false, &family));
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![account_hash, tx_hash]));
+    family.with_fetcher(|fetcher| {
+        assert_eq!(fetcher.fetches.lock().clone(), vec![account_hash, tx_hash])
+    });
     assert_eq!(
-        reporter
-            .lock()
-            .by_seq,
+        reporter.lock().by_seq,
         vec![
             (600, *account_hash.as_uint256()),
             (600, *tx_hash.as_uint256())
@@ -186,7 +175,9 @@ fn ledger_walk_ledger_parallel_returns_state_walk_result_and_skips_tx_tree() {
     let journal = RecordingLedgerJournal::default();
 
     assert!(ledger.walk_ledger_with_family(&journal, true, &family));
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![state_missing_hash]));
+    family.with_fetcher(|fetcher| {
+        assert_eq!(fetcher.fetches.lock().clone(), vec![state_missing_hash])
+    });
     assert!(journal.infos().is_empty());
     assert!(journal.warns().is_empty());
 }
@@ -231,7 +222,9 @@ fn ledger_walk_ledger_serial_checks_tx_tree_after_missing_account_root() {
     let journal = RecordingLedgerJournal::default();
 
     assert!(!ledger.walk_ledger_with_family(&journal, false, &family));
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![account_hash, tx_hash]));
+    family.with_fetcher(|fetcher| {
+        assert_eq!(fetcher.fetches.lock().clone(), vec![account_hash, tx_hash])
+    });
     assert_eq!(
         journal.infos(),
         vec![format!(

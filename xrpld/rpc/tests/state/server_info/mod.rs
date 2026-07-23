@@ -187,7 +187,7 @@ pub(super) fn attach_test_server_ports(app: &mut ApplicationRoot, grpc: Option<P
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
-            standalone_mode: false,
+                standalone_mode: false,
             },
             ServerPortSetup {
                 name: "port_admin".to_owned(),
@@ -207,7 +207,7 @@ pub(super) fn attach_test_server_ports(app: &mut ApplicationRoot, grpc: Option<P
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
-            standalone_mode: false,
+                standalone_mode: false,
             },
         ],
         client: None,
@@ -233,5 +233,5 @@ pub(super) fn sample_ledger(seq: u32, close_time: u32, hash_byte: u8) -> Arc<Led
 }
 
 mod admin_and_counters;
-mod source_and_state;
 mod ledger_data;
+mod source_and_state;

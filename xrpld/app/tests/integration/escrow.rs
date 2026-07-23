@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use basics::base_uint::{Uint160, Uint256};
-use ledger::{ApplyView, ApplyViewImpl, Ledger, LedgerHeader, ReadView};
+use ledger::{ApplyView, ApplyViewImpl, Ledger, LedgerHeader, ReadView, Sandbox};
 use protocol::{
     AccountID, ApplyFlags, LedgerEntryType, STAmount, STLedgerEntry, STTx, Ter, TxType, XRPAmount,
     account_keylet, get_field_by_symbol,
@@ -21,6 +21,7 @@ use shamap::sync::{SHAMapType, SyncState, SyncTree};
 use shamap::tree_node::SHAMapNodeType;
 
 use super::pipeline::full_apply;
+use app::state::transactor_dispatcher::handle_real_dispatch;
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
@@ -60,8 +61,8 @@ fn make_ledger(entries: Vec<STLedgerEntry>) -> Ledger {
     Ledger::from_maps(
         LedgerHeader {
             seq: 3,
-            close_time: 1000,
-            parent_close_time: 1000,
+            close_time: 0,
+            parent_close_time: 0,
             ..LedgerHeader::default()
         },
         SyncTree::from_root_with_type(
@@ -314,24 +315,42 @@ fn escrow_create_dst_tag_needed() {
 fn escrow_create_and_finish() {
     let alice = acct(0x11);
     let bob = acct(0x22);
-    let ledger = make_ledger(vec![
+    let mut ledger = make_ledger(vec![
         account_root(alice, 5_000_000_000, 0, 0),
         account_root(bob, 5_000_000_000, 0, 0),
     ]);
-    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx_create = escrow_create_tx(alice, bob, 1_000_000_000, 1, 1_001);
+    let mut create_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut create_view, &tx_create, TxType::ESCROW_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    create_view
+        .apply(&mut ledger)
+        .expect("create state should apply");
+    assert_eq!(get_owner_count(&ledger, alice), 1);
+    assert_eq!(get_balance(&ledger, alice), 4_000_000_000);
 
-    // Create escrow with FinishAfter in the past (so it can be finished immediately)
-    let tx_create = escrow_create_tx(alice, bob, 1_000_000_000, 1, 500); // 500 < close_time(1000)
-    let r1 = full_apply(&mut view, &tx_create, TxType::ESCROW_CREATE);
-    assert_eq!(r1, Ter::TES_SUCCESS);
-
-    let alice_balance_after_create = get_balance(&view, alice);
-    assert!(alice_balance_after_create < 5_000_000_000); // deducted
-
-    // Finish the escrow
+    let mut header = ledger.header();
+    header.parent_close_time = 1_002;
+    ledger.set_ledger_info(header);
     let tx_finish = escrow_finish_tx(bob, alice, 1, 1);
-    let r2 = full_apply(&mut view, &tx_finish, TxType::ESCROW_FINISH);
-    assert_eq!(r2, Ter::TES_SUCCESS);
+    let mut finish_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut finish_view, &tx_finish, TxType::ESCROW_FINISH, None),
+        Ter::TES_SUCCESS
+    );
+    finish_view
+        .apply(&mut ledger)
+        .expect("finish state should apply");
+    assert_eq!(get_owner_count(&ledger, alice), 0);
+    assert_eq!(get_balance(&ledger, bob), 6_000_000_000);
+    assert!(
+        ledger
+            .read(protocol::escrow_keylet(acct_id(alice), 1))
+            .expect("escrow read")
+            .is_none()
+    );
 }
 
 /// C++ Escrow_test — full lifecycle: create then cancel.
@@ -339,21 +358,42 @@ fn escrow_create_and_finish() {
 fn escrow_create_and_cancel() {
     let alice = acct(0x11);
     let bob = acct(0x22);
-    let ledger = make_ledger(vec![
+    let mut ledger = make_ledger(vec![
         account_root(alice, 5_000_000_000, 0, 0),
         account_root(bob, 5_000_000_000, 0, 0),
     ]);
-    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx_create = escrow_create_cancel_tx(alice, bob, 1_000_000_000, 1, 1_001);
+    let mut create_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut create_view, &tx_create, TxType::ESCROW_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    create_view
+        .apply(&mut ledger)
+        .expect("create state should apply");
+    assert_eq!(get_owner_count(&ledger, alice), 1);
+    assert_eq!(get_balance(&ledger, alice), 4_000_000_000);
 
-    // Create escrow with CancelAfter in the past (so it can be cancelled)
-    let tx_create = escrow_create_cancel_tx(alice, bob, 1_000_000_000, 1, 500); // 500 < close_time(1000)
-    let r1 = full_apply(&mut view, &tx_create, TxType::ESCROW_CREATE);
-    assert_eq!(r1, Ter::TES_SUCCESS);
-
-    // Cancel the escrow
+    let mut header = ledger.header();
+    header.parent_close_time = 1_002;
+    ledger.set_ledger_info(header);
     let tx_cancel = escrow_cancel_tx(bob, alice, 1, 1);
-    let r2 = full_apply(&mut view, &tx_cancel, TxType::ESCROW_CANCEL);
-    assert_eq!(r2, Ter::TES_SUCCESS);
+    let mut cancel_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+    assert_eq!(
+        handle_real_dispatch(&mut cancel_view, &tx_cancel, TxType::ESCROW_CANCEL, None),
+        Ter::TES_SUCCESS
+    );
+    cancel_view
+        .apply(&mut ledger)
+        .expect("cancel state should apply");
+    assert_eq!(get_owner_count(&ledger, alice), 0);
+    assert_eq!(get_balance(&ledger, alice), 5_000_000_000);
+    assert!(
+        ledger
+            .read(protocol::escrow_keylet(acct_id(alice), 1))
+            .expect("escrow read")
+            .is_none()
+    );
 }
 
 /// C++ Escrow_test — finish before FinishAfter time fails.

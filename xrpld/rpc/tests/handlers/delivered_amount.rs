@@ -2,7 +2,8 @@
 
 use basics::base_uint::Uint256;
 use protocol::{
-    AccountID, JsonValue, STAmount, STArray, STObject, STTx, TxMeta, TxType, get_field_by_symbol,
+    AccountID, JsonOptions, JsonValue, MPTAmount, MPTIssue, STAmount, STArray, STObject, STTx,
+    StBase, TxMeta, TxType, get_field_by_symbol, make_mpt_id,
 };
 use rpc::{DELIVERED_AMOUNT_SWITCH_LEDGER, get_delivered_amount, insert_delivered_amount};
 
@@ -33,6 +34,52 @@ fn payment_meta(tx_id: Uint256, ledger_seq: u32, delivered: Option<STAmount>) ->
         object.set_field_amount(get_field_by_symbol("sfDeliveredAmount"), delivered);
     }
     TxMeta::from_stobject(tx_id, ledger_seq, object)
+}
+
+#[test]
+fn fix_mpt_delivered_amount_rpc_uses_canonical_metadata_and_preserves_unavailable_off() {
+    let mpt_issue = MPTIssue::new(make_mpt_id(1, account(3)));
+    let tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), account(1));
+        tx.set_account_id(get_field_by_symbol("sfDestination"), account(2));
+        tx.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::from_mpt_amount(
+                get_field_by_symbol("sfAmount"),
+                MPTAmount::from_value(1_000),
+                mpt_issue,
+            ),
+        );
+    });
+    let delivered = STAmount::from_mpt_amount(
+        get_field_by_symbol("sfDeliveredAmount"),
+        MPTAmount::from_value(800),
+        mpt_issue,
+    );
+    let tx_id = tx.get_transaction_id();
+
+    let on_meta = payment_meta(tx_id, 1, Some(delivered));
+    let mut on_json = on_meta.get_json(JsonOptions::INCLUDE_DATE);
+    insert_delivered_amount(&mut on_json, 1, None, &tx, &on_meta);
+    let JsonValue::Object(on_json) = on_json else {
+        panic!("metadata JSON should be an object");
+    };
+    assert_eq!(
+        on_json.get("DeliveredAmount"),
+        on_json.get("delivered_amount")
+    );
+
+    let off_meta = payment_meta(tx_id, 1, None);
+    let mut off_json = off_meta.get_json(JsonOptions::INCLUDE_DATE);
+    insert_delivered_amount(&mut off_json, 1, None, &tx, &off_meta);
+    let JsonValue::Object(off_json) = off_json else {
+        panic!("metadata JSON should be an object");
+    };
+    assert!(!off_json.contains_key("DeliveredAmount"));
+    assert_eq!(
+        off_json.get("delivered_amount"),
+        Some(&JsonValue::String("unavailable".to_owned()))
+    );
 }
 
 #[test]

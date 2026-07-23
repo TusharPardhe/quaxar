@@ -37,8 +37,8 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -70,7 +70,11 @@ impl Job {
 
 impl std::fmt::Debug for Job {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Job").field("job_type", &self.job_type).field("name", &self.name).field("index", &self.index).finish()
+        f.debug_struct("Job")
+            .field("job_type", &self.job_type)
+            .field("name", &self.name)
+            .field("index", &self.index)
+            .finish()
     }
 }
 
@@ -95,7 +99,9 @@ impl Ord for Job {
         // BinaryHeap is a max-heap; we want the highest JobType (priority)
         // popped first, and within a type, the lowest index (earliest
         // submitted) popped first -- so index comparison is reversed.
-        self.job_type.cmp(&other.job_type).then_with(|| other.index.cmp(&self.index))
+        self.job_type
+            .cmp(&other.job_type)
+            .then_with(|| other.index.cmp(&self.index))
     }
 }
 
@@ -130,7 +136,11 @@ struct State {
 
 impl State {
     fn new() -> Self {
-        Self { queue: BinaryHeap::new(), counters: std::collections::BTreeMap::new(), process_count: 0 }
+        Self {
+            queue: BinaryHeap::new(),
+            counters: std::collections::BTreeMap::new(),
+            process_count: 0,
+        }
     }
 
     fn counters_mut(&mut self, jt: JobType) -> &mut JobTypeCounters {
@@ -158,7 +168,11 @@ impl State {
                 }
                 return None;
             };
-            let running = self.counters.get(&job.job_type).map(|c| c.running).unwrap_or(0);
+            let running = self
+                .counters
+                .get(&job.job_type)
+                .map(|c| c.running)
+                .unwrap_or(0);
             if running < job.job_type.limit() {
                 break job;
             }
@@ -338,7 +352,17 @@ impl JobQueue {
         let next_index = AtomicU64::new(0);
         let load_events = AtomicU64::new(0);
 
-        let inner = Arc::new(JobQueueInner { state, not_empty, idle, stopping, stopped, next_index, load_events, ever_deferred: AtomicU64::new(0), workers: Mutex::new(Vec::new()) });
+        let inner = Arc::new(JobQueueInner {
+            state,
+            not_empty,
+            idle,
+            stopping,
+            stopped,
+            next_index,
+            load_events,
+            ever_deferred: AtomicU64::new(0),
+            workers: Mutex::new(Vec::new()),
+        });
 
         let mut workers = Vec::with_capacity(thread_count);
         for instance in 0..thread_count {
@@ -407,12 +431,20 @@ impl JobQueue {
              documents it as running on instead"
         );
 
-        if self.inner.stopping.load(AtomicOrdering::SeqCst) || self.inner.stopped.load(AtomicOrdering::SeqCst) {
+        if self.inner.stopping.load(AtomicOrdering::SeqCst)
+            || self.inner.stopped.load(AtomicOrdering::SeqCst)
+        {
             return false;
         }
 
         let index = self.inner.next_index.fetch_add(1, AtomicOrdering::SeqCst);
-        let job = Job { job_type, name: name.into(), index, queue_time: Instant::now(), func: Box::new(func) };
+        let job = Job {
+            job_type,
+            name: name.into(),
+            index,
+            queue_time: Instant::now(),
+            func: Box::new(func),
+        };
 
         let mut state = self.inner.state.lock();
         let counters = state.counters_mut(job_type);
@@ -422,7 +454,9 @@ impl JobQueue {
             // slot frees up), but track it as deferred for bookkeeping
             // parity with the reference's `data.deferred` counter.
             counters.deferred += 1;
-            self.inner.ever_deferred.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner
+                .ever_deferred
+                .fetch_add(1, AtomicOrdering::Relaxed);
         }
         counters.waiting += 1;
         state.queue.push(job);
@@ -435,20 +469,35 @@ impl JobQueue {
     /// Jobs waiting (not yet running) at this priority. Matches
     /// `getJobCount`.
     pub fn job_count(&self, job_type: JobType) -> usize {
-        self.inner.state.lock().counters.get(&job_type).map(|c| c.waiting).unwrap_or(0)
+        self.inner
+            .state
+            .lock()
+            .counters
+            .get(&job_type)
+            .map(|c| c.waiting)
+            .unwrap_or(0)
     }
 
     /// Jobs waiting plus running at this priority. Matches
     /// `getJobCountTotal`.
     pub fn job_count_total(&self, job_type: JobType) -> usize {
         let state = self.inner.state.lock();
-        state.counters.get(&job_type).map(|c| c.waiting + c.running).unwrap_or(0)
+        state
+            .counters
+            .get(&job_type)
+            .map(|c| c.waiting + c.running)
+            .unwrap_or(0)
     }
 
     /// All waiting jobs at or above this priority. Matches `getJobCountGE`.
     pub fn job_count_ge(&self, job_type: JobType) -> usize {
         let state = self.inner.state.lock();
-        state.counters.iter().filter(|&(&jt, _)| jt >= job_type).map(|(_, c)| c.waiting).sum()
+        state
+            .counters
+            .iter()
+            .filter(|&(&jt, _)| jt >= job_type)
+            .map(|(_, c)| c.waiting)
+            .sum()
     }
 
     /// Record `count` completed jobs of `job_type` having taken `elapsed`
@@ -458,7 +507,9 @@ impl JobQueue {
     /// only the count is tracked, which is enough to detect a queue
     /// that never stops accumulating load.
     pub fn add_load_events(&self, job_type: JobType, count: u64, _elapsed: std::time::Duration) {
-        self.inner.load_events.fetch_add(count, AtomicOrdering::Relaxed);
+        self.inner
+            .load_events
+            .fetch_add(count, AtomicOrdering::Relaxed);
         let mut state = self.inner.state.lock();
         state.counters_mut(job_type).load_events += count;
     }
@@ -484,7 +535,15 @@ impl JobQueue {
         let mut state = self.inner.state.lock();
         let job = state.take_next_runnable_job()?;
         state.process_count += 1;
-        Some(RunningJob { inner: Arc::clone(&self.inner), job_type: job.job_type, name: job.name, index: job.index, queue_time: job.queue_time, func: Some(job.func), finished: false })
+        Some(RunningJob {
+            inner: Arc::clone(&self.inner),
+            job_type: job.job_type,
+            name: job.name,
+            index: job.index,
+            queue_time: job.queue_time,
+            func: Some(job.func),
+            finished: false,
+        })
     }
 
     /// Reserve and immediately run the next runnable job on the calling
@@ -496,7 +555,10 @@ impl JobQueue {
     /// (e.g. `while queue.dispatch_next_job().is_some() {}`).
     pub fn dispatch_next_job(&self) -> Option<()> {
         let mut running = self.reserve_next_job()?;
-        let func = running.func.take().expect("RunningJob::func is only taken once, by dispatch_next_job or Drop");
+        let func = running
+            .func
+            .take()
+            .expect("RunningJob::func is only taken once, by dispatch_next_job or Drop");
         func();
         running.finish();
         Some(())
@@ -516,7 +578,14 @@ impl JobQueue {
     /// stays visible to callers that check after the triggering jobs
     /// have already finished running.
     pub fn is_overloaded(&self) -> bool {
-        self.inner.ever_deferred.load(AtomicOrdering::Relaxed) > 0 || self.inner.state.lock().counters.values().any(|c| c.waiting > 1_000)
+        self.inner.ever_deferred.load(AtomicOrdering::Relaxed) > 0
+            || self
+                .inner
+                .state
+                .lock()
+                .counters
+                .values()
+                .any(|c| c.waiting > 1_000)
     }
 
     /// A minimal JSON diagnostic summary. Matches `JobQueue::getJson`'s
@@ -736,7 +805,9 @@ mod tests {
             tx.send(42).unwrap();
         }));
 
-        let value = rx.recv_timeout(Duration::from_secs(5)).expect("job should run and send a value");
+        let value = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("job should run and send a value");
         assert_eq!(value, 42);
         jq.stop();
     }
@@ -755,7 +826,9 @@ mod tests {
             gate_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         }));
-        gate_rx.recv_timeout(Duration::from_secs(5)).expect("gate job should start");
+        gate_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("gate job should start");
 
         // While the single worker is blocked in the gate job, queue a
         // low-priority and a high-priority job.
@@ -770,8 +843,12 @@ mod tests {
 
         release_tx.send(()).unwrap();
 
-        let first = order_rx.recv_timeout(Duration::from_secs(5)).expect("first job should run");
-        let second = order_rx.recv_timeout(Duration::from_secs(5)).expect("second job should run");
+        let first = order_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first job should run");
+        let second = order_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second job should run");
         assert_eq!(first, "high");
         assert_eq!(second, "low");
         jq.stop();
@@ -787,7 +864,9 @@ mod tests {
             gate_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         }));
-        gate_rx.recv_timeout(Duration::from_secs(5)).expect("gate job should start");
+        gate_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("gate job should start");
 
         assert!(jq.add_job(JobType::JtPack, "waiting-job", || {}));
         assert_eq!(jq.job_count(JobType::JtPack), 1);
@@ -815,7 +894,10 @@ mod tests {
                 {
                     let mut running = barrier_state.lock();
                     *running += 1;
-                    assert_eq!(*running, 1, "JtPack limit of 1 must not be exceeded concurrently");
+                    assert_eq!(
+                        *running, 1,
+                        "JtPack limit of 1 must not be exceeded concurrently"
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(20));
                 {
@@ -826,7 +908,10 @@ mod tests {
             }));
         }
 
-        let mut results = vec![rx.recv_timeout(Duration::from_secs(5)).unwrap(), rx.recv_timeout(Duration::from_secs(5)).unwrap()];
+        let mut results = vec![
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ];
         results.sort();
         assert_eq!(results, vec![0, 1]);
         jq.stop();

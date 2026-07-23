@@ -75,12 +75,16 @@ fn as_limit(value: &JsonValue) -> Option<i64> {
     }
 }
 
-fn parse_binary(params: &JsonValue) -> bool {
+fn parse_binary(params: &JsonValue) -> Result<bool, RpcStatus> {
     let JsonValue::Object(object) = params else {
-        return false;
+        return Ok(false);
     };
 
-    matches!(object.get("binary"), Some(JsonValue::Bool(true)))
+    match object.get("binary") {
+        None => Ok(false),
+        Some(JsonValue::Bool(value)) => Ok(*value),
+        Some(_) => Err(RpcStatus::expected_field_error("binary", "boolean")),
+    }
 }
 
 fn parse_marker(params: &JsonValue) -> Result<Option<Uint256>, RpcStatus> {
@@ -219,7 +223,14 @@ pub fn do_ledger_data<S: LedgerDataSource>(
         }
     };
 
-    let binary = parse_binary(request.params);
+    let binary = match parse_binary(request.params) {
+        Ok(binary) => binary,
+        Err(status) => {
+            let mut error = JsonValue::Object(BTreeMap::new());
+            status.inject(&mut error);
+            return LedgerDataResponse::Json(error);
+        }
+    };
     let mut limit = match parse_limit(request.params) {
         Ok(limit) => limit.unwrap_or(-1),
         Err(status) => {

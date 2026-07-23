@@ -10,7 +10,8 @@ use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use ledger::calculate_ledger_hash;
 use ledger::{Ledger, LedgerHeader, pend_save_validated};
 use protocol::{
-    AccountID, STAmount, STArray, STObject, STTx, Serializer, TxType, get_field_by_symbol,
+    AccountID, MPTAmount, MPTIssue, STAmount, STArray, STObject, STTx, Serializer, TxMeta, TxType,
+    get_field_by_symbol, make_mpt_id,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -144,7 +145,16 @@ fn validated_ledger_persistence_writes_cpp_style_relational_rows_and_marks_cache
     ));
 
     let tx = payment_tx(7);
-    let meta = metadata(3);
+    let delivered_amount = STAmount::from_mpt_amount(
+        get_field_by_symbol("sfDeliveredAmount"),
+        MPTAmount::from_value(800),
+        MPTIssue::new(make_mpt_id(7, account(0x71))),
+    );
+    let mut meta = metadata(3);
+    meta.set_field_amount(
+        get_field_by_symbol("sfDeliveredAmount"),
+        delivered_amount.clone(),
+    );
     let raw_txn = tx.get_serializer().data().to_vec();
     let raw_meta = meta.get_serializer().data().to_vec();
     let ledger = immutable_ledger_with_txs(&[(Arc::clone(&tx), meta)], 8123);
@@ -196,6 +206,13 @@ fn validated_ledger_persistence_writes_cpp_style_relational_rows_and_marks_cache
     assert_eq!(saved.3, "V");
     assert_eq!(saved.4, raw_txn);
     assert_eq!(saved.5, raw_meta);
+
+    let reparsed = TxMeta::from_raw(tx.get_transaction_id(), 8123, &saved.5);
+    assert_eq!(
+        reparsed.get_delivered_amount(),
+        Some(&delivered_amount),
+        "Transactions.TxnMeta must retain the exact MPT sfDeliveredAmount"
+    );
 
     let cached = transaction_master
         .fetch_from_cache(&tx.get_transaction_id())

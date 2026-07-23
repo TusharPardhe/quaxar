@@ -9,7 +9,7 @@ use protocol::{
 };
 use shamap::traversal::TraversalError;
 
-use crate::{FreezeHandling, Ledger, account_funds, is_frozen};
+use crate::{FreezeHandling, Ledger, ReadView, account_funds, is_frozen};
 
 fn issue_from_stissue(issue: STIssue) -> Option<Issue> {
     match issue.asset() {
@@ -204,13 +204,14 @@ pub fn amm_account_holds(
     Ok(zero_issue_amount(issue))
 }
 
-pub fn is_only_liquidity_provider(
-    view: &Ledger,
+pub fn is_only_liquidity_provider<V: ReadView + ?Sized>(
+    view: &V,
     amm_issue: Issue,
     lp_account: AccountID,
 ) -> Expected<bool, Ter> {
     let mut n_lp_token_trust_lines = 0u8;
     let mut n_iou_trust_lines = 0u8;
+    let mut n_mptokens = 0u8;
     let mut has_amm = false;
     let root = owner_dir_keylet(raw_account_id(amm_issue.account));
     let mut current_index = root;
@@ -238,18 +239,19 @@ pub fn is_only_liquidity_provider(
             let Some(sle) = sle else {
                 return Unexpected::new(Ter::TEC_INTERNAL).into();
             };
-            if sle.get_field_u16(get_field_by_symbol("sfLedgerEntryType"))
-                == protocol::LedgerEntryType::AMM as u16
-            {
+            let entry_type = sle.get_field_u16(get_field_by_symbol("sfLedgerEntryType"));
+            if entry_type == protocol::LedgerEntryType::AMM as u16 {
                 if has_amm {
                     return Unexpected::new(Ter::TEC_INTERNAL).into();
                 }
                 has_amm = true;
                 continue;
             }
-            if sle.get_field_u16(get_field_by_symbol("sfLedgerEntryType"))
-                != protocol::LedgerEntryType::RippleState as u16
-            {
+            if entry_type == protocol::LedgerEntryType::MPToken as u16 {
+                n_mptokens = n_mptokens.saturating_add(1);
+                continue;
+            }
+            if entry_type != protocol::LedgerEntryType::RippleState as u16 {
                 return Unexpected::new(Ter::TEC_INTERNAL).into();
             }
             let low_limit = sle.get_field_amount(get_field_by_symbol("sfLowLimit"));
@@ -283,7 +285,12 @@ pub fn is_only_liquidity_provider(
 
         let next = owner_dir.get_field_u64(get_field_by_symbol("sfIndexNext"));
         if next == 0 {
-            if n_lp_token_trust_lines != 1 || n_iou_trust_lines == 0 || n_iou_trust_lines > 2 {
+            if n_lp_token_trust_lines != 1
+                || (n_iou_trust_lines == 0 && n_mptokens == 0)
+                || n_iou_trust_lines > 2
+                || n_mptokens > 2
+                || n_iou_trust_lines.saturating_add(n_mptokens) > 2
+            {
                 return Unexpected::new(Ter::TEC_INTERNAL).into();
             }
             return Expected::from_value(true);

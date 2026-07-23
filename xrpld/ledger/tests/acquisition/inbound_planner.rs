@@ -1,4 +1,3 @@
-use parking_lot::Mutex;
 use basics::base_uint::Uint256;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
@@ -6,6 +5,7 @@ use basics::tagged_cache::ManualClock;
 use ledger::{
     Ledger, LedgerHeader, needed_hashes_with_family, needed_hashes_with_family_and_first_child,
 };
+use parking_lot::Mutex;
 use shamap::family::{MissingNodeReporter, NullFullBelowCache, SHAMapFamily, SHAMapNodeFetcher};
 use shamap::fetch::SHAMapSyncFilter;
 use shamap::item::SHAMapItem;
@@ -47,10 +47,7 @@ struct SharedReporter(Arc<Mutex<RecordingMissingNodeReporter>>);
 
 impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_seq(&self, ref_num: u32, node_hash: Uint256) {
-        self.0
-            .lock()
-            .by_seq
-            .push((ref_num, node_hash));
+        self.0.lock().by_seq.push((ref_num, node_hash));
     }
 
     fn missing_node_acquire_by_hash(&self, _ref_hash: Uint256, _ref_num: u32) {}
@@ -78,12 +75,7 @@ fn needed_hashes_returns_root_when_loaded_map_hash_is_zero() {
 
     assert_eq!(needed, vec![*root.as_uint256()]);
     family.with_fetcher(|fetcher| assert!(fetcher.fetches.lock().is_empty()));
-    assert!(
-        reporter
-            .lock()
-            .by_seq
-            .is_empty()
-    );
+    assert!(reporter.lock().by_seq.is_empty());
 }
 
 #[test]
@@ -115,12 +107,7 @@ fn needed_state_hashes_returns_empty_for_zero_root() {
 
     assert!(needed.is_empty());
     family.with_fetcher(|fetcher| assert!(fetcher.fetches.lock().is_empty()));
-    assert!(
-        reporter
-            .lock()
-            .by_seq
-            .is_empty()
-    );
+    assert!(reporter.lock().by_seq.is_empty());
 }
 
 #[test]
@@ -174,12 +161,20 @@ fn needed_state_hashes_returns_missing_child_hashes_in_scan_order() {
         needed,
         vec![*missing_b.as_uint256(), *missing_a.as_uint256()]
     );
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![missing_b, missing_a]));
-    assert!(
-        reporter
-            .lock()
-            .by_seq
-            .is_empty()
+    // The family scan first observes each missing child, then performs its
+    // deferred completion lookup. Request hashes remain deduplicated above.
+    family.with_fetcher(|fetcher| {
+        assert_eq!(
+            fetcher.fetches.lock().clone(),
+            vec![missing_b, missing_a, missing_b, missing_a]
+        );
+    });
+    assert_eq!(
+        reporter.lock().by_seq,
+        vec![
+            (902, *missing_b.as_uint256()),
+            (902, *missing_a.as_uint256()),
+        ]
     );
 }
 
@@ -224,12 +219,7 @@ fn needed_tx_hashes_clears_synching_when_tree_is_complete() {
     assert!(needed.is_empty());
     assert_eq!(ledger.tx_map().state(), SyncState::Modifying);
     family.with_fetcher(|fetcher| assert!(fetcher.fetches.lock().is_empty()));
-    assert!(
-        reporter
-            .lock()
-            .by_seq
-            .is_empty()
-    );
+    assert!(reporter.lock().by_seq.is_empty());
 }
 
 #[test]
@@ -287,11 +277,8 @@ fn needed_state_hashes_stays_empty_when_complete_subtree_is_only_in_backed_fetch
     assert!(first.is_empty());
     assert!(second.is_empty());
     assert_eq!(ledger.state_map().state(), SyncState::Modifying);
-    family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![root.get_child_hash(7)]));
-    assert!(
-        reporter
-            .lock()
-            .by_seq
-            .is_empty()
-    );
+    family.with_fetcher(|fetcher| {
+        assert_eq!(fetcher.fetches.lock().clone(), vec![root.get_child_hash(7)])
+    });
+    assert!(reporter.lock().by_seq.is_empty());
 }

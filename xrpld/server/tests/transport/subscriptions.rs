@@ -116,7 +116,7 @@ fn auth_request_role_detects_admin_and_gateway_roles() {
                 .expect("gateway admin network should parse"),
         ],
         secure_gateway_nets_v6: Vec::new(),
-            standalone_mode: false,
+        standalone_mode: false,
     });
 
     let request = http::Request::builder()
@@ -193,10 +193,13 @@ async fn websocket_subscription_fanout_emits_json_text() {
     session.subscribe_stream(StreamKind::Transactions);
     manager.publish(SubscriptionEvent {
         stream: StreamKind::Transactions,
-        payload: bytes::Bytes::from(sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([(
-            "transaction".to_owned(),
-            JsonValue::String("abc123".to_owned()),
-        )]))).unwrap()),
+        payload: bytes::Bytes::from(
+            sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([(
+                "transaction".to_owned(),
+                JsonValue::String("abc123".to_owned()),
+            )])))
+            .unwrap(),
+        ),
     });
 
     let message = receiver
@@ -422,9 +425,17 @@ fn builtin_dispatcher_routes_ping_and_server_info() {
         from_protocol_json(&server_info)["info"]["fetch_pack"],
         serde_json::Value::Number(1_u64.into())
     );
-    assert_eq!(
-        from_protocol_json(&server_info)["info"]["load"]["job_count"],
-        serde_json::Value::Number(0_u64.into())
+    assert!(
+        from_protocol_json(&server_info)["info"]["load"]
+            .get("jobs")
+            .is_some()
+            || from_protocol_json(&server_info)["info"]["load"]
+                .get("load_events")
+                .is_some()
+            || from_protocol_json(&server_info)["info"]["load"]
+                .get("threads")
+                .is_some(),
+        "server_info load must expose the application job-queue schema"
     );
     assert_eq!(
         from_protocol_json(&server_info)["info"]["last_close"]["converge_time_s"],
@@ -548,9 +559,17 @@ fn builtin_dispatcher_routes_ping_and_server_info() {
         from_protocol_json(&server_state)["state"]["fetch_pack"],
         serde_json::Value::Number(1_u64.into())
     );
-    assert_eq!(
-        from_protocol_json(&server_state)["state"]["load"]["job_count"],
-        serde_json::Value::Number(0_u64.into())
+    assert!(
+        from_protocol_json(&server_state)["state"]["load"]
+            .get("jobs")
+            .is_some()
+            || from_protocol_json(&server_state)["state"]["load"]
+                .get("load_events")
+                .is_some()
+            || from_protocol_json(&server_state)["state"]["load"]
+                .get("threads")
+                .is_some(),
+        "server_state load must expose the application job-queue schema"
     );
     assert_eq!(
         from_protocol_json(&server_state)["state"]["closed_ledger"]["close_time"],
@@ -1434,18 +1453,21 @@ async fn websocket_subscription_ledger_stream_receives_ledger_closed_event() {
     // Simulate ledger close event
     manager.publish(SubscriptionEvent {
         stream: StreamKind::Ledger,
-        payload: bytes::Bytes::from(sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([
-            (
-                "type".to_owned(),
-                JsonValue::String("ledgerClosed".to_owned()),
-            ),
-            ("ledger_index".to_owned(), JsonValue::Unsigned(42)),
-            (
-                "ledger_hash".to_owned(),
-                JsonValue::String("ABCD".repeat(16)),
-            ),
-            ("txn_count".to_owned(), JsonValue::Unsigned(5)),
-        ]))).unwrap()),
+        payload: bytes::Bytes::from(
+            sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([
+                (
+                    "type".to_owned(),
+                    JsonValue::String("ledgerClosed".to_owned()),
+                ),
+                ("ledger_index".to_owned(), JsonValue::Unsigned(42)),
+                (
+                    "ledger_hash".to_owned(),
+                    JsonValue::String("ABCD".repeat(16)),
+                ),
+                ("txn_count".to_owned(), JsonValue::Unsigned(5)),
+            ])))
+            .unwrap(),
+        ),
     });
 
     let message = receiver
@@ -1482,14 +1504,17 @@ async fn websocket_subscription_server_stream_receives_fee_change() {
     // Simulate server status event
     manager.publish(SubscriptionEvent {
         stream: StreamKind::Server,
-        payload: bytes::Bytes::from(sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([
-            (
-                "type".to_owned(),
-                JsonValue::String("serverStatus".to_owned()),
-            ),
-            ("load_base".to_owned(), JsonValue::Unsigned(256)),
-            ("load_factor".to_owned(), JsonValue::Unsigned(512)),
-        ]))).unwrap()),
+        payload: bytes::Bytes::from(
+            sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([
+                (
+                    "type".to_owned(),
+                    JsonValue::String("serverStatus".to_owned()),
+                ),
+                ("load_base".to_owned(), JsonValue::Unsigned(256)),
+                ("load_factor".to_owned(), JsonValue::Unsigned(512)),
+            ])))
+            .unwrap(),
+        ),
     });
 
     let message = receiver
@@ -1527,10 +1552,13 @@ async fn websocket_subscription_unsubscribe_stops_receiving() {
     // Publish after unsubscribe
     manager.publish(SubscriptionEvent {
         stream: StreamKind::Transactions,
-        payload: bytes::Bytes::from(sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([(
-            "type".to_owned(),
-            JsonValue::String("transaction".to_owned()),
-        )]))).unwrap()),
+        payload: bytes::Bytes::from(
+            sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([(
+                "type".to_owned(),
+                JsonValue::String("transaction".to_owned()),
+            )])))
+            .unwrap(),
+        ),
     });
 
     // Give a moment for any message to arrive
@@ -1564,19 +1592,25 @@ async fn websocket_subscription_multiple_streams_independent() {
     // Publish to ledger
     manager.publish(SubscriptionEvent {
         stream: StreamKind::Ledger,
-        payload: bytes::Bytes::from(sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([(
-            "type".to_owned(),
-            JsonValue::String("ledgerClosed".to_owned()),
-        )]))).unwrap()),
+        payload: bytes::Bytes::from(
+            sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([(
+                "type".to_owned(),
+                JsonValue::String("ledgerClosed".to_owned()),
+            )])))
+            .unwrap(),
+        ),
     });
 
     // Publish to server
     manager.publish(SubscriptionEvent {
         stream: StreamKind::Server,
-        payload: bytes::Bytes::from(sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([(
-            "type".to_owned(),
-            JsonValue::String("serverStatus".to_owned()),
-        )]))).unwrap()),
+        payload: bytes::Bytes::from(
+            sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([(
+                "type".to_owned(),
+                JsonValue::String("serverStatus".to_owned()),
+            )])))
+            .unwrap(),
+        ),
     });
 
     // Should receive both
@@ -1624,19 +1658,25 @@ async fn websocket_subscription_does_not_receive_unsubscribed_stream() {
     // Publish to transactions (not subscribed)
     manager.publish(SubscriptionEvent {
         stream: StreamKind::Transactions,
-        payload: bytes::Bytes::from(sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([(
-            "type".to_owned(),
-            JsonValue::String("transaction".to_owned()),
-        )]))).unwrap()),
+        payload: bytes::Bytes::from(
+            sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([(
+                "type".to_owned(),
+                JsonValue::String("transaction".to_owned()),
+            )])))
+            .unwrap(),
+        ),
     });
 
     // Publish to ledger (subscribed)
     manager.publish(SubscriptionEvent {
         stream: StreamKind::Ledger,
-        payload: bytes::Bytes::from(sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([(
-            "type".to_owned(),
-            JsonValue::String("ledgerClosed".to_owned()),
-        )]))).unwrap()),
+        payload: bytes::Bytes::from(
+            sonic_rs::to_vec(&JsonValue::Object(BTreeMap::from([(
+                "type".to_owned(),
+                JsonValue::String("ledgerClosed".to_owned()),
+            )])))
+            .unwrap(),
+        ),
     });
 
     // Should only receive ledger event

@@ -264,15 +264,15 @@ mod tests {
 
     #[test]
     fn hold_preconditions_reject_delegated_transactions() {
-        let preflight = QueueHoldPreflight::new(false, false, ApplyFlags::NONE, Some(200))
-            .with_delegate(true);
+        let preflight =
+            QueueHoldPreflight::new(false, false, ApplyFlags::NONE, Some(200)).with_delegate(true);
         assert_eq!(
             check_hold_preconditions(preflight, 100, 2),
             Ter::TEL_CAN_NOT_QUEUE
         );
 
-        let no_delegate = QueueHoldPreflight::new(false, false, ApplyFlags::NONE, Some(200))
-            .with_delegate(false);
+        let no_delegate =
+            QueueHoldPreflight::new(false, false, ApplyFlags::NONE, Some(200)).with_delegate(false);
         assert_eq!(
             check_hold_preconditions(no_delegate, 100, 2),
             Ter::TES_SUCCESS

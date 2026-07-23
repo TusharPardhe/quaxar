@@ -179,6 +179,9 @@ fn networkops_recv_validation_bypasses_accept_when_hash_is_already_pending() {
         root.validators()
             .load(None, &[second_public.to_node_public_base58(),], &[], None,)
     );
+    root.validators()
+        .update_trusted(&std::collections::HashSet::new(), 0);
+    assert!(root.validators().trusted(second_public));
 
     let accept_sink = RecordingAcceptSink::default();
     assert!(runtime.insert_pending_validation(ledger_id));

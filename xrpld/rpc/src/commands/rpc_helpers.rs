@@ -7,9 +7,10 @@ use std::collections::BTreeMap;
 use basics::{base_uint::Uint256, str_hex::str_hex, string_utilities::to_uint64};
 use protocol::{
     JsonOptions, JsonValue, KeyType, LedgerEntryType, LedgerFormats, PublicKey, STArray, STObject,
-    STParsedJSONObject, STTx, SecretKey, Seed, SerialIter, StBase, build_multi_signing_data,
-    derive_public_key, generate_secret_key, get_field_by_name, get_field_by_symbol, jss,
-    parse_base58_account_id, serialize_pay_chan_authorization, sf_generic, sign,
+    STParsedJSONObject, STTx, SecretKey, Seed, SerialIter, Serializer, StBase,
+    build_multi_signing_data, derive_public_key, generate_secret_key, get_field_by_name,
+    get_field_by_symbol, is_tes_success, jss, parse_base58_account_id,
+    serialize_pay_chan_authorization, sf_generic, sign,
 };
 
 #[cfg(not(test))]
@@ -117,9 +118,8 @@ pub fn transaction_sign<Runtime: RpcRuntime, Source>(
     if st_tx.get_seq_value() == 0 {
         if let Some(app) = ctx.runtime.app() {
             let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-            let account_keylet = protocol::account_keylet(
-                basics::base_uint::Uint160::from_void(account.data()),
-            );
+            let account_keylet =
+                protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
             // Try open ledger first (has latest state including pending txs)
             let seq = app
                 .network_ops_current_account_seq(&account)
@@ -135,7 +135,11 @@ pub fn transaction_sign<Runtime: RpcRuntime, Source>(
     }
     // Auto-fill Fee if not set (default to base fee)
     if !st_tx.is_field_present(get_field_by_symbol("sfFee"))
-        || st_tx.get_field_amount(get_field_by_symbol("sfFee")).xrp().drops() == 0
+        || st_tx
+            .get_field_amount(get_field_by_symbol("sfFee"))
+            .xrp()
+            .drops()
+            == 0
     {
         st_tx.set_field_amount(
             get_field_by_symbol("sfFee"),
@@ -504,21 +508,31 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
 ) -> Result<JsonValue, Status> {
     tracing::debug!(target: "rpc", method = "simulate", "RPC request received");
     let mut ret = BTreeMap::new();
+    let binary = ctx
+        .params
+        .get(jss::binary)
+        .and_then(|value| match value {
+            JsonValue::Bool(value) => Some(*value),
+            _ => None,
+        })
+        .unwrap_or(false);
+    let mut simulation_meta_blob = None;
     ret.insert(jss::applied.to_string(), JsonValue::Bool(false));
 
     // If a ledger is available, run the real transactor and capture metadata
     if let Some(ledger) = ctx.runtime.current_ledger_for_simulation() {
         let ledger_seq = ledger.header().seq;
+        let close_time = ledger.header().close_time;
         let mut view = ledger::ApplyViewImpl::new(ledger, tx::ApplyFlags::NONE);
         let txn_type = tx.get_txn_type();
         // C++ catches std::runtime_error from transactor apply and returns
         // an RPC error. Match this by catching panics (e.g., STAmount overflow)
         // to prevent mutex poisoning and server crash.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            app::apply_submit_transactor_shell(&mut view, tx, txn_type)
+            app::apply_submit_transactor_shell_with_delivered_amount(&mut view, tx, txn_type)
         }));
-        let result = match result {
-            Ok(ter) => ter,
+        let (result, delivered_amount) = match result {
+            Ok((ter, delivered_amount)) => (ter, delivered_amount),
             Err(_) => {
                 ret.insert(
                     jss::engine_result.to_string(),
@@ -531,7 +545,7 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
 
         ret.insert(
             jss::engine_result.to_string(),
-            JsonValue::String(format!("{:?}", result)),
+            JsonValue::String(protocol::trans_token(result).to_owned()),
         );
         ret.insert(
             jss::engine_result_code.to_string(),
@@ -546,18 +560,36 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
             JsonValue::Unsigned(u64::from(ledger_seq)),
         );
 
-        // Build metadata from the view's change table
-        let affected_nodes = view.table().to_simulation_metadata();
-        let mut meta = BTreeMap::new();
-        meta.insert(
-            "AffectedNodes".to_string(),
-            JsonValue::Array(affected_nodes),
-        );
-        meta.insert(
-            "TransactionResult".to_string(),
-            JsonValue::String(format!("{:?}", result)),
-        );
-        ret.insert("meta".to_string(), JsonValue::Object(meta));
+        // Build one typed metadata object from the actual dry-run changes.
+        // JSON and binary simulation responses must render the same metadata.
+        if is_tes_success(result) || protocol::is_tec_claim(result) {
+            let mut transaction_meta =
+                view.table()
+                    .to_tx_meta(tx.get_transaction_id(), ledger_seq, delivered_amount);
+            let mut serializer = Serializer::default();
+            transaction_meta.add_raw(&mut serializer, result, 0);
+
+            let mut meta = transaction_meta.get_json(JsonOptions::new(0));
+            if is_tes_success(result) {
+                crate::handlers::delivered_amount::insert_delivered_amount(
+                    &mut meta,
+                    ledger_seq,
+                    Some(close_time),
+                    tx,
+                    &transaction_meta,
+                );
+            }
+            simulation_meta_blob = Some(hex::encode(serializer.data()));
+            ret.insert("meta".to_string(), meta);
+        } else {
+            let mut meta = BTreeMap::new();
+            meta.insert("AffectedNodes".to_owned(), JsonValue::Array(Vec::new()));
+            meta.insert(
+                "TransactionResult".to_owned(),
+                JsonValue::String(format!("{:?}", result)),
+            );
+            ret.insert("meta".to_string(), JsonValue::Object(meta));
+        }
     } else {
         ret.insert(
             jss::engine_result.to_string(),
@@ -566,25 +598,22 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
         ret.insert(jss::engine_result_code.to_string(), JsonValue::Signed(0));
         ret.insert(
             "engine_result_message".to_string(),
-            JsonValue::String("The transaction was applied. Only final in a validated ledger.".to_string()),
+            JsonValue::String(
+                "The transaction was applied. Only final in a validated ledger.".to_string(),
+            ),
         );
     }
 
-    if !ctx
-        .params
-        .get(jss::binary)
-        .and_then(|v| match v {
-            JsonValue::Bool(b) => Some(*b),
-            _ => None,
-        })
-        .unwrap_or(false)
-    {
+    if !binary {
         ret.insert(jss::tx_json.to_string(), tx.json(JsonOptions::new(0)));
     } else {
         ret.insert(
             jss::tx_blob.to_string(),
             JsonValue::String(hex::encode(tx.get_serializer().data())),
         );
+        if let Some(meta_blob) = simulation_meta_blob {
+            ret.insert("meta_blob".to_string(), JsonValue::String(meta_blob));
+        }
     }
 
     Ok(JsonValue::Object(ret))

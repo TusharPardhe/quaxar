@@ -247,7 +247,10 @@ impl AppNetworkOpsValidationRuntime {
                 Some(self.validations.persistence().as_ref()),
                 Some(self.journal.as_ref()),
             );
-            (status == consensus::ValidationStatus::Current, check_accept_args)
+            (
+                status == consensus::ValidationStatus::Current,
+                check_accept_args,
+            )
         };
 
         // Matches the reference: `checkAccept` runs AFTER `validations.add()`

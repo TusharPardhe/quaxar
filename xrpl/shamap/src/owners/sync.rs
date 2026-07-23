@@ -427,6 +427,224 @@ impl SyncTree {
         self.state = SyncState::Synching;
     }
 
+    /// Release all loaded tree nodes from memory, leaving only the root hash
+    /// and branch topology intact. After this call, every traversal re-fetches
+    /// nodes from NuDB on demand via the backed-fetch path (`descend()`).
+    ///
+    /// Takes `&self` (not `&mut self`) — operates via interior mutability using
+    /// the per-branch spinlocks on each SHAMapTreeNode. This is critical: it
+    /// means the call works on `Arc<Ledger>` without needing exclusive access,
+    /// so ALL holders of a given ledger (closed/validated/published slots,
+    /// ledger_history cache, consensus state) automatically see the released
+    /// tree. No slot-swapping or cloning required.
+    ///
+    /// # Preconditions
+    /// - `self.backed` must be `true` (reads after release go to NuDB).
+    /// - All nodes must already be persisted to NuDB (via the acquisition
+    ///   worker's `store_object` or `persist_dirty_nodes_to_store`).
+    ///
+    /// # Safety
+    /// Thread-safe by construction: each child slot is independently locked
+    /// via `release_loaded_children`'s spinlock protocol, matching the same
+    /// locking used by `get_child`/`canonicalize_child` for concurrent reads.
+    pub fn release_to_disk(&self) {
+        if !self.backed {
+            return;
+        }
+        if self.root.get_hash().is_zero() {
+            return;
+        }
+        // Diagnostic: log root state before walk
+        {
+            let mut loaded_count = 0u32;
+            let mut non_empty_count = 0u32;
+            for branch in 0..BRANCH_FACTOR {
+                if !self.root.is_empty_branch(branch) {
+                    non_empty_count += 1;
+                    if self.root.get_child(branch).is_some() {
+                        loaded_count += 1;
+                    }
+                }
+            }
+            tracing::info!(
+                target: "ledger",
+                root_hash = %self.root.get_hash(),
+                non_empty_branches = non_empty_count,
+                loaded_children = loaded_count,
+                backed = self.backed,
+                "release_to_disk: inspecting root before walk"
+            );
+        }
+
+        // Iterative breadth-first release using an explicit work stack.
+        let mut inner_nodes: Vec<SharedIntrusive<SHAMapTreeNode>> = Vec::new();
+        let mut work_stack: Vec<SharedIntrusive<SHAMapTreeNode>> = vec![self.root.clone()];
+
+        // Phase 1: collect all reachable inner nodes (top-down traversal)
+        while let Some(node) = work_stack.pop() {
+            if !node.is_inner() {
+                continue;
+            }
+            for branch in 0..BRANCH_FACTOR {
+                if !node.is_empty_branch(branch) {
+                    if let Some(child) = node.get_child(branch) {
+                        work_stack.push(child);
+                    }
+                }
+            }
+            inner_nodes.push(node);
+        }
+
+        // Phase 2: release children bottom-up (reverse of collection order,
+        // which was top-down — so reversing gives us leaves-first).
+        for node in inner_nodes.iter().rev() {
+            node.release_loaded_children();
+        }
+
+        tracing::info!(
+            target: "ledger",
+            inner_nodes_released = inner_nodes.len(),
+            "release_to_disk: evicted all loaded tree nodes to NuDB"
+        );
+    }
+
+    /// Progressively release "full below" subtrees to bound in-memory
+    /// node count during acquisition. Unlike `release_to_disk` (which
+    /// releases ALL children), this only releases children of inner nodes
+    /// whose subtrees are fully downloaded (marked `full_below`). The
+    /// released subtrees can be re-fetched from NuDB on demand via the
+    /// `node_fetcher` path.
+    ///
+    /// Returns the number of inner nodes whose children were released.
+    ///
+    /// # Preconditions
+    /// - `self.backed` must be true (reads after release go to NuDB).
+    /// - All "full below" nodes must already be persisted to NuDB.
+    pub fn spill_full_below_subtrees(&self, generation: u32) -> usize {
+        if !self.backed {
+            return 0;
+        }
+        if self.root.get_hash().is_zero() {
+            return 0;
+        }
+
+        // Walk top-down, collecting inner nodes that are full_below AND have
+        // loaded children. We release their children bottom-up to avoid
+        // holding references to nodes being freed.
+        //
+        // Strategy: we release children of nodes at depth >= 2 that are
+        // full_below. We keep depth-0 (root) and depth-1 children loaded
+        // so that `get_missing_nodes` traversal doesn't immediately need to
+        // re-fetch the top of the tree on the next tick.
+        let mut to_release: Vec<SharedIntrusive<SHAMapTreeNode>> = Vec::new();
+        let mut work_stack: Vec<(SharedIntrusive<SHAMapTreeNode>, usize)> =
+            vec![(self.root.clone(), 0)];
+
+        while let Some((node, depth)) = work_stack.pop() {
+            if !node.is_inner() {
+                continue;
+            }
+
+            if node.is_full_below(generation) && depth >= 2 {
+                // This subtree is complete — release its children.
+                to_release.push(node);
+                // Don't descend further; releasing this node's children
+                // will drop all transitive descendants.
+                continue;
+            }
+
+            // Not full below at this depth — descend into loaded children.
+            for branch in 0..BRANCH_FACTOR {
+                if !node.is_empty_branch(branch) {
+                    if let Some(child) = node.get_child(branch) {
+                        work_stack.push((child, depth + 1));
+                    }
+                }
+            }
+        }
+
+        let released = to_release.len();
+        // Release bottom-up (deepest first — since work_stack is DFS,
+        // to_release is already in a reasonable order but we reverse
+        // for safety).
+        for node in to_release.iter().rev() {
+            node.release_loaded_children();
+        }
+
+        if released > 0 {
+            tracing::debug!(
+                target: "shamap",
+                released_inner_nodes = released,
+                "spill_full_below_subtrees: evicted full-below subtrees"
+            );
+        }
+        released
+    }
+
+    /// Aggressively release loaded children at depth >= `keep_depth`, regardless
+    /// of full_below status. This caps memory during active acquisition by
+    /// ensuring only the top N levels of the tree stay resident in RAM.
+    ///
+    /// Nodes at depth >= `keep_depth` have their children dropped. The next
+    /// `get_missing_nodes` traversal will re-fetch only the frontier nodes it
+    /// actually needs from NuDB via the backed `descend()` path.
+    ///
+    /// This leverages quaxar's `release_loaded_children()` mechanism (which
+    /// rippled lacks) to bound acquisition memory to approximately:
+    ///   top `keep_depth` levels × branch_factor nodes ≈ 16^keep_depth inner nodes
+    ///   + active frontier nodes loaded on-demand during getMissingNodes
+    ///
+    /// # Preconditions
+    /// - `self.backed` must be true (reads after release go to NuDB).
+    /// - Nodes must already be persisted to NuDB before calling this.
+    pub fn release_deep_children(&self, keep_depth: usize) -> usize {
+        if !self.backed {
+            return 0;
+        }
+        if self.root.get_hash().is_zero() {
+            return 0;
+        }
+
+        let mut released = 0usize;
+        let mut work_stack: Vec<(SharedIntrusive<SHAMapTreeNode>, usize)> =
+            vec![(self.root.clone(), 0)];
+
+        while let Some((node, depth)) = work_stack.pop() {
+            if !node.is_inner() {
+                continue;
+            }
+
+            if depth >= keep_depth {
+                // Release this node's children — they can be re-fetched from NuDB.
+                if node.has_any_loaded_child() {
+                    node.release_loaded_children();
+                    released += 1;
+                }
+                // Don't descend further — children are now released.
+                continue;
+            }
+
+            // Above keep_depth — descend into loaded children.
+            for branch in 0..BRANCH_FACTOR {
+                if !node.is_empty_branch(branch) {
+                    if let Some(child) = node.get_child(branch) {
+                        work_stack.push((child, depth + 1));
+                    }
+                }
+            }
+        }
+
+        if released > 0 {
+            tracing::debug!(
+                target: "shamap",
+                released_inner_nodes = released,
+                keep_depth,
+                "release_deep_children: evicted deep subtrees for memory bound"
+            );
+        }
+        released
+    }
+
     pub fn set_immutable(&mut self) {
         assert!(
             self.state != SyncState::Invalid,
@@ -618,6 +836,8 @@ impl SyncTree {
         CLOCK: CacheClock,
         S: BuildHasher + Clone,
         FB: FullBelowCache,
+        F: SHAMapNodeFetcher,
+        MR: MissingNodeReporter,
         REQ: FnMut(SHAMapHash, u32),
     {
         crate::fetch::descend_async_with_family(
@@ -1174,6 +1394,7 @@ impl SyncTree {
         S: BuildHasher + Clone,
         C: FullBelowCache,
         F: SHAMapNodeFetcher,
+        MR: MissingNodeReporter,
         R: FnMut() -> u8,
         REQ: FnMut(SHAMapHash, u32),
         COMPLETE:
@@ -1689,7 +1910,6 @@ impl SyncTree {
         )
     }
 
-
     /// Collect strong references to ALL nodes in this tree, loading from the
     /// family's fetcher if needed. Returns a Vec of SharedIntrusive refs that
     /// pin every node in memory — as long as the Vec is alive, no node can be
@@ -2170,6 +2390,7 @@ impl DeferredMissingNodeScan {
         S: BuildHasher + Clone,
         FB: FullBelowCache,
         F: SHAMapNodeFetcher,
+        MR: MissingNodeReporter,
         R: FnMut() -> u8,
         REQ: FnMut(SHAMapHash, u32),
     {

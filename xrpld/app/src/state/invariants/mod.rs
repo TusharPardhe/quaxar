@@ -106,6 +106,9 @@ fn check_invariants_inner<V: ApplyView>(
     fee: XRPAmount,
 ) -> Ter {
     let mut xrp_balance_change: i64 = 0;
+    let mut has_xrp_trust_line = false;
+    let mut deep_freeze_violation = false;
+    let mut mpt_issuance_locked_violation = false;
     let fix_cleanup_3_1_3 = sandbox
         .rules()
         .enabled(&protocol::feature_id("fixCleanup3_1_3"));
@@ -138,9 +141,7 @@ fn check_invariants_inner<V: ApplyView>(
     let mut lending = LendingState::default();
     let mut clawback = ClawbackState::default();
     let mut object_deletion = ObjectDeletionState::default();
-    let fix_cleanup_3_3_0 = sandbox
-        .rules()
-        .enabled(&protocol::fix_cleanup_3_3_0());
+    let fix_cleanup_3_3_0 = sandbox.rules().enabled(&protocol::fix_cleanup_3_3_0());
 
     for (index, entry) in sandbox.items() {
         let is_delete = entry.action == Action::Erase;
@@ -226,7 +227,7 @@ fn check_invariants_inner<V: ApplyView>(
             record_object_deletion_state(&mut object_deletion, is_delete, before_sle);
         }
 
-        if fix_cleanup_3_2_0 {
+        if fix_cleanup_3_2_0 || mptokens_v2_enabled {
             let deleted_sle = before_sle.unwrap_or(&entry.sle);
             record_mpt_issuance_lifecycle(
                 sandbox,
@@ -237,6 +238,9 @@ fn check_invariants_inner<V: ApplyView>(
                 after_sle,
                 deleted_sle,
             );
+        }
+
+        if fix_cleanup_3_2_0 {
             if !maybe_record_directory_root(&mut directory_roots, is_delete, before_sle, after_sle)
             {
                 return Ter::TEC_INVARIANT_FAILED;
@@ -342,18 +346,34 @@ fn check_invariants_inner<V: ApplyView>(
             }
             LedgerEntryType::DirectoryNode => {}
             LedgerEntryType::RippleState => {
-                if let Some(a) = after_sle
-                    && !validate_ripple_state_entry(a)
-                {
-                    return Ter::TEC_INVARIANT_FAILED;
+                if let Some(a) = after_sle {
+                    has_xrp_trust_line = accumulate_invariant_violation(
+                        has_xrp_trust_line,
+                        is_xrp_trust_line(a),
+                        fix_cleanup_3_1_3,
+                    );
+                    deep_freeze_violation = accumulate_invariant_violation(
+                        deep_freeze_violation,
+                        has_deep_freeze_without_freeze(a),
+                        fix_cleanup_3_1_3,
+                    );
                 }
             }
             LedgerEntryType::MPTokenIssuance | LedgerEntryType::MPToken => {
-                if fix_cleanup_3_2_0
-                    && let Some(a) = after_sle
-                    && !validate_mpt_entry(a)
-                {
-                    return Ter::TEC_INVARIANT_FAILED;
+                if let Some(a) = after_sle {
+                    if a.get_type() == LedgerEntryType::MPTokenIssuance
+                        && a.is_field_present(sf("sfLockedAmount"))
+                    {
+                        mpt_issuance_locked_violation = accumulate_invariant_violation(
+                            mpt_issuance_locked_violation,
+                            a.get_field_u64(sf("sfOutstandingAmount"))
+                                < a.get_field_u64(sf("sfLockedAmount")),
+                            fix_cleanup_3_1_3,
+                        );
+                    }
+                    if fix_cleanup_3_2_0 && !validate_mpt_entry(a) {
+                        return Ter::TEC_INVARIANT_FAILED;
+                    }
                 }
             }
             LedgerEntryType::Vault => {
@@ -399,6 +419,10 @@ fn check_invariants_inner<V: ApplyView>(
         }
     }
 
+    if has_xrp_trust_line || deep_freeze_violation || mpt_issuance_locked_violation {
+        return Ter::TEC_INVARIANT_FAILED;
+    }
+
     if (fix_cleanup_3_1_3 || txn_type == protocol::TxType::PERMISSIONED_DOMAIN_SET)
         && !validates_permissioned_domain(txn_type, result, fix_cleanup_3_1_3, &permissioned_domain)
     {
@@ -432,7 +456,7 @@ fn check_invariants_inner<V: ApplyView>(
         return Ter::TEC_INVARIANT_FAILED;
     }
 
-    if fix_cleanup_3_2_0 {
+    if fix_cleanup_3_2_0 || mptokens_v2_enabled {
         if !validates_mpt_issuance_lifecycle(&mpt_issuance_lifecycle) {
             return Ter::TEC_INVARIANT_FAILED;
         }
@@ -447,6 +471,9 @@ fn check_invariants_inner<V: ApplyView>(
         ) {
             return Ter::TEC_INVARIANT_FAILED;
         }
+    }
+
+    if fix_cleanup_3_2_0 {
         for root_index in directory_roots {
             if !matches!(
                 sandbox.read(protocol::Keylet::new(

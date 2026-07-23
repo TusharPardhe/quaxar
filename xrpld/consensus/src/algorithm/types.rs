@@ -174,13 +174,18 @@ where
     pub proposers: usize,
 }
 
-impl<TxSet, NodeId, LedgerId, TxSetId, Tx, TxId> ConsensusResult<TxSet, NodeId, LedgerId, TxSetId, Tx, TxId>
+impl<TxSet, NodeId, LedgerId, TxSetId, Tx, TxId>
+    ConsensusResult<TxSet, NodeId, LedgerId, TxSetId, Tx, TxId>
 where
     TxSetId: Eq + std::hash::Hash + Clone + PartialEq,
     TxId: Eq + std::hash::Hash + Ord + Clone + ToString,
     NodeId: Eq + std::hash::Hash + Ord + Clone + ToString,
 {
-    pub fn new(txns: TxSet, position: ConsensusProposal<NodeId, LedgerId, TxSetId>, txns_id: TxSetId) -> Self {
+    pub fn new(
+        txns: TxSet,
+        position: ConsensusProposal<NodeId, LedgerId, TxSetId>,
+        txns_id: TxSetId,
+    ) -> Self {
         debug_assert!(
             txns_id == position.position().clone(),
             "ConsensusResult::new: txns id must match position"

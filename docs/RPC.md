@@ -173,14 +173,16 @@ curl -s http://127.0.0.1:5005 \
 
 ### export_snapshot
 
-Trigger a snapshot export. Runs in a background thread; the node stays online.
-Output is an LZ4 compressed file with SHA-256 chunk integrity. Admin only.
+Start a snapshot export as a background job. The node stays online. Output is
+an LZ4 compressed file with SHA-256 chunk integrity. Admin only. Supply an
+explicit `output` file path, then use `snapshot_status` to observe the final
+outcome.
 
 **Request:**
 ```json
 {
   "method": "export_snapshot",
-  "params": [{}]
+  "params": [{"output":"/var/lib/quaxar/snapshots/bootstrap.xrpls"}]
 }
 ```
 
@@ -188,8 +190,37 @@ Output is an LZ4 compressed file with SHA-256 chunk integrity. Admin only.
 ```json
 {
   "result": {
-    "message": "Snapshot export started",
-    "status": "success"
+    "ledger_seq": 123456,
+    "status": "started"
+  }
+}
+```
+
+### snapshot_status
+
+Return the most recent snapshot-export job state. Admin only. A node accepts
+one active export at a time. `state` is `idle`, `running`, `completed`, or
+`failed`; completed responses include `file_size`, while failed responses
+include `error`. The status is in-memory, so a node restart resets it to
+`idle`.
+
+**Request:**
+```json
+{
+  "method": "snapshot_status",
+  "params": [{}]
+}
+```
+
+**Completed response:**
+```json
+{
+  "result": {
+    "status": "success",
+    "state": "completed",
+    "output": "/var/lib/quaxar/snapshots/bootstrap.xrpls",
+    "ledger_seq": 123456,
+    "file_size": 4563487682
   }
 }
 ```

@@ -12,12 +12,53 @@
 //! - Reserve checks
 //! - Pseudo-account rejection
 
+use std::{cell::RefCell, sync::Arc};
+
 use basics::math::base_uint::Uint160;
 use protocol::{
     AccountID, Asset, PARITY_RATE, STAmount, STLedgerEntry, STTx, Ter, XRPAmount, divide_rate,
     get_field_by_symbol, is_ter_retry, is_tes_success, multiply_rate,
 };
-use std::sync::Arc;
+thread_local! {
+    static MPT_DELIVERED_AMOUNT_CAPTURES: RefCell<Vec<Option<STAmount>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Scoped equivalent of rippled's `ApplyContext::deliver` handoff for direct
+/// MPT payment metadata. Transaction-shell callers that do not construct
+/// metadata safely discard the capture when their application returns.
+pub struct MptDeliveredAmountCapture {
+    active: bool,
+}
+
+impl MptDeliveredAmountCapture {
+    pub fn new() -> Self {
+        MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| captures.borrow_mut().push(None));
+        Self { active: true }
+    }
+
+    pub fn finish(mut self) -> Option<STAmount> {
+        self.active = false;
+        MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| captures.borrow_mut().pop().flatten())
+    }
+}
+
+impl Drop for MptDeliveredAmountCapture {
+    fn drop(&mut self) {
+        if self.active {
+            MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| {
+                let _ = captures.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+fn record_mpt_delivered_amount(amount: STAmount) {
+    MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| {
+        if let Some(delivered_amount) = captures.borrow_mut().last_mut() {
+            *delivered_amount = Some(amount);
+        }
+    });
+}
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
@@ -59,6 +100,14 @@ pub fn do_payment<V: ledger::ApplyView>(
     } else {
         None
     };
+
+    // rippled Payment::preflight rejects a nonpositive destination amount and
+    // a present nonpositive SendMax before any path/flow arithmetic.  Without
+    // this boundary an invalid issuer-source partial payment can enter
+    // RippleCalc with a zero required input and reach a raw divide-by-zero.
+    if dst_amount.signum() <= 0 || send_max.as_ref().is_some_and(|amount| amount.signum() <= 0) {
+        return Ter::TEM_BAD_AMOUNT;
+    }
 
     let partial_payment_allowed = (tx_flags & TF_PARTIAL_PAYMENT) != 0;
     let limit_quality = (tx_flags & TF_LIMIT_QUALITY) != 0;
@@ -334,6 +383,14 @@ fn do_direct_mpt_payment<V: ledger::ApplyView>(
     if matches!(result, Ter::TEC_INSUFFICIENT_FUNDS | Ter::TEC_PATH_DRY) {
         result = Ter::TEC_PATH_PARTIAL;
     }
+    if is_tes_success(result)
+        && view.rules().enabled(&protocol::fix_mpt_delivered_amount())
+        && amount_deliver != *dst_amount
+    {
+        // Matches Payment.cpp: direct MPT payments use the actual net amount,
+        // not the requested destination amount, when the amendment is active.
+        record_mpt_delivered_amount(amount_deliver);
+    }
     result
 }
 
@@ -355,9 +412,8 @@ fn is_direct_iou_payment(
     if !one_is_issuer {
         return false;
     }
-    send_max.is_some_and(|send_max| {
-        send_max.asset() == dst_amount.asset() && send_max == dst_amount
-    })
+    send_max
+        .is_some_and(|send_max| send_max.asset() == dst_amount.asset() && send_max == dst_amount)
 }
 
 fn do_direct_iou_payment<V: ledger::ApplyView>(

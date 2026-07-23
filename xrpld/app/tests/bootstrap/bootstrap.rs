@@ -6,8 +6,8 @@ use basics::{base_uint::Uint256, intrusive_pointer::make_shared_intrusive, str_h
 use ledger::{Ledger, LedgerHeader, calculate_ledger_hash};
 use nodestore::{DummyScheduler, Manager, ManagerImp, NodeObjectType, NullJournal, Scheduler};
 use protocol::{
-    AccountID, LedgerEntryType, STAmount, STArray, STLedgerEntry, STObject, STTx, TxType,
-    account_keylet, get_field_by_symbol,
+    AccountID, LedgerEntryType, MPTAmount, MPTIssue, STAmount, STArray, STLedgerEntry, STObject,
+    STTx, TxType, account_keylet, get_field_by_symbol, make_mpt_id,
 };
 use shamap::{
     item::SHAMapItem,
@@ -779,10 +779,31 @@ fn app_bootstrap_loads_replay_parent_and_injects_replay_transactions() {
     let dir = TempDir::new().expect("tempdir");
     let parent = persisted_bootstrap_state_only_ledger(20);
     let replay_tx = payment_tx(1, 0x11, 0x21);
+    let delivered_amount = STAmount::from_mpt_amount(
+        get_field_by_symbol("sfDeliveredAmount"),
+        MPTAmount::from_value(800),
+        MPTIssue::new(make_mpt_id(7, account(0x71))),
+    );
+    let mut replay_meta = metadata(2, 0x92);
+    replay_meta.set_field_amount(
+        get_field_by_symbol("sfDeliveredAmount"),
+        delivered_amount.clone(),
+    );
     let replay = persisted_bootstrap_replay_ledger(
         21,
         *parent.header().hash.as_uint256(),
-        &[(Arc::clone(&replay_tx), metadata(2, 0x92))],
+        &[(Arc::clone(&replay_tx), replay_meta)],
+    );
+    let replay_snapshot = replay.tx_snapshot().expect("replay transaction metadata");
+    assert_eq!(replay_snapshot.len(), 1);
+    assert_eq!(
+        replay_snapshot[0].0.get_transaction_id(),
+        replay_tx.get_transaction_id()
+    );
+    assert_eq!(
+        replay_snapshot[0].1.get_delivered_amount(),
+        Some(&delivered_amount),
+        "serialized replay metadata must decode the exact MPT sfDeliveredAmount"
     );
     let (database_path, node_db_path, config_path) =
         persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "RocksDB");
@@ -1252,4 +1273,64 @@ path = {}
     );
 
     bootstrap.runtime.shutdown();
+}
+
+#[test]
+fn app_bootstrap_normal_restores_latest_and_configured_history() {
+    let dir = TempDir::new().expect("tempdir");
+    let parent = persisted_bootstrap_state_only_ledger(20);
+    let latest = persisted_bootstrap_replay_ledger(21, *parent.header().hash.as_uint256(), &[]);
+    let (database_path, node_db_path, config_path) =
+        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&latest)], "RocksDB");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+
+[ledger_history]
+2
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let bootstrap = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Normal,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("Normal startup should restore durable storage");
+
+    assert_eq!(bootstrap.root.closed_ledger_seq(), Some(21));
+    assert_eq!(bootstrap.root.validated_ledger_seq(), Some(21));
+    assert_eq!(bootstrap.root.published_ledger_seq(), Some(21));
+    let master = bootstrap
+        .root
+        .ledger_master_runtime()
+        .expect("ledger master runtime")
+        .ledger_master();
+    assert!(master.have_ledger(20));
+    assert!(master.have_ledger(21));
+    assert_eq!(master.complete_ledgers().to_string(), "20-21");
 }

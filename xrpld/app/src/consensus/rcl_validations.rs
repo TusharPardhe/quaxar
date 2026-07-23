@@ -81,7 +81,9 @@ pub struct RclValidationsStoreView<'a, Clock: crate::state::time_keeper::TimeKee
     shared: &'a SharedAppValidations<Clock>,
 }
 
-impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> RclValidationsStoreView<'_, Clock> {
+impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static>
+    RclValidationsStoreView<'_, Clock>
+{
     /// The signer public keys of trusted, full validations tracked for
     /// `ledger_id` at sequence `seq`. Matches the reference's
     /// `RCLValidations::getTrustedForLedger` usage in
@@ -93,7 +95,11 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> RclValidations
     /// `Arc<STValidation>` wrapper) rather than just signer keys, since
     /// that filter needs the full validation to look up the signer's
     /// current master key.
-    pub fn trusted_for_ledger_by_sequence(&self, ledger_id: Uint256, seq: u32) -> Vec<STValidation> {
+    pub fn trusted_for_ledger_by_sequence(
+        &self,
+        ledger_id: Uint256,
+        seq: u32,
+    ) -> Vec<STValidation> {
         self.shared
             .inner
             .lock()
@@ -113,7 +119,11 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> RclValidations
     /// ledger id validators are on, not which round each individual
     /// validation was issued in.
     pub fn fees_for_ledger(&self, ledger_id: Uint256, _seq: u32, base_fee: u32) -> Vec<u32> {
-        self.shared.inner.lock().expect("shared app validations mutex must not be poisoned").fees(&ledger_id, base_fee)
+        self.shared
+            .inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .fees(&ledger_id, base_fee)
     }
 }
 
@@ -135,9 +145,12 @@ pub struct SharedAppValidations<Clock: crate::state::time_keeper::TimeKeeperCloc
     _clock: std::marker::PhantomData<Clock>,
 }
 
-impl<Clock: crate::state::time_keeper::TimeKeeperClock> std::fmt::Debug for SharedAppValidations<Clock> {
+impl<Clock: crate::state::time_keeper::TimeKeeperClock> std::fmt::Debug
+    for SharedAppValidations<Clock>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SharedAppValidations").finish_non_exhaustive()
+        f.debug_struct("SharedAppValidations")
+            .finish_non_exhaustive()
     }
 }
 
@@ -170,7 +183,10 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
         let now_source = move || time_keeper.close_time();
         let adaptor = RclValidationsAdaptor::new(now_source);
         Self {
-            inner: Arc::new(Mutex::new(Validations::new(consensus::rcl_support::ValidationParms::default(), adaptor))),
+            inner: Arc::new(Mutex::new(Validations::new(
+                consensus::rcl_support::ValidationParms::default(),
+                adaptor,
+            ))),
             persistence: Arc::new(NullRclValidationPersistence),
             ledger_master_state,
             journal,
@@ -209,7 +225,9 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
     }
 
     /// The ledger-master state this tracker was constructed against.
-    pub fn ledger_master_state(&self) -> &Arc<crate::ledger::ledger_master_state::SharedLedgerMasterState> {
+    pub fn ledger_master_state(
+        &self,
+    ) -> &Arc<crate::ledger::ledger_master_state::SharedLedgerMasterState> {
         &self.ledger_master_state
     }
 
@@ -224,7 +242,11 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
     /// hook, called wherever the node processes a newly built or acquired
     /// ledger.
     pub fn register_ledger(&self, ledger: &ledger::Ledger) {
-        self.inner.lock().expect("shared app validations mutex must not be poisoned").adaptor().register_ledger(ledger);
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .adaptor()
+            .register_ledger(ledger);
     }
 
     /// Number of trusted, full validations tracked for `ledger_hash`.
@@ -232,7 +254,10 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
     /// `bootstrap.rs`'s catch-up loop calls this without needing the full
     /// tracker.
     pub fn num_trusted_for_ledger(&self, ledger_hash: Uint256) -> usize {
-        self.inner.lock().expect("shared app validations mutex must not be poisoned").num_trusted_for_ledger(&ledger_hash)
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .num_trusted_for_ledger(&ledger_hash)
     }
 
     /// Attach (or detach) the ledger master runtime this validations
@@ -244,8 +269,14 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
     /// `ApplicationRoot::attach_ledger_master_runtime` has a place to wire
     /// the two together for future extension (e.g. auto-registering newly
     /// validated ledgers).
-    pub fn set_ledger_master_runtime(&self, runtime: Option<Arc<AppLedgerMasterRuntime>>) -> Option<Arc<AppLedgerMasterRuntime>> {
-        let mut slot = self.ledger_master_runtime.lock().expect("shared app validations ledger master runtime mutex must not be poisoned");
+    pub fn set_ledger_master_runtime(
+        &self,
+        runtime: Option<Arc<AppLedgerMasterRuntime>>,
+    ) -> Option<Arc<AppLedgerMasterRuntime>> {
+        let mut slot = self
+            .ledger_master_runtime
+            .lock()
+            .expect("shared app validations ledger master runtime mutex must not be poisoned");
         let previous = std::mem::replace(&mut *slot, runtime.clone());
         self.inner
             .lock()
@@ -295,19 +326,29 @@ pub fn handle_new_validation_with_store(
     let status = validations.add(node_id, wrapped);
 
     if let Some(journal) = journal {
-        journal.trace(&format!("handleNewValidation: {status} for ledger {}", validation.get_ledger_hash()));
+        journal.trace(&format!(
+            "handleNewValidation: {status} for ledger {}",
+            validation.get_ledger_hash()
+        ));
     }
 
     let mut check_accept_args = None;
     if status == consensus::ValidationStatus::Current {
-        if !bypass_accept {
-            // Matches the reference: `validations.add()` fully returns
-            // (releasing its internal lock) BEFORE `checkAccept` runs --
-            // they are sequential, not nested. Returning the args here
-            // instead of invoking the sink directly lets the caller run
-            // it AFTER releasing the validations lock it's holding,
-            // avoiding a self-deadlock (num_trusted_for_ledger inside
-            // check_accept needs to re-lock the same mutex).
+        if !bypass_accept && validation.is_trusted() {
+            // Matches the reference (RCLValidations.cpp:193):
+            // `if (outcome == ValStatus::current && isTrusted)`
+            //     `app.getLedgerMaster().checkAccept(...)`.
+            // Only trusted current validations trigger checkAccept;
+            // untrusted validations are tracked but must not drive
+            // ledger acquisition or acceptance decisions.
+            //
+            // `validations.add()` fully returns (releasing its internal
+            // lock) BEFORE `checkAccept` runs -- they are sequential,
+            // not nested. Returning the args here instead of invoking
+            // the sink directly lets the caller run it AFTER releasing
+            // the validations lock it's holding, avoiding a
+            // self-deadlock (num_trusted_for_ledger inside check_accept
+            // needs to re-lock the same mutex).
             check_accept_args = Some((
                 validation.get_ledger_hash(),
                 validation.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence")),
@@ -330,10 +371,15 @@ pub type SharedAppValidationsLedger = RclValidatedLedger;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::ledger_master_state::{LedgerMasterCloseTimeProvider, SharedLedgerMasterState};
+    use crate::ledger::ledger_master_state::{
+        LedgerMasterCloseTimeProvider, SharedLedgerMasterState,
+    };
     use crate::state::app_registry::AppJournal;
     use crate::state::time_keeper::{SystemTimeKeeperClock, TimeKeeper};
-    use protocol::{KeyType, calc_node_id, derive_public_key, generate_secret_key, get_field_by_symbol, random_seed};
+    use protocol::{
+        KeyType, calc_node_id, derive_public_key, generate_secret_key, get_field_by_symbol,
+        random_seed,
+    };
 
     struct AllTrusted;
     impl RclValidationTrustSource for AllTrusted {
@@ -357,8 +403,10 @@ mod tests {
 
     fn signed_validation(ledger_hash: Uint256, seq: u32, sign_time: u32) -> STValidation {
         let seed = random_seed();
-        let secret_key = generate_secret_key(KeyType::Secp256k1, &seed).expect("secret key generation should succeed");
-        let public_key = derive_public_key(KeyType::Secp256k1, &secret_key).expect("public key derivation should succeed");
+        let secret_key = generate_secret_key(KeyType::Secp256k1, &seed)
+            .expect("secret key generation should succeed");
+        let public_key = derive_public_key(KeyType::Secp256k1, &secret_key)
+            .expect("public key derivation should succeed");
         let node_id = calc_node_id(&public_key);
 
         STValidation::new_signed(sign_time, &public_key, node_id, &secret_key, |v| {
@@ -372,9 +420,17 @@ mod tests {
     fn shared_validations() -> (SharedAppValidations<SystemTimeKeeperClock>, u32) {
         let time_keeper = Arc::new(TimeKeeper::new());
         let now = time_keeper.close_time().as_seconds();
-        let close_time_provider = Arc::clone(&time_keeper) as Arc<dyn LedgerMasterCloseTimeProvider>;
+        let close_time_provider =
+            Arc::clone(&time_keeper) as Arc<dyn LedgerMasterCloseTimeProvider>;
         let ledger_master_state = Arc::new(SharedLedgerMasterState::new(close_time_provider));
-        (SharedAppValidations::new(time_keeper, ledger_master_state, Arc::new(AppJournal::new("Validations"))), now)
+        (
+            SharedAppValidations::new(
+                time_keeper,
+                ledger_master_state,
+                Arc::new(AppJournal::new("Validations")),
+            ),
+            now,
+        )
     }
 
     #[test]
@@ -386,7 +442,15 @@ mod tests {
 
         let mut validation = signed_validation(ledger_hash, 1, now);
         let mut inner = shared.validations().lock().unwrap();
-        let status = handle_new_validation_with_store(&AllTrusted, &mut inner, &mut validation, false, None, None).0;
+        let status = handle_new_validation_with_store(
+            &AllTrusted,
+            &mut inner,
+            &mut validation,
+            false,
+            None,
+            None,
+        )
+        .0;
 
         assert_eq!(status, consensus::ValidationStatus::Current);
         assert!(validation.is_trusted());
@@ -401,7 +465,14 @@ mod tests {
 
         let mut validation = signed_validation(ledger_hash, 1, now);
         let mut inner = shared.validations().lock().unwrap();
-        let _ = handle_new_validation_with_store(&NoneTrusted, &mut inner, &mut validation, false, None, None);
+        let _ = handle_new_validation_with_store(
+            &NoneTrusted,
+            &mut inner,
+            &mut validation,
+            false,
+            None,
+            None,
+        );
 
         assert!(!validation.is_trusted());
     }
@@ -416,7 +487,14 @@ mod tests {
         let mut validation = signed_validation(ledger_hash, 1, now);
         {
             let mut inner = shared.validations().lock().unwrap();
-            let _ = handle_new_validation_with_store(&AllTrusted, &mut inner, &mut validation, false, None, None);
+            let _ = handle_new_validation_with_store(
+                &AllTrusted,
+                &mut inner,
+                &mut validation,
+                false,
+                None,
+                None,
+            );
         }
 
         assert_eq!(shared.num_trusted_for_ledger(ledger_hash), 1);

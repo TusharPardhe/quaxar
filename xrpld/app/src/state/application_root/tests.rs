@@ -7,15 +7,18 @@ use crate::runtime::main_runtime::{GrpcRuntime, ManagedComponent};
 use crate::shamap::shamap_store_service::SHAMapStoreService;
 use crate::tx_queue::transaction::Transaction;
 use crate::{
-    AppOpenLedgerView, AppQueueApplyTxSource, AppTxQ, NetworkOpsOperatingMode,
-    NetworkOpsProcessSetOwnerSync, NetworkOpsTransactionSetOutcome, SHAMapStore,
-    SHAMapStoreCloseTimeProvider, SHAMapStoreComponent, SHAMapStoreComponentRuntime,
+    AppOpenLedgerView, AppQueueApplyTxSource, AppTxQ, NetworkOpsConsensusMode,
+    NetworkOpsOperatingMode, NetworkOpsProcessSetOwnerSync, NetworkOpsTransactionSetOutcome,
+    SHAMapStore, SHAMapStoreCloseTimeProvider, SHAMapStoreComponent, SHAMapStoreComponentRuntime,
     SHAMapStoreHealthRuntime, SHAMapStoreOperatingMode, SHAMapStoreRuntime, SharedAppTxQ,
     SharedSHAMapStoreHealthState,
 };
 use basics::base_uint::{Uint160, Uint256};
 use basics::sha_map_hash::SHAMapHash;
-use ledger::{LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader, ReadView, Sandbox};
+use ledger::{
+    ApplyView, LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader, ReadView, Sandbox,
+    calculate_ledger_hash,
+};
 use protocol::{
     AccountID, KeyType, LedgerEntryType, Rules, STAmount, STLedgerEntry, STTx, SecretKey, SeqProxy,
     Ter, TxType, account_keylet, calc_account_id, derive_public_key, get_field_by_symbol,
@@ -246,6 +249,36 @@ fn signed_payment_tx_with_ticket(
             get_field_by_symbol("sfAmount"),
             STAmount::new_native(1_000_000, false),
         );
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(fee_drops, false),
+        );
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 0);
+        tx.set_field_u32(get_field_by_symbol("sfTicketSequence"), ticket_sequence);
+        tx.set_field_vl(get_field_by_symbol("sfSigningPubKey"), public.as_bytes());
+    });
+    tx.sign(&public, &secret, None)
+        .expect("signature should succeed");
+    (source, Arc::new(tx))
+}
+
+fn signed_escrow_create_tx_with_ticket(
+    seed: u8,
+    destination: AccountID,
+    ticket_sequence: u32,
+    fee_drops: u64,
+) -> (AccountID, Arc<STTx>) {
+    let secret = SecretKey::from_bytes([seed; 32]);
+    let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+    let source = calc_account_id(public.as_bytes());
+    let mut tx = STTx::new(TxType::ESCROW_CREATE, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+        tx.set_account_id(get_field_by_symbol("sfDestination"), destination);
+        tx.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::new_native(1_000, false),
+        );
+        tx.set_field_u32(get_field_by_symbol("sfFinishAfter"), 1_000);
         tx.set_field_amount(
             get_field_by_symbol("sfFee"),
             STAmount::new_native(fee_drops, false),
@@ -548,6 +581,48 @@ fn apply_submit_tx_for_test(
 }
 
 #[test]
+fn closed_ledger_transition_rebases_persistent_submit_state() {
+    fn immutable_ledger(seq: u32, parent: u8) -> Arc<Ledger> {
+        let mut header = LedgerHeader {
+            seq,
+            parent_hash: SHAMapHash::new(Uint256::from_array([parent; 32])),
+            close_time: seq.saturating_add(10),
+            close_time_resolution: LEDGER_DEFAULT_TIME_RESOLUTION,
+            ..LedgerHeader::default()
+        };
+        header.hash = calculate_ledger_hash(&header);
+        let mut ledger = Ledger::new(header, true);
+        ledger.set_immutable(true);
+        Arc::new(ledger)
+    }
+
+    let root = ApplicationRoot::new(0).expect("root should build");
+    let first = immutable_ledger(100, 0x11);
+    let second = immutable_ledger(101, 0x22);
+    let account = AccountID::from_array([0xA5; 20]);
+
+    root.on_closed_ledger(Arc::clone(&first));
+    *root.open_ledger_sandbox.lock().expect("sandbox mutex") =
+        Some(Sandbox::new(first, ApplyFlags::NONE));
+    root.note_open_ledger_tx(&account, 7);
+
+    root.on_closed_ledger(second);
+
+    assert!(
+        root.open_ledger_sandbox
+            .lock()
+            .expect("sandbox mutex")
+            .is_none(),
+        "a submit sandbox cannot outlive its parent closed ledger"
+    );
+    assert_eq!(
+        root.network_ops_current_account_seq(&account),
+        None,
+        "per-account submit sequence state must be rebased with the sandbox"
+    );
+}
+
+#[test]
 fn app_queue_apply_tx_source_reports_sttx_facts_submit_path() {
     let account = AccountID::from_array([0x61; 20]);
     let destination = AccountID::from_array([0x62; 20]);
@@ -746,6 +821,89 @@ fn submit_direct_apply_ticket_use_clears_ticket_tracking() {
             .exists(protocol::ticket_keylet(raw_account_id(source), 2))
             .expect("ticket lookup should succeed")
     );
+}
+
+#[test]
+fn submit_ticketed_escrow_create_consumes_ticket_preserves_sequence_and_rejects_reuse() {
+    let destination = account("F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1");
+    let (source, ticket_create) = signed_ticket_create_tx(0x63, 1, 1, 10);
+    let (_, ticketed_escrow) = signed_escrow_create_tx_with_ticket(0x63, destination, 2, 11);
+    let (_, stale_ticketed_escrow) = signed_escrow_create_tx_with_ticket(0x63, destination, 2, 12);
+
+    let mut base = ledger_view_with_balance_and_owner_count(1, source, 1, 2_000_000, 0, &[]);
+    base.set_rules(Rules::new([protocol::feature_id("fixIncludeKeyletFields")]));
+    let base = Arc::new(base);
+    let mut open_ledger =
+        AppOpenLedgerView::with_parent_hash(2, 10, *base.header().hash.as_uint256());
+    let mut submit_view = Sandbox::new(Arc::clone(&base), ApplyFlags::NONE);
+
+    let mut destination_root = STLedgerEntry::from_type_and_key(
+        LedgerEntryType::AccountRoot,
+        account_keylet(raw_account_id(destination)).key,
+    );
+    destination_root.set_account_id(get_field_by_symbol("sfAccount"), destination);
+    destination_root.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+    destination_root.set_field_amount(
+        get_field_by_symbol("sfBalance"),
+        STAmount::new_native(2_000_000, false),
+    );
+    destination_root.set_field_u32(get_field_by_symbol("sfOwnerCount"), 0);
+    submit_view
+        .insert(Arc::new(destination_root))
+        .expect("destination account should insert");
+
+    let ticket_create_result =
+        apply_submit_tx_for_test(&mut open_ledger, &mut submit_view, ticket_create, 2);
+    assert_eq!(ticket_create_result.ter, Ter::TES_SUCCESS);
+    assert!(ticket_create_result.applied);
+    assert!(
+        submit_view
+            .exists(protocol::ticket_keylet(raw_account_id(source), 2))
+            .expect("ticket should exist after TicketCreate")
+    );
+
+    let escrow_result =
+        apply_submit_tx_for_test(&mut open_ledger, &mut submit_view, ticketed_escrow, 2);
+    assert_eq!(escrow_result.ter, Ter::TES_SUCCESS);
+    assert!(escrow_result.applied);
+
+    let source_root = submit_view
+        .read(account_keylet(raw_account_id(source)))
+        .expect("source account read should succeed")
+        .expect("source account should exist");
+    assert_eq!(
+        source_root.get_field_u32(get_field_by_symbol("sfSequence")),
+        3,
+        "ticket use must not advance the account-root sequence"
+    );
+    assert_eq!(
+        source_root.get_field_u32(get_field_by_symbol("sfOwnerCount")),
+        1
+    );
+    assert!(
+        !source_root.is_field_present(get_field_by_symbol("sfTicketCount")),
+        "consuming the only ticket must clear TicketCount"
+    );
+    assert!(
+        !submit_view
+            .exists(protocol::ticket_keylet(raw_account_id(source), 2))
+            .expect("consumed ticket lookup should succeed")
+    );
+
+    let escrow = submit_view
+        .read(protocol::escrow_keylet(raw_account_id(source), 2))
+        .expect("ticketed escrow read should succeed")
+        .expect("ticketed escrow should exist");
+    assert_eq!(
+        escrow.get_field_u32(get_field_by_symbol("sfSequence")),
+        2,
+        "fixIncludeKeyletFields must persist the TicketSequence, not Sequence = 0"
+    );
+
+    let stale_result =
+        apply_submit_tx_for_test(&mut open_ledger, &mut submit_view, stale_ticketed_escrow, 2);
+    assert_eq!(stale_result.ter, Ter::TEF_NO_TICKET);
+    assert!(!stale_result.applied);
 }
 
 #[test]
@@ -1285,6 +1443,45 @@ fn application_root_normalizes_connected_to_syncing_with_fresh_validated_ledger(
         NetworkOpsOperatingMode::Syncing
     );
     assert_eq!(app.network_ops_operating_mode_string(), "syncing");
+}
+
+#[test]
+fn application_root_matches_rippled_admin_proposing_presentation() {
+    let app = ApplicationRoot::with_options(super::ApplicationRootOptions {
+        start_valid: true,
+        ..super::ApplicationRootOptions::default()
+    })
+    .expect("root shell should build");
+
+    // A full observing node, including every non-validator stock node, is full
+    // to both public and admin RPC callers.
+    assert_eq!(
+        app.network_ops_operating_mode_string_for_admin(false),
+        "full"
+    );
+    assert_eq!(
+        app.network_ops_operating_mode_string_for_admin(true),
+        "full"
+    );
+
+    app.network_ops_state()
+        .set_consensus_mode(NetworkOpsConsensusMode::Proposing);
+    // rippled only applies the proposing presentation to admin responses.
+    assert_eq!(
+        app.network_ops_operating_mode_string_for_admin(false),
+        "full"
+    );
+    assert_eq!(
+        app.network_ops_operating_mode_string_for_admin(true),
+        "proposing"
+    );
+
+    app.network_ops_state()
+        .set_consensus_mode(NetworkOpsConsensusMode::WrongLedger);
+    assert_eq!(
+        app.network_ops_operating_mode_string_for_admin(true),
+        "full"
+    );
 }
 
 #[test]

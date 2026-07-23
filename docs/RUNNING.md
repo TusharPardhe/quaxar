@@ -1,4 +1,4 @@
-# Running xrpld
+# Running Quaxar
 
 Guide for node operators running the Rust implementation of the XRP Ledger server.
 
@@ -54,7 +54,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 **Linux (Ubuntu/Debian):**
 ```bash
-sudo apt install build-essential pkg-config libssl-dev librocksdb-dev clang cmake
+sudo apt install build-essential pkg-config libssl-dev librocksdb-dev clang cmake git
 ```
 
 **macOS:**
@@ -66,11 +66,11 @@ brew install openssl rocksdb cmake
 
 ```bash
 git clone https://github.com/TusharPardhe/quaxar.git
-cd xrpld
-cargo install --path xrpld/main
+cd quaxar
+CC=clang CXX=clang++ cargo install --path xrpld/main
 ```
 
-This builds the release binary and installs it to `~/.cargo/bin/xrpld` (already in PATH).
+This builds the release binary and installs it to `~/.cargo/bin/quaxar` (already in PATH).
 
 ### Build Troubleshooting
 
@@ -81,13 +81,13 @@ The RocksDB C++ library compiles from source by default and can exhaust memory. 
 ```bash
 # Linux
 sudo apt install librocksdb-dev
-ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu cargo install --path xrpld/main
+ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu CC=clang CXX=clang++ cargo install --path xrpld/main
 ```
 
 **Rustc segfault during build (too many parallel jobs):**
 
 ```bash
-CARGO_BUILD_JOBS=2 cargo install --path xrpld/main
+CARGO_BUILD_JOBS=2 CC=clang CXX=clang++ cargo install --path xrpld/main
 ```
 
 **OpenSSL build failure:**
@@ -191,21 +191,21 @@ for guidance on `ledger_fetch_limit` tuning.
 ## Starting the Node
 
 ```bash
-RUST_LOG=info ./target/release/xrpld --conf xrpld.cfg
+RUST_LOG=info ./target/release/quaxar --conf xrpld.cfg
 ```
 
 Background:
 ```bash
-RUST_LOG=info nohup ./target/release/xrpld --conf xrpld.cfg > xrpld.log 2>&1 &
+RUST_LOG=info nohup ./target/release/quaxar --conf xrpld.cfg > quaxar.log 2>&1 &
 ```
 
 ## Systemd Service
 
-Create `/etc/systemd/system/xrpld.service`:
+Create `/etc/systemd/system/quaxar.service`:
 
 ```ini
 [Unit]
-Description=XRP Ledger Node (Rust)
+Description=Quaxar XRP Ledger Node
 After=network-online.target
 Wants=network-online.target
 
@@ -225,7 +225,7 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now xrpld
+sudo systemctl enable --now quaxar
 ```
 
 ## Monitoring
@@ -244,7 +244,21 @@ Or via RPC:
 curl -s http://127.0.0.1:5005 -d '{"method":"server_info"}' | jq .result.info.server_state
 ```
 
-Expected healthy states: `full`, `proposing`, `validating`.
+A non-validator node normally progresses through `connected`, `syncing`, `tracking`, and `full`; it must not enter `proposing` without validator credentials.
+
+### System Time
+
+Quaxar reads the host operating system's UTC clock. It does not currently consume
+rippled-style `[sntp_servers]` entries, so configure and monitor host NTP rather
+than adding an inert configuration section. On supported Linux hosts:
+
+```bash
+timedatectl status
+sudo timedatectl set-ntp true
+```
+
+Use your platform's standard NTP service or a managed time source before running
+a production node.
 
 ### Database Usage
 
@@ -296,10 +310,14 @@ existing synced node. This bypasses the multi-hour network sync entirely.
 **On the source node (online):**
 
 ```bash
-quaxar rpc export_snapshot
+quaxar export-snapshot --output /var/lib/quaxar/snapshots/bootstrap.xrpls
 ```
 
-The export runs in a background thread. On NVMe, 26.5M nodes export in ~3
+The node exports in a background job and remains online. The CLI displays a
+spinner while it polls the admin `snapshot_status` RPC, then reports completion
+or failure and the resulting file size. On an older node without
+`snapshot_status`, the CLI reports that export was started and instructs the
+operator to monitor snapshot logs instead. On NVMe, 26.5M nodes export in ~3
 minutes. The snapshot file uses LZ4 compressed chunks with SHA-256 integrity
 verification.
 
@@ -309,8 +327,9 @@ verification.
 quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/xrpld/xrpld.cfg
 ```
 
-After import completes, start the node normally. It will resume from the
-snapshot state and catch up to the network tip within minutes.
+The CLI displays a spinner while it imports and verifies all chunk and final
+file hashes. After it reports completion, start the node normally. It will
+resume from the snapshot state and catch up to the network tip within minutes.
 
 See [CLI.md](CLI.md) for command details and [SYNCING.md](SYNCING.md) for
 alternative sync methods.

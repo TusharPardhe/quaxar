@@ -133,7 +133,7 @@ fn server_info_ports_hide_admin_restricted_entries_from_non_admin() {
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
-            standalone_mode: false,
+                standalone_mode: false,
             },
             ServerPortSetup {
                 name: "port_admin".to_owned(),
@@ -153,7 +153,7 @@ fn server_info_ports_hide_admin_restricted_entries_from_non_admin() {
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
-            standalone_mode: false,
+                standalone_mode: false,
             },
         ],
         Some(PublishedGrpcPort {
@@ -280,7 +280,7 @@ fn server_state_ports_hide_admin_restricted_entries_from_non_admin() {
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
-            standalone_mode: false,
+                standalone_mode: false,
             },
             ServerPortSetup {
                 name: "port_admin".to_owned(),
@@ -300,7 +300,7 @@ fn server_state_ports_hide_admin_restricted_entries_from_non_admin() {
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
-            standalone_mode: false,
+                standalone_mode: false,
             },
         ],
         Some(PublishedGrpcPort {

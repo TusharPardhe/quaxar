@@ -123,8 +123,8 @@ pub fn offer_sle(
     sle
 }
 
-/// Build a ledger from entries with standard test config.
-pub fn build_ledger(entries: Vec<STLedgerEntry>) -> Ledger {
+/// Build a ledger from entries with standard test config at an explicit sequence.
+pub fn build_ledger_at_sequence(seq: u32, entries: Vec<STLedgerEntry>) -> Ledger {
     let mut tree = MutableTree::new(1);
     for e in entries {
         tree.add_item(
@@ -135,7 +135,7 @@ pub fn build_ledger(entries: Vec<STLedgerEntry>) -> Ledger {
     }
     let mut ledger = Ledger::from_maps(
         LedgerHeader {
-            seq: 3,
+            seq,
             close_time: 1000,
             parent_close_time: 1000,
             parent_hash: basics::sha_map_hash::SHAMapHash::new(
@@ -158,6 +158,11 @@ pub fn build_ledger(entries: Vec<STLedgerEntry>) -> Ledger {
         increment: 50_000,
     });
     ledger
+}
+
+/// Build a ledger from entries with standard test config.
+pub fn build_ledger(entries: Vec<STLedgerEntry>) -> Ledger {
+    build_ledger_at_sequence(3, entries)
 }
 
 /// Build a ledger with amendments enabled.

@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use basics::sha_map_hash::SHAMapHash;
-use shamap::tree_node::SHAMapNodeType;
 use shamap::fetch::SHAMapSyncFilter;
+use shamap::tree_node::SHAMapNodeType;
 
 use crate::tx_queue::transaction_master::TransactionMaster;
 use ledger::transaction_acquire::TransactionAcquireFilterFactory;

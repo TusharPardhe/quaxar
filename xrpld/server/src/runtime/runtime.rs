@@ -437,6 +437,12 @@ impl ServerRuntime<BuiltinDispatcher<ApplicationServerInfo<OwnedApplicationServe
         }
 
         let shared_subs = Arc::new(SubscriptionManager::default());
+        let subscription_publisher = Arc::clone(&shared_subs);
+        app.set_subscription_publisher(move |stream_name, payload| {
+            if let Some(stream) = crate::StreamKind::from_name(stream_name) {
+                subscription_publisher.publish_json(stream, payload);
+            }
+        });
         let source =
             ApplicationServerInfo::new(OwnedApplicationServerInfo::from_application_root(app));
         let path_source: Arc<dyn rpc::PathFinderSource + Send + Sync> = Arc::new(source.clone());
@@ -547,6 +553,10 @@ mod tests {
     use app::{
         ApplicationRoot, ManagedComponent, ServerPortClientSetup, ServerPortOverlaySetup,
         ServerPortSetup, ServerPortsSetup,
+    };
+    use ledger::{Ledger, TxsRawView};
+    use protocol::{
+        JsonValue, STAmount, STTx, Serializer, Ter, TxMeta, TxType, get_field_by_symbol,
     };
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
@@ -738,7 +748,7 @@ mod tests {
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
-            standalone_mode: false,
+                standalone_mode: false,
             }],
             client: Some(ServerPortClientSetup {
                 secure: false,
@@ -782,6 +792,96 @@ mod tests {
     }
 
     #[test]
+    fn server_runtime_bridges_published_accepted_transactions_exactly_once() {
+        let mut app = ApplicationRoot::new(0).expect("root shell should build");
+        app.attach_server_ports_setup(Arc::new(ServerPortsSetup {
+            ports: vec![ServerPortSetup {
+                name: "port_rpc".to_owned(),
+                ip: "127.0.0.1".to_owned(),
+                port: 0,
+                limit: 0,
+                protocols: vec!["http".to_owned(), "ws".to_owned()],
+                user: String::new(),
+                password: String::new(),
+                admin_user: String::new(),
+                admin_password: String::new(),
+                ssl_key: String::new(),
+                ssl_cert: String::new(),
+                ssl_chain: String::new(),
+                ssl_ciphers: String::new(),
+                admin_nets_v4: Vec::new(),
+                admin_nets_v6: Vec::new(),
+                secure_gateway_nets_v4: Vec::new(),
+                secure_gateway_nets_v6: Vec::new(),
+                standalone_mode: false,
+            }],
+            client: None,
+            overlay: None,
+            grpc: None,
+        }));
+        let runtime =
+            ServerRuntime::from_application_root(&app).expect("runtime should build from app");
+        let mut receiver = runtime
+            .subscriptions()
+            .subscribe(crate::StreamKind::Transactions);
+
+        let source = protocol::AccountID::from_array([0x11; 20]);
+        let destination = protocol::AccountID::from_array([0x22; 20]);
+        let tx = Arc::new(STTx::new(TxType::PAYMENT, |object| {
+            object.set_account_id(get_field_by_symbol("sfAccount"), source);
+            object.set_account_id(get_field_by_symbol("sfDestination"), destination);
+            object.set_field_amount(
+                get_field_by_symbol("sfAmount"),
+                STAmount::new_native(1_000, false),
+            );
+            object.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+            object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        }));
+        let mut meta = TxMeta::new(tx.get_transaction_id(), 500);
+        meta.set_delivered_amount(Some(STAmount::new_native(800, false)));
+        let mut raw_meta = Serializer::default();
+        meta.add_raw(&mut raw_meta, Ter::TES_SUCCESS, 0);
+
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(500, 500_000_000, false);
+        ledger
+            .raw_tx_insert(
+                tx.get_transaction_id(),
+                Arc::new(Serializer::from_bytes(tx.get_serializer().data())),
+                Some(Arc::new(raw_meta)),
+            )
+            .expect("accepted transaction should insert");
+        app.on_published_ledger(Arc::new(ledger));
+
+        let event = receiver
+            .try_recv()
+            .expect("runtime subscriber should receive accepted transaction");
+        assert!(
+            receiver.try_recv().is_err(),
+            "a published ledger must produce exactly one transaction event"
+        );
+        let event: JsonValue = sonic_rs::from_slice(&event.payload).expect("event JSON");
+        let JsonValue::Object(event) = event else {
+            panic!("transaction event should be an object")
+        };
+        assert_eq!(
+            event.get("type"),
+            Some(&JsonValue::String("transaction".to_owned()))
+        );
+        assert_eq!(event.get("validated"), Some(&JsonValue::Bool(true)));
+        let JsonValue::Object(meta) = event.get("meta").expect("event metadata") else {
+            panic!("event metadata should be an object")
+        };
+        assert_eq!(meta.get("DeliveredAmount"), meta.get("delivered_amount"));
+        assert_eq!(
+            meta.get("DeliveredAmount"),
+            Some(&JsonValue::String("800".to_owned()))
+        );
+    }
+
+    #[test]
     fn server_runtime_builds_from_current_thread_application_root() {
         let mut app = ApplicationRoot::new(0).expect("root shell should build");
         app.attach_server_ports_setup(Arc::new(ServerPortsSetup {
@@ -803,7 +903,7 @@ mod tests {
                 admin_nets_v6: Vec::new(),
                 secure_gateway_nets_v4: Vec::new(),
                 secure_gateway_nets_v6: Vec::new(),
-            standalone_mode: false,
+                standalone_mode: false,
             }],
             client: Some(ServerPortClientSetup {
                 secure: false,

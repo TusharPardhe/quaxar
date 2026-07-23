@@ -2,8 +2,8 @@
 
 use protocol::{
     KeyType, PublicKey, SecretKey, Seed, TokenType, derive_public_key, encode_base58_token,
-    generate_root_secret_key, parse_base58_node_public, parse_base58_seed,
-    parse_base58_with_type, parse_generic_seed, random_seed,
+    generate_root_secret_key, parse_base58_node_public, parse_base58_seed, parse_base58_with_type,
+    parse_generic_seed, random_seed,
 };
 use rusqlite::OptionalExtension;
 use std::fmt;

@@ -50,7 +50,9 @@ pub fn delete_sle(
     let subject = sle_credential.get_account_id(sf("sfSubject"));
     let accepted = sle_credential.is_flag(lsfAccepted);
 
-    // Remove from issuer's directory
+    let Some(issuer_sle) = view.peek(account_keylet(to_uint160(issuer)))? else {
+        return Ok(Ter::TEC_INTERNAL);
+    };
     let issuer_page = sle_credential.get_field_u64(sf("sfIssuerNode"));
     if !dir_remove(
         view,
@@ -62,17 +64,16 @@ pub fn delete_sle(
         return Ok(Ter::TEF_BAD_LEDGER);
     }
 
-    // Adjust owner count for issuer if they are the owner
-    let issuer_is_owner = !accepted || (subject == issuer);
-    if issuer_is_owner {
-        let Some(issuer_sle) = view.peek(account_keylet(to_uint160(issuer)))? else {
-            return Ok(Ter::TEF_BAD_LEDGER);
-        };
+    if !accepted || subject == issuer {
         adjust_owner_count(view, &issuer_sle, -1)?;
     }
 
-    // Remove from subject's directory (if different from issuer)
+    // rippled processes the accepted-subject leg only after completing the
+    // issuer leg. Preserve that mutation order for malformed-ledger paths.
     if subject != issuer {
+        let Some(subject_sle) = view.peek(account_keylet(to_uint160(subject)))? else {
+            return Ok(Ter::TEC_INTERNAL);
+        };
         let subject_page = sle_credential.get_field_u64(sf("sfSubjectNode"));
         if !dir_remove(
             view,
@@ -84,12 +85,7 @@ pub fn delete_sle(
             return Ok(Ter::TEF_BAD_LEDGER);
         }
 
-        // C++ parity: only decrement subject OwnerCount when credential was
-        // accepted (ownership transferred from issuer to subject on accept).
         if accepted {
-            let Some(subject_sle) = view.peek(account_keylet(to_uint160(subject)))? else {
-                return Ok(Ter::TEF_BAD_LEDGER);
-            };
             adjust_owner_count(view, &subject_sle, -1)?;
         }
     }
@@ -283,7 +279,12 @@ pub fn verify_valid_domain(
         {
             found_expired = true;
             let result = delete_sle(view, sle_cred)?;
-            if !protocol::is_tes_success(result) {
+            // Before fixCleanup3_1_3, removeExpired reported the expired
+            // credential even when deletion failed. Preserve that replay
+            // behavior; the amendment makes the deletion failure observable.
+            if view.rules().enabled(&protocol::fix_cleanup_3_1_3())
+                && !protocol::is_tes_success(result)
+            {
                 return Ok(result);
             }
         }
@@ -328,7 +329,11 @@ pub fn verify_deposit_preauth(
             {
                 found_expired = true;
                 let result = delete_sle(view, sle_cred)?;
-                if !protocol::is_tes_success(result) {
+                // See verify_valid_domain: deletion errors were ignored until
+                // fixCleanup3_1_3, even though the credential was expired.
+                if view.rules().enabled(&protocol::fix_cleanup_3_1_3())
+                    && !protocol::is_tes_success(result)
+                {
                     return Ok(result);
                 }
             }

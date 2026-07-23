@@ -1,14 +1,22 @@
-use app::{AppLedgerFill, LedgerToJsonContext, LedgerTxEntry, get_json};
+use app::{AppLedgerFill, LedgerToJsonContext, LedgerTxEntry, get_json, get_json_with_family};
 use basics::base_uint::Uint256;
 use basics::chrono::NetClockTimePoint;
 use basics::sha_map_hash::SHAMapHash;
 use basics::str_hex::str_hex;
+use basics::tagged_cache::MonotonicClock;
 use ledger::{Ledger, LedgerFillOptions, LedgerHeader};
 use protocol::{
-    AccountID, JsonValue, LedgerEntryType, MPTID, STAmount, STArray, STObject, STTx, TxMeta,
-    TxType, get_field_by_symbol, make_mpt_id,
+    AccountID, JsonValue, LedgerEntryType, MPTID, STAmount, STArray, STObject, STTx, Serializer,
+    TxMeta, TxType, get_field_by_symbol, make_mpt_id,
 };
+use shamap::family::{NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
+use shamap::item::SHAMapItem;
+use shamap::mutation::MutableTree;
+use shamap::sync::{SHAMapType, SyncState, SyncTree};
+use shamap::tree_node::SHAMapNodeType;
+use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 fn account(hex: &str) -> AccountID {
     AccountID::from_hex(hex).expect("account hex should parse")
@@ -167,6 +175,68 @@ fn array(value: &JsonValue) -> &[JsonValue] {
         panic!("json value must be an array");
     };
     values
+}
+
+#[test]
+fn ledger_to_json_tx_family_traverses_transaction_md_leaves() {
+    let tx = payment_tx(7);
+    let meta = payment_meta(tx.get_transaction_id(), 44, None);
+    let mut payload = Serializer::new(0);
+    payload.add_vl(tx.get_serializer().data());
+    payload.add_vl(meta.get_as_object().get_serializer().data());
+
+    let mut tx_tree = MutableTree::new(44);
+    tx_tree
+        .add_item(
+            SHAMapNodeType::TransactionMd,
+            SHAMapItem::new(tx.get_transaction_id(), payload.data().to_vec()),
+        )
+        .expect("TransactionMd leaf should insert");
+    let tx_root = tx_tree.root();
+    let mut ledger = Ledger::from_maps(
+        LedgerHeader {
+            seq: 44,
+            hash: hash(0xAA),
+            parent_hash: hash(0xAB),
+            tx_hash: tx_root.get_hash(),
+            ..LedgerHeader::default()
+        },
+        SyncTree::new_with_type(SHAMapType::State, false, 44),
+        SyncTree::from_root_with_type(
+            tx_root,
+            SHAMapType::Transaction,
+            true,
+            44,
+            SyncState::Immutable,
+        ),
+    );
+    ledger.set_immutable(true);
+
+    let family = SHAMapFamily::new(
+        Arc::new(TreeNodeCache::new(
+            "ledger-json-transaction-md",
+            8,
+            time::Duration::seconds(1),
+            MonotonicClock::default(),
+        )),
+        NullFullBelowCache::new(0),
+        NullNodeFetcher,
+        NullMissingNodeReporter,
+    );
+    let rendered = get_json_with_family(
+        &AppLedgerFill::new(&ledger, LedgerFillOptions::DUMP_TXRP),
+        &family,
+    )
+    .expect("family-aware ledger rendering should succeed");
+    let rendered = object(rendered);
+    assert_eq!(
+        array(
+            rendered
+                .get("transactions")
+                .expect("transactions should be present")
+        ),
+        &[JsonValue::String(tx.get_transaction_id().to_string())]
+    );
 }
 
 #[test]

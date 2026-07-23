@@ -3,7 +3,11 @@
 
 use std::collections::BTreeMap;
 
-use protocol::{get_field_by_symbol, JsonValue, STAmount, STTx, TxType};
+use basics::base_uint::{Uint160, Uint192};
+use protocol::{
+    get_field_by_symbol, AccountID, JsonValue, MPTAmount, MPTIssue, STAmount, STLedgerEntry, STTx,
+    TxType,
+};
 use rpc_integration_tests::env::*;
 use server::{StreamKind, SubscriptionManager};
 
@@ -68,6 +72,143 @@ fn publish_transaction(subs: &SubscriptionManager, tx_type: &str, account: &str,
             ("validated".to_owned(), JsonValue::Bool(true)),
         ])),
     );
+}
+
+fn account_uint160(account: AccountID) -> Uint160 {
+    Uint160::from_slice(account.data()).expect("account ID width")
+}
+
+fn mpt_id_for(issuer: AccountID, sequence: u32) -> Uint192 {
+    let mut bytes = [0u8; 24];
+    bytes[..4].copy_from_slice(&sequence.to_be_bytes());
+    bytes[4..].copy_from_slice(issuer.data());
+    Uint192::from_slice(&bytes).expect("MPT ID width")
+}
+
+fn mpt_issuance_entry(issuer: AccountID, sequence: u32) -> STLedgerEntry {
+    let keylet = protocol::mpt_issuance_keylet(sequence, account_uint160(issuer));
+    let mut entry = STLedgerEntry::new(keylet);
+    entry.set_account_id(get_field_by_symbol("sfIssuer"), issuer);
+    entry.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+    entry.set_field_u64(get_field_by_symbol("sfOutstandingAmount"), 10_000);
+    entry.set_field_u16(get_field_by_symbol("sfTransferFee"), 25_000);
+    entry.set_field_u32(get_field_by_symbol("sfFlags"), protocol::lsfMPTCanTransfer);
+    entry.set_field_u64(get_field_by_symbol("sfOwnerNode"), 0);
+    entry
+}
+
+fn mptoken_entry(holder: AccountID, issuance_id: Uint192, amount: u64) -> STLedgerEntry {
+    let keylet = protocol::mptoken_keylet_from_mptid(issuance_id, account_uint160(holder));
+    let mut entry = STLedgerEntry::new(keylet);
+    entry.set_account_id(get_field_by_symbol("sfAccount"), holder);
+    entry.set_field_h192(get_field_by_symbol("sfMPTokenIssuanceID"), issuance_id);
+    entry.set_field_u64(get_field_by_symbol("sfMPTAmount"), amount);
+    entry.set_field_u32(get_field_by_symbol("sfFlags"), 0);
+    entry.set_field_u64(get_field_by_symbol("sfOwnerNode"), 0);
+    entry
+}
+
+#[test]
+fn accepted_mpt_partial_payment_publishes_persisted_delivered_amount_only_when_enabled() {
+    for amendment_enabled in [false, true] {
+        let mut source = TestAccount::new(if amendment_enabled {
+            "sub_mpt_source_on"
+        } else {
+            "sub_mpt_source_off"
+        });
+        let destination = TestAccount::new(if amendment_enabled {
+            "sub_mpt_destination_on"
+        } else {
+            "sub_mpt_destination_off"
+        });
+        let issuer = TestAccount::new(if amendment_enabled {
+            "sub_mpt_issuer_on"
+        } else {
+            "sub_mpt_issuer_off"
+        });
+        let issuance_id = mpt_id_for(issuer.id, 1);
+        let features = amendment_enabled
+            .then_some(protocol::fix_mpt_delivered_amount())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let env = RpcTestEnv::with_entries_and_features(
+            &[
+                (&source, 1_000_000_000),
+                (&destination, 1_000_000_000),
+                (&issuer, 1_000_000_000),
+            ],
+            &[
+                mpt_issuance_entry(issuer.id, 1),
+                mptoken_entry(source.id, issuance_id, 10_000),
+            ],
+            &features,
+        );
+        let subscriptions = SubscriptionManager::new(16);
+        let publisher = subscriptions.clone();
+        env.app.set_subscription_publisher(move |stream, payload| {
+            if let Some(kind) = StreamKind::from_name(stream) {
+                publisher.publish_json(kind, payload);
+            }
+        });
+        let mut receiver = subscriptions.subscribe(StreamKind::Transactions);
+        let mut payment = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), source.id);
+            tx.set_account_id(get_field_by_symbol("sfDestination"), destination.id);
+            tx.set_field_amount(
+                get_field_by_symbol("sfAmount"),
+                STAmount::from_mpt_amount(
+                    get_field_by_symbol("sfAmount"),
+                    MPTAmount::from_value(1_000),
+                    MPTIssue::new(issuance_id),
+                ),
+            );
+            tx.set_field_u32(get_field_by_symbol("sfFlags"), 0x0002_0000);
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+            tx.set_field_u32(get_field_by_symbol("sfSequence"), source.next_seq());
+        });
+        sign_tx(&mut payment, &source);
+        env.submit_and_close(&payment);
+
+        let event = receiver
+            .try_recv()
+            .expect("accepted ledger must publish transaction event");
+        let payload: JsonValue = serde_json::from_slice(&event.payload).expect("event JSON");
+        assert!(
+            receiver.try_recv().is_err(),
+            "accepted ledger must publish exactly one transaction event"
+        );
+        let JsonValue::Object(payload) = payload else {
+            panic!("event object")
+        };
+        assert_eq!(payload.get("validated"), Some(&JsonValue::Bool(true)));
+        let JsonValue::Object(meta) = payload.get("meta").expect("event metadata") else {
+            panic!("metadata object")
+        };
+        if amendment_enabled {
+            assert!(meta.contains_key("DeliveredAmount"));
+            assert_eq!(meta.get("DeliveredAmount"), meta.get("delivered_amount"));
+        } else {
+            assert!(!meta.contains_key("DeliveredAmount"));
+            assert!(
+                matches!(meta.get("delivered_amount"), Some(JsonValue::Object(amount)) if amount.get("value") == Some(&JsonValue::String("1000".to_owned()))),
+                "legacy fallback must expose the requested MPT amount without sfDeliveredAmount"
+            );
+        }
+        let closed = env.app.closed_ledger().expect("closed ledger");
+        let (_, persisted_meta) = closed
+            .tx_snapshot()
+            .expect("accepted transactions")
+            .into_iter()
+            .next()
+            .expect("payment metadata");
+        assert_eq!(
+            persisted_meta.get_delivered_amount().is_some(),
+            amendment_enabled
+        );
+    }
 }
 
 #[test]

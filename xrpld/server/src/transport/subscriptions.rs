@@ -129,7 +129,10 @@ impl SubscriptionManager {
     pub fn publish_json(&self, stream: StreamKind, payload: JsonValue) -> usize {
         let json = crate::json::from_protocol_json(&payload);
         let text = sonic_rs::to_string(&json).unwrap_or_default();
-        self.publish(SubscriptionEvent { stream, payload: bytes::Bytes::from(text) })
+        self.publish(SubscriptionEvent {
+            stream,
+            payload: bytes::Bytes::from(text),
+        })
     }
 
     pub fn unsubscribe(&self, stream: StreamKind) {

@@ -118,8 +118,11 @@ impl NodeStoreScheduler {
             return;
         }
 
-        self.job_queue
-            .add_load_events(JobType::JtNsWrite, report.write_count as u64, report.elapsed);
+        self.job_queue.add_load_events(
+            JobType::JtNsWrite,
+            report.write_count as u64,
+            report.elapsed,
+        );
     }
 }
 

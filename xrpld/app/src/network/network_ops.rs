@@ -26,6 +26,20 @@ pub enum NetworkOpsOperatingMode {
     Full,
 }
 
+/// Snapshot of the consensus engine mode used by `NetworkOPs::strOperatingMode`.
+///
+/// This deliberately remains distinct from the node operating mode: rippled
+/// only exposes `proposing` for an admin response when a full node's consensus
+/// engine is actively proposing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum NetworkOpsConsensusMode {
+    Observing = 0,
+    Proposing = 1,
+    WrongLedger = 2,
+    SwitchedLedger = 3,
+}
+
 impl NetworkOpsOperatingMode {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -186,7 +200,7 @@ impl SharedNetworkOpsState {
     pub fn new(operating_mode: NetworkOpsOperatingMode) -> Self {
         Self {
             operating_mode: AtomicU8::new(encode_operating_mode(operating_mode)),
-            consensus_mode: AtomicU8::new(0),
+            consensus_mode: AtomicU8::new(NetworkOpsConsensusMode::Observing as u8),
             need_network_ledger: AtomicBool::new(false),
             amendment_blocked: AtomicBool::new(false),
             unl_blocked: AtomicBool::new(false),
@@ -194,12 +208,17 @@ impl SharedNetworkOpsState {
         }
     }
 
-    pub fn consensus_mode(&self) -> u8 {
-        self.consensus_mode.load(Ordering::Acquire)
+    pub fn consensus_mode(&self) -> NetworkOpsConsensusMode {
+        match self.consensus_mode.load(Ordering::Acquire) {
+            1 => NetworkOpsConsensusMode::Proposing,
+            2 => NetworkOpsConsensusMode::WrongLedger,
+            3 => NetworkOpsConsensusMode::SwitchedLedger,
+            _ => NetworkOpsConsensusMode::Observing,
+        }
     }
 
-    pub fn set_consensus_mode(&self, mode: u8) {
-        self.consensus_mode.store(mode, Ordering::Release);
+    pub fn set_consensus_mode(&self, mode: NetworkOpsConsensusMode) {
+        self.consensus_mode.store(mode as u8, Ordering::Release);
     }
 
     pub fn set_operating_mode(&self, operating_mode: NetworkOpsOperatingMode) {
@@ -340,7 +359,7 @@ impl AppNetworkOpsModeOwner {
         self.state.unl_blocked()
     }
 
-    pub fn set_consensus_mode(&self, mode: u8) {
+    pub fn set_consensus_mode(&self, mode: NetworkOpsConsensusMode) {
         self.state.set_consensus_mode(mode);
     }
 

@@ -45,7 +45,8 @@ pub trait AppServerInfoView {
     fn network_ops_runtime(&self) -> Option<Arc<app::AppNetworkOpsRuntime>> {
         None
     }
-    fn network_ops_operating_mode_string(&self) -> &'static str;
+    fn network_ops_operating_mode(&self) -> app::NetworkOpsOperatingMode;
+    fn network_ops_operating_mode_string(&self, admin: bool) -> &'static str;
     fn need_network_ledger(&self) -> bool;
     fn amendment_blocked(&self) -> bool;
     fn unl_blocked(&self) -> bool;
@@ -166,8 +167,12 @@ impl<T: AppServerInfoView + ?Sized> AppServerInfoView for &T {
         (**self).network_ops_runtime()
     }
 
-    fn network_ops_operating_mode_string(&self) -> &'static str {
-        (**self).network_ops_operating_mode_string()
+    fn network_ops_operating_mode(&self) -> app::NetworkOpsOperatingMode {
+        (**self).network_ops_operating_mode()
+    }
+
+    fn network_ops_operating_mode_string(&self, admin: bool) -> &'static str {
+        (**self).network_ops_operating_mode_string(admin)
     }
 
     fn need_network_ledger(&self) -> bool {
@@ -383,8 +388,12 @@ impl AppServerInfoView for ApplicationRoot {
         self.network_ops_runtime()
     }
 
-    fn network_ops_operating_mode_string(&self) -> &'static str {
-        self.network_ops_operating_mode_string()
+    fn network_ops_operating_mode(&self) -> app::NetworkOpsOperatingMode {
+        ApplicationRoot::network_ops_operating_mode(self)
+    }
+
+    fn network_ops_operating_mode_string(&self, admin: bool) -> &'static str {
+        self.network_ops_operating_mode_string_for_admin(admin)
     }
 
     fn need_network_ledger(&self) -> bool {
@@ -548,10 +557,16 @@ impl AppServerInfoView for OwnedApplicationServerInfo {
         self.network_ops_runtime.clone()
     }
 
-    fn network_ops_operating_mode_string(&self) -> &'static str {
-        // Match rippled: Full + active validator = "proposing"
-        if self.network_ops_state.operating_mode()
-            == app::network::network_ops::NetworkOpsOperatingMode::Full
+    fn network_ops_operating_mode(&self) -> app::NetworkOpsOperatingMode {
+        self.network_ops_state.operating_mode()
+    }
+
+    fn network_ops_operating_mode_string(&self, admin: bool) -> &'static str {
+        use app::{NetworkOpsConsensusMode, NetworkOpsOperatingMode};
+
+        if admin
+            && self.network_ops_state.operating_mode() == NetworkOpsOperatingMode::Full
+            && self.network_ops_state.consensus_mode() == NetworkOpsConsensusMode::Proposing
         {
             return "proposing";
         }

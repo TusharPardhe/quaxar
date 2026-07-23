@@ -116,7 +116,7 @@ pub fn make_features_request_header(
         header.push_str("txrr=1;");
     }
     if vp_reduce_relay_enabled {
-        header.push_str("vprr=1;");
+        header.push_str("compr=lz4;ledgerreplay=1;txrr=1;");
     }
     header
 }
@@ -140,7 +140,7 @@ pub fn make_features_response_header(
         header.push_str("txrr=1;");
     }
     if vp_reduce_relay_enabled && feature_enabled(headers, FEATURE_VPRR) {
-        header.push_str("vprr=1;");
+        header.push_str("compr=lz4;ledgerreplay=1;txrr=1;");
     }
     header
 }
@@ -830,7 +830,7 @@ mod tests {
     fn feature_header_builders_match_cpp_shape() {
         assert_eq!(
             make_features_request_header(true, true, true, true),
-            "compr=lz4;ledgerreplay=1;txrr=1;vprr=1;"
+            "compr=lz4;ledgerreplay=1;txrr=1;"
         );
         let request = make_request(true, true, true, true, true);
         assert_eq!(

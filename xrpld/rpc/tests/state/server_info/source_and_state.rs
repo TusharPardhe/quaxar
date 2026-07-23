@@ -284,8 +284,12 @@ fn server_info_reads_application_owner_state_boundary() {
         panic!("load must be object");
     };
     // Our load object uses different field names than rippled's job_count/process_count
-    assert!(load.contains_key("jobs") || load.contains_key("load_events") || load.contains_key("threads"),
-        "load object should contain known fields, got: {load:?}");
+    assert!(
+        load.contains_key("jobs")
+            || load.contains_key("load_events")
+            || load.contains_key("threads"),
+        "load object should contain known fields, got: {load:?}"
+    );
     let JsonValue::Object(validated_ledger) = info
         .get("validated_ledger")
         .expect("validated ledger must exist")

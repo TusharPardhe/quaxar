@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use app::state::application_root::apply_submit_transactor_shell;
 use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView};
@@ -544,6 +545,81 @@ fn offer_tick_size_rounding() {
     let tx = offer_tx(alice, xrp(1_234_567_890), iou(gw, usd, 999), 1);
     let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
     assert_eq!(result, Ter::TES_SUCCESS);
+}
+
+#[test]
+fn offer_tick_size_zero_rate_tef_rolls_back_shell_state() {
+    let alice = acct(0x11);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+
+    let mut gw_root = account_root(gw, 10_000_000_000, 0, 0);
+    gw_root.set_field_u8(sf("sfTickSize"), 5);
+    let ledger = build_ledger(vec![
+        account_root(alice, 10_000_000_000, 1, 0),
+        gw_root,
+        trust_line(alice, gw, usd, 1_000, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    // Create an offer that the malformed rounded offer will try to cancel.
+    // This gives the test a concrete mutation that must be discarded for TEF.
+    let original = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 999), 1);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &original, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    let account_key = account_keylet(acct_id(alice));
+    let offer_key = protocol::offer_keylet(acct_id(alice), 1);
+    let account_before = view
+        .read(account_key)
+        .expect("account read")
+        .expect("account");
+    let balance_before = account_before.get_field_amount(sf("sfBalance"));
+    let sequence_before = account_before.get_field_u32(sf("sfSequence"));
+    let staged_entries_before = view.table().size();
+    let destroyed_before = view.table().drops_destroyed();
+    assert!(view.read(offer_key).expect("offer read").is_some());
+
+    // The smallest valid IOU divided by the largest XRP amount yields a
+    // zero/unrepresentable tick-rounded rate. rippled divides by that zero
+    // rate, catches the exception at doApply, and returns tefEXCEPTION
+    // without applying its per-transaction OpenView.
+    let tiny_iou = STAmount::from_iou_amount(
+        sf("sfTakerPays"),
+        IOUAmount::min_positive_amount(),
+        Issue::new(usd, gw),
+    );
+    let zero_rate = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        tx.set_field_amount(sf("sfTakerPays"), tiny_iou);
+        tx.set_field_amount(sf("sfTakerGets"), xrp(100_000_000_000_000_000));
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 2);
+    });
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &zero_rate, TxType::OFFER_CREATE),
+        Ter::TEF_EXCEPTION
+    );
+
+    let account_after = view
+        .read(account_key)
+        .expect("account read")
+        .expect("account");
+    assert_eq!(
+        account_after.get_field_amount(sf("sfBalance")),
+        balance_before
+    );
+    assert_eq!(
+        account_after.get_field_u32(sf("sfSequence")),
+        sequence_before
+    );
+    assert!(view.read(offer_key).expect("offer read").is_some());
+    assert_eq!(view.table().size(), staged_entries_before);
+    assert_eq!(view.table().drops_destroyed(), destroyed_before);
 }
 
 /// C++ Offer_test — offer fees consume funds (transfer rate eats into available).

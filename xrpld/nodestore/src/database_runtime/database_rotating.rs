@@ -102,9 +102,14 @@ impl DatabaseDelegate for DatabaseRotatingCore {
                 // to be deleted; without this, a node canonicalized into
                 // the cache after the freshen snapshot would survive only
                 // in RAM once the archive is dropped.
-                if !duplicate && self.rotation_in_flight.load(std::sync::atomic::Ordering::Acquire) {
+                if !duplicate
+                    && self
+                        .rotation_in_flight
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
                     writable.store(Arc::clone(node_object_ref));
-                    self.copy_forward_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.copy_forward_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -127,7 +132,7 @@ pub struct DatabaseRotatingImp {
 
 impl Drop for DatabaseRotatingImp {
     fn drop(&mut self) {
-        self.database.stop();
+        self.stop();
     }
 }
 
@@ -173,12 +178,14 @@ impl DatabaseRotatingImp {
     /// Call with `true` before starting the copy phase, `false` after
     /// rotate() completes. Matches rippled's setRotationInFlight().
     pub fn set_rotation_in_flight(&self, in_flight: bool) {
-        self.rotation_in_flight.store(in_flight, std::sync::atomic::Ordering::Release);
+        self.rotation_in_flight
+            .store(in_flight, std::sync::atomic::Ordering::Release);
     }
 
     /// Returns and resets the count of nodes copied forward during rotation.
     pub fn take_copy_forward_count(&self) -> u64 {
-        self.copy_forward_count.swap(0, std::sync::atomic::Ordering::Relaxed)
+        self.copy_forward_count
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn rotate_impl(&self, new_backend: Box<dyn Backend>, callback: &mut dyn FnMut(&str, &str)) {
@@ -286,6 +293,21 @@ impl DatabaseRotatingImp {
 
     pub fn stop(&self) {
         self.database.stop();
+        let (writable, archive) = {
+            let state = self
+                .state
+                .lock()
+                .expect("rotating backend mutex must not be poisoned");
+            (
+                Arc::clone(&state.writable_backend),
+                Arc::clone(&state.archive_backend),
+            )
+        };
+        for (role, backend) in [("writable", writable), ("archive", archive)] {
+            if let Err(error) = backend.close() {
+                tracing::error!(target: "nodestore", %error, role, "Rotating NodeStore backend close failed");
+            }
+        }
     }
 
     pub fn is_stopping(&self) -> bool {

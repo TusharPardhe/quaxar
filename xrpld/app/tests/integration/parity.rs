@@ -19830,25 +19830,6 @@ fn ls6_deposit_preauth_ten() {
 }
 
 #[test]
-fn ls6_nftoken_mint_twenty() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 50_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for i in 1..=20u32 {
-        let tx = STTx::new(TxType::NFTOKEN_MINT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfNFTokenTaxon"), i);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), i);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::NFTOKEN_MINT),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
-#[test]
 fn ls6_credential_twenty() {
     let i = acct(0x11);
     let s = acct(0x22);

@@ -160,11 +160,7 @@ fn execute_direct_fwd<V: ApplyView>(
             crate::domain::mul_ratio::QUALITY_ONE,
             true, // round up (src pays more)
         );
-        protocol::STAmount::from_iou_amount(
-            sf("sfAmount"),
-            adjusted_iou,
-            step_issue,
-        )
+        protocol::STAmount::from_iou_amount(sf("sfAmount"), adjusted_iou, step_issue)
     } else {
         deliver.clone()
     };

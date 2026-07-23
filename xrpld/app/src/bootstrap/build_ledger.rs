@@ -26,8 +26,8 @@ use protocol::{
     JsonOptions, Keylet, LedgerEntryType, STTx, Serializer, StBase, fee_settings_keylet,
     skip_keylet,
 };
-use shamap::{mutation::MutationError, traversal::TraversalError};
 use rayon::prelude::*;
+use shamap::{mutation::MutationError, traversal::TraversalError};
 use tx::{ApplyFlags, ApplyTransactionResult};
 
 use crate::{LEDGER_RETRY_PASSES, LEDGER_TOTAL_PASSES};
@@ -496,7 +496,10 @@ pub fn decode_acquired_tx_set(
 /// Parallel signature pre-validation using rayon.
 /// Returns the set of transaction IDs with invalid signatures so the
 /// sequential apply loop can skip them without calling check_sign again.
-fn parallel_sig_precheck(txs: &[Arc<STTx>], rules: &protocol::Rules) -> std::collections::HashSet<Uint256> {
+fn parallel_sig_precheck(
+    txs: &[Arc<STTx>],
+    rules: &protocol::Rules,
+) -> std::collections::HashSet<Uint256> {
     txs.par_iter()
         .filter_map(|tx| {
             if tx.check_sign(rules).is_err() {

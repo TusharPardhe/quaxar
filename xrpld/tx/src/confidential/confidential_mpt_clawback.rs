@@ -55,9 +55,7 @@ pub struct ConfidentialMPTClawbackPreclaimFacts {
     pub proof_valid: bool,
 }
 
-pub fn run_confidential_mpt_clawback_preclaim(
-    facts: &ConfidentialMPTClawbackPreclaimFacts,
-) -> Ter {
+pub fn run_confidential_mpt_clawback_preclaim(facts: &ConfidentialMPTClawbackPreclaimFacts) -> Ter {
     if !facts.account_exists {
         return Ter::TER_NO_ACCOUNT;
     }

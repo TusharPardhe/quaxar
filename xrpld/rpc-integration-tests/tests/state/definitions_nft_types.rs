@@ -83,9 +83,21 @@ fn nft_type_code_5() {
     let mut r3 = m.subscribe(StreamKind::Ledger);
     let p = JsonValue::Object(BTreeMap::from([("v".to_owned(), u(42))]));
     m.publish_json(StreamKind::Ledger, p.clone());
-    { let _ev = r1.try_recv().unwrap(); let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap(); assert_eq!(parsed, p); }
-    { let _ev = r2.try_recv().unwrap(); let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap(); assert_eq!(parsed, p); }
-    { let _ev = r3.try_recv().unwrap(); let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap(); assert_eq!(parsed, p); }
+    {
+        let _ev = r1.try_recv().unwrap();
+        let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap();
+        assert_eq!(parsed, p);
+    }
+    {
+        let _ev = r2.try_recv().unwrap();
+        let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap();
+        assert_eq!(parsed, p);
+    }
+    {
+        let _ev = r3.try_recv().unwrap();
+        let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap();
+        assert_eq!(parsed, p);
+    }
 }
 #[test]
 fn nft_type_code_6() {
@@ -100,7 +112,7 @@ fn nft_type_code_6() {
     let mut c = 0;
     while let Ok(e) = r.try_recv() {
         let _payload_json: JsonValue = serde_json::from_slice(&e.payload).unwrap();
-    let JsonValue::Object(p) = _payload_json else {
+        let JsonValue::Object(p) = _payload_json else {
             panic!("")
         };
         assert_eq!(p.get("i"), Some(&u(c)));

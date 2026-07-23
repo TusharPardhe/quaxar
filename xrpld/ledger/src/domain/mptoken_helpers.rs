@@ -375,12 +375,12 @@ pub fn require_auth_mpt_with_type(
         .enabled(&protocol::feature_id("SingleAssetVault"))
         || view.rules().enabled(&protocol::feature_id("MPTokensV2")))
         && let Some(account_root) = view.read(account_key)?
-            && (account_root.is_field_present(sf("sfVaultID"))
-                || account_root.is_field_present(sf("sfLoanBrokerID"))
-                || account_root.is_field_present(sf("sfAMMID")))
-        {
-            return Ok(Ter::TES_SUCCESS);
-        }
+        && (account_root.is_field_present(sf("sfVaultID"))
+            || account_root.is_field_present(sf("sfLoanBrokerID"))
+            || account_root.is_field_present(sf("sfAMMID")))
+    {
+        return Ok(Ter::TES_SUCCESS);
+    }
 
     let mptoken_key = mptoken_keylet_from_mptid(mpt_issue.mpt_id(), to_uint160(*account));
     let sle_token = view.read(mptoken_key)?;
@@ -742,6 +742,14 @@ pub fn add_empty_holding_mpt(
     authorize_mp_token(view, mpt_id, account_id)
 }
 
+fn mpt_holding_has_obligations(
+    mpt_amount: u64,
+    locked_amount: u64,
+    fix_cleanup_3_1_3: bool,
+) -> bool {
+    mpt_amount != 0 || (fix_cleanup_3_1_3 && locked_amount != 0)
+}
+
 /// Remove an empty MPToken holding.
 ///
 pub fn remove_empty_holding_mpt(
@@ -763,12 +771,11 @@ pub fn remove_empty_holding_mpt(
     } else {
         0
     };
-    if mptoken.get_field_u64(sf("sfMPTAmount")) != 0
-        || (view
-            .rules()
-            .enabled(&protocol::feature_id("fixCleanup3_1_3"))
-            && locked_amount != 0)
-    {
+    if mpt_holding_has_obligations(
+        mptoken.get_field_u64(sf("sfMPTAmount")),
+        locked_amount,
+        view.rules().enabled(&protocol::fix_cleanup_3_1_3()),
+    ) {
         return Ok(Ter::TEC_HAS_OBLIGATIONS);
     }
 
@@ -826,6 +833,26 @@ pub fn create_mp_token(
 pub fn is_mpt_overflow(send_amount: i64, outstanding_amount: u64, maximum_amount: i64) -> bool {
     send_amount > maximum_amount
         || outstanding_amount > (maximum_amount as u64).saturating_sub(send_amount as u64)
+}
+
+/// Check whether an issuer MPT send exceeds its maximum amount. With
+/// fixCleanup3_1_3, `total_send_amount` is the amount already scheduled for
+/// other recipients in the same operation. The condition order guards every
+/// unsigned subtraction, matching rippled's aggregate check.
+pub fn mpt_send_exceeds_maximum_amount(
+    send_amount: u64,
+    outstanding_amount: u64,
+    maximum_amount: u64,
+    total_send_amount: u64,
+    fix_cleanup_3_1_3: bool,
+) -> bool {
+    if fix_cleanup_3_1_3 {
+        send_amount > maximum_amount
+            || total_send_amount > maximum_amount - send_amount
+            || outstanding_amount > maximum_amount - send_amount - total_send_amount
+    } else {
+        send_amount > maximum_amount || outstanding_amount > maximum_amount - send_amount
+    }
 }
 
 /// Authorize an MPToken (create it for a holder).
@@ -914,19 +941,29 @@ pub fn enforce_mp_token_authorization(
         None
     };
 
+    let mut expired_domain_credential = false;
     let authorized_by_domain = if let Some(domain_id) = maybe_domain_id {
         let result = super::credential_helpers::verify_valid_domain(view, account, domain_id)?;
+        expired_domain_credential = result == Ter::TEC_EXPIRED;
         result == Ter::TES_SUCCESS
     } else {
         false
     };
 
     if !authorized_by_domain && sle_token.is_none() {
-        return Ok(Ter::TEC_NO_AUTH);
+        return Ok(if expired_domain_credential {
+            Ter::TEC_EXPIRED
+        } else {
+            Ter::TEC_NO_AUTH
+        });
     }
 
     if !authorized_by_domain && maybe_domain_id.is_some() {
-        return Ok(Ter::TEC_NO_AUTH);
+        return Ok(if expired_domain_credential {
+            Ter::TEC_EXPIRED
+        } else {
+            Ter::TEC_NO_AUTH
+        });
     }
 
     if !authorized_by_domain {
@@ -950,8 +987,28 @@ pub fn enforce_mp_token_authorization(
     Ok(Ter::TES_SUCCESS)
 }
 
+#[cfg(test)]
+mod cleanup_3_1_3_tests {
+    use super::{mpt_holding_has_obligations, mpt_send_exceeds_maximum_amount};
+
+    #[test]
+    fn locked_mpt_holding_obligations_track_fix_cleanup_3_1_3() {
+        assert!(!mpt_holding_has_obligations(0, 7, false));
+        assert!(mpt_holding_has_obligations(0, 7, true));
+        assert!(mpt_holding_has_obligations(1, 0, false));
+        assert!(mpt_holding_has_obligations(1, 0, true));
+    }
+
+    #[test]
+    fn aggregate_mpt_maximum_amount_tracks_fix_cleanup_3_1_3() {
+        // Two 100-unit outputs each fit under a 150-unit maximum, but their
+        // aggregate fits only in legacy behavior.
+        assert!(mpt_send_exceeds_maximum_amount(100, 0, 150, 100, true));
+        assert!(!mpt_send_exceeds_maximum_amount(100, 0, 150, 100, false));
+    }
+}
+
 /// Get the issuer's available funds for self-issuance.
-///
 pub fn issuer_funds_to_self_issue(
     view: &dyn ReadView,
     issue: &MPTIssue,

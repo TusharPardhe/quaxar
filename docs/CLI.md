@@ -156,15 +156,19 @@ quaxar stop
 
 ### export-snapshot
 
-Trigger a snapshot export via the admin RPC. The node remains online while the
-export runs in a background thread.
+Export a snapshot through the admin RPC while the node remains online. The
+node performs the export in a background job; the CLI shows a spinner until the
+node reports that job as completed or failed.
 
 ```bash
-quaxar export-snapshot
+quaxar export-snapshot --output /var/lib/quaxar/snapshots/testnet.xrpls
 ```
 
-This calls the `export_snapshot` RPC method. The output file is written to the
-configured node store path. See [RPC.md](RPC.md) for details on the RPC method.
+`--output` is required and names the snapshot file to create. The CLI polls the
+admin `snapshot_status` RPC once per second and reports the final file size on
+success. Against an older node that does not support that RPC, it truthfully
+reports only that export was started and directs the operator to monitor the
+node's snapshot logs. See [RPC.md](RPC.md) for the RPC details.
 
 ### load-snapshot
 
@@ -180,7 +184,9 @@ quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/xrpld/xrpld.cfg
 | `--input` | Yes | Path to snapshot file |
 | `--conf` | Yes | Path to config file (determines NuDB path) |
 
-The import uses bulk loading mode with pre-allocated NuDB hash tables. On NVMe,
+The import uses bulk loading mode with pre-allocated NuDB hash tables. The CLI
+shows a spinner throughout the synchronous import and reports success only
+after the loader has verified every chunk and the final file hash. On NVMe,
 26.5M nodes load in approximately 3 minutes.
 
 ## Exit Codes

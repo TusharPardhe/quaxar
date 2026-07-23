@@ -14,6 +14,7 @@ pub mod node_store_scheduler;
 pub mod offer_create;
 pub mod overlay_status;
 pub mod payment;
+pub mod snapshot_export_state;
 pub mod status_metrics;
 pub mod status_rpc_state;
 pub mod stop_tree;

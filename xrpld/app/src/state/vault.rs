@@ -189,6 +189,65 @@ fn runtime_to_amount(asset: Asset, value: RuntimeNumber) -> Option<STAmount> {
     to_amount_from_number(asset, value, basics::number::RoundingMode::TowardsZero).ok()
 }
 
+/// Port of `View.cpp::canWithdraw` for VaultWithdraw. The caller selects the
+/// amount being checked: pre-amendment share withdrawals use their share
+/// amount, while fixCleanup3_1_3 checks the converted vault asset amount.
+fn can_vault_withdraw<V: ApplyView>(
+    view: &mut V,
+    from: &AccountID,
+    to: &AccountID,
+    amount: &STAmount,
+    has_destination_tag: bool,
+) -> Ter {
+    let Some(destination) = view.peek(account_keylet(to_160(to))).ok().flatten() else {
+        return Ter::TEC_NO_DST;
+    };
+    if destination.is_flag(protocol::lsfRequireDestTag) && !has_destination_tag {
+        return Ter::TEC_DST_TAG_NEEDED;
+    }
+    if from == to {
+        return Ter::TES_SUCCESS;
+    }
+    if destination.is_flag(protocol::lsfDepositAuth)
+        && view
+            .peek(protocol::deposit_preauth_keylet(to_160(to), to_160(from)))
+            .ok()
+            .flatten()
+            .is_none()
+    {
+        return Ter::TEC_NO_PERMISSION;
+    }
+
+    let Asset::Issue(issue) = amount.asset() else {
+        return Ter::TES_SUCCESS;
+    };
+    if issue.native() || *to == issue.account {
+        return Ter::TES_SUCCESS;
+    }
+    let Some(line) = view
+        .peek(protocol::line(*to, issue.account, issue.currency))
+        .ok()
+        .flatten()
+    else {
+        return Ter::TEC_NO_LINE;
+    };
+    let mut owed = amount_number(&line.get_field_amount(sf("sfBalance")));
+    if *to > issue.account {
+        owed = -owed;
+    }
+    if owed <= RuntimeNumber::zero() {
+        let limit = if *to < issue.account {
+            amount_number(&line.get_field_amount(sf("sfLowLimit")))
+        } else {
+            amount_number(&line.get_field_amount(sf("sfHighLimit")))
+        };
+        if -owed >= limit || amount_number(amount) > limit + owed {
+            return Ter::TEC_NO_LINE;
+        }
+    }
+    Ter::TES_SUCCESS
+}
+
 fn round_runtime_to_scale(
     value: RuntimeNumber,
     target_scale: i32,
@@ -688,6 +747,29 @@ fn assets_to_shares_withdraw(
     shares.try_to_i64().ok().map(|value| value.unsigned_abs())
 }
 
+fn assets_to_shares_withdraw_truncated(
+    vault: &LoadedVault,
+    issuance: &LoadedIssuance,
+    amount: &STAmount,
+    waive_unrealized_loss: bool,
+) -> Option<u64> {
+    if amount.negative() || amount.asset() != vault.asset {
+        return None;
+    }
+    let asset_total = if waive_unrealized_loss {
+        vault.assets_total
+    } else {
+        vault.assets_total - vault.loss_unrealized
+    };
+    if asset_total == RuntimeNumber::zero() {
+        return Some(0);
+    }
+    let shares = RuntimeNumber::from_i64(issuance.outstanding_amount as i64)
+        * amount_number(amount)
+        / asset_total;
+    number_to_mpt_units_truncated(shares)
+}
+
 fn is_sole_shareholder<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
@@ -1169,6 +1251,24 @@ pub fn apply_vault_withdraw<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return Ter::TEF_INTERNAL;
     };
 
+    let limit_check_amount = if view.rules().enabled(&protocol::fix_cleanup_3_1_3())
+        && amount.asset() == share_asset(vault.share_id)
+    {
+        &assets_withdrawn
+    } else {
+        &amount
+    };
+    let can_withdraw = can_vault_withdraw(
+        view,
+        &account,
+        &destination,
+        limit_check_amount,
+        sttx.is_field_present(sf("sfDestinationTag")),
+    );
+    if can_withdraw != Ter::TES_SUCCESS {
+        return can_withdraw;
+    }
+
     if token_balance(view, vault.share_id, &account).unwrap_or_default() < shares_redeemed {
         return Ter::TEC_INSUFFICIENT_FUNDS;
     }
@@ -1238,34 +1338,72 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         return Ter::TEF_BAD_LEDGER;
     };
 
-    let (shares_destroyed, assets_recovered) = match sttx.is_field_present(sf("sfAmount")) {
-        false if account == vault.owner => {
-            let shares = token_balance(view, vault.share_id, &holder).unwrap_or_default();
-            let assets = shares_to_assets(&vault, &issuance, shares, true, false)
-                .unwrap_or_else(|| zero_amount(vault.asset));
-            (shares, assets)
-        }
-        false => {
-            let shares = token_balance(view, vault.share_id, &holder).unwrap_or_default();
-            (shares, zero_amount(vault.asset))
-        }
-        true => {
-            let amount = sttx.get_field_amount(sf("sfAmount"));
-            if amount.asset() == share_asset(vault.share_id) && account == vault.owner {
-                let shares = token_balance(view, vault.share_id, &holder).unwrap_or_default();
-                (shares, zero_amount(vault.asset))
-            } else {
-                let Some(shares) = assets_to_shares_withdraw(&vault, &issuance, &amount, false)
-                else {
-                    return Ter::TEC_INTERNAL;
-                };
-                let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, false) else {
-                    return Ter::TEC_INTERNAL;
-                };
-                (shares, assets)
-            }
-        }
+    let clawback_amount = if sttx.is_field_present(sf("sfAmount")) {
+        sttx.get_field_amount(sf("sfAmount"))
+    } else if account == vault.owner {
+        zero_amount(share_asset(vault.share_id))
+    } else {
+        zero_amount(vault.asset)
     };
+    let (mut shares_destroyed, mut assets_recovered) = if account == vault.owner
+        && clawback_amount.asset() == share_asset(vault.share_id)
+    {
+        (
+            token_balance(view, vault.share_id, &holder).unwrap_or_default(),
+            zero_amount(vault.asset),
+        )
+    } else if clawback_amount.asset() == vault.asset && clawback_amount.signum() == 0 {
+        let shares = token_balance(view, vault.share_id, &holder).unwrap_or_default();
+        let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, false) else {
+            return Ter::TEC_INTERNAL;
+        };
+        (shares, assets)
+    } else {
+        let Some(shares) = assets_to_shares_withdraw(&vault, &issuance, &clawback_amount, false)
+        else {
+            return Ter::TEC_INTERNAL;
+        };
+        let Some(assets) = shares_to_assets(&vault, &issuance, shares, true, false) else {
+            return Ter::TEC_INTERNAL;
+        };
+        (shares, assets)
+    };
+
+    // Before fixCleanup3_1_3, an asset-zero clawback returns before the
+    // AssetsAvailable clamp. Keep that replay behavior. The amended path
+    // clamps the asset recovery and recomputes a truncated share amount so
+    // the resulting conversion cannot exceed AssetsAvailable through rounding.
+    let legacy_unclamped_zero = !view.rules().enabled(&protocol::fix_cleanup_3_1_3())
+        && clawback_amount.asset() == vault.asset
+        && clawback_amount.signum() == 0;
+    if !legacy_unclamped_zero
+        && assets_recovered
+            > runtime_to_amount(vault.asset, vault.assets_available)
+                .unwrap_or_else(|| zero_amount(vault.asset))
+    {
+        let Some(available) = runtime_to_amount(vault.asset, vault.assets_available) else {
+            return Ter::TEC_INTERNAL;
+        };
+        let Some(truncated_shares) =
+            assets_to_shares_withdraw_truncated(&vault, &issuance, &available, false)
+        else {
+            return Ter::TEC_INTERNAL;
+        };
+        shares_destroyed = truncated_shares;
+        let Some(recomputed_assets) =
+            shares_to_assets(&vault, &issuance, shares_destroyed, true, false)
+        else {
+            return Ter::TEC_INTERNAL;
+        };
+        assets_recovered = recomputed_assets;
+        if assets_recovered > available {
+            return Ter::TEC_INTERNAL;
+        }
+    }
+
+    if shares_destroyed == 0 {
+        return Ter::TEC_PRECISION_LOSS;
+    }
 
     let ter = transfer_mpt(
         view,
@@ -1294,13 +1432,14 @@ pub fn apply_vault_clawback<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         }
         let recovered = amount_number(&assets_recovered);
         vault.assets_total -= recovered;
-        // Clamp to assets_available to prevent underflow (C++ parity: fixCleanup3_1_3)
-        let clamped = if recovered > vault.assets_available {
-            vault.assets_available
+        if legacy_unclamped_zero {
+            // Historical behavior did not reduce the requested recovery to
+            // AssetsAvailable; retain the old saturating state update.
+            let clamped = recovered.min(vault.assets_available);
+            vault.assets_available -= clamped;
         } else {
-            recovered
-        };
-        vault.assets_available -= clamped;
+            vault.assets_available -= recovered;
+        }
     }
 
     persist_vault(view, &mut vault)

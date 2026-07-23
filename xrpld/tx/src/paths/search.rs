@@ -136,8 +136,9 @@ impl Pathfinder {
                     let dst_issue = dst_amount.issue();
 
                     // Scan the account's trust lines to find currencies it holds
-                    let owner_dir2 =
-                        protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(acc.data()));
+                    let owner_dir2 = protocol::owner_dir_keylet(
+                        basics::base_uint::Uint160::from_void(acc.data()),
+                    );
                     if let Ok(Some(dir_sle)) = view.read(owner_dir2) {
                         let indexes = dir_sle.get_field_v256(sf("sfIndexes"));
                         for index in indexes.value() {
@@ -171,7 +172,8 @@ impl Pathfinder {
                                     }
 
                                     // Skip if same currency as destination
-                                    if currency == dst_issue.currency && issuer == dst_issue.account {
+                                    if currency == dst_issue.currency && issuer == dst_issue.account
+                                    {
                                         continue;
                                     }
 
@@ -180,16 +182,18 @@ impl Pathfinder {
                                     // Use succ() on the book base key (same as
                                     // BookTip step iterates the book
                                     // directory using the quality-keyed SHAMap).
-                                    let src_asset = protocol::Asset::Issue(
-                                        protocol::Issue::new(currency, issuer),
-                                    );
+                                    let src_asset = protocol::Asset::Issue(protocol::Issue::new(
+                                        currency, issuer,
+                                    ));
                                     let dst_asset = protocol::Asset::Issue(dst_issue);
                                     let book = protocol::Book::new(src_asset, dst_asset, None);
                                     let book_base = protocol::keylet::book(book).key;
                                     let book_end = {
                                         let mut end = book_base;
                                         let bytes = end.data_mut();
-                                        for b in bytes[24..32].iter_mut() { *b = 0xFF; }
+                                        for b in bytes[24..32].iter_mut() {
+                                            *b = 0xFF;
+                                        }
                                         end
                                     };
                                     if let Ok(Some(_)) = view.succ(book_base, Some(book_end)) {
@@ -215,7 +219,9 @@ impl Pathfinder {
                         let book_end = {
                             let mut end = book_base;
                             let bytes = end.data_mut();
-                            for b in bytes[24..32].iter_mut() { *b = 0xFF; }
+                            for b in bytes[24..32].iter_mut() {
+                                *b = 0xFF;
+                            }
                             end
                         };
                         if let Ok(Some(_)) = view.succ(book_base, Some(book_end)) {

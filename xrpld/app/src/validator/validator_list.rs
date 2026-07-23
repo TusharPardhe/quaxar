@@ -465,7 +465,11 @@ impl<C: ValidatorListClock> ValidatorList<C> {
     }
 
     pub fn unl_size(&self) -> usize {
-        self.state.read().expect("validator list read lock").trusted_master_keys.len()
+        self.state
+            .read()
+            .expect("validator list read lock")
+            .trusted_master_keys
+            .len()
     }
 
     pub fn trusted(&self, identity: PublicKey) -> bool {

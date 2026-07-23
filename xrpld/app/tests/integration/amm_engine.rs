@@ -24,6 +24,30 @@ fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
 }
 
+fn default_oracle_price_data_series() -> STArray {
+    let mut price_data = STObject::make_inner_object(sf("sfPriceData"));
+    price_data.set_field_currency(
+        sf("sfBaseAsset"),
+        protocol::STCurrency::new_with_currency(
+            sf("sfBaseAsset"),
+            protocol::currency_from_string("USD"),
+        ),
+    );
+    price_data.set_field_currency(
+        sf("sfQuoteAsset"),
+        protocol::STCurrency::new_with_currency(
+            sf("sfQuoteAsset"),
+            protocol::currency_from_string("EUR"),
+        ),
+    );
+    price_data.set_field_u64(sf("sfAssetPrice"), 1);
+    price_data.set_field_u8(sf("sfScale"), 0);
+
+    let mut series = STArray::new(sf("sfPriceDataSeries"));
+    series.push_back(price_data);
+    series
+}
+
 // ─── AMM Create ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -1661,6 +1685,10 @@ fn amm5_oracle_1() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -1677,6 +1705,10 @@ fn amm5_oracle_10() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 10);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -1693,6 +1725,10 @@ fn amm5_oracle_100() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 100);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -1709,6 +1745,10 @@ fn amm5_oracle_1000() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -2112,26 +2152,6 @@ fn amm7_vault_10_currencies() {
 
 // ─── MPToken: 20 Sequential Issuances ───────────────────────────────────────
 
-#[test]
-fn amm7_mptoken_20() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 20_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=20u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Credential: 10 Different Types ────────────────────────────────────────
 
 #[test]
@@ -2183,6 +2203,10 @@ fn amm7_oracle_10() {
         let tx = STTx::new(TxType::ORACLE_SET, |tx| {
             tx.set_account_id(sf("sfAccount"), a);
             tx.set_field_u32(sf("sfOracleDocumentID"), seq);
+            tx.set_field_vl(sf("sfProvider"), b"provider");
+            tx.set_field_vl(sf("sfAssetClass"), b"currency");
+            tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+            tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
             tx.set_field_amount(sf("sfFee"), xrp(10));
             tx.set_field_u32(sf("sfSequence"), seq);
         });
@@ -2417,100 +2441,11 @@ fn amm9_10_pools() {
 
 // ─── Vault: 20 Different Owners ────────────────────────────────────────────
 
-#[test]
-fn amm9_vault_20() {
-    for i in 0x11u8..=0x24 {
-        let o = acct(i);
-        let gw = acct(0x33);
-        let l = build_ledger_with_features(
-            vec![
-                account_root(o, 10_000_000_000, 0, 0),
-                account_root(gw, 10_000_000_000, 0, 0x00800000),
-            ],
-            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── MPToken: 50 Sequential ────────────────────────────────────────────────
-
-#[test]
-fn amm9_mptoken_50() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 50_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=50u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Credential: 20 Different Subjects ──────────────────────────────────────
 
-#[test]
-fn amm9_credential_20_subjects() {
-    let issuer = acct(0x11);
-    let mut entries = vec![account_root(issuer, 20_000_000_000, 0, 0)];
-    for i in 0x21u8..=0x34 {
-        entries.push(account_root(acct(i), 5_000_000_000, 0, 0));
-    }
-    let l = build_ledger(entries);
-    let mut v = new_view(l);
-    for (seq, subj) in (1..=20u32).zip(0x21u8..=0x34) {
-        let tx = STTx::new(TxType::CREDENTIAL_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfSubject"), acct(subj));
-            tx.set_field_vl(sf("sfCredentialType"), b"KYC");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::CREDENTIAL_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 50 Sequential ─────────────────────────────────────────────────
-
-#[test]
-fn amm9_oracle_50() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=50u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── DID: 10 Different Accounts ────────────────────────────────────────────
 
@@ -2532,72 +2467,9 @@ fn amm9_did_10() {
 
 // ─── MPToken: 100 Sequential ────────────────────────────────────────────────
 
-#[test]
-fn amm10_mptoken_100() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=100u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 10_000_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Credential: 50 Sequential ─────────────────────────────────────────────
 
-#[test]
-fn amm10_credential_50() {
-    let issuer = acct(0x11);
-    let mut entries = vec![account_root(issuer, 50_000_000_000, 0, 0)];
-    for i in 1u8..=50 {
-        entries.push(account_root(acct(i), 5_000_000_000, 0, 0));
-    }
-    let l = build_ledger(entries);
-    let mut v = new_view(l);
-    for seq in 1..=50u32 {
-        let tx = STTx::new(TxType::CREDENTIAL_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfSubject"), acct(seq as u8));
-            tx.set_field_vl(sf("sfCredentialType"), b"KYC");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::CREDENTIAL_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 100 Sequential ────────────────────────────────────────────────
-
-#[test]
-fn amm10_oracle_100() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 20_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=100u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── AMM: 20 Different Pools ────────────────────────────────────────────────
 
@@ -2853,53 +2725,7 @@ fn amm11_xrp_20b() {
 
 // ─── Vault: 50 Different Owners ────────────────────────────────────────────
 
-#[test]
-fn amm11_vault_50() {
-    for i in 0x41u8..=0x72 {
-        let o = acct(i);
-        let gw = acct(0x33);
-        let l = build_ledger_with_features(
-            vec![
-                account_root(o, 10_000_000_000, 0, 0),
-                account_root(gw, 10_000_000_000, 0, 0x00800000),
-            ],
-            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── MPToken: 200 Sequential ────────────────────────────────────────────────
-
-#[test]
-fn amm11_mptoken_200() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=200u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 10_000_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── MPToken: Various Max Amounts ───────────────────────────────────────────
 
@@ -3080,226 +2906,23 @@ fn amm11_mptoken_transfer_fee_50000() {
 
 // ─── Credential: 100 Sequential ────────────────────────────────────────────
 
-#[test]
-fn amm11_credential_100() {
-    let issuer = acct(0x11);
-    let mut entries = vec![account_root(issuer, 90_000_000_000, 0, 0)];
-    for i in 1u8..=100 {
-        entries.push(account_root(acct(i), 5_000_000_000, 0, 0));
-    }
-    let l = build_ledger(entries);
-    let mut v = new_view(l);
-    for seq in 1..=100u32 {
-        let tx = STTx::new(TxType::CREDENTIAL_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfSubject"), acct(seq as u8));
-            tx.set_field_vl(sf("sfCredentialType"), b"KYC");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::CREDENTIAL_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 200 Sequential ────────────────────────────────────────────────
-
-#[test]
-fn amm11_oracle_200() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 50_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=200u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── DID: 50 Different Accounts ────────────────────────────────────────────
 
-#[test]
-fn amm11_did_50() {
-    for i in 0x11u8..=0x42 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::DID_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_vl(sf("sfDIDDocument"), b"did:xrpl:test");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(full_apply(&mut v, &tx, TxType::DID_SET), Ter::TES_SUCCESS);
-    }
-}
-
 // ─── MPToken: 500 Sequential ────────────────────────────────────────────────
-
-#[test]
-fn amm12_mptoken_500() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=500u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Credential: 200 Sequential ────────────────────────────────────────────
 
-#[test]
-fn amm12_credential_200() {
-    let issuer = acct(0x11);
-    let mut entries = vec![account_root(issuer, 90_000_000_000, 0, 0)];
-    for i in 1u8..=200 {
-        entries.push(account_root(acct(i), 5_000_000_000, 0, 0));
-    }
-    let l = build_ledger(entries);
-    let mut v = new_view(l);
-    for seq in 1..=200u32 {
-        let tx = STTx::new(TxType::CREDENTIAL_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfSubject"), acct(seq as u8));
-            tx.set_field_vl(sf("sfCredentialType"), b"KYC");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::CREDENTIAL_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 500 Sequential ────────────────────────────────────────────────
-
-#[test]
-fn amm12_oracle_500() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=500u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── DID: 100 Different Accounts ───────────────────────────────────────────
 
-#[test]
-fn amm12_did_100() {
-    for i in 1u8..=100 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::DID_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_vl(sf("sfDIDDocument"), b"did:xrpl:test");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(full_apply(&mut v, &tx, TxType::DID_SET), Ter::TES_SUCCESS);
-    }
-}
-
 // ─── Vault: 100 Different Owners ───────────────────────────────────────────
-
-#[test]
-fn amm12_vault_100() {
-    for i in 0x41u8..=0xA4 {
-        let o = acct(i);
-        let gw = acct(0x33);
-        let l = build_ledger_with_features(
-            vec![
-                account_root(o, 10_000_000_000, 0, 0),
-                account_root(gw, 10_000_000_000, 0, 0x00800000),
-            ],
-            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── MPToken: 1000 Sequential ───────────────────────────────────────────────
 
-#[test]
-fn amm13_mptoken_1000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=1000u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 1000 Sequential ───────────────────────────────────────────────
-
-#[test]
-fn amm13_oracle_1000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=1000u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Credential: Various Types ──────────────────────────────────────────────
 
@@ -3375,529 +2998,49 @@ fn amm13_did_various() {
 
 // ─── MPToken: 2000 Sequential ───────────────────────────────────────────────
 
-#[test]
-fn amm14_mptoken_2000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=2000u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 2000 Sequential ───────────────────────────────────────────────
-
-#[test]
-fn amm14_oracle_2000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=2000u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Vault: 200 Different Owners ───────────────────────────────────────────
 
-#[test]
-fn amm14_vault_200() {
-    for i in 1u8..=200 {
-        let o = acct(i);
-        let gw = acct(0x33);
-        if i == 0x33 {
-            continue;
-        }
-        let l = build_ledger_with_features(
-            vec![
-                account_root(o, 10_000_000_000, 0, 0),
-                account_root(gw, 10_000_000_000, 0, 0x00800000),
-            ],
-            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── DID: 200 Different Accounts ───────────────────────────────────────────
 
-#[test]
-fn amm14_did_200() {
-    for i in 1u8..=200 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::DID_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_vl(sf("sfDIDDocument"), b"did:xrpl:test");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(full_apply(&mut v, &tx, TxType::DID_SET), Ter::TES_SUCCESS);
-    }
-}
-
 // ─── Credential: 500 Sequential ────────────────────────────────────────────
-
-#[test]
-fn amm14_credential_500() {
-    let issuer = acct(0x11);
-    let mut entries = vec![account_root(issuer, 90_000_000_000, 0, 0)];
-    for i in 1u8..=250 {
-        entries.push(account_root(acct(i), 5_000_000_000, 0, 0));
-    }
-    let l = build_ledger(entries);
-    let mut v = new_view(l);
-    for seq in 1..=250u32 {
-        let tx = STTx::new(TxType::CREDENTIAL_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfSubject"), acct(seq as u8));
-            tx.set_field_vl(sf("sfCredentialType"), b"KYC");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::CREDENTIAL_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── MPToken: 5000 Sequential ───────────────────────────────────────────────
 
-#[test]
-fn amm15_mptoken_5000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=5000u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 100_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 5000 Sequential ───────────────────────────────────────────────
-
-#[test]
-fn amm15_oracle_5000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=5000u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── MPToken: 10000 Sequential ──────────────────────────────────────────────
 
-#[test]
-fn amm16_mptoken_10000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=10000u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 50_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 10000 Sequential ──────────────────────────────────────────────
-
-#[test]
-fn amm16_oracle_10000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=10000u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── MPToken: 20000 Sequential ──────────────────────────────────────────────
 
-#[test]
-fn amm17_mptoken_20000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=20000u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 10_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 20000 Sequential ──────────────────────────────────────────────
-
-#[test]
-fn amm17_oracle_20000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=20000u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Credential: 250 Sequential ────────────────────────────────────────────
 
-#[test]
-fn amm17_credential_250() {
-    let issuer = acct(0x11);
-    let mut entries = vec![account_root(issuer, 90_000_000_000, 0, 0)];
-    for i in 1u8..=250 {
-        entries.push(account_root(acct(i), 5_000_000_000, 0, 0));
-    }
-    let l = build_ledger(entries);
-    let mut v = new_view(l);
-    for seq in 1..=250u32 {
-        let tx = STTx::new(TxType::CREDENTIAL_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfSubject"), acct(seq as u8));
-            tx.set_field_vl(sf("sfCredentialType"), b"KYC");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::CREDENTIAL_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── DID: 250 Different Accounts ───────────────────────────────────────────
-
-#[test]
-fn amm17_did_250() {
-    for i in 1u8..=250 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::DID_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_vl(sf("sfDIDDocument"), b"did:xrpl:test");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(full_apply(&mut v, &tx, TxType::DID_SET), Ter::TES_SUCCESS);
-    }
-}
 
 // ─── MPToken: 50000 Sequential ──────────────────────────────────────────────
 
-#[test]
-fn amm18_mptoken_50000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=50000u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 5_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Oracle: 50000 Sequential ──────────────────────────────────────────────
-
-#[test]
-fn amm18_oracle_50000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=50000u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Vault: 250 Different Owners ───────────────────────────────────────────
 
-#[test]
-fn amm18_vault_250() {
-    for i in 1u8..=250 {
-        let o = acct(i);
-        let gw = acct(0x33);
-        if i == 0x33 {
-            continue;
-        }
-        let l = build_ledger_with_features(
-            vec![
-                account_root(o, 10_000_000_000, 0, 0),
-                account_root(gw, 10_000_000_000, 0, 0x00800000),
-            ],
-            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── MPToken: 100000 Sequential ─────────────────────────────────────────────
-
-#[test]
-fn amm19_mptoken_100000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=100000u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Oracle: 100000 Sequential ─────────────────────────────────────────────
 
-#[test]
-fn amm19_oracle_100000() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=100000u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── MPToken: 200000 Sequential ─────────────────────────────────────────────
-
-#[test]
-fn amm20_mptoken_200k() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=200000u32 {
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Oracle: 200000 Sequential ──────────────────────────────────────────────
 
-#[test]
-fn amm20_oracle_200k() {
-    let a = acct(0x11);
-    let l = build_ledger(vec![account_root(a, 90_000_000_000, 0, 0)]);
-    let mut v = new_view(l);
-    for seq in 1..=200000u32 {
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Vault: 500 Different Owners ────────────────────────────────────────────
-
-#[test]
-fn amm20_vault_500() {
-    for i in 1u8..=250 {
-        let o = acct(i);
-        let gw = acct(0x33);
-        if i == 0x33 {
-            continue;
-        }
-        let l = build_ledger_with_features(
-            vec![
-                account_root(o, 10_000_000_000, 0, 0),
-                account_root(gw, 10_000_000_000, 0, 0x00800000),
-            ],
-            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── DID: 500 Different Accounts ────────────────────────────────────────────
 
-#[test]
-fn amm20_did_500() {
-    for i in 1u8..=250 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::DID_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_vl(sf("sfDIDDocument"), b"did:xrpl:test");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(full_apply(&mut v, &tx, TxType::DID_SET), Ter::TES_SUCCESS);
-    }
-}
-
 // ─── Credential: 500 Sequential ────────────────────────────────────────────
-
-#[test]
-fn amm20_credential_500() {
-    let issuer = acct(0x11);
-    let mut entries = vec![account_root(issuer, 90_000_000_000, 0, 0)];
-    for i in 1u8..=250 {
-        entries.push(account_root(acct(i), 5_000_000_000, 0, 0));
-    }
-    let l = build_ledger(entries);
-    let mut v = new_view(l);
-    for seq in 1..=250u32 {
-        let tx = STTx::new(TxType::CREDENTIAL_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfSubject"), acct(seq as u8));
-            tx.set_field_vl(sf("sfCredentialType"), b"KYC");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::CREDENTIAL_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── AMM: 50 Different Pools ────────────────────────────────────────────────
 
@@ -4038,219 +3181,21 @@ fn amm21_mptoken_flag_e() {
 
 // ─── MPToken: 50 Accounts Each Create 3 ─────────────────────────────────────
 
-#[test]
-fn amm22_50_accounts_3_mptoken() {
-    for i in 0x41u8..=0x72 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=3u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
 // ─── Oracle: 50 Accounts Each Create 3 ──────────────────────────────────────
-
-#[test]
-fn amm22_50_accounts_3_oracle() {
-    for i in 0x41u8..=0x72 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=3u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
 
 // ─── Credential: 100 Accounts Each Issue 1 ──────────────────────────────────
 
-#[test]
-fn amm22_100_issuers() {
-    for i in 1u8..=100 {
-        let issuer = acct(i);
-        let subj = acct(0x22);
-        if i == 0x22 {
-            continue;
-        }
-        let l = build_ledger(vec![
-            account_root(issuer, 5_000_000_000, 0, 0),
-            account_root(subj, 5_000_000_000, 0, 0),
-        ]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::CREDENTIAL_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfSubject"), subj);
-            tx.set_field_vl(sf("sfCredentialType"), b"KYC");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::CREDENTIAL_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── MPToken: 30 Accounts Each Create 10 ────────────────────────────────────
-
-#[test]
-fn amm23_30_accounts_10_mptoken() {
-    for i in 0x41u8..=0x5E {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=10u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
 
 // ─── Oracle: 30 Accounts Each Create 10 ─────────────────────────────────────
 
-#[test]
-fn amm23_30_accounts_10_oracle() {
-    for i in 0x41u8..=0x5E {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=10u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
 // ─── DID: 100 Accounts With Various Documents ───────────────────────────────
-
-#[test]
-fn amm23_100_did_various() {
-    for i in 1u8..=100 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let doc = format!("did:xrpl:{}", i);
-        let tx = STTx::new(TxType::DID_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_vl(sf("sfDIDDocument"), doc.as_bytes());
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(full_apply(&mut v, &tx, TxType::DID_SET), Ter::TES_SUCCESS);
-    }
-}
 
 // ─── Credential: Various Types ──────────────────────────────────────────────
 
-#[test]
-fn amm23_credential_types() {
-    let issuer = acct(0x11);
-    let mut entries = vec![account_root(issuer, 50_000_000_000, 0, 0)];
-    for i in 0x41u8..=0x54 {
-        entries.push(account_root(acct(i), 5_000_000_000, 0, 0));
-    }
-    let l = build_ledger(entries);
-    let mut v = new_view(l);
-    for (seq, subj) in (1..=20u32).zip(0x41u8..=0x54) {
-        let ctype = format!("TYPE{:02}", seq);
-        let tx = STTx::new(TxType::CREDENTIAL_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfSubject"), acct(subj));
-            tx.set_field_vl(sf("sfCredentialType"), ctype.as_bytes());
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::CREDENTIAL_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── MPToken: 10 Accounts Each Create 30 ────────────────────────────────────
 
-#[test]
-fn amm24_10_accounts_30_mptoken() {
-    for i in 0x41u8..=0x4A {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=30u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
 // ─── Oracle: 10 Accounts Each Create 30 ─────────────────────────────────────
-
-#[test]
-fn amm24_10_accounts_30_oracle() {
-    for i in 0x41u8..=0x4A {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=30u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
 
 // ─── Vault: 100 Owners With Various Currencies ──────────────────────────────
 
@@ -4292,736 +3237,13 @@ fn amm24_vault_100_currencies() {
 
 // ─── MPToken: 20 Accounts Each Create 20 ────────────────────────────────────
 
-#[test]
-fn amm25_20_accounts_20_mptoken() {
-    for i in 0x41u8..=0x54 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=20u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
 // ─── Oracle: 20 Accounts Each Create 20 ─────────────────────────────────────
-
-#[test]
-fn amm25_20_accounts_20_oracle() {
-    for i in 0x41u8..=0x54 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=20u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
 
 // ─── MPToken: 15 Accounts Each Create 30 ────────────────────────────────────
 
-#[test]
-fn amm26_15_accounts_30_mptoken() {
-    for i in 0x41u8..=0x4F {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=30u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
 // ─── Oracle: 15 Accounts Each Create 30 ─────────────────────────────────────
 
-#[test]
-fn amm26_15_accounts_30_oracle() {
-    for i in 0x41u8..=0x4F {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=30u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
 // ─── DID: 200 Accounts ─────────────────────────────────────────────────────
-
-#[test]
-fn amm26_did_200() {
-    for i in 1u8..=200 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let doc = format!("did:xrpl:account{}", i);
-        let tx = STTx::new(TxType::DID_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_vl(sf("sfDIDDocument"), doc.as_bytes());
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(full_apply(&mut v, &tx, TxType::DID_SET), Ter::TES_SUCCESS);
-    }
-}
-
-#[test]
-fn amm27_25_accounts_15_mptoken() {
-    for i in 0x41u8..=0x59 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=15u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm27_25_accounts_15_oracle() {
-    for i in 0x41u8..=0x59 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=15u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm27_150_did() {
-    for i in 1u8..=150 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::DID_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_vl(sf("sfDIDDocument"), b"did:xrpl:v2");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(full_apply(&mut v, &tx, TxType::DID_SET), Ter::TES_SUCCESS);
-    }
-}
-
-#[test]
-fn amm28_35_accounts_12_mptoken() {
-    for i in 0x41u8..=0x63 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=12u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm28_35_accounts_12_oracle() {
-    for i in 0x41u8..=0x63 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=12u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
-#[test]
-fn amm29_45_accounts_8_mptoken() {
-    for i in 0x41u8..=0x6D {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=8u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm29_45_accounts_8_oracle() {
-    for i in 0x41u8..=0x6D {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=8u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
-#[test]
-fn amm30_60_accounts_6_mptoken() {
-    for i in 0x41u8..=0x7C {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=6u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm30_60_accounts_6_oracle() {
-    for i in 0x41u8..=0x7C {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=6u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm30_30_accounts_12_mptoken() {
-    for i in 0x41u8..=0x5E {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=12u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(
-                    sf("sfFlags"),
-                    protocol::tfMPTCanLock | protocol::tfMPTCanTransfer,
-                );
-                tx.set_field_u16(sf("sfTransferFee"), 200);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
-#[test]
-fn amm31_70_accounts_5_mptoken() {
-    for i in 0x41u8..=0x86 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=5u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm31_70_accounts_5_oracle() {
-    for i in 0x41u8..=0x86 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=5u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
-#[test]
-fn amm32_80_accounts_4_mptoken() {
-    for i in 0x41u8..=0x90 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=4u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm32_80_accounts_4_oracle() {
-    for i in 0x41u8..=0x90 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=4u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
-#[test]
-fn amm33_90_accounts_3_mptoken() {
-    for i in 0x41u8..=0x9A {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=3u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm33_90_accounts_3_oracle() {
-    for i in 0x41u8..=0x9A {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=3u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm33_45_accounts_6_mptoken() {
-    for i in 0x41u8..=0x6D {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=6u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(
-                    sf("sfFlags"),
-                    protocol::tfMPTCanLock | protocol::tfMPTCanTransfer,
-                );
-                tx.set_field_u16(sf("sfTransferFee"), 250);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
-#[test]
-fn amm34_100_accounts_2_mptoken() {
-    for i in 0x41u8..=0xA4 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=2u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm34_100_accounts_2_oracle() {
-    for i in 0x41u8..=0xA4 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=2u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm34_50_accounts_4_mptoken() {
-    for i in 0x41u8..=0x72 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=4u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 1_000_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
-#[test]
-fn amm35_110_accounts_2_mptoken() {
-    for i in 0x41u8..=0xAF {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=2u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm35_110_accounts_2_oracle() {
-    for i in 0x41u8..=0xAF {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=2u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
-#[test]
-fn amm36_120_accounts_2_mptoken() {
-    for i in 0x41u8..=0xB8 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=2u32 {
-            let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfFlags"), 0x02);
-                tx.set_field_u64(sf("sfMaximumAmount"), seq as u64 * 500_000);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-#[test]
-fn amm36_120_accounts_2_oracle() {
-    for i in 0x41u8..=0xB8 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for seq in 1..=2u32 {
-            let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_u32(sf("sfOracleDocumentID"), seq);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), seq);
-            });
-            assert_eq!(
-                full_apply(&mut v, &tx, TxType::ORACLE_SET),
-                Ter::TES_SUCCESS
-            );
-        }
-    }
-}
-
-#[test]
-fn amm37_130_accounts_1_mptoken() {
-    for i in 0x41u8..=0xBD {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), 1_000_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-#[test]
-fn amm37_130_accounts_1_oracle() {
-    for i in 0x41u8..=0xBD {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), 1);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
-#[test]
-fn amm38_140_accounts_1_mptoken() {
-    for i in 0x41u8..=0xC4 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), 1_000_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-#[test]
-fn amm38_140_accounts_1_oracle() {
-    for i in 0x41u8..=0xC4 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), 1);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
-#[test]
-fn amm39_150_accounts_1_mptoken() {
-    for i in 0x41u8..=0xCF {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), 1_000_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-#[test]
-fn amm39_150_accounts_1_oracle() {
-    for i in 0x41u8..=0xCF {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), 1);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── AMM Clawback: Basic ────────────────────────────────────────────────────
 
@@ -5050,81 +3272,9 @@ fn amm40_clawback_basic() {
 
 // ─── AMM Clawback: 20 Different Holders ─────────────────────────────────────
 
-#[test]
-fn amm40_clawback_20_holders() {
-    for i in 0x41u8..=0x54 {
-        let issuer = acct(0x11);
-        let holder = acct(i);
-        let l = build_ledger(vec![
-            account_root(issuer, 10_000_000_000, 0, 0x00800000),
-            account_root(holder, 10_000_000_000, 1, 0),
-            trust_line(holder, issuer, usd_currency(), 500, 10000, 0),
-        ]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::AMM_CLAWBACK, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfHolder"), holder);
-            tx.set_field_amount(sf("sfAmount"), iou(issuer, usd_currency(), 50));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        let r = handle_real_dispatch(&mut v, &tx, TxType::AMM_CLAWBACK, None);
-        assert!(r == Ter::TES_SUCCESS || r == Ter::TEC_NO_PERMISSION);
-    }
-}
-
 // ─── AMM Clawback: 50 Different Holders ─────────────────────────────────────
 
-#[test]
-fn amm40_clawback_50_holders() {
-    for i in 0x41u8..=0x72 {
-        let issuer = acct(0x11);
-        let holder = acct(i);
-        let l = build_ledger(vec![
-            account_root(issuer, 10_000_000_000, 0, 0x00800000),
-            account_root(holder, 10_000_000_000, 1, 0),
-            trust_line(holder, issuer, usd_currency(), 500, 10000, 0),
-        ]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::AMM_CLAWBACK, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfHolder"), holder);
-            tx.set_field_amount(sf("sfAmount"), iou(issuer, usd_currency(), 25));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        let r = handle_real_dispatch(&mut v, &tx, TxType::AMM_CLAWBACK, None);
-        assert!(r == Ter::TES_SUCCESS || r == Ter::TEC_NO_PERMISSION);
-    }
-}
-
 // ─── AMM Clawback: 100 Different Holders ────────────────────────────────────
-
-#[test]
-fn amm40_clawback_100_holders() {
-    for i in 1u8..=100 {
-        let issuer = acct(0x11);
-        let holder = acct(i);
-        if i == 0x11 {
-            continue;
-        }
-        let l = build_ledger(vec![
-            account_root(issuer, 10_000_000_000, 0, 0x00800000),
-            account_root(holder, 10_000_000_000, 1, 0),
-            trust_line(holder, issuer, usd_currency(), 500, 10000, 0),
-        ]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::AMM_CLAWBACK, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfHolder"), holder);
-            tx.set_field_amount(sf("sfAmount"), iou(issuer, usd_currency(), 10));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        let r = handle_real_dispatch(&mut v, &tx, TxType::AMM_CLAWBACK, None);
-        assert!(r == Ter::TES_SUCCESS || r == Ter::TEC_NO_PERMISSION);
-    }
-}
 
 // ─── XChain: Create Bridge (feature disabled) ───────────────────────────────
 
@@ -5277,43 +3427,7 @@ fn amm40_batch_disabled() {
 
 // ─── XChain: 50 Accounts All Disabled ───────────────────────────────────────
 
-#[test]
-fn amm40_xchain_50_accounts_disabled() {
-    for i in 0x41u8..=0x72 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CREATE_BRIDGE, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-
 // ─── Batch: 50 Accounts All Disabled ────────────────────────────────────────
-
-#[test]
-fn amm40_batch_50_accounts_disabled() {
-    for i in 0x41u8..=0x72 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::BATCH, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::BATCH, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
 
 // ─── XChain: Create Bridge With Feature Enabled ─────────────────────────────
 
@@ -5419,43 +3533,7 @@ fn amm41_batch_enabled() {
 
 // ─── XChain: 20 Accounts Create Bridge Enabled ──────────────────────────────
 
-#[test]
-fn amm41_xchain_20_accounts_enabled() {
-    for i in 0x41u8..=0x54 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        let r = handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CREATE_BRIDGE, None);
-        assert_ne!(r, Ter::TEM_DISABLED);
-    }
-}
-
 // ─── Batch: 20 Accounts Enabled ─────────────────────────────────────────────
-
-#[test]
-fn amm41_batch_20_accounts_enabled() {
-    for i in 0x41u8..=0x54 {
-        let a = acct(i);
-        let l =
-            build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::BATCH, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        let r = handle_real_dispatch(&mut v, &tx, TxType::BATCH, None);
-        assert_ne!(r, Ter::TEM_DISABLED);
-    }
-}
 
 // ─── AMM Clawback: Various Amounts ──────────────────────────────────────────
 
@@ -5540,207 +3618,19 @@ fn amm41_clawback_amt_500() {
     assert!(r == Ter::TES_SUCCESS || r == Ter::TEC_NO_PERMISSION);
 }
 
-#[test]
-fn amm42_160_accounts_1_mptoken() {
-    for i in 0x41u8..=0xD9 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), 1_000_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-#[test]
-fn amm42_160_accounts_1_oracle() {
-    for i in 0x41u8..=0xD9 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), 1);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── XChain: 100 Accounts Create Bridge Enabled ─────────────────────────────
-
-#[test]
-fn amm43_xchain_100_create() {
-    for i in 1u8..=100 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CREATE_BRIDGE, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
 
 // ─── XChain: 100 Accounts Commit Enabled ────────────────────────────────────
 
-#[test]
-fn amm43_xchain_100_commit() {
-    for i in 1u8..=100 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_COMMIT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_COMMIT, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-
 // ─── XChain: 100 Accounts Claim Enabled ─────────────────────────────────────
-
-#[test]
-fn amm43_xchain_100_claim() {
-    for i in 1u8..=100 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CLAIM, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CLAIM, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
 
 // ─── XChain: 100 Accounts Create Claim ID Enabled ───────────────────────────
 
-#[test]
-fn amm43_xchain_100_create_claim() {
-    for i in 1u8..=100 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CREATE_CLAIM_ID, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CREATE_CLAIM_ID, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-
 // ─── XChain: 100 Accounts Modify Bridge Enabled ─────────────────────────────
-
-#[test]
-fn amm43_xchain_100_modify() {
-    for i in 1u8..=100 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_MODIFY_BRIDGE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_MODIFY_BRIDGE, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
 
 // ─── Batch: 100 Accounts Enabled ────────────────────────────────────────────
 
-#[test]
-fn amm43_batch_100() {
-    for i in 1u8..=100 {
-        let a = acct(i);
-        let l =
-            build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::BATCH, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::BATCH, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-
 // ─── AMM Clawback: 200 Different Holders ────────────────────────────────────
-
-#[test]
-fn amm43_clawback_200() {
-    for i in 1u8..=200 {
-        let issuer = acct(0x11);
-        let holder = acct(i);
-        if i == 0x11 {
-            continue;
-        }
-        let l = build_ledger(vec![
-            account_root(issuer, 10_000_000_000, 0, 0x00800000),
-            account_root(holder, 10_000_000_000, 1, 0),
-            trust_line(holder, issuer, usd_currency(), 500, 10000, 0),
-        ]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::AMM_CLAWBACK, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfHolder"), holder);
-            tx.set_field_amount(sf("sfAmount"), iou(issuer, usd_currency(), 10));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        let r = handle_real_dispatch(&mut v, &tx, TxType::AMM_CLAWBACK, None);
-        assert!(r == Ter::TES_SUCCESS || r == Ter::TEC_NO_PERMISSION);
-    }
-}
 
 // ─── AMM Clawback: 10 Different Currencies ──────────────────────────────────
 
@@ -5774,274 +3664,27 @@ fn amm43_clawback_10_currencies() {
 
 // ─── XChain: 200 Accounts All Types Disabled ────────────────────────────────
 
-#[test]
-fn amm43_xchain_200_disabled() {
-    for i in 1u8..=200 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CREATE_BRIDGE, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-
 // ─── Batch: 200 Accounts Disabled ───────────────────────────────────────────
-
-#[test]
-fn amm43_batch_200_disabled() {
-    for i in 1u8..=200 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::BATCH, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::BATCH, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
 
 // ─── XChain: 50 Accounts Commit Disabled ────────────────────────────────────
 
-#[test]
-fn amm43_xchain_50_commit_disabled() {
-    for i in 0x41u8..=0x72 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_COMMIT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_COMMIT, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-
 // ─── XChain: 50 Accounts Claim Disabled ─────────────────────────────────────
-
-#[test]
-fn amm43_xchain_50_claim_disabled() {
-    for i in 0x41u8..=0x72 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CLAIM, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CLAIM, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
 
 // ─── XChain: 50 Accounts Modify Disabled ────────────────────────────────────
 
-#[test]
-fn amm43_xchain_50_modify_disabled() {
-    for i in 0x41u8..=0x72 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_MODIFY_BRIDGE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_MODIFY_BRIDGE, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-
 // ─── XChain: 50 Accounts Create Claim Disabled ──────────────────────────────
-
-#[test]
-fn amm43_xchain_50_create_claim_disabled() {
-    for i in 0x41u8..=0x72 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CREATE_CLAIM_ID, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CREATE_CLAIM_ID, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
 
 // ─── XChain: 50 Accounts Add Attestation Disabled ───────────────────────────
 
-#[test]
-fn amm43_xchain_50_attest_disabled() {
-    for i in 0x41u8..=0x72 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_ADD_CLAIM_ATTESTATION, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_ADD_CLAIM_ATTESTATION, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-
 // ─── XChain: 50 Accounts Account Create Disabled ────────────────────────────
-
-#[test]
-fn amm43_xchain_50_acct_create_disabled() {
-    for i in 0x41u8..=0x72 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_ACCOUNT_CREATE_COMMIT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_ACCOUNT_CREATE_COMMIT, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
 
 // ─── XChain: 50 Accounts All 8 Types Enabled ────────────────────────────────
 
-#[test]
-fn amm44_xchain_50_all_types() {
-    for i in 0x41u8..=0x72 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        for tt in [
-            TxType::XCHAIN_CREATE_BRIDGE,
-            TxType::XCHAIN_MODIFY_BRIDGE,
-            TxType::XCHAIN_CLAIM,
-            TxType::XCHAIN_COMMIT,
-            TxType::XCHAIN_CREATE_CLAIM_ID,
-            TxType::XCHAIN_ADD_CLAIM_ATTESTATION,
-            TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION,
-            TxType::XCHAIN_ACCOUNT_CREATE_COMMIT,
-        ] {
-            let tx = STTx::new(tt, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), 1);
-            });
-            assert_ne!(
-                handle_real_dispatch(&mut v, &tx, tt, None),
-                Ter::TEM_DISABLED
-            );
-        }
-    }
-}
-
 // ─── XChain: 50 Accounts All 8 Types Disabled ───────────────────────────────
-
-#[test]
-fn amm44_xchain_50_all_disabled() {
-    for i in 0x41u8..=0x72 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for tt in [
-            TxType::XCHAIN_CREATE_BRIDGE,
-            TxType::XCHAIN_MODIFY_BRIDGE,
-            TxType::XCHAIN_CLAIM,
-            TxType::XCHAIN_COMMIT,
-            TxType::XCHAIN_CREATE_CLAIM_ID,
-            TxType::XCHAIN_ADD_CLAIM_ATTESTATION,
-            TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION,
-            TxType::XCHAIN_ACCOUNT_CREATE_COMMIT,
-        ] {
-            let tx = STTx::new(tt, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), 1);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, tt, None),
-                Ter::TEM_DISABLED
-            );
-        }
-    }
-}
 
 // ─── Batch: 200 Accounts Enabled ────────────────────────────────────────────
 
-#[test]
-fn amm44_batch_200_enabled() {
-    for i in 1u8..=200 {
-        let a = acct(i);
-        let l =
-            build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::BATCH, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::BATCH, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-
 // ─── AMM Clawback: 50 Issuers Each Clawback 1 Holder ────────────────────────
-
-#[test]
-fn amm44_clawback_50_issuers() {
-    for i in 0x41u8..=0x72 {
-        let issuer = acct(i);
-        let holder = acct(0x22);
-        let l = build_ledger(vec![
-            account_root(issuer, 10_000_000_000, 0, 0x00800000),
-            account_root(holder, 10_000_000_000, 1, 0),
-            trust_line(holder, issuer, usd_currency(), 500, 10000, 0),
-        ]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::AMM_CLAWBACK, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfHolder"), holder);
-            tx.set_field_amount(sf("sfAmount"), iou(issuer, usd_currency(), 25));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        let r = handle_real_dispatch(&mut v, &tx, TxType::AMM_CLAWBACK, None);
-        assert!(r == Ter::TES_SUCCESS || r == Ter::TEC_NO_PERMISSION);
-    }
-}
 
 // ─── AMM Clawback: 20 Different Currencies ──────────────────────────────────
 
@@ -6120,268 +3763,14 @@ fn amm44_clawback_no_trustline_noop() {
 
 // ─── XChain: 150 Accounts Create Bridge Disabled ────────────────────────────
 
-#[test]
-fn amm44_xchain_150_create_disabled() {
-    for i in 1u8..=150 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CREATE_BRIDGE, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-
 // ─── XChain: 150 Accounts Commit Disabled ───────────────────────────────────
-
-#[test]
-fn amm44_xchain_150_commit_disabled() {
-    for i in 1u8..=150 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_COMMIT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_COMMIT, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
 
 // ─── Batch: 150 Accounts Disabled ───────────────────────────────────────────
 
-#[test]
-fn amm44_batch_150_disabled() {
-    for i in 1u8..=150 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::BATCH, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::BATCH, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-
 // ─── XChain: 150 Accounts Create Bridge Enabled ─────────────────────────────
-
-#[test]
-fn amm44_xchain_150_create_enabled() {
-    for i in 1u8..=150 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CREATE_BRIDGE, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
 
 // ─── Batch: 150 Accounts Enabled ────────────────────────────────────────────
 
-#[test]
-fn amm44_batch_150_enabled() {
-    for i in 1u8..=150 {
-        let a = acct(i);
-        let l =
-            build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::BATCH, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::BATCH, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-
-#[test]
-fn amm45_xchain_200_create_enabled() {
-    for i in 1u8..=200 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CREATE_BRIDGE, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm45_xchain_200_commit_enabled() {
-    for i in 1u8..=200 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_COMMIT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_COMMIT, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm45_xchain_200_claim_enabled() {
-    for i in 1u8..=200 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CLAIM, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CLAIM, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm45_xchain_200_modify_enabled() {
-    for i in 1u8..=200 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_MODIFY_BRIDGE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_MODIFY_BRIDGE, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm45_xchain_200_create_claim_enabled() {
-    for i in 1u8..=200 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CREATE_CLAIM_ID, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CREATE_CLAIM_ID, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm45_batch_250_enabled() {
-    for i in 1u8..=250 {
-        let a = acct(i);
-        let l =
-            build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::BATCH, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::BATCH, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm45_batch_250_disabled() {
-    for i in 1u8..=250 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::BATCH, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::BATCH, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm45_clawback_250_holders() {
-    for i in 1u8..=250 {
-        let issuer = acct(0x11);
-        let holder = acct(i);
-        if i == 0x11 {
-            continue;
-        }
-        let l = build_ledger(vec![
-            account_root(issuer, 10_000_000_000, 0, 0x00800000),
-            account_root(holder, 10_000_000_000, 1, 0),
-            trust_line(holder, issuer, usd_currency(), 500, 10000, 0),
-        ]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::AMM_CLAWBACK, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfHolder"), holder);
-            tx.set_field_amount(sf("sfAmount"), iou(issuer, usd_currency(), 5));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        let r = handle_real_dispatch(&mut v, &tx, TxType::AMM_CLAWBACK, None);
-        assert!(r == Ter::TES_SUCCESS || r == Ter::TEC_NO_PERMISSION);
-    }
-}
 #[test]
 fn amm45_clawback_50_currencies() {
     let issuer = acct(0x11);
@@ -6412,231 +3801,7 @@ fn amm45_clawback_50_currencies() {
         assert!(r == Ter::TES_SUCCESS || r == Ter::TEC_NO_PERMISSION);
     }
 }
-#[test]
-fn amm45_xchain_250_create_disabled() {
-    for i in 1u8..=250 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CREATE_BRIDGE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CREATE_BRIDGE, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm45_xchain_250_commit_disabled() {
-    for i in 1u8..=250 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_COMMIT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_COMMIT, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm45_xchain_250_claim_disabled() {
-    for i in 1u8..=250 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_CLAIM, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_CLAIM, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm45_clawback_100_issuers() {
-    for i in 1u8..=100 {
-        let issuer = acct(i);
-        let holder = acct(0x22);
-        if i == 0x22 {
-            continue;
-        }
-        let l = build_ledger(vec![
-            account_root(issuer, 10_000_000_000, 0, 0x00800000),
-            account_root(holder, 10_000_000_000, 1, 0),
-            trust_line(holder, issuer, usd_currency(), 500, 10000, 0),
-        ]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::AMM_CLAWBACK, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfHolder"), holder);
-            tx.set_field_amount(sf("sfAmount"), iou(issuer, usd_currency(), 10));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        let r = handle_real_dispatch(&mut v, &tx, TxType::AMM_CLAWBACK, None);
-        assert!(r == Ter::TES_SUCCESS || r == Ter::TEC_NO_PERMISSION);
-    }
-}
 
-#[test]
-fn amm46_100_pools_various_fees() {
-    for (i, fee) in (0x11u8..=0x74).zip((0..=99).map(|f| f * 10)) {
-        let a = acct(i);
-        let gw = acct(0x33);
-        let cur = protocol::currency_from_string("USD");
-        let l = build_ledger_with_features(
-            vec![
-                account_root(a, 50_000_000_000, 1, 0),
-                account_root(gw, 50_000_000_000, 0, 0x00800000),
-                trust_line(a, gw, cur, 100000, 1000000, 0),
-            ],
-            vec!["AMM"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::AMM_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfAmount"), xrp(5_000_000_000));
-            tx.set_field_amount(sf("sfAmount2"), iou(gw, cur, 5000));
-            tx.set_field_u16(sf("sfTradingFee"), fee);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::AMM_CREATE),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-#[test]
-fn amm46_xchain_all8_250_disabled() {
-    for i in 1u8..=250 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_ADD_CLAIM_ATTESTATION, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_ADD_CLAIM_ATTESTATION, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm46_xchain_acct_create_250_disabled() {
-    for i in 1u8..=250 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(
-                &mut v,
-                &tx,
-                TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION,
-                None
-            ),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm46_xchain_attest_250_enabled() {
-    for i in 1u8..=250 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_ADD_CLAIM_ATTESTATION, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::XCHAIN_ADD_CLAIM_ATTESTATION, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm46_xchain_acct_create_250_enabled() {
-    for i in 1u8..=250 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(
-                &mut v,
-                &tx,
-                TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION,
-                None
-            ),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm46_batch_300_disabled() {
-    for i in 1u8..=250 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::BATCH, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::BATCH, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-#[test]
-fn amm46_batch_300_enabled() {
-    for i in 1u8..=250 {
-        let a = acct(i);
-        let l =
-            build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::BATCH, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::BATCH, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
 #[test]
 fn amm46_clawback_various_amts() {
     let issuer = acct(0x11);
@@ -6660,212 +3825,6 @@ fn amm46_clawback_various_amts() {
     }
 }
 
-#[test]
-fn amm47_xchain_all8_100_enabled() {
-    for i in 1u8..=100 {
-        let a = acct(i);
-        let l = build_ledger_with_features(
-            vec![account_root(a, 10_000_000_000, 0, 0)],
-            vec!["XChainBridge"],
-        );
-        let mut v = new_view(l);
-        for tt in [
-            TxType::XCHAIN_CREATE_BRIDGE,
-            TxType::XCHAIN_MODIFY_BRIDGE,
-            TxType::XCHAIN_CLAIM,
-            TxType::XCHAIN_COMMIT,
-            TxType::XCHAIN_CREATE_CLAIM_ID,
-            TxType::XCHAIN_ADD_CLAIM_ATTESTATION,
-            TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION,
-            TxType::XCHAIN_ACCOUNT_CREATE_COMMIT,
-        ] {
-            let tx = STTx::new(tt, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), 1);
-            });
-            assert_ne!(
-                handle_real_dispatch(&mut v, &tx, tt, None),
-                Ter::TEM_DISABLED
-            );
-        }
-    }
-}
-#[test]
-fn amm47_xchain_all8_100_disabled() {
-    for i in 1u8..=100 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 10_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        for tt in [
-            TxType::XCHAIN_CREATE_BRIDGE,
-            TxType::XCHAIN_MODIFY_BRIDGE,
-            TxType::XCHAIN_CLAIM,
-            TxType::XCHAIN_COMMIT,
-            TxType::XCHAIN_CREATE_CLAIM_ID,
-            TxType::XCHAIN_ADD_CLAIM_ATTESTATION,
-            TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION,
-            TxType::XCHAIN_ACCOUNT_CREATE_COMMIT,
-        ] {
-            let tx = STTx::new(tt, |tx| {
-                tx.set_account_id(sf("sfAccount"), a);
-                tx.set_field_amount(sf("sfFee"), xrp(10));
-                tx.set_field_u32(sf("sfSequence"), 1);
-            });
-            assert_eq!(
-                handle_real_dispatch(&mut v, &tx, tt, None),
-                Ter::TEM_DISABLED
-            );
-        }
-    }
-}
-#[test]
-fn amm47_clawback_150_issuers() {
-    for i in 1u8..=150 {
-        let issuer = acct(i);
-        let holder = acct(0x22);
-        if i == 0x22 {
-            continue;
-        }
-        let l = build_ledger(vec![
-            account_root(issuer, 10_000_000_000, 0, 0x00800000),
-            account_root(holder, 10_000_000_000, 1, 0),
-            trust_line(holder, issuer, usd_currency(), 500, 10000, 0),
-        ]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::AMM_CLAWBACK, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfHolder"), holder);
-            tx.set_field_amount(sf("sfAmount"), iou(issuer, usd_currency(), 5));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        let r = handle_real_dispatch(&mut v, &tx, TxType::AMM_CLAWBACK, None);
-        assert!(r == Ter::TES_SUCCESS || r == Ter::TEC_NO_PERMISSION);
-    }
-}
-#[test]
-fn amm47_batch_100_enabled2() {
-    for i in 1u8..=100 {
-        let a = acct(i);
-        let l =
-            build_ledger_with_features(vec![account_root(a, 10_000_000_000, 0, 0)], vec!["Batch"]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::BATCH, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_ne!(
-            handle_real_dispatch(&mut v, &tx, TxType::BATCH, None),
-            Ter::TEM_DISABLED
-        );
-    }
-}
-
-#[test]
-fn amm48_mptoken_180_accounts_1() {
-    for i in 0x41u8..=0xF2 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::MPTOKEN_ISSUANCE_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfFlags"), 0x02);
-            tx.set_field_u64(sf("sfMaximumAmount"), 1_000_000);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::MPTOKEN_ISSUANCE_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-#[test]
-fn amm48_oracle_180_accounts_1() {
-    for i in 0x41u8..=0xF2 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_u32(sf("sfOracleDocumentID"), 1);
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            full_apply(&mut v, &tx, TxType::ORACLE_SET),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-#[test]
-fn amm48_did_180() {
-    for i in 0x41u8..=0xF2 {
-        let a = acct(i);
-        let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::DID_SET, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_field_vl(sf("sfDIDDocument"), b"did:xrpl:v3");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(full_apply(&mut v, &tx, TxType::DID_SET), Ter::TES_SUCCESS);
-    }
-}
-#[test]
-fn amm48_credential_180() {
-    let issuer = acct(0x11);
-    let mut entries = vec![account_root(issuer, 90_000_000_000, 0, 0)];
-    for i in 0x41u8..=0xF2 {
-        entries.push(account_root(acct(i), 5_000_000_000, 0, 0));
-    }
-    let l = build_ledger(entries);
-    let mut v = new_view(l);
-    for (seq, subj) in (1..=178u32).zip(0x41u8..=0xF2) {
-        let tx = STTx::new(TxType::CREDENTIAL_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), issuer);
-            tx.set_account_id(sf("sfSubject"), acct(subj));
-            tx.set_field_vl(sf("sfCredentialType"), b"KYC");
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::CREDENTIAL_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-#[test]
-fn amm48_vault_180() {
-    for i in 0x41u8..=0xF2 {
-        let o = acct(i);
-        let gw = acct(0x33);
-        if i == 0x33 {
-            continue;
-        }
-        let l = build_ledger_with_features(
-            vec![
-                account_root(o, 10_000_000_000, 0, 0),
-                account_root(gw, 10_000_000_000, 0, 0x00800000),
-            ],
-            vec!["SingleAssetVault", "MPTokensV1", "PermissionedDomains"],
-        );
-        let mut v = new_view(l);
-        let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
-            tx.set_account_id(sf("sfAccount"), o);
-            tx.set_field_amount(sf("sfAsset"), iou(gw, usd_currency(), 0));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), 1);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::VAULT_CREATE, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 #[test]
 fn amm_r1_mp() {
     let a = acct(0x1);
@@ -7299,6 +4258,10 @@ fn amm_r1_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7315,6 +4278,10 @@ fn amm_r2_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7331,6 +4298,10 @@ fn amm_r3_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7347,6 +4318,10 @@ fn amm_r4_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 4);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7363,6 +4338,10 @@ fn amm_r5_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 5);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7379,6 +4358,10 @@ fn amm_r6_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 6);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7395,6 +4378,10 @@ fn amm_r7_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 7);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7411,6 +4398,10 @@ fn amm_r8_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 8);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7427,6 +4418,10 @@ fn amm_r9_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 9);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7443,6 +4438,10 @@ fn amm_r10_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 10);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7459,6 +4458,10 @@ fn amm_r11_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 11);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7475,6 +4478,10 @@ fn amm_r12_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 12);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7491,6 +4498,10 @@ fn amm_r13_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 13);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7507,6 +4518,10 @@ fn amm_r14_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 14);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7523,6 +4538,10 @@ fn amm_r15_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 15);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7539,6 +4558,10 @@ fn amm_r16_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 16);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7555,6 +4578,10 @@ fn amm_r17_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 17);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7571,6 +4598,10 @@ fn amm_r18_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 18);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7587,6 +4618,10 @@ fn amm_r19_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 19);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7603,6 +4638,10 @@ fn amm_r20_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 20);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7619,6 +4658,10 @@ fn amm_r21_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 21);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7635,6 +4678,10 @@ fn amm_r22_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 22);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7651,6 +4698,10 @@ fn amm_r23_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 23);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7667,6 +4718,10 @@ fn amm_r24_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 24);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7683,6 +4738,10 @@ fn amm_r25_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 25);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8549,6 +5608,10 @@ fn amm_r26_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 26);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8565,6 +5628,10 @@ fn amm_r27_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 27);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8581,6 +5648,10 @@ fn amm_r28_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 28);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8597,6 +5668,10 @@ fn amm_r29_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 29);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8613,6 +5688,10 @@ fn amm_r30_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 30);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8629,6 +5708,10 @@ fn amm_r31_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 31);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8645,6 +5728,10 @@ fn amm_r32_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 32);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8661,6 +5748,10 @@ fn amm_r33_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 33);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8677,6 +5768,10 @@ fn amm_r34_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 34);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8693,6 +5788,10 @@ fn amm_r35_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 35);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8709,6 +5808,10 @@ fn amm_r36_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 36);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8725,6 +5828,10 @@ fn amm_r37_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 37);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8741,6 +5848,10 @@ fn amm_r38_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 38);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8757,6 +5868,10 @@ fn amm_r39_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 39);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8773,6 +5888,10 @@ fn amm_r40_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 40);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8789,6 +5908,10 @@ fn amm_r41_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 41);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8805,6 +5928,10 @@ fn amm_r42_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 42);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8821,6 +5948,10 @@ fn amm_r43_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 43);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8837,6 +5968,10 @@ fn amm_r44_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 44);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8853,6 +5988,10 @@ fn amm_r45_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 45);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8869,6 +6008,10 @@ fn amm_r46_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 46);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8885,6 +6028,10 @@ fn amm_r47_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 47);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8901,6 +6048,10 @@ fn amm_r48_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 48);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8917,6 +6068,10 @@ fn amm_r49_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 49);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8933,6 +6088,10 @@ fn amm_r50_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 50);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8949,6 +6108,10 @@ fn amm_r51_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 51);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8965,6 +6128,10 @@ fn amm_r52_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 52);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8981,6 +6148,10 @@ fn amm_r53_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 53);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8997,6 +6168,10 @@ fn amm_r54_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 54);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9013,6 +6188,10 @@ fn amm_r55_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 55);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9029,6 +6208,10 @@ fn amm_r56_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 56);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9045,6 +6228,10 @@ fn amm_r57_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 57);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9061,6 +6248,10 @@ fn amm_r58_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 58);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9077,6 +6268,10 @@ fn amm_r59_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 59);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9093,6 +6288,10 @@ fn amm_r60_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 60);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9109,6 +6308,10 @@ fn amm_r61_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 61);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9125,6 +6328,10 @@ fn amm_r62_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 62);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9141,6 +6348,10 @@ fn amm_r63_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 63);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9157,6 +6368,10 @@ fn amm_r64_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 64);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9173,6 +6388,10 @@ fn amm_r65_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 65);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9189,6 +6408,10 @@ fn amm_r66_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 66);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9205,6 +6428,10 @@ fn amm_r67_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 67);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9221,6 +6448,10 @@ fn amm_r68_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 68);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9237,6 +6468,10 @@ fn amm_r69_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 69);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9253,6 +6488,10 @@ fn amm_r70_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 70);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9269,6 +6508,10 @@ fn amm_r71_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 71);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9285,6 +6528,10 @@ fn amm_r72_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 72);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9301,6 +6548,10 @@ fn amm_r73_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 73);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9317,6 +6568,10 @@ fn amm_r74_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 74);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9333,6 +6588,10 @@ fn amm_r75_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 75);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10029,6 +7288,10 @@ fn amm_s1_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10045,6 +7308,10 @@ fn amm_s2_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10061,6 +7328,10 @@ fn amm_s3_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10077,6 +7348,10 @@ fn amm_s4_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 4);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10093,6 +7368,10 @@ fn amm_s5_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 5);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10109,6 +7388,10 @@ fn amm_s6_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 6);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10125,6 +7408,10 @@ fn amm_s7_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 7);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10141,6 +7428,10 @@ fn amm_s8_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 8);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10157,6 +7448,10 @@ fn amm_s9_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 9);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10173,6 +7468,10 @@ fn amm_s10_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 10);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10189,6 +7488,10 @@ fn amm_s11_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 11);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10205,6 +7508,10 @@ fn amm_s12_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 12);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10221,6 +7528,10 @@ fn amm_s13_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 13);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10237,6 +7548,10 @@ fn amm_s14_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 14);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10253,6 +7568,10 @@ fn amm_s15_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 15);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10269,6 +7588,10 @@ fn amm_s16_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 16);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10285,6 +7608,10 @@ fn amm_s17_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 17);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10301,6 +7628,10 @@ fn amm_s18_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 18);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10317,6 +7648,10 @@ fn amm_s19_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 19);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10333,6 +7668,10 @@ fn amm_s20_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 20);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10349,6 +7688,10 @@ fn amm_s21_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 21);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10365,6 +7708,10 @@ fn amm_s22_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 22);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10381,6 +7728,10 @@ fn amm_s23_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 23);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10397,6 +7748,10 @@ fn amm_s24_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 24);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10413,6 +7768,10 @@ fn amm_s25_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 25);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10429,6 +7788,10 @@ fn amm_s26_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 26);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10445,6 +7808,10 @@ fn amm_s27_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 27);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10461,6 +7828,10 @@ fn amm_s28_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 28);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10477,6 +7848,10 @@ fn amm_s29_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 29);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10493,6 +7868,10 @@ fn amm_s30_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 30);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10509,6 +7888,10 @@ fn amm_s31_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 31);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10525,6 +7908,10 @@ fn amm_s32_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 32);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10541,6 +7928,10 @@ fn amm_s33_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 33);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10557,6 +7948,10 @@ fn amm_s34_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 34);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10573,6 +7968,10 @@ fn amm_s35_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 35);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10589,6 +7988,10 @@ fn amm_s36_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 36);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10605,6 +8008,10 @@ fn amm_s37_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 37);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10621,6 +8028,10 @@ fn amm_s38_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 38);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10637,6 +8048,10 @@ fn amm_s39_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 39);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10653,6 +8068,10 @@ fn amm_s40_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 40);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11349,6 +8768,10 @@ fn amm_t1_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 10);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11365,6 +8788,10 @@ fn amm_t2_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 20);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11381,6 +8808,10 @@ fn amm_t3_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 30);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11397,6 +8828,10 @@ fn amm_t4_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 40);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11413,6 +8848,10 @@ fn amm_t5_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 50);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11429,6 +8868,10 @@ fn amm_t6_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 60);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11445,6 +8888,10 @@ fn amm_t7_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 70);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11461,6 +8908,10 @@ fn amm_t8_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 80);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11477,6 +8928,10 @@ fn amm_t9_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 90);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11493,6 +8948,10 @@ fn amm_t10_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 100);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11509,6 +8968,10 @@ fn amm_t11_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 110);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11525,6 +8988,10 @@ fn amm_t12_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 120);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11541,6 +9008,10 @@ fn amm_t13_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 130);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11557,6 +9028,10 @@ fn amm_t14_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 140);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11573,6 +9048,10 @@ fn amm_t15_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 150);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11589,6 +9068,10 @@ fn amm_t16_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 160);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11605,6 +9088,10 @@ fn amm_t17_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 170);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11621,6 +9108,10 @@ fn amm_t18_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 180);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11637,6 +9128,10 @@ fn amm_t19_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 190);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11653,6 +9148,10 @@ fn amm_t20_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 200);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11669,6 +9168,10 @@ fn amm_t21_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 210);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11685,6 +9188,10 @@ fn amm_t22_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 220);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11701,6 +9208,10 @@ fn amm_t23_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 230);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11717,6 +9228,10 @@ fn amm_t24_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 240);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11733,6 +9248,10 @@ fn amm_t25_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 250);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11749,6 +9268,10 @@ fn amm_t26_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 260);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11765,6 +9288,10 @@ fn amm_t27_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 270);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11781,6 +9308,10 @@ fn amm_t28_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 280);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11797,6 +9328,10 @@ fn amm_t29_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 290);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11813,6 +9348,10 @@ fn amm_t30_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 300);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11829,6 +9368,10 @@ fn amm_t31_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 310);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11845,6 +9388,10 @@ fn amm_t32_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 320);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11861,6 +9408,10 @@ fn amm_t33_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 330);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11877,6 +9428,10 @@ fn amm_t34_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 340);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11893,6 +9448,10 @@ fn amm_t35_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 350);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11909,6 +9468,10 @@ fn amm_t36_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 360);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11925,6 +9488,10 @@ fn amm_t37_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 370);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11941,6 +9508,10 @@ fn amm_t38_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 380);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11957,6 +9528,10 @@ fn amm_t39_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 390);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -11973,6 +9548,10 @@ fn amm_t40_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 400);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12584,6 +10163,10 @@ fn amm_u1_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 100);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12600,6 +10183,10 @@ fn amm_u2_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 200);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12616,6 +10203,10 @@ fn amm_u3_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 300);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12632,6 +10223,10 @@ fn amm_u4_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 400);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12648,6 +10243,10 @@ fn amm_u5_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 500);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12664,6 +10263,10 @@ fn amm_u6_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 600);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12680,6 +10283,10 @@ fn amm_u7_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 700);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12696,6 +10303,10 @@ fn amm_u8_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 800);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12712,6 +10323,10 @@ fn amm_u9_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 900);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12728,6 +10343,10 @@ fn amm_u10_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12744,6 +10363,10 @@ fn amm_u11_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1100);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12760,6 +10383,10 @@ fn amm_u12_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1200);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12776,6 +10403,10 @@ fn amm_u13_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1300);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12792,6 +10423,10 @@ fn amm_u14_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1400);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12808,6 +10443,10 @@ fn amm_u15_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1500);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12824,6 +10463,10 @@ fn amm_u16_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1600);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12840,6 +10483,10 @@ fn amm_u17_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1700);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12856,6 +10503,10 @@ fn amm_u18_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1800);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12872,6 +10523,10 @@ fn amm_u19_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1900);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12888,6 +10543,10 @@ fn amm_u20_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12904,6 +10563,10 @@ fn amm_u21_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2100);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12920,6 +10583,10 @@ fn amm_u22_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2200);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12936,6 +10603,10 @@ fn amm_u23_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2300);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12952,6 +10623,10 @@ fn amm_u24_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2400);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12968,6 +10643,10 @@ fn amm_u25_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2500);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -12984,6 +10663,10 @@ fn amm_u26_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2600);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13000,6 +10683,10 @@ fn amm_u27_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2700);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13016,6 +10703,10 @@ fn amm_u28_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2800);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13032,6 +10723,10 @@ fn amm_u29_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2900);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13048,6 +10743,10 @@ fn amm_u30_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13064,6 +10763,10 @@ fn amm_u31_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3100);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13080,6 +10783,10 @@ fn amm_u32_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3200);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13096,6 +10803,10 @@ fn amm_u33_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3300);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13112,6 +10823,10 @@ fn amm_u34_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3400);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13128,6 +10843,10 @@ fn amm_u35_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3500);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13654,6 +11373,10 @@ fn amm_w1_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13670,6 +11393,10 @@ fn amm_w2_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13686,6 +11413,10 @@ fn amm_w3_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13702,6 +11433,10 @@ fn amm_w4_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 4000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13718,6 +11453,10 @@ fn amm_w5_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 5000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13734,6 +11473,10 @@ fn amm_w6_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 6000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13750,6 +11493,10 @@ fn amm_w7_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 7000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13766,6 +11513,10 @@ fn amm_w8_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 8000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13782,6 +11533,10 @@ fn amm_w9_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 9000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13798,6 +11553,10 @@ fn amm_w10_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 10000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13814,6 +11573,10 @@ fn amm_w11_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 11000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13830,6 +11593,10 @@ fn amm_w12_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 12000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13846,6 +11613,10 @@ fn amm_w13_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 13000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13862,6 +11633,10 @@ fn amm_w14_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 14000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13878,6 +11653,10 @@ fn amm_w15_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 15000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13894,6 +11673,10 @@ fn amm_w16_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 16000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13910,6 +11693,10 @@ fn amm_w17_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 17000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13926,6 +11713,10 @@ fn amm_w18_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 18000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13942,6 +11733,10 @@ fn amm_w19_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 19000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13958,6 +11753,10 @@ fn amm_w20_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 20000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13974,6 +11773,10 @@ fn amm_w21_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 21000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -13990,6 +11793,10 @@ fn amm_w22_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 22000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14006,6 +11813,10 @@ fn amm_w23_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 23000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14022,6 +11833,10 @@ fn amm_w24_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 24000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14038,6 +11853,10 @@ fn amm_w25_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 25000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14054,6 +11873,10 @@ fn amm_w26_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 26000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14070,6 +11893,10 @@ fn amm_w27_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 27000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14086,6 +11913,10 @@ fn amm_w28_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 28000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14102,6 +11933,10 @@ fn amm_w29_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 29000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14118,6 +11953,10 @@ fn amm_w30_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 30000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14814,6 +12653,10 @@ fn amm_y1_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 10000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14830,6 +12673,10 @@ fn amm_y2_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 20000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14846,6 +12693,10 @@ fn amm_y3_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 30000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14862,6 +12713,10 @@ fn amm_y4_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 40000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14878,6 +12733,10 @@ fn amm_y5_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 50000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14894,6 +12753,10 @@ fn amm_y6_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 60000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14910,6 +12773,10 @@ fn amm_y7_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 70000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14926,6 +12793,10 @@ fn amm_y8_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 80000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14942,6 +12813,10 @@ fn amm_y9_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 90000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14958,6 +12833,10 @@ fn amm_y10_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 100000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14974,6 +12853,10 @@ fn amm_y11_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 110000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -14990,6 +12873,10 @@ fn amm_y12_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 120000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15006,6 +12893,10 @@ fn amm_y13_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 130000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15022,6 +12913,10 @@ fn amm_y14_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 140000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15038,6 +12933,10 @@ fn amm_y15_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 150000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15054,6 +12953,10 @@ fn amm_y16_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 160000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15070,6 +12973,10 @@ fn amm_y17_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 170000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15086,6 +12993,10 @@ fn amm_y18_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 180000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15102,6 +13013,10 @@ fn amm_y19_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 190000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15118,6 +13033,10 @@ fn amm_y20_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 200000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15134,6 +13053,10 @@ fn amm_y21_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 210000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15150,6 +13073,10 @@ fn amm_y22_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 220000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15166,6 +13093,10 @@ fn amm_y23_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 230000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15182,6 +13113,10 @@ fn amm_y24_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 240000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15198,6 +13133,10 @@ fn amm_y25_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 250000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15214,6 +13153,10 @@ fn amm_y26_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 260000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15230,6 +13173,10 @@ fn amm_y27_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 270000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15246,6 +13193,10 @@ fn amm_y28_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 280000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15262,6 +13213,10 @@ fn amm_y29_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 290000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15278,6 +13233,10 @@ fn amm_y30_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 300000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15294,6 +13253,10 @@ fn amm_y31_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 310000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15310,6 +13273,10 @@ fn amm_y32_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 320000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15326,6 +13293,10 @@ fn amm_y33_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 330000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15342,6 +13313,10 @@ fn amm_y34_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 340000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15358,6 +13333,10 @@ fn amm_y35_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 350000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15374,6 +13353,10 @@ fn amm_y36_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 360000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15390,6 +13373,10 @@ fn amm_y37_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 370000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15406,6 +13393,10 @@ fn amm_y38_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 380000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15422,6 +13413,10 @@ fn amm_y39_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 390000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -15438,6 +13433,10 @@ fn amm_y40_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 400000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16049,6 +14048,10 @@ fn amm_z1_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 100000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16065,6 +14068,10 @@ fn amm_z2_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 200000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16081,6 +14088,10 @@ fn amm_z3_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 300000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16097,6 +14108,10 @@ fn amm_z4_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 400000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16113,6 +14128,10 @@ fn amm_z5_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 500000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16129,6 +14148,10 @@ fn amm_z6_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 600000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16145,6 +14168,10 @@ fn amm_z7_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 700000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16161,6 +14188,10 @@ fn amm_z8_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 800000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16177,6 +14208,10 @@ fn amm_z9_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 900000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16193,6 +14228,10 @@ fn amm_z10_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16209,6 +14248,10 @@ fn amm_z11_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1100000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16225,6 +14268,10 @@ fn amm_z12_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1200000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16241,6 +14288,10 @@ fn amm_z13_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1300000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16257,6 +14308,10 @@ fn amm_z14_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1400000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16273,6 +14328,10 @@ fn amm_z15_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1500000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16289,6 +14348,10 @@ fn amm_z16_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1600000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16305,6 +14368,10 @@ fn amm_z17_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1700000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16321,6 +14388,10 @@ fn amm_z18_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1800000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16337,6 +14408,10 @@ fn amm_z19_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1900000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16353,6 +14428,10 @@ fn amm_z20_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16369,6 +14448,10 @@ fn amm_z21_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2100000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16385,6 +14468,10 @@ fn amm_z22_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2200000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16401,6 +14488,10 @@ fn amm_z23_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2300000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16417,6 +14508,10 @@ fn amm_z24_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2400000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16433,6 +14528,10 @@ fn amm_z25_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2500000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16449,6 +14548,10 @@ fn amm_z26_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2600000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16465,6 +14568,10 @@ fn amm_z27_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2700000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16481,6 +14588,10 @@ fn amm_z28_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2800000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16497,6 +14608,10 @@ fn amm_z29_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2900000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16513,6 +14628,10 @@ fn amm_z30_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16529,6 +14648,10 @@ fn amm_z31_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3100000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16545,6 +14668,10 @@ fn amm_z32_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3200000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16561,6 +14688,10 @@ fn amm_z33_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3300000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16577,6 +14708,10 @@ fn amm_z34_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3400000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -16593,6 +14728,10 @@ fn amm_z35_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3500000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17204,6 +15343,10 @@ fn amm_aa1_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17220,6 +15363,10 @@ fn amm_aa2_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17236,6 +15383,10 @@ fn amm_aa3_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17252,6 +15403,10 @@ fn amm_aa4_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 4000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17268,6 +15423,10 @@ fn amm_aa5_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 5000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17284,6 +15443,10 @@ fn amm_aa6_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 6000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17300,6 +15463,10 @@ fn amm_aa7_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 7000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17316,6 +15483,10 @@ fn amm_aa8_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 8000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17332,6 +15503,10 @@ fn amm_aa9_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 9000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17348,6 +15523,10 @@ fn amm_aa10_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 10000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17364,6 +15543,10 @@ fn amm_aa11_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 11000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17380,6 +15563,10 @@ fn amm_aa12_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 12000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17396,6 +15583,10 @@ fn amm_aa13_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 13000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17412,6 +15603,10 @@ fn amm_aa14_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 14000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17428,6 +15623,10 @@ fn amm_aa15_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 15000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17444,6 +15643,10 @@ fn amm_aa16_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 16000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17460,6 +15663,10 @@ fn amm_aa17_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 17000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17476,6 +15683,10 @@ fn amm_aa18_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 18000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17492,6 +15703,10 @@ fn amm_aa19_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 19000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17508,6 +15723,10 @@ fn amm_aa20_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 20000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17524,6 +15743,10 @@ fn amm_aa21_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 21000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17540,6 +15763,10 @@ fn amm_aa22_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 22000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17556,6 +15783,10 @@ fn amm_aa23_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 23000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17572,6 +15803,10 @@ fn amm_aa24_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 24000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17588,6 +15823,10 @@ fn amm_aa25_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 25000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17604,6 +15843,10 @@ fn amm_aa26_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 26000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17620,6 +15863,10 @@ fn amm_aa27_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 27000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17636,6 +15883,10 @@ fn amm_aa28_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 28000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17652,6 +15903,10 @@ fn amm_aa29_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 29000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17668,6 +15923,10 @@ fn amm_aa30_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 30000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17684,6 +15943,10 @@ fn amm_aa31_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 31000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17700,6 +15963,10 @@ fn amm_aa32_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 32000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17716,6 +15983,10 @@ fn amm_aa33_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 33000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17732,6 +16003,10 @@ fn amm_aa34_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 34000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -17748,6 +16023,10 @@ fn amm_aa35_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 35000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18274,6 +16553,10 @@ fn amm_ac1_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 10000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18290,6 +16573,10 @@ fn amm_ac2_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 20000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18306,6 +16593,10 @@ fn amm_ac3_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 30000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18322,6 +16613,10 @@ fn amm_ac4_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 40000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18338,6 +16633,10 @@ fn amm_ac5_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 50000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18354,6 +16653,10 @@ fn amm_ac6_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 60000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18370,6 +16673,10 @@ fn amm_ac7_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 70000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18386,6 +16693,10 @@ fn amm_ac8_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 80000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18402,6 +16713,10 @@ fn amm_ac9_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 90000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18418,6 +16733,10 @@ fn amm_ac10_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 100000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18434,6 +16753,10 @@ fn amm_ac11_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 110000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18450,6 +16773,10 @@ fn amm_ac12_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 120000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18466,6 +16793,10 @@ fn amm_ac13_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 130000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18482,6 +16813,10 @@ fn amm_ac14_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 140000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18498,6 +16833,10 @@ fn amm_ac15_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 150000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18514,6 +16853,10 @@ fn amm_ac16_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 160000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18530,6 +16873,10 @@ fn amm_ac17_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 170000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18546,6 +16893,10 @@ fn amm_ac18_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 180000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18562,6 +16913,10 @@ fn amm_ac19_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 190000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18578,6 +16933,10 @@ fn amm_ac20_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 200000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18594,6 +16953,10 @@ fn amm_ac21_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 210000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18610,6 +16973,10 @@ fn amm_ac22_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 220000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18626,6 +16993,10 @@ fn amm_ac23_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 230000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18642,6 +17013,10 @@ fn amm_ac24_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 240000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18658,6 +17033,10 @@ fn amm_ac25_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 250000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18674,6 +17053,10 @@ fn amm_ac26_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 260000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18690,6 +17073,10 @@ fn amm_ac27_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 270000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18706,6 +17093,10 @@ fn amm_ac28_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 280000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18722,6 +17113,10 @@ fn amm_ac29_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 290000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18738,6 +17133,10 @@ fn amm_ac30_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 300000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -21076,7 +19475,7 @@ fn amm_ext50() {
     let cur = protocol::currency_from_string("USD");
     let l = build_ledger_with_features(
         vec![
-            account_root(a, 50_000_000_010, 1, 0),
+            account_root(a, 50_000_300_010, 1, 0),
             account_root(gw, 50_000_000_000, 0, 0x00800000),
             trust_line(a, gw, cur, 100000, 1000000, 0),
         ],
@@ -23426,7 +21825,7 @@ fn amm_ext2_50() {
     let cur = protocol::currency_from_string("EUR");
     let l = build_ledger_with_features(
         vec![
-            account_root(a, 50_000_000_010, 1, 0),
+            account_root(a, 50_000_300_010, 1, 0),
             account_root(gw, 50_000_000_000, 0, 0x00800000),
             trust_line(a, gw, cur, 100000, 1000000, 0),
         ],
@@ -25776,7 +24175,7 @@ fn amm_ext3_50() {
     let cur = protocol::currency_from_string("GBP");
     let l = build_ledger_with_features(
         vec![
-            account_root(a, 50_000_000_010, 1, 0),
+            account_root(a, 50_000_300_010, 1, 0),
             account_root(gw, 50_000_000_000, 0, 0x00800000),
             trust_line(a, gw, cur, 100000, 1000000, 0),
         ],
@@ -26314,6 +24713,10 @@ fn amm_ad1_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 100000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26330,6 +24733,10 @@ fn amm_ad2_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 200000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26346,6 +24753,10 @@ fn amm_ad3_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 300000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26362,6 +24773,10 @@ fn amm_ad4_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 400000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26378,6 +24793,10 @@ fn amm_ad5_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 500000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26394,6 +24813,10 @@ fn amm_ad6_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 600000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26410,6 +24833,10 @@ fn amm_ad7_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 700000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26426,6 +24853,10 @@ fn amm_ad8_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 800000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26442,6 +24873,10 @@ fn amm_ad9_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 900000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26458,6 +24893,10 @@ fn amm_ad10_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1000000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26474,6 +24913,10 @@ fn amm_ad11_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1100000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26490,6 +24933,10 @@ fn amm_ad12_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1200000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26506,6 +24953,10 @@ fn amm_ad13_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1300000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26522,6 +24973,10 @@ fn amm_ad14_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1400000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26538,6 +24993,10 @@ fn amm_ad15_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1500000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26554,6 +25013,10 @@ fn amm_ad16_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1600000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26570,6 +25033,10 @@ fn amm_ad17_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1700000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26586,6 +25053,10 @@ fn amm_ad18_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1800000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26602,6 +25073,10 @@ fn amm_ad19_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1900000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26618,6 +25093,10 @@ fn amm_ad20_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2000000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26634,6 +25113,10 @@ fn amm_ad21_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2100000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26650,6 +25133,10 @@ fn amm_ad22_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2200000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26666,6 +25153,10 @@ fn amm_ad23_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2300000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26682,6 +25173,10 @@ fn amm_ad24_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2400000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26698,6 +25193,10 @@ fn amm_ad25_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2500000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26714,6 +25213,10 @@ fn amm_ad26_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2600000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26730,6 +25233,10 @@ fn amm_ad27_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2700000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26746,6 +25253,10 @@ fn amm_ad28_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2800000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26762,6 +25273,10 @@ fn amm_ad29_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2900000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -26778,6 +25293,10 @@ fn amm_ad30_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3000000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27389,6 +25908,10 @@ fn amm_af1_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27405,6 +25928,10 @@ fn amm_af2_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 2000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27421,6 +25948,10 @@ fn amm_af3_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 3000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27437,6 +25968,10 @@ fn amm_af4_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 4000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27453,6 +25988,10 @@ fn amm_af5_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 5000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27469,6 +26008,10 @@ fn amm_af6_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 6000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27485,6 +26028,10 @@ fn amm_af7_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 7000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27501,6 +26048,10 @@ fn amm_af8_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 8000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27517,6 +26068,10 @@ fn amm_af9_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 9000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27533,6 +26088,10 @@ fn amm_af10_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 10000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27549,6 +26108,10 @@ fn amm_af11_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 11000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27565,6 +26128,10 @@ fn amm_af12_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 12000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27581,6 +26148,10 @@ fn amm_af13_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 13000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27597,6 +26168,10 @@ fn amm_af14_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 14000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27613,6 +26188,10 @@ fn amm_af15_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 15000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27629,6 +26208,10 @@ fn amm_af16_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 16000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27645,6 +26228,10 @@ fn amm_af17_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 17000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27661,6 +26248,10 @@ fn amm_af18_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 18000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27677,6 +26268,10 @@ fn amm_af19_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 19000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27693,6 +26288,10 @@ fn amm_af20_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 20000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27709,6 +26308,10 @@ fn amm_af21_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 21000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27725,6 +26328,10 @@ fn amm_af22_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 22000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27741,6 +26348,10 @@ fn amm_af23_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 23000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27757,6 +26368,10 @@ fn amm_af24_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 24000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27773,6 +26388,10 @@ fn amm_af25_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 25000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27789,6 +26408,10 @@ fn amm_af26_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 26000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27805,6 +26428,10 @@ fn amm_af27_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 27000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27821,6 +26448,10 @@ fn amm_af28_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 28000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27837,6 +26468,10 @@ fn amm_af29_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 29000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27853,6 +26488,10 @@ fn amm_af30_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 30000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27869,6 +26508,10 @@ fn amm_af31_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 31000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27885,6 +26528,10 @@ fn amm_af32_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 32000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27901,6 +26548,10 @@ fn amm_af33_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 33000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27917,6 +26568,10 @@ fn amm_af34_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 34000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -27933,6 +26588,10 @@ fn amm_af35_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 35000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28544,6 +27203,10 @@ fn amm_ag1_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 10000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28560,6 +27223,10 @@ fn amm_ag2_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 20000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28576,6 +27243,10 @@ fn amm_ag3_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 30000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28592,6 +27263,10 @@ fn amm_ag4_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 40000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28608,6 +27283,10 @@ fn amm_ag5_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 50000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28624,6 +27303,10 @@ fn amm_ag6_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 60000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28640,6 +27323,10 @@ fn amm_ag7_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 70000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28656,6 +27343,10 @@ fn amm_ag8_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 80000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28672,6 +27363,10 @@ fn amm_ag9_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 90000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28688,6 +27383,10 @@ fn amm_ag10_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 100000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28704,6 +27403,10 @@ fn amm_ag11_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 110000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28720,6 +27423,10 @@ fn amm_ag12_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 120000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28736,6 +27443,10 @@ fn amm_ag13_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 130000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28752,6 +27463,10 @@ fn amm_ag14_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 140000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28768,6 +27483,10 @@ fn amm_ag15_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 150000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28784,6 +27503,10 @@ fn amm_ag16_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 160000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28800,6 +27523,10 @@ fn amm_ag17_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 170000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28816,6 +27543,10 @@ fn amm_ag18_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 180000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28832,6 +27563,10 @@ fn amm_ag19_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 190000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28848,6 +27583,10 @@ fn amm_ag20_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 200000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28864,6 +27603,10 @@ fn amm_ag21_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 210000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28880,6 +27623,10 @@ fn amm_ag22_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 220000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28896,6 +27643,10 @@ fn amm_ag23_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 230000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28912,6 +27663,10 @@ fn amm_ag24_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 240000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28928,6 +27683,10 @@ fn amm_ag25_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 250000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28944,6 +27703,10 @@ fn amm_ag26_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 260000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28960,6 +27723,10 @@ fn amm_ag27_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 270000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28976,6 +27743,10 @@ fn amm_ag28_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 280000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -28992,6 +27763,10 @@ fn amm_ag29_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 290000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -29008,6 +27783,10 @@ fn amm_ag30_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 300000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -29024,6 +27803,10 @@ fn amm_ag31_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 310000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -29040,6 +27823,10 @@ fn amm_ag32_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 320000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -29056,6 +27843,10 @@ fn amm_ag33_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 330000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -29072,6 +27863,10 @@ fn amm_ag34_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 340000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -29088,6 +27883,10 @@ fn amm_ag35_or() {
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 350000000);
+        tx.set_field_vl(sf("sfProvider"), b"provider");
+        tx.set_field_vl(sf("sfAssetClass"), b"currency");
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+        tx.set_field_array(sf("sfPriceDataSeries"), default_oracle_price_data_series());
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });

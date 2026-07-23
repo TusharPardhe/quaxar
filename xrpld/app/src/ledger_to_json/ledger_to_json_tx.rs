@@ -2,11 +2,15 @@ use std::collections::BTreeMap;
 
 use basics::chrono::to_string_iso;
 use basics::str_hex::str_hex;
+use basics::tagged_cache::CacheClock;
 use ledger::Ledger;
 use protocol::{
     JsonOptions, JsonValue, LedgerEntryType, STTx, StBase, TxMeta, TxType, get_field_by_symbol,
     make_mpt_id,
 };
+use shamap::family::{FullBelowCache, MissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher};
+use shamap::traversal::TraversalError;
+use std::hash::BuildHasher;
 
 use crate::ledger_to_json::ledger_to_json_owner_funds::insert_owner_funds;
 use crate::{AppLedgerFill, LedgerTxEntry, copy_from, insert_deliver_max};
@@ -27,6 +31,44 @@ pub(crate) fn fill_json_transactions(json: &mut JsonValue, fill: &AppLedgerFill<
         .map(|entry| fill_json_tx_entry(fill, binary, expanded, entry.txn, entry.meta))
         .collect();
     root.insert("transactions".to_owned(), JsonValue::Array(txs));
+}
+
+pub(crate) fn fill_json_transactions_with_family<CLOCK, S, C, F, MR, NS>(
+    json: &mut JsonValue,
+    fill: &AppLedgerFill<'_>,
+    family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
+) -> Result<(), TraversalError>
+where
+    CLOCK: CacheClock,
+    S: BuildHasher + Clone,
+    C: FullBelowCache,
+    F: SHAMapNodeFetcher,
+    MR: MissingNodeReporter,
+{
+    let JsonValue::Object(root) = json else {
+        panic!("ledger json root must be an object");
+    };
+
+    let expanded = fill.is_expanded();
+    let binary = fill.is_binary();
+    let mut txs = Vec::new();
+    fill.ledger
+        .tx_map()
+        .visit_leaves_with_family(family, &mut |item| {
+            if let Ok((txn, meta)) =
+                ledger::decode_transaction_md_item(fill.ledger.header().seq, item)
+            {
+                txs.push(fill_json_tx_entry(
+                    fill,
+                    binary,
+                    expanded,
+                    txn.as_ref(),
+                    Some(&meta),
+                ));
+            }
+        })?;
+    root.insert("transactions".to_owned(), JsonValue::Array(txs));
+    Ok(())
 }
 
 pub(crate) fn fill_json_tx_entry(
@@ -159,6 +201,32 @@ fn fill_json_tx_v1(
         insert_mp_token_issuance_id(&mut meta_json, txn, meta);
         object.insert("metaData".to_owned(), meta_json);
     }
+}
+
+pub(crate) fn transaction_subscription_event(
+    ledger: &Ledger,
+    txn: &STTx,
+    meta: &TxMeta,
+) -> JsonValue {
+    let mut meta_json = meta.get_json(JsonOptions::NONE);
+    insert_delivered_amount(&mut meta_json, ledger, txn, meta);
+    JsonValue::Object(BTreeMap::from([
+        (
+            "type".to_owned(),
+            JsonValue::String("transaction".to_owned()),
+        ),
+        ("transaction".to_owned(), txn.json(JsonOptions::NONE)),
+        ("meta".to_owned(), meta_json),
+        (
+            "ledger_index".to_owned(),
+            JsonValue::Unsigned(u64::from(ledger.header().seq)),
+        ),
+        (
+            "ledger_hash".to_owned(),
+            JsonValue::String(ledger.header().hash.to_string()),
+        ),
+        ("validated".to_owned(), JsonValue::Bool(true)),
+    ]))
 }
 
 fn insert_delivered_amount(meta_json: &mut JsonValue, ledger: &Ledger, txn: &STTx, meta: &TxMeta) {

@@ -44,7 +44,10 @@ use basics::unordered_containers::{HashMap, HashSet};
 
 use crate::algorithm::functions::{check_consensus, should_close_ledger};
 use crate::algorithm::params::ConsensusParms;
-use crate::algorithm::types::{ConsensusCloseTimes, ConsensusMode, ConsensusPhase, ConsensusResult, ConsensusState, ConsensusTimer};
+use crate::algorithm::types::{
+    ConsensusCloseTimes, ConsensusMode, ConsensusPhase, ConsensusResult, ConsensusState,
+    ConsensusTimer,
+};
 use crate::model::proposal::ConsensusProposal;
 
 /// Convert a `time::Duration` (used by [`NetClockTimePoint`] arithmetic,
@@ -84,7 +87,10 @@ pub trait ConsensusTxSet: Clone {
     fn id(&self) -> Self::Id;
     /// Transactions that differ between `self` and `other`, keyed by tx id,
     /// with the bool indicating which set contains it (`true` = `self`).
-    fn compare(&self, other: &Self) -> std::collections::BTreeMap<<Self::Tx as ConsensusTx>::Id, bool>;
+    fn compare(
+        &self,
+        other: &Self,
+    ) -> std::collections::BTreeMap<<Self::Tx as ConsensusTx>::Id, bool>;
     fn insert(&mut self, tx: Self::Tx) -> bool;
     fn erase(&mut self, tx_id: &<Self::Tx as ConsensusTx>::Id) -> bool;
 }
@@ -116,10 +122,17 @@ pub trait ConsensusAdaptor {
     type Ledger: ConsensusLedger;
     type NodeId: Eq + std::hash::Hash + Ord + Clone + ToString;
     type TxSet: ConsensusTxSet;
-    type PeerPos: PeerPosition<Self::NodeId, <Self::Ledger as ConsensusLedger>::Id, <Self::TxSet as ConsensusTxSet>::Id>;
+    type PeerPos: PeerPosition<
+            Self::NodeId,
+            <Self::Ledger as ConsensusLedger>::Id,
+            <Self::TxSet as ConsensusTxSet>::Id,
+        >;
 
     /// Attempt to acquire a specific ledger.
-    fn acquire_ledger(&self, ledger_id: &<Self::Ledger as ConsensusLedger>::Id) -> Option<Self::Ledger>;
+    fn acquire_ledger(
+        &self,
+        ledger_id: &<Self::Ledger as ConsensusLedger>::Id,
+    ) -> Option<Self::Ledger>;
 
     /// Acquire the transaction set associated with a proposed position.
     /// Returning `None` may spawn an asynchronous request; the result
@@ -134,7 +147,11 @@ pub trait ConsensusAdaptor {
 
     /// Number of proposers that have validated a ledger descended from
     /// `prev_ledger`/`prev_ledger_id`.
-    fn proposers_finished(&self, prev_ledger: &Self::Ledger, prev_ledger_id: &<Self::Ledger as ConsensusLedger>::Id) -> usize;
+    fn proposers_finished(
+        &self,
+        prev_ledger: &Self::Ledger,
+        prev_ledger_id: &<Self::Ledger as ConsensusLedger>::Id,
+    ) -> usize;
 
     /// The ID of the last closed (and validated) ledger the application
     /// thinks consensus should use as the prior ledger.
@@ -149,7 +166,12 @@ pub trait ConsensusAdaptor {
     fn on_mode_change(&self, before: ConsensusMode, after: ConsensusMode);
 
     /// Called when the ledger closes; returns the initial position.
-    fn on_close(&self, prev_ledger: &Self::Ledger, now: NetClockTimePoint, mode: ConsensusMode) -> ConsensusResultOf<Self>;
+    fn on_close(
+        &self,
+        prev_ledger: &Self::Ledger,
+        now: NetClockTimePoint,
+        mode: ConsensusMode,
+    ) -> ConsensusResultOf<Self>;
 
     /// Called when a ledger is accepted by consensus.
     #[allow(clippy::too_many_arguments)]
@@ -163,7 +185,14 @@ pub trait ConsensusAdaptor {
     );
 
     /// Propose our position to peers.
-    fn propose(&self, pos: &ConsensusProposal<Self::NodeId, <Self::Ledger as ConsensusLedger>::Id, <Self::TxSet as ConsensusTxSet>::Id>);
+    fn propose(
+        &self,
+        pos: &ConsensusProposal<
+            Self::NodeId,
+            <Self::Ledger as ConsensusLedger>::Id,
+            <Self::TxSet as ConsensusTxSet>::Id,
+        >,
+    );
 
     /// Share a received peer proposal with other peers (delayed relay).
     fn share_peer_position(&self, prop: &Self::PeerPos);
@@ -191,6 +220,14 @@ pub trait ConsensusAdaptor {
     /// Round a raw close time to the given resolution. Adaptor-provided,
     /// same rationale as `next_ledger_time_resolution`.
     fn round_close_time(&self, raw: NetClockTimePoint, resolution: Duration) -> NetClockTimePoint;
+
+    /// Total number of trusted validators in the UNL. Used by
+    /// `should_pause` to determine the fraction of laggards. Defaults to
+    /// `0`, which disables the pause logic in the generic algorithm. The
+    /// RCL adaptor overrides this with the live UNL size.
+    fn validators_count(&self) -> usize {
+        0
+    }
 }
 
 /// Shorthand for the concrete [`ConsensusResult`] type produced by an
@@ -203,7 +240,6 @@ pub type ConsensusResultOf<A> = ConsensusResult<
     <<A as ConsensusAdaptor>::TxSet as ConsensusTxSet>::Tx,
     <<<A as ConsensusAdaptor>::TxSet as ConsensusTxSet>::Tx as ConsensusTx>::Id,
 >;
-
 
 /// A source of `Instant`s for measuring consensus progress. Matches the
 /// reference's injected `clock_type` (`beast::AbstractClock`), which
@@ -374,7 +410,11 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             self.recent_peer_positions.remove(n);
         }
 
-        let mut start_mode = if proposing { ConsensusMode::Proposing } else { ConsensusMode::Observing };
+        let mut start_mode = if proposing {
+            ConsensusMode::Proposing
+        } else {
+            ConsensusMode::Observing
+        };
 
         if prev_ledger.id() != prev_ledger_id {
             if let Some(new_ledger) = adaptor.acquire_ledger(&prev_ledger_id) {
@@ -411,10 +451,14 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         self.raw_close_times.self_ = NetClockTimePoint::default();
         self.dead_nodes.clear();
 
-        self.close_resolution =
-            adaptor.next_ledger_time_resolution(self.previous_ledger.close_time_resolution(), self.previous_ledger.close_agree(), self.previous_ledger.seq() + 1);
+        self.close_resolution = adaptor.next_ledger_time_resolution(
+            self.previous_ledger.close_time_resolution(),
+            self.previous_ledger.close_agree(),
+            self.previous_ledger.seq() + 1,
+        );
 
         self.playback_proposals(adaptor);
+
         if self.curr_peer_positions.len() > (self.prev_proposers / 2) {
             // We may be falling behind; don't wait for the timer, consider
             // closing the ledger immediately.
@@ -425,7 +469,12 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
     /// A peer has proposed a new position; adjust our tracking. Returns
     /// whether we should do delayed relay of this proposal. Matches
     /// `peerProposal`.
-    pub fn peer_proposal(&mut self, adaptor: &A, now: NetClockTimePoint, new_proposal: &A::PeerPos) -> bool {
+    pub fn peer_proposal(
+        &mut self,
+        adaptor: &A,
+        now: NetClockTimePoint,
+        new_proposal: &A::PeerPos,
+    ) -> bool {
         let peer_id = new_proposal.proposal().node_id().clone();
 
         {
@@ -439,7 +488,12 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         self.peer_proposal_internal(adaptor, now, new_proposal)
     }
 
-    fn peer_proposal_internal(&mut self, adaptor: &A, now: NetClockTimePoint, new_peer_pos: &A::PeerPos) -> bool {
+    fn peer_proposal_internal(
+        &mut self,
+        adaptor: &A,
+        now: NetClockTimePoint,
+        new_peer_pos: &A::PeerPos,
+    ) -> bool {
         if self.phase == ConsensusPhase::Accepted {
             return false;
         }
@@ -475,11 +529,16 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
                 return true;
             }
 
-            self.curr_peer_positions.insert(peer_id.clone(), new_peer_pos.clone());
+            self.curr_peer_positions
+                .insert(peer_id.clone(), new_peer_pos.clone());
         }
 
         if new_peer_prop.is_initial() {
-            *self.raw_close_times.peers.entry(new_peer_prop.close_time()).or_insert(0) += 1;
+            *self
+                .raw_close_times
+                .peers
+                .entry(new_peer_prop.close_time())
+                .or_insert(0) += 1;
         }
 
         {
@@ -535,8 +594,11 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             return;
         }
 
-        let positions: Vec<(A::NodeId, <A::TxSet as ConsensusTxSet>::Id)> =
-            self.curr_peer_positions.iter().map(|(node_id, pos)| (node_id.clone(), pos.proposal().position().clone())).collect();
+        let positions: Vec<(A::NodeId, <A::TxSet as ConsensusTxSet>::Id)> = self
+            .curr_peer_positions
+            .iter()
+            .map(|(node_id, pos)| (node_id.clone(), pos.proposal().position().clone()))
+            .collect();
 
         for (node_id, position) in positions {
             if position == id {
@@ -570,7 +632,13 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         }
 
         if let Some(new_ledger) = adaptor.acquire_ledger(&self.prev_ledger_id) {
-            self.start_round_internal(adaptor, self.now, lgr_id, &new_ledger, ConsensusMode::SwitchedLedger);
+            self.start_round_internal(
+                adaptor,
+                self.now,
+                lgr_id,
+                &new_ledger,
+                ConsensusMode::SwitchedLedger,
+            );
         } else {
             self.mode.set(ConsensusMode::WrongLedger, adaptor);
         }
@@ -579,7 +647,8 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
     /// Check that our previous ledger matches the network's. Matches
     /// `checkLedger`.
     fn check_ledger(&mut self, adaptor: &A) {
-        let net_lgr = adaptor.get_prev_ledger(&self.prev_ledger_id, &self.previous_ledger, self.mode.get());
+        let net_lgr =
+            adaptor.get_prev_ledger(&self.prev_ledger_id, &self.previous_ledger, self.mode.get());
 
         if net_lgr != self.prev_ledger_id || self.previous_ledger.id() != self.prev_ledger_id {
             self.handle_wrong_ledger(adaptor, net_lgr);
@@ -589,10 +658,16 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
     /// Replay recent proposals so they aren't lost after a radical context
     /// change. Matches `playbackProposals`.
     fn playback_proposals(&mut self, adaptor: &A) {
-        let all: Vec<A::PeerPos> = self.recent_peer_positions.values().flat_map(|deque| deque.iter().cloned()).collect();
+        let all: Vec<A::PeerPos> = self
+            .recent_peer_positions
+            .values()
+            .flat_map(|deque| deque.iter().cloned())
+            .collect();
 
         for pos in all {
-            if *pos.proposal().prev_ledger() == self.prev_ledger_id && self.peer_proposal_internal(adaptor, self.now, &pos) {
+            if *pos.proposal().prev_ledger() == self.prev_ledger_id
+                && self.peer_proposal_internal(adaptor, self.now, &pos)
+            {
                 adaptor.share_peer_position(&pos);
             }
         }
@@ -603,16 +678,26 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         let any_transactions = adaptor.has_open_transactions();
         let proposers_closed = self.curr_peer_positions.len();
         let proposers_validated = adaptor.proposers_validated(&self.prev_ledger_id);
+        if proposers_closed > 0 || self.prev_proposers > 0 {
+            tracing::info!(target: "consensus", proposers_closed, proposers_validated, prev_proposers = self.prev_proposers, "phase_open: proposer state");
+        }
 
         self.open_time.tick_to(self.clock.now());
 
         let mode = self.mode.get();
         let close_agree = self.previous_ledger.close_agree();
         let prev_close_time = self.previous_ledger.close_time();
-        let prev_parent_close_time_plus_1 = self.previous_ledger.parent_close_time() + time::Duration::seconds(1);
-        let previous_close_correct = mode != ConsensusMode::WrongLedger && close_agree && (prev_close_time != prev_parent_close_time_plus_1);
+        let prev_parent_close_time_plus_1 =
+            self.previous_ledger.parent_close_time() + time::Duration::seconds(1);
+        let previous_close_correct = mode != ConsensusMode::WrongLedger
+            && close_agree
+            && (prev_close_time != prev_parent_close_time_plus_1);
 
-        let last_close_time = if previous_close_correct { prev_close_time } else { self.prev_close_time };
+        let last_close_time = if previous_close_correct {
+            prev_close_time
+        } else {
+            self.prev_close_time
+        };
 
         // Guard against zero close time (genesis or early rounds before
         // any real close time was established). Without this, since_close
@@ -635,7 +720,10 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             Duration::ZERO
         };
 
-        let idle_interval = adaptor.parms().ledger_idle_interval.max(self.previous_ledger.close_time_resolution() * 2);
+        let idle_interval = adaptor
+            .parms()
+            .ledger_idle_interval
+            .max(self.previous_ledger.close_time_resolution() * 2);
 
         if should_close_ledger(
             any_transactions,
@@ -655,10 +743,31 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
     /// Close the open ledger and establish our initial position. Matches
     /// `closeLedger`.
     fn close_ledger(&mut self, adaptor: &A) {
-        debug_assert!(self.result.is_none(), "Consensus::close_ledger: result must not already be set");
+        debug_assert!(
+            self.result.is_none(),
+            "Consensus::close_ledger: result must not already be set"
+        );
 
         self.phase = ConsensusPhase::Establish;
-        self.raw_close_times.self_ = self.now;
+        // When recovering from a ledger switch, prefer the peer-reported
+        // close time over our local clock. Our local "now" may be several
+        // seconds past peers' actual close moment due to acquisition delay.
+        // This ensures our close_time matches what peers used, producing
+        // the same ledger hash after effective_close_time rounding.
+        if self.mode.get() == ConsensusMode::SwitchedLedger
+            && !self.raw_close_times.peers.is_empty()
+        {
+            let best_peer_time = self
+                .raw_close_times
+                .peers
+                .iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(time, _)| *time)
+                .unwrap_or(self.now);
+            self.raw_close_times.self_ = best_peer_time;
+        } else {
+            self.raw_close_times.self_ = self.now;
+        }
         self.peer_unchanged_counter = 0;
         self.establish_counter = 0;
 
@@ -678,8 +787,11 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
 
         self.result = Some(result);
 
-        let peer_positions: Vec<<A::TxSet as ConsensusTxSet>::Id> =
-            self.curr_peer_positions.values().map(|p| p.proposal().position().clone()).collect();
+        let peer_positions: Vec<<A::TxSet as ConsensusTxSet>::Id> = self
+            .curr_peer_positions
+            .values()
+            .map(|p| p.proposal().position().clone())
+            .collect();
         for pos in peer_positions {
             if let Some(set) = self.acquired.get(&pos).cloned() {
                 self.create_disputes(adaptor, &set);
@@ -689,7 +801,10 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
 
     /// Handle the `Establish` phase. Matches `phaseEstablish`.
     fn phase_establish(&mut self, adaptor: &A) {
-        debug_assert!(self.result.is_some(), "Consensus::phase_establish: result must be set");
+        debug_assert!(
+            self.result.is_some(),
+            "Consensus::phase_establish: result must be set"
+        );
 
         self.peer_unchanged_counter += 1;
         self.establish_counter += 1;
@@ -705,7 +820,8 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
 
         let round_time_ms = self.result.as_ref().expect("result set").round_time.read();
         let denom = self.prev_round_time.max(parms.av_min_consensus_time);
-        self.converge_percent = (round_time_ms.as_millis() as i64 * 100) / denom.as_millis().max(1) as i64;
+        self.converge_percent =
+            (round_time_ms.as_millis() as i64 * 100) / denom.as_millis().max(1) as i64;
 
         if round_time_ms < parms.ledger_min_consensus {
             return;
@@ -734,22 +850,42 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         self.phase = ConsensusPhase::Accepted;
 
         let result = self.result.take().expect("result set");
-        adaptor.on_accept(&result, &self.previous_ledger, self.close_resolution, &self.raw_close_times, self.mode.get());
+        adaptor.on_accept(
+            &result,
+            &self.previous_ledger,
+            self.close_resolution,
+            &self.raw_close_times,
+            self.mode.get(),
+        );
         self.result = Some(result);
     }
 
     /// Evaluate whether pausing increases the likelihood of validation.
-    /// Matches `shouldPause`. This is a stub returning `false` in the
-    /// generic algorithm: the reference's implementation depends entirely
-    /// on validator/UNL/laggard bookkeeping that lives at the RCL
-    /// adaptation layer (`getValidLedgerIndex`, `getQuorumKeys`,
-    /// `laggards`, `validator`, `haveValidated`), which is out of scope for
-    /// the generic, adaptor-agnostic state machine built in this phase. It
-    /// is intentionally left as a seam: Phase 5/6's `RclConsensusAdaptor`
-    /// can override this behavior once those data sources exist, either by
-    /// adding an adaptor method here or wrapping `Consensus` at that layer.
-    fn should_pause(&self, _adaptor: &A) -> bool {
-        false
+    /// Matches rippled's `shouldPause`: if we are a validator (Proposing
+    /// mode) and more than 20% of trusted validators have not yet validated
+    /// the previous ledger, pause to let them catch up. This prevents fast
+    /// validators from advancing too quickly and leaving slow validators
+    /// unable to participate in consensus.
+    fn should_pause(&self, adaptor: &A) -> bool {
+        // Only validators (Proposing mode) should ever pause.
+        if self.mode.get() != ConsensusMode::Proposing {
+            return false;
+        }
+
+        let total = adaptor.validators_count();
+        // If we don't know the UNL size, can't compute laggard fraction.
+        if total == 0 {
+            return false;
+        }
+
+        // Count validators who have validated the parent ledger.
+        let validated_parent = adaptor.proposers_validated(&self.prev_ledger_id);
+
+        // Laggards = validators who haven't validated the parent yet.
+        let laggards = total.saturating_sub(validated_parent);
+
+        // Pause if more than 20% of validators are lagging.
+        laggards > total / 5
     }
 
     /// Adjust our position to try to agree with other validators. Matches
@@ -757,10 +893,17 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
     fn update_our_positions(&mut self, adaptor: &A) {
         let parms = adaptor.parms().clone();
 
-        let peer_cutoff = self.now.checked_sub(std_duration_to_time(parms.propose_freshness)).unwrap_or_default();
-        let our_cutoff = self.now.checked_sub(std_duration_to_time(parms.propose_interval)).unwrap_or_default();
+        let peer_cutoff = self
+            .now
+            .checked_sub(std_duration_to_time(parms.propose_freshness))
+            .unwrap_or_default();
+        let our_cutoff = self
+            .now
+            .checked_sub(std_duration_to_time(parms.propose_interval))
+            .unwrap_or_default();
 
-        let mut close_time_votes: std::collections::BTreeMap<NetClockTimePoint, i32> = std::collections::BTreeMap::new();
+        let mut close_time_votes: std::collections::BTreeMap<NetClockTimePoint, i32> =
+            std::collections::BTreeMap::new();
 
         {
             let stale_peers: Vec<A::NodeId> = self
@@ -789,7 +932,10 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
 
         {
             let proposing = self.mode.get() == ConsensusMode::Proposing;
-            let result = self.result.as_mut().expect("result set during update_our_positions");
+            let result = self
+                .result
+                .as_mut()
+                .expect("result set during update_our_positions");
             let mut mutable_set: Option<A::TxSet> = None;
 
             let dispute_count = result.disputes.len();
@@ -811,7 +957,11 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             }
 
             if dispute_count > 0 || vote_changes > 0 {
-                let vote_detail: Vec<(bool, i32, i32)> = result.disputes.values().map(|d| (d.get_our_vote(), d.yays(), d.nays())).collect();
+                let vote_detail: Vec<(bool, i32, i32)> = result
+                    .disputes
+                    .values()
+                    .map(|d| (d.get_our_vote(), d.yays(), d.nays()))
+                    .collect();
                 tracing::info!(target: "consensus", dispute_count, vote_changes, proposing, converge_pct = self.converge_percent, votes = ?vote_detail, "update_our_positions: dispute status");
             }
 
@@ -823,23 +973,45 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
 
         if self.curr_peer_positions.is_empty() {
             self.have_close_time_consensus = true;
-            let position_close_time = self.result.as_ref().expect("result set").position.close_time();
+            let position_close_time = self
+                .result
+                .as_ref()
+                .expect("result set")
+                .position
+                .close_time();
             consensus_close_time = self.round_close_time_for(adaptor, position_close_time);
         } else {
-            let (needed_weight, new_state) = crate::algorithm::params::get_needed_weight(&parms, self.close_time_avalanche_state, self.converge_percent as i32, 0, 0);
+            let (needed_weight, new_state) = crate::algorithm::params::get_needed_weight(
+                &parms,
+                self.close_time_avalanche_state,
+                self.converge_percent as i32,
+                0,
+                0,
+            );
             if let Some(new_state) = new_state {
                 self.close_time_avalanche_state = new_state;
             }
 
             let mut participants = self.curr_peer_positions.len() as i32;
             if self.mode.get() == ConsensusMode::Proposing {
-                let our_close_time = self.round_close_time_for(adaptor, self.result.as_ref().expect("result set").position.close_time());
+                let our_close_time = self.round_close_time_for(
+                    adaptor,
+                    self.result
+                        .as_ref()
+                        .expect("result set")
+                        .position
+                        .close_time(),
+                );
                 *close_time_votes.entry(our_close_time).or_insert(0) += 1;
                 participants += 1;
             }
 
-            let mut thresh_vote = crate::algorithm::types::participants_needed(participants, needed_weight as i32);
-            let thresh_consensus = crate::algorithm::types::participants_needed(participants, parms.av_ct_consensus_pct as i32);
+            let mut thresh_vote =
+                crate::algorithm::types::participants_needed(participants, needed_weight as i32);
+            let thresh_consensus = crate::algorithm::types::participants_needed(
+                participants,
+                parms.av_ct_consensus_pct as i32,
+            );
 
             for (t, v) in &close_time_votes {
                 if *v >= thresh_vote {
@@ -854,7 +1026,8 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
 
         if our_new_set.is_none() {
             let result = self.result.as_ref().expect("result set");
-            let position_close_time = self.round_close_time_for(adaptor, result.position.close_time());
+            let position_close_time =
+                self.round_close_time_for(adaptor, result.position.close_time());
             if consensus_close_time != position_close_time || result.position.is_stale(our_cutoff) {
                 our_new_set = Some(result.txns.clone());
             }
@@ -867,14 +1040,21 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             {
                 let result = self.result.as_mut().expect("result set");
                 result.txns = new_set;
-                result.position.change_position(new_id.clone(), consensus_close_time, now);
+                result
+                    .position
+                    .change_position(new_id.clone(), consensus_close_time, now);
             }
 
             if !self.acquired.contains_key(&new_id) {
                 let txns = self.result.as_ref().expect("result set").txns.clone();
                 self.acquired.insert(new_id.clone(), txns.clone());
 
-                let is_bow_out = self.result.as_ref().expect("result set").position.is_bow_out();
+                let is_bow_out = self
+                    .result
+                    .as_ref()
+                    .expect("result set")
+                    .position
+                    .is_bow_out();
                 if !is_bow_out {
                     adaptor.share_tx_set(&txns);
                 }
@@ -908,7 +1088,13 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
     /// whether we have consensus (state is not `No`). Matches
     /// `haveConsensus`.
     fn have_consensus(&mut self, adaptor: &A) -> bool {
-        let our_position = self.result.as_ref().expect("result set").position.position().clone();
+        let our_position = self
+            .result
+            .as_ref()
+            .expect("result set")
+            .position
+            .position()
+            .clone();
 
         let mut agree = 0usize;
         let mut disagree = 0usize;
@@ -920,7 +1106,8 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             }
         }
 
-        let current_finished = adaptor.proposers_finished(&self.previous_ledger, &self.prev_ledger_id);
+        let current_finished =
+            adaptor.proposers_finished(&self.previous_ledger, &self.prev_ledger_id);
         let parms = adaptor.parms().clone();
         let proposing = self.mode.get() == ConsensusMode::Proposing;
 
@@ -928,7 +1115,10 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             let result = self.result.as_ref().expect("result set");
             self.have_close_time_consensus
                 && !result.disputes.is_empty()
-                && result.disputes.values().all(|dispute| dispute.stalled(&parms, proposing, self.peer_unchanged_counter))
+                && result
+                    .disputes
+                    .values()
+                    .all(|dispute| dispute.stalled(&parms, proposing, self.peer_unchanged_counter))
         };
 
         let state = check_consensus(
@@ -995,10 +1185,20 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         let differences = our_txns.compare(other);
 
         for (tx_id, in_this_set) in differences {
-            let tx = if in_this_set { our_txns.find(&tx_id) } else { other.find(&tx_id) };
+            let tx = if in_this_set {
+                our_txns.find(&tx_id)
+            } else {
+                other.find(&tx_id)
+            };
             let Some(tx) = tx else { continue };
 
-            if self.result.as_ref().expect("result set").disputes.contains_key(&tx_id) {
+            if self
+                .result
+                .as_ref()
+                .expect("result set")
+                .disputes
+                .contains_key(&tx_id)
+            {
                 continue;
             }
 
@@ -1016,7 +1216,11 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
 
             adaptor.share_tx(dtx.tx());
 
-            self.result.as_mut().expect("result set").disputes.insert(tx_id, dtx);
+            self.result
+                .as_mut()
+                .expect("result set")
+                .disputes
+                .insert(tx_id, dtx);
         }
     }
 
@@ -1024,7 +1228,12 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
     /// Calls `create_disputes` as needed. Matches `updateDisputes`.
     fn update_disputes(&mut self, adaptor: &A, node: &A::NodeId, other: &A::TxSet) {
         let other_id = other.id();
-        let already_compared = self.result.as_ref().expect("result set").compares.contains(&other_id);
+        let already_compared = self
+            .result
+            .as_ref()
+            .expect("result set")
+            .compares
+            .contains(&other_id);
         if !already_compared {
             self.create_disputes(adaptor, other);
         }
@@ -1210,11 +1419,20 @@ mod tests {
             self.state.borrow().proposers_validated
         }
 
-        fn proposers_finished(&self, _prev_ledger: &MockLedger, _prev_ledger_id: &LedgerId) -> usize {
+        fn proposers_finished(
+            &self,
+            _prev_ledger: &MockLedger,
+            _prev_ledger_id: &LedgerId,
+        ) -> usize {
             self.state.borrow().proposers_finished
         }
 
-        fn get_prev_ledger(&self, prev_ledger_id: &LedgerId, _prev_ledger: &MockLedger, _mode: ConsensusMode) -> LedgerId {
+        fn get_prev_ledger(
+            &self,
+            prev_ledger_id: &LedgerId,
+            _prev_ledger: &MockLedger,
+            _mode: ConsensusMode,
+        ) -> LedgerId {
             // Mock always agrees with our own view unless a test overrides
             // via direct field mutation (not exercised in these tests).
             *prev_ledger_id
@@ -1224,7 +1442,12 @@ mod tests {
             self.state.borrow_mut().mode_changes.push((before, after));
         }
 
-        fn on_close(&self, _prev_ledger: &MockLedger, now: NetClockTimePoint, _mode: ConsensusMode) -> ConsensusResultOf<Self> {
+        fn on_close(
+            &self,
+            _prev_ledger: &MockLedger,
+            now: NetClockTimePoint,
+            _mode: ConsensusMode,
+        ) -> ConsensusResultOf<Self> {
             let txns = MockTxSet::default();
             let id = txns.id();
             let position = ConsensusProposal::new(0, 0, id, now, now, 0);
@@ -1260,11 +1483,20 @@ mod tests {
             &self.parms
         }
 
-        fn next_ledger_time_resolution(&self, previous_resolution: Duration, _previous_agree: bool, _ledger_seq: u32) -> Duration {
+        fn next_ledger_time_resolution(
+            &self,
+            previous_resolution: Duration,
+            _previous_agree: bool,
+            _ledger_seq: u32,
+        ) -> Duration {
             previous_resolution
         }
 
-        fn round_close_time(&self, raw: NetClockTimePoint, _resolution: Duration) -> NetClockTimePoint {
+        fn round_close_time(
+            &self,
+            raw: NetClockTimePoint,
+            _resolution: Duration,
+        ) -> NetClockTimePoint {
             raw
         }
     }
@@ -1284,7 +1516,14 @@ mod tests {
         let adaptor = MockAdaptor::new();
         let mut c: Consensus<MockAdaptor> = Consensus::new();
 
-        c.start_round(&adaptor, NetClockTimePoint::new(1000), 0, genesis_ledger(), &HashSet::default(), true);
+        c.start_round(
+            &adaptor,
+            NetClockTimePoint::new(1000),
+            0,
+            genesis_ledger(),
+            &HashSet::default(),
+            true,
+        );
 
         assert_eq!(c.phase(), ConsensusPhase::Open);
         assert_eq!(c.mode(), ConsensusMode::Proposing);
@@ -1298,7 +1537,14 @@ mod tests {
 
         // prev_ledger_id (99) does not match prev_ledger.id() (0), and the
         // mock has no ledger registered for id 99, so acquisition fails.
-        c.start_round(&adaptor, NetClockTimePoint::new(1000), 99, genesis_ledger(), &HashSet::default(), true);
+        c.start_round(
+            &adaptor,
+            NetClockTimePoint::new(1000),
+            99,
+            genesis_ledger(),
+            &HashSet::default(),
+            true,
+        );
 
         assert_eq!(c.mode(), ConsensusMode::WrongLedger);
     }
@@ -1309,14 +1555,24 @@ mod tests {
         let mut c: Consensus<MockAdaptor> = Consensus::new();
 
         let start = NetClockTimePoint::new(1000);
-        c.start_round(&adaptor, start, 0, genesis_ledger(), &HashSet::default(), true);
+        c.start_round(
+            &adaptor,
+            start,
+            0,
+            genesis_ledger(),
+            &HashSet::default(),
+            true,
+        );
         assert_eq!(c.phase(), ConsensusPhase::Open);
 
         // No transactions; advance past the *effective* idle interval,
         // which is max(ledger_idle_interval, 2 * close_time_resolution).
         // The genesis ledger's close_time_resolution is 10s, so the floor
         // (20s) exceeds ledger_idle_interval (15s) here.
-        let effective_idle = adaptor.parms.ledger_idle_interval.max(Duration::from_secs(10) * 2);
+        let effective_idle = adaptor
+            .parms
+            .ledger_idle_interval
+            .max(Duration::from_secs(10) * 2);
         let later = start + time::Duration::seconds(effective_idle.as_secs() as i64 + 1);
         c.timer_entry(&adaptor, later);
 
@@ -1337,9 +1593,19 @@ mod tests {
         let mut c: Consensus<MockAdaptor> = Consensus::new();
 
         let start = NetClockTimePoint::new(1000);
-        c.start_round(&adaptor, start, 0, genesis_ledger(), &HashSet::default(), true);
+        c.start_round(
+            &adaptor,
+            start,
+            0,
+            genesis_ledger(),
+            &HashSet::default(),
+            true,
+        );
 
-        let effective_idle = adaptor.parms.ledger_idle_interval.max(Duration::from_secs(10) * 2);
+        let effective_idle = adaptor
+            .parms
+            .ledger_idle_interval
+            .max(Duration::from_secs(10) * 2);
         let after_idle = start + time::Duration::seconds(effective_idle.as_secs() as i64 + 1);
         c.timer_entry(&adaptor, after_idle);
         assert_eq!(c.phase(), ConsensusPhase::Establish);
@@ -1370,7 +1636,9 @@ mod tests {
 
     impl ManualClock {
         fn new() -> Self {
-            Self { now: RefCell::new(Instant::now()) }
+            Self {
+                now: RefCell::new(Instant::now()),
+            }
         }
         fn advance(&self, d: Duration) {
             let next = *self.now.borrow() + d;
@@ -1391,11 +1659,24 @@ mod tests {
         let mut c: Consensus<MockAdaptor, &ManualClock> = Consensus::with_clock(&clock);
 
         let start = NetClockTimePoint::new(1000);
-        c.start_round(&adaptor, start, 0, genesis_ledger(), &HashSet::default(), true);
+        c.start_round(
+            &adaptor,
+            start,
+            0,
+            genesis_ledger(),
+            &HashSet::default(),
+            true,
+        );
 
-        let idle = adaptor.parms.ledger_idle_interval.max(Duration::from_secs(10) * 2);
+        let idle = adaptor
+            .parms
+            .ledger_idle_interval
+            .max(Duration::from_secs(10) * 2);
         clock.advance(idle + Duration::from_secs(1));
-        c.timer_entry(&adaptor, start + time::Duration::seconds(idle.as_secs() as i64 + 1));
+        c.timer_entry(
+            &adaptor,
+            start + time::Duration::seconds(idle.as_secs() as i64 + 1),
+        );
         assert_eq!(c.phase(), ConsensusPhase::Establish);
 
         // Advance both the manual steady clock (drives round_time via
@@ -1405,7 +1686,8 @@ mod tests {
         // doesn't bail out early.
         let max_consensus = adaptor.parms.ledger_max_consensus;
         clock.advance(max_consensus + Duration::from_secs(1));
-        let now2 = start + time::Duration::seconds((idle.as_secs() + max_consensus.as_secs() + 2) as i64);
+        let now2 =
+            start + time::Duration::seconds((idle.as_secs() + max_consensus.as_secs() + 2) as i64);
         c.timer_entry(&adaptor, now2);
 
         assert_eq!(c.phase(), ConsensusPhase::Accepted);
@@ -1417,10 +1699,23 @@ mod tests {
         let adaptor = MockAdaptor::new();
         let mut c: Consensus<MockAdaptor> = Consensus::new();
         let now = NetClockTimePoint::new(1000);
-        c.start_round(&adaptor, now, 0, genesis_ledger(), &HashSet::default(), true);
+        c.start_round(
+            &adaptor,
+            now,
+            0,
+            genesis_ledger(),
+            &HashSet::default(),
+            true,
+        );
 
         let bad_proposal = ConsensusProposal::new(99, 0, 0, now, now, 42);
-        let accepted = c.peer_proposal(&adaptor, now, &MockPeerPos { proposal: bad_proposal });
+        let accepted = c.peer_proposal(
+            &adaptor,
+            now,
+            &MockPeerPos {
+                proposal: bad_proposal,
+            },
+        );
         assert!(!accepted);
     }
 
@@ -1429,7 +1724,14 @@ mod tests {
         let adaptor = MockAdaptor::new();
         let mut c: Consensus<MockAdaptor> = Consensus::new();
         let now = NetClockTimePoint::new(1000);
-        c.start_round(&adaptor, now, 0, genesis_ledger(), &HashSet::default(), true);
+        c.start_round(
+            &adaptor,
+            now,
+            0,
+            genesis_ledger(),
+            &HashSet::default(),
+            true,
+        );
 
         let mut prop = ConsensusProposal::new(0, 0, 0, now, now, 42);
         prop.bow_out(now);
@@ -1447,20 +1749,40 @@ mod tests {
         let mut c: Consensus<MockAdaptor> = Consensus::new();
 
         let start = NetClockTimePoint::new(1000);
-        c.start_round(&adaptor, start, 0, genesis_ledger(), &HashSet::default(), true);
+        c.start_round(
+            &adaptor,
+            start,
+            0,
+            genesis_ledger(),
+            &HashSet::default(),
+            true,
+        );
 
         // Close the ledger so we have an initial (empty) position/result.
-        let effective_idle = adaptor.parms.ledger_idle_interval.max(Duration::from_secs(10) * 2);
+        let effective_idle = adaptor
+            .parms
+            .ledger_idle_interval
+            .max(Duration::from_secs(10) * 2);
         let closed_at = start + time::Duration::seconds(effective_idle.as_secs() as i64 + 1);
         c.timer_entry(&adaptor, closed_at);
         assert_eq!(c.phase(), ConsensusPhase::Establish);
 
         let peer_set = MockTxSet::with(&[7]);
         let peer_set_id = peer_set.id();
-        adaptor.state.borrow_mut().tx_sets.insert(peer_set_id, peer_set);
+        adaptor
+            .state
+            .borrow_mut()
+            .tx_sets
+            .insert(peer_set_id, peer_set);
 
         let peer_proposal = ConsensusProposal::new(0, 1, peer_set_id, closed_at, closed_at, 99);
-        let accepted = c.peer_proposal(&adaptor, closed_at, &MockPeerPos { proposal: peer_proposal });
+        let accepted = c.peer_proposal(
+            &adaptor,
+            closed_at,
+            &MockPeerPos {
+                proposal: peer_proposal,
+            },
+        );
         assert!(accepted);
 
         // The peer's tx set should now be acquired, and a dispute created

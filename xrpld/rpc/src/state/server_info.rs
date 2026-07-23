@@ -1,7 +1,7 @@
 //! Narrow `server_info` RPC handler port.
 
-use std::sync::{Arc, RwLock};
 use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 
 use protocol::JsonValue;
 
@@ -97,7 +97,11 @@ pub fn do_server_info_prerendered<S: ServerInfoSource>(
     let counters = want_counters(context.params);
 
     if !counters {
-        let cache = if admin { &SERVER_INFO_ADMIN_CACHE } else { &SERVER_INFO_CACHE };
+        let cache = if admin {
+            &SERVER_INFO_ADMIN_CACHE
+        } else {
+            &SERVER_INFO_CACHE
+        };
         if let Some(cached) = cache.read().unwrap().clone() {
             return ServerInfoResponse::PreRendered(cached);
         }

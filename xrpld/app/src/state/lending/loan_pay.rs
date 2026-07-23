@@ -215,6 +215,16 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         _ => return Ter::TEC_NO_ENTRY,
     };
 
+    if payment_type == tx::LoanPayPaymentType::Overpayment
+        && !loan_sle.is_flag(protocol::lsfLoanOverpayment)
+    {
+        return if view.rules().enabled(&protocol::fix_cleanup_3_1_3()) {
+            Ter::TEC_NO_PERMISSION
+        } else {
+            Ter::TEM_INVALID_FLAG
+        };
+    }
+
     // Load and cache broker
     let broker_id = loan_sle.get_field_h256(sf("sfLoanBrokerID"));
     let broker_keylet = protocol::loan_broker_keylet_from_key(broker_id);
@@ -356,7 +366,7 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     let regular_payment = rounded_periodic_payment + service_fee;
     let effective_overpayment_amount = effective_loan_pay_amount(
         payment_type,
-        view.rules().enabled(&feature_id("fixSecurity3_1_3")),
+        view.rules().enabled(&protocol::fix_cleanup_3_1_3()),
         view.rules().enabled(&feature_id("fixCleanup3_2_0")),
         vault_asset,
         payment_amount,
@@ -678,6 +688,49 @@ pub fn apply_loan_pay<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         broker_view.cover_available += total_to_broker;
     }
 
+    if view.rules().enabled(&protocol::fix_cleanup_3_1_3())
+        && let Asset::MPTIssue(issue) = vault_asset
+        && borrower == issue.issuer()
+    {
+        let mut total_send_amount = 0_u64;
+        for value in [rounded_to_vault, total_to_broker] {
+            if value <= RuntimeNumber::zero() {
+                continue;
+            }
+            let Some(amount) = runtime_to_amount(vault_asset, value, RoundingMode::Downward) else {
+                return Ter::TEC_INTERNAL;
+            };
+            let units = amount.mpt().value();
+            let Ok(units) = u64::try_from(units) else {
+                return Ter::TEC_INTERNAL;
+            };
+            let Some(next_total) = total_send_amount.checked_add(units) else {
+                return Ter::TEC_PATH_DRY;
+            };
+            total_send_amount = next_total;
+        }
+        let Some(issuance) = view
+            .peek(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
+            .ok()
+            .flatten()
+        else {
+            return Ter::TEC_OBJECT_NOT_FOUND;
+        };
+        let maximum_amount = ledger::mptoken_helpers::max_mpt_amount(&issuance);
+        let Ok(maximum_amount) = u64::try_from(maximum_amount) else {
+            return Ter::TEC_INTERNAL;
+        };
+        if ledger::mptoken_helpers::mpt_send_exceeds_maximum_amount(
+            0,
+            issuance.get_field_u64(sf("sfOutstandingAmount")),
+            maximum_amount,
+            total_send_amount,
+            true,
+        ) {
+            return Ter::TEC_PATH_DRY;
+        }
+    }
+
     // Fund transfers
     if rounded_to_vault > RuntimeNumber::zero() {
         if let Some(xfer) = runtime_to_amount(vault_asset, rounded_to_vault, RoundingMode::Downward)
@@ -817,7 +870,7 @@ mod loan_pay_effective_amount_tests {
     }
 
     #[test]
-    fn loan_pay_overpayment_amount_truncates_at_loan_scale_after_fix_security_3_1_3() {
+    fn loan_pay_overpayment_amount_truncates_at_loan_scale_after_fix_cleanup_3_1_3() {
         let amount = RuntimeNumber::try_from_external_parts(123_456_789, -8, get_mantissa_scale())
             .expect("valid runtime number");
 
@@ -838,7 +891,7 @@ mod loan_pay_effective_amount_tests {
     }
 
     #[test]
-    fn loan_pay_overpayment_amount_keeps_legacy_precision_without_fix_security_3_1_3() {
+    fn loan_pay_overpayment_amount_keeps_legacy_precision_without_fix_cleanup_3_1_3() {
         let amount = RuntimeNumber::try_from_external_parts(123_456_789, -8, get_mantissa_scale())
             .expect("valid runtime number");
 
@@ -855,7 +908,7 @@ mod loan_pay_effective_amount_tests {
     }
 
     #[test]
-    fn loan_pay_regular_amount_keeps_precision_after_fix_security_3_1_3() {
+    fn loan_pay_regular_amount_keeps_precision_after_fix_cleanup_3_1_3() {
         let amount = RuntimeNumber::try_from_external_parts(123_456_789, -8, get_mantissa_scale())
             .expect("valid runtime number");
 

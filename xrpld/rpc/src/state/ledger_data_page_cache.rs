@@ -1,9 +1,9 @@
 //! Pre-serialized ledger_data response page cache.
 
-use std::sync::{Arc, RwLock};
 use basics::base_uint::Uint256;
 use basics::str_hex::str_hex;
 use protocol::JsonValue;
+use std::sync::{Arc, RwLock};
 
 pub const DEFAULT_PAGE_SIZE: usize = 256;
 
@@ -29,42 +29,46 @@ pub struct LedgerDataPageCache {
 
 impl LedgerDataPageCache {
     /// Build the page cache from an iterator of (key, binary_data, json) tuples.
-    pub fn build<I>(
-        ledger_seq: u32,
-        ledger_hash: Uint256,
-        entries: I,
-        page_size: usize,
-    ) -> Self
+    pub fn build<I>(ledger_seq: u32, ledger_hash: Uint256, entries: I, page_size: usize) -> Self
     where
         I: Iterator<Item = (Uint256, Vec<u8>, JsonValue)>,
     {
         let mut all_entries: Vec<(Uint256, Vec<u8>, JsonValue)> = entries.collect();
         all_entries.sort_unstable_by_key(|(k, _, _)| *k);
-        
+
         let mut pages = Vec::new();
         let mut i = 0;
-        
+
         while i < all_entries.len() {
             let end = (i + page_size).min(all_entries.len());
             let page_entries = &all_entries[i..end];
-            
+
             // Build JSON state array
-            let json_state: Vec<serde_json::Value> = page_entries.iter().map(|(key, _, json)| {
-                let mut node = json.clone();
-                if let JsonValue::Object(obj) = &mut node {
-                    obj.insert("index".to_owned(), JsonValue::String(key.to_string()));
-                }
-                from_protocol_json(&node)
-            }).collect();
-            
+            let json_state: Vec<serde_json::Value> = page_entries
+                .iter()
+                .map(|(key, _, json)| {
+                    let mut node = json.clone();
+                    if let JsonValue::Object(obj) = &mut node {
+                        obj.insert("index".to_owned(), JsonValue::String(key.to_string()));
+                    }
+                    from_protocol_json(&node)
+                })
+                .collect();
+
             // Build binary state array
-            let binary_state: Vec<serde_json::Value> = page_entries.iter().map(|(key, binary, _)| {
-                let mut node = std::collections::BTreeMap::new();
-                node.insert("data".to_owned(), JsonValue::String(str_hex(binary.as_slice())));
-                node.insert("index".to_owned(), JsonValue::String(key.to_string()));
-                from_protocol_json(&JsonValue::Object(node))
-            }).collect();
-            
+            let binary_state: Vec<serde_json::Value> = page_entries
+                .iter()
+                .map(|(key, binary, _)| {
+                    let mut node = std::collections::BTreeMap::new();
+                    node.insert(
+                        "data".to_owned(),
+                        JsonValue::String(str_hex(binary.as_slice())),
+                    );
+                    node.insert("index".to_owned(), JsonValue::String(key.to_string()));
+                    from_protocol_json(&JsonValue::Object(node))
+                })
+                .collect();
+
             // Compute marker for this page
             let next_marker = if end < all_entries.len() {
                 let mut marker = all_entries[end].0;
@@ -73,30 +77,48 @@ impl LedgerDataPageCache {
             } else {
                 None
             };
-            
+
             // Build json result envelope
             let mut json_obj = serde_json::Map::new();
-            json_obj.insert("ledger_hash".to_owned(), serde_json::Value::String(ledger_hash.to_string()));
-            json_obj.insert("ledger_index".to_owned(), serde_json::Value::Number(serde_json::Number::from(ledger_seq)));
+            json_obj.insert(
+                "ledger_hash".to_owned(),
+                serde_json::Value::String(ledger_hash.to_string()),
+            );
+            json_obj.insert(
+                "ledger_index".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(ledger_seq)),
+            );
             if let Some(m) = next_marker {
-                json_obj.insert("marker".to_owned(), serde_json::Value::String(m.to_string()));
+                json_obj.insert(
+                    "marker".to_owned(),
+                    serde_json::Value::String(m.to_string()),
+                );
             }
             json_obj.insert("state".to_owned(), serde_json::Value::Array(json_state));
-            
+
             // Build binary result envelope
             let mut binary_obj = serde_json::Map::new();
-            binary_obj.insert("ledger_hash".to_owned(), serde_json::Value::String(ledger_hash.to_string()));
-            binary_obj.insert("ledger_index".to_owned(), serde_json::Value::Number(serde_json::Number::from(ledger_seq)));
+            binary_obj.insert(
+                "ledger_hash".to_owned(),
+                serde_json::Value::String(ledger_hash.to_string()),
+            );
+            binary_obj.insert(
+                "ledger_index".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(ledger_seq)),
+            );
             if let Some(m) = next_marker {
-                binary_obj.insert("marker".to_owned(), serde_json::Value::String(m.to_string()));
+                binary_obj.insert(
+                    "marker".to_owned(),
+                    serde_json::Value::String(m.to_string()),
+                );
             }
             binary_obj.insert("state".to_owned(), serde_json::Value::Array(binary_state));
 
-            let json_bytes = serde_json::to_vec(&serde_json::Value::Object(json_obj))
-                .unwrap_or_default();
-            let binary_bytes = serde_json::to_vec(&serde_json::Value::Object(binary_obj))
-                .unwrap_or_default();
-            
+            let json_bytes =
+                serde_json::to_vec(&serde_json::Value::Object(json_obj)).unwrap_or_default();
+            let binary_bytes =
+                serde_json::to_vec(&serde_json::Value::Object(binary_obj)).unwrap_or_default();
+
             pages.push(LedgerDataPage {
                 start_key: page_entries[0].0,
                 next_marker,
@@ -104,11 +126,16 @@ impl LedgerDataPageCache {
                 binary_state_bytes: binary_bytes.into(),
                 entry_count: page_entries.len(),
             });
-            
+
             i = end;
         }
-        
-        Self { pages, page_size, ledger_seq, ledger_hash }
+
+        Self {
+            pages,
+            page_size,
+            ledger_seq,
+            ledger_hash,
+        }
     }
 
     pub fn find_page_for_marker(&self, marker: Option<Uint256>) -> Option<&LedgerDataPage> {
@@ -117,13 +144,21 @@ impl LedgerDataPageCache {
             Some(m) => {
                 // Binary search for the page whose start_key <= m
                 let idx = self.pages.partition_point(|p| p.start_key <= m);
-                if idx == 0 { self.pages.first() } else { self.pages.get(idx - 1) }
+                if idx == 0 {
+                    self.pages.first()
+                } else {
+                    self.pages.get(idx - 1)
+                }
             }
         }
     }
-    
-    pub fn page_count(&self) -> usize { self.pages.len() }
-    pub fn ledger_seq(&self) -> u32 { self.ledger_seq }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+    pub fn ledger_seq(&self) -> u32 {
+        self.ledger_seq
+    }
 }
 
 pub struct LedgerDataPageCacheStore {
@@ -131,13 +166,17 @@ pub struct LedgerDataPageCacheStore {
 }
 
 impl LedgerDataPageCacheStore {
-    pub fn new() -> Self { Self { inner: RwLock::new(None) } }
-    
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(None),
+        }
+    }
+
     pub fn get(&self, ledger_seq: u32) -> Option<Arc<LedgerDataPageCache>> {
         let g = self.inner.read().unwrap();
         g.as_ref().filter(|c| c.ledger_seq == ledger_seq).cloned()
     }
-    
+
     pub fn insert(&self, cache: Arc<LedgerDataPageCache>) {
         let mut g = self.inner.write().unwrap();
         *g = Some(cache);
@@ -145,10 +184,13 @@ impl LedgerDataPageCacheStore {
 }
 
 impl Default for LedgerDataPageCacheStore {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-static GLOBAL_PAGE_CACHE: std::sync::OnceLock<LedgerDataPageCacheStore> = std::sync::OnceLock::new();
+static GLOBAL_PAGE_CACHE: std::sync::OnceLock<LedgerDataPageCacheStore> =
+    std::sync::OnceLock::new();
 
 pub fn get_global_page_cache() -> &'static LedgerDataPageCacheStore {
     GLOBAL_PAGE_CACHE.get_or_init(LedgerDataPageCacheStore::new)
@@ -182,7 +224,7 @@ mod tests {
     fn test_find_page_for_marker() {
         let mut key1 = Uint256::default();
         key1.as_mut_slice()[31] = 10;
-        
+
         let mut key2 = Uint256::default();
         key2.as_mut_slice()[31] = 20;
 

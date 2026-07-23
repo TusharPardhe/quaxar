@@ -4,7 +4,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use basics::{base_uint::Uint256, chrono::NetClockTimePoint};
 use protocol::{
-    AccountID, JsonValue, STAmount, STArray, STObject, STTx, TxMeta, TxType, get_field_by_symbol,
+    AccountID, JsonValue, MPTAmount, MPTIssue, STAmount, STArray, STObject, STTx, TxMeta, TxType,
+    get_field_by_symbol,
 };
 use rpc::{
     AccountTxLedgerRange, AccountTxMarker, AccountTxPage, AccountTxQuery, AccountTxSource,
@@ -151,6 +152,138 @@ fn source() -> FakeSource {
         },
         close_times: BTreeMap::from([(22, NetClockTimePoint::new(600_000_100))]),
     }
+}
+
+#[test]
+fn account_tx_preserves_persisted_mpt_delivered_amount_in_json_and_binary() {
+    let mpt_issue = MPTIssue::new(protocol::make_mpt_id(1, account(3)));
+    let tx = Arc::new(STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), account(1));
+        tx.set_account_id(get_field_by_symbol("sfDestination"), account(2));
+        tx.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::from_mpt_amount(
+                get_field_by_symbol("sfAmount"),
+                MPTAmount::from_value(1_000),
+                mpt_issue,
+            ),
+        );
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(10, false),
+        );
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 5);
+    }));
+    let delivered = STAmount::from_mpt_amount(
+        get_field_by_symbol("sfDeliveredAmount"),
+        MPTAmount::from_value(800),
+        mpt_issue,
+    );
+    let mut on_meta = payment_meta(tx.get_transaction_id());
+    on_meta.set_delivered_amount(Some(delivered));
+    let mut off_meta = payment_meta(tx.get_transaction_id());
+    off_meta.set_delivered_amount(None);
+    let validated = LedgerLookupLedger {
+        hash: Uint256::from_array([0x22; 32]),
+        seq: 22,
+        open: false,
+    };
+    let source = FakeSource {
+        current: Some(validated),
+        closed: Some(validated),
+        validated: Some(validated),
+        page: AccountTxPage {
+            ledger_range: AccountTxLedgerRange { min: 22, max: 22 },
+            limit: 25,
+            marker: None,
+            transactions: vec![
+                rpc::TxRecord {
+                    txn: Arc::clone(&tx),
+                    meta: Some(on_meta.clone()),
+                    ledger_index: 22,
+                    close_time: Some(NetClockTimePoint::new(600_000_100)),
+                    ledger_hash: Some(validated.hash),
+                    validated: true,
+                    txn_index: Some(3),
+                    network_id: Some(0),
+                },
+                rpc::TxRecord {
+                    txn: Arc::clone(&tx),
+                    meta: Some(off_meta.clone()),
+                    ledger_index: 22,
+                    close_time: None,
+                    ledger_hash: Some(validated.hash),
+                    validated: true,
+                    txn_index: Some(4),
+                    network_id: Some(0),
+                },
+            ],
+        },
+        close_times: BTreeMap::from([(22, NetClockTimePoint::new(600_000_100))]),
+    };
+    let json_params = object([
+        (
+            "account",
+            JsonValue::String(protocol::to_base58(account(1))),
+        ),
+        ("ledger_index", JsonValue::String("validated".to_owned())),
+    ]);
+    let json = do_account_tx(&json_params, RpcRole::Admin, 2, &source);
+    let JsonValue::Array(json_txs) = json.get("transactions").expect("transactions") else {
+        panic!("transactions must be an array");
+    };
+    let JsonValue::Object(on_entry) = &json_txs[0] else {
+        panic!("on entry must be an object");
+    };
+    let JsonValue::Object(on_meta_json) = on_entry.get("meta").expect("on metadata") else {
+        panic!("on metadata must be an object");
+    };
+    assert_eq!(
+        on_meta_json.get("DeliveredAmount"),
+        on_meta_json.get("delivered_amount")
+    );
+    let JsonValue::Object(off_entry) = &json_txs[1] else {
+        panic!("off entry must be an object");
+    };
+    let JsonValue::Object(off_meta_json) = off_entry.get("meta").expect("off metadata") else {
+        panic!("off metadata must be an object");
+    };
+    assert_eq!(
+        off_meta_json.get("delivered_amount"),
+        Some(&JsonValue::String("unavailable".to_owned()))
+    );
+    assert!(!off_meta_json.contains_key("DeliveredAmount"));
+
+    let binary_params = object([
+        (
+            "account",
+            JsonValue::String(protocol::to_base58(account(1))),
+        ),
+        ("ledger_index", JsonValue::String("validated".to_owned())),
+        ("binary", JsonValue::Bool(true)),
+    ]);
+    let binary = do_account_tx(&binary_params, RpcRole::Admin, 2, &source);
+    let JsonValue::Array(binary_txs) = binary.get("transactions").expect("transactions") else {
+        panic!("transactions must be an array");
+    };
+    let JsonValue::Object(on_binary) = &binary_txs[0] else {
+        panic!("on binary entry must be an object");
+    };
+    assert_eq!(
+        on_binary.get("meta_blob"),
+        Some(&JsonValue::String(basics::str_hex::str_hex(
+            on_meta.get_as_object().get_serializer().data()
+        )))
+    );
+    let JsonValue::Object(off_binary) = &binary_txs[1] else {
+        panic!("off binary entry must be an object");
+    };
+    assert_eq!(
+        off_binary.get("meta_blob"),
+        Some(&JsonValue::String(basics::str_hex::str_hex(
+            off_meta.get_as_object().get_serializer().data()
+        )))
+    );
 }
 
 #[test]

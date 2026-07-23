@@ -417,3 +417,4 @@ devnet-loadtest.log
 # Any generated protocol buffer files (if protobuf is used)
 *.pb.go
 *_pb2.py
+test-network/

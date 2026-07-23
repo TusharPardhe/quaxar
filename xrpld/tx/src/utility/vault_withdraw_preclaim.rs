@@ -130,7 +130,7 @@ mod tests {
                 vault_exists: true,
                 amount_asset_matches_vault_asset_or_share: true,
                 withdrawal_policy_is_first_come_first_serve: true,
-                fix_security_3_1_3_enabled: true,
+                fix_cleanup_3_1_3_enabled: true,
                 amount_asset_is_vault_share: true,
                 share_issuance_exists: true,
             },

@@ -10,6 +10,7 @@ pub mod rpc_helpers;
 pub mod rpc_sub;
 pub mod server_handler;
 pub mod session;
+pub mod snapshot_status;
 
 // Re-export commonly used types
 pub use black_list::{BlackListSource, do_black_list};
@@ -22,3 +23,4 @@ pub use rpc_helpers::*;
 pub use rpc_sub::*;
 pub use server_handler::*;
 pub use session::*;
+pub use snapshot_status::{SnapshotStatusSource, do_snapshot_status};

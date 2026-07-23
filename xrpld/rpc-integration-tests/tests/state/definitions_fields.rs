@@ -130,7 +130,11 @@ fn definitions_field_6() {
         ("b".to_owned(), sv("x")),
     ]));
     m.publish_json(StreamKind::Ledger, p.clone());
-    { let _ev = r.try_recv().unwrap(); let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap(); assert_eq!(parsed, p); }
+    {
+        let _ev = r.try_recv().unwrap();
+        let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap();
+        assert_eq!(parsed, p);
+    }
 }
 #[test]
 fn definitions_field_7() {
@@ -141,7 +145,11 @@ fn definitions_field_7() {
         ("d".to_owned(), si(-5)),
     ]));
     m.publish_json(StreamKind::Transactions, p.clone());
-    { let _ev = r.try_recv().unwrap(); let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap(); assert_eq!(parsed, p); }
+    {
+        let _ev = r.try_recv().unwrap();
+        let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap();
+        assert_eq!(parsed, p);
+    }
 }
 #[test]
 fn definitions_field_8() {
@@ -149,7 +157,11 @@ fn definitions_field_8() {
     let mut r = m.subscribe(StreamKind::Server);
     let p = JsonValue::Object(BTreeMap::from([("e".to_owned(), u(999))]));
     m.publish_json(StreamKind::Server, p.clone());
-    { let _ev = r.try_recv().unwrap(); let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap(); assert_eq!(parsed, p); }
+    {
+        let _ev = r.try_recv().unwrap();
+        let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap();
+        assert_eq!(parsed, p);
+    }
 }
 #[test]
 fn definitions_field_9() {
@@ -157,7 +169,11 @@ fn definitions_field_9() {
     let mut r = m.subscribe(StreamKind::Validations);
     let p = JsonValue::Object(BTreeMap::from([("f".to_owned(), sv("val"))]));
     m.publish_json(StreamKind::Validations, p.clone());
-    { let _ev = r.try_recv().unwrap(); let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap(); assert_eq!(parsed, p); }
+    {
+        let _ev = r.try_recv().unwrap();
+        let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap();
+        assert_eq!(parsed, p);
+    }
 }
 #[test]
 fn definitions_field_10() {
@@ -165,7 +181,11 @@ fn definitions_field_10() {
     let mut r = m.subscribe(StreamKind::Manifests);
     let p = JsonValue::Object(BTreeMap::from([("g".to_owned(), u(0))]));
     m.publish_json(StreamKind::Manifests, p.clone());
-    { let _ev = r.try_recv().unwrap(); let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap(); assert_eq!(parsed, p); }
+    {
+        let _ev = r.try_recv().unwrap();
+        let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap();
+        assert_eq!(parsed, p);
+    }
 }
 #[test]
 fn definitions_field_11() {
@@ -173,7 +193,11 @@ fn definitions_field_11() {
     let mut r = m.subscribe(StreamKind::Consensus);
     let p = JsonValue::Object(BTreeMap::from([("h".to_owned(), b(false))]));
     m.publish_json(StreamKind::Consensus, p.clone());
-    { let _ev = r.try_recv().unwrap(); let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap(); assert_eq!(parsed, p); }
+    {
+        let _ev = r.try_recv().unwrap();
+        let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap();
+        assert_eq!(parsed, p);
+    }
 }
 #[test]
 fn definitions_field_12() {
@@ -181,7 +205,11 @@ fn definitions_field_12() {
     let mut r = m.subscribe(StreamKind::PeerStatus);
     let p = JsonValue::Object(BTreeMap::from([("i".to_owned(), sv("peer"))]));
     m.publish_json(StreamKind::PeerStatus, p.clone());
-    { let _ev = r.try_recv().unwrap(); let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap(); assert_eq!(parsed, p); }
+    {
+        let _ev = r.try_recv().unwrap();
+        let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap();
+        assert_eq!(parsed, p);
+    }
 }
 #[test]
 fn definitions_field_13() {
@@ -189,7 +217,11 @@ fn definitions_field_13() {
     let mut r = m.subscribe(StreamKind::BookChanges);
     let p = JsonValue::Object(BTreeMap::from([("j".to_owned(), u(42))]));
     m.publish_json(StreamKind::BookChanges, p.clone());
-    { let _ev = r.try_recv().unwrap(); let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap(); assert_eq!(parsed, p); }
+    {
+        let _ev = r.try_recv().unwrap();
+        let parsed: JsonValue = serde_json::from_slice(&_ev.payload).unwrap();
+        assert_eq!(parsed, p);
+    }
 }
 // ServerDefinitions exact type codes
 #[test]

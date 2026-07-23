@@ -28,6 +28,7 @@ pub const FIX_AMMV1_1_NAME: &str = "fixAMMv1_1";
 pub const FIX_AMMV1_3_NAME: &str = "fixAMMv1_3";
 pub const FIX_CLEANUP_3_2_0_NAME: &str = "fixCleanup3_2_0";
 pub const FIX_CLEANUP_3_3_0_NAME: &str = "fixCleanup3_3_0";
+pub const FIX_MPT_DELIVERED_AMOUNT_NAME: &str = "fixMPTDeliveredAmount";
 pub const FEATURE_SPONSOR_NAME: &str = "Sponsor";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +58,7 @@ impl RegisteredFeature {
 pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     RegisteredFeature::new(
         FEATURE_BATCH_V1_1_NAME,
-        false,
+        true,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new(
@@ -67,8 +68,9 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     ),
     // release-3.1: cleanup for expired NFT offers, MPToken locked amount,
     // credential deletion errors, PermissionedDEX hybrid validation.
-    // Enabled on testnet; mark supported so node is not amendment-blocked.
-    RegisteredFeature::new("fixCleanup3_1_3", true, RegisteredFeatureVote::DefaultYes),
+    // Enabled on public testnet, but retained as unsupported until the complete
+    // multi-domain consensus/replay parity matrix is certified.
+    RegisteredFeature::new("fixCleanup3_1_3", false, RegisteredFeatureVote::DefaultYes),
     RegisteredFeature::new(
         FIX_CLEANUP_3_2_0_NAME,
         true,
@@ -76,19 +78,23 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     ),
     RegisteredFeature::new(
         FIX_CLEANUP_3_3_0_NAME,
-        false,
+        true,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new("MPTokensV2", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("fixSecurity3_1_3", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "fixPermissionedDomainInvariant",
-        true,
+        false,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new("fixBatchInnerSigs", false, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("LendingProtocol", true, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("LendingProtocolV1_1", false, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("LendingProtocol", false, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new(
+        "LendingProtocolV1_1",
+        false,
+        RegisteredFeatureVote::DefaultNo,
+    ),
     RegisteredFeature::new(
         "PermissionDelegationV1_1",
         false,
@@ -97,24 +103,24 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     RegisteredFeature::new("fixDirectoryLimit", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "fixIncludeKeyletFields",
-        true,
+        false,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new("DynamicMPT", false, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("fixTokenEscrowV1", true, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("fixTokenEscrowV1", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "fixPriceOracleOrder",
-        true,
+        false,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new(
-        "fixMPTDeliveredAmount",
-        true,
+        FIX_MPT_DELIVERED_AMOUNT_NAME,
+        false,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new(
         "fixAMMClawbackRounding",
-        true,
+        false,
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new("TokenEscrow", true, RegisteredFeatureVote::DefaultNo),
@@ -125,8 +131,8 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     ),
     RegisteredFeature::new("fixAMMv1_3", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("PermissionedDEX", true, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("Batch", false, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("SingleAssetVault", true, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("Batch", true, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("SingleAssetVault", false, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "fixPayChanCancelAfter",
         true,
@@ -294,6 +300,9 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     RegisteredFeature::new("MultiSign", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("MultiSignReserve", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new("NegativeUNL", true, RegisteredFeatureVote::Obsolete),
+    RegisteredFeature::new("NonFungibleTokensV1", true, RegisteredFeatureVote::Obsolete),
+    RegisteredFeature::new("fixNFTokenDirV1", true, RegisteredFeatureVote::Obsolete),
+    RegisteredFeature::new("fixNFTokenNegOffer", true, RegisteredFeatureVote::Obsolete),
     RegisteredFeature::new(
         "NonFungibleTokensV1_1",
         true,
@@ -422,6 +431,10 @@ pub fn fix_token_escrow_v1() -> Uint256 {
     feature_id("fixTokenEscrowV1")
 }
 
+pub fn fix_mpt_delivered_amount() -> Uint256 {
+    feature_id(FIX_MPT_DELIVERED_AMOUNT_NAME)
+}
+
 pub fn fix_ammv1_1() -> Uint256 {
     feature_id(FIX_AMMV1_1_NAME)
 }
@@ -498,11 +511,12 @@ mod tests {
         FEATURE_SINGLE_ASSET_VAULT_NAME, FEATURE_TOKEN_ESCROW_NAME, FEATURE_UNIVERSAL_NUMBER_NAME,
         FEATURE_XCHAIN_BRIDGE_NAME, FEATURE_XRP_FEES_NAME, FIX_AMMV1_1_NAME, FIX_AMMV1_3_NAME,
         FIX_BATCH_INNER_SIGS_NAME, FIX_INNER_OBJ_TEMPLATE_NAME, FIX_INNER_OBJ_TEMPLATE2_NAME,
-        FIX_PREVIOUS_TXN_ID_NAME, FeatureSet, REGISTERED_FEATURES, feature_amm, feature_batch,
-        feature_clawback, feature_id, feature_lending_protocol, feature_name,
-        feature_single_asset_vault, feature_token_escrow, feature_universal_number,
+        FIX_MPT_DELIVERED_AMOUNT_NAME, FIX_PREVIOUS_TXN_ID_NAME, FeatureSet, REGISTERED_FEATURES,
+        feature_amm, feature_batch, feature_clawback, feature_id, feature_lending_protocol,
+        feature_name, feature_single_asset_vault, feature_token_escrow, feature_universal_number,
         feature_xchain_bridge, feature_xrp_fees, fix_ammv1_1, fix_ammv1_3, fix_batch_inner_sigs,
-        fix_inner_obj_template, fix_inner_obj_template2, fix_previous_txn_id,
+        fix_inner_obj_template, fix_inner_obj_template2, fix_mpt_delivered_amount,
+        fix_previous_txn_id,
     };
     use basics::base_uint::Uint256;
 
@@ -544,6 +558,19 @@ mod tests {
         );
         assert_eq!(feature_id(FIX_AMMV1_1_NAME), fix_ammv1_1());
         assert_eq!(feature_id(FIX_AMMV1_3_NAME), fix_ammv1_3());
+        assert_eq!(
+            feature_id(FIX_MPT_DELIVERED_AMOUNT_NAME),
+            fix_mpt_delivered_amount()
+        );
+    }
+
+    #[test]
+    fn fix_mpt_delivered_amount_is_registered_as_unsupported() {
+        let registered = REGISTERED_FEATURES
+            .iter()
+            .find(|registered| registered.name == FIX_MPT_DELIVERED_AMOUNT_NAME)
+            .expect("fixMPTDeliveredAmount must be registered");
+        assert!(!registered.supported);
     }
 
     #[test]

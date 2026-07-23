@@ -4,11 +4,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use basics::base_uint::Uint160;
+use basics::base_uint::{Uint160, Uint256};
 use ledger::{Ledger, LedgerHeader, LEDGER_DEFAULT_TIME_RESOLUTION};
 use protocol::{
     account_keylet, calc_account_id, derive_public_key, get_field_by_symbol, AccountID, JsonValue,
-    KeyType, LedgerEntryType, STAmount, STLedgerEntry, STTx, SecretKey,
+    KeyType, LedgerEntryType, Rules, STAmount, STLedgerEntry, STTx, SecretKey,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -65,13 +65,31 @@ pub struct RpcTestEnv {
 impl RpcTestEnv {
     /// Create a new standalone environment with funded accounts.
     pub fn new(funded_accounts: &[(&TestAccount, u64)]) -> Self {
-        Self::with_flags(funded_accounts, &[])
+        Self::with_flags_and_entries(funded_accounts, &[], &[], &[])
     }
 
     /// Create environment with some accounts having specific flags (e.g. DefaultRipple for gateways).
     pub fn with_flags(
         funded_accounts: &[(&TestAccount, u64)],
         flagged: &[(&TestAccount, u32)],
+    ) -> Self {
+        Self::with_flags_and_entries(funded_accounts, flagged, &[], &[])
+    }
+
+    /// Create an environment with additional typed state entries and explicit amendment features.
+    pub fn with_entries_and_features(
+        funded_accounts: &[(&TestAccount, u64)],
+        entries: &[STLedgerEntry],
+        features: &[Uint256],
+    ) -> Self {
+        Self::with_flags_and_entries(funded_accounts, &[], entries, features)
+    }
+
+    fn with_flags_and_entries(
+        funded_accounts: &[(&TestAccount, u64)],
+        flagged: &[(&TestAccount, u32)],
+        entries: &[STLedgerEntry],
+        features: &[Uint256],
     ) -> Self {
         let mut state_tree = MutableTree::new(1);
 
@@ -100,6 +118,15 @@ impl RpcTestEnv {
                 .expect("account should insert");
         }
 
+        for entry in entries {
+            state_tree
+                .add_item(
+                    SHAMapNodeType::AccountState,
+                    SHAMapItem::new(*entry.key(), entry.get_serializer().data().to_vec()),
+                )
+                .expect("typed ledger entry should insert");
+        }
+
         let mut parent = Ledger::from_maps(
             LedgerHeader {
                 seq: 1,
@@ -123,6 +150,7 @@ impl RpcTestEnv {
             ),
         );
         parent.set_accepted(1000, LEDGER_DEFAULT_TIME_RESOLUTION, true);
+        parent.set_rules(Rules::new(features.iter().copied()));
 
         let mut app = ApplicationRoot::with_options(ApplicationRootOptions {
             standalone: true,

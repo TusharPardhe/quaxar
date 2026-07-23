@@ -534,11 +534,7 @@ where
             .expect("TaggedCache mutex must not be poisoned");
         let hits = state.hits + self.fast_hits.load(Ordering::Relaxed);
         let total = hits + state.misses;
-        let hit_rate = if total == 0 {
-            0
-        } else {
-            (hits * 100) / total
-        };
+        let hit_rate = if total == 0 { 0 } else { (hits * 100) / total };
         TaggedCacheMetricsSnapshot {
             size: state.cache_count,
             track_size: state.cache.len(),
@@ -622,8 +618,7 @@ where
 
             let mut all_removals = 0usize;
             for partition in state.cache.map_mut() {
-                let (counts, mut removed, _keys) =
-                    sweep_value_partition(partition, when_expire);
+                let (counts, mut removed, _keys) = sweep_value_partition(partition, when_expire);
                 if counts.cache_removals != 0 || counts.map_removals != 0 {
                     self.instrumentation.logger.debug(&format!(
                         "TaggedCache partition sweep {}: cache = {}-{}, map-={}",
@@ -1604,8 +1599,7 @@ mod tests {
         ));
         let lock_was_available = Arc::new(AtomicBool::new(false));
         let mutex_addr: usize =
-            cache.as_ref().get_ref().peek_mutex() as *const RecursiveMutex<DropProbeState>
-                as usize;
+            cache.as_ref().get_ref().peek_mutex() as *const RecursiveMutex<DropProbeState> as usize;
 
         let probe = DropProbe {
             on_drop: Box::new({

@@ -132,7 +132,7 @@ fn mp_token_issuance_create_preflight_guards() {
         });
     let bad_fee = run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
         fix_cleanup_3_2_0_enabled: false,
-            confidential_transfer_enabled: false,
+        confidential_transfer_enabled: false,
         reference_holding_present: false,
         mutable_flags: None,
         tx_flags: tfMPTCanTransfer,
@@ -157,7 +157,7 @@ fn mp_token_issuance_create_preflight_guards() {
         });
     let zero_domain = run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
         fix_cleanup_3_2_0_enabled: false,
-            confidential_transfer_enabled: false,
+        confidential_transfer_enabled: false,
         reference_holding_present: false,
         mutable_flags: None,
         tx_flags: tfMPTRequireAuth,
@@ -208,7 +208,7 @@ fn mp_token_issuance_create_preflight_guards() {
         });
     let zero_max = run_mp_token_issuance_create_preflight(MPTokenIssuanceCreatePreflightFacts {
         fix_cleanup_3_2_0_enabled: false,
-            confidential_transfer_enabled: false,
+        confidential_transfer_enabled: false,
         reference_holding_present: false,
         mutable_flags: None,
         tx_flags: 0,

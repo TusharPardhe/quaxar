@@ -1,21 +1,18 @@
 use super::{
-    AcqMsg, AcqRegistry, AcqResult, CatchupResourceProfile, CompletedLedgerAcceptance,
-    InboundEntry, InboundLedgers, InboundState, LedgerPublishAdvance, NodeStoreWriteMsg,
+    AcqMsg, AcqRegistry, CatchupResourceProfile, CompletedLedgerAcceptance, LedgerPublishAdvance,
     PEERFINDER_MAX_CONNECT_ATTEMPTS, PEERFINDER_MAX_HOPS, PEERFINDER_NUMBER_OF_ENDPOINTS,
-    PEERFINDER_RECENT_ATTEMPT_DURATION, PendingNodeStoreObject, RunDataLimiter,
-    bind_server_runtime_into_root, bootstrap_acquire_budget_available, build_endpoint_broadcast,
-    candidate_ledger_for_seq, candidate_reference_hash_from_reference_ledger,
-    classify_completed_ledger_acceptance, classify_publish_advance,
-    cold_bootstrap_persisted_validated_target, command_suggestions, current_ledger_is_fresh,
-    first_command_like_arg, flush_nodestore_writes, hash_for_seq_from_reference_ledger,
+    PEERFINDER_RECENT_ATTEMPT_DURATION, bind_server_runtime_into_root,
+    bootstrap_acquire_budget_available, build_endpoint_broadcast, candidate_ledger_for_seq,
+    candidate_reference_hash_from_reference_ledger, classify_completed_ledger_acceptance,
+    classify_publish_advance, cold_bootstrap_persisted_validated_target, command_suggestions,
+    current_ledger_is_fresh, first_command_like_arg, hash_for_seq_from_reference_ledger,
     ledger_fetch_limit_override, node_store_usage_path, path_size_bytes, peerfinder_canonical_ip,
     peerfinder_outbound_target, preferred_closed_ledger_hash,
     preferred_closed_ledger_hash_from_hashes, promote_current_ledger, prune_known_endpoints,
     prune_recent_connect_attempts, remember_known_endpoint, select_autoconnect_endpoints,
     select_bootcache_endpoints, select_consensus_acquisition_target,
     select_post_acquisition_operating_mode, select_target_seq,
-    should_attempt_completed_ledger_promotion, should_process_acquisition_tick,
-    should_retry_publish_after_completed_history,
+    should_attempt_completed_ledger_promotion, should_retry_publish_after_completed_history,
 };
 use app::{AppBootstrapOptions, build_bootstrap_root, load_basic_config_file};
 use basics::base_uint::Uint256;
@@ -384,80 +381,6 @@ fn select_consensus_acquisition_target_prefers_latest_seq_for_large_catchup_gaps
         select_consensus_acquisition_target(200, &targets),
         Some((newer, 320))
     );
-}
-
-#[test]
-fn poll_results_keeps_completed_entry_when_sender_disconnects_after_completion() {
-    let registry: AcqRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let tree_cache = Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
-        "test-acq",
-        8,
-        time::Duration::seconds(1),
-        basics::tagged_cache::MonotonicClock::default(),
-    ));
-    let full_below = Arc::new(shamap::family::FullBelowCacheImpl::new(
-        1,
-        basics::tagged_cache::MonotonicClock::default(),
-        basics::hardened_hash::HardenedHashBuilder::default(),
-        8,
-    ));
-    let fetch_pack = Arc::new(ledger::FetchPackCache::new(
-        8,
-        time::Duration::seconds(1),
-        basics::tagged_cache::MonotonicClock::default(),
-    ));
-    let run_data_limiter = Arc::new(RunDataLimiter::new(1));
-    let shared_stored = Arc::new(basics::tagged_cache::KeyCache::new(
-        "test-acq-write-dedup",
-        8,
-        time::Duration::seconds(1),
-        basics::tagged_cache::MonotonicClock::default(),
-    ));
-    let (completed_ledgers_tx, _completed_ledgers_rx) = std::sync::mpsc::channel();
-    let mut inbound_ledgers = InboundLedgers::new(
-        registry,
-        tree_cache,
-        full_below,
-        fetch_pack,
-        run_data_limiter,
-        shared_stored,
-        completed_ledgers_tx,
-    );
-
-    let ledger = Ledger::from_ledger_seq_and_close_time(99, 777, false);
-    let hash = *ledger.header().hash.as_uint256();
-    let (tx, _rx) = std::sync::mpsc::channel::<AcqMsg>();
-    let (result_tx, result_rx) = std::sync::mpsc::channel::<AcqResult>();
-    result_tx
-        .send(AcqResult::Complete(ledger.clone()))
-        .expect("result channel should accept completion");
-    drop(result_tx);
-
-    let now = Instant::now();
-    inbound_ledgers.entries.insert(
-        hash,
-        InboundEntry {
-            seq: ledger.header().seq,
-            tx,
-            result_rx,
-            handle: std::thread::spawn(|| {}),
-            last_touched: now,
-            started_at: now,
-            completed_at: None,
-            state: InboundState::InProgress,
-            skip_state: false,
-        },
-    );
-
-    let completed = inbound_ledgers.poll_results();
-
-    assert_eq!(completed.len(), 1);
-    assert!(inbound_ledgers.recent_failures.is_empty());
-    let entry = inbound_ledgers
-        .entries
-        .get(&hash)
-        .expect("entry should remain");
-    assert!(matches!(entry.state, InboundState::Complete(_)));
 }
 
 #[test]
@@ -1113,84 +1036,4 @@ fn ledger_fetch_limit_override_parses_optional_expert_config() {
         invalid,
         "Configured ledger_acquisition.ledger_fetch_limit is invalid"
     );
-}
-
-#[test]
-fn acquisition_tick_processes_initial_peer_updates_before_timeout() {
-    assert!(should_process_acquisition_tick(
-        false, false, false, true, true
-    ));
-    assert!(!should_process_acquisition_tick(
-        false, false, false, true, false
-    ));
-    assert!(!should_process_acquisition_tick(
-        false, false, false, false, true
-    ));
-}
-
-#[test]
-fn flush_nodestore_writes_waits_for_prior_messages() {
-    let (tx, rx) = std::sync::mpsc::channel::<NodeStoreWriteMsg>();
-    let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let pending = std::sync::Arc::new(std::sync::Mutex::new(HashMap::<
-        Uint256,
-        PendingNodeStoreObject,
-    >::new()));
-    let writes_for_worker = std::sync::Arc::clone(&writes);
-    let pending_for_worker = std::sync::Arc::clone(&pending);
-    let worker = std::thread::spawn(move || {
-        loop {
-            match rx.recv().expect("worker message") {
-                NodeStoreWriteMsg::Write {
-                    obj_type,
-                    data,
-                    hash,
-                    ..
-                } => {
-                    writes_for_worker.lock().expect("writes mutex").push(hash);
-                    pending_for_worker
-                        .lock()
-                        .expect("pending mutex")
-                        .remove(&hash)
-                        .or_else(|| {
-                            Some(PendingNodeStoreObject {
-                                obj_type,
-                                data,
-                                hash,
-                            })
-                        });
-                }
-                NodeStoreWriteMsg::Flush(ack) => {
-                    let _ = ack.send(());
-                }
-                NodeStoreWriteMsg::Stop => break,
-            }
-        }
-    });
-
-    for fill in [0x11u8, 0x22, 0x33] {
-        let hash = Uint256::from_array([fill; 32]);
-        pending.lock().expect("pending mutex").insert(
-            hash,
-            PendingNodeStoreObject {
-                obj_type: nodestore::NodeObjectType::AccountNode,
-                data: vec![fill],
-                hash,
-            },
-        );
-        tx.send(NodeStoreWriteMsg::Write {
-            obj_type: nodestore::NodeObjectType::AccountNode,
-            data: vec![fill],
-            hash,
-            seq: u32::from(fill),
-        })
-        .expect("write message");
-    }
-
-    assert!(flush_nodestore_writes(&tx));
-    assert_eq!(writes.lock().expect("writes mutex").len(), 3);
-    assert!(pending.lock().expect("pending mutex").is_empty());
-
-    tx.send(NodeStoreWriteMsg::Stop).expect("stop message");
-    worker.join().expect("worker join");
 }

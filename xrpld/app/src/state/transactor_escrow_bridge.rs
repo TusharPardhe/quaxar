@@ -13,9 +13,18 @@ pub fn build_escrow_create_facts<V: ApplyView>(
     account: &AccountID,
     dst_account: &AccountID,
     amount: &STAmount,
+    finish_after: Option<u32>,
+    cancel_after: Option<u32>,
 ) -> Result<EscrowCreateApplyFacts, ViewError> {
     let mut facts = EscrowCreateApplyFacts::default();
     facts.amount_is_xrp = amount.native();
+    facts.finish_after_expired =
+        finish_after.is_some_and(|time| view.header().parent_close_time > time);
+    facts.cancel_after_expired =
+        cancel_after.is_some_and(|time| view.header().parent_close_time > time);
+    facts.include_sequence_field = view
+        .rules()
+        .enabled(&protocol::feature_id("fixIncludeKeyletFields"));
 
     if let Some(src_sle) =
         view.peek(protocol::account_keylet(Uint160::from_void(account.data())))?
@@ -58,6 +67,7 @@ pub struct ViewBackedEscrowCreateSink<'a, V> {
     pub escrow_seq: u32,
     pub finish_after: Option<u32>,
     pub cancel_after: Option<u32>,
+    pub condition: Option<Vec<u8>>,
     pub source_tag: Option<u32>,
     pub destination_tag: Option<u32>,
 }
@@ -75,6 +85,9 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
         }
         if let Some(cancel_after) = self.cancel_after {
             sle.set_field_u32(get_field_by_symbol("sfCancelAfter"), cancel_after);
+        }
+        if let Some(condition) = &self.condition {
+            sle.set_field_vl(get_field_by_symbol("sfCondition"), condition);
         }
         if let Some(source_tag) = self.source_tag {
             sle.set_field_u32(get_field_by_symbol("sfSourceTag"), source_tag);
@@ -99,7 +112,18 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
         }
         let _ = self.view.insert(Arc::new(sle));
     }
-    fn set_sequence_field(&mut self) {}
+    fn set_sequence_field(&mut self) {
+        if let Ok(Some(sle)) = self.view.peek(protocol::escrow_keylet(
+            Uint160::from_void(self.account.data()),
+            self.escrow_seq,
+        )) {
+            let mut obj = sle.clone_as_object();
+            obj.set_field_u32(get_field_by_symbol("sfSequence"), self.escrow_seq);
+            let _ = self
+                .view
+                .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
+        }
+    }
     fn set_transfer_rate(&mut self) {}
     fn insert_sender_owner_dir(&mut self) -> Option<u64> {
         let escrow_kl =
@@ -232,23 +256,29 @@ pub struct ViewBackedEscrowFinishSink<'a, V> {
 }
 
 impl<'a, V: ApplyView> EscrowFinishApplySink for ViewBackedEscrowFinishSink<'a, V> {
-    fn transfer_escrow_amount(&mut self) {
-        let dst_keylet = protocol::account_keylet(Uint160::from_void(self.destination.data()));
-        if let Ok(Some(dst_sle)) = self.view.peek(dst_keylet) {
-            let dst_balance = dst_sle.get_field_amount(get_field_by_symbol("sfBalance"));
-            let new_dst_balance = if self.amount.native() {
-                STAmount::from_xrp_amount(XRPAmount::from_drops(
+    fn transfer_escrow_amount(&mut self) -> Ter {
+        if self.amount.native() {
+            let dst_keylet = protocol::account_keylet(Uint160::from_void(self.destination.data()));
+            if let Ok(Some(dst_sle)) = self.view.peek(dst_keylet) {
+                let dst_balance = dst_sle.get_field_amount(get_field_by_symbol("sfBalance"));
+                let new_dst_balance = STAmount::from_xrp_amount(XRPAmount::from_drops(
                     dst_balance.xrp().drops() + self.amount.xrp().drops(),
-                ))
-            } else {
-                dst_balance.clone() + self.amount.clone()
-            };
-            let mut dst_obj = dst_sle.clone_as_object();
-            dst_obj.set_field_amount(get_field_by_symbol("sfBalance"), new_dst_balance);
-            let _ = self.view.update(Arc::new(STLedgerEntry::from_stobject(
-                dst_obj,
-                *dst_sle.key(),
-            )));
+                ));
+                let mut dst_obj = dst_sle.clone_as_object();
+                dst_obj.set_field_amount(get_field_by_symbol("sfBalance"), new_dst_balance);
+                let _ = self.view.update(Arc::new(STLedgerEntry::from_stobject(
+                    dst_obj,
+                    *dst_sle.key(),
+                )));
+            }
+            Ter::TES_SUCCESS
+        } else {
+            ledger::ripple_state_helpers::account_send(
+                self.view,
+                &self.owner,
+                &self.destination,
+                &self.amount,
+            )
         }
     }
     fn remove_escrow_entry(&mut self) {
@@ -316,7 +346,7 @@ impl<'a, V: ApplyView> EscrowCancelApplySink for ViewBackedEscrowCancelSink<'a, 
         {
             if sle.has_field(get_field_by_symbol("sfCancelAfter")) {
                 let cancel_after = sle.get_field_u32(get_field_by_symbol("sfCancelAfter"));
-                return self.view.header().parent_close_time >= cancel_after;
+                return self.view.header().parent_close_time > cancel_after;
             }
         }
         false

@@ -3,6 +3,7 @@
 use crate::load::load_manager::LoadFeeControl;
 use std::cmp::max;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const LOAD_FEE_NORMAL: u32 = 256;
 pub const LOAD_FEE_INC_FRACTION: u32 = 4;
@@ -28,6 +29,9 @@ struct LoadFeeTrackInner {
 #[derive(Debug)]
 pub struct SharedLoadFeeTrack {
     inner: Mutex<LoadFeeTrackInner>,
+    /// The base fee (in drops) from the most recently validated ledger.
+    /// Updated on each validated ledger acceptance via `update_from_validated_ledger`.
+    network_base_fee: AtomicU64,
 }
 
 impl Default for SharedLoadFeeTrack {
@@ -45,6 +49,7 @@ impl SharedLoadFeeTrack {
                 cluster_fee: LOAD_FEE_NORMAL,
                 raise_count: 0,
             }),
+            network_base_fee: AtomicU64::new(0),
         }
     }
 
@@ -105,6 +110,36 @@ impl SharedLoadFeeTrack {
         inner.raise_count != 0
             || inner.local_fee != LOAD_FEE_NORMAL
             || inner.cluster_fee != LOAD_FEE_NORMAL
+    }
+
+    /// Update fee tracking state from a newly validated ledger.
+    ///
+    /// Rippled parity: after `checkAccept` promotes a validated ledger, the
+    /// node calls `app_.getFeeTrack().setClusterFee(ledger->fees().base)` to
+    /// inform the fee escalation algorithm of the network's current base fee.
+    /// This method records the validated ledger's base fee and adjusts the
+    /// cluster fee factor accordingly.
+    pub fn update_from_validated_ledger(&self, base_fee_drops: u64) {
+        // Store the raw base fee for use by RPC and server_info reporting.
+        self.network_base_fee
+            .store(base_fee_drops, Ordering::Release);
+
+        // Rippled sets cluster_fee = base fee from the validated ledger as a
+        // load factor signal. When the network base fee is the default (10
+        // drops), the cluster fee stays at LOAD_FEE_NORMAL (256). A higher
+        // base fee indicates elevated network load and should be reflected.
+        //
+        // In rippled the cluster fee is stored as a u32 load factor; we
+        // clamp the base fee to u32::MAX to avoid truncation panics on
+        // hypothetical extreme values.
+        let clamped = base_fee_drops.min(u32::MAX as u64) as u32;
+        self.set_cluster_fee(clamped.max(LOAD_FEE_NORMAL));
+    }
+
+    /// Returns the base fee (in drops) from the most recently validated ledger.
+    /// Returns 0 if no validated ledger has been processed yet.
+    pub fn network_base_fee(&self) -> u64 {
+        self.network_base_fee.load(Ordering::Acquire)
     }
 }
 
@@ -174,6 +209,25 @@ mod tests {
         assert!(track.raise_local_fee());
         assert_eq!(track.local_fee(), 500);
         assert_eq!(track.load_factor(), 500);
+        assert!(track.is_loaded_cluster());
+    }
+
+    #[test]
+    fn update_from_validated_ledger_stores_base_fee_and_adjusts_cluster() {
+        let track = SharedLoadFeeTrack::new();
+        assert_eq!(track.network_base_fee(), 0);
+        assert_eq!(track.cluster_fee(), LOAD_FEE_NORMAL);
+
+        // Default base fee of 10 drops — cluster_fee stays at LOAD_FEE_NORMAL
+        // since 10 < 256.
+        track.update_from_validated_ledger(10);
+        assert_eq!(track.network_base_fee(), 10);
+        assert_eq!(track.cluster_fee(), LOAD_FEE_NORMAL);
+
+        // Higher base fee (e.g. 500 drops) raises the cluster fee factor.
+        track.update_from_validated_ledger(500);
+        assert_eq!(track.network_base_fee(), 500);
+        assert_eq!(track.cluster_fee(), 500);
         assert!(track.is_loaded_cluster());
     }
 }

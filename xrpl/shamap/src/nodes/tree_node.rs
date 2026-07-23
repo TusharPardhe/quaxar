@@ -723,6 +723,61 @@ impl SHAMapTreeNode {
         result
     }
 
+    /// Evict all loaded children from this inner node, freeing their memory.
+    ///
+    /// The branch bitmap (`is_branch`) and branch hashes are preserved — only
+    /// the loaded child pointers are set to `None`. After this call:
+    /// - `is_empty_branch(b)` returns the same value as before (topology intact)
+    /// - `get_child_hash(b)` returns the same hash as before (identity intact)
+    /// - `get_child(b)` returns `None` for all branches (data evicted)
+    ///
+    /// This enables the backed-fetch path (`descend()` in SHAMap traversal) to
+    /// re-load individual nodes from NuDB on demand — the standard lazy-load
+    /// mechanism that already handles `None` children on backed trees.
+    ///
+    /// Thread-safety: uses the existing per-branch spinlock (`children_lock`)
+    /// identically to `get_child` / `canonicalize_child`. Concurrent readers
+    /// will either see the child (before eviction of that slot) or None (after),
+    /// both of which are valid states for a backed tree.
+    ///
+    /// Does NOT require `cowid != 0` — this is a memory-management operation,
+    /// not a tree mutation. The tree's logical content is unchanged.
+    pub fn release_loaded_children(&self) {
+        let Some(arrays) = self.inner_arrays.as_ref() else {
+            return; // Leaf node — nothing to release.
+        };
+
+        let is_branch = self.is_branch.load(Ordering::Relaxed);
+        if is_branch == 0 {
+            return; // No branches — nothing loaded.
+        }
+
+        let tagged = arrays.tagged();
+        let num_children = is_branch.count_ones() as usize;
+
+        // Iterate over all compact indices that correspond to non-empty branches.
+        // Each index is locked independently via the per-branch spinlock.
+        for index in 0..num_children {
+            let mask = 1u16 << index;
+
+            // Acquire spinlock for this slot
+            loop {
+                if arrays.children_lock().fetch_or(mask, Ordering::Acquire) & mask == 0 {
+                    break;
+                }
+                while arrays.children_lock().load(Ordering::Relaxed) & mask != 0 {
+                    std::hint::spin_loop();
+                }
+            }
+
+            // Drop the child pointer (the hash at this index is untouched)
+            tagged.set_child_at_index(index, None);
+
+            // Release spinlock
+            arrays.children_lock().fetch_and(!mask, Ordering::Release);
+        }
+    }
+
     /// Raw pointer child access — no ref counting, no clone.
     /// Safety: caller must ensure the parent outlives the returned pointer.
     #[inline(always)]
@@ -781,6 +836,27 @@ impl SHAMapTreeNode {
             .children_lock()
             .fetch_and(!mask, Ordering::Release);
         result
+    }
+
+    /// Returns true if any non-empty branch has a loaded child pointer.
+    /// Used to avoid unnecessary release_loaded_children calls on nodes
+    /// that already have all children released.
+    pub fn has_any_loaded_child(&self) -> bool {
+        let Some(arrays) = self.inner_arrays.as_ref() else {
+            return false;
+        };
+        let is_branch = self.is_branch.load(Ordering::Relaxed);
+        if is_branch == 0 {
+            return false;
+        }
+        let tagged = arrays.tagged();
+        let num_children = is_branch.count_ones() as usize;
+        for index in 0..num_children {
+            if tagged.has_child_at_index(index) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn canonicalize_child(

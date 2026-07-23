@@ -39,7 +39,9 @@ pub fn should_close_ledger(
     // Rust as a saturating Duration, which cannot go negative) and against
     // unexpectedly large values for either duration; those are unexpected
     // cases where we just close the ledger.
-    if prev_round_time > Duration::from_secs(600) || time_since_prev_close > Duration::from_secs(600) {
+    if prev_round_time > Duration::from_secs(600)
+        || time_since_prev_close > Duration::from_secs(600)
+    {
         debug!(
             any_transactions,
             prev_proposers,
@@ -176,13 +178,22 @@ pub fn check_consensus(
     }
 
     // Have sufficient nodes on our UNL moved on and reached the threshold?
-    if check_consensus_reached(current_finished, current_proposers, false, parms.min_consensus_pct, reached_max, false) {
+    if check_consensus_reached(
+        current_finished,
+        current_proposers,
+        false,
+        parms.min_consensus_pct,
+        reached_max,
+        false,
+    ) {
         warn!("checkConsensus: we see no consensus, but enough nodes have moved on");
         return ConsensusState::MovedOn;
     }
 
-    let max_agree_time = previous_agree_time.saturating_mul(parms.ledger_abandon_consensus_factor as u32);
-    let clamped_max = max_agree_time.clamp(parms.ledger_max_consensus, parms.ledger_abandon_consensus);
+    let max_agree_time =
+        previous_agree_time.saturating_mul(parms.ledger_abandon_consensus_factor as u32);
+    let clamped_max =
+        max_agree_time.clamp(parms.ledger_max_consensus, parms.ledger_abandon_consensus);
     if current_agree_time > clamped_max {
         warn!("checkConsensus: consensus taken too long");
         // Note: the Expired result may be overridden by the caller.
@@ -305,7 +316,17 @@ mod tests {
     #[test]
     fn check_consensus_no_before_min_consensus_time() {
         let p = parms();
-        let state = check_consensus(10, 10, 10, 0, Duration::from_secs(2), p.ledger_min_consensus, false, &p, true);
+        let state = check_consensus(
+            10,
+            10,
+            10,
+            0,
+            Duration::from_secs(2),
+            p.ledger_min_consensus,
+            false,
+            &p,
+            true,
+        );
         assert_eq!(state, ConsensusState::No);
     }
 
@@ -349,7 +370,17 @@ mod tests {
     fn check_consensus_expired_after_abandon_threshold() {
         let p = parms();
         // Nobody agrees, nobody finished, and we've well exceeded max consensus.
-        let state = check_consensus(10, 10, 0, 0, Duration::from_secs(2), p.ledger_abandon_consensus + Duration::from_secs(1), false, &p, true);
+        let state = check_consensus(
+            10,
+            10,
+            0,
+            0,
+            Duration::from_secs(2),
+            p.ledger_abandon_consensus + Duration::from_secs(1),
+            false,
+            &p,
+            true,
+        );
         assert_eq!(state, ConsensusState::Expired);
     }
 

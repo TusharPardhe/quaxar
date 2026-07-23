@@ -2386,6 +2386,10 @@ pub trait RpcRuntime {
     fn export_snapshot(&self, _output_path: &str) -> Result<JsonValue, String> {
         Err("Not implemented".to_owned())
     }
+
+    fn snapshot_status(&self) -> JsonValue {
+        protocol::json!({ "status": "success", "state": "unavailable" })
+    }
 }
 
 impl RpcRuntime for () {}
@@ -2438,6 +2442,10 @@ impl RpcRuntime for ApplicationRoot {
         self.status_rpc_current_ledger_index()
             .or_else(|| self.live_current_ledger_index())
             .or_else(|| self.validated_ledger_seq().map(|seq| seq.saturating_add(1)))
+    }
+
+    fn current_ledger_for_simulation(&self) -> Option<std::sync::Arc<ledger::Ledger>> {
+        self.closed_ledger().or_else(|| self.validated_ledger())
     }
 
     fn standalone(&self) -> bool {
@@ -2793,6 +2801,8 @@ impl RpcRuntime for ApplicationRoot {
         let ledger_hash = header.hash.to_string();
         let account_hash = header.account_hash.to_string();
         let output_owned = output_path.to_owned();
+        let export_state = self.begin_snapshot_export(output_owned.clone(), ledger_seq)?;
+        let export_state_for_thread = std::sync::Arc::clone(&export_state);
 
         // Spawn export on a background thread to avoid blocking the RPC handler
         // and to prevent memory pressure on the main thread pool.
@@ -2808,14 +2818,20 @@ impl RpcRuntime for ApplicationRoot {
                 );
                 match export_snapshot(backend.as_ref(), &manifest, path) {
                     Ok(()) => {
+                        let file_size = std::fs::metadata(path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0);
+                        export_state_for_thread.complete(file_size);
                         tracing::info!(
                             target: "snapshot",
                             ledger_seq,
                             path = %path.display(),
+                            file_size,
                             "Snapshot export completed successfully"
                         );
                     }
                     Err(e) => {
+                        export_state_for_thread.fail(e.to_string());
                         tracing::error!(
                             target: "snapshot",
                             error = %e,
@@ -2825,7 +2841,11 @@ impl RpcRuntime for ApplicationRoot {
                     }
                 }
             })
-            .map_err(|e| format!("Failed to spawn export thread: {e}"))?;
+            .map_err(|e| {
+                let message = format!("Failed to spawn export thread: {e}");
+                export_state.fail(message.clone());
+                message
+            })?;
 
         Ok(protocol::json!({
             "status": "started",
@@ -2835,6 +2855,32 @@ impl RpcRuntime for ApplicationRoot {
             "account_hash": account_hash,
             "output": output_path
         }))
+    }
+
+    fn snapshot_status(&self) -> JsonValue {
+        let snapshot = self.snapshot_export_status();
+        let mut result = std::collections::BTreeMap::new();
+        result.insert("status".to_owned(), JsonValue::String("success".to_owned()));
+        result.insert(
+            "state".to_owned(),
+            JsonValue::String(snapshot.phase.as_str().to_owned()),
+        );
+        if let Some(output) = snapshot.output {
+            result.insert("output".to_owned(), JsonValue::String(output));
+        }
+        if let Some(ledger_seq) = snapshot.ledger_seq {
+            result.insert(
+                "ledger_seq".to_owned(),
+                JsonValue::Unsigned(u64::from(ledger_seq)),
+            );
+        }
+        if let Some(file_size) = snapshot.file_size {
+            result.insert("file_size".to_owned(), JsonValue::Unsigned(file_size));
+        }
+        if let Some(error) = snapshot.error {
+            result.insert("error".to_owned(), JsonValue::String(error));
+        }
+        JsonValue::Object(result)
     }
 }
 

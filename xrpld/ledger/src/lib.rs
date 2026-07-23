@@ -12,8 +12,8 @@ pub mod views;
 
 pub use acquisition::delta_acquire;
 pub use acquisition::fetch_pack;
-pub use acquisition::inbound_ledger;
-pub use acquisition::inbound_ledgers;
+pub use acquisition::ledger_fetcher;
+// inbound_ledgers module removed — unified into app::ledger::inbound_ledgers
 pub use acquisition::inbound_transactions;
 pub use acquisition::skip_list_acquire;
 pub use acquisition::transaction_acquire;
@@ -138,7 +138,7 @@ pub use history_sync::{
     should_drop_fetch_pack_request,
 };
 pub use holder::LedgerHolder;
-pub use inbound_ledger::{
+pub use ledger_fetcher::{
     INBOUND_LEDGER_MAX_NEEDED_STATE_HASHES, INBOUND_LEDGER_MAX_NEEDED_TX_HASHES,
     INBOUND_LEDGER_MAX_USEFUL_PEERS, InboundLedgerCompletionDisposition, InboundLedgerDataType,
     InboundLedgerJournal, InboundLedgerLocal, InboundLedgerNodeData, InboundLedgerObjectType,
@@ -146,13 +146,12 @@ pub use inbound_ledger::{
     InboundLedgerPacketShape, InboundLedgerPeerScore, InboundLedgerPlannerState,
     InboundLedgerReason, InboundLedgerReceivedPacket, InboundLedgerRequest,
     InboundLedgerRequestTrigger, InboundLedgerRunDataResult, InboundLedgerStore,
-    NullInboundLedgerJournal, get_needed_hashes_with_family, make_inbound_get_ledger_request,
-    make_inbound_needed_by_hash_request, needed_hashes_with_family,
-    needed_hashes_with_family_and_first_child,
+    InboundLedgerTimerResult, NullInboundLedgerJournal, get_needed_hashes_with_family,
+    make_inbound_get_ledger_request, make_inbound_needed_by_hash_request,
+    needed_hashes_with_family, needed_hashes_with_family_and_first_child,
 };
-pub use inbound_ledgers::{
-    INBOUND_LEDGERS_REACQUIRE_INTERVAL, InboundLedgerRoute, InboundLedgersLocal, stash_stale_packet,
-};
+// Removed: InboundLedgersLocal, InboundLedgerRoute, stash_stale_packet
+// These will be reimplemented in app::ledger::inbound_ledgers
 pub use inbound_transactions::{InboundTransactions, InboundTransactionsDataStatus};
 pub use ledger_to_json::{
     DEFAULT_LEDGER_JSON_API_VERSION, LedgerFill, LedgerFillOptions, add_json, add_json_with_family,
@@ -414,10 +413,16 @@ fn decode_tx_node(
     let Some(item) = node.peek_item() else {
         return Ok(None);
     };
-    Ok(Some(decode_tx_item(ledger_seq, &item)?))
+    Ok(Some(decode_transaction_md_item(ledger_seq, &item)?))
 }
 
-fn decode_tx_item(ledger_seq: u32, item: &SHAMapItem) -> Result<LedgerTxRead, LedgerTxReadError> {
+/// Decode a validated-ledger `TransactionMd` SHAMap leaf into its transaction
+/// and metadata.  Consumers traversing released acquired maps should use this
+/// rather than parsing the nested VL payload directly.
+pub fn decode_transaction_md_item(
+    ledger_seq: u32,
+    item: &SHAMapItem,
+) -> Result<LedgerTxRead, LedgerTxReadError> {
     let (tx_bytes, meta_bytes) = split_transaction_with_meta(item.data())?;
     let tx = parse_sttx(&tx_bytes)?;
     let meta = parse_tx_meta(item.key(), ledger_seq, &meta_bytes)?;
@@ -709,13 +714,15 @@ impl Ledger {
                 ..LedgerHeader::default()
             },
             state_map: {
-                let mut sm = prev_ledger.state_map.share_root_snapshot();
-                // Mark unbacked so mutations traverse only in-memory nodes.
-                // All loaded nodes from the parent tree are reachable via the
-                // shared root. This prevents traversal failures when the
-                // node_fetcher can't resolve hash-only references during COW
-                // operations on the child tree.
-                sm.set_unbacked();
+                let sm = prev_ledger.state_map.share_root_snapshot();
+                // Inherit the parent's backed flag. When the parent is backed
+                // (nodes persisted to NuDB) and has a node_fetcher, the child
+                // must also be backed so that read operations (e.g.
+                // update_skip_list) can resolve nodes via the fetcher after
+                // release_maps_to_disk has evicted in-memory children.
+                // Mutations go through MutableTree which always passes
+                // backed=true and its own fetch callback independently of
+                // this flag, so COW is not affected.
                 sm
             },
             tx_map: SyncTree::new_with_type(SHAMapType::Transaction, true, 0),
@@ -1076,6 +1083,24 @@ impl Ledger {
         &mut self.tx_map
     }
 
+    /// Release all in-memory tree nodes from both state and transaction maps.
+    ///
+    /// Takes `&self` — operates via interior mutability (per-branch spinlocks
+    /// on SHAMapTreeNode). This means it works on `Arc<Ledger>` directly,
+    /// so ALL holders of this ledger (closed/validated/published slots, history
+    /// cache, consensus state) automatically see the released tree without any
+    /// slot-swapping or cloning.
+    ///
+    /// After this call, all SHAMap reads go through the `node_fetcher` to NuDB
+    /// on demand. The tree's identity (root hash, branch topology) is preserved.
+    ///
+    /// Call AFTER the ledger's nodes are confirmed durable in NuDB (either via
+    /// the acquisition worker's store_object path, or persist_dirty_nodes_to_store).
+    pub fn release_maps_to_disk(&self) {
+        self.state_map.release_to_disk();
+        self.tx_map.release_to_disk();
+    }
+
     pub fn needed_tx_hashes_with_family<CLOCK, S, C, F, MR, NS>(
         &mut self,
         max: i32,
@@ -1089,7 +1114,7 @@ impl Ledger {
         F: SHAMapNodeFetcher,
         MR: MissingNodeReporter,
     {
-        inbound_ledger::needed_hashes_with_family(
+        ledger_fetcher::needed_hashes_with_family(
             self.header.tx_hash,
             &mut self.tx_map,
             max,
@@ -1111,7 +1136,7 @@ impl Ledger {
         F: SHAMapNodeFetcher,
         MR: MissingNodeReporter,
     {
-        inbound_ledger::needed_hashes_with_family(
+        ledger_fetcher::needed_hashes_with_family(
             self.header.account_hash,
             &mut self.state_map,
             max,
@@ -1166,7 +1191,18 @@ impl Ledger {
     /// Used by consensus to pin state map nodes in memory before building.
     pub fn node_fetcher_closure(
         &self,
-    ) -> Option<Arc<dyn Fn(basics::sha_map_hash::SHAMapHash) -> Option<basics::memory::intrusive_pointer::SharedIntrusive<shamap::nodes::tree_node::SHAMapTreeNode>> + Send + Sync>> {
+    ) -> Option<
+        Arc<
+            dyn Fn(
+                    basics::sha_map_hash::SHAMapHash,
+                ) -> Option<
+                    basics::memory::intrusive_pointer::SharedIntrusive<
+                        shamap::nodes::tree_node::SHAMapTreeNode,
+                    >,
+                > + Send
+                + Sync,
+        >,
+    > {
         self.node_fetcher.clone()
     }
 
@@ -1310,7 +1346,7 @@ impl Ledger {
             let item = node
                 .peek_item()
                 .expect("ledger tx snapshot leaf nodes should carry an item");
-            snapshot.push(decode_tx_item(self.header.seq, &item)?);
+            snapshot.push(decode_transaction_md_item(self.header.seq, &item)?);
             current = self
                 .tx_map
                 .peek_next_item_with_family(item.key(), &mut stack, family)?;
@@ -1828,7 +1864,7 @@ impl Ledger {
         {
             let seq = self.header.seq;
             let hash = self.header.account_hash;
-            tracing::info!(target: "ledger", seq, account_hash = %hash, tx_hash = %self.header.tx_hash, "Ledger immutable — hashes computed");
+            tracing::debug!(target: "ledger", seq, account_hash = %hash, tx_hash = %self.header.tx_hash, "Ledger immutable — hashes computed");
         }
     }
 
@@ -1938,14 +1974,34 @@ impl Ledger {
     }
 
     /// Persist dirty SHAMap nodes to the node store WITHOUT rebuilding
-    /// the in-memory tree. This matches rippled's BuildLedger.cpp
-    /// flushDirty() which writes to NuDB but keeps the full tree in
-    /// memory for immediate serving via get_node_fat.
+    /// the in-memory tree. Matches rippled's `BuildLedger.cpp` lines 69-73:
+    ///   built->stateMap().flushDirty(AccountNode)
+    ///   built->txMap().flushDirty(TransactionNode)
     ///
-    /// Unlike `flush_state_map_to_store` (which rebuilds from root, losing
-    /// in-memory children), this preserves the full tree structure so the
-    /// ledger can be served to peers via InboundLedger immediately.
-    pub fn persist_dirty_nodes_to_store(&mut self) {
+    /// For each flushed node this performs the two-step write that rippled's
+    /// `SHAMap::writeNode` (SHAMap.cpp:935-947) performs:
+    ///   1. **Canonicalize into the shared tree-node cache** — matches
+    ///      `canonicalize(node->getHash(), node)` which calls
+    ///      `f_.getTreeNodeCache()->canonicalizeReplaceClient()`. This ensures
+    ///      subsequent `cacheLookup()` calls return a hit instead of falling
+    ///      through to a NuDB round-trip (fixes Issue B: tree cache = 0).
+    ///   2. **Persist to NuDB** — matches `f_.db().store(t, data, hash, seq)`.
+    ///
+    /// # Parameters
+    /// - `tree_cache`: Shared tree-node cache (the single `TreeNodeCache`
+    ///   instance shared across all SHAMaps via `SHAMapFamily`). When `Some`,
+    ///   each flushed node is canonicalized into the cache before NuDB
+    ///   persistence. When `None`, only NuDB persistence occurs (backward
+    ///   compatible with callers that don't have a cache reference).
+    pub fn persist_dirty_nodes_to_store(
+        &mut self,
+        tree_cache: Option<
+            &shamap::tree_node_cache::TreeNodeCache<
+                basics::tagged_cache::MonotonicClock,
+                basics::hardened_hash::HardenedHashBuilder,
+            >,
+        >,
+    ) {
         let ledger_seq = self.header.seq;
         let writer = self.node_writer.clone();
         if writer.is_none() {
@@ -1963,6 +2019,19 @@ impl Ledger {
              -> basics::memory::intrusive_pointer::SharedIntrusive<
                 shamap::nodes::tree_node::SHAMapTreeNode,
             > {
+                // Step 1: Canonicalize into the shared tree-node cache.
+                // Matches rippled SHAMap::writeNode (SHAMap.cpp:941):
+                //   canonicalize(node->getHash(), node);
+                if let Some(cache) = tree_cache {
+                    let mut node_ref = node.clone();
+                    let key = *node.get_hash().as_uint256();
+                    cache.canonicalize_replace_client(&key, &mut node_ref);
+                }
+
+                // Step 2: Persist to NuDB.
+                // Matches rippled SHAMap::writeNode (SHAMap.cpp:944-945):
+                //   Serializer s; node->serializeWithPrefix(s);
+                //   f_.db().store(t, std::move(s.modData()), node->getHash().asUInt256(), ledgerSeq_);
                 if let Some(ref write_fn) = writer {
                     let hash = node.get_hash();
                     if let Ok(data) = node.serialize_with_prefix() {
@@ -1989,6 +2058,14 @@ impl Ledger {
              -> basics::memory::intrusive_pointer::SharedIntrusive<
                 shamap::nodes::tree_node::SHAMapTreeNode,
             > {
+                // Step 1: Canonicalize into the shared tree-node cache (same as above).
+                if let Some(cache) = tree_cache {
+                    let mut node_ref = node.clone();
+                    let key = *node.get_hash().as_uint256();
+                    cache.canonicalize_replace_client(&key, &mut node_ref);
+                }
+
+                // Step 2: Persist to NuDB (same as above).
                 if let Some(ref write_fn) = writer {
                     let hash = node.get_hash();
                     if let Ok(data) = node.serialize_with_prefix() {
@@ -2221,12 +2298,34 @@ impl Ledger {
             return Ok(());
         }
 
+        let seq = self.header.seq;
+        let backed = self.state_map.backed();
+        let has_fetcher = self.node_fetcher.is_some();
+        let has_mutable = self.mutable_state.is_some();
+        tracing::debug!(
+            target: "ledger",
+            seq,
+            backed,
+            has_fetcher,
+            has_mutable,
+            "[skip_list] update_skip_list enter"
+        );
+
         let prev_index = self.header.seq - 1;
 
         // Per-256 skip list (one per 256-ledger range)
         if (prev_index & 0xff) == 0 {
             let keylet = skip_keylet_for_ledger(prev_index);
-            if let Ok(Some(sle)) = self.peek(keylet) {
+            let peek_result = self.peek(keylet);
+            tracing::debug!(
+                target: "ledger",
+                seq,
+                key = %keylet.key,
+                found = peek_result.as_ref().map(|r| r.is_some()).unwrap_or(false),
+                err = peek_result.is_err(),
+                "[skip_list] per-256 skip list peek"
+            );
+            if let Ok(Some(sle)) = peek_result {
                 let mut hashes = sle.get_field_v256(get_field_by_symbol("sfHashes"));
                 assert!(hashes.value().len() <= 256);
                 hashes.push_back(*self.header.parent_hash.as_uint256());
@@ -2234,22 +2333,35 @@ impl Ledger {
                 obj.set_field_v256(get_field_by_symbol("sfHashes"), hashes);
                 obj.set_field_u32(get_field_by_symbol("sfLastLedgerSequence"), prev_index);
                 let updated = Arc::new(STLedgerEntry::from_stobject(obj, keylet.key));
-                self.raw_replace(updated)
-                    .map_err(|e| MutationError::Traversal(e.into()))?;
+                tracing::debug!(target: "ledger", seq, key = %keylet.key, "[skip_list] per-256: raw_replace");
+                let r = self.raw_replace(updated)
+                    .map_err(|e| { let te = e.into(); tracing::error!(target: "ledger", seq, ?te, "[skip_list] per-256 raw_replace failed: ViewError→TraversalError"); MutationError::Traversal(te) });
+                r?
             } else {
                 let mut sle = STLedgerEntry::new(keylet);
                 let mut hashes = protocol::STVector256::new();
                 hashes.push_back(*self.header.parent_hash.as_uint256());
                 sle.set_field_v256(get_field_by_symbol("sfHashes"), hashes);
                 sle.set_field_u32(get_field_by_symbol("sfLastLedgerSequence"), prev_index);
-                self.raw_insert(Arc::new(sle))
-                    .map_err(|e| MutationError::Traversal(e.into()))?;
+                tracing::debug!(target: "ledger", seq, key = %keylet.key, "[skip_list] per-256: raw_insert");
+                let r = self.raw_insert(Arc::new(sle))
+                    .map_err(|e| { let te = e.into(); tracing::error!(target: "ledger", seq, ?te, "[skip_list] per-256 raw_insert failed: ViewError→TraversalError"); MutationError::Traversal(te) });
+                r?
             }
         }
 
         // Global skip list (last 256 hashes)
         let keylet = skip_keylet();
-        if let Ok(Some(sle)) = self.peek(keylet) {
+        let peek_result = self.peek(keylet);
+        tracing::debug!(
+            target: "ledger",
+            seq,
+            key = %keylet.key,
+            found = peek_result.as_ref().map(|r| r.is_some()).unwrap_or(false),
+            err = peek_result.is_err(),
+            "[skip_list] global skip list peek"
+        );
+        if let Ok(Some(sle)) = peek_result {
             let old_hashes = sle.get_field_v256(get_field_by_symbol("sfHashes"));
             let mut new_values: Vec<Uint256> = old_hashes.value().to_vec();
             assert!(new_values.len() <= 256);
@@ -2263,18 +2375,23 @@ impl Ledger {
             obj.set_field_v256(get_field_by_symbol("sfHashes"), hashes);
             obj.set_field_u32(get_field_by_symbol("sfLastLedgerSequence"), prev_index);
             let updated = Arc::new(STLedgerEntry::from_stobject(obj, keylet.key));
-            self.raw_replace(updated)
-                .map_err(|e| MutationError::Traversal(e.into()))?;
+            tracing::debug!(target: "ledger", seq, key = %keylet.key, "[skip_list] global: raw_replace");
+            let r = self.raw_replace(updated)
+                .map_err(|e| { let te = e.into(); tracing::error!(target: "ledger", seq, ?te, "[skip_list] global raw_replace failed: ViewError→TraversalError"); MutationError::Traversal(te) });
+            r?
         } else {
             let mut sle = STLedgerEntry::new(keylet);
             let mut hashes = protocol::STVector256::new();
             hashes.push_back(*self.header.parent_hash.as_uint256());
             sle.set_field_v256(get_field_by_symbol("sfHashes"), hashes);
             sle.set_field_u32(get_field_by_symbol("sfLastLedgerSequence"), prev_index);
-            self.raw_insert(Arc::new(sle))
-                .map_err(|e| MutationError::Traversal(e.into()))?;
+            tracing::debug!(target: "ledger", seq, key = %keylet.key, "[skip_list] global: raw_insert");
+            let r = self.raw_insert(Arc::new(sle))
+                .map_err(|e| { let te = e.into(); tracing::error!(target: "ledger", seq, ?te, "[skip_list] global raw_insert failed: ViewError→TraversalError"); MutationError::Traversal(te) });
+            r?
         }
 
+        tracing::debug!(target: "ledger", seq, "[skip_list] update_skip_list OK");
         Ok(())
     }
 
@@ -2561,12 +2678,54 @@ impl Ledger {
         payload: Vec<u8>,
     ) -> Result<(), MutationError> {
         // Route through apply_state_batch to keep mutable_state in sync.
-        let exists = self.state_map.peek_item(key, &mut |_| None)?.is_some();
+        // Use the ledger's node_fetcher when checking whether the key already
+        // exists in the state map. Without this, nodes that were evicted from
+        // memory by `release_maps_to_disk` (backed=true but no in-memory
+        // children) cannot be resolved, causing TraversalError::MissingNode.
+        // That error propagates through ViewError::Mutation and then through
+        // the `From<ViewError> for TraversalError` catch-all arm into
+        // TraversalError::View, producing the `Mutation(Traversal(View))`
+        // error seen when building ledger N+1 from a released ledger N state.
+        let seq = self.header.seq;
+        let backed = self.state_map.backed();
+        let has_fetcher = self.node_fetcher.is_some();
+        let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| -> Option<
+            basics::memory::intrusive_pointer::SharedIntrusive<
+                shamap::nodes::tree_node::SHAMapTreeNode,
+            >,
+        > {
+            let fetcher = self.node_fetcher.as_ref()?;
+            fetcher(hash)
+        };
+        let peek_result = self.state_map.peek_item(key, &mut fetch_fn);
+        tracing::debug!(
+            target: "ledger",
+            seq,
+            %key,
+            backed,
+            has_fetcher,
+            exists = peek_result.as_ref().map(|r| r.is_some()).unwrap_or(false),
+            err = peek_result.is_err(),
+            "[replace_state_map] peek result"
+        );
+        if let Err(ref e) = peek_result {
+            tracing::error!(
+                target: "ledger",
+                seq,
+                %key,
+                backed,
+                has_fetcher,
+                ?e,
+                "[replace_state_map] peek FAILED — this is the Mutation(Traversal(View)) source"
+            );
+        }
+        let exists = peek_result?.is_some();
         let op = if exists {
             StateBatchOp::Update
         } else {
             StateBatchOp::Insert
         };
+        tracing::debug!(target: "ledger", seq, %key, ?op, "[replace_state_map] applying batch");
         self.apply_state_batch(&[(op, key, payload)])
     }
 

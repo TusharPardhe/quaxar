@@ -1,5 +1,6 @@
 use crate::BuildLedgerJournal;
 use crate::consensus::rcl_validations::RclValidationJournal;
+use crate::ledger::inbound_ledgers::InboundLedgersLocal;
 use crate::ledger::open_ledger::{OpenLedger, OpenLedgerTx, OpenLedgerView};
 use crate::load::load_manager::LoadManagerJournal;
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
@@ -10,8 +11,8 @@ use crate::validator::validator_site::ValidatorSite;
 use basics::base_uint::Uint256;
 use basics::tagged_cache::{MonotonicClock, TaggedCache};
 use ledger::{
-    AcceptedLedger, CachedSles, InboundLedgersLocal, InboundTransactions, LedgerCleaner,
-    LedgerReplayer, OrderBookDB, PendingSaves, ReadView,
+    AcceptedLedger, CachedSles, InboundTransactions, LedgerCleaner, LedgerReplayer, OrderBookDB,
+    PendingSaves, ReadView,
 };
 use nodestore::{JournalLevel as NodeStoreJournalLevel, NodeStoreJournal};
 use overlay::Cluster;
@@ -97,6 +98,12 @@ use xrpld_core::{DatabaseCon, WALLET_DB_INIT, WALLET_DB_NAME};
 
 static WALLET_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// RPC-owned resumable-ledger-request cache. This is NOT the network
+/// acquisition registry (see `crate::ledger::inbound_ledgers::InboundLedgers`
+/// / `AppLedgerMasterRuntime.inbound_ledgers`, which is what the bootstrap
+/// consensus loop and catchup loop actually use to sync ledgers over the
+/// peer overlay). Only the RPC admin `ledger_data` resumption path
+/// (`rpc/src/state/context.rs`) reads or writes this type.
 pub type AppInboundLedgers = Arc<Mutex<InboundLedgersLocal<MonotonicClock>>>;
 pub type AppInboundTransactions = Arc<Mutex<InboundTransactions>>;
 pub type AppAcceptedLedgerCache = Arc<TaggedCache<Uint256, Arc<AcceptedLedger>>>;
@@ -730,6 +737,7 @@ pub struct AppConfig {
     pub do_import: bool,
     pub validation_quorum: usize,
     pub validation_seed: Option<String>,
+    pub validator_token: Option<Vec<String>>,
 }
 
 impl Default for AppConfig {
@@ -747,6 +755,7 @@ impl Default for AppConfig {
             do_import: false,
             validation_quorum: 1,
             validation_seed: None,
+            validator_token: None,
         }
     }
 }
@@ -1102,6 +1111,7 @@ impl ApplicationRegistryOwners {
                 do_import: false,
                 validation_quorum: 1,
                 validation_seed: None,
+                validator_token: None,
             },
         })
     }

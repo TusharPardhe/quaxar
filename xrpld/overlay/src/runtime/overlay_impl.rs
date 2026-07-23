@@ -830,6 +830,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         &mut self,
         message: &crate::message::TmValidation,
     ) -> crate::router::RouteAction {
+        tracing::trace!(target: "overlay", peer_id = %self.peer.id(), len = message.validation.len(), "on_validation: received TMValidation from peer");
         if message.validation.len() < 50 {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Validation too short, ignoring");
             return crate::router::RouteAction::Continue;
@@ -841,6 +842,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         .ok()
         .and_then(Result::ok);
         if parsed.is_none() {
+            tracing::warn!(target: "overlay", peer_id = %self.peer.id(), len = message.validation.len(), "on_validation: PARSE FAILED — dropping validation");
             return crate::router::RouteAction::Continue;
         }
 
@@ -1753,6 +1755,10 @@ impl OverlayImpl {
 
     pub fn take_proposals(&self) -> Vec<crate::QueuedProposal> {
         self.queued_inbound.take_proposals()
+    }
+
+    pub fn take_validator_lists(&self) -> Vec<crate::PeerMessage<crate::TmValidatorList>> {
+        self.queued_inbound.take_validator_lists()
     }
 
     pub fn take_ledger_data(&self) -> Vec<crate::PeerMessage<crate::TmLedgerData>> {

@@ -54,7 +54,9 @@ pub struct RclCxTxRef {
 
 impl RclCxTxRef {
     pub fn new(item: SHAMapItem) -> Self {
-        Self { item: Arc::new(item) }
+        Self {
+            item: Arc::new(item),
+        }
     }
 
     pub fn from_transaction(tx: &STTx) -> Self {
@@ -100,7 +102,12 @@ pub struct RclTxSetMutable {
 impl RclTxSet {
     pub fn new(cache: RclTxSetSharedCache, ledger_seq: u32) -> Self {
         let map = StorageTree::new(1, false, ledger_seq, Arc::clone(&cache));
-        Self { root: map.root(), cache, backed: false, ledger_seq }
+        Self {
+            root: map.root(),
+            cache,
+            backed: false,
+            ledger_seq,
+        }
     }
 
     pub fn from_parts(
@@ -109,24 +116,55 @@ impl RclTxSet {
         backed: bool,
         ledger_seq: u32,
     ) -> Self {
-        Self { root, cache, backed, ledger_seq }
+        Self {
+            root,
+            cache,
+            backed,
+            ledger_seq,
+        }
     }
 
     pub fn mutable_view(&self) -> RclTxSetMutable {
         let owner_cowid = self.root.cowid().max(1);
         let next_cowid = owner_cowid + 1;
-        let base = StorageTree::from_loaded_root(self.root.clone(), owner_cowid, self.backed, self.ledger_seq, Arc::clone(&self.cache));
-        RclTxSetMutable { map: base.mutable_snapshot(next_cowid), cache: Arc::clone(&self.cache), backed: self.backed, ledger_seq: self.ledger_seq }
+        let base = StorageTree::from_loaded_root(
+            self.root.clone(),
+            owner_cowid,
+            self.backed,
+            self.ledger_seq,
+            Arc::clone(&self.cache),
+        );
+        RclTxSetMutable {
+            map: base.mutable_snapshot(next_cowid),
+            cache: Arc::clone(&self.cache),
+            backed: self.backed,
+            ledger_seq: self.ledger_seq,
+        }
     }
 
     pub fn exists(&self, entry: Uint256) -> bool {
-        let map = StorageTree::from_loaded_root(self.root.clone(), 1, self.backed, self.ledger_seq, Arc::clone(&self.cache));
-        map.has_item(entry, &mut |_| None).expect("loaded consensus tx set should not need fetches")
+        let map = StorageTree::from_loaded_root(
+            self.root.clone(),
+            1,
+            self.backed,
+            self.ledger_seq,
+            Arc::clone(&self.cache),
+        );
+        map.has_item(entry, &mut |_| None)
+            .expect("loaded consensus tx set should not need fetches")
     }
 
     pub fn find(&self, entry: Uint256) -> Option<Arc<SHAMapItem>> {
-        let map = StorageTree::from_loaded_root(self.root.clone(), 1, self.backed, self.ledger_seq, Arc::clone(&self.cache));
-        map.peek_item(entry, &mut |_| None).expect("loaded consensus tx set should not need fetches").map(Arc::new)
+        let map = StorageTree::from_loaded_root(
+            self.root.clone(),
+            1,
+            self.backed,
+            self.ledger_seq,
+            Arc::clone(&self.cache),
+        );
+        map.peek_item(entry, &mut |_| None)
+            .expect("loaded consensus tx set should not need fetches")
+            .map(Arc::new)
     }
 
     /// Returns every item stored in this transaction set. Matches the
@@ -137,10 +175,18 @@ impl RclTxSet {
     /// -- it must be read directly from this already-captured set, not by
     /// re-querying any mutable, concurrently-reset open ledger view.
     pub fn all_items(&self) -> Vec<Arc<SHAMapItem>> {
-        let map = StorageTree::from_loaded_root(self.root.clone(), 1, self.backed, self.ledger_seq, Arc::clone(&self.cache));
+        let map = StorageTree::from_loaded_root(
+            self.root.clone(),
+            1,
+            self.backed,
+            self.ledger_seq,
+            Arc::clone(&self.cache),
+        );
         let mut items = Vec::new();
-        map.visit_leaves(&mut |_| None, &mut |item| items.push(Arc::new(item.clone())))
-            .expect("loaded consensus tx set should not need fetches");
+        map.visit_leaves(&mut |_| None, &mut |item| {
+            items.push(Arc::new(item.clone()))
+        })
+        .expect("loaded consensus tx set should not need fetches");
         items
     }
 
@@ -150,13 +196,25 @@ impl RclTxSet {
 
     pub fn compare(&self, other: &Self) -> BTreeMap<Uint256, bool> {
         let mut delta = Delta::new();
-        let _ = compare(&self.root, &other.root, self.backed, &mut |_| None, other.backed, &mut |_| None, &mut delta, 65_536)
-            .expect("loaded consensus tx sets should compare without fetches");
+        let _ = compare(
+            &self.root,
+            &other.root,
+            self.backed,
+            &mut |_| None,
+            other.backed,
+            &mut |_| None,
+            &mut delta,
+            65_536,
+        )
+        .expect("loaded consensus tx sets should compare without fetches");
 
         delta
             .into_iter()
             .map(|(key, (left, right))| {
-                assert!((left.is_some() && right.is_none()) || (left.is_none() && right.is_some()), "xrpl::RCLTxSet::compare : either side is set");
+                assert!(
+                    (left.is_some() && right.is_none()) || (left.is_none() && right.is_some()),
+                    "xrpl::RCLTxSet::compare : either side is set"
+                );
                 (key, left.is_some())
             })
             .collect()
@@ -175,18 +233,27 @@ impl RclTxSet {
 
 impl RclTxSetMutable {
     pub fn insert(&mut self, tx: &RclCxTxRef) -> bool {
-        self.map.add_item(SHAMapNodeType::TransactionNm, (*tx.item()).clone()).expect("loaded consensus tx set insert should not need fetches")
+        self.map
+            .add_item(SHAMapNodeType::TransactionNm, (*tx.item()).clone())
+            .expect("loaded consensus tx set insert should not need fetches")
     }
 
     pub fn erase(&mut self, entry: Uint256) -> bool {
-        self.map.delete_item(entry).expect("loaded consensus tx set erase should not need fetches")
+        self.map
+            .delete_item(entry)
+            .expect("loaded consensus tx set erase should not need fetches")
     }
 
     pub fn freeze(mut self) -> RclTxSet {
         self.map.unshare();
         let root = self.map.root();
         root.update_hash_deep();
-        RclTxSet { root, cache: self.cache, backed: self.backed, ledger_seq: self.ledger_seq }
+        RclTxSet {
+            root,
+            cache: self.cache,
+            backed: self.backed,
+            ledger_seq: self.ledger_seq,
+        }
     }
 }
 
@@ -266,7 +333,11 @@ impl RclCxLedger {
     }
 
     pub fn get_json(&self) -> JsonValue {
-        get_json(&LedgerFill::new(self.ledger.as_ref(), LedgerFillOptions::default())).expect("loaded consensus ledger should render to JSON")
+        get_json(&LedgerFill::new(
+            self.ledger.as_ref(),
+            LedgerFillOptions::default(),
+        ))
+        .expect("loaded consensus ledger should render to JSON")
     }
 
     pub fn ledger(&self) -> Arc<Ledger> {
@@ -287,7 +358,9 @@ impl crate::ConsensusLedger for RclCxLedger {
     }
 
     fn close_time_resolution(&self) -> std::time::Duration {
-        let secs = RclCxLedger::close_time_resolution(self).whole_seconds().max(0);
+        let secs = RclCxLedger::close_time_resolution(self)
+            .whole_seconds()
+            .max(0);
         std::time::Duration::from_secs(secs as u64)
     }
 
@@ -306,7 +379,9 @@ impl crate::ConsensusLedger for RclCxLedger {
 
 impl Default for RclCxLedger {
     fn default() -> Self {
-        Self::new(Arc::new(Ledger::from_ledger_seq_and_close_time(0, 0, false)))
+        Self::new(Arc::new(Ledger::from_ledger_seq_and_close_time(
+            0, 0, false,
+        )))
     }
 }
 
@@ -348,7 +423,9 @@ where
     A::Ledger: crate::model::TrieLedger<Seq = u32, Id = Uint256>,
 {
     pub fn new(parms: crate::rcl_support::ValidationParms, adaptor: A) -> Self {
-        Self { inner: crate::rcl_support::Validations::new(parms, adaptor) }
+        Self {
+            inner: crate::rcl_support::Validations::new(parms, adaptor),
+        }
     }
 
     pub fn inner(&self) -> &crate::rcl_support::Validations<A> {
@@ -365,11 +442,19 @@ where
     /// at sequence `seq`. Built from `Validations::get_trusted_for_ledger`
     /// by mapping each wrapped validation through its `NodeKey`. Used by
     /// `negative_unl_vote.rs`'s reliability score table.
-    pub fn trusted_for_ledger_by_sequence(&mut self, ledger_id: Uint256, seq: u32) -> Vec<<A::Validation as crate::rcl_support::ValidationT>::NodeKey>
+    pub fn trusted_for_ledger_by_sequence(
+        &mut self,
+        ledger_id: Uint256,
+        seq: u32,
+    ) -> Vec<<A::Validation as crate::rcl_support::ValidationT>::NodeKey>
     where
         <A::Validation as crate::rcl_support::ValidationT>::Wrapped: AsValidationKey<A>,
     {
-        self.inner.get_trusted_for_ledger(&ledger_id, seq).into_iter().map(|wrapped| wrapped.node_key()).collect()
+        self.inner
+            .get_trusted_for_ledger(&ledger_id, seq)
+            .into_iter()
+            .map(|wrapped| wrapped.node_key())
+            .collect()
     }
 }
 

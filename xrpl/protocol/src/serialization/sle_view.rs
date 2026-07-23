@@ -9,9 +9,9 @@ const STI_UINT32: i32 = 2;
 const STI_AMOUNT: i32 = 6;
 
 /// Field indices from the protocol sfield specs.
-const SF_SEQUENCE_FIELD: i32 = 4;       // UInt32, field_value=4
-const SF_OWNER_COUNT_FIELD: i32 = 13;   // UInt32, field_value=13
-const SF_BALANCE_FIELD: i32 = 2;        // Amount, field_value=2
+const SF_SEQUENCE_FIELD: i32 = 4; // UInt32, field_value=4
+const SF_OWNER_COUNT_FIELD: i32 = 13; // UInt32, field_value=13
+const SF_BALANCE_FIELD: i32 = 2; // Amount, field_value=2
 
 /// Raw 64-bit Amount value decoded from wire format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +44,9 @@ impl<'a> SleView<'a> {
         if offset + 4 > self.data.len() {
             return None;
         }
-        Some(u32::from_be_bytes(self.data[offset..offset + 4].try_into().ok()?))
+        Some(u32::from_be_bytes(
+            self.data[offset..offset + 4].try_into().ok()?,
+        ))
     }
 
     /// Decode the OwnerCount field (UInt32, field_value=13).
@@ -53,7 +55,9 @@ impl<'a> SleView<'a> {
         if offset + 4 > self.data.len() {
             return None;
         }
-        Some(u32::from_be_bytes(self.data[offset..offset + 4].try_into().ok()?))
+        Some(u32::from_be_bytes(
+            self.data[offset..offset + 4].try_into().ok()?,
+        ))
     }
 
     /// Scan from the beginning of the serialized data to find the field with
@@ -88,13 +92,17 @@ impl<'a> SleView<'a> {
         let mut consumed = 1;
 
         if type_id == 0 {
-            if pos + consumed >= data.len() { return None; }
+            if pos + consumed >= data.len() {
+                return None;
+            }
             type_id = data[pos + consumed] as i32;
             consumed += 1;
         }
 
         if field_id == 0 {
-            if pos + consumed >= data.len() { return None; }
+            if pos + consumed >= data.len() {
+                return None;
+            }
             field_id = data[pos + consumed] as i32;
             consumed += 1;
         }
@@ -105,12 +113,12 @@ impl<'a> SleView<'a> {
     /// Return the byte length of a field value given the type_id.
     fn field_data_length(data: &[u8], pos: usize, type_id: i32) -> Option<usize> {
         match type_id {
-            16 => Some(1),  // UInt8
-            1 => Some(2),   // UInt16
-            2 => Some(4),   // UInt32
-            3 => Some(8),   // UInt64
-            4 => Some(16),  // UInt128
-            5 => Some(32),  // UInt256
+            16 => Some(1), // UInt8
+            1 => Some(2),  // UInt16
+            2 => Some(4),  // UInt32
+            3 => Some(8),  // UInt64
+            4 => Some(16), // UInt128
+            5 => Some(32), // UInt256
             6 => {
                 // Amount type: discriminate by top bit of first byte.
                 // - Native XRP: bit 62 clear (top byte & 0x80 == 0x40 pattern) → 8 bytes
@@ -137,9 +145,7 @@ impl<'a> SleView<'a> {
             22 => Some(48), // UInt384
             23 => Some(64), // UInt512
             // Variable-length types (VL, Account, etc.) — decode VL prefix.
-            7 | 8 | 18 | 19 | 24 | 25 | 26 => {
-                Self::decode_vl_length(data, pos)
-            }
+            7 | 8 | 18 | 19 | 24 | 25 | 26 => Self::decode_vl_length(data, pos),
             // Object (14) — scan until end-of-object marker (0xE1).
             14 => Self::scan_object_length(data, pos),
             // Array (15) — scan until end-of-array marker (0xF1).
@@ -150,17 +156,23 @@ impl<'a> SleView<'a> {
 
     /// Decode a variable-length prefix and return total consumed bytes (prefix + payload).
     fn decode_vl_length(data: &[u8], pos: usize) -> Option<usize> {
-        if pos >= data.len() { return None; }
+        if pos >= data.len() {
+            return None;
+        }
         let b1 = data[pos] as usize;
         if b1 <= 192 {
             Some(1 + b1)
         } else if b1 <= 240 {
-            if pos + 1 >= data.len() { return None; }
+            if pos + 1 >= data.len() {
+                return None;
+            }
             let b2 = data[pos + 1] as usize;
             let len = 193 + ((b1 - 193) * 256) + b2;
             Some(2 + len)
         } else if b1 <= 254 {
-            if pos + 2 >= data.len() { return None; }
+            if pos + 2 >= data.len() {
+                return None;
+            }
             let b2 = data[pos + 1] as usize;
             let b3 = data[pos + 2] as usize;
             let len = 12481 + ((b1 - 241) * 65536) + (b2 * 256) + b3;

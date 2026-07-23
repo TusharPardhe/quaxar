@@ -111,14 +111,14 @@ pub(super) fn adjust_imprecise_number(
 
 pub(super) fn effective_loan_pay_amount(
     payment_type: tx::LoanPayPaymentType,
-    fix_security_3_1_3: bool,
+    fix_cleanup_3_1_3: bool,
     fix_cleanup_3_2_0: bool,
     asset: Asset,
     payment_amount: RuntimeNumber,
     loan_scale: i32,
 ) -> RuntimeNumber {
     if payment_type == tx::LoanPayPaymentType::Overpayment
-        && (fix_security_3_1_3 || fix_cleanup_3_2_0)
+        && (fix_cleanup_3_1_3 || fix_cleanup_3_2_0)
     {
         round_number_to_asset_with_scale(
             asset,

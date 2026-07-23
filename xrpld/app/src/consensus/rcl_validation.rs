@@ -29,7 +29,9 @@ impl RclValidation {
 
     fn load_fee(&self) -> Option<u32> {
         let field = get_field_by_symbol("sfLoadFee");
-        self.val.is_field_present(field).then(|| self.val.get_field_u32(field))
+        self.val
+            .is_field_present(field)
+            .then(|| self.val.get_field_u32(field))
     }
 }
 
@@ -45,7 +47,8 @@ impl ValidationT for RclValidation {
     }
 
     fn seq(&self) -> u32 {
-        self.val.get_field_u32(get_field_by_symbol("sfLedgerSequence"))
+        self.val
+            .get_field_u32(get_field_by_symbol("sfLedgerSequence"))
     }
 
     fn sign_time(&self) -> NetClockTimePoint {
@@ -104,7 +107,11 @@ pub struct RclValidatedLedger {
 
 impl RclValidatedLedger {
     pub fn genesis() -> Self {
-        Self { ledger_id: Uint256::zero(), ledger_seq: 0, ancestors: Arc::new(vec![Uint256::zero()]) }
+        Self {
+            ledger_id: Uint256::zero(),
+            ledger_seq: 0,
+            ancestors: Arc::new(vec![Uint256::zero()]),
+        }
     }
 
     pub fn from_ledger(ledger: &Ledger) -> Self {
@@ -119,11 +126,18 @@ impl RclValidatedLedger {
         let min_seq = ledger_seq.saturating_sub(MAX_ANCESTORS_TRACKED.min(ledger_seq));
         let mut ancestors = Vec::with_capacity((ledger_seq - min_seq + 1) as usize);
         for seq in min_seq..=ledger_seq {
-            let hash = ledger.hash_of_seq(seq, journal).map(|h| *h.as_uint256()).unwrap_or_else(Uint256::zero);
+            let hash = ledger
+                .hash_of_seq(seq, journal)
+                .map(|h| *h.as_uint256())
+                .unwrap_or_else(Uint256::zero);
             ancestors.push(hash);
         }
 
-        Self { ledger_id, ledger_seq, ancestors: Arc::new(ancestors) }
+        Self {
+            ledger_id,
+            ledger_seq,
+            ancestors: Arc::new(ancestors),
+        }
     }
 
     fn min_seq(&self) -> u32 {
@@ -182,7 +196,9 @@ impl ValidationsLedger for RclValidatedLedger {
 pub struct RclValidationsAdaptor {
     ledgers: parking_lot::Mutex<std::collections::HashMap<Uint256, RclValidatedLedger>>,
     now: Arc<dyn Fn() -> NetClockTimePoint + Send + Sync>,
-    ledger_master_runtime: parking_lot::Mutex<Option<Arc<crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime>>>,
+    ledger_master_runtime: parking_lot::Mutex<
+        Option<Arc<crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime>>,
+    >,
 }
 
 impl RclValidationsAdaptor {
@@ -209,7 +225,10 @@ impl RclValidationsAdaptor {
     /// `RCLValidationsAdaptor` holding a reference to the owning
     /// `Application` for `app_.getLedgerMaster()`/`app_.getInboundLedgers()`
     /// access.
-    pub fn set_ledger_master_runtime(&self, runtime: Option<Arc<crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime>>) {
+    pub fn set_ledger_master_runtime(
+        &self,
+        runtime: Option<Arc<crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime>>,
+    ) {
         *self.ledger_master_runtime.lock() = runtime;
     }
 }
@@ -250,14 +269,22 @@ impl consensus::rcl_support::ValidationsAdaptor for RclValidationsAdaptor {
         };
 
         let hash = basics::sha_map_hash::SHAMapHash::new(*ledger_id);
-        if let Some(ledger) = runtime.ledger_master().ledger_history().get_cached_ledger_by_hash(hash) {
+        if let Some(ledger) = runtime
+            .ledger_master()
+            .ledger_history()
+            .get_cached_ledger_by_hash(hash)
+        {
             return Some(RclValidatedLedger::from_ledger(&ledger));
         }
 
-        if let Some(guard) = runtime.shared_inbound_ledgers.lock().ok()
+        if let Some(guard) = runtime.inbound_ledgers.lock().ok()
             && let Some(shared) = guard.as_ref()
         {
-            shared.acquire(*ledger_id, 0);
+            shared.acquire_async(
+                *ledger_id,
+                0,
+                crate::ledger::inbound_ledgers::AcquireReason::Consensus,
+            );
         }
         None
     }
@@ -273,12 +300,16 @@ impl consensus::rcl::AsValidationKey<RclValidationsAdaptor> for Arc<STValidation
 mod tests {
     use super::*;
     use ledger::Ledger as LedgerImpl;
-    use protocol::{KeyType, SecretKey, calc_node_id, derive_public_key, generate_secret_key, random_seed};
+    use protocol::{
+        KeyType, SecretKey, calc_node_id, derive_public_key, generate_secret_key, random_seed,
+    };
 
     fn signed_validation(ledger_hash: Uint256, seq: u32, sign_time: u32) -> Arc<STValidation> {
         let seed = random_seed();
-        let secret_key: SecretKey = generate_secret_key(KeyType::Secp256k1, &seed).expect("secret key generation should succeed");
-        let public_key = derive_public_key(KeyType::Secp256k1, &secret_key).expect("public key derivation should succeed");
+        let secret_key: SecretKey = generate_secret_key(KeyType::Secp256k1, &seed)
+            .expect("secret key generation should succeed");
+        let public_key = derive_public_key(KeyType::Secp256k1, &secret_key)
+            .expect("public key derivation should succeed");
         let node_id = calc_node_id(&public_key);
 
         let val = STValidation::new_signed(sign_time, &public_key, node_id, &secret_key, |v| {

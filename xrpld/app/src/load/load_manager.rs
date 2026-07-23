@@ -407,9 +407,14 @@ mod tests {
             gate_tx.send(()).unwrap();
             release_rx.recv().unwrap();
         }));
-        gate_rx.recv_timeout(Duration::from_secs(5)).expect("first JtPack job should start");
+        gate_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first JtPack job should start");
         assert!(queue.add_job(JobType::JtPack, "second", || {}));
-        assert!(queue.is_overloaded(), "queue must be overloaded: JtPack's limit of 1 is already held by the still-running first job");
+        assert!(
+            queue.is_overloaded(),
+            "queue must be overloaded: JtPack's limit of 1 is already held by the still-running first job"
+        );
         release_tx.send(()).unwrap();
 
         let fees = Arc::new(RecordingFees::default());

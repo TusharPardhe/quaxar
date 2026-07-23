@@ -3,7 +3,6 @@ mod fetch_pack_cache;
 mod fetch_pack_filters;
 mod inbound_dispatch;
 mod inbound_ledger;
-mod inbound_ledgers_local;
 mod inbound_owner_local;
 mod inbound_planner;
 mod inbound_receive;

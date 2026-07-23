@@ -256,7 +256,10 @@ fn tx_result_code_5() {
     ]));
     m.publish_json(StreamKind::BookChanges, payload.clone());
     let e = r.try_recv().unwrap();
-    { let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap(); assert_eq!(parsed, payload); }
+    {
+        let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+        assert_eq!(parsed, payload);
+    }
 }
 #[test]
 fn tx_result_code_6() {
@@ -275,7 +278,10 @@ fn tx_result_code_6() {
     ]));
     m.publish_json(StreamKind::Validations, payload.clone());
     let e = r.try_recv().unwrap();
-    { let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap(); assert_eq!(parsed, payload); }
+    {
+        let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+        assert_eq!(parsed, payload);
+    }
 }
 #[test]
 fn tx_result_code_7() {
@@ -296,7 +302,10 @@ fn tx_result_code_7() {
     ]));
     m.publish_json(StreamKind::Manifests, payload.clone());
     let e = r.try_recv().unwrap();
-    { let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap(); assert_eq!(parsed, payload); }
+    {
+        let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+        assert_eq!(parsed, payload);
+    }
 }
 #[test]
 fn tx_result_code_8() {
@@ -308,7 +317,10 @@ fn tx_result_code_8() {
     ]));
     m.publish_json(StreamKind::Consensus, payload.clone());
     let e = r.try_recv().unwrap();
-    { let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap(); assert_eq!(parsed, payload); }
+    {
+        let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+        assert_eq!(parsed, payload);
+    }
 }
 #[test]
 fn tx_result_code_9() {
@@ -322,7 +334,10 @@ fn tx_result_code_9() {
     ]));
     m.publish_json(StreamKind::PeerStatus, payload.clone());
     let e = r.try_recv().unwrap();
-    { let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap(); assert_eq!(parsed, payload); }
+    {
+        let parsed: JsonValue = serde_json::from_slice(&e.payload).unwrap();
+        assert_eq!(parsed, payload);
+    }
 }
 // === More ServerDefinitions specific checks ===
 #[test]

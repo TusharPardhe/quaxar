@@ -1,4 +1,3 @@
-use parking_lot::Mutex;
 use basics::base_uint::Uint256;
 use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
@@ -7,6 +6,7 @@ use ledger::{
     Fees, Ledger, LedgerConfig, LedgerHeader, LedgerInfoProvider, LedgerJournal,
     XRP_LEDGER_EARLIEST_FEES, amendments_key, calculate_ledger_hash, fees_key,
 };
+use parking_lot::Mutex;
 use protocol::{FeatureSet, encode_amendments_entry, encode_fee_settings_entry, feature_xrp_fees};
 use shamap::family::{MissingNodeReporter, NullFullBelowCache, SHAMapFamily, SHAMapNodeFetcher};
 use shamap::item::SHAMapItem;
@@ -83,10 +83,7 @@ struct SharedReporter(Arc<Mutex<RecordingMissingNodeReporter>>);
 
 impl MissingNodeReporter for SharedReporter {
     fn missing_node_acquire_by_seq(&self, ref_num: u32, node_hash: Uint256) {
-        self.0
-            .lock()
-            .by_seq
-            .push((ref_num, node_hash));
+        self.0.lock().by_seq.push((ref_num, node_hash));
     }
 
     fn missing_node_acquire_by_hash(&self, _ref_hash: Uint256, _ref_num: u32) {}
@@ -100,29 +97,21 @@ struct RecordingLedgerJournal {
 
 impl RecordingLedgerJournal {
     fn infos(&self) -> Vec<String> {
-        self.infos
-            .lock()
-            .clone()
+        self.infos.lock().clone()
     }
 
     fn warns(&self) -> Vec<String> {
-        self.warns
-            .lock()
-            .clone()
+        self.warns.lock().clone()
     }
 }
 
 impl LedgerJournal for RecordingLedgerJournal {
     fn info(&self, message: &str) {
-        self.infos
-            .lock()
-            .push(message.to_owned());
+        self.infos.lock().push(message.to_owned());
     }
 
     fn warn(&self, message: &str) {
-        self.warns
-            .lock()
-            .push(message.to_owned());
+        self.warns.lock().push(message.to_owned());
     }
 }
 

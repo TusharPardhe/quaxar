@@ -1,0 +1,23 @@
+services:
+  quaxar-testnet:
+    build: .
+    container_name: quaxar-testnet
+    restart: "no"
+    ports:
+      - "5005:5005"
+      - "6006:6006"
+      - "51235:51235"
+    volumes:
+      - quaxar-testnet-data:/var/lib/xrpld
+      - ./xrpld-testnet.cfg:/etc/xrpld/xrpld.cfg:ro
+      - ./validators-testnet.txt:/etc/xrpld/validators-testnet.txt:ro
+    user: "0:0"
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+    environment:
+      - RUST_LOG=info,consensus=debug,inbound_ledger=debug,bootstrap=debug,overlay=info,app=info
+
+volumes:
+  quaxar-testnet-data:

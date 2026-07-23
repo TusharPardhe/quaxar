@@ -512,7 +512,9 @@ mod tests {
 
         assert_eq!(visited, 2);
         assert!(root.get_child(5).is_some());
-        family.with_fetcher(|fetcher| assert_eq!(fetcher.fetches.lock().clone(), vec![expected_hash]));
+        family.with_fetcher(|fetcher| {
+            assert_eq!(fetcher.fetches.lock().clone(), vec![expected_hash])
+        });
     }
 
     #[test]

@@ -156,7 +156,11 @@ impl LedgerStateIndex {
                 limit,
             }
         } else {
-            let indices = self.type_indices.get(&type_filter).map(|v| v.as_slice()).unwrap_or(&[]);
+            let indices = self
+                .type_indices
+                .get(&type_filter)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
             let start = indices.partition_point(|&i| self.entries[i].key <= start_key);
             LedgerStateQuery {
                 index: self,
@@ -224,8 +228,10 @@ impl<'a> LedgerStateQuery<'a> {
         let mut next_marker: Option<Uint256> = None;
         let mut pos = self.start;
 
-        let len = self.type_filter_indices.map_or(self.index.entries.len(), |indices| indices.len());
-        
+        let len = self
+            .type_filter_indices
+            .map_or(self.index.entries.len(), |indices| indices.len());
+
         while pos < len {
             let entry_idx = self.type_filter_indices.map_or(pos, |indices| indices[pos]);
             let entry = &self.index.entries[entry_idx];
@@ -382,8 +388,7 @@ mod tests {
             make_entry(1, LedgerEntryType::Offer),
             make_entry(2, LedgerEntryType::AccountRoot),
         ];
-        let index =
-            LedgerStateIndex::build_from_iter(1, Uint256::default(), entries.into_iter());
+        let index = LedgerStateIndex::build_from_iter(1, Uint256::default(), entries.into_iter());
 
         assert_eq!(index.len(), 3);
         let keys: Vec<u64> = index
@@ -417,8 +422,7 @@ mod tests {
             make_entry(3, LedgerEntryType::AccountRoot),
             make_entry(4, LedgerEntryType::Offer),
         ];
-        let index =
-            LedgerStateIndex::build_from_iter(1, Uint256::default(), entries.into_iter());
+        let index = LedgerStateIndex::build_from_iter(1, Uint256::default(), entries.into_iter());
 
         let query = index.query(None, 10, LedgerEntryType::Offer);
         let (page, marker) = query.collect_entries();

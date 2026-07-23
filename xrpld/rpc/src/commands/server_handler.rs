@@ -63,6 +63,7 @@ static HANDLER_MAP: phf::Map<&'static str, RpcHandlerSpec> = phf::phf_map! {
     "account_tx"            => RpcHandlerSpec::new("account_tx",            Role::User,  HandlerCondition::None,                1, u32::MAX),
     "can_delete"            => RpcHandlerSpec::new("can_delete",            Role::Admin, HandlerCondition::None,                1, u32::MAX),
     "export_snapshot"       => RpcHandlerSpec::new("export_snapshot",       Role::Admin, HandlerCondition::None,                1, u32::MAX),
+    "snapshot_status"       => RpcHandlerSpec::new("snapshot_status",       Role::Admin, HandlerCondition::None,                1, u32::MAX),
     "channel_authorize"     => RpcHandlerSpec::new("channel_authorize",     Role::User,  HandlerCondition::None,                1, u32::MAX),
     "connect"               => RpcHandlerSpec::new("connect",               Role::Admin, HandlerCondition::None,                1, u32::MAX),
     "fee"                   => RpcHandlerSpec::new("fee",                   Role::User,  HandlerCondition::NeedsCurrentLedger,  1, u32::MAX),
@@ -166,6 +167,13 @@ const HANDLERS: &[RpcHandlerSpec] = &[
     ),
     RpcHandlerSpec::new(
         "export_snapshot",
+        Role::Admin,
+        HandlerCondition::None,
+        1,
+        u32::MAX,
+    ),
+    RpcHandlerSpec::new(
+        "snapshot_status",
         Role::Admin,
         HandlerCondition::None,
         1,
@@ -554,13 +562,7 @@ const HANDLERS: &[RpcHandlerSpec] = &[
         1,
         u32::MAX,
     ),
-    RpcHandlerSpec::new(
-        "version",
-        Role::User,
-        HandlerCondition::None,
-        1,
-        u32::MAX,
-    ),
+    RpcHandlerSpec::new("version", Role::User, HandlerCondition::None, 1, u32::MAX),
 ];
 
 pub fn handler_specs() -> &'static [RpcHandlerSpec] {

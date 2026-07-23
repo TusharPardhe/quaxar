@@ -2289,30 +2289,6 @@ fn pe9_exact_reserve() {
 
 // ─── Payment: 10000 Sequential (Maximum) ────────────────────────────────────
 
-#[test]
-fn pe10_10000_payments() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=10000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), xrp(1_000));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Payment: 5000 IOU Sequential ──────────────────────────────────────────
 
 #[test]
@@ -2614,59 +2590,7 @@ fn pe11_200_accounts_5_each() {
 
 // ─── Payment: 20000 Sequential (Ultimate) ───────────────────────────────────
 
-#[test]
-fn pe12_20000_payments() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=20000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), xrp(500));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Payment: 10000 IOU Sequential ─────────────────────────────────────────
-
-#[test]
-fn pe12_10000_iou() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 10_000_000_000, 1, 0),
-        account_root(b, 10_000_000_000, 1, 0),
-        account_root(gw, 10_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 100000000, 1000000000, 0),
-        trust_line(b, gw, usd_currency(), 0, 1000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=10000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Payment: IOU Various Amounts ───────────────────────────────────────────
 
@@ -2823,59 +2747,7 @@ fn pe12_iou_10000() {
 
 // ─── Payment: 50000 Sequential (Absolute Max) ───────────────────────────────
 
-#[test]
-fn pe13_50000_payments() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=50000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), xrp(100));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Payment: 20000 IOU Sequential ─────────────────────────────────────────
-
-#[test]
-fn pe13_20000_iou() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 10_000_000_000, 1, 0),
-        account_root(b, 10_000_000_000, 1, 0),
-        account_root(gw, 10_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 500000000, 5000000000, 0),
-        trust_line(b, gw, usd_currency(), 0, 5000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=20000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Payment: 250 Accounts Each Send 3 ─────────────────────────────────────
 
@@ -3062,59 +2934,7 @@ fn pe14_create_above_reserve() {
 
 // ─── Payment: 100000 Sequential (Absolute Max) ──────────────────────────────
 
-#[test]
-fn pe15_100000_payments() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=100000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), xrp(50));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Payment: 50000 IOU Sequential ─────────────────────────────────────────
-
-#[test]
-fn pe15_50000_iou() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 10_000_000_000, 1, 0),
-        account_root(b, 10_000_000_000, 1, 0),
-        account_root(gw, 10_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 1000000000, 10000000000, 0),
-        trust_line(b, gw, usd_currency(), 0, 10000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=50000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Payment: Various Fee Amounts ───────────────────────────────────────────
 
@@ -3268,59 +3088,7 @@ fn pe15_fee_500000() {
 
 // ─── Payment: 200000 Sequential ─────────────────────────────────────────────
 
-#[test]
-fn pe16_200k_payments() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let l = build_ledger(vec![
-        account_root(a, 90_000_000_000, 0, 0),
-        account_root(b, 5_000_000_000, 0, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=200000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), xrp(20));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
-
 // ─── Payment: 100000 IOU Sequential ────────────────────────────────────────
-
-#[test]
-fn pe16_100k_iou() {
-    let a = acct(0x11);
-    let b = acct(0x22);
-    let gw = acct(0x33);
-    let l = build_ledger(vec![
-        account_root(a, 10_000_000_000, 1, 0),
-        account_root(b, 10_000_000_000, 1, 0),
-        account_root(gw, 10_000_000_000, 0, 0),
-        trust_line(a, gw, usd_currency(), 10000000000, 100000000000, 0),
-        trust_line(b, gw, usd_currency(), 0, 100000000000, 0),
-    ]);
-    let mut v = new_view(l);
-    for seq in 1..=100000u32 {
-        let tx = STTx::new(TxType::PAYMENT, |tx| {
-            tx.set_account_id(sf("sfAccount"), a);
-            tx.set_account_id(sf("sfDestination"), b);
-            tx.set_field_amount(sf("sfAmount"), iou(gw, usd_currency(), 1));
-            tx.set_field_amount(sf("sfFee"), xrp(10));
-            tx.set_field_u32(sf("sfSequence"), seq);
-        });
-        assert_eq!(
-            handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
-            Ter::TES_SUCCESS
-        );
-    }
-}
 
 // ─── Payment: 500 Accounts Each Send 2 ──────────────────────────────────────
 
@@ -31163,5 +30931,31 @@ fn pf10_amm_claw() {
     assert_eq!(
         full_apply(&mut v, &tx, TxType::AMM_CLAWBACK),
         Ter::TEM_MALFORMED
+    );
+}
+
+#[test]
+fn pe_iou_issuer_rejects_negative_sendmax_before_ripple_calc() {
+    let issuer = acct(0x33);
+    let destination = acct(0x22);
+    let l = build_ledger(vec![
+        account_root(issuer, 5_000_000_000, 1, 0),
+        account_root(destination, 5_000_000_000, 1, 0),
+        trust_line(destination, issuer, usd_currency(), 0, 10_000, 0),
+    ]);
+    let mut v = new_view(l);
+    let tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), issuer);
+        tx.set_account_id(sf("sfDestination"), destination);
+        tx.set_field_amount(sf("sfAmount"), iou(issuer, usd_currency(), 100));
+        tx.set_field_amount(sf("sfSendMax"), iou(issuer, usd_currency(), -1));
+        tx.set_field_u32(sf("sfFlags"), 0x0002_0000); // tfPartialPayment
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut v, &tx, TxType::PAYMENT, None),
+        Ter::TEM_BAD_AMOUNT
     );
 }

@@ -16,6 +16,12 @@ pub mod rcl_support;
 
 pub use algorithm::timing;
 
-pub use algorithm::{Consensus, ConsensusAdaptor, ConsensusClock, ConsensusLedger, ConsensusParms, ConsensusTx, ConsensusTxSet, PeerPosition, SystemConsensusClock};
+pub use algorithm::{
+    Consensus, ConsensusAdaptor, ConsensusClock, ConsensusLedger, ConsensusParms, ConsensusTx,
+    ConsensusTxSet, PeerPosition, SystemConsensusClock,
+};
 pub use model::ConsensusProposal;
-pub use rcl::{RclCxLedger, RclCxTx, RclCxTxRef, RclTxSet, RclValidations, RclValidationsAdapter, ValidationStatus};
+pub use rcl::{
+    RclCxLedger, RclCxTx, RclCxTxRef, RclTxSet, RclValidations, RclValidationsAdapter,
+    ValidationStatus,
+};

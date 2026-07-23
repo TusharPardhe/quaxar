@@ -11,9 +11,9 @@ use basics::{
 };
 use ledger::{LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader};
 use protocol::{
-    AccountID, JsonValue, KeyType, LedgerEntryType, STAmount, STArray, STLedgerEntry, STObject,
-    STTx, SecretKey, TxMeta, TxType, account_keylet, calc_account_id, derive_public_key,
-    get_field_by_symbol,
+    AccountID, JsonValue, KeyType, LedgerEntryType, MPTAmount, MPTIssue, STAmount, STArray,
+    STLedgerEntry, STObject, STTx, SecretKey, TxMeta, TxType, account_keylet, calc_account_id,
+    derive_public_key, get_field_by_symbol,
 };
 use rpc::{TxRequest, TxSource, do_tx};
 use shamap::item::SHAMapItem;

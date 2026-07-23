@@ -131,11 +131,9 @@ pub fn homomorphic_add(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
     // EC point addition on each ciphertext half (C1, C2).
     // Each half is a compressed secp256k1 point (33 bytes).
     let a_c1 = secp256k1::PublicKey::from_slice(&a[..EC_CIPHERTEXT_COMPONENT_LENGTH]).ok()?;
-    let a_c2 =
-        secp256k1::PublicKey::from_slice(&a[EC_CIPHERTEXT_COMPONENT_LENGTH..]).ok()?;
+    let a_c2 = secp256k1::PublicKey::from_slice(&a[EC_CIPHERTEXT_COMPONENT_LENGTH..]).ok()?;
     let b_c1 = secp256k1::PublicKey::from_slice(&b[..EC_CIPHERTEXT_COMPONENT_LENGTH]).ok()?;
-    let b_c2 =
-        secp256k1::PublicKey::from_slice(&b[EC_CIPHERTEXT_COMPONENT_LENGTH..]).ok()?;
+    let b_c2 = secp256k1::PublicKey::from_slice(&b[EC_CIPHERTEXT_COMPONENT_LENGTH..]).ok()?;
 
     let sum_c1 = a_c1.combine(&b_c1).ok()?;
     let sum_c2 = a_c2.combine(&b_c2).ok()?;
@@ -167,8 +165,7 @@ pub fn homomorphic_subtract(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
     };
 
     let a_c1 = secp256k1::PublicKey::from_slice(&a[..EC_CIPHERTEXT_COMPONENT_LENGTH]).ok()?;
-    let a_c2 =
-        secp256k1::PublicKey::from_slice(&a[EC_CIPHERTEXT_COMPONENT_LENGTH..]).ok()?;
+    let a_c2 = secp256k1::PublicKey::from_slice(&a[EC_CIPHERTEXT_COMPONENT_LENGTH..]).ok()?;
 
     let neg_b_c1_bytes = negate_compressed(&b[..EC_CIPHERTEXT_COMPONENT_LENGTH]);
     let neg_b_c2_bytes = negate_compressed(&b[EC_CIPHERTEXT_COMPONENT_LENGTH..]);
@@ -235,11 +232,7 @@ pub fn increment_confidential_version(current_version: Option<u32>) -> u32 {
 
 use crate::Ter;
 
-pub fn verify_schnorr_proof(
-    pub_key: &[u8],
-    proof: &[u8],
-    context_hash: &Uint256,
-) -> Ter {
+pub fn verify_schnorr_proof(pub_key: &[u8], proof: &[u8], context_hash: &Uint256) -> Ter {
     if proof.len() != EC_SCHNORR_PROOF_LENGTH || pub_key.len() != EC_PUB_KEY_LENGTH {
         return Ter::TEC_INTERNAL;
     }

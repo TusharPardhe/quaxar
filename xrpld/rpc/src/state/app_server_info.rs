@@ -162,7 +162,10 @@ impl<V: AppServerInfoView> ServerInfoSource for ApplicationServerInfo<V> {
         // status-rpc-state hasn't been populated yet (e.g. standalone or early
         // startup).
         if status_snapshot.complete_ledgers.is_none() {
-            if let Some(ledger) = self.view.validated_ledger().or_else(|| self.view.closed_ledger())
+            if let Some(ledger) = self
+                .view
+                .validated_ledger()
+                .or_else(|| self.view.closed_ledger())
             {
                 let seq = ledger.header().seq;
                 if seq > 0 {
@@ -184,7 +187,11 @@ impl<V: AppServerInfoView> ServerInfoSource for ApplicationServerInfo<V> {
 
         info.insert(
             "server_state".to_owned(),
-            JsonValue::String(self.view.network_ops_operating_mode_string().to_owned()),
+            JsonValue::String(
+                self.view
+                    .network_ops_operating_mode_string(admin)
+                    .to_owned(),
+            ),
         );
 
         if self.view.need_network_ledger() {
@@ -254,6 +261,12 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
         self.view.app()
     }
 
+    fn current_ledger_for_simulation(&self) -> Option<std::sync::Arc<ledger::Ledger>> {
+        self.view
+            .closed_ledger()
+            .or_else(|| self.view.validated_ledger())
+    }
+
     fn peers_get(&self) -> JsonValue {
         self.view
             .app()
@@ -296,16 +309,9 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
             return true;
         }
 
-        // Syncing, Tracking, and Full all satisfy the condition.
-        let mode = self.view.network_ops_operating_mode_string();
-        if mode == NetworkOpsOperatingMode::Syncing.as_str()
-            || mode == NetworkOpsOperatingMode::Tracking.as_str()
-            || mode == NetworkOpsOperatingMode::Full.as_str()
-            || mode == "proposing"
-        {
-            return true;
-        }
-        false
+        // Syncing, Tracking, and Full all satisfy the condition. Use the
+        // underlying operating mode, not the admin-only presentation overlay.
+        self.view.network_ops_operating_mode() >= NetworkOpsOperatingMode::Syncing
     }
 
     fn path_search_max(&self) -> u32 {
@@ -364,6 +370,13 @@ impl<V: AppServerInfoView> RpcRuntime for ApplicationServerInfo<V> {
         )
     }
 
+    fn snapshot_status(&self) -> protocol::JsonValue {
+        self.app().map_or_else(
+            || protocol::json!({ "status": "success", "state": "unavailable" }),
+            |app| <ApplicationRoot as RpcRuntime>::snapshot_status(app),
+        )
+    }
+
     fn log_level_set(&self, partition: String, level: String) -> crate::status::Status {
         self.app().map_or_else(
             || crate::status::Status::new(crate::status::RpcErrorCode::NotImplemented),
@@ -399,7 +412,7 @@ mod tests {
     fn owned_application_server_info_network_synced_mode_gate_without_caught_up_ledgers() {
         let app = ApplicationRoot::with_options(ApplicationRootOptions::default())
             .expect("app should build");
-            
+
         let close_time = app.current_close_time_seconds();
         let ledger = std::sync::Arc::new(ledger::Ledger::from_ledger_seq_and_close_time(
             512,
@@ -407,7 +420,7 @@ mod tests {
             false,
         ));
         app.on_validated_ledger(ledger);
-        
+
         app.set_network_ops_operating_mode(app::NetworkOpsOperatingMode::Full);
         app.set_need_network_ledger(false);
         let source =
@@ -476,10 +489,8 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
         _search_level: u32,
         _is_legacy: bool,
     ) -> Result<JsonValue, crate::RpcStatus> {
-        use protocol::{
-            parse_base58_account_id, currency_from_string,
-        };
         use basics::base_uint::Uint160;
+        use protocol::{currency_from_string, parse_base58_account_id};
 
         let source_amount = request
             .send_max
@@ -499,10 +510,12 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
 
         // Validate that the destination account exists on the ledger.
         // rippled returns actNotFound for unfunded destination accounts.
-        if let Some(ref ledger) = self.view.validated_ledger().or_else(|| self.view.closed_ledger())
+        if let Some(ref ledger) = self
+            .view
+            .validated_ledger()
+            .or_else(|| self.view.closed_ledger())
         {
-            let dst_keylet =
-                protocol::account_keylet(Uint160::from_void(dst_id.data()));
+            let dst_keylet = protocol::account_keylet(Uint160::from_void(dst_id.data()));
             if ledger.read(dst_keylet).ok().flatten().is_none() {
                 return Err(crate::RpcStatus::new(
                     crate::status::RpcErrorCode::ActNotFound,
@@ -524,7 +537,11 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
                         _ => {}
                     }
                 }
-                if filter.is_empty() { None } else { Some(filter) }
+                if filter.is_empty() {
+                    None
+                } else {
+                    Some(filter)
+                }
             } else {
                 None
             }
@@ -536,18 +553,32 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
         let (dst_currency, dst_issuer) = match &request.destination_amount {
             JsonValue::String(_) => ("XRP".to_owned(), None), // XRP amount
             JsonValue::Object(obj) => {
-                let currency = obj.get("currency")
-                    .and_then(|v| if let JsonValue::String(s) = v { Some(s.clone()) } else { None })
+                let currency = obj
+                    .get("currency")
+                    .and_then(|v| {
+                        if let JsonValue::String(s) = v {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or_else(|| "XRP".to_owned());
-                let issuer = obj.get("issuer")
-                    .and_then(|v| if let JsonValue::String(s) = v { Some(s.clone()) } else { None });
+                let issuer = obj.get("issuer").and_then(|v| {
+                    if let JsonValue::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                });
                 (currency, issuer)
             }
             _ => return Ok(JsonValue::Array(Vec::new())),
         };
 
         // Access the validated ledger to check if paths exist
-        let ledger = self.view.validated_ledger()
+        let ledger = self
+            .view
+            .validated_ledger()
             .or_else(|| self.view.closed_ledger());
 
         let mut alternatives = Vec::new();
@@ -610,8 +641,15 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
             // Apply source_currencies filter
             if let Some(ref filter) = source_currencies_filter {
                 let src_currency = match &source_amount {
-                    JsonValue::Object(obj) => obj.get("currency")
-                        .and_then(|v| if let JsonValue::String(s) = v { Some(s.clone()) } else { None })
+                    JsonValue::Object(obj) => obj
+                        .get("currency")
+                        .and_then(|v| {
+                            if let JsonValue::String(s) = v {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        })
                         .unwrap_or_else(|| "XRP".to_owned()),
                     _ => "XRP".to_owned(),
                 };
@@ -641,22 +679,31 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
                             let dst_asset = protocol::Asset::Issue(dst_issue);
 
                             // Scan source account's trust lines to find held currencies
-                            let src_dir = protocol::owner_dir_keylet(Uint160::from_void(src_id.data()));
+                            let src_dir =
+                                protocol::owner_dir_keylet(Uint160::from_void(src_id.data()));
                             if let Ok(Some(dir_sle)) = ledger.read(src_dir) {
-                                let indexes = dir_sle.get_field_v256(protocol::get_field_by_symbol("sfIndexes"));
+                                let indexes = dir_sle
+                                    .get_field_v256(protocol::get_field_by_symbol("sfIndexes"));
                                 for index in indexes.value() {
                                     let entry_keylet = protocol::Keylet::new(
-                                        protocol::LedgerEntryType::RippleState, *index);
+                                        protocol::LedgerEntryType::RippleState,
+                                        *index,
+                                    );
                                     if let Ok(Some(entry)) = ledger.read(entry_keylet) {
-                                        if entry.get_type() != protocol::LedgerEntryType::RippleState {
+                                        if entry.get_type()
+                                            != protocol::LedgerEntryType::RippleState
+                                        {
                                             continue;
                                         }
                                         let low_limit = entry.get_field_amount(
-                                            protocol::get_field_by_symbol("sfLowLimit"));
+                                            protocol::get_field_by_symbol("sfLowLimit"),
+                                        );
                                         let high_limit = entry.get_field_amount(
-                                            protocol::get_field_by_symbol("sfHighLimit"));
+                                            protocol::get_field_by_symbol("sfHighLimit"),
+                                        );
                                         let balance = entry.get_field_amount(
-                                            protocol::get_field_by_symbol("sfBalance"));
+                                            protocol::get_field_by_symbol("sfBalance"),
+                                        );
                                         let low_account = low_limit.issue().account;
                                         let currency = low_limit.issue().currency;
                                         let issuer = if low_account == src_id {
@@ -684,17 +731,21 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
                                         // this source currency to the destination exists by
                                         // looking for any entry in the book's quality range.
                                         let src_asset = protocol::Asset::Issue(
-                                            protocol::Issue::new(currency, issuer));
+                                            protocol::Issue::new(currency, issuer),
+                                        );
                                         let book = protocol::Book::new(src_asset, dst_asset, None);
                                         let book_base = protocol::keylet::book(book).key;
                                         let book_end = {
                                             let mut end = book_base;
                                             let bytes = end.data_mut();
-                                            for b in bytes[24..32].iter_mut() { *b = 0xFF; }
+                                            for b in bytes[24..32].iter_mut() {
+                                                *b = 0xFF;
+                                            }
                                             end
                                         };
 
-                                        if ledger.succ(book_base, Some(book_end))
+                                        if ledger
+                                            .succ(book_base, Some(book_end))
                                             .ok()
                                             .flatten()
                                             .is_some()
@@ -702,29 +753,51 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
                                             // Book exists. Build the path and alternative.
                                             // Path element: currency + issuer for IOU book step
                                             let path_step = JsonValue::Object(BTreeMap::from([
-                                                ("currency".to_owned(), JsonValue::String(dst_currency.clone())),
-                                                ("issuer".to_owned(), JsonValue::String(dst_issuer_str.clone())),
+                                                (
+                                                    "currency".to_owned(),
+                                                    JsonValue::String(dst_currency.clone()),
+                                                ),
+                                                (
+                                                    "issuer".to_owned(),
+                                                    JsonValue::String(dst_issuer_str.clone()),
+                                                ),
                                             ]));
-                                            let paths = JsonValue::Array(vec![
-                                                JsonValue::Array(vec![path_step]),
-                                            ]);
+                                            let paths =
+                                                JsonValue::Array(vec![JsonValue::Array(vec![
+                                                    path_step,
+                                                ])]);
                                             // Source amount matches the source currency
-                                            let src_cur_str = protocol::currency_to_string(currency);
+                                            let src_cur_str =
+                                                protocol::currency_to_string(currency);
                                             let src_iss_str = protocol::to_base58(issuer);
                                             let src_amt = JsonValue::Object(BTreeMap::from([
-                                                ("currency".to_owned(), JsonValue::String(src_cur_str)),
-                                                ("issuer".to_owned(), JsonValue::String(src_iss_str)),
-                                                ("value".to_owned(), match &request.destination_amount {
-                                                    JsonValue::Object(obj) => obj.get("value")
-                                                        .cloned()
-                                                        .unwrap_or(JsonValue::String("0".to_owned())),
-                                                    _ => JsonValue::String("0".to_owned()),
-                                                }),
+                                                (
+                                                    "currency".to_owned(),
+                                                    JsonValue::String(src_cur_str),
+                                                ),
+                                                (
+                                                    "issuer".to_owned(),
+                                                    JsonValue::String(src_iss_str),
+                                                ),
+                                                (
+                                                    "value".to_owned(),
+                                                    match &request.destination_amount {
+                                                        JsonValue::Object(obj) => {
+                                                            obj.get("value").cloned().unwrap_or(
+                                                                JsonValue::String("0".to_owned()),
+                                                            )
+                                                        }
+                                                        _ => JsonValue::String("0".to_owned()),
+                                                    },
+                                                ),
                                             ]));
                                             alternatives.push(JsonValue::Object(BTreeMap::from([
                                                 ("source_amount".to_owned(), src_amt),
                                                 ("paths_computed".to_owned(), paths),
-                                                ("paths_canonical".to_owned(), JsonValue::Array(Vec::new())),
+                                                (
+                                                    "paths_canonical".to_owned(),
+                                                    JsonValue::Array(Vec::new()),
+                                                ),
                                             ])));
                                             // Continue scanning for more alternatives
                                         }
@@ -739,47 +812,64 @@ impl<V: AppServerInfoView> PathFinderSource for ApplicationServerInfo<V> {
                                 // Check book: source_currency → XRP
                                 // For each source currency the account holds, check if
                                 // there's also a XRP → destination book
-                                let xrp_to_dst_book = protocol::Book::new(xrp_asset, dst_asset, None);
+                                let xrp_to_dst_book =
+                                    protocol::Book::new(xrp_asset, dst_asset, None);
                                 let xrp_dst_base = protocol::keylet::book(xrp_to_dst_book).key;
                                 let xrp_dst_end = {
                                     let mut end = xrp_dst_base;
                                     let bytes = end.data_mut();
-                                    for b in bytes[24..32].iter_mut() { *b = 0xFF; }
+                                    for b in bytes[24..32].iter_mut() {
+                                        *b = 0xFF;
+                                    }
                                     end
                                 };
-                                let has_xrp_to_dst = ledger.succ(xrp_dst_base, Some(xrp_dst_end))
-                                    .ok().flatten().is_some();
+                                let has_xrp_to_dst = ledger
+                                    .succ(xrp_dst_base, Some(xrp_dst_end))
+                                    .ok()
+                                    .flatten()
+                                    .is_some();
 
                                 if has_xrp_to_dst {
                                     // XRP bridge available — add as alternative with XRP source
-                                    let xrp_step = JsonValue::Object(BTreeMap::from([
-                                        ("currency".to_owned(), JsonValue::String("XRP".to_owned())),
-                                    ]));
+                                    let xrp_step = JsonValue::Object(BTreeMap::from([(
+                                        "currency".to_owned(),
+                                        JsonValue::String("XRP".to_owned()),
+                                    )]));
                                     let dst_step = JsonValue::Object(BTreeMap::from([
-                                        ("currency".to_owned(), JsonValue::String(dst_currency.clone())),
-                                        ("issuer".to_owned(), JsonValue::String(dst_issuer_str.clone())),
+                                        (
+                                            "currency".to_owned(),
+                                            JsonValue::String(dst_currency.clone()),
+                                        ),
+                                        (
+                                            "issuer".to_owned(),
+                                            JsonValue::String(dst_issuer_str.clone()),
+                                        ),
                                     ]));
-                                    let paths = JsonValue::Array(vec![
-                                        JsonValue::Array(vec![xrp_step, dst_step]),
-                                    ]);
-                                    let src_amt = JsonValue::String(
-                                        match &request.destination_amount {
+                                    let paths = JsonValue::Array(vec![JsonValue::Array(vec![
+                                        xrp_step, dst_step,
+                                    ])]);
+                                    let src_amt =
+                                        JsonValue::String(match &request.destination_amount {
                                             JsonValue::Object(obj) => {
                                                 // Estimate XRP amount (1:1 for simplicity, actual
                                                 // rate determined at payment time by the flow engine)
                                                 obj.get("value")
                                                     .and_then(|v| v.as_str())
                                                     .and_then(|s| s.parse::<f64>().ok())
-                                                    .map(|v| format!("{}", (v * 1_000_000.0) as u64))
+                                                    .map(|v| {
+                                                        format!("{}", (v * 1_000_000.0) as u64)
+                                                    })
                                                     .unwrap_or_else(|| "0".to_owned())
                                             }
                                             _ => "0".to_owned(),
-                                        }
-                                    );
+                                        });
                                     alternatives.push(JsonValue::Object(BTreeMap::from([
                                         ("source_amount".to_owned(), src_amt),
                                         ("paths_computed".to_owned(), paths),
-                                        ("paths_canonical".to_owned(), JsonValue::Array(Vec::new())),
+                                        (
+                                            "paths_canonical".to_owned(),
+                                            JsonValue::Array(Vec::new()),
+                                        ),
                                     ])));
                                 }
                             }
@@ -1747,17 +1837,18 @@ impl<V: AppServerInfoView> LedgerSource for ApplicationServerInfo<V> {
         let ledger = get_ledger_obj(&self.view, ledger_lookup.seq, ledger_lookup.hash)
             .ok_or_else(|| RpcStatus::new(RpcErrorCode::LedgerNotFound))?;
 
-        // For full/state dumps, use the family-aware path so visit_leaves
-        // can fetch tree nodes from the nodestore (not just in-memory nodes).
+        // For full/state/transaction dumps, use the family-aware path so
+        // traversal can fetch released nodes from the NodeStore rather than
+        // rendering an empty TransactionMd map.
         if options.contains(LedgerFillOptions::FULL)
             || options.contains(LedgerFillOptions::DUMP_STATE)
+            || options.contains(LedgerFillOptions::DUMP_TXRP)
         {
             if let Some(app) = self.view.app()
                 && let Some(family) = build_rpc_state_family(app)
             {
-                let core_fill = ledger::LedgerFill::new(&ledger, options)
-                    .with_closed(ledger.is_immutable());
-                return ledger::get_json_with_family(&core_fill, &family)
+                let app_fill = app::AppLedgerFill::new(&ledger, options);
+                return app::get_json_with_family(&app_fill, &family)
                     .map_err(|_| RpcStatus::new(RpcErrorCode::Internal));
             }
         }
@@ -2221,10 +2312,8 @@ impl<V: AppServerInfoView> crate::handlers::book_changes::BookChangesSource
                     resolved.header().seq,
                     (*meta_arc).clone(),
                 );
-                transactions.push(crate::handlers::book_changes::BookChangesTransaction {
-                    txn: tx,
-                    meta,
-                });
+                transactions
+                    .push(crate::handlers::book_changes::BookChangesTransaction { txn: tx, meta });
             }
         }
 
@@ -2275,19 +2364,33 @@ impl<V: AppServerInfoView> crate::handlers::get_counts::GetCountsSource
         JsonValue::Null
     }
     fn accepted_ledger_cache_size(&self) -> u64 {
-        0
+        self.view
+            .app()
+            .map(|app| app.accepted_ledger_cache().get_cache_size() as u64)
+            .unwrap_or(0)
     }
     fn accepted_ledger_cache_hit_rate(&self) -> JsonValue {
         JsonValue::Null
     }
     fn fullbelow_size(&self) -> i64 {
-        0
+        self.view
+            .app()
+            .map(|app| app.full_below_cache_size() as i64)
+            .unwrap_or(0)
     }
     fn treenode_cache_size(&self) -> u64 {
-        0
+        self.view
+            .app()
+            .and_then(|app| app.shared_tree_cache())
+            .map(|cache| cache.get_cache_size() as u64)
+            .unwrap_or(0)
     }
     fn treenode_track_size(&self) -> u64 {
-        0
+        self.view
+            .app()
+            .and_then(|app| app.shared_tree_cache())
+            .map(|cache| cache.get_track_size() as u64)
+            .unwrap_or(0)
     }
     fn add_node_store_counts(&self, json: &mut BTreeMap<String, JsonValue>) {
         let Some(app) = self.view.app() else {
@@ -2592,114 +2695,64 @@ impl<V: AppServerInfoView + Sync> crate::handlers::ledger_data::LedgerDataSource
         let mut entries = Vec::new();
         let remaining = limit;
 
-        let resolved_ledger = match resolve_lookup_ledger(&self.view, ledger) {
-            Some(l) => l,
-            None => {
-                return Err(crate::status::RpcStatus::new(
-                    crate::status::RpcErrorCode::LedgerNotFound,
-                ))
-            }
-        };
-        let ledger_seq = resolved_ledger.header().seq;
-        let ledger_hash = *resolved_ledger.header().hash.as_uint256();
-
-        let cache = crate::state::ledger_state_index::get_global_state_index_cache();
-        let index_arc = cache.get_or_build(ledger_seq, || {
-            use rayon::prelude::*;
-            
-            let keys = std::iter::successors(
-                succ_lookup_ledger_key(&self.view, ledger, Uint256::default(), None),
-                |&k| succ_lookup_ledger_key(&self.view, ledger, k, None)
-            );
-
-            let build_entries: Vec<_> = keys
-                .par_bridge()
-                .filter_map(|next_key| {
-                    if let Some(sle) = read_lookup_ledger_entry(&self.view, ledger, unchecked_keylet(next_key)) {
-                        let mut serializer = Serializer::new(256);
-                        sle.add(&mut serializer);
-                        Some(crate::state::ledger_state_index::StateIndexEntry {
-                            key: next_key,
-                            raw_data: Arc::from(serializer.data().to_vec()),
-                            entry_type: sle.get_type(),
-                            json_cache: std::sync::OnceLock::new(),
-                            binary_hex_cache: std::sync::OnceLock::new(),
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let index = Arc::new(crate::state::ledger_state_index::LedgerStateIndex::build_from_iter(
-                ledger_seq,
-                ledger_hash,
-                build_entries.iter().cloned(),
+        if resolve_lookup_ledger(&self.view, ledger).is_none() {
+            return Err(crate::status::RpcStatus::new(
+                crate::status::RpcErrorCode::LedgerNotFound,
             ));
-            
-            let page_cache = crate::state::ledger_data_page_cache::LedgerDataPageCache::build(
-                ledger_seq,
-                ledger_hash,
-                build_entries.into_iter().map(|e| {
-                    let mut sit = protocol::SerialIter::new(e.raw_data.as_ref());
-                    let sle = protocol::STLedgerEntry::from_serial_iter(&mut sit, e.key);
-                    (e.key, e.raw_data.to_vec(), sle.json(protocol::JsonOptions::NONE))
-                }),
-                crate::state::ledger_data_page_cache::DEFAULT_PAGE_SIZE,
-            );
-            crate::state::ledger_data_page_cache::get_global_page_cache().insert(Arc::new(page_cache));
-            index
-        });
-
-        // Try to hit the page cache first
-        let limit = if remaining < 0 { usize::MAX } else { remaining as usize };
-        if type_filter == LedgerEntryType::Any {
-            if let Some(cache) = crate::state::ledger_data_page_cache::get_global_page_cache().get(ledger_seq) {
-                if let Some(page) = cache.find_page_for_marker(marker) {
-                    // Only use cache if the requested marker is EXACTLY the page start
-                    // AND the user's limit is large enough to consume the whole page
-                    // AND this is not the first page (since first page needs ledger_json which we aren't caching inside the page bytes yet, wait, we DO need to handle it)
-                    let matches_start = marker.is_none() || marker.unwrap() == page.start_key;
-                    if matches_start && limit >= page.entry_count && marker.is_some() {
-                        return Ok(crate::handlers::ledger_data::LedgerDataResolved {
-                            base_json: JsonValue::Object(BTreeMap::new()),
-                            ledger_json: JsonValue::Null,
-                            entries: vec![],
-                            marker: page.next_marker,
-                            pre_rendered: Some(if binary {
-                                page.binary_state_bytes.clone()
-                            } else {
-                                page.json_state_bytes.clone()
-                            }),
-                        });
-                    }
-                }
-            }
         }
+        // `doLedgerData` in rippled walks `sles.upperBound(marker)` and stops
+        // before the first node beyond the requested page.  Do the same here.
+        // Building an index/cache of every SLE before applying `limit` made a
+        // cold `limit: 1` request scan and serialize the entire ledger.
+        //
+        // The page budget intentionally decrements *before* applying the type
+        // filter.  That seemingly unusual ordering is rippled's observable
+        // cursor contract: type-filtered queries advance through ledger keys,
+        // not just matching entries.
+        let mut cursor = marker.unwrap_or_default();
+        let mut remaining = remaining;
+        let mut next_marker = None;
 
-        let query = index_arc.query(marker, limit, type_filter);
-        let (page_entries, next_marker) = query.collect_entries();
-        let page_marker = next_marker;
+        while let Some(next_key) = succ_lookup_ledger_key(&self.view, ledger, cursor, None) {
+            let Some(sle) =
+                read_lookup_ledger_entry(&self.view, ledger, unchecked_keylet(next_key))
+            else {
+                // A successor returned by a complete ledger must be readable.
+                // Preserve the old tolerant behavior for a transient missing
+                // node, but never advance past it: otherwise a page could
+                // silently omit state.
+                break;
+            };
 
-        for entry in page_entries {
-            let mut sit = protocol::SerialIter::new(entry.raw_data.as_ref());
-            let sle = STLedgerEntry::from_serial_iter(&mut sit, entry.key);
+            if remaining <= 0 {
+                let mut resume_before = next_key;
+                resume_before.decrement();
+                next_marker = Some(resume_before);
+                break;
+            }
+            remaining -= 1;
+            cursor = next_key;
+
+            if type_filter != LedgerEntryType::Any && sle.get_type() != type_filter {
+                continue;
+            }
 
             let binary_data = if binary {
-                entry.raw_data.clone()
+                let mut serializer = Serializer::new(256);
+                sle.add(&mut serializer);
+                Arc::<[u8]>::from(serializer.data().to_vec())
             } else {
-                std::sync::Arc::new([])
+                Arc::<[u8]>::from([])
             };
-            
             let json = if binary {
                 JsonValue::Null
             } else {
                 sle.json(JsonOptions::NONE)
             };
-            
+
             entries.push(crate::handlers::ledger_data::LedgerDataEntry {
-                key: entry.key,
-                entry_type: entry.entry_type,
+                key: next_key,
+                entry_type: sle.get_type(),
                 json,
                 binary: binary_data,
             });
@@ -2709,7 +2762,7 @@ impl<V: AppServerInfoView + Sync> crate::handlers::ledger_data::LedgerDataSource
             base_json: JsonValue::Object(BTreeMap::new()),
             ledger_json,
             entries,
-            marker: page_marker,
+            marker: next_marker,
             pre_rendered: None,
         })
     }
@@ -2795,29 +2848,39 @@ impl<V: AppServerInfoView> crate::state::tx_reduce_relay::TxReduceRelaySource
 impl<V: AppServerInfoView> crate::handlers::get_aggregate_price::AggregatePriceSource
     for ApplicationServerInfo<V>
 {
-    fn read_oracle(&self, account: &str, document_id: u32) -> Option<crate::handlers::get_aggregate_price::OracleData> {
-        let ledger = self.view.validated_ledger().or_else(|| self.view.closed_ledger())?;
+    fn read_oracle(
+        &self,
+        account: &str,
+        document_id: u32,
+    ) -> Option<crate::handlers::get_aggregate_price::OracleData> {
+        let ledger = self
+            .view
+            .validated_ledger()
+            .or_else(|| self.view.closed_ledger())?;
         let account_id = protocol::parse_base58_account_id(account)?;
-        let keylet = protocol::oracle_keylet(
-            Uint160::from_void(account_id.data()),
-            document_id,
-        );
+        let keylet = protocol::oracle_keylet(Uint160::from_void(account_id.data()), document_id);
         let sle = ledger.read(keylet).ok().flatten()?;
         let last_update_time = sle.get_field_u32(protocol::get_field_by_symbol("sfLastUpdateTime"));
-        let price_data_series_arr = sle.get_field_array(protocol::get_field_by_symbol("sfPriceDataSeries"));
+        let price_data_series_arr =
+            sle.get_field_array(protocol::get_field_by_symbol("sfPriceDataSeries"));
         let mut entries = Vec::new();
         for entry in price_data_series_arr.iter() {
             let base_asset = protocol::currency_to_string(
-                entry.get_field_currency(protocol::get_field_by_symbol("sfBaseAsset")).currency(),
+                entry
+                    .get_field_currency(protocol::get_field_by_symbol("sfBaseAsset"))
+                    .currency(),
             );
             let quote_asset = protocol::currency_to_string(
-                entry.get_field_currency(protocol::get_field_by_symbol("sfQuoteAsset")).currency(),
+                entry
+                    .get_field_currency(protocol::get_field_by_symbol("sfQuoteAsset"))
+                    .currency(),
             );
-            let asset_price = if entry.is_field_present(protocol::get_field_by_symbol("sfAssetPrice")) {
-                Some(entry.get_field_u64(protocol::get_field_by_symbol("sfAssetPrice")))
-            } else {
-                None
-            };
+            let asset_price =
+                if entry.is_field_present(protocol::get_field_by_symbol("sfAssetPrice")) {
+                    Some(entry.get_field_u64(protocol::get_field_by_symbol("sfAssetPrice")))
+                } else {
+                    None
+                };
             let scale = if entry.is_field_present(protocol::get_field_by_symbol("sfScale")) {
                 entry.get_field_u8(protocol::get_field_by_symbol("sfScale"))
             } else {
