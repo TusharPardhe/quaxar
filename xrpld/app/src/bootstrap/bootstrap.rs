@@ -1540,13 +1540,29 @@ fn run_start_mode_consensus_loop(
                         }
                     }
 
-                    // Periodic release of deep subtree branches (NVMe-only)
+                    // Periodic release of deep subtree branches (NVMe-only).
+                    // ONLY when no acquisitions are active — releasing during
+                    // active acquisition thrashes (nodes get re-requested).
                     if hk_sweep_interval > 0 && root.tier2_release_safe() {
-                        let keep_depth = root.min_keep_depth();
-                        if let Some(lm_rt) = root.ledger_master_runtime() {
-                            if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
-                                if let Some(ref il) = *guard {
-                                    il.release_deep_children_all(keep_depth);
+                        let has_active = root
+                            .ledger_master_runtime()
+                            .and_then(|lm_rt| {
+                                lm_rt
+                                    .inbound_ledgers
+                                    .lock()
+                                    .ok()
+                                    .and_then(|guard| {
+                                        guard.as_ref().map(|il| il.has_active_acquisitions())
+                                    })
+                            })
+                            .unwrap_or(false);
+                        if !has_active {
+                            let keep_depth = root.min_keep_depth();
+                            if let Some(lm_rt) = root.ledger_master_runtime() {
+                                if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
+                                    if let Some(ref il) = *guard {
+                                        il.release_deep_children_all(keep_depth);
+                                    }
                                 }
                             }
                         }
