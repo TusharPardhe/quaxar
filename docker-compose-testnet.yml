@@ -15,7 +15,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 8G
+          memory: 16G
     environment:
       - RUST_LOG=info,consensus=debug,inbound_ledger=debug,bootstrap=debug,overlay=info,app=info
 

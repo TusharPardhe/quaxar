@@ -5593,7 +5593,7 @@ impl ApplicationRoot {
             //   built->txMap().flushDirty(TransactionNode)
             // Passing the shared tree cache ensures canonicalize is called
             // during flush (matching rippled's writeNode → canonicalize + db().store()).
-            ledger.persist_dirty_nodes_to_store(self.shared_tree_cache());
+            let _ = ledger.persist_dirty_nodes_to_store(self.shared_tree_cache());
             Arc::new(ledger)
         };
 

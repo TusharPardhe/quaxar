@@ -2513,6 +2513,119 @@ impl Backend for NuDbBackend {
         tracing::info!(target: "nodestore", objects_written, batch_size_bytes, "Batch flush complete");
     }
 
+    fn store_views(&self, views: &[crate::format::types::NodeRecordView<'_>]) {
+        use crate::format::codec::EncodedBlob;
+
+        let bulk_importing = self.bulk_importing.load(Ordering::Acquire);
+        let mut to_write = Vec::with_capacity(views.len());
+
+        for view in views {
+            let encoded = EncodedBlob::from_view(view);
+            let compressed = match nodeobject_compress(encoded.get_data()) {
+                Ok(c) => c,
+                Err(error) => {
+                    tracing::error!(target: "nodestore", error = %error, "store_views compress failed");
+                    continue;
+                }
+            };
+            let hash_prefix = match self.key_hash_prefix(encoded.get_key()) {
+                Ok(p) => p,
+                Err(error) => {
+                    self.journal.log(JournalLevel::Error, &error);
+                    continue;
+                }
+            };
+            let key_size = encoded.get_key().len() as u16;
+            to_write.push((hash_prefix, key_size, encoded, compressed));
+        }
+
+        if to_write.is_empty() {
+            return;
+        }
+
+        let mut coalesced_buffer = Vec::new();
+        let mut total_bytes = 0;
+        for (_, key_size, _, compressed) in &to_write {
+            total_bytes += 6 + *key_size as usize + compressed.len();
+        }
+        coalesced_buffer.reserve_exact(total_bytes);
+
+        let mut entries = Vec::with_capacity(to_write.len());
+        let mut current_offset = 0;
+
+        for (hash_prefix, key_size, encoded, compressed) in to_write {
+            let record_size = compressed.len() as u64;
+            let mut header = [0u8; 6];
+            let mut off = 0usize;
+            write_u48_be(&mut header, &mut off, record_size).unwrap();
+
+            coalesced_buffer.extend_from_slice(&header);
+            coalesced_buffer.extend_from_slice(encoded.get_key());
+            coalesced_buffer.extend_from_slice(&compressed);
+
+            entries.push((hash_prefix, record_size, current_offset as u64));
+            current_offset += 6 + key_size as usize + compressed.len();
+        }
+
+        let _store_guard = self
+            .store_mutex
+            .lock()
+            .expect("nudb backend store mutex must not be poisoned");
+
+        let base_offset = match self.append_data(&coalesced_buffer) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!(target: "nodestore", error = %e, "store_views data append failed");
+                return;
+            }
+        };
+
+        let key_header = {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .expect("nudb backend runtime mutex must not be poisoned");
+            if !runtime.open_state.is_open() {
+                return;
+            }
+            if let Err(error) = self.ensure_primary_bucket(&mut runtime) {
+                self.journal.log(JournalLevel::Error, &error);
+                return;
+            }
+            if !bulk_importing {
+                runtime.split_fraction = runtime
+                    .split_fraction
+                    .saturating_add(65_536 * entries.len() as u64);
+                while runtime.split_fraction >= runtime.split_threshold {
+                    runtime.split_fraction -= runtime.split_threshold;
+                    if let Err(error) = self.split_one_bucket(&mut runtime) {
+                        self.journal.log(JournalLevel::Error, &error);
+                    }
+                }
+            }
+            runtime.key_header.expect("header must be present")
+        };
+
+        if !bulk_importing {
+            if let Err(error) = self.begin_burst_checkpoint_if_needed(&key_header) {
+                self.journal.log(JournalLevel::Error, &error);
+                return;
+            }
+        }
+
+        for (hash_prefix, size, relative_offset) in entries {
+            let entry = NuDbBucketEntry {
+                offset: base_offset + relative_offset,
+                size,
+                hash_prefix,
+            };
+            let bucket_index = self.bucket_index(hash_prefix, &key_header);
+            if let Err(error) = self.insert_bucket_entry(bucket_index, entry) {
+                self.journal.log(JournalLevel::Error, &error);
+            }
+        }
+    }
+
     fn sync(&self) {
         if let Err(error) = self
             .commit_active_burst_if_needed()
@@ -2583,6 +2696,12 @@ impl Backend for NuDbBackend {
         self.flush_bucket_cache()?;
         self.sync();
 
+        // Note: The key file mmap (created at open time) doesn't cover buckets
+        // appended during bulk import. Future key reads for new buckets will use
+        // the pread fallback path until the next open. This is a performance
+        // note, not a correctness issue — all reads work via the fallback.
+        tracing::debug!(target: "nodestore", "Key file grew during bulk import; mmap covers initial extent only");
+
         // Remove crash recovery marker
         let marker_path = self
             .config
@@ -2592,6 +2711,22 @@ impl Backend for NuDbBackend {
         let _ = fs::remove_file(&marker_path);
 
         tracing::info!(target: "nodestore", "NuDB bulk import complete");
+        Ok(())
+    }
+
+    fn bulk_import_abort(&self) -> Result<(), String> {
+        tracing::warn!(target: "nodestore", "NuDB bulk import aborted — clearing import lock and dirty cache");
+        self.bulk_importing.store(false, Ordering::Release);
+
+        // Clear any dirty buckets accumulated during the failed import.
+        self.bucket_cache.clear();
+
+        let marker_path = self
+            .config
+            .layout
+            .base_path
+            .join(".bulk_import_in_progress");
+        let _ = fs::remove_file(&marker_path);
         Ok(())
     }
 

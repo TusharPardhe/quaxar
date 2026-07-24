@@ -36,6 +36,15 @@ pub trait Backend: Send + Sync + 'static {
 
     fn store_batch(&self, batch: &Batch);
 
+    fn store_views(&self, views: &[crate::format::types::NodeRecordView<'_>]) {
+        // Default implementation that converts to batch for backends that haven't implemented it yet
+        let batch = views
+            .iter()
+            .map(|v| Arc::new(NodeObject::new(v.object_type, v.data.to_vec(), v.hash)))
+            .collect::<Vec<_>>();
+        self.store_batch(&batch);
+    }
+
     fn sync(&self);
 
     /// Begin bulk import mode. Optimized for loading millions of nodes sequentially.
@@ -46,6 +55,11 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Finish bulk import. Flushes all data to disk, builds indexes.
     fn bulk_import_finish(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Abort bulk import. Clears bulk import locks without flushing data.
+    fn bulk_import_abort(&self) -> Result<(), String> {
         Ok(())
     }
 

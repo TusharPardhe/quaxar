@@ -32,3 +32,12 @@ impl Status {
 }
 
 pub type Batch = Vec<Arc<NodeObject>>;
+
+use crate::NodeObjectType;
+use basics::base_uint::Uint256;
+
+pub struct NodeRecordView<'a> {
+    pub object_type: NodeObjectType,
+    pub hash: Uint256,
+    pub data: &'a [u8],
+}

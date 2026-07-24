@@ -998,7 +998,7 @@ fn testnet_ledger_17266266_replay_state_bytes_match_public_ledger() {
 /// Test: flush fix enables state reads across ledger builds.
 ///
 /// Root cause of all parity bugs: state SHAMap nodes not in NuDB.
-/// Fix: flush_state_map_to_store() on every build, not just on success.
+/// Fix: let _ = build_ledger.flush_state_map_to_store(); on every build, not just on success.
 ///
 /// Uses seq 104120867 as parent (state written by flush fix) and builds
 /// seq 104120868. Proves state reads succeed (no panic, no terNO_ACCOUNT).

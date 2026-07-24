@@ -1,14 +1,39 @@
 use std::fs::File;
-use std::io::{BufReader, Read};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
 use super::{SnapshotError, manifest::*};
-use crate::{Backend, Batch, NodeObject, NodeObjectType};
+use crate::{Backend, NodeObjectType, format::types::NodeRecordView};
 use basics::base_uint::Uint256;
+
+struct BulkImportGuard<'a> {
+    backend: &'a dyn Backend,
+    finished: bool,
+}
+
+impl<'a> BulkImportGuard<'a> {
+    fn new(backend: &'a dyn Backend) -> Self {
+        Self {
+            backend,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        self.finished = true;
+        self.backend.bulk_import_finish()
+    }
+}
+
+impl<'a> Drop for BulkImportGuard<'a> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.backend.bulk_import_abort();
+        }
+    }
+}
 
 /// Load a snapshot file from `input_path` into `backend`.
 ///
@@ -17,26 +42,35 @@ pub fn load_snapshot(
     backend: &dyn Backend,
     input_path: &Path,
 ) -> Result<SnapshotManifest, SnapshotError> {
-    let start = Instant::now();
-    tracing::info!(
-        target: "snapshot",
-        path = %input_path.display(),
-        "Starting snapshot load"
-    );
+    let start_time = Instant::now();
+    let import_guard = BulkImportGuard::new(backend);
 
-    let file = File::open(input_path)
-        .map_err(|e| SnapshotError::io_path("opening snapshot file", input_path, e))?;
-    let mut reader = BufReader::new(file);
+    let file = File::open(input_path).map_err(|e| SnapshotError::io("opening file", e))?;
+    let mmap = unsafe {
+        let mmap = memmap2::MmapOptions::new()
+            .map(&file)
+            .map_err(|e| SnapshotError::io("mmap failed", e))?;
+        // Advise the kernel that we will read sequentially and it can aggressively evict pages
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+        mmap
+    };
+
     let mut file_hasher = Sha256::new();
+    let mut mmap_offset = 0;
 
     // Read header
-    let mut header_buf = [0u8; SNAPSHOT_HEADER_SIZE];
-    reader
-        .read_exact(&mut header_buf)
-        .map_err(|e| SnapshotError::io("reading header", e))?;
-    file_hasher.update(header_buf);
+    if mmap.len() < SNAPSHOT_HEADER_SIZE {
+        return Err(SnapshotError::io(
+            "file too small for header",
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, ""),
+        ));
+    }
 
-    let mut manifest = SnapshotManifest::deserialize_header(&header_buf)?;
+    let header_buf = &mmap[mmap_offset..mmap_offset + SNAPSHOT_HEADER_SIZE];
+    file_hasher.update(header_buf);
+    mmap_offset += SNAPSHOT_HEADER_SIZE;
+
+    let mut manifest = SnapshotManifest::deserialize_header(header_buf)?;
 
     // Read chunk count from header to know how many chunk table entries to read
     let chunk_count = u32::from_be_bytes(
@@ -54,15 +88,21 @@ pub fn load_snapshot(
     );
 
     // Read chunk table
+    let table_size = chunk_count * CHUNK_META_SIZE;
+    if mmap.len() < mmap_offset + table_size {
+        return Err(SnapshotError::io(
+            "file too small for chunk table",
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, ""),
+        ));
+    }
+
     for _ in 0..chunk_count {
-        let mut entry_buf = [0u8; CHUNK_META_SIZE];
-        reader
-            .read_exact(&mut entry_buf)
-            .map_err(|e| SnapshotError::io("reading chunk table", e))?;
+        let entry_buf = &mmap[mmap_offset..mmap_offset + CHUNK_META_SIZE];
         file_hasher.update(entry_buf);
         manifest
             .chunks
-            .push(SnapshotManifest::deserialize_chunk_meta(&entry_buf));
+            .push(SnapshotManifest::deserialize_chunk_meta(entry_buf));
+        mmap_offset += CHUNK_META_SIZE;
     }
 
     // Read and process each chunk
@@ -75,11 +115,17 @@ pub fn load_snapshot(
         })?;
 
     for (i, meta) in manifest.chunks.iter().enumerate() {
-        let mut compressed = vec![0u8; meta.compressed_len as usize];
-        reader
-            .read_exact(&mut compressed)
-            .map_err(|e| SnapshotError::io("reading chunk data", e))?;
-        file_hasher.update(&compressed);
+        let compressed_len = meta.compressed_len as usize;
+        if mmap.len() < mmap_offset + compressed_len {
+            return Err(SnapshotError::io(
+                "file too small for chunk data",
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, ""),
+            ));
+        }
+
+        let compressed = &mmap[mmap_offset..mmap_offset + compressed_len];
+        file_hasher.update(compressed);
+        mmap_offset += compressed_len;
 
         // Verify chunk hash
         let computed_hash: [u8; 32] = Sha256::digest(&compressed).into();
@@ -100,8 +146,8 @@ pub fn load_snapshot(
                 }
             })?;
 
-        // Decode node records and build batch
-        let mut batch: Batch = Vec::new();
+        // Decode node records and build zero-copy views
+        let mut views = Vec::new();
         let mut offset = 0;
         while offset < decompressed.len() {
             let (node_type_byte, hash, data_range, consumed) =
@@ -109,15 +155,18 @@ pub fn load_snapshot(
 
             let obj_type =
                 NodeObjectType::try_from(node_type_byte).unwrap_or(NodeObjectType::Unknown);
-            let data = decompressed[data_range].to_vec();
             let uint_hash = Uint256::from_array(hash);
-            let node = Arc::new(NodeObject::new(obj_type, data, uint_hash));
-            batch.push(node);
+
+            views.push(NodeRecordView {
+                object_type: obj_type,
+                hash: uint_hash,
+                data: &decompressed[data_range],
+            });
             offset += consumed;
         }
 
-        backend.store_batch(&batch);
-        total_nodes += batch.len() as u64;
+        backend.store_views(&views);
+        total_nodes += views.len() as u64;
 
         if (i + 1) % 10 == 0 || i + 1 == manifest.chunks.len() {
             tracing::info!(
@@ -125,30 +174,47 @@ pub fn load_snapshot(
                 chunk = i + 1,
                 total_chunks = manifest.chunks.len(),
                 nodes_loaded = total_nodes,
-                elapsed_ms = start.elapsed().as_millis() as u64,
+                elapsed_ms = start_time.elapsed().as_millis() as u64,
                 "Loading snapshot chunks"
             );
         }
     }
 
-    backend
-        .bulk_import_finish()
+    let mmap_len = mmap.len();
+    if mmap_len < mmap_offset + SNAPSHOT_FOOTER_SIZE {
+        drop(mmap);
+        return Err(SnapshotError::io(
+            "file too small for footer",
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, ""),
+        ));
+    }
+
+    let mut expected_footer = [0u8; 32];
+    expected_footer.copy_from_slice(&mmap[mmap_offset..mmap_offset + SNAPSHOT_FOOTER_SIZE]);
+    mmap_offset += SNAPSHOT_FOOTER_SIZE;
+
+    let final_computed_hash: [u8; 32] = file_hasher.finalize().into();
+    if final_computed_hash != expected_footer {
+        return Err(SnapshotError::FileHashMismatch {
+            expected: expected_footer,
+            computed: final_computed_hash,
+        });
+    }
+
+    // Drop the massive mmap reference before running backend.bulk_import_finish()
+    // This frees RAM (potentially gigabytes of pagecache) which helps prevent OOM
+    // when bulk_import_finish triggers a massive bucket_cache flush or NuDB checkpoint.
+    drop(mmap);
+
+    import_guard
+        .finish()
         .map_err(|e| SnapshotError::BackendWriteFailed {
             reason: format!("bulk_import_finish: {e}"),
         })?;
 
-    // Read and verify footer
-    let mut footer = [0u8; SNAPSHOT_FOOTER_SIZE];
-    reader
-        .read_exact(&mut footer)
-        .map_err(|e| SnapshotError::io("reading footer", e))?;
-
-    let computed_file_hash: [u8; 32] = file_hasher.finalize().into();
-    if computed_file_hash != footer {
-        return Err(SnapshotError::FileHashMismatch {
-            expected: footer,
-            computed: computed_file_hash,
-        });
+    // We reached EOF gracefully
+    if mmap_offset < mmap_len {
+        tracing::warn!(target: "snapshot", "Ignored {} trailing bytes", mmap_len - mmap_offset);
     }
 
     tracing::info!(
@@ -156,7 +222,7 @@ pub fn load_snapshot(
         ledger_seq = manifest.ledger_seq,
         total_nodes,
         chunks = manifest.chunks.len(),
-        elapsed_ms = start.elapsed().as_millis() as u64,
+        elapsed_ms = start_time.elapsed().as_millis() as u64,
         "Snapshot load complete, integrity verified"
     );
 

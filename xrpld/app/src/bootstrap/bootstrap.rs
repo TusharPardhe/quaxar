@@ -3020,7 +3020,7 @@ fn seed_startup_ledger_state(
             // Persist dirty nodes to NuDB + tree cache.
             // Matches rippled's `stateMap_.flushDirty(AccountNode)` in
             // Ledger::Ledger(kCreateGenesis, ...) constructor.
-            genesis_for_persist.persist_dirty_nodes_to_store(tree_cache);
+            let _ = genesis_for_persist.persist_dirty_nodes_to_store(tree_cache);
             tracing::info!(
                 target: "bootstrap",
                 seq = closed.header().seq,

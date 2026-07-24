@@ -1063,6 +1063,10 @@ impl Backend for RocksDbBackend {
         write_batch_to_database(&self.database, self.key_bytes, batch, &self.journal);
     }
 
+    fn store_views(&self, views: &[crate::format::types::NodeRecordView<'_>]) {
+        write_views_to_database(&self.database, self.key_bytes, views, &self.journal);
+    }
+
     fn sync(&self) {}
 
     fn for_each(&self, callback: &mut dyn FnMut(Arc<NodeObject>)) {
@@ -1149,6 +1153,31 @@ fn write_batch_to_database(
     if let Err(error) = db.write(write_batch) {
         journal.log(JournalLevel::Error, error.as_ref());
         panic!("storeBatch failed: {error}");
+    }
+}
+
+fn write_views_to_database(
+    database: &Arc<Mutex<Option<DBWithThreadMode<MultiThreaded>>>>,
+    key_bytes: usize,
+    views: &[crate::format::types::NodeRecordView<'_>],
+    journal: &Arc<dyn NodeStoreJournal>,
+) {
+    let database = database
+        .lock()
+        .expect("rocksdb database mutex must not be poisoned");
+    let db = database
+        .as_ref()
+        .expect("xrpl::NodeStore::RocksDBBackend::store_views : non-null database");
+
+    let mut write_batch = WriteBatch::default();
+    for view in views {
+        let encoded = EncodedBlob::from_view(view);
+        write_batch.put(&encoded.get_key()[..key_bytes], encoded.get_data());
+    }
+
+    if let Err(error) = db.write(write_batch) {
+        journal.log(JournalLevel::Error, error.as_ref());
+        panic!("store_views failed: {error}");
     }
 }
 

@@ -2565,6 +2565,54 @@ fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
                 manifest.ledger_seq,
                 manifest.chunks.len()
             );
+
+            // Persist the ledger header to ledger_headers.db so the node starts
+            // from this ledger on next boot instead of falling back to genesis.
+            if let Some(db_path) = config.section("database_path").values().first() {
+                let headers_db_path =
+                    std::path::Path::new(db_path.trim()).join("ledger_headers.db");
+                if let Err(e) = std::fs::create_dir_all(db_path.trim()) {
+                    eprintln!("  ⚠ Failed to create database_path directory: {e}");
+                } else {
+                    match rdb::LedgerDb::open(&headers_db_path) {
+                        Ok(db) => {
+                            use basics::base_uint::Uint256;
+                            use basics::sha_map_hash::SHAMapHash;
+                            let header = protocol::LedgerHeader {
+                                seq: manifest.ledger_seq,
+                                drops: manifest.drops,
+                                hash: SHAMapHash::new(Uint256::from_void(&manifest.ledger_hash)),
+                                parent_hash: SHAMapHash::new(Uint256::from_void(
+                                    &manifest.parent_hash,
+                                )),
+                                account_hash: SHAMapHash::new(Uint256::from_void(
+                                    &manifest.account_hash,
+                                )),
+                                tx_hash: SHAMapHash::new(Uint256::from_void(&manifest.tx_hash)),
+                                close_time: manifest.close_time,
+                                parent_close_time: manifest.parent_close_time,
+                                close_time_resolution: manifest.close_time_res,
+                                close_flags: manifest.close_flags,
+                                validated: true,
+                                accepted: true,
+                            };
+                            match db.insert_ledger(&header) {
+                                Ok(()) => println!(
+                                    "  → Ledger header registered in {}",
+                                    headers_db_path.display()
+                                ),
+                                Err(e) => eprintln!("  ⚠ Failed to register header: {e}"),
+                            }
+                        }
+                        Err(e) => eprintln!("  ⚠ Failed to open ledger_headers.db: {e}"),
+                    }
+                }
+            } else {
+                eprintln!(
+                    "  ⚠ No [database_path] in config — header not registered. Node may start from genesis."
+                );
+            }
+
             true
         }
         Err(e) => {

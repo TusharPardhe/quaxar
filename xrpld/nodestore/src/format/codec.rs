@@ -182,6 +182,33 @@ pub struct EncodedBlob {
 }
 
 impl EncodedBlob {
+    pub fn from_view(view: &crate::format::types::NodeRecordView<'_>) -> Self {
+        let size = view
+            .data
+            .len()
+            .checked_add(ENCODED_BLOB_PREFIX_BYTES)
+            .expect("EncodedBlob size must fit usize");
+        let size_u32 = u32::try_from(size).expect("EncodedBlob size must fit u32");
+
+        let storage = if size <= ENCODED_BLOB_INLINE_BYTES {
+            EncodedBlobStorage::Inline([0u8; ENCODED_BLOB_INLINE_BYTES])
+        } else {
+            EncodedBlobStorage::Heap(vec![0u8; size].into_boxed_slice())
+        };
+
+        let mut blob = Self {
+            key: *view.hash.data(),
+            size: size_u32,
+            storage,
+        };
+
+        let payload = blob.storage.as_mut_slice(size);
+        payload[..8].fill(0);
+        payload[8] = view.object_type as u8;
+        payload[9..].copy_from_slice(view.data);
+        blob
+    }
+
     pub fn new(object: &NodeObject) -> Self {
         let size = object
             .data()

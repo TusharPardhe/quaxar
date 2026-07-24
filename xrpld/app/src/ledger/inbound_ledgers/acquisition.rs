@@ -781,6 +781,11 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
     // Otherwise a graceful restart can see the header while neither map root
     // is findable by hash in the NodeStore.
     mutable.store.sync();
+
+    // All nodes are now durable in NuDB. Clear the TreeNodeCache to free RAM.
+    // The node_fetcher closure (set below) reads from NuDB on demand.
+    state.shared_tree_cache.clear();
+
     if !ledger.is_immutable() {
         ledger.set_immutable(true);
     }

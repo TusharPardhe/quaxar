@@ -764,8 +764,10 @@ pub fn build_ledger_from_acquired_tx(
     // Must flush BEFORE set_immutable so state_map.hash() reflects all mutations.
     // apply_state_batch writes to mutable_state; flush_state_map_to_store
     // propagates mutable_state → state_map so finalize_immutable gets the right hash.
-    built.flush_state_map_to_store();
-    built.flush_tx_map_to_store();
+    if built.flush_state_map_to_store(None).is_err() {
+        return None;
+    }
+    built.flush_tx_map_to_store(None);
 
     // Finalize: compute state hash (now reads from updated state_map)
     built.set_immutable(true);
@@ -821,8 +823,10 @@ pub fn build_ledger_from_acquired_tx(
         );
         // The next build uses this ledger as parent — it needs the state nodes
         // in NuDB to read account/directory state via the fetcher.
-        built.flush_state_map_to_store();
-        built.flush_tx_map_to_store();
+        if built.flush_state_map_to_store(None).is_err() {
+            return None;
+        }
+        built.flush_tx_map_to_store(None);
         return None;
     }
 
@@ -837,8 +841,8 @@ pub fn build_ledger_from_acquired_tx(
             built.header().account_hash,
             built.header().tx_hash
         );
-        built.flush_state_map_to_store(); // flush even on full-hash mismatch
-        built.flush_tx_map_to_store();
+        let _ = built.flush_state_map_to_store(None); // flush even on full-hash mismatch
+        built.flush_tx_map_to_store(None);
         return None;
     }
 
@@ -1018,8 +1022,10 @@ pub fn build_ledger_from_consensus(
 
     // Update skip list and finalize
     let _ = built.update_skip_list();
-    built.flush_state_map_to_store();
-    built.flush_tx_map_to_store();
+    if built.flush_state_map_to_store(None).is_err() {
+        return None;
+    }
+    built.flush_tx_map_to_store(None);
     built.set_immutable(true);
 
     Some(built)

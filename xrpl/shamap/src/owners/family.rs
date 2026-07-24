@@ -225,6 +225,15 @@ pub trait SHAMapNodeFetcher: Send + Sync + 'static {
     fn fetch_node_blob(&self, _hash: SHAMapHash) -> Option<Blob> {
         None
     }
+
+    /// Fast-path bypass for tree traversal. Fetches directly from Flat DB.
+    fn fetch_flat_item(
+        &self,
+        _id: &basics::base_uint::Uint256,
+        _ledger_seq: u32,
+    ) -> Option<crate::item::SHAMapItem> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
@@ -476,6 +485,10 @@ impl<C, S, FB, F, MR> SHAMapFamily<C, S, FB, F, MR, ()> {
 }
 
 impl<C, S, FB, F, MR, NS> SHAMapFamily<C, S, FB, F, MR, NS> {
+    pub fn fetcher(&self) -> &F {
+        &self.fetcher
+    }
+
     pub fn new_with_node_store(
         tree_node_cache: Arc<TreeNodeCache<C, S>>,
         full_below_cache: FB,

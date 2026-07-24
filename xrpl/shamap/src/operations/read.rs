@@ -64,6 +64,14 @@ where
     F: SHAMapNodeFetcher,
     MR: MissingNodeReporter,
 {
+    // Flat-item fast path: bypass tree traversal if a direct lookup is available.
+    // Safety: This path is only reached after the caller's ephemeral overlay check
+    // (in Ledger::read) has already determined the item is not modified in the
+    // current tick. The flat DB is consistent with the committed state root.
+    if let Some(item) = family.fetcher().fetch_flat_item(&id, ledger_seq) {
+        return Ok(Some(item));
+    }
+
     Ok(find_key_with_family(root, id, backed, ledger_seq, family)?
         .and_then(|leaf| leaf.peek_item()))
 }
@@ -94,6 +102,16 @@ where
     F: SHAMapNodeFetcher,
     MR: MissingNodeReporter,
 {
+    // Flat-item fast path with hash: compute leaf hash from the item data.
+    if let Some(item) = family.fetcher().fetch_flat_item(&id, ledger_seq) {
+        let leaf = crate::nodes::tree_node::SHAMapTreeNode::new_leaf(
+            crate::nodes::tree_node::SHAMapNodeType::AccountState,
+            item.clone(),
+            0,
+        );
+        return Ok(Some((item, leaf.get_hash())));
+    }
+
     Ok(find_key_with_family(root, id, backed, ledger_seq, family)?
         .and_then(|leaf| leaf.peek_item().map(|item| (item, leaf.get_hash()))))
 }

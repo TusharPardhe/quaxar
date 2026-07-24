@@ -161,7 +161,7 @@ fn parent_with_account_in_nudb(
     ));
 
     // 5. Finalize: flush dirty nodes to NuDB, then mark immutable.
-    ledger.flush_state_map_to_store();
+    let _ = ledger.flush_state_map_to_store(None);
     ledger.set_immutable(true);
     ledger
 }
@@ -212,7 +212,7 @@ fn backed_fee_ledger_without_fetcher(
             }
         },
     ));
-    ledger.flush_state_map_to_store();
+    let _ = ledger.flush_state_map_to_store(None);
 
     let root_hash = ledger.state_map().root().get_hash();
     let root_wire = ledger

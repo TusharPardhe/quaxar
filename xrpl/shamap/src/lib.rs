@@ -9,6 +9,7 @@
 
 pub mod cow_shamap;
 pub mod delta_tracker;
+pub mod ephemeral;
 pub mod nodes;
 pub mod operations;
 pub mod owners;

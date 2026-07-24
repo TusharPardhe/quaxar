@@ -522,7 +522,7 @@ pub struct Ledger {
     /// is a single persistent SHAMap that all rawInsert/rawErase/rawReplace
     /// operate on directly. Initialized on first mutation, persists across all
     /// operations until set_immutable extracts the final root.
-    mutable_state: Option<MutableTree>,
+    ephemeral_state: Option<shamap::ephemeral::EphemeralWorkingSet>,
 }
 
 impl std::fmt::Debug for Ledger {
@@ -545,7 +545,7 @@ impl Ledger {
             immutable: false,
             node_fetcher: None,
             node_writer: None,
-            mutable_state: None,
+            ephemeral_state: None,
         }
     }
 
@@ -685,7 +685,7 @@ impl Ledger {
             immutable: false,
             node_fetcher: None,
             node_writer: None,
-            mutable_state: None,
+            ephemeral_state: None,
         }
     }
 
@@ -731,7 +731,7 @@ impl Ledger {
             immutable: false,
             node_fetcher: prev_ledger.node_fetcher.clone(),
             node_writer: prev_ledger.node_writer.clone(),
-            mutable_state: None,
+            ephemeral_state: None,
         }
     }
 
@@ -747,7 +747,7 @@ impl Ledger {
             immutable: true,
             node_fetcher: None,
             node_writer: None,
-            mutable_state: None,
+            ephemeral_state: None,
         }
     }
 
@@ -780,7 +780,7 @@ impl Ledger {
             immutable: true,
             node_fetcher: None,
             node_writer: None,
-            mutable_state: None,
+            ephemeral_state: None,
         };
         let mut loaded = true;
         let mut no_filter: Option<&mut dyn SHAMapSyncFilter> = None;
@@ -1259,18 +1259,20 @@ impl Ledger {
     }
 
     pub fn exists_keylet(&self, keylet: Keylet) -> Result<bool, TraversalError> {
-        let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| -> Option<
-            basics::memory::intrusive_pointer::SharedIntrusive<
-                shamap::nodes::tree_node::SHAMapTreeNode,
-            >,
-        > {
-            let fetcher = self.node_fetcher.as_ref()?;
-            fetcher(hash)
-        };
-        self.state_map.has_item(keylet.key, &mut fetch_fn)
+        self.read(keylet).map(|r| r.is_some())
     }
 
     pub fn exists(&self, key: Uint256) -> Result<bool, TraversalError> {
+        if let Some(ephemeral) = &self.ephemeral_state {
+            if let Some(opt_item) = ephemeral.get(&key) {
+                return Ok(matches!(
+                    opt_item,
+                    shamap::ephemeral::EphemeralOp::Insert(_, _)
+                        | shamap::ephemeral::EphemeralOp::Update(_, _)
+                ));
+            }
+        }
+
         let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| -> Option<
             basics::memory::intrusive_pointer::SharedIntrusive<
                 shamap::nodes::tree_node::SHAMapTreeNode,
@@ -1360,24 +1362,67 @@ impl Ledger {
         key: Uint256,
         last: Option<Uint256>,
     ) -> Result<Option<Uint256>, TraversalError> {
-        let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| -> Option<
-            basics::memory::intrusive_pointer::SharedIntrusive<
-                shamap::nodes::tree_node::SHAMapTreeNode,
-            >,
-        > {
-            let fetcher = self.node_fetcher.as_ref()?;
-            fetcher(hash)
-        };
-        let Some(leaf) = self.state_map.upper_bound(key, &mut fetch_fn)? else {
-            return Ok(None);
-        };
-        let Some(item) = leaf.peek_item() else {
-            return Ok(None);
-        };
-        if last.is_some_and(|last| item.key() >= last) {
-            return Ok(None);
+        let mut current_search_key = key;
+        let mut e_iter = self.ephemeral_state.as_ref().map(|e| {
+            e.modifications
+                .range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
+                .peekable()
+        });
+
+        loop {
+            let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| -> Option<
+                basics::memory::intrusive_pointer::SharedIntrusive<
+                    shamap::nodes::tree_node::SHAMapTreeNode,
+                >,
+            > {
+                let fetcher = self.node_fetcher.as_ref()?;
+                fetcher(hash)
+            };
+
+            let mut p_succ = None;
+            if let Some(leaf) = self
+                .state_map
+                .upper_bound(current_search_key, &mut fetch_fn)?
+            {
+                if let Some(item) = leaf.peek_item() {
+                    p_succ = Some(item.key());
+                }
+            }
+
+            let mut e_next = None;
+            let mut e_is_delete = false;
+            if let Some(iter) = &mut e_iter {
+                while let Some(&(&k, _)) = iter.peek() {
+                    if k <= current_search_key {
+                        iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(&(&k, ref op)) = iter.peek() {
+                    e_next = Some(k);
+                    e_is_delete = matches!(op, shamap::ephemeral::EphemeralOp::Delete);
+                }
+            }
+
+            let next_key = match (p_succ, e_next) {
+                (Some(p), Some(e)) => std::cmp::min(p, e),
+                (Some(p), None) => p,
+                (None, Some(e)) => e,
+                (None, None) => return Ok(None),
+            };
+
+            if last.is_some_and(|last| next_key >= last) {
+                return Ok(None);
+            }
+
+            if Some(next_key) == e_next && e_is_delete {
+                current_search_key = next_key;
+                continue;
+            }
+
+            return Ok(Some(next_key));
         }
-        Ok(Some(item.key()))
     }
 
     pub fn succ_with_family<CLOCK, S, C, F, MR, NS>(
@@ -1393,21 +1438,78 @@ impl Ledger {
         F: SHAMapNodeFetcher,
         MR: MissingNodeReporter,
     {
-        let Some(leaf) = self.state_map.upper_bound_with_family(key, family)? else {
-            return Ok(None);
-        };
-        let Some(item) = leaf.peek_item() else {
-            return Ok(None);
-        };
-        if last.is_some_and(|last| item.key() >= last) {
-            return Ok(None);
+        let mut current_search_key = key;
+        let mut e_iter = self.ephemeral_state.as_ref().map(|e| {
+            e.modifications
+                .range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
+                .peekable()
+        });
+
+        loop {
+            let mut p_succ = None;
+            if let Some(leaf) = self
+                .state_map
+                .upper_bound_with_family(current_search_key, family)?
+            {
+                if let Some(item) = leaf.peek_item() {
+                    p_succ = Some(item.key());
+                }
+            }
+
+            let mut e_next = None;
+            let mut e_is_delete = false;
+            if let Some(iter) = &mut e_iter {
+                while let Some(&(&k, _)) = iter.peek() {
+                    if k <= current_search_key {
+                        iter.next();
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(&(&k, ref op)) = iter.peek() {
+                    e_next = Some(k);
+                    e_is_delete = matches!(op, shamap::ephemeral::EphemeralOp::Delete);
+                }
+            }
+
+            let next_key = match (p_succ, e_next) {
+                (Some(p), Some(e)) => std::cmp::min(p, e),
+                (Some(p), None) => p,
+                (None, Some(e)) => e,
+                (None, None) => return Ok(None),
+            };
+
+            if last.is_some_and(|last| next_key >= last) {
+                return Ok(None);
+            }
+
+            if Some(next_key) == e_next && e_is_delete {
+                current_search_key = next_key;
+                continue;
+            }
+
+            return Ok(Some(next_key));
         }
-        Ok(Some(item.key()))
     }
 
     pub fn read(&self, keylet: Keylet) -> Result<Option<STLedgerEntry>, TraversalError> {
         if keylet.key == Uint256::zero() {
             return Ok(None);
+        }
+
+        // Ephemeral Working Set Check
+        if let Some(ephemeral) = &self.ephemeral_state {
+            if let Some(opt_item) = ephemeral.get(&keylet.key) {
+                match opt_item {
+                    shamap::ephemeral::EphemeralOp::Insert(item, _)
+                    | shamap::ephemeral::EphemeralOp::Update(item, _) => {
+                        return Ok(parse_state_sle(item.data(), keylet));
+                    }
+                    shamap::ephemeral::EphemeralOp::Delete => {
+                        return Ok(None); // Deleted in this ledger tick
+                    }
+                }
+            }
         }
 
         let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| -> Option<
@@ -1470,7 +1572,7 @@ impl Ledger {
                         self.node_fetcher.is_some(),
                         self.state_map.is_full(),
                         self.state_map.state(),
-                        self.mutable_state.is_some(),
+                        self.ephemeral_state.is_some(),
                         bt,
                     );
                 }
@@ -1542,6 +1644,20 @@ impl Ledger {
             "xrpl::Ledger::read_with_family : zero key"
         );
 
+        if let Some(ephemeral) = &self.ephemeral_state {
+            if let Some(opt_item) = ephemeral.get(&keylet.key) {
+                match opt_item {
+                    shamap::ephemeral::EphemeralOp::Insert(item, _)
+                    | shamap::ephemeral::EphemeralOp::Update(item, _) => {
+                        return Ok(parse_state_sle(item.data(), keylet));
+                    }
+                    shamap::ephemeral::EphemeralOp::Delete => {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
         let Some(item) = self.state_map.peek_item_with_family(keylet.key, family)? else {
             return Ok(None);
         };
@@ -1554,6 +1670,26 @@ impl Ledger {
     }
 
     pub fn digest(&self, key: Uint256) -> Result<Option<Uint256>, TraversalError> {
+        if let Some(ephemeral) = &self.ephemeral_state {
+            if let Some(opt_item) = ephemeral.get(&key) {
+                match opt_item {
+                    shamap::ephemeral::EphemeralOp::Insert(item, _)
+                    | shamap::ephemeral::EphemeralOp::Update(item, _) => {
+                        // Digest requires hashing the leaf node
+                        let leaf = shamap::nodes::tree_node::SHAMapTreeNode::new_leaf(
+                            shamap::nodes::tree_node::SHAMapNodeType::AccountState,
+                            item.clone(),
+                            0, // cowid
+                        );
+                        return Ok(Some(*leaf.get_hash().as_uint256()));
+                    }
+                    shamap::ephemeral::EphemeralOp::Delete => {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+
         Ok(self
             .state_map
             .peek_item_with_hash(key, &mut |_| None)?
@@ -1574,17 +1710,97 @@ impl Ledger {
     where
         V: FnMut(&STLedgerEntry) -> bool,
     {
+        let empty_map = std::collections::BTreeMap::new();
+        let ephemeral_map = self
+            .ephemeral_state
+            .as_ref()
+            .map(|e| &e.modifications)
+            .unwrap_or(&empty_map);
+        let mut ephemeral_iter = ephemeral_map.iter().peekable();
+        let mut should_continue = true;
+
         self.state_map.visit_nodes(&mut |_| None, &mut |node| {
+            if !should_continue {
+                return false;
+            }
             if !node.is_leaf() {
                 return true;
             }
 
             let item = node.peek_item().expect("leaf nodes should carry an item");
+            let p_key = item.key();
+
+            while let Some((e_key, _)) = ephemeral_iter.peek() {
+                if **e_key < p_key {
+                    let (_, op) = ephemeral_iter.next().unwrap();
+                    match op {
+                        shamap::ephemeral::EphemeralOp::Insert(e_item, _)
+                        | shamap::ephemeral::EphemeralOp::Update(e_item, _) => {
+                            if let Some(sle) = parse_state_sle_any(e_item.data(), e_item.key()) {
+                                if !visit(&sle) {
+                                    should_continue = false;
+                                    return false;
+                                }
+                            }
+                        }
+                        shamap::ephemeral::EphemeralOp::Delete => {}
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if !should_continue {
+                return false;
+            }
+
+            if let Some((e_key, _)) = ephemeral_iter.peek() {
+                if **e_key == p_key {
+                    let (_, op) = ephemeral_iter.next().unwrap();
+                    match op {
+                        shamap::ephemeral::EphemeralOp::Insert(e_item, _)
+                        | shamap::ephemeral::EphemeralOp::Update(e_item, _) => {
+                            if let Some(sle) = parse_state_sle_any(e_item.data(), e_item.key()) {
+                                if !visit(&sle) {
+                                    should_continue = false;
+                                    return false;
+                                }
+                            }
+                        }
+                        shamap::ephemeral::EphemeralOp::Delete => {}
+                    }
+                    return true;
+                }
+            }
+
             match parse_state_sle_any(item.data(), item.key()) {
-                Some(sle) => visit(&sle),
+                Some(sle) => {
+                    should_continue = visit(&sle);
+                    should_continue
+                }
                 None => true,
             }
-        })
+        })?;
+
+        if !should_continue {
+            return Ok(());
+        }
+
+        for (_, op) in ephemeral_iter {
+            match op {
+                shamap::ephemeral::EphemeralOp::Insert(e_item, _)
+                | shamap::ephemeral::EphemeralOp::Update(e_item, _) => {
+                    if let Some(sle) = parse_state_sle_any(e_item.data(), e_item.key()) {
+                        if !visit(&sle) {
+                            break;
+                        }
+                    }
+                }
+                shamap::ephemeral::EphemeralOp::Delete => {}
+            }
+        }
+
+        Ok(())
     }
 
     pub fn visit_state_sles_with_family<CLOCK, S, C, F, MR, NS, V>(
@@ -1619,17 +1835,100 @@ impl Ledger {
         MR: MissingNodeReporter,
         V: FnMut(&STLedgerEntry) -> bool,
     {
-        self.state_map.visit_nodes_with_family(family, &mut |node| {
-            if !node.is_leaf() {
-                return true;
-            }
+        let empty_map = std::collections::BTreeMap::new();
+        let ephemeral_map = self
+            .ephemeral_state
+            .as_ref()
+            .map(|e| &e.modifications)
+            .unwrap_or(&empty_map);
+        let mut ephemeral_iter = ephemeral_map.iter().peekable();
+        let mut should_continue = true;
 
-            let item = node.peek_item().expect("leaf nodes should carry an item");
-            match parse_state_sle_any(item.data(), item.key()) {
-                Some(sle) => visit(&sle),
-                None => true,
+        self.state_map
+            .visit_nodes_with_family(family, &mut |node| {
+                if !should_continue {
+                    return false;
+                }
+                if !node.is_leaf() {
+                    return true;
+                }
+
+                let item = node.peek_item().expect("leaf nodes should carry an item");
+                let p_key = item.key();
+
+                while let Some((e_key, _)) = ephemeral_iter.peek() {
+                    if **e_key < p_key {
+                        let (_, op) = ephemeral_iter.next().unwrap();
+                        match op {
+                            shamap::ephemeral::EphemeralOp::Insert(e_item, _)
+                            | shamap::ephemeral::EphemeralOp::Update(e_item, _) => {
+                                if let Some(sle) = parse_state_sle_any(e_item.data(), e_item.key())
+                                {
+                                    if !visit(&sle) {
+                                        should_continue = false;
+                                        return false;
+                                    }
+                                }
+                            }
+                            shamap::ephemeral::EphemeralOp::Delete => {}
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                if !should_continue {
+                    return false;
+                }
+
+                if let Some((e_key, _)) = ephemeral_iter.peek() {
+                    if **e_key == p_key {
+                        let (_, op) = ephemeral_iter.next().unwrap();
+                        match op {
+                            shamap::ephemeral::EphemeralOp::Insert(e_item, _)
+                            | shamap::ephemeral::EphemeralOp::Update(e_item, _) => {
+                                if let Some(sle) = parse_state_sle_any(e_item.data(), e_item.key())
+                                {
+                                    if !visit(&sle) {
+                                        should_continue = false;
+                                        return false;
+                                    }
+                                }
+                            }
+                            shamap::ephemeral::EphemeralOp::Delete => {}
+                        }
+                        return true;
+                    }
+                }
+
+                match parse_state_sle_any(item.data(), item.key()) {
+                    Some(sle) => {
+                        should_continue = visit(&sle);
+                        should_continue
+                    }
+                    None => true,
+                }
+            })?;
+
+        if !should_continue {
+            return Ok(());
+        }
+
+        for (_, op) in ephemeral_iter {
+            match op {
+                shamap::ephemeral::EphemeralOp::Insert(e_item, _)
+                | shamap::ephemeral::EphemeralOp::Update(e_item, _) => {
+                    if let Some(sle) = parse_state_sle_any(e_item.data(), e_item.key()) {
+                        if !visit(&sle) {
+                            break;
+                        }
+                    }
+                }
+                shamap::ephemeral::EphemeralOp::Delete => {}
             }
-        })
+        }
+
+        Ok(())
     }
 
     pub fn setup_with_entries(
@@ -1707,6 +2006,17 @@ impl Ledger {
         &self,
     ) -> Result<LedgerSetupEntries, LedgerSetupError> {
         self.read_setup_entries_from_lookup(|key| {
+            if let Some(ephemeral) = &self.ephemeral_state {
+                if let Some(op) = ephemeral.get(&key) {
+                    return match op {
+                        shamap::ephemeral::EphemeralOp::Insert(item, hash)
+                        | shamap::ephemeral::EphemeralOp::Update(item, hash) => {
+                            Ok(Some((item.clone(), *hash)))
+                        }
+                        shamap::ephemeral::EphemeralOp::Delete => Ok(None),
+                    };
+                }
+            }
             let fetcher = self.node_fetcher.clone();
             self.state_map.peek_item_with_hash(key, &mut |hash| {
                 fetcher.as_ref().and_then(|fetch| fetch(hash))
@@ -1726,6 +2036,17 @@ impl Ledger {
         MR: MissingNodeReporter,
     {
         self.read_setup_entries_from_lookup(|key| {
+            if let Some(ephemeral) = &self.ephemeral_state {
+                if let Some(op) = ephemeral.get(&key) {
+                    return match op {
+                        shamap::ephemeral::EphemeralOp::Insert(item, hash)
+                        | shamap::ephemeral::EphemeralOp::Update(item, hash) => {
+                            Ok(Some((item.clone(), *hash)))
+                        }
+                        shamap::ephemeral::EphemeralOp::Delete => Ok(None),
+                    };
+                }
+            }
             self.state_map.peek_item_with_hash_and_family(key, family)
         })
     }
@@ -1887,55 +2208,124 @@ impl Ledger {
         }
     }
 
-    /// Walks the loaded subtree bottom-up, computes hashes, marks nodes
-    /// shareable (cowid=0), and writes them to the node store.
-    /// Must be called after set_immutable and before the ledger is used
-    /// as a parent for the next build.
-    pub fn flush_state_map_to_store(&mut self) {
+    /// Flush the current working set (ephemeral_state) into the persistent trie and
+    /// flush those modified nodes directly to the disk database so this ledger can be used
+    /// as a parent for the next ledger. This is the equivalent of rippled's `SHAMap::flushDirty` (SHAMap.cpp:1010-1031).
+    pub fn flush_state_map_to_store(
+        &mut self,
+        tree_cache: Option<
+            &shamap::tree_node_cache::TreeNodeCache<
+                basics::tagged_cache::MonotonicClock,
+                basics::hardened_hash::HardenedHashBuilder,
+            >,
+        >,
+    ) -> Result<(), TraversalError> {
         let ledger_seq = self.header.seq;
 
-        // Use the persistent mutable_state if available (has all loaded nodes),
-        // otherwise create from state_map root.
-        let mut tree = self.mutable_state.take().unwrap_or_else(|| {
-            MutableTree::from_loaded_root(self.state_map.root(), ledger_seq.max(1))
-        });
+        let mut tree = MutableTree::from_loaded_root(self.state_map.root(), ledger_seq.max(1));
 
-        let writer = self.node_writer.clone();
-        tree.flush_dirty(
-            &mut |node: basics::memory::intrusive_pointer::SharedIntrusive<
-                shamap::nodes::tree_node::SHAMapTreeNode,
-            >|
-             -> basics::memory::intrusive_pointer::SharedIntrusive<
-                shamap::nodes::tree_node::SHAMapTreeNode,
-            > {
-                if let Some(ref write_fn) = writer {
-                    let hash = node.get_hash();
-                    if let Ok(data) = node.serialize_with_prefix() {
-                        write_fn(
-                            LedgerNodeObjectType::AccountNode,
-                            *hash.as_uint256(),
-                            data,
-                            ledger_seq,
-                        );
+        if let Some(ephemeral) = &self.ephemeral_state {
+            // We need a fetch closure for the mutation operations
+            let fetcher = self.node_fetcher.clone();
+            let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| {
+                if let Some(f) = &fetcher {
+                    f(hash)
+                } else {
+                    None
+                }
+            };
+
+            for (key, op) in &ephemeral.modifications {
+                match op {
+                    shamap::ephemeral::EphemeralOp::Insert(item, _) => {
+                        let inserted = tree
+                            .add_item_with_fetch(
+                                shamap::nodes::tree_node::SHAMapNodeType::AccountState,
+                                item.clone(),
+                                &mut fetch_fn,
+                            )
+                            .map_err(|_| TraversalError::View)?;
+                        if !inserted {
+                            tree.update_item_with_fetch(
+                                shamap::nodes::tree_node::SHAMapNodeType::AccountState,
+                                item.clone(),
+                                &mut fetch_fn,
+                            )
+                            .map_err(|_| TraversalError::View)?;
+                        }
+                    }
+                    shamap::ephemeral::EphemeralOp::Update(item, _) => {
+                        let updated = tree
+                            .update_item_with_fetch(
+                                shamap::nodes::tree_node::SHAMapNodeType::AccountState,
+                                item.clone(),
+                                &mut fetch_fn,
+                            )
+                            .map_err(|_| TraversalError::View)?;
+                        if !updated {
+                            tree.add_item_with_fetch(
+                                shamap::nodes::tree_node::SHAMapNodeType::AccountState,
+                                item.clone(),
+                                &mut fetch_fn,
+                            )
+                            .map_err(|_| TraversalError::View)?;
+                        }
+                    }
+                    shamap::ephemeral::EphemeralOp::Delete => {
+                        let _ = tree.delete_item_with_fetch(*key, &mut fetch_fn);
                     }
                 }
-                node
-            },
-        );
+            }
+        }
 
-        // Update state_map with the flushed root (all nodes now have cowid=0)
+        let writer = self.node_writer.clone();
+        tree.flush_dirty(&mut |node| {
+            let ret_node = if let Some(cache) = tree_cache {
+                let mut node_ref = node.clone();
+                let key = *node_ref.get_hash().as_uint256();
+                cache.canonicalize_replace_client(&key, &mut node_ref);
+                node_ref
+            } else {
+                node.clone()
+            };
+
+            if let Some(ref write_fn) = writer {
+                let hash = ret_node.get_hash();
+                if let Ok(data) = ret_node.serialize_with_prefix() {
+                    write_fn(
+                        LedgerNodeObjectType::AccountNode,
+                        *hash.as_uint256(),
+                        data,
+                        ledger_seq,
+                    );
+                }
+            }
+            ret_node
+        });
+
         let map_type = self.state_map.map_type();
         let backed = self.state_map.backed();
         let state = self.state_map.state();
         let was_full = self.state_map.is_full();
+
         let next = SyncTree::from_root_with_type(tree.root(), map_type, backed, ledger_seq, state);
         if was_full {
             next.set_full();
         }
         self.state_map = next;
+        self.ephemeral_state = None;
+        Ok(())
     }
 
-    pub fn flush_tx_map_to_store(&mut self) {
+    pub fn flush_tx_map_to_store(
+        &mut self,
+        tree_cache: Option<
+            &shamap::tree_node_cache::TreeNodeCache<
+                basics::tagged_cache::MonotonicClock,
+                basics::hardened_hash::HardenedHashBuilder,
+            >,
+        >,
+    ) {
         let ledger_seq = self.header.seq;
         let mut tree = MutableTree::from_loaded_root(self.tx_map.root(), ledger_seq.max(1));
 
@@ -1958,7 +2348,14 @@ impl Ledger {
                         );
                     }
                 }
-                node
+                if let Some(cache) = &tree_cache {
+                    let key = *node.get_hash().as_uint256();
+                    let mut node_ref = node;
+                    cache.canonicalize_replace_client(&key, &mut node_ref);
+                    node_ref
+                } else {
+                    node
+                }
             },
         );
 
@@ -2001,85 +2398,16 @@ impl Ledger {
                 basics::hardened_hash::HardenedHashBuilder,
             >,
         >,
-    ) {
-        let ledger_seq = self.header.seq;
+    ) -> Result<(), TraversalError> {
         let writer = self.node_writer.clone();
         if writer.is_none() {
-            return;
+            return Ok(());
         }
 
-        // Flush state map dirty nodes
-        let mut state_tree = self.mutable_state.take().unwrap_or_else(|| {
-            MutableTree::from_loaded_root(self.state_map.root(), ledger_seq.max(1))
-        });
-        state_tree.flush_dirty(
-            &mut |node: basics::memory::intrusive_pointer::SharedIntrusive<
-                shamap::nodes::tree_node::SHAMapTreeNode,
-            >|
-             -> basics::memory::intrusive_pointer::SharedIntrusive<
-                shamap::nodes::tree_node::SHAMapTreeNode,
-            > {
-                // Step 1: Canonicalize into the shared tree-node cache.
-                // Matches rippled SHAMap::writeNode (SHAMap.cpp:941):
-                //   canonicalize(node->getHash(), node);
-                if let Some(cache) = tree_cache {
-                    let mut node_ref = node.clone();
-                    let key = *node.get_hash().as_uint256();
-                    cache.canonicalize_replace_client(&key, &mut node_ref);
-                }
+        self.flush_state_map_to_store(tree_cache)?;
+        self.flush_tx_map_to_store(tree_cache);
 
-                // Step 2: Persist to NuDB.
-                // Matches rippled SHAMap::writeNode (SHAMap.cpp:944-945):
-                //   Serializer s; node->serializeWithPrefix(s);
-                //   f_.db().store(t, std::move(s.modData()), node->getHash().asUInt256(), ledgerSeq_);
-                if let Some(ref write_fn) = writer {
-                    let hash = node.get_hash();
-                    if let Ok(data) = node.serialize_with_prefix() {
-                        write_fn(
-                            LedgerNodeObjectType::AccountNode,
-                            *hash.as_uint256(),
-                            data,
-                            ledger_seq,
-                        );
-                    }
-                }
-                node
-            },
-        );
-        // Keep mutable_state so the tree stays in memory
-        self.mutable_state = Some(state_tree);
-
-        // Flush tx map dirty nodes
-        let mut tx_tree = MutableTree::from_loaded_root(self.tx_map.root(), ledger_seq.max(1));
-        tx_tree.flush_dirty(
-            &mut |node: basics::memory::intrusive_pointer::SharedIntrusive<
-                shamap::nodes::tree_node::SHAMapTreeNode,
-            >|
-             -> basics::memory::intrusive_pointer::SharedIntrusive<
-                shamap::nodes::tree_node::SHAMapTreeNode,
-            > {
-                // Step 1: Canonicalize into the shared tree-node cache (same as above).
-                if let Some(cache) = tree_cache {
-                    let mut node_ref = node.clone();
-                    let key = *node.get_hash().as_uint256();
-                    cache.canonicalize_replace_client(&key, &mut node_ref);
-                }
-
-                // Step 2: Persist to NuDB (same as above).
-                if let Some(ref write_fn) = writer {
-                    let hash = node.get_hash();
-                    if let Ok(data) = node.serialize_with_prefix() {
-                        write_fn(
-                            LedgerNodeObjectType::TransactionNode,
-                            *hash.as_uint256(),
-                            data,
-                            ledger_seq,
-                        );
-                    }
-                }
-                node
-            },
-        );
+        Ok(())
     }
 
     /// Set the node writer closure for flushing dirty nodes to the store.
@@ -2301,7 +2629,7 @@ impl Ledger {
         let seq = self.header.seq;
         let backed = self.state_map.backed();
         let has_fetcher = self.node_fetcher.is_some();
-        let has_mutable = self.mutable_state.is_some();
+        let has_mutable = self.ephemeral_state.is_some();
         tracing::debug!(
             target: "ledger",
             seq,
@@ -2767,80 +3095,31 @@ impl Ledger {
             return Ok(());
         }
 
-        let ledger_seq = self.header.seq;
+        let _ledger_seq = self.header.seq;
 
-        // Use a globally unique cowid to prevent in-place mutation of shared nodes.
-        // In C++ rippled, each SHAMap has its own cowid_ incremented from the copy
-        // constructor. Using ledger_seq alone can collide when multiple MutableTrees
-        // are created from roots with the same cowid (e.g., submit-time sandbox and
-        // accept-time build both operating on the same closed ledger's state).
-        static NEXT_COWID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
-
-        // across ALL transactions, matching reference where stateMap_ is a persistent
-        // SHAMap that rawInsert/rawErase/rawReplace all operate on directly.
-        if self.mutable_state.is_none() {
-            let cowid = NEXT_COWID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.mutable_state = Some(MutableTree::from_loaded_root(
-                self.state_map.root(),
-                cowid.max(1),
+        if self.ephemeral_state.is_none() {
+            self.ephemeral_state = Some(shamap::ephemeral::EphemeralWorkingSet::new(
+                shamap::nodes::tree_node::SHAMapNodeType::AccountState,
             ));
         }
-        let tree = self.mutable_state.as_mut().unwrap();
-
-        let mut fetch_fn = |hash: basics::sha_map_hash::SHAMapHash| -> Option<
-            basics::memory::intrusive_pointer::SharedIntrusive<
-                shamap::nodes::tree_node::SHAMapTreeNode,
-            >,
-        > {
-            let fetcher = self.node_fetcher.as_ref()?;
-            fetcher(hash)
-        };
+        let ephemeral = self.ephemeral_state.as_mut().unwrap();
 
         for (op, key, payload) in ops {
             match op {
                 StateBatchOp::Insert => {
-                    let inserted = tree.add_item_with_fetch(
-                        shamap::tree_node::SHAMapNodeType::AccountState,
-                        SHAMapItem::new(*key, payload.clone()),
-                        &mut fetch_fn,
-                    )?;
-                    // If the item already exists (add_item returns Ok(false)), fall back
-                    // to update. This handles the case where a sandbox tracks a modification
-                    // as Insert (because the item was created within the sandbox's scope)
-                    // but the item already exists in the underlying state map from a
-                    // previous ledger.
-                    if !inserted {
-                        tree.update_item_with_fetch(
-                            shamap::tree_node::SHAMapNodeType::AccountState,
-                            SHAMapItem::new(*key, payload.clone()),
-                            &mut fetch_fn,
-                        )?;
-                    }
+                    ephemeral.insert(*key, SHAMapItem::new(*key, payload.clone()));
                 }
                 StateBatchOp::Update => {
-                    tree.update_item_with_fetch(
-                        shamap::tree_node::SHAMapNodeType::AccountState,
-                        SHAMapItem::new(*key, payload.clone()),
-                        &mut fetch_fn,
-                    )?;
+                    ephemeral.update(*key, SHAMapItem::new(*key, payload.clone()));
                 }
                 StateBatchOp::Delete => {
-                    tree.delete_item_with_fetch(*key, &mut fetch_fn)?;
+                    ephemeral.remove(*key);
                 }
             }
         }
 
-        // Update state_map root from the persistent tree (for reads between TXs)
-        let map_type = self.state_map.map_type();
-        let backed = self.state_map.backed();
-        let state = self.state_map.state();
-        let was_full = self.state_map.is_full();
-        let next_state_map =
-            SyncTree::from_root_with_type(tree.root(), map_type, backed, ledger_seq, state);
-        if was_full {
-            next_state_map.set_full();
-        }
-        self.state_map = next_state_map;
+        // (state_map is intentionally NOT updated here during the batch,
+        // as all reads will instantly check ephemeral_state first.)
         let seq = self.header.seq;
         let ops_count = ops.len();
         tracing::debug!(target: "ledger", seq, ops_count, "State batch applied");
