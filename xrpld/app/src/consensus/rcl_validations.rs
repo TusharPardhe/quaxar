@@ -1,4 +1,4 @@
-//! App-level wiring for Phase 5's generic `Validations<Adaptor>` tracker
+//! App-level wiring for the generic `Validations<Adaptor>` tracker
 //! against real `STValidation`/`Ledger` types, plus the `NetworkOPs`
 //! validation-ingress support types (`RclValidationJournal`,
 //! `RclValidationAcceptanceSink`, `RclValidationTrustSource`) and the

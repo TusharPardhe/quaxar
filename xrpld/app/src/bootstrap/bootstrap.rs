@@ -698,6 +698,15 @@ pub fn build_bootstrap_root(
     }
 
     let _ = root.attach_default_consensus_runtime();
+
+    // Rippled parity: setMaxDisallowedLedger — store the highest ledger seq
+    // from the relational database so validators can reject stale proposals.
+    if root.validation_public_key().is_some() {
+        if let Some(max_seq) = root.relational_database().as_ref().and_then(|db| db.max_ledger_seq()) {
+            root.set_max_disallowed_ledger(max_seq);
+        }
+    }
+
     let node_store_kind = attach_shamap_store_if_configured(
         &mut root,
         config,
@@ -1017,6 +1026,7 @@ fn run_start_mode_consensus_loop(
                     basics::tagged_cache::MonotonicClock::default(),
                 )),
                 shared_completed_tx.clone(),
+                runtime.root().network_ops_state().need_network_ledger_arc(),
             ))
         });
 
@@ -1523,6 +1533,12 @@ fn run_start_mode_consensus_loop(
                                 "TreeNodeCache sweep (matching rippled doSweep)"
                             );
                         }
+
+                        // TransactionMaster sweep — matching rippled's doSweep which
+                        // sweeps the MasterTransaction TaggedCache (65,536 entries, 30min TTL).
+                        // Without this, completed transactions accumulate indefinitely.
+                        root.transaction_master().sweep();
+
                         last_cache_sweep = std::time::Instant::now();
                     }
 
@@ -1542,6 +1558,19 @@ fn run_start_mode_consensus_loop(
                         let tick = IDLE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if tick % 4 == 0 {
                             overlay_rt.overlay().delete_idle_peers();
+                        }
+
+                        // relay_history sweep every 60s — prunes entries for disconnected peers
+                        // preventing unbounded memory growth on long-lived nodes.
+                        static LAST_RELAY_SWEEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let last_sweep = LAST_RELAY_SWEEP.load(std::sync::atomic::Ordering::Relaxed);
+                        if now_secs.saturating_sub(last_sweep) >= 60 {
+                            LAST_RELAY_SWEEP.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                            overlay_rt.overlay().sweep_relay_history(5000);
                         }
 
                         // Ping every 60 seconds
@@ -2380,9 +2409,8 @@ fn initialize_startup_ledger_state(
             }
         }
         StartUpType::Fresh | StartUpType::Snapshot => {
-            if !root.config().standalone {
-                root.set_need_network_ledger(true);
-            }
+            // Rippled parity: --start (Fresh) does NOT set need_network_ledger.
+            // Only Network and Normal modes require network ledger acquisition.
             seed_startup_ledger_state(root, options, config)
         }
     }

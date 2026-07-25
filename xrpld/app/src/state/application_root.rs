@@ -268,6 +268,10 @@ pub struct ApplicationRoot {
             >,
         >,
     >,
+    /// Maximum disallowed ledger sequence — set from the relational database's
+    /// highest stored ledger for validator nodes. Matches rippled's
+    /// `setMaxDisallowedLedger` in Application::setup().
+    max_disallowed_ledger: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl std::fmt::Debug for ApplicationRoot {
@@ -2346,6 +2350,7 @@ impl ApplicationRoot {
             consensus_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             shared_tree_cache: std::sync::OnceLock::new(),
             shared_full_below_cache: std::sync::OnceLock::new(),
+            max_disallowed_ledger: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         });
 
         // TODO: Re-enable ConsensusTransSetSF filter once serialization is verified.
@@ -2535,7 +2540,7 @@ impl ApplicationRoot {
             .unwrap_or_default()
     }
 
-    fn process_closed_ledger_txq(
+    pub(crate) fn process_closed_ledger_txq(
         &self,
         ledger: &Ledger,
         time_leap: bool,
@@ -3266,6 +3271,16 @@ impl ApplicationRoot {
 
     pub const fn validation_public_key(&self) -> Option<PublicKey> {
         self.validation_public_key
+    }
+
+    pub fn set_max_disallowed_ledger(&self, seq: u32) {
+        use std::sync::atomic::Ordering;
+        self.max_disallowed_ledger.store(seq, Ordering::Release);
+    }
+
+    pub fn max_disallowed_ledger(&self) -> u32 {
+        use std::sync::atomic::Ordering;
+        self.max_disallowed_ledger.load(Ordering::Acquire)
     }
 
     pub fn network_ops_state(&self) -> Arc<SharedNetworkOpsState> {
@@ -5660,6 +5675,20 @@ impl ApplicationRoot {
         tracing::info!(target: "app", seq = closed_seq, tx_count, close_time, "Ledger closed");
 
         let _ = self.process_closed_ledger_txq(closed.as_ref(), false);
+
+        // Register the built ledger in ledger_history so that
+        // get_cached_ledger_by_hash / get_cached_ledger_by_seq can find it.
+        // Without this, the inline accept path (do_accept_and_start_next_round
+        // → accept_ledger_with_txns) produces a ledger that is invisible to
+        // by-hash/by-seq lookups, causing acquire_ledger to fall through to
+        // async and tryAdvance to break at the gap.
+        if let Some(runtime) = self.ledger_master_runtime() {
+            runtime
+                .ledger_master()
+                .ledger_history()
+                .insert(Arc::clone(&closed), false);
+        }
+
         self.on_closed_ledger(Arc::clone(&closed));
         self.on_published_ledger(Arc::clone(&closed));
         self.promote_operating_mode_after_accepted_ledger(closed.as_ref());

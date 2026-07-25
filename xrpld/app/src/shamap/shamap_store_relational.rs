@@ -223,6 +223,22 @@ impl SqliteSHAMapStoreRelational {
         Arc::clone(&self.ledger_db)
     }
 
+    /// Query the maximum `LedgerSeq` stored in the relational database.
+    /// Returns `None` if the query fails or the table is empty.
+    pub fn max_ledger_seq(&self) -> Option<u32> {
+        use rusqlite::OptionalExtension;
+        let connection = self.ledger_db.get_session();
+        connection
+            .query_row(
+                "SELECT MAX(LedgerSeq) FROM Ledgers",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
     pub fn transaction_db(&self) -> Option<Arc<DatabaseCon>> {
         self.transaction_db.as_ref().map(Arc::clone)
     }

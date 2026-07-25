@@ -206,10 +206,10 @@ pub struct RclValidationsAdaptor {
 
 impl RclValidationsAdaptor {
     /// Construct an adaptor with the given network-time source. The caller
-    /// supplies this because `Validations` (Phase 5) has no way to derive
-    /// "now" itself: rippled's `Application`-backed `RCLValidationsAdaptor`
-    /// reads the same clock the rest of the node's networking layer uses,
-    /// which this crate does not own.
+    /// supplies this because the generic `Validations` tracker has no access
+    /// to the application's clock — rippled's `RCLValidationsAdaptor` reads
+    /// the same clock the rest of the node's networking layer uses, so the
+    /// app layer must inject it here.
     pub fn new(now: impl Fn() -> NetClockTimePoint + Send + Sync + 'static) -> Self {
         Self {
             ledgers: parking_lot::Mutex::new(std::collections::HashMap::new()),

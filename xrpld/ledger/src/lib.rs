@@ -146,9 +146,10 @@ pub use ledger_fetcher::{
     InboundLedgerPacketShape, InboundLedgerPeerScore, InboundLedgerPlannerState,
     InboundLedgerReason, InboundLedgerReceivedPacket, InboundLedgerRequest,
     InboundLedgerRequestTrigger, InboundLedgerRunDataResult, InboundLedgerStore,
-    InboundLedgerTimerResult, NullInboundLedgerJournal, get_needed_hashes_with_family,
-    make_inbound_get_ledger_request, make_inbound_needed_by_hash_request,
-    needed_hashes_with_family, needed_hashes_with_family_and_first_child,
+    InboundLedgerTimerResult, NullInboundLedgerJournal, StateScanParams, TriggerSetup,
+    TxScanParams, get_needed_hashes_with_family, make_inbound_get_ledger_request,
+    make_inbound_needed_by_hash_request, needed_hashes_with_family,
+    needed_hashes_with_family_and_first_child,
 };
 // Removed: InboundLedgersLocal, InboundLedgerRoute, stash_stale_packet
 // These will be reimplemented in app::ledger::inbound_ledgers

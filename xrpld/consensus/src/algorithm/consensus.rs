@@ -25,12 +25,12 @@
 //!   `tracing` spans/events at call sites instead; there is no `clog`
 //!   parameter.
 //! - `getJson`/diagnostic dump methods are omitted. They are RPC-facing
-//!   presentation concerns that belong at the app/RCL layer (Phase 5/6),
-//!   not in the generic algorithm. `phase()` and `mode()` accessors are
-//!   kept since callers need them to build their own diagnostics.
+//!   presentation concerns that belong at the app/RCL layer, not in the
+//!   generic algorithm. `phase()` and `mode()` accessors are kept since
+//!   callers need them to build their own diagnostics.
 //! - `Tx_t::id()` is expressed via the [`ConsensusTx`] trait (`tx_id`)
-//!   rather than assuming an inherent method, matching the deliberate
-//!   deviation already made in [`crate::model::DisputedTx`] during Phase 2.
+//!   rather than assuming an inherent method. This keeps the generic
+//!   algorithm crate independent of any specific transaction type.
 //! - The two small `LedgerTiming`-derived helpers the reference calls
 //!   directly (`getNextLedgerTimeResolution`, `roundCloseTime`) are exposed
 //!   as [`ConsensusAdaptor`] methods rather than a hard dependency on the

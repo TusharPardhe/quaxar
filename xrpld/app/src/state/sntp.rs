@@ -2,11 +2,19 @@
 //! host OS cannot be NTP-configured by the operator (LXC containers, Docker,
 //! managed VPS, etc.).
 //!
-//! Implements a lightweight SNTP/UDP client modelled after rippled's former
-//! `SNTPClock` (removed in commit `548c91ebb6`).  The client queries the
-//! configured servers in round-robin, maintains a sliding window of offset
-//! samples, and selects the **median** as the correction.  Small (±1 s)
-//! corrections are treated as noise and zeroed.
+//! rippled removed its own SNTPClient in commit `548c91ebb6`.  Quaxar
+//! re-introduces the capability as an **operator convenience feature** for
+//! deployments where the host kernel time source is inaccessible.  This is
+//! an intentional extension beyond rippled; the core consensus clock path is
+//! identical to rippled.
+//!
+//! The client queries the configured `[sntp_servers]` in round-robin, builds
+//! a sliding window of RFC 4330 offset samples, and stores the **median** as
+//! the correction applied by `TimeKeeper::now()`.  Corrections of ≤ 1 s are
+//! treated as noise and discarded to avoid jitter.
+//!
+//! Offset sign convention: **positive = our clock is behind the server** (we
+//! are slow).  `TimeKeeper::now()` *adds* the offset to correct forward.
 //!
 //! Usage:
 //! ```ignore
@@ -87,7 +95,11 @@ impl SntpClient {
         });
     }
 
-    /// Current SNTP offset in seconds (positive = system clock is fast).
+    /// Current SNTP offset in seconds.
+    ///
+    /// **Positive** means the server clock is ahead of our system clock (our
+    /// clock is slow).  `TimeKeeper::now()` adds this value to the raw Unix
+    /// timestamp so that network time is corrected forward.
     pub fn offset_seconds(&self) -> i64 {
         self.offset_secs.load(Ordering::Acquire)
     }
@@ -176,12 +188,17 @@ impl SntpClient {
             }
         };
 
-        // Build query with nonce in the transmit-timestamp fraction field.
+        // Place the nonce in bytes 44–47 of the request (the fraction field of
+        // the client Transmit Timestamp, per RFC 4330 §5).  The server echoes
+        // the entire client Transmit Timestamp back in its Originate Timestamp
+        // field (response bytes 16–23), so we read the nonce back from bytes
+        // 20–23 of the response to verify we are processing our own reply.
         let mut query = NTP_QUERY;
         let nonce = rand_nonce();
-        query[12..16].copy_from_slice(&nonce.to_be_bytes()); // transmit fraction = nonce
+        query[44..48].copy_from_slice(&nonce.to_be_bytes()); // transmit-timestamp fraction
 
-        let send_time = unix_now_secs();
+        // T1 = client transmit time (Unix seconds, integer part).
+        let t1 = unix_now_secs() as i64;
 
         if socket.send_to(&query, addr).await.is_err() {
             return None;
@@ -193,31 +210,42 @@ impl SntpClient {
             _ => return None,
         };
 
-        // Validate response: check nonce.
-        let resp_nonce = u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]]);
+        // T4 = client receive time (immediately after recv_from returns).
+        let t4 = unix_now_secs() as i64;
+
+        // Verify the server echoed our nonce back in the Originate Timestamp
+        // fraction field (response bytes 20–23), confirming this is our reply.
+        let resp_nonce = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]);
         if resp_nonce != nonce {
             return None;
         }
 
-        // Validate stratum.
-        let info = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let stratum = (info >> 16) & 0xff;
+        // Validate stratum (byte 1 of the response).
+        let stratum = buf[1];
         if stratum == 0 || stratum > 14 {
             return None;
         }
 
-        // Reject alarm condition (LI bits 30-31 = 3).
-        if (info >> 30) == 3 {
+        // Reject alarm condition: LI field (top 2 bits of byte 0) == 3.
+        if (buf[0] >> 6) == 3 {
             return None;
         }
 
-        // Server receive timestamp (integer part).
-        let server_recv = i64::from(u32::from_be_bytes([buf[32], buf[33], buf[34], buf[35]]));
+        // T2 = server receive timestamp, integer part (NTP epoch), bytes 32–35.
+        // T3 = server transmit timestamp, integer part (NTP epoch), bytes 40–43.
+        // Both are in NTP epoch (seconds since 1900-01-01); subtract
+        // NTP_UNIX_OFFSET to convert to Unix epoch before arithmetic.
+        let t2 = i64::from(u32::from_be_bytes([buf[32], buf[33], buf[34], buf[35]]))
+            - NTP_UNIX_OFFSET;
+        let t3 = i64::from(u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]]))
+            - NTP_UNIX_OFFSET;
 
-        // Simplified offset: server_recv - send_time - NTP_UNIX_OFFSET.
-        // (This matches rippled's simplified calculation that ignores
-        // round-trip delay for speed.)
-        let offset = server_recv - send_time as i64 - NTP_UNIX_OFFSET;
+        // RFC 4330 §5 offset formula: θ = ((T2−T1) + (T3−T4)) / 2.
+        // Positive θ means the server is ahead of us (our clock is slow).
+        // OPTIMIZATION vs rippled: rippled removed its SNTP client entirely;
+        // this implementation follows the RFC directly rather than using a
+        // simplified one-sided estimate.
+        let offset = ((t2 - t1) + (t3 - t4)) / 2;
 
         Some(offset)
     }
@@ -246,14 +274,21 @@ mod tests {
 
     #[test]
     fn ntp_query_packet_layout() {
-        // LI=0, VN=3, Mode=3
+        // Byte 0: LI=0 (2 bits), VN=3 (3 bits), Mode=3 client (3 bits) = 0x1B.
         assert_eq!(NTP_QUERY[0], 0x1B);
         assert_eq!(NTP_QUERY.len(), 48);
+        // The NTP_QUERY template has the nonce placeholder at bytes 44-47
+        // (Transmit Timestamp fraction field, per RFC 4330 §5).  It must be
+        // zero in the template; the caller fills it in per-request.
+        assert_eq!(&NTP_QUERY[44..48], &[0u8; 4]);
+        // Bytes 12-15 (Reference Timestamp integer) must be zero in a client
+        // request — we do not know the server reference clock.
+        assert_eq!(&NTP_QUERY[12..16], &[0u8; 4]);
     }
 
     #[test]
     fn offset_debounce() {
-        // ±1 s corrections should be zeroed.
+        // Corrections within ±1 s are zeroed to avoid jitter.
         let offsets: Vec<i64> = vec![-1, 0, 1, 2, -2, 3, -3, 4, -4];
         let mut sorted = offsets;
         sorted.sort_unstable();
@@ -265,6 +300,7 @@ mod tests {
 
     #[test]
     fn offset_median_filter() {
+        // One outlier (100) cannot pull the median away from the cluster (10).
         let offsets = vec![10, 11, 10, 10, 10, 10, 10, 10, 100];
         let mut sorted = offsets;
         sorted.sort_unstable();

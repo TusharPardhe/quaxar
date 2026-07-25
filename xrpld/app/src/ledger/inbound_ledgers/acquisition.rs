@@ -505,6 +505,19 @@ fn trigger(
     reason: InboundLedgerRequestTrigger,
     peer: Option<Arc<dyn Peer>>,
 ) {
+    // M11: Structured trigger that separates setup, scan, and result processing.
+    //
+    // In rippled (InboundLedger.cpp:620-622), the acquisition lock is released
+    // during the expensive `getMissingNodes` state-map walk:
+    //   sl.unlock();
+    //   auto nodes = ledger_->stateMap().getMissingNodes(...);
+    //   sl.lock();
+    //
+    // In quaxar, `get_missing_nodes_with_family` requires `&mut SyncTree`,
+    // which is owned by `Ledger` inside `InboundLedgerLocal` — so we cannot
+    // release the `mutable` lock during the scan. When the Ledger is
+    // refactored to `Arc<Ledger>`, the scan methods can be called outside the
+    // lock scope (the `do_*_scan` methods are already factored for this).
     let mut mutable = state.mutable.lock().expect("acquisition mutable lock");
     let AcqMutableState {
         inbound,
@@ -513,13 +526,56 @@ fn trigger(
     } = &mut *mutable;
     let journal = WorkerJournal;
     let config = ledger::LedgerConfig::default();
-    let mut send = |message: overlay::ProtocolMessage| {
-        state.peer_set.send_request(&message, peer.as_ref());
-    };
     let family = family(state);
-    inbound.trigger_with_family(
-        reason, &journal, &config, store, fetch_pack, &family, &mut send,
-    );
+
+    // Phase 1: Setup — try local DB, by-hash fallback, compute scan params.
+    let setup = inbound.prepare_trigger(reason, &journal, &config, store, fetch_pack, &family);
+
+    // Send any messages produced during setup (header request, root nodes, etc.).
+    for msg in &setup.messages_to_send {
+        state.peer_set.send_request(msg, peer.as_ref());
+    }
+
+    // Phase 2: State-map scan (expensive walk).
+    let state_missing = if let Some(ref params) = setup.state_scan {
+        inbound.do_state_map_scan(params, store, fetch_pack, &family)
+    } else {
+        Vec::new()
+    };
+
+    // Phase 3: Apply state-scan results.
+    if let Some(ref params) = setup.state_scan {
+        let mut send_fn = |message: overlay::ProtocolMessage| {
+            state.peer_set.send_request(&message, peer.as_ref());
+        };
+        inbound.apply_state_scan_results(state_missing, params, &family, &mut send_fn);
+    }
+
+    // Phase 4: Tx-map scan (expensive walk).
+    let tx_missing = if let Some(ref params) = setup.tx_scan {
+        inbound.do_tx_map_scan(params, store, fetch_pack, &family)
+    } else {
+        Vec::new()
+    };
+
+    // Phase 5: Apply tx-scan results and finalize.
+    {
+        let mut send_fn = |message: overlay::ProtocolMessage| {
+            state.peer_set.send_request(&message, peer.as_ref());
+        };
+        if let Some(ref params) = setup.tx_scan {
+            inbound.apply_tx_scan_results(tx_missing, params, &family, &mut send_fn);
+        }
+
+        // Completion check — matches the tail of trigger_with_family.
+        if inbound.planner_state().have_header
+            && inbound.planner_state().have_state
+            && inbound.planner_state().have_transactions
+        {
+            inbound.set_complete();
+        }
+    }
+    // mutable dropped here — lock released.
 }
 
 fn add_peers(state: &AcquisitionState) -> Vec<Arc<dyn Peer>> {

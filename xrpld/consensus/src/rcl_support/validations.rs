@@ -19,8 +19,9 @@
 //!   swapped for a proper aged-map crate without changing the public API.
 //! - The reference threads a `beast::Journal` through `expire()` purely
 //!   for a debug timing log; this port uses `tracing::debug!` instead.
-//! - `getJsonTrie()` is omitted (RPC-facing presentation concern, per the
-//!   same rationale as `Consensus::getJson` in Phase 3).
+//! - `getJsonTrie()` is omitted: it is an RPC-facing presentation concern
+//!   that does not belong in the consensus library layer (same reasoning as
+//!   `Consensus::getJson` omission in `consensus.rs`).
 //! - The `Adaptor::MutexType` customization point is dropped: the
 //!   reference allows swapping the mutex type but always uses
 //!   `std::mutex` in practice. This port uses `parking_lot::Mutex`
@@ -37,10 +38,9 @@ use crate::model::ledger_trie::{LedgerTrie, SpanTip, TrieLedger};
 /// Timing parameters controlling validation staleness and expiration.
 /// Matches `ValidationParms`.
 ///
-/// Deferred here from Phase 1 (`ConsensusParms`) after discovering during
-/// that phase's rewrite that these fields belong to a *separate* struct in
-/// the reference, not `ConsensusParms` -- see Phase 1's design-decision
-/// notes.
+/// Extracted into a separate struct (rather than folding into `ConsensusParms`)
+/// to align with rippled's design: the reference keeps `ValidationParms` and
+/// `ConsensusParms` as distinct types with distinct ownership.
 #[derive(Debug, Clone, Copy)]
 pub struct ValidationParms {
     /// Seconds a validation remains current after its ledger's close time.
@@ -702,9 +702,28 @@ impl<A: ValidationsAdaptor> Validations<A> {
             return Some((curr.seq(), curr.id()));
         }
 
-        // A ledger ahead of us is preferred regardless of chain.
-        if preferred.seq > curr.seq() {
+        // A ledger ahead of us is preferred regardless of chain, but cap the
+        // distance to prevent runaway restart loops: if the preferred ledger
+        // is more than 256 sequences ahead of our current ledger, we stay
+        // put.  This bounds the damage from a stale `valid_ledger_seq`
+        // (which feeds `min_valid_seq` via `get_preferred_min_seq`), because
+        // without this guard `check_ledger` would see a `net_lgr` far ahead
+        // of `prev_ledger_id`, call `handle_wrong_ledger`, and restart the
+        // round -- which immediately gets killed again on the next tick,
+        // creating an infinite deadlock.
+        const MAX_PREFERRED_DISTANCE: u32 = 256;
+        if preferred.seq > curr.seq()
+            && preferred.seq <= curr.seq() + MAX_PREFERRED_DISTANCE
+        {
             return Some((preferred.seq, preferred.id));
+        }
+
+        if preferred.seq > curr.seq() {
+            tracing::info!(
+                target: "consensus",
+                max = MAX_PREFERRED_DISTANCE,
+                "get_preferred: preferred too far ahead, capping to curr"
+            );
         }
 
         // Only switch to an earlier/same sequence if it's a different chain.

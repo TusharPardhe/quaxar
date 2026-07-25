@@ -91,8 +91,10 @@ pub fn reload_log_filter(filter: &str) -> Result<(), String> {
     f(filter)
 }
 
-/// Wrap a real `Arc<Ledger>` as the `consensus::RclCxLedger` view Phase 3's
+/// Wrap a real `Arc<Ledger>` as the `consensus::RclCxLedger` view that the
 /// `Consensus<Adaptor>` state machine and the `ConsensusRunner` trait use.
+/// `RclCxLedger` is a thin, clone-cheap wrapper over `Arc<Ledger>` that
+/// exposes only the id/seq/close-time accessors the generic algorithm needs.
 /// Matches the reference's implicit `RCLCxLedger{ledger}` construction at
 /// each `startRound`/`gotTxSet` call site.
 pub fn consensus_ledger_from_ledger(
@@ -109,10 +111,11 @@ pub fn consensus_ledger_from_ledger(
 pub use ::ledger::NullLedgerJournal as NullRclValidationJournal;
 
 /// Wrap a real `&ledger::Ledger` as the ancestor-trie-carrying
-/// `RclValidatedLedger` Phase 5's validations tracker needs for
-/// `get_preferred`/`get_preferred_lcl` queries (see `xrpld/main`'s
-/// `preferred_closed_ledger_hash`-adjacent catch-up logic). Matches the
-/// reference's implicit `RCLValidatedLedger{ledger}` construction.
+/// `RclValidatedLedger` that the validations tracker needs for
+/// `get_preferred`/`get_preferred_lcl` queries.  `RclValidatedLedger`
+/// eagerly caches its ancestor hash vector so that Byzantine-safe ledger
+/// preference resolution does not need to re-traverse the ledger chain.
+/// Matches the reference's implicit `RCLValidatedLedger{ledger}` construction.
 pub fn validated_ledger_from_ledger(
     ledger: &::ledger::Ledger,
     journal: &impl ::ledger::LedgerJournal,

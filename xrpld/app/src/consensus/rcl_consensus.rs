@@ -1,4 +1,4 @@
-//! App-level wiring of Phase 3's generic `Consensus<Adaptor>` state machine
+//! App-level wiring of the generic `Consensus<Adaptor>` state machine
 //! against real `Ledger`/`SHAMap`/`STValidation`/`ValidatorList` types.
 //! Ported from `RCLConsensus.h`/`RCLConsensus.cpp`.
 //!
@@ -25,13 +25,13 @@
 //! - No mutex protects the `Consensus` state machine
 //! - Proposals, timer_entry, and accept all run on the same thread in FIFO order
 //!
-//! ## `Ledger` associated type: `RclCxLedger` vs `RclValidatedLedger`
+//! ## Two ledger types: `RclCxLedger` vs `RclValidatedLedger`
 //!
-//! Phase 3's `Consensus<Adaptor>::Ledger` associated type must implement
-//! `consensus::ConsensusLedger` (id/seq/close-time accessors only) --
+//! The `Consensus<Adaptor>::Ledger` associated type must implement
+//! `consensus::ConsensusLedger` (id/seq/close-time accessors only) —
 //! that's [`consensus::RclCxLedger`], a thin wrapper over `Arc<Ledger>`.
-//! Phase 5's validation tracker instead needs `ValidationsLedger`
-//! (ancestor-trie lookups for Byzantine-safe preference resolution) --
+//! The validation tracker instead needs `ValidationsLedger`
+//! (ancestor-trie lookups for Byzantine-safe preference resolution) —
 //! that's [`crate::consensus::rcl_validation::RclValidatedLedger`], a
 //! *different* concrete type with its own eagerly-cached ancestor vector.
 
@@ -501,16 +501,26 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
 
     fn get_prev_ledger(
         &self,
-        _prev_ledger_id: &Uint256,
+        prev_ledger_id: &Uint256,
         prev_ledger: &Self::Ledger,
-        _mode: ConsensusMode,
+        mode: ConsensusMode,
     ) -> Uint256 {
         let min_valid_seq = self
             .ledger_master_runtime
             .ledger_master()
             .valid_ledger_seq();
         let wrapped = self.validated_view(prev_ledger);
-        RclConsensusValidationSource::preferred_min_seq(&self.validations, &wrapped, min_valid_seq)
+        let preferred =
+            RclConsensusValidationSource::preferred_min_seq(&self.validations, &wrapped, min_valid_seq);
+        if mode != ConsensusMode::WrongLedger && preferred != *prev_ledger_id {
+            tracing::info!(
+                target: "consensus",
+                requested = %prev_ledger_id,
+                preferred = %preferred,
+                "Consensus view change — preferred ledger differs from current"
+            );
+        }
+        preferred
     }
 
     fn on_mode_change(&self, before: ConsensusMode, after: ConsensusMode) {
@@ -1003,6 +1013,67 @@ impl AppConsensus {
                                 if pending.proposing {
                                     v.set_flag(protocol::VF_FULL_VALIDATION);
                                 }
+
+                                // sfValidatedHash — hash of the last fully
+                                // validated ledger (may be the one we just
+                                // accepted or an earlier one).
+                                if let Some(validated) = root.validated_ledger() {
+                                    v.set_field_h256(
+                                        protocol::get_field_by_symbol("sfValidatedHash"),
+                                        *validated.header().hash.as_uint256(),
+                                    );
+                                }
+
+                                // sfCookie — random nonce for replay protection.
+                                v.set_field_u64(
+                                    protocol::get_field_by_symbol("sfCookie"),
+                                    basics::random::rand_int_full::<u64>(),
+                                );
+
+                                // sfServerVersion — report on voting ledgers
+                                // (the ledger just before a flag ledger).
+                                if closed.is_voting_ledger() {
+                                    v.set_field_u64(
+                                        protocol::get_field_by_symbol("sfServerVersion"),
+                                        protocol::get_encoded_version(),
+                                    );
+                                }
+
+                                // sfLoadFee — report when load factor exceeds
+                                // base (matching rippled's FeeTrack logic).
+                                {
+                                    let load_fee_track = root.load_fee_track();
+                                    let fee = std::cmp::max(
+                                        load_fee_track.local_fee(),
+                                        load_fee_track.cluster_fee(),
+                                    );
+                                    if fee > load_fee_track.load_base() {
+                                        v.set_field_u32(
+                                            protocol::get_field_by_symbol("sfLoadFee"),
+                                            fee,
+                                        );
+                                    }
+                                }
+
+                                // Fee vote and amendments — only on voting
+                                // ledgers (the ledger just before a flag ledger).
+                                if closed.is_voting_ledger() {
+                                    if let Some(ref fee_vote) = self.adaptor.fee_vote {
+                                        fee_vote.do_validation(
+                                            closed.fees(),
+                                            closed.rules(),
+                                            v,
+                                        );
+                                    }
+                                    if let Some(ref amendment_status) =
+                                        self.adaptor.amendment_status
+                                    {
+                                        amendment_status.do_validation_for_ledger(
+                                            closed.as_ref(),
+                                            v,
+                                        );
+                                    }
+                                }
                             },
                         ) {
                             Ok(built_validation) => {
@@ -1033,6 +1104,17 @@ impl AppConsensus {
                                 if !h.is_zero() {
                                     *peer_counts.entry(h).or_insert(0) += 1;
                                 }
+                            }
+                        }
+
+                        // H3: Include our own closed ledger in the tally so
+                        // getPreferredLCL accounts for our view.  Matches
+                        // rippled where checkLastClosedLedger counts the node's
+                        // own closed ledger hash among peers.
+                        if let Some(our_closed_lcl) = root.closed_ledger() {
+                            let our_h = *our_closed_lcl.header().hash.as_uint256();
+                            if !our_h.is_zero() {
+                                *peer_counts.entry(our_h).or_insert(0) += 1;
                             }
                         }
 
@@ -1234,9 +1316,10 @@ impl AppConsensus {
 
 impl ConsensusRunner for AppConsensus {
     fn peer_proposal(&mut self, now: NetClockTimePoint, peer_pos: &RclCxPeerPos) -> bool {
-        // Signature already verified by the overlay layer before queueing.
-        // Matches rippled where processTrustedProposal trusts the overlay's
-        // prior validation.
+        // Signature was verified by `overlay_impl.rs::on_propose_ledger` before
+        // this proposal was queued — matching rippled's `checkPropose` which
+        // calls `peerPos.checkSign()` and drops invalid proposals before they
+        // reach `processTrustedProposal` / `peer_proposal`.
         let our_prev = *self.state.prev_ledger_id();
         let their_prev = *peer_pos.proposal().prev_ledger();
         let accepted = self.state.peer_proposal(&self.adaptor, now, peer_pos);
