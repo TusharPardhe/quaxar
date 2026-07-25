@@ -528,7 +528,7 @@ fn trigger(
     let config = ledger::LedgerConfig::default();
     let family = family(state);
 
-    // Phase 1: Setup — try local DB, by-hash fallback, compute scan params.
+    // Setup — try local DB, by-hash fallback, compute scan params.
     let setup = inbound.prepare_trigger(reason, &journal, &config, store, fetch_pack, &family);
 
     // Send any messages produced during setup (header request, root nodes, etc.).
@@ -536,14 +536,14 @@ fn trigger(
         state.peer_set.send_request(msg, peer.as_ref());
     }
 
-    // Phase 2: State-map scan (expensive walk).
+    // State-map scan (expensive walk).
     let state_missing = if let Some(ref params) = setup.state_scan {
         inbound.do_state_map_scan(params, store, fetch_pack, &family)
     } else {
         Vec::new()
     };
 
-    // Phase 3: Apply state-scan results.
+    // Apply state-scan results.
     if let Some(ref params) = setup.state_scan {
         let mut send_fn = |message: overlay::ProtocolMessage| {
             state.peer_set.send_request(&message, peer.as_ref());
@@ -551,14 +551,14 @@ fn trigger(
         inbound.apply_state_scan_results(state_missing, params, &family, &mut send_fn);
     }
 
-    // Phase 4: Tx-map scan (expensive walk).
+    // Tx-map scan (expensive walk).
     let tx_missing = if let Some(ref params) = setup.tx_scan {
         inbound.do_tx_map_scan(params, store, fetch_pack, &family)
     } else {
         Vec::new()
     };
 
-    // Phase 5: Apply tx-scan results and finalize.
+    // Apply tx-scan results and finalize.
     {
         let mut send_fn = |message: overlay::ProtocolMessage| {
             state.peer_set.send_request(&message, peer.as_ref());

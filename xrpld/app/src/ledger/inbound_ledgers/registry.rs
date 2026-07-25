@@ -32,6 +32,10 @@ const FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 /// Entries idle longer than this are swept.
 const SWEEP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+fn response_sequence_matches_request(expected_seq: u32, response_seq: u32) -> bool {
+    expected_seq == 0 || response_seq == 0 || expected_seq == response_seq
+}
+
 /// Rust worker count for the `JtLedgerData`-equivalent queue. This does not
 /// limit the number of tracked acquisitions.
 const WORKER_COUNT: usize = 64;
@@ -265,7 +269,20 @@ impl InboundLedgers {
             }
         }
         let _ = self.acquire(hash, seq, reason);
-        self.pending_acquires.lock().expect("pending_acquires lock").remove(&hash);
+        self.pending_acquires
+            .lock()
+            .expect("pending_acquires lock")
+            .remove(&hash);
+    }
+
+    /// Start a closed-ledger acquisition when only its hash is known.
+    ///
+    /// A peer's advertised history range is not a reliable sequence binding
+    /// for its current closed-ledger hash. Keep the sequence unknown until the
+    /// response header establishes it, while retaining the hash as the primary
+    /// acquisition key.
+    pub fn acquire_closed_ledger_async(&self, hash: Uint256, reason: AcquireReason) {
+        self.acquire_async(hash, 0, reason);
     }
 
     /// Route a TMLedgerData response to the correct acquisition.
@@ -293,9 +310,7 @@ impl InboundLedgers {
                 return false;
             };
             if let Some(response_seq) = response_seq
-                && entry.seq != 0
-                && response_seq != 0
-                && entry.seq != response_seq
+                && !response_sequence_matches_request(entry.seq, response_seq)
             {
                 tracing::warn!(
                     target: "inbound_ledger",
@@ -783,5 +798,18 @@ impl InboundLedgers {
 impl std::fmt::Debug for InboundLedgers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InboundLedgers").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::response_sequence_matches_request;
+
+    #[test]
+    fn unknown_closed_ledger_sequence_accepts_authoritative_response_sequence() {
+        assert!(response_sequence_matches_request(0, 105_847_104));
+        assert!(response_sequence_matches_request(105_847_104, 0));
+        assert!(response_sequence_matches_request(105_847_104, 105_847_104));
+        assert!(!response_sequence_matches_request(105_847_103, 105_847_104));
     }
 }

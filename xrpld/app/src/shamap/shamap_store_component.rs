@@ -1,4 +1,5 @@
 use crate::runtime::main_runtime::ManagedComponent;
+use crate::shamap::shamap_store_app_runtime::SHAMapStoreRotationWindow;
 use crate::{
     SHAMapStore, SHAMapStoreCopyDisposition, SHAMapStoreHealthPolicy, SHAMapStoreHealthRuntime,
     SHAMapStoreRuntime, SHAMapStoreSavedState, SHAMapStoreSavedStateDb, SHAMapStoreWorkerStep,
@@ -8,6 +9,10 @@ use ledger::Ledger;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+struct NoopRotationWindow;
+
+impl SHAMapStoreRotationWindow for NoopRotationWindow {}
 
 pub trait SHAMapStoreComponentRuntime:
     SHAMapStoreRuntime + SHAMapStoreHealthRuntime + Send + 'static
@@ -26,6 +31,10 @@ pub trait SHAMapStoreComponentRuntime:
         _health_policy: SHAMapStoreHealthPolicy,
     ) -> Result<SHAMapStoreCopyDisposition, String> {
         Ok(SHAMapStoreCopyDisposition::Completed { node_count: 0 })
+    }
+
+    fn begin_rotation_window(&mut self) -> Result<Box<dyn SHAMapStoreRotationWindow>, String> {
+        Ok(Box::new(NoopRotationWindow))
     }
 
     fn freshen_caches(&mut self) -> Result<(), String> {

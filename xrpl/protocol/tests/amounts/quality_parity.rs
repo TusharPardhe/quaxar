@@ -138,7 +138,7 @@ fn quality_ceil_and_round_examples_match_cpp() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2C-P1: Direct ports from C++ Quality_test.cpp
+// Direct ports from C++ Quality_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // --- testcase("comparisons") ---

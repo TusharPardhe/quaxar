@@ -309,6 +309,12 @@ pub struct AppRclConsensusAdaptor {
     /// Uses a Mutex to satisfy the type system (ConsensusAdaptor::on_accept
     /// takes &self), but only one thread ever accesses this.
     pub(crate) pending_accept: StdMutex<Option<PendingAcceptWork>>,
+    /// Ledger most recently requested by consensus after a cache miss.
+    ///
+    /// This mirrors rippled's `acquiringLedger_`: consensus may ask for the
+    /// same unavailable LCL on every timer/proposal pass, but only the first
+    /// miss should begin its potentially expensive inbound acquisition.
+    acquiring_ledger: StdMutex<Option<Uint256>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -362,6 +368,7 @@ impl AppRclConsensusAdaptor {
             parms: ConsensusParms::default(),
             tx_set_cache,
             pending_accept: StdMutex::new(None),
+            acquiring_ledger: StdMutex::new(None),
         }
     }
 
@@ -395,6 +402,17 @@ fn sync_tree_to_rcl_tx_set(
     cache: &consensus::rcl::RclTxSetSharedCache,
 ) -> consensus::RclTxSet {
     consensus::RclTxSet::from_parts(sync_tree.root(), Arc::clone(cache), sync_tree.backed(), 0)
+}
+
+fn should_acquire_consensus_ledger(
+    acquiring_ledger: &mut Option<Uint256>,
+    ledger_id: Uint256,
+) -> bool {
+    if *acquiring_ledger == Some(ledger_id) {
+        return false;
+    }
+    *acquiring_ledger = Some(ledger_id);
+    true
 }
 
 /// Thin adapter bridging `Validations<RclValidationsAdaptor>` (our inner type)
@@ -438,39 +456,29 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             return Some(RclCxLedger::new(ledger));
         }
 
-        if let Some(guard) = self.ledger_master_runtime.inbound_ledgers.lock().ok()
-            && let Some(shared) = guard.as_ref()
-        {
-            // Resolve the seq from the ledger cache first, falling back to
-            // peers that advertise this hash (matching the peer-query pattern
-            // in the beginConsensus path).  A correct seq lets the acquisition
-            // layer select peers via ledger-range fast-path and include the
-            // sequence in wire requests, both of which are critical for
-            // reliable mainnet operation.
-            let seq = self
-                .ledger_master_runtime
-                .ledger_master()
-                .ledger_history()
-                .get_cached_ledger_by_hash(hash)
-                .map(|l| l.header().seq)
-                .or_else(|| {
-                    if let Some(ort) = self.app_root.overlay_runtime() {
-                        use overlay::Overlay;
-                        ort.overlay()
-                            .active_peers()
-                            .iter()
-                            .find(|p| p.closed_ledger_hash() == *ledger_id)
-                            .map(|p| p.ledger_range().1)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0);
-            shared.acquire_async(
+        let shared = self
+            .ledger_master_runtime
+            .inbound_ledgers
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        if let Some(shared) = shared {
+            let should_acquire = should_acquire_consensus_ledger(
+                &mut self
+                    .acquiring_ledger
+                    .lock()
+                    .expect("acquiring_ledger mutex must not be poisoned"),
                 *ledger_id,
-                seq,
-                crate::ledger::inbound_ledgers::AcquireReason::Consensus,
             );
+            if should_acquire {
+                // A peer's current closed-ledger hash is not sequence-bound to
+                // the separately advertised history range. Acquire by hash and
+                // learn the authoritative sequence from the returned header.
+                shared.acquire_closed_ledger_async(
+                    *ledger_id,
+                    crate::ledger::inbound_ledgers::AcquireReason::Consensus,
+                );
+            }
         }
         None
     }
@@ -510,8 +518,11 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             .ledger_master()
             .valid_ledger_seq();
         let wrapped = self.validated_view(prev_ledger);
-        let preferred =
-            RclConsensusValidationSource::preferred_min_seq(&self.validations, &wrapped, min_valid_seq);
+        let preferred = RclConsensusValidationSource::preferred_min_seq(
+            &self.validations,
+            &wrapped,
+            min_valid_seq,
+        );
         if mode != ConsensusMode::WrongLedger && preferred != *prev_ledger_id {
             tracing::info!(
                 target: "consensus",
@@ -563,11 +574,15 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 // Amendment voting — creates ttAMENDMENT pseudo-txs for
                 // amendments gaining/losing majority or activating.
                 if let Some(ref amendment_status) = self.amendment_status {
-                    let prev_id = prev_ledger.id();
+                    let prev_id = prev_ledger.ledger().header().parent_hash;
+                    let parent_validations =
+                        self.validations.store().trusted_for_ledger_by_sequence(
+                            *prev_id.as_uint256(),
+                            prev_ledger.seq() - 1,
+                        );
                     let parent_validations = self
-                        .validations
-                        .store()
-                        .trusted_for_ledger_by_sequence(prev_id, prev_ledger.seq());
+                        .validators
+                        .negative_unl_filter_validations(parent_validations);
                     let mut vote_set: Vec<protocol::STTx> = Vec::new();
                     amendment_status.do_voting_for_ledger(
                         &prev_ledger.ledger(),
@@ -589,11 +604,15 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 // FeeVote — injects a ttFEE pseudo-tx when the network
                 // should move to new fee parameters.
                 if let Some(ref fee_vote) = self.fee_vote {
-                    let prev_id = prev_ledger.id();
+                    let prev_id = prev_ledger.ledger().header().parent_hash;
+                    let parent_validations =
+                        self.validations.store().trusted_for_ledger_by_sequence(
+                            *prev_id.as_uint256(),
+                            prev_ledger.seq() - 1,
+                        );
                     let parent_validations = self
-                        .validations
-                        .store()
-                        .trusted_for_ledger_by_sequence(prev_id, prev_ledger.seq());
+                        .validators
+                        .negative_unl_filter_validations(parent_validations);
                     let mut fee_vote_set: Vec<protocol::STTx> = Vec::new();
                     let ledger_ref = prev_ledger.ledger();
                     fee_vote.do_voting(&*ledger_ref, &parent_validations, &mut fee_vote_set);
@@ -1059,19 +1078,13 @@ impl AppConsensus {
                                 // ledgers (the ledger just before a flag ledger).
                                 if closed.is_voting_ledger() {
                                     if let Some(ref fee_vote) = self.adaptor.fee_vote {
-                                        fee_vote.do_validation(
-                                            closed.fees(),
-                                            closed.rules(),
-                                            v,
-                                        );
+                                        fee_vote.do_validation(closed.fees(), closed.rules(), v);
                                     }
                                     if let Some(ref amendment_status) =
                                         self.adaptor.amendment_status
                                     {
-                                        amendment_status.do_validation_for_ledger(
-                                            closed.as_ref(),
-                                            v,
-                                        );
+                                        amendment_status
+                                            .do_validation_for_ledger(closed.as_ref(), v);
                                     }
                                 }
                             },
@@ -1166,34 +1179,12 @@ impl AppConsensus {
                                 // Demote to Connected matching rippled NetworkOPs.cpp:1997.
                                 if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                                     if let Some(shared) = guard.as_ref() {
-                                        // Resolve the seq from the ledger cache first,
-                                        // falling back to the peer that reports this hash.
-                                        let seq = lm_rt
-                                            .ledger_master()
-                                            .ledger_history()
-                                            .get_cached_ledger_by_hash(
-                                                basics::sha_map_hash::SHAMapHash::new(
-                                                    network_closed,
-                                                ),
-                                            )
-                                            .map(|l| l.header().seq)
-                                            .or_else(|| {
-                                                // Ask peers for the seq of this hash.
-                                                if let Some(ort) = root.overlay_runtime() {
-                                                    use overlay::Overlay;
-                                                    ort.overlay()
-                                                        .active_peers()
-                                                        .iter()
-                                                        .find(|p| {
-                                                            p.closed_ledger_hash() == network_closed
-                                                        })
-                                                        .map(|p| p.ledger_range().1)
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                            .unwrap_or(0);
-                                        shared.acquire_async(network_closed, seq, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
+                                        // The peer's history range does not authoritatively
+                                        // bind a sequence to its closed-ledger hash.
+                                        shared.acquire_closed_ledger_async(
+                                            network_closed,
+                                            crate::ledger::inbound_ledgers::AcquireReason::Consensus,
+                                        );
                                     }
                                 }
                                 root.set_need_network_ledger(true);
@@ -1395,7 +1386,7 @@ impl ConsensusRunner for AppConsensus {
 
 #[cfg(test)]
 mod sync_tree_conversion_tests {
-    use super::sync_tree_to_rcl_tx_set;
+    use super::{should_acquire_consensus_ledger, sync_tree_to_rcl_tx_set};
     use basics::hardened_hash::HardenedHashBuilder;
     use basics::tagged_cache::MonotonicClock;
     use protocol::{STAmount, STTx, TxType, get_field_by_symbol, serialize_blob};
@@ -1449,6 +1440,18 @@ mod sync_tree_conversion_tests {
         );
         tree.set_full();
         tree
+    }
+
+    #[test]
+    fn consensus_ledger_acquisition_is_coalesced_by_hash() {
+        let first = basics::base_uint::Uint256::from_u64(1);
+        let second = basics::base_uint::Uint256::from_u64(2);
+        let mut acquiring = None;
+
+        assert!(should_acquire_consensus_ledger(&mut acquiring, first));
+        assert!(!should_acquire_consensus_ledger(&mut acquiring, first));
+        assert!(should_acquire_consensus_ledger(&mut acquiring, second));
+        assert!(!should_acquire_consensus_ledger(&mut acquiring, second));
     }
 
     #[test]

@@ -199,9 +199,7 @@ pub struct RclValidationsAdaptor {
     ledger_master_runtime: parking_lot::Mutex<
         Option<Arc<crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime>>,
     >,
-    overlay: parking_lot::Mutex<
-        Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
-    >,
+    overlay: parking_lot::Mutex<Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>>,
 }
 
 impl RclValidationsAdaptor {
@@ -238,10 +236,7 @@ impl RclValidationsAdaptor {
 
     /// Attach (or detach) the overlay so `acquire` can resolve a ledger
     /// sequence number from peers when the local cache does not have it.
-    pub fn set_overlay(
-        &self,
-        overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
-    ) {
+    pub fn set_overlay(&self, overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>) {
         *self.overlay.lock() = overlay;
     }
 }
@@ -293,31 +288,11 @@ impl consensus::rcl_support::ValidationsAdaptor for RclValidationsAdaptor {
         if let Some(guard) = runtime.inbound_ledgers.lock().ok()
             && let Some(shared) = guard.as_ref()
         {
-            // Resolve the seq from the ledger cache first, falling back to
-            // peers that advertise this hash.  A correct seq lets the
-            // acquisition layer select peers via ledger-range fast-path and
-            // include the sequence in wire requests, both critical for
-            // reliable mainnet operation.
-            let seq = runtime
-                .ledger_master()
-                .ledger_history()
-                .get_cached_ledger_by_hash(hash)
-                .map(|l| l.header().seq)
-                .or_else(|| {
-                    if let Some(ort) = self.overlay.lock().as_ref() {
-                        use overlay::Overlay;
-                        ort.active_peers()
-                            .iter()
-                            .find(|p| p.closed_ledger_hash() == *ledger_id)
-                            .map(|p| p.ledger_range().1)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0);
-            shared.acquire_async(
+            // This path has only a ledger hash. A peer's history range is
+            // not an authoritative hash-to-sequence binding, so acquire by
+            // hash and learn the sequence from the response header.
+            shared.acquire_closed_ledger_async(
                 *ledger_id,
-                seq,
                 crate::ledger::inbound_ledgers::AcquireReason::Consensus,
             );
         }

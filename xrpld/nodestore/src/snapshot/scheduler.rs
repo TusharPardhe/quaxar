@@ -30,6 +30,7 @@
 //! verify the root matches — any extraneous nodes are harmless (they exist in the
 //! store but are not reachable from the verified root).
 
+use protocol::LedgerHeader;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -83,13 +84,9 @@ impl SnapshotScheduler {
     ///
     /// The export iterates the backend without holding any application-level lock.
     /// See module-level documentation for snapshot isolation guarantees per backend.
-    pub fn on_ledger_accepted(
-        &self,
-        ledger_seq: u32,
-        ledger_hash: [u8; 32],
-        account_hash: [u8; 32],
-        backend: Arc<dyn Backend>,
-    ) -> bool {
+    pub fn on_ledger_accepted(&self, header: LedgerHeader, backend: Arc<dyn Backend>) -> bool {
+        let ledger_seq = header.seq;
+        let ledger_hash = *header.hash.as_uint256().data();
         if !self.is_enabled() {
             return false;
         }
@@ -110,9 +107,23 @@ impl SnapshotScheduler {
 
         self.last_snapshot_seq.store(ledger_seq, Ordering::Release);
 
+        let manifest = SnapshotManifest {
+            version: SNAPSHOT_VERSION,
+            ledger_seq,
+            ledger_hash,
+            account_hash: *header.account_hash.as_uint256().data(),
+            tx_hash: *header.tx_hash.as_uint256().data(),
+            parent_hash: *header.parent_hash.as_uint256().data(),
+            drops: header.drops,
+            close_time: header.close_time,
+            parent_close_time: header.parent_close_time,
+            close_time_res: header.close_time_resolution,
+            close_flags: header.close_flags,
+            chunks: Vec::new(),
+        };
+
         let output_dir = self.config.output_dir.clone();
         let in_progress = Arc::clone(&self.export_in_progress);
-
         let spawn_result = thread::Builder::new()
             .name(format!("snapshot-export-{ledger_seq}"))
             .spawn(move || {
@@ -122,21 +133,6 @@ impl SnapshotScheduler {
                     .collect();
                 let filename = format!("snapshot-{ledger_seq}-{hash_hex}.xrpls");
                 let output_path = output_dir.join(&filename);
-
-                let manifest = SnapshotManifest {
-                    version: SNAPSHOT_VERSION,
-                    ledger_seq,
-                    ledger_hash,
-                    account_hash,
-                    tx_hash: [0u8; 32],
-                    parent_hash: [0u8; 32],
-                    drops: 0,
-                    close_time: 0,
-                    parent_close_time: 0,
-                    close_time_res: 10,
-                    close_flags: 0,
-                    chunks: Vec::new(),
-                };
 
                 match export_snapshot(backend.as_ref(), &manifest, &output_path) {
                     Ok(()) => {

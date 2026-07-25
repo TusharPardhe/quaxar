@@ -44,6 +44,15 @@ fn database_counts_json_reports_expected_node_store_fields() {
         panic!("counts json should be an object");
     };
     let expected_keys = [
+        "node_object_cache_capacity_bytes",
+        "node_object_cache_durable_loads",
+        "node_object_cache_entries",
+        "node_object_cache_hits",
+        "node_object_cache_invalidations",
+        "node_object_cache_misses",
+        "node_object_cache_oversized",
+        "node_object_cache_promotions",
+        "node_object_cache_rejected",
         "node_read_bytes",
         "node_reads_duration_us",
         "node_reads_hit",
@@ -108,7 +117,7 @@ fn rotating_database_counts_json_reports_the_same_public_fields() {
     let JsonValue::Object(counts) = database.get_counts_json() else {
         panic!("counts json should be an object");
     };
-    assert_eq!(counts.len(), 10);
+    assert_eq!(counts.len(), 19);
     assert!(matches!(
         counts.get("read_request_bundle"),
         Some(JsonValue::Signed(4))

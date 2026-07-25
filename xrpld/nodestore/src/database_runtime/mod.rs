@@ -5,5 +5,6 @@ pub mod database_rotating;
 pub mod factory;
 pub mod journal;
 pub mod manager;
+pub(crate) mod node_object_cache;
 pub mod scheduler;
 pub mod task;

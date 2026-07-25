@@ -376,27 +376,9 @@ fn strand_loop(
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let pending = lm_rt.take_pending_consensus_ledger();
             if let Some(hash) = pending {
-                // Resolve the seq from the ledger cache first, falling back
-                // to peers that advertise this hash.
-                let seq = lm_rt
-                    .ledger_master()
-                    .ledger_history()
-                    .get_cached_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(hash))
-                    .map(|l| l.header().seq)
-                    .or_else(|| {
-                        if let Some(ort) = root.overlay_runtime() {
-                            use overlay::Overlay;
-                            ort.overlay()
-                                .active_peers()
-                                .iter()
-                                .find(|p| p.closed_ledger_hash() == hash)
-                                .map(|p| p.ledger_range().1)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0);
-                shared_inbound.acquire_async(hash, seq, AcquireReason::Consensus);
+                // A pending consensus ledger is keyed by hash only. Do not
+                // infer its sequence from a peer's independent history range.
+                shared_inbound.acquire_closed_ledger_async(hash, AcquireReason::Consensus);
             }
         }
 
@@ -444,7 +426,9 @@ fn check_accept_and_advance(
         // H3: Include our own closed ledger in the tally so getPreferredLCL
         // accounts for our view.  Matches rippled where checkLastClosedLedger
         // counts the node's own closed ledger hash among peers.
-        if root.network_ops_operating_mode() >= crate::network::network_ops::NetworkOpsOperatingMode::Tracking {
+        if root.network_ops_operating_mode()
+            >= crate::network::network_ops::NetworkOpsOperatingMode::Tracking
+        {
             if let Some(our_closed) = root.closed_ledger() {
                 let our_hash = *our_closed.header().hash.as_uint256();
                 if !our_hash.is_zero() {
@@ -476,16 +460,12 @@ fn check_accept_and_advance(
             // when it does not.
             let target = peers
                 .iter()
-                .filter_map(|peer| {
-                    let hash = peer.closed_ledger_hash();
-                    let (_, seq) = peer.ledger_range();
-                    (hash == preferred_hash && seq > 1).then_some((seq, hash))
-                })
-                .max_by_key(|(seq, _)| *seq);
-            if let Some((seq, hash)) = target
+                .map(|peer| peer.closed_ledger_hash())
+                .find(|hash| *hash == preferred_hash);
+            if let Some(hash) = target
                 && !shared_inbound.contains(&hash)
             {
-                shared_inbound.acquire_async(hash, seq, AcquireReason::Consensus);
+                shared_inbound.acquire_closed_ledger_async(hash, AcquireReason::Consensus);
             }
 
             if let Some(network_ledger) = lm
@@ -505,135 +485,131 @@ fn check_accept_and_advance(
                     // sequence.  Matches rippled's isCompatible guard which prevents
                     // re-processing already-validated ledger heights.
                     if new_seq > lm.valid_ledger_seq() {
-                    let trusted_validation_quorum =
-                        root.validations().num_trusted_for_ledger(new_hash) >= quorum;
+                        let trusted_validation_quorum =
+                            root.validations().num_trusted_for_ledger(new_hash) >= quorum;
 
-                    if trusted_validation_quorum {
-                        let mut ledger = (*network_ledger).clone();
-                        ledger.set_validated();
-                        let validated = Arc::new(ledger);
-                        lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
-                        lm.mark_ledger_complete(validated.header().seq);
-                        root.note_validated_ledger_for_sync(Arc::clone(&validated));
-                        root.on_closed_ledger(Arc::clone(&validated));
-                        root.try_advance_publication();
-                        root.promote_operating_mode_after_accepted_ledger(&validated);
-                    } else {
-                        // This is a peer-LCL fallback, not a claim that the
-                        // ledger is validated. Install it as the closed ledger
-                        // so consensus can resume; later trusted validations
-                        // still flow through checkAccept before advancing the
-                        // validated-ledger slot.
-                        //
-                        // We must also advance `valid_ledger_seq` here.  If we
-                        // leave it at its old value (e.g. after a DB-restart
-                        // catch-up), `get_preferred` can return ledgers far
-                        // ahead of what we've actually closed, causing every
-                        // subsequent consensus round to be killed by
-                        // `check_ledger` before it can advance the validated
-                        // ledger -- an infinite restart deadlock.  Updating
-                        // `valid_ledger_seq` bounds `min_valid_seq` so that
-                        // `get_preferred` only returns ledgers we've actually
-                        // closed, preventing the deadlock.
-                        lm.set_valid_ledger_no_sweep(
-                            Arc::clone(&network_ledger),
-                            None,
-                            None,
+                        if trusted_validation_quorum {
+                            let mut ledger = (*network_ledger).clone();
+                            ledger.set_validated();
+                            let validated = Arc::new(ledger);
+                            lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
+                            lm.mark_ledger_complete(validated.header().seq);
+                            root.note_validated_ledger_for_sync(Arc::clone(&validated));
+                            root.on_closed_ledger(Arc::clone(&validated));
+                            root.try_advance_publication();
+                            root.promote_operating_mode_after_accepted_ledger(&validated);
+                        } else {
+                            // This is a peer-LCL fallback, not a claim that the
+                            // ledger is validated. Install it as the closed ledger
+                            // so consensus can resume; later trusted validations
+                            // still flow through checkAccept before advancing the
+                            // validated-ledger slot.
+                            //
+                            // We must also advance `valid_ledger_seq` here.  If we
+                            // leave it at its old value (e.g. after a DB-restart
+                            // catch-up), `get_preferred` can return ledgers far
+                            // ahead of what we've actually closed, causing every
+                            // subsequent consensus round to be killed by
+                            // `check_ledger` before it can advance the validated
+                            // ledger -- an infinite restart deadlock.  Updating
+                            // `valid_ledger_seq` bounds `min_valid_seq` so that
+                            // `get_preferred` only returns ledgers we've actually
+                            // closed, preventing the deadlock.
+                            lm.set_valid_ledger_no_sweep(Arc::clone(&network_ledger), None, None);
+                            lm.mark_ledger_complete(network_ledger.header().seq);
+                            root.on_closed_ledger(Arc::clone(&network_ledger));
+                            root.promote_operating_mode_after_accepted_ledger(&network_ledger);
+                        }
+
+                        root.set_need_network_ledger(false);
+
+                        // Rippled parity: rebuild open ledger on the new chain so
+                        // local transactions and TxQ state are re-evaluated against
+                        // the new parent. Matches NetworkOPs::switchLastClosedLedger
+                        // `openLedger_.accept(...)` after chain jump.
+                        root.rebuild_open_ledger_after_consensus(
+                            new_seq.saturating_add(1),
+                            network_ledger.fees().base,
+                            new_hash,
                         );
-                        lm.mark_ledger_complete(network_ledger.header().seq);
-                        root.on_closed_ledger(Arc::clone(&network_ledger));
-                        root.promote_operating_mode_after_accepted_ledger(&network_ledger);
-                    }
 
-                    root.set_need_network_ledger(false);
+                        // Rippled parity: broadcast neSWITCHED_LEDGER to all peers
+                        // so they know we jumped to the network chain.
+                        if let Some(overlay_rt) = root.overlay_runtime() {
+                            use overlay::Overlay;
+                            let hdr = network_ledger.header();
+                            let status = overlay::ProtocolMessage::new(
+                                overlay::ProtocolPayload::StatusChange(
+                                    overlay::message::wire::TmStatusChange {
+                                        new_status: None,
+                                        new_event: Some(3), // neSWITCHED_LEDGER
+                                        ledger_seq: Some(hdr.seq),
+                                        ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
+                                        ledger_hash_previous: Some(
+                                            hdr.parent_hash.as_uint256().data().to_vec(),
+                                        ),
+                                        network_time: None,
+                                        first_seq: Some(0),
+                                        last_seq: Some(0),
+                                    },
+                                ),
+                            );
+                            overlay_rt.overlay().broadcast(&status);
+                        }
 
-                    // Rippled parity: rebuild open ledger on the new chain so
-                    // local transactions and TxQ state are re-evaluated against
-                    // the new parent. Matches NetworkOPs::switchLastClosedLedger
-                    // `openLedger_.accept(...)` after chain jump.
-                    root.rebuild_open_ledger_after_consensus(
-                        new_seq.saturating_add(1),
-                        network_ledger.fees().base,
-                        new_hash,
-                    );
+                        // H5: TxQ::processClosedLedger on chain jump.  Matches
+                        // rippled's switchLastClosedLedger which calls
+                        // TxQ::processClosedLedger with backStep=true after
+                        // re-parenting the open ledger.
+                        root.process_closed_ledger_txq(network_ledger.as_ref(), false);
 
-                    // Rippled parity: broadcast neSWITCHED_LEDGER to all peers
-                    // so they know we jumped to the network chain.
-                    if let Some(overlay_rt) = root.overlay_runtime() {
-                        use overlay::Overlay;
-                        let hdr = network_ledger.header();
-                        let status = overlay::ProtocolMessage::new(
-                            overlay::ProtocolPayload::StatusChange(
-                                overlay::message::wire::TmStatusChange {
-                                    new_status: None,
-                                    new_event: Some(3), // neSWITCHED_LEDGER
-                                    ledger_seq: Some(hdr.seq),
-                                    ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
-                                    ledger_hash_previous: Some(
-                                        hdr.parent_hash.as_uint256().data().to_vec(),
-                                    ),
-                                    network_time: None,
-                                    first_seq: Some(0),
-                                    last_seq: Some(0),
-                                },
-                            ),
+                        // H6: Update NegativeUNL and trust set before starting the
+                        // next consensus round.  Matches rippled's
+                        // switchLastClosedLedger which calls
+                        // updateTrie(validations, ledger) and
+                        // validators.setNegativeUNL() before beginConsensus.
+                        {
+                            let nunl_bytes = network_ledger.negative_unl();
+                            let nunl: std::collections::HashSet<PublicKey> =
+                                nunl_bytes.into_iter().map(PublicKey::from_bytes).collect();
+                            root.validators().set_negative_unl(nunl);
+                        }
+                        root.validators().update_trusted(
+                            &std::collections::HashSet::new(),
+                            root.current_close_time_seconds(),
                         );
-                        overlay_rt.overlay().broadcast(&status);
-                    }
 
-                    // H5: TxQ::processClosedLedger on chain jump.  Matches
-                    // rippled's switchLastClosedLedger which calls
-                    // TxQ::processClosedLedger with backStep=true after
-                    // re-parenting the open ledger.
-                    root.process_closed_ledger_txq(network_ledger.as_ref(), false);
+                        let now = root.shared_time_keeper().close_time();
+                        let prev_cx = crate::consensus_ledger_from_ledger(&network_ledger);
+                        if let Some(inbound_tx) = root.inbound_transactions().lock().ok().as_mut() {
+                            inbound_tx.new_round(network_ledger.header().seq);
+                        }
+                        runner.start_round(now, new_hash, prev_cx, true);
 
-                    // H6: Update NegativeUNL and trust set before starting the
-                    // next consensus round.  Matches rippled's
-                    // switchLastClosedLedger which calls
-                    // updateTrie(validations, ledger) and
-                    // validators.setNegativeUNL() before beginConsensus.
-                    {
-                        let nunl_bytes = network_ledger.negative_unl();
-                        let nunl: std::collections::HashSet<PublicKey> = nunl_bytes
-                            .into_iter()
-                            .map(PublicKey::from_bytes)
-                            .collect();
-                        root.validators().set_negative_unl(nunl);
-                    }
-                    root.validators().update_trusted(&std::collections::HashSet::new(),
-                        root.current_close_time_seconds());
-
-                    let now = root.shared_time_keeper().close_time();
-                    let prev_cx = crate::consensus_ledger_from_ledger(&network_ledger);
-                    if let Some(inbound_tx) = root.inbound_transactions().lock().ok().as_mut() {
-                        inbound_tx.new_round(network_ledger.header().seq);
-                    }
-                    runner.start_round(now, new_hash, prev_cx, true);
-
-                    // M16: Cycle peer status after chain jump.  Matches rippled's
-                    // endConsensus which calls cycleStatus() on peers that still
-                    // advertise the now-dead closed ledger, so they re-report
-                    // their current state on the next StatusChange message.
-                    if let Some(overlay_rt) = root.overlay_runtime() {
-                        use overlay::Overlay;
-                        let dead_ledger = network_ledger.header().parent_hash;
-                        for peer in overlay_rt.overlay().active_peers() {
-                            if peer.closed_ledger_hash() == *dead_ledger.as_uint256() {
-                                peer.cycle_status();
+                        // M16: Cycle peer status after chain jump.  Matches rippled's
+                        // endConsensus which calls cycleStatus() on peers that still
+                        // advertise the now-dead closed ledger, so they re-report
+                        // their current state on the next StatusChange message.
+                        if let Some(overlay_rt) = root.overlay_runtime() {
+                            use overlay::Overlay;
+                            let dead_ledger = network_ledger.header().parent_hash;
+                            for peer in overlay_rt.overlay().active_peers() {
+                                if peer.closed_ledger_hash() == *dead_ledger.as_uint256() {
+                                    peer.cycle_status();
+                                }
                             }
                         }
-                    }
 
-                    consensus_rt.update_phase(runner.phase());
-                    consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-                    *last_round_ledger_id = Some(new_hash);
-                    tracing::info!(
-                        target: "consensus",
-                        new_seq,
-                        %new_hash,
-                        trusted_validation_quorum,
-                        "Consensus restarted on network chain (switchLastClosedLedger)"
-                    );
+                        consensus_rt.update_phase(runner.phase());
+                        consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
+                        *last_round_ledger_id = Some(new_hash);
+                        tracing::info!(
+                            target: "consensus",
+                            new_seq,
+                            %new_hash,
+                            trusted_validation_quorum,
+                            "Consensus restarted on network chain (switchLastClosedLedger)"
+                        );
                     } else {
                         tracing::warn!(
                             target: "consensus",
@@ -672,11 +648,9 @@ fn check_accept_and_advance(
                 // Rippled parity: propagate median fee from trusted validations.
                 // Matches LedgerMaster::checkAccept lines 986-1014.
                 let load_base = root.load_fee_track().load_base();
-                let mut fees = root.validations().fees_for_ledger(
-                    closed_hash,
-                    closed_seq,
-                    load_base,
-                );
+                let mut fees =
+                    root.validations()
+                        .fees_for_ledger(closed_hash, closed_seq, load_base);
                 {
                     let parent_hash = *closed.header().parent_hash.as_uint256();
                     let mut fees2 = root.validations().fees_for_ledger(

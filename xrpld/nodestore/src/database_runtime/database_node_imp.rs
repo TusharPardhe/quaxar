@@ -14,7 +14,6 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
-use std::time::Instant;
 
 struct DatabaseNodeImpCore {
     backend: Arc<dyn Backend>,
@@ -119,9 +118,10 @@ impl DatabaseNodeImp {
     }
 
     pub fn store(&self, object_type: NodeObjectType, data: Blob, hash: Uint256, _ledger_seq: u32) {
-        self.database.store_stats(1, data.len() as u64);
         let object = NodeObject::create_object(object_type, data, hash);
-        self.backend.store(object);
+        self.backend.store(Arc::clone(&object));
+        self.database.store_stats(1, object.data().len() as u64);
+        self.database.promote_node_object(object);
     }
 
     pub fn is_same_db(&self, _first: u32, _second: u32) -> bool {
@@ -147,33 +147,28 @@ impl DatabaseNodeImp {
         self.database.async_fetch(hash, ledger_seq, callback);
     }
 
+    /// Compatibility batch helper. The public Database trait has no batch
+    /// surface, so route each element through DatabaseRuntime to retain the
+    /// mandatory cache, validation, and single-flight policy.
     pub fn fetch_batch(&self, hashes: &[Uint256]) -> Vec<Option<Arc<NodeObject>>> {
-        let before = Instant::now();
-        let (mut results, _status) = self.backend.fetch_batch(hashes);
-        assert!(
-            results.len() == hashes.len() || results.is_empty(),
-            "number of output objects either matches number of input hashes or is empty"
-        );
-        results.resize(hashes.len(), None);
-
-        for (index, result) in results.iter().enumerate() {
-            if result.is_none() {
-                self.database.journal().log(
-                    JournalLevel::Error,
-                    &format!(
-                        "fetchBatch - record not found in db. hash = {}",
-                        str_hex(hashes[index].data())
-                    ),
-                );
-            }
-        }
-
-        self.database.update_fetch_metrics(
-            hashes.len() as u64,
-            0,
-            before.elapsed().as_micros() as u64,
-        );
-        results
+        hashes
+            .iter()
+            .map(|hash| {
+                let result =
+                    self.database
+                        .fetch_node_object(hash, 0, FetchType::Synchronous, false);
+                if result.is_none() {
+                    self.database.journal().log(
+                        JournalLevel::Error,
+                        &format!(
+                            "fetchBatch - record not found in db. hash = {}",
+                            str_hex(hash.data())
+                        ),
+                    );
+                }
+                result
+            })
+            .collect()
     }
 
     pub fn stop(&self) {

@@ -39,8 +39,17 @@ pub trait SHAMapStoreTransactionCacheRuntime: Send + Sync {
 
 pub trait SHAMapStoreNodeStoreRuntime: Send + Sync {
     fn fetch_node_object(&self, hash: &Uint256, ledger_seq: u32) -> bool;
+
+    /// Enable archive-read copy-forward for the rotation exposure window.
+    fn set_rotation_in_flight(&self, _in_flight: bool) {}
+
     fn rotate_with(&self, new_backend: Box<dyn Backend>) -> (String, String);
 }
+
+/// RAII token returned by a component runtime while rotating. Its destructor
+/// closes the archive-read copy-forward window on normal return, early return,
+/// and unwinding.
+pub trait SHAMapStoreRotationWindow: Send {}
 
 pub trait SHAMapStoreRotatingBackendFactory: Send + Sync {
     fn make_backend(&self) -> Result<Box<dyn Backend>, String>;
@@ -110,6 +119,18 @@ impl SHAMapStoreRotatingBackendFactory for ConfiguredSHAMapStoreBackendFactory {
             Arc::clone(&self.journal),
             None,
         )
+    }
+}
+
+struct NodeStoreRotationWindow {
+    node_store: Arc<dyn SHAMapStoreNodeStoreRuntime>,
+}
+
+impl SHAMapStoreRotationWindow for NodeStoreRotationWindow {}
+
+impl Drop for NodeStoreRotationWindow {
+    fn drop(&mut self) {
+        self.node_store.set_rotation_in_flight(false);
     }
 }
 
@@ -325,6 +346,13 @@ impl SHAMapStoreComponentRuntime for SHAMapStoreAppRuntime {
         )
     }
 
+    fn begin_rotation_window(&mut self) -> Result<Box<dyn SHAMapStoreRotationWindow>, String> {
+        self.node_store.set_rotation_in_flight(true);
+        Ok(Box::new(NodeStoreRotationWindow {
+            node_store: Arc::clone(&self.node_store),
+        }))
+    }
+
     fn freshen_caches(&mut self) -> Result<(), String> {
         self.freshen_keys(self.node_family.tree_node_cache_keys());
         if self.stopping {
@@ -414,6 +442,10 @@ where
     fn fetch_node_object(&self, hash: &Uint256, ledger_seq: u32) -> bool {
         nodestore::Database::fetch_node_object(self, hash, ledger_seq, FetchType::Synchronous, true)
             .is_some()
+    }
+
+    fn set_rotation_in_flight(&self, in_flight: bool) {
+        nodestore::DatabaseRotating::set_rotation_in_flight(self, in_flight);
     }
 
     fn rotate_with(&self, new_backend: Box<dyn Backend>) -> (String, String) {
@@ -521,6 +553,13 @@ mod tests {
             true
         }
 
+        fn set_rotation_in_flight(&self, in_flight: bool) {
+            self.rotations
+                .lock()
+                .expect("rotations mutex must not be poisoned")
+                .push(format!("rotation-in-flight:{in_flight}"));
+        }
+
         fn rotate_with(&self, new_backend: Box<dyn Backend>) -> (String, String) {
             let name = new_backend.get_name();
             self.rotations
@@ -589,6 +628,40 @@ mod tests {
         fn make_backend(&self) -> Result<Box<dyn Backend>, String> {
             Ok(Box::new(TestBackend("writable.next")))
         }
+    }
+
+    #[test]
+    fn app_runtime_rotation_window_enables_and_clears_copy_forward() {
+        let node_store: Arc<RecordingNodeStoreRuntime> = Arc::default();
+        let mut runtime = SHAMapStoreAppRuntime::new(
+            Arc::new(RecordingLedgerRuntime::default()),
+            Arc::new(RecordingNodeFamilyRuntime::default()),
+            Arc::new(RecordingTransactionRuntime::default()),
+            node_store.clone(),
+            Arc::new(RecordingFactory),
+            None,
+            Arc::new(NullSHAMapStoreCopyRuntime),
+        );
+
+        let window = runtime.begin_rotation_window().expect("rotation window");
+        assert_eq!(
+            *node_store
+                .rotations
+                .lock()
+                .expect("rotations mutex must not be poisoned"),
+            vec!["rotation-in-flight:true".to_owned()]
+        );
+        drop(window);
+        assert_eq!(
+            *node_store
+                .rotations
+                .lock()
+                .expect("rotations mutex must not be poisoned"),
+            vec![
+                "rotation-in-flight:true".to_owned(),
+                "rotation-in-flight:false".to_owned(),
+            ]
+        );
     }
 
     #[test]

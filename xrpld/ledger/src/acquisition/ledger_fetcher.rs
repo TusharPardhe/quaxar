@@ -3164,18 +3164,20 @@ pub fn make_inbound_needed_by_hash_request(
         InboundLedgerObjectType::StateNode => TM_GET_OBJECT_BY_HASH_STATE_NODE,
     };
 
-    // Rippled parity: include ALL needed hashes (state, tx, ledger) in one
-    // batched request. Matches InboundLedger::trigger where byHash_ &&
-    // timeouts_ > threshold builds a TMGetObjectByHash containing all types.
+    // Rippled parity: rippled explicitly filters the needed hashes by the first
+    // type it encounters (p.first == tmBH.type()). It does not mix object types
+    // within a single TMGetObjectByHash packet.
     let mut objects = Vec::new();
     for &(object_type, hash) in needed {
-        objects.push(overlay::message::wire::TmIndexedObject {
-            hash: Some(hash.data().to_vec()),
-            index: None,
-            data: None,
-            node_id: None,
-            ledger_seq: (seq != 0).then_some(seq),
-        });
+        if object_type == first_type {
+            objects.push(overlay::message::wire::TmIndexedObject {
+                hash: Some(hash.data().to_vec()),
+                index: None,
+                data: None,
+                node_id: None,
+                ledger_seq: (seq != 0).then_some(seq),
+            });
+        }
     }
 
     Some(ProtocolMessage::new(ProtocolPayload::GetObjects(

@@ -3,7 +3,7 @@
 use basics::base_uint::Uint256;
 use basics::chrono::NetClockTimePoint;
 use consensus::model::ConsensusProposal;
-use protocol::{PublicKey, sha512_half, sign_digest, verify_digest};
+use protocol::{HashPrefix, PublicKey, sha512_half, sign_digest, verify_digest};
 
 /// The RCL consensus proposal type, keyed by the proposer's `PublicKey`
 /// (matching `component_runtime.rs`'s `PendingProposal` and
@@ -81,7 +81,7 @@ fn proposal_signing_hash(
     position: &Uint256,
 ) -> Uint256 {
     let mut data = Vec::with_capacity(4 + 4 + 4 + 32 + 32);
-    data.extend_from_slice(&0x5052_4F50u32.to_be_bytes());
+    data.extend_from_slice(&HashPrefix::Proposal.as_u32().to_be_bytes());
     data.extend_from_slice(&propose_seq.to_be_bytes());
     data.extend_from_slice(&close_time.as_seconds().to_be_bytes());
     data.extend_from_slice(prev_ledger.data());
@@ -169,6 +169,29 @@ mod tests {
             now,
             node_id,
         )
+    }
+
+    #[test]
+    fn proposal_signing_hash_uses_canonical_xrpl_prefix() {
+        let (_, public_key) = keypair();
+        let proposal = sample_proposal(public_key);
+        let mut canonical_preimage = Vec::with_capacity(4 + 4 + 4 + 32 + 32);
+        canonical_preimage.extend_from_slice(&0x5052_5000u32.to_be_bytes());
+        canonical_preimage.extend_from_slice(&proposal.propose_seq().to_be_bytes());
+        canonical_preimage.extend_from_slice(&proposal.close_time().as_seconds().to_be_bytes());
+        canonical_preimage.extend_from_slice(proposal.prev_ledger().data());
+        canonical_preimage.extend_from_slice(proposal.position().data());
+
+        assert_eq!(HashPrefix::Proposal.as_u32(), 0x5052_5000);
+        assert_eq!(
+            proposal_signing_hash(
+                proposal.propose_seq(),
+                proposal.close_time(),
+                proposal.prev_ledger(),
+                proposal.position(),
+            ),
+            sha512_half(&canonical_preimage),
+        );
     }
 
     #[test]

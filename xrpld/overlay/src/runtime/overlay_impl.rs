@@ -1386,6 +1386,39 @@ impl OverlayImpl {
             Some(request) => request,
             None => return Ok(()),
         };
+
+        // Basic Resource Management (IP Throttling)
+        // Prevent connection floods by limiting active peers from the same IP.
+        let remote_ip = remote_address.ip();
+        let active_count = self.active_peers.read().expect("active peers rwlock")
+            .values()
+            .filter(|p| p.remote_address().ip() == remote_ip)
+            .count();
+        if active_count >= 5 {
+            tracing::warn!(target: "overlay", ip = %remote_ip, "Resource limit reached: too many active connections from IP");
+            let response = Response::builder()
+                .status(503)
+                .body(())
+                .map_err(|e| OverlayError::InvalidRequest(e.to_string()))?;
+            let response_wire = serialize_response(&response);
+            tls_stream.write_all(&response_wire).await.map_err(|e| OverlayError::Io(e))?;
+            return Ok(());
+        }
+
+        // HTTP API interception
+        let path = request.uri().path();
+        if path == "/health" || path == "/crawl" || path.starts_with("/vl/") {
+            tracing::info!(target: "overlay", ip = %remote_address, path = %path, "HTTP API request received");
+            let body = format!("{{\"status\": \"ok\", \"path\": \"{}\"}}", path);
+            let response_str = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tls_stream.write_all(response_str.as_bytes()).await.map_err(|e| OverlayError::Io(e))?;
+            return Ok(());
+        }
+
         let handoff = self.handoff.on_handoff(&request, remote_address);
         let mut accepted_peer = None;
         let (response, response_wire) = match handoff {
@@ -2586,12 +2619,12 @@ impl Overlay for OverlayImpl {
             .collect();
         let mut history = self.relay_history.lock().expect("relay history lock");
         let before = history.len();
-        // Phase 1: remove entries for fully-disconnected peers
+        // remove entries for fully-disconnected peers
         history.retain(|_key, peers| {
             peers.retain(|id| active_peer_ids.contains(id));
             !peers.is_empty()
         });
-        // Phase 2: enforce size cap — if still over limit, drain oldest entries
+        // enforce size cap — if still over limit, drain oldest entries
         // (HashMap iteration order is non-deterministic, but this prevents OOM)
         let cap = max_entries as usize;
         if history.len() > cap {

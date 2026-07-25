@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use basics::base_uint::Uint256;
-use protocol::{PublicKey, sha512_half, verify_digest};
+use protocol::{HashPrefix, PublicKey, sha512_half, verify_digest};
 
 use crate::message::{
     TmEndpoints, TmGetLedger, TmGetObjectByHash, TmHaveTransactions, TmLedgerData, TmManifests,
@@ -57,7 +57,7 @@ impl QueuedProposal {
     ///
     /// Matches rippled's `RCLCxPeerPos::checkSign()` which calls
     /// `verify_digest` against the proposal signing hash.  The hash encodes
-    /// `HashPrefix::Proposal (0x50524F50) | propose_seq | close_time |
+    /// `HashPrefix::Proposal (0x50525000) | propose_seq | close_time |
     /// prev_ledger | current_tx_hash`, matching `RCLCxPeerPos::hash_append`.
     ///
     /// Returns `false` if the signature is invalid or the key type is wrong.
@@ -67,9 +67,10 @@ impl QueuedProposal {
         let close_time = self.message.close_time;
         let propose_seq = self.message.propose_seq;
         // Proposal signing hash: HashPrefix::Proposal | seq | close_time |
-        // prev_ledger | tx_hash. The prefix 0x50524F50 = b"PROP".
+        // prev_ledger | tx_hash. HashPrefix::Proposal is the canonical
+        // XRPL `PRP\0` domain separator.
         let mut data = Vec::with_capacity(4 + 4 + 4 + 32 + 32);
-        data.extend_from_slice(&0x5052_4F50u32.to_be_bytes());
+        data.extend_from_slice(&HashPrefix::Proposal.as_u32().to_be_bytes());
         data.extend_from_slice(&propose_seq.to_be_bytes());
         data.extend_from_slice(&close_time.to_be_bytes());
         data.extend_from_slice(self.previous_ledger.data());

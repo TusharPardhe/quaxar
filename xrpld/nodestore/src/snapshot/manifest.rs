@@ -10,7 +10,7 @@
 //! │   ├── ledger_seq:       u32 BE
 //! │   ├── ledger_hash:      [u8; 32]
 //! │   ├── account_hash:     [u8; 32]  (state_map root; verified after load)
-//! │   ├── tx_hash:          [u8; 32]  (tx_map root; informational)
+//! │   ├── tx_hash:          [u8; 32]  (tx_map root; verified after load)
 //! │   ├── parent_hash:      [u8; 32]
 //! │   ├── drops:            u64 BE
 //! │   ├── close_time:       u32 BE
@@ -51,6 +51,17 @@ pub const SNAPSHOT_VERSION: u16 = 1;
 /// Target uncompressed size of each data chunk (8 MiB).
 /// The last chunk may be smaller.
 pub const SNAPSHOT_CHUNK_UNCOMPRESSED_TARGET: usize = 8 * 1024 * 1024;
+
+/// Maximum chunk table entries accepted from an untrusted snapshot header.
+/// This bounds metadata memory and prevents an attacker from inducing a huge
+/// backend preallocation estimate before any chunk has been authenticated.
+pub const SNAPSHOT_MAX_CHUNKS: usize = 1_000_000;
+
+/// Maximum encoded/compressed payload for one chunk accepted by the loader.
+pub const SNAPSHOT_MAX_COMPRESSED_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum size declared by LZ4's size-prepended uncompressed payload.
+pub const SNAPSHOT_MAX_UNCOMPRESSED_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Size of the fixed-width snapshot file header in bytes.
 pub const SNAPSHOT_HEADER_SIZE: usize = 8  // magic
@@ -270,7 +281,7 @@ impl SnapshotManifest {
         pos += 1;
 
         // chunk_count
-        let chunk_count = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        let _chunk_count = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
         let _ = pos;
 
         Ok(Self {
@@ -285,7 +296,7 @@ impl SnapshotManifest {
             parent_close_time,
             close_time_res,
             close_flags,
-            chunks: Vec::with_capacity(chunk_count),
+            chunks: Vec::new(),
         })
     }
 

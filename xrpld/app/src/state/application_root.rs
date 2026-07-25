@@ -1995,40 +1995,18 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                                                 // next on_accept finds matching chain → starts round.
                                                 if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                                                     if let Some(shared) = guard.as_ref() {
-                                                        // Resolve the seq from the ledger cache
-                                                        // first, falling back to peers that
-                                                        // advertise this hash.
-                                                        let seq = lm_rt
-                                                            .ledger_master()
-                                                            .ledger_history()
-                                                            .get_cached_ledger_by_hash(
-                                                                basics::sha_map_hash::SHAMapHash::new(
-                                                                    network_closed,
-                                                                ),
-                                                            )
-                                                            .map(|l| l.header().seq)
-                                                            .or_else(|| {
-                                                                if let Some(ort) = root.overlay_runtime() {
-                                                                    use overlay::Overlay;
-                                                                    ort.overlay()
-                                                                        .active_peers()
-                                                                        .iter()
-                                                                        .find(|p| {
-                                                                            p.closed_ledger_hash() == network_closed
-                                                                        })
-                                                                        .map(|p| p.ledger_range().1)
-                                                                } else {
-                                                                    None
-                                                                }
-                                                            })
-                                                            .unwrap_or(0);
+                                                        // A peer's current closed-ledger hash is
+                                                        // not sequence-bound to its separately
+                                                        // advertised history range.
                                                         tracing::warn!(
                                                             target: "consensus",
                                                             %network_closed,
-                                                            seq,
-                                                            "checkLastClosedLedger: CALLING acquire_async for network ledger"
+                                                            "checkLastClosedLedger: acquiring network ledger by hash"
                                                         );
-                                                        shared.acquire_async(network_closed, seq, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
+                                                        shared.acquire_closed_ledger_async(
+                                                            network_closed,
+                                                            crate::ledger::inbound_ledgers::AcquireReason::Consensus,
+                                                        );
                                                         tracing::info!(
                                                             target: "consensus",
                                                             %network_closed,
@@ -3010,8 +2988,7 @@ impl ApplicationRoot {
         if servers.is_empty() {
             return;
         }
-        let client =
-            crate::state::sntp::SntpClient::new(self.registry.logs.journal("sntp"));
+        let client = crate::state::sntp::SntpClient::new(self.registry.logs.journal("sntp"));
         // Spawn a task that polls the SNTP client offset and pushes it
         // into the TimeKeeper.
         let sntp = client.clone();

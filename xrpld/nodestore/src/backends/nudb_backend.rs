@@ -2595,6 +2595,22 @@ impl Backend for NuDbBackend {
         Ok(())
     }
 
+    fn bulk_import_abort(&self) {
+        self.bulk_importing.store(false, Ordering::Release);
+        let marker_path = self
+            .config
+            .layout
+            .base_path
+            .join(".bulk_import_in_progress");
+        if let Err(error) = fs::write(&marker_path, b"") {
+            self.journal.log(
+                JournalLevel::Error,
+                &format!("Failed to restore bulk import marker after import failure: {error}"),
+            );
+        }
+        self.sync();
+    }
+
     fn for_each(&self, callback: &mut dyn FnMut(Arc<NodeObject>)) {
         if let Err(error) = self.commit_active_burst_if_needed() {
             self.journal.log(JournalLevel::Error, &error);

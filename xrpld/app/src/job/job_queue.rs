@@ -32,7 +32,7 @@
 //!   working scheduler, not part of the scheduling algorithm itself, and
 //!   are deferred to whenever the app wires up its metrics story.
 //! - `getJson`/`isOverloaded` diagnostic surfaces are omitted for the same
-//!   reason `Consensus::getJson` was omitted in Phase 3: presentation
+//!   reason `Consensus::getJson` was omitted presentation
 //!   concerns belong at a higher layer once the underlying data exists.
 
 use std::cmp::Ordering;

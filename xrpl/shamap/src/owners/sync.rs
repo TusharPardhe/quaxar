@@ -480,7 +480,7 @@ impl SyncTree {
         let mut inner_nodes: Vec<SharedIntrusive<SHAMapTreeNode>> = Vec::new();
         let mut work_stack: Vec<SharedIntrusive<SHAMapTreeNode>> = vec![self.root.clone()];
 
-        // Phase 1: collect all reachable inner nodes (top-down traversal)
+        // collect all reachable inner nodes (top-down traversal)
         while let Some(node) = work_stack.pop() {
             if !node.is_inner() {
                 continue;
@@ -495,7 +495,7 @@ impl SyncTree {
             inner_nodes.push(node);
         }
 
-        // Phase 2: release children bottom-up (reverse of collection order,
+        // release children bottom-up (reverse of collection order,
         // which was top-down — so reversing gives us leaves-first).
         for node in inner_nodes.iter().rev() {
             node.release_loaded_children();
