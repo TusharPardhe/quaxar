@@ -184,29 +184,12 @@ impl InboundLedgers {
             return entry.completed_ledger.clone();
         }
 
-        // Cold bootstrap must complete one account-state acquisition before
-        // following later validation tips. Without this admission guard, every
-        // newly validated hash starts another full-state download while the
-        // node has no completed ledger, splitting the same peers and store
-        // across moving targets indefinitely. Once any ledger is complete,
-        // normal hash-deduplicated consensus acquisition resumes.
-        let has_completed_ledger = inner
-            .entries
-            .values()
-            .any(|entry| entry.state.completed.load(Ordering::Acquire));
-        let has_active_acquisition = inner.entries.values().any(|entry| {
-            !entry.failed
-                && !entry.state.failed.load(Ordering::Acquire)
-                && !entry.state.completed.load(Ordering::Acquire)
-        });
-        if reason == AcquireReason::Consensus && !has_completed_ledger && has_active_acquisition {
-            tracing::debug!(
-                target: "inbound_ledger",
-                %hash,
-                "acquire: deferred moving consensus target during cold bootstrap"
-            );
-            return None;
-        }
+        // NOTE: rippled does NOT have a cold bootstrap guard here.
+        // Its `InboundLedgers::acquire` lets acquisitions flow freely,
+        // relying on hash deduplication (same hash won't be acquired twice)
+        // and timeout cleanup (idle acquisitions are swept after 60s).
+        // Removing this guard matches rippled's parity and prevents the
+        // node from being stuck on a stale target when peers have moved on.
 
         // Validate required resources
         let ns = {

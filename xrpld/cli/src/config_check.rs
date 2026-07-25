@@ -49,7 +49,7 @@ pub fn run(conf_path: Option<&str>) {
         all_ok = false;
     }
 
-    for optional in ["[ips]", "[ips_fixed]"] {
+    for optional in ["[ips]", "[ips_fixed]", "[sntp_servers]"] {
         if content.contains(optional) {
             println!("  ✅ {optional}");
         }

@@ -26,6 +26,9 @@ impl TimeKeeperClock for SystemTimeKeeperClock {
 pub struct TimeKeeper<C = SystemTimeKeeperClock> {
     clock: C,
     close_offset_seconds: AtomicI64,
+    /// SNTP-reported offset in seconds (positive = system clock is fast).
+    /// Applied on top of the raw system clock in `now()`.
+    sntp_offset_seconds: AtomicI64,
 }
 
 impl Default for TimeKeeper<SystemTimeKeeperClock> {
@@ -48,11 +51,13 @@ where
         Self {
             clock,
             close_offset_seconds: AtomicI64::new(0),
+            sntp_offset_seconds: AtomicI64::new(0),
         }
     }
 
     pub fn now(&self) -> NetClockTimePoint {
-        let unix = self.clock.now_unix_seconds();
+        let sntp = self.sntp_offset_seconds.load(Ordering::Acquire);
+        let unix = self.clock.now_unix_seconds().saturating_sub(sntp);
         let net_seconds = unix.saturating_sub(EPOCH_OFFSET_SECONDS);
         NetClockTimePoint::new(u32::try_from(net_seconds).unwrap_or_default())
     }
@@ -63,6 +68,17 @@ where
 
     pub fn close_offset(&self) -> Duration {
         Duration::seconds(self.close_offset_seconds.load(Ordering::Acquire))
+    }
+
+    /// Update the SNTP-reported offset.  Called by the SNTP client when a
+    /// new median offset is computed.
+    pub fn set_sntp_offset(&self, offset_secs: i64) {
+        self.sntp_offset_seconds.store(offset_secs, Ordering::Release);
+    }
+
+    /// Current SNTP offset in seconds.
+    pub fn sntp_offset(&self) -> i64 {
+        self.sntp_offset_seconds.load(Ordering::Acquire)
     }
 
     pub fn adjust_close_time(&self, by: Duration) -> Duration {

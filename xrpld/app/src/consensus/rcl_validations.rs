@@ -260,6 +260,16 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
             .num_trusted_for_ledger(&ledger_hash)
     }
 
+    /// Fees reported by trusted, full validators for `ledger_id`.
+    /// Matches `Validations::fees`; delegates to the inner tracker's
+    /// `fees()` method.
+    pub fn fees_for_ledger(&self, ledger_id: Uint256, seq: u32, base_fee: u32) -> Vec<u32> {
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .fees(&ledger_id, base_fee)
+    }
+
     /// Attach (or detach) the ledger master runtime this validations
     /// tracker should coordinate with when ledgers are attached/rotated.
     /// Returns the previously-attached runtime, if any. This is a thin
@@ -284,6 +294,19 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
             .adaptor()
             .set_ledger_master_runtime(runtime);
         previous
+    }
+
+    /// Provide the overlay to the inner validation adaptor so it can resolve
+    /// ledger sequence numbers from peers when the local cache misses.
+    pub fn set_overlay(
+        &self,
+        overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
+    ) {
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .adaptor()
+            .set_overlay(overlay);
     }
 }
 

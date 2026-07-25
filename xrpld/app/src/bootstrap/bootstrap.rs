@@ -660,6 +660,28 @@ pub fn build_bootstrap_root(
             root.attach_configured_overlay_runtime(config, Arc::new(BootstrapOverlayHandoff))?;
     }
 
+    // Start built-in SNTP client if [sntp_servers] is configured.  This
+    // allows nodes in LXC containers, Docker, or managed VPS environments
+    // (where host NTP cannot be configured by the operator) to discipline
+    // their clock independently, matching rippled's former [sntp_servers]
+    // support.
+    if !options.standalone {
+        let sntp_servers: Vec<String> = config
+            .section("sntp_servers")
+            .values()
+            .iter()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !sntp_servers.is_empty() {
+            tracing::info!(target: "bootstrap",
+                count = sntp_servers.len(),
+                "Starting built-in SNTP client ([sntp_servers] configured)"
+            );
+            root.start_sntp_client(sntp_servers);
+        }
+    }
+
     // Load validation seed into config BEFORE consensus runtime is created,
     // so the consensus adaptor can read it.
     if let Ok(seed) = config.legacy("validation_seed") {
@@ -2358,7 +2380,7 @@ fn initialize_startup_ledger_state(
             }
         }
         StartUpType::Fresh | StartUpType::Snapshot => {
-            if options.start_type == StartUpType::Snapshot && !root.config().standalone {
+            if !root.config().standalone {
                 root.set_need_network_ledger(true);
             }
             seed_startup_ledger_state(root, options, config)

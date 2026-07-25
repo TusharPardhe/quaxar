@@ -441,14 +441,30 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         if let Some(guard) = self.ledger_master_runtime.inbound_ledgers.lock().ok()
             && let Some(shared) = guard.as_ref()
         {
-            // Try to look up the seq from the ledger cache so the acquisition
-            // layer can prioritise correctly (0 = unknown).
+            // Resolve the seq from the ledger cache first, falling back to
+            // peers that advertise this hash (matching the peer-query pattern
+            // in the beginConsensus path).  A correct seq lets the acquisition
+            // layer select peers via ledger-range fast-path and include the
+            // sequence in wire requests, both of which are critical for
+            // reliable mainnet operation.
             let seq = self
                 .ledger_master_runtime
                 .ledger_master()
                 .ledger_history()
                 .get_cached_ledger_by_hash(hash)
                 .map(|l| l.header().seq)
+                .or_else(|| {
+                    if let Some(ort) = self.app_root.overlay_runtime() {
+                        use overlay::Overlay;
+                        ort.overlay()
+                            .active_peers()
+                            .iter()
+                            .find(|p| p.closed_ledger_hash() == *ledger_id)
+                            .map(|p| p.ledger_range().1)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or(0);
             shared.acquire_async(
                 *ledger_id,

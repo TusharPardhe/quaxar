@@ -141,6 +141,21 @@ Validator-list runtime toggle.
 |-----|---------|
 | `enabled` | Enables validator-list fetching and processing. |
 
+### `[sntp_servers]`
+
+Built-in SNTP time synchronisation for environments where host NTP cannot be
+configured (LXC containers, Docker, managed VPS). One server per line. When
+configured, the node queries these servers in the background and applies the
+computed clock offset. Disabled in standalone mode.
+
+```ini
+[sntp_servers]
+time.windows.com
+time.apple.com
+time.nist.gov
+pool.ntp.org
+```
+
 ### `[reduce_relay]`
 
 Controls validation and transaction relay reduction.

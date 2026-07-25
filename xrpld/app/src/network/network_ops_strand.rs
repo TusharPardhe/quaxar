@@ -366,7 +366,27 @@ fn strand_loop(
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let pending = lm_rt.take_pending_consensus_ledger();
             if let Some(hash) = pending {
-                shared_inbound.acquire_async(hash, 0, AcquireReason::Consensus);
+                // Resolve the seq from the ledger cache first, falling back
+                // to peers that advertise this hash.
+                let seq = lm_rt
+                    .ledger_master()
+                    .ledger_history()
+                    .get_cached_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(hash))
+                    .map(|l| l.header().seq)
+                    .or_else(|| {
+                        if let Some(ort) = root.overlay_runtime() {
+                            use overlay::Overlay;
+                            ort.overlay()
+                                .active_peers()
+                                .iter()
+                                .find(|p| p.closed_ledger_hash() == hash)
+                                .map(|p| p.ledger_range().1)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                shared_inbound.acquire_async(hash, seq, AcquireReason::Consensus);
             }
         }
 
@@ -482,6 +502,41 @@ fn check_accept_and_advance(
                     }
 
                     root.set_need_network_ledger(false);
+
+                    // Rippled parity: rebuild open ledger on the new chain so
+                    // local transactions and TxQ state are re-evaluated against
+                    // the new parent. Matches NetworkOPs::switchLastClosedLedger
+                    // `openLedger_.accept(...)` after chain jump.
+                    root.rebuild_open_ledger_after_consensus(
+                        new_seq.saturating_add(1),
+                        network_ledger.fees().base,
+                        new_hash,
+                    );
+
+                    // Rippled parity: broadcast neSWITCHED_LEDGER to all peers
+                    // so they know we jumped to the network chain.
+                    if let Some(overlay_rt) = root.overlay_runtime() {
+                        use overlay::Overlay;
+                        let hdr = network_ledger.header();
+                        let status = overlay::ProtocolMessage::new(
+                            overlay::ProtocolPayload::StatusChange(
+                                overlay::message::wire::TmStatusChange {
+                                    new_status: None,
+                                    new_event: Some(3), // neSWITCHED_LEDGER
+                                    ledger_seq: Some(hdr.seq),
+                                    ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
+                                    ledger_hash_previous: Some(
+                                        hdr.parent_hash.as_uint256().data().to_vec(),
+                                    ),
+                                    network_time: None,
+                                    first_seq: Some(0),
+                                    last_seq: Some(0),
+                                },
+                            ),
+                        );
+                        overlay_rt.overlay().broadcast(&status);
+                    }
+
                     let now = root.shared_time_keeper().close_time();
                     let prev_cx = crate::consensus_ledger_from_ledger(&network_ledger);
                     runner.start_round(now, new_hash, prev_cx, true);
@@ -521,6 +576,31 @@ fn check_accept_and_advance(
                 root.note_validated_ledger_for_sync(Arc::clone(&validated));
                 lm.mark_ledger_complete(validated.header().seq);
                 root.set_need_network_ledger(false);
+
+                // Rippled parity: propagate median fee from trusted validations.
+                // Matches LedgerMaster::checkAccept lines 986-1014.
+                let load_base = root.load_fee_track().load_base();
+                let mut fees = root.validations().fees_for_ledger(
+                    closed_hash,
+                    closed_seq,
+                    load_base,
+                );
+                {
+                    let parent_hash = *closed.header().parent_hash.as_uint256();
+                    let mut fees2 = root.validations().fees_for_ledger(
+                        parent_hash,
+                        closed_seq.saturating_sub(1),
+                        load_base,
+                    );
+                    fees.append(&mut fees2);
+                }
+                let fee = if fees.is_empty() {
+                    load_base
+                } else {
+                    fees.sort_unstable();
+                    fees[fees.len() / 2]
+                };
+                root.load_fee_track().set_remote_fee(fee);
             }
         }
     }
@@ -671,26 +751,45 @@ fn check_accept_and_advance(
             );
 
             if should_acquire {
-                let parent_hash = lm
-                    .ledger_history()
-                    .get_cached_ledger_by_seq(missing + 1)
-                    .map(|l| *l.header().parent_hash.as_uint256());
-                if let Some(hash) = parent_hash {
-                    if !hash.is_zero() {
-                        let sha_hash = basics::sha_map_hash::SHAMapHash::new(hash);
-                        if lm
-                            .ledger_history()
-                            .get_cached_ledger_by_hash(sha_hash)
-                            .is_none()
-                            && !shared_inbound.has_entry_for_seq_or_hash(missing, &hash)
-                        {
-                            // Parent hashes permit a sequential walk when no
-                            // relational index is available for rippled-style
-                            // multi-ledger prefetch. The registry keeps this
-                            // bounded by deduplicating the active request.
-                            shared_inbound.acquire_async(hash, missing, AcquireReason::History);
-                        }
+                // Rippled parity: batch prefetch up to ledgerFetchSize (256)
+                // consecutive missing ledgers going backward from `missing`.
+                // Matches LedgerMaster::doAdvance prefetch loop.
+                let prefetch_limit = configured_ledger_history.min(256);
+                let mut prefetch_count = 0u32;
+                let lh = lm.ledger_history();
+
+                for seq in (earliest_seq..=missing).rev() {
+                    if prefetch_count >= prefetch_limit {
+                        break;
                     }
+                    if complete.contains(seq) {
+                        continue;
+                    }
+                    // Resolve hash from ledger_history index. If non-zero,
+                    // the ledger has been seen before (via validation or
+                    // peer report) and we can acquire by hash directly.
+                    let sha_hash = lh.get_ledger_hash(seq);
+                    if sha_hash.is_zero() {
+                        continue;
+                    }
+                    let hash = *sha_hash.as_uint256();
+                    if lh.get_cached_ledger_by_hash(sha_hash).is_some() {
+                        continue;
+                    }
+                    if shared_inbound.has_entry_for_seq_or_hash(seq, &hash) {
+                        continue;
+                    }
+                    shared_inbound.acquire_async(hash, seq, AcquireReason::History);
+                    prefetch_count += 1;
+                }
+
+                if prefetch_count > 1 {
+                    tracing::debug!(
+                        target: "history",
+                        missing,
+                        prefetched = prefetch_count,
+                        "batch prefetch of consecutive missing ledgers"
+                    );
                 }
             }
         }

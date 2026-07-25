@@ -169,6 +169,9 @@ pub struct ApplicationRoot {
     basic_app: Arc<BasicApp>,
     job_queue: Arc<JobQueue>,
     time_keeper: Arc<TimeKeeper<SystemTimeKeeperClock>>,
+    /// Built-in SNTP client for environments where host NTP cannot be
+    /// configured (LXC, Docker, managed VPS).  `None` when not initialised.
+    sntp_client: Option<crate::state::sntp::SntpClient>,
     stop_tree: Arc<StopTree>,
     collector_manager: Arc<CollectorManager>,
     load_manager: Arc<LoadManager>,
@@ -1988,12 +1991,40 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                                                 // next on_accept finds matching chain → starts round.
                                                 if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                                                     if let Some(shared) = guard.as_ref() {
+                                                        // Resolve the seq from the ledger cache
+                                                        // first, falling back to peers that
+                                                        // advertise this hash.
+                                                        let seq = lm_rt
+                                                            .ledger_master()
+                                                            .ledger_history()
+                                                            .get_cached_ledger_by_hash(
+                                                                basics::sha_map_hash::SHAMapHash::new(
+                                                                    network_closed,
+                                                                ),
+                                                            )
+                                                            .map(|l| l.header().seq)
+                                                            .or_else(|| {
+                                                                if let Some(ort) = root.overlay_runtime() {
+                                                                    use overlay::Overlay;
+                                                                    ort.overlay()
+                                                                        .active_peers()
+                                                                        .iter()
+                                                                        .find(|p| {
+                                                                            p.closed_ledger_hash() == network_closed
+                                                                        })
+                                                                        .map(|p| p.ledger_range().1)
+                                                                } else {
+                                                                    None
+                                                                }
+                                                            })
+                                                            .unwrap_or(0);
                                                         tracing::warn!(
                                                             target: "consensus",
                                                             %network_closed,
+                                                            seq,
                                                             "checkLastClosedLedger: CALLING acquire_async for network ledger"
                                                         );
-                                                        shared.acquire_async(network_closed, 0, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
+                                                        shared.acquire_async(network_closed, seq, crate::ledger::inbound_ledgers::AcquireReason::Consensus);
                                                         tracing::info!(
                                                             target: "consensus",
                                                             %network_closed,
@@ -2264,6 +2295,7 @@ impl ApplicationRoot {
             basic_app: Arc::new(BasicApp::new(io_threads)?),
             job_queue: Arc::new(job_queue.clone()),
             time_keeper: Arc::clone(&time_keeper),
+            sntp_client: None,
             stop_tree: Arc::new(StopTree::new("application")),
             collector_manager: Arc::new(collector_manager),
             load_manager: Arc::new(load_manager),
@@ -2570,7 +2602,7 @@ impl ApplicationRoot {
         );
     }
 
-    fn rebuild_open_ledger_after_consensus(
+    pub(crate) fn rebuild_open_ledger_after_consensus(
         &self,
         next_open_index: u32,
         base_fee_drops: u64,
@@ -2966,6 +2998,29 @@ impl ApplicationRoot {
         Arc::clone(&self.time_keeper)
     }
 
+    /// Initialise and start the built-in SNTP client with the given server
+    /// list.  The client runs in a background tokio task and periodically
+    /// updates the `TimeKeeper`'s SNTP offset.
+    pub fn start_sntp_client(&mut self, servers: Vec<String>) {
+        if servers.is_empty() {
+            return;
+        }
+        let client =
+            crate::state::sntp::SntpClient::new(self.registry.logs.journal("sntp"));
+        // Spawn a task that polls the SNTP client offset and pushes it
+        // into the TimeKeeper.
+        let sntp = client.clone();
+        let tk = Arc::clone(&self.time_keeper);
+        tokio::spawn(async move {
+            loop {
+                tk.set_sntp_offset(sntp.offset_seconds());
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            }
+        });
+        client.run(servers);
+        self.sntp_client = Some(client);
+    }
+
     pub fn stop_tree(&self) -> &StopTree {
         &self.stop_tree
     }
@@ -3076,6 +3131,10 @@ impl ApplicationRoot {
         let overlay_status: Arc<dyn OverlayStatusSource> = overlay;
         self.overlay_status = Some(overlay_status);
         self.runtime_bindings.overlay = Some(overlay_runtime.clone());
+        // Provide the overlay to the validations adaptor so it can resolve
+        // ledger sequence numbers from peers on acquisition cache misses.
+        self.validations
+            .set_overlay(Some(overlay_runtime.overlay()));
         self.overlay_runtime.replace(overlay_runtime)
     }
 

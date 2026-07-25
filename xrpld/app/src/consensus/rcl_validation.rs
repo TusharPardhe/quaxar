@@ -199,6 +199,9 @@ pub struct RclValidationsAdaptor {
     ledger_master_runtime: parking_lot::Mutex<
         Option<Arc<crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime>>,
     >,
+    overlay: parking_lot::Mutex<
+        Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
+    >,
 }
 
 impl RclValidationsAdaptor {
@@ -212,6 +215,7 @@ impl RclValidationsAdaptor {
             ledgers: parking_lot::Mutex::new(std::collections::HashMap::new()),
             now: Arc::new(now),
             ledger_master_runtime: parking_lot::Mutex::new(None),
+            overlay: parking_lot::Mutex::new(None),
         }
     }
 
@@ -230,6 +234,15 @@ impl RclValidationsAdaptor {
         runtime: Option<Arc<crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime>>,
     ) {
         *self.ledger_master_runtime.lock() = runtime;
+    }
+
+    /// Attach (or detach) the overlay so `acquire` can resolve a ledger
+    /// sequence number from peers when the local cache does not have it.
+    pub fn set_overlay(
+        &self,
+        overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
+    ) {
+        *self.overlay.lock() = overlay;
     }
 }
 
@@ -280,9 +293,31 @@ impl consensus::rcl_support::ValidationsAdaptor for RclValidationsAdaptor {
         if let Some(guard) = runtime.inbound_ledgers.lock().ok()
             && let Some(shared) = guard.as_ref()
         {
+            // Resolve the seq from the ledger cache first, falling back to
+            // peers that advertise this hash.  A correct seq lets the
+            // acquisition layer select peers via ledger-range fast-path and
+            // include the sequence in wire requests, both critical for
+            // reliable mainnet operation.
+            let seq = runtime
+                .ledger_master()
+                .ledger_history()
+                .get_cached_ledger_by_hash(hash)
+                .map(|l| l.header().seq)
+                .or_else(|| {
+                    if let Some(ort) = self.overlay.lock().as_ref() {
+                        use overlay::Overlay;
+                        ort.active_peers()
+                            .iter()
+                            .find(|p| p.closed_ledger_hash() == *ledger_id)
+                            .map(|p| p.ledger_range().1)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
             shared.acquire_async(
                 *ledger_id,
-                0,
+                seq,
                 crate::ledger::inbound_ledgers::AcquireReason::Consensus,
             );
         }
