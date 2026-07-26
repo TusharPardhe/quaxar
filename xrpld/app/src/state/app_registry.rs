@@ -514,28 +514,92 @@ impl crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource for SharedApp
         next_seq: u32,
         base_fee: u64,
         parent_hash: &basics::base_uint::Uint256,
-        accepted_ids: &std::collections::HashSet<basics::base_uint::Uint256>,
+        completed_transaction_ids: &std::collections::HashSet<basics::base_uint::Uint256>,
+        retry_transactions: &[std::sync::Arc<protocol::STTx>],
     ) {
-        // Capture anything left in the OLD open ledger that did NOT make it
-        // into the just-accepted set, so it can be carried forward into the
-        // new one -- matching the reference's `getOpenLedger().accept(...)`
-        // reseeding from `localTxs_`/leftover retriable transactions
-        // instead of a full destructive reset. See the trait doc comment
-        // for why this matters (transactions submitted between `on_close`'s
-        // capture and this reset would otherwise be silently lost).
-        let leftover: Vec<std::sync::Arc<protocol::STTx>> = self
-            .current_open_transactions()
-            .into_iter()
-            .filter(|tx| !accepted_ids.contains(&tx.get_transaction_id()))
-            .collect();
-
+        // Snapshot, filter, and replace under one OpenLedger modification
+        // lock. A separate current_open_transactions() call followed by a
+        // later modify() would lose a local submission that arrived between
+        // those two critical sections.
         self.modify(|view| {
+            let mut leftover: Vec<std::sync::Arc<protocol::STTx>> = view
+                .ordered_txs()
+                .into_iter()
+                .map(|record| record.tx.clone())
+                .filter(|tx| !completed_transaction_ids.contains(&tx.get_transaction_id()))
+                .collect();
+            for tx in retry_transactions {
+                if !completed_transaction_ids.contains(&tx.get_transaction_id())
+                    && !leftover
+                        .iter()
+                        .any(|existing| existing.get_transaction_id() == tx.get_transaction_id())
+                {
+                    leftover.push(std::sync::Arc::clone(tx));
+                }
+            }
+
             *view = AppOpenLedgerView::with_parent_hash(next_seq, base_fee, *parent_hash);
             for tx in leftover {
                 view.push_transaction(tx);
             }
             true
         });
+    }
+}
+
+#[cfg(test)]
+mod open_ledger_tests {
+    use super::*;
+    use crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource;
+
+    fn test_transaction(sequence: u32) -> Arc<protocol::STTx> {
+        Arc::new(protocol::STTx::new(protocol::TxType::PAYMENT, |tx| {
+            tx.set_field_u32(protocol::get_field_by_symbol("sfSequence"), sequence);
+        }))
+    }
+
+    #[test]
+    fn consensus_accept_retains_local_and_peer_retry_transactions_once() {
+        let open_ledger = SharedAppOpenLedger::new(OpenLedger::new(
+            AppOpenLedgerView::with_parent_hash(10, 10, Uint256::from_u64(9)),
+        ));
+        let completed = test_transaction(1);
+        let local_retry = test_transaction(2);
+        let peer_retry = test_transaction(3);
+        open_ledger.modify(|view| {
+            view.push_transaction(Arc::clone(&completed));
+            view.push_transaction(Arc::clone(&local_retry));
+            true
+        });
+
+        let completed_ids = std::collections::HashSet::from([completed.get_transaction_id()]);
+        RclConsensusOpenLedgerSource::accept_consensus_ledger(
+            &open_ledger,
+            11,
+            12,
+            &Uint256::from_u64(10),
+            &completed_ids,
+            &[
+                Arc::clone(&local_retry),
+                Arc::clone(&peer_retry),
+                Arc::clone(&peer_retry),
+            ],
+        );
+
+        let retained = open_ledger.current_open_transactions();
+        let retained_ids: std::collections::HashSet<_> = retained
+            .iter()
+            .map(|transaction| transaction.get_transaction_id())
+            .collect();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(
+            retained_ids,
+            std::collections::HashSet::from([
+                local_retry.get_transaction_id(),
+                peer_retry.get_transaction_id(),
+            ])
+        );
+        assert_eq!(open_ledger.current().ledger_current_index, 11);
     }
 }
 

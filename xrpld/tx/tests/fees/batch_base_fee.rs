@@ -1,10 +1,10 @@
 //! Integration tests that pin the narrowed `Batch::calculateBaseFee(...)`
 //! wrapper to the current C++ aggregate-fee behavior.
 
-use protocol::TxType;
+use protocol::{MAX_MULTI_SIGNERS, TxType};
 use tx::{
-    BatchBaseFeeInnerTransaction, BatchBaseFeeSignerEntry, MAX_BATCH_TX_COUNT,
-    run_batch_calculate_base_fee,
+    BatchBaseFeeInnerTransaction, BatchBaseFeeSignerEntry, MAX_BATCH_SIGNER_COUNT,
+    MAX_BATCH_TX_COUNT, run_batch_calculate_base_fee,
 };
 
 #[derive(Clone, Copy)]
@@ -103,10 +103,29 @@ fn batch_calculate_base_fee_rejects_too_many_batch_signers() {
                 fee: 10,
             },
         ]),
-        Some((0..=MAX_BATCH_TX_COUNT).map(|_| TestSigner {
+        Some((0..=MAX_BATCH_SIGNER_COUNT).map(|_| TestSigner {
             has_txn_signature: true,
             multisigner_count: 0,
         })),
+        |inner| inner.fee,
+        checked_add,
+        checked_mul_fee_by_usize,
+    );
+
+    assert_eq!(fee, 100_000_000_000);
+}
+
+#[test]
+fn batch_calculate_base_fee_rejects_too_many_nested_multisigners() {
+    let fee = run_batch_calculate_base_fee(
+        100_000_000_000_u64,
+        10,
+        10,
+        None::<[TestInnerTx; 0]>,
+        Some([TestSigner {
+            has_txn_signature: false,
+            multisigner_count: MAX_MULTI_SIGNERS + 1,
+        }]),
         |inner| inner.fee,
         checked_add,
         checked_mul_fee_by_usize,

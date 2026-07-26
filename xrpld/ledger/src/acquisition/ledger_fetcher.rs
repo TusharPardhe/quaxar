@@ -922,7 +922,10 @@ impl InboundLedgerLocal {
                 JsonValue::Bool(self.planner_state.have_transactions),
             );
         }
-        entry.insert("timeouts".to_owned(), JsonValue::Unsigned(self.timeouts as u64));
+        entry.insert(
+            "timeouts".to_owned(),
+            JsonValue::Unsigned(self.timeouts as u64),
+        );
 
         if self.planner_state.have_header {
             if !self.planner_state.have_state {
@@ -2875,8 +2878,7 @@ impl InboundLedgerLocal {
             return Vec::new();
         }
 
-        let mut filter =
-            AccountStateSF::new(InboundLedgerSyncStore(&mut *store), &mut *fetch_pack);
+        let mut filter = AccountStateSF::new(InboundLedgerSyncStore(&mut *store), &mut *fetch_pack);
         let mut filter_ref: Option<&mut dyn shamap::fetch::SHAMapSyncFilter> = Some(&mut filter);
         ledger.state_map_mut().get_missing_nodes_with_family(
             params.missing_limit,
@@ -2952,8 +2954,7 @@ impl InboundLedgerLocal {
                 );
             }
             if !fresh.is_empty() {
-                let node_ids: Vec<_> =
-                    fresh.iter().take(limit).map(|(id, _)| *id).collect();
+                let node_ids: Vec<_> = fresh.iter().take(limit).map(|(id, _)| *id).collect();
                 log_acq_request_nodes(
                     self.seq,
                     "state",
@@ -3090,8 +3091,7 @@ impl InboundLedgerLocal {
                 );
             }
             if !fresh.is_empty() {
-                let node_ids: Vec<_> =
-                    fresh.iter().take(limit).map(|(id, _)| *id).collect();
+                let node_ids: Vec<_> = fresh.iter().take(limit).map(|(id, _)| *id).collect();
                 log_acq_request_nodes(
                     self.seq,
                     "tx",

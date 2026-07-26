@@ -215,6 +215,15 @@ impl InnerObjectFormats {
                 ("sfSigners", SOEStyle::Optional),
             ],
         );
+        add(
+            &mut inner,
+            "sfSponsorSignature",
+            &[
+                ("sfSigningPubKey", SOEStyle::Optional),
+                ("sfTxnSignature", SOEStyle::Optional),
+                ("sfSigners", SOEStyle::Optional),
+            ],
+        );
 
         Self { inner }
     }

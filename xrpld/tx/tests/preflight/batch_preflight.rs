@@ -11,8 +11,11 @@ struct StubInnerTx {
     flags: u32,
     signature_facts: BatchSignatureFacts,
     counterparty_signature_facts: Option<BatchSignatureFacts>,
+    sponsor_signature_facts: Option<BatchSignatureFacts>,
     fee_is_native_zero: bool,
+    fee_is_sponsored: bool,
     account: &'static str,
+    sponsor: Option<&'static str>,
     counterparty: Option<&'static str>,
     sequence: u32,
     ticket_sequence: Option<u32>,
@@ -29,8 +32,11 @@ impl StubInnerTx {
                 ..BatchSignatureFacts::default()
             },
             counterparty_signature_facts: None,
+            sponsor_signature_facts: None,
             fee_is_native_zero: true,
+            fee_is_sponsored: false,
             account,
+            sponsor: None,
             counterparty: None,
             sequence: 1,
             ticket_sequence: None,
@@ -72,6 +78,18 @@ impl BatchInnerTransaction for StubInnerTx {
 
     fn counterparty(&self) -> Option<Self::Account> {
         self.counterparty
+    }
+
+    fn sponsor(&self) -> Option<Self::Account> {
+        self.sponsor
+    }
+
+    fn sponsor_signature_facts(&self) -> Option<BatchSignatureFacts> {
+        self.sponsor_signature_facts
+    }
+
+    fn fee_is_sponsored(&self) -> bool {
+        self.fee_is_sponsored
     }
 
     fn sequence(&self) -> u32 {
@@ -191,6 +209,63 @@ fn tx_batch_preflight_rejects_signature_fields_and_non_empty_signing_pub_key() {
         |_| Ter::TES_SUCCESS,
     );
     assert_eq!(result, Ter::TEM_BAD_REGKEY);
+}
+
+#[test]
+fn tx_batch_preflight_rejects_sponsor_signature_fields() {
+    let mut with_sponsor_signature = StubInnerTx::new("tx-1", "alice");
+    with_sponsor_signature.sponsor_signature_facts = Some(BatchSignatureFacts {
+        has_txn_signature: true,
+        signing_pub_key_is_empty: true,
+        ..BatchSignatureFacts::default()
+    });
+
+    let result = validate_batch_preflight_structure(
+        BatchTransactionFlags::ALL_OR_NOTHING.bits(),
+        [with_sponsor_signature, StubInnerTx::new("tx-2", "bob")],
+        |_| Ter::TES_SUCCESS,
+    );
+    assert_eq!(result, Ter::TEM_BAD_SIGNATURE);
+
+    let mut with_sponsor_signers = StubInnerTx::new("tx-3", "alice");
+    with_sponsor_signers.sponsor_signature_facts = Some(BatchSignatureFacts {
+        has_signers: true,
+        signing_pub_key_is_empty: true,
+        ..BatchSignatureFacts::default()
+    });
+    let result = validate_batch_preflight_structure(
+        BatchTransactionFlags::ALL_OR_NOTHING.bits(),
+        [with_sponsor_signers, StubInnerTx::new("tx-4", "bob")],
+        |_| Ter::TES_SUCCESS,
+    );
+    assert_eq!(result, Ter::TEM_BAD_SIGNER);
+
+    let mut with_sponsor_regkey = StubInnerTx::new("tx-5", "alice");
+    with_sponsor_regkey.sponsor_signature_facts = Some(BatchSignatureFacts {
+        signing_pub_key_is_empty: false,
+        ..BatchSignatureFacts::default()
+    });
+    let result = validate_batch_preflight_structure(
+        BatchTransactionFlags::ALL_OR_NOTHING.bits(),
+        [with_sponsor_regkey, StubInnerTx::new("tx-6", "bob")],
+        |_| Ter::TES_SUCCESS,
+    );
+    assert_eq!(result, Ter::TEM_BAD_REGKEY);
+}
+
+#[test]
+fn tx_batch_preflight_rejects_fee_sponsored_inner_transaction() {
+    let mut fee_sponsored = StubInnerTx::new("tx-1", "alice");
+    fee_sponsored.sponsor = Some("sponsor");
+    fee_sponsored.fee_is_sponsored = true;
+
+    let result = validate_batch_preflight_structure(
+        BatchTransactionFlags::ALL_OR_NOTHING.bits(),
+        [fee_sponsored, StubInnerTx::new("tx-2", "bob")],
+        |_| Ter::TES_SUCCESS,
+    );
+
+    assert_eq!(result, Ter::TEM_INVALID_FLAG);
 }
 
 #[test]

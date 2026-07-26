@@ -1,10 +1,13 @@
 use super::{
-    AppOpenLedgerTxQApplyRuntime, ApplicationRoot, NodeFamilyRuntime, queue_apply_preclaim_ter,
+    AcceptLedgerPendingRuntime, AcceptLedgerPendingTransaction, AppOpenLedgerTxQApplyRuntime,
+    ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, apply_submit_transactor_shell,
+    batch_base_fee, queue_apply_preclaim_ter,
 };
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::network::network_ops_runtime::AppNetworkOpsApplyHeldOutcome;
 use crate::runtime::main_runtime::{GrpcRuntime, ManagedComponent};
 use crate::shamap::shamap_store_service::SHAMapStoreService;
+use crate::state::accept_ledger_pending_apply::AcceptLedgerPendingApplyRuntime;
 use crate::tx_queue::transaction::Transaction;
 use crate::{
     AppOpenLedgerView, AppQueueApplyTxSource, AppTxQ, NetworkOpsConsensusMode,
@@ -20,8 +23,9 @@ use ledger::{
     calculate_ledger_hash,
 };
 use protocol::{
-    AccountID, KeyType, LedgerEntryType, Rules, STAmount, STLedgerEntry, STTx, SecretKey, SeqProxy,
-    Ter, TxType, account_keylet, calc_account_id, derive_public_key, get_field_by_symbol,
+    AccountID, BatchTransactionFlags, INNER_BATCH_TRANSACTION_FLAG, KeyType, LedgerEntryType,
+    Rules, STAmount, STArray, STLedgerEntry, STObject, STTx, SecretKey, SeqProxy, StBase, Ter,
+    TxType, account_keylet, calc_account_id, derive_public_key, get_field_by_symbol,
     ticket_keylet_from_seq_proxy,
 };
 use shamap::item::SHAMapItem;
@@ -1840,6 +1844,46 @@ fn attached_shamap_store_service_reads_root_validated_age_from_ledger_master_sta
 }
 
 #[test]
+fn consensus_outcome_defers_open_ledger_reset_to_outcome_handoff() {
+    use crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource;
+
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(10, 1_000, false));
+    app.on_closed_ledger(Arc::clone(&parent));
+    let _ = app.open_ledger().modify(|view| {
+        *view = AppOpenLedgerView::with_parent_hash(
+            11,
+            parent.fees().base,
+            *parent.header().hash.as_uint256(),
+        );
+        true
+    });
+
+    let outcome = app
+        .accept_ledger_with_txns_outcome(11, 1_010, 30, true, parent.fees().base, Vec::new())
+        .expect("consensus ledger acceptance should complete");
+
+    assert_eq!(outcome.next_open_index, 12);
+    assert_eq!(app.open_ledger().current().ledger_current_index, 11);
+
+    let closed = app
+        .closed_ledger()
+        .expect("accepted ledger should be available");
+    RclConsensusOpenLedgerSource::accept_consensus_ledger(
+        app.open_ledger(),
+        outcome.next_open_index,
+        parent.fees().base,
+        closed.header().hash.as_uint256(),
+        &outcome.completed_transaction_ids,
+        &outcome.retry_transactions,
+    );
+
+    let next_open = app.open_ledger().current();
+    assert_eq!(next_open.ledger_current_index, 12);
+    assert_eq!(next_open.parent_hash, *closed.header().hash.as_uint256());
+}
+
+#[test]
 fn consensus_built_switches_lcl_without_promoting_validated_or_published() {
     let mut app = ApplicationRoot::new(0).expect("root shell should build");
     let ledger_master_runtime = Arc::new(AppLedgerMasterRuntime::default());
@@ -1897,4 +1941,259 @@ fn consensus_built_switches_lcl_without_promoting_validated_or_published() {
     assert!(tx_ids.contains(&current_tx.get_transaction_id()));
     assert!(tx_ids.contains(&local_tx.get_transaction_id()));
     assert_eq!(app.status_rpc_current_ledger_index(), Some(12));
+}
+
+fn live_batch_preflight_result(sttx: STTx) -> Ter {
+    let ctx = tx::PreflightContext {
+        registry: crate::state::app_registry::AppPlaceholder,
+        tx: AcceptLedgerPendingTransaction {
+            transaction: Arc::new(Mutex::new(Transaction::new(Arc::new(sttx)))),
+        },
+        rules: Rules::default(),
+        flags: ApplyFlags::NONE,
+        parent_batch_id: None,
+        journal: Arc::new(crate::state::app_registry::AppJournal::new(
+            "batch-policy-test",
+        )),
+    };
+
+    AcceptLedgerPendingRuntime
+        .dispatch_preflight(&ctx, TxType::BATCH)
+        .expect("live preflight should not return a runtime error")
+        .0
+}
+
+fn batch_policy_inner(account: AccountID, sequence: u32) -> STTx {
+    STTx::new(TxType::PAYMENT, move |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+        tx.set_account_id(
+            get_field_by_symbol("sfDestination"),
+            AccountID::from_array([0xF0; 20]),
+        );
+        tx.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::new_native(1, false),
+        );
+        tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(0, false));
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+        tx.set_field_u32(get_field_by_symbol("sfFlags"), INNER_BATCH_TRANSACTION_FLAG);
+        tx.set_field_vl(get_field_by_symbol("sfSigningPubKey"), &[]);
+    })
+}
+
+fn batch_policy_batch(outer: AccountID, inners: &[STTx]) -> STTx {
+    let mut raw_transactions = STArray::new(get_field_by_symbol("sfRawTransactions"));
+    for inner in inners {
+        let mut raw = inner.clone_as_object();
+        raw.set_fname(get_field_by_symbol("sfRawTransaction"));
+        raw_transactions.push_back(raw);
+    }
+
+    STTx::new(TxType::BATCH, move |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), outer);
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(10, false),
+        );
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        tx.set_field_u32(
+            get_field_by_symbol("sfFlags"),
+            BatchTransactionFlags::ALL_OR_NOTHING.bits(),
+        );
+        tx.set_field_array(get_field_by_symbol("sfRawTransactions"), raw_transactions);
+    })
+}
+
+#[test]
+fn live_batch_preflight_rejects_sponsorship_before_signature_or_apply() {
+    let outer = AccountID::from_array([0x10; 20]);
+    let mut reserve_sponsored = batch_policy_batch(
+        outer,
+        &[
+            batch_policy_inner(AccountID::from_array([0x20; 20]), 1),
+            batch_policy_inner(outer, 2),
+        ],
+    );
+    reserve_sponsored.set_field_u32(get_field_by_symbol("sfSponsorFlags"), 2);
+    assert_eq!(
+        live_batch_preflight_result(reserve_sponsored),
+        Ter::TEM_INVALID_FLAG
+    );
+
+    let mut fee_sponsored_inner = batch_policy_inner(AccountID::from_array([0x20; 20]), 1);
+    fee_sponsored_inner.set_account_id(
+        get_field_by_symbol("sfSponsor"),
+        AccountID::from_array([0x30; 20]),
+    );
+    fee_sponsored_inner.set_field_u32(get_field_by_symbol("sfSponsorFlags"), 1);
+    let fee_sponsored =
+        batch_policy_batch(outer, &[fee_sponsored_inner, batch_policy_inner(outer, 2)]);
+    assert_eq!(
+        live_batch_preflight_result(fee_sponsored),
+        Ter::TEM_INVALID_FLAG
+    );
+}
+
+fn open_ledger_batch_preflight_result(sttx: STTx) -> Ter {
+    let outer = sttx.get_account_id(get_field_by_symbol("sfAccount"));
+    let base = Arc::new(ledger_view_with_balance_and_owner_count(
+        1,
+        outer,
+        1,
+        2_000_000,
+        0,
+        &[],
+    ));
+    let mut open_ledger =
+        AppOpenLedgerView::with_parent_hash(2, 10, *base.header().hash.as_uint256());
+    let mut submit_view = Sandbox::new(Arc::clone(&base), ApplyFlags::NONE);
+    let rules = submit_view.rules().clone();
+    let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
+        &mut open_ledger,
+        &mut submit_view,
+        Arc::new(sttx),
+        rules,
+        ApplyFlags::NONE,
+        2,
+        Ter::TES_SUCCESS,
+        Arc::new(Mutex::new(std::collections::HashMap::new())),
+    );
+
+    runtime.run_preflight().ter
+}
+
+#[test]
+fn direct_batch_shell_rejects_outer_preflight_before_mutating_ledger_state() {
+    let outer = AccountID::from_array([0x10; 20]);
+    let mut malformed = batch_policy_batch(
+        outer,
+        &[
+            batch_policy_inner(AccountID::from_array([0x20; 20]), 1),
+            batch_policy_inner(outer, 2),
+        ],
+    );
+    malformed.set_field_u32(get_field_by_symbol("sfSponsorFlags"), 2);
+    let base = Arc::new(ledger_view_with_balance_and_owner_count(
+        1,
+        outer,
+        1,
+        2_000_000,
+        0,
+        &[],
+    ));
+    let mut view = Sandbox::new(Arc::clone(&base), ApplyFlags::NONE);
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &malformed, TxType::BATCH),
+        Ter::TEM_INVALID_FLAG
+    );
+
+    let account_root = view
+        .read(account_keylet(raw_account_id(outer)))
+        .expect("account read should succeed")
+        .expect("account should exist");
+    assert_eq!(
+        account_root.get_field_u32(get_field_by_symbol("sfSequence")),
+        1
+    );
+    assert_eq!(
+        account_root
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops(),
+        2_000_000
+    );
+}
+
+#[test]
+fn batch_base_fee_uses_account_delete_owner_reserve_increment() {
+    let outer = AccountID::from_array([0x10; 20]);
+    let destination = AccountID::from_array([0x30; 20]);
+    let account_delete = STTx::new(TxType::ACCOUNT_DELETE, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), outer);
+        tx.set_account_id(get_field_by_symbol("sfDestination"), destination);
+        tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(0, false));
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        tx.set_field_u32(get_field_by_symbol("sfFlags"), INNER_BATCH_TRANSACTION_FLAG);
+        tx.set_field_vl(get_field_by_symbol("sfSigningPubKey"), &[]);
+    });
+    let batch = batch_policy_batch(outer, &[account_delete, batch_policy_inner(outer, 2)]);
+    let mut ledger = ledger_view(1, outer, 1, &[]);
+    ledger.set_fees(ledger::Fees {
+        base: 10,
+        reserve: 10_000,
+        increment: 2_000,
+    });
+
+    // ledger base + outer Batch + AccountDelete owner-reserve fee + Payment
+    assert_eq!(batch_base_fee(&ledger, &batch), 2_030);
+}
+
+#[test]
+fn live_batch_preclaim_authorizes_master_and_enforces_aggregate_fee_validity() {
+    let secret = SecretKey::from_bytes([0x51; 32]);
+    let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+    let outer = calc_account_id(public.as_bytes());
+    let ledger = ledger_view(1, outer, 1, &[]);
+
+    let mut authorized = batch_policy_batch(
+        outer,
+        &[batch_policy_inner(outer, 1), batch_policy_inner(outer, 2)],
+    );
+    let mut batch_signers = STArray::new(get_field_by_symbol("sfBatchSigners"));
+    let mut signer = STObject::make_inner_object(get_field_by_symbol("sfBatchSigner"));
+    signer.set_account_id(get_field_by_symbol("sfAccount"), outer);
+    signer.set_field_vl(get_field_by_symbol("sfSigningPubKey"), public.as_bytes());
+    signer.set_field_vl(get_field_by_symbol("sfTxnSignature"), &[0x01]);
+    batch_signers.push_back(signer);
+    authorized.set_field_array(get_field_by_symbol("sfBatchSigners"), batch_signers);
+
+    let expected_fee = ledger.fees().base * 5;
+    assert_eq!(batch_base_fee(&ledger, &authorized), expected_fee);
+    assert_eq!(
+        queue_apply_preclaim_ter(&ledger, &authorized, ledger.header().seq),
+        Ter::TES_SUCCESS
+    );
+
+    let oversized = batch_policy_batch(
+        outer,
+        &(0..=tx::MAX_BATCH_TX_COUNT)
+            .map(|sequence| batch_policy_inner(outer, sequence as u32 + 1))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(batch_base_fee(&ledger, &oversized), INVALID_BATCH_BASE_FEE);
+    assert_eq!(
+        queue_apply_preclaim_ter(&ledger, &oversized, ledger.header().seq),
+        Ter::TEC_INSUFF_FEE
+    );
+}
+
+#[test]
+fn open_ledger_batch_preflight_rejects_sponsorship_before_direct_apply() {
+    let outer = AccountID::from_array([0x10; 20]);
+    let mut reserve_sponsored = batch_policy_batch(
+        outer,
+        &[
+            batch_policy_inner(AccountID::from_array([0x20; 20]), 1),
+            batch_policy_inner(outer, 2),
+        ],
+    );
+    reserve_sponsored.set_field_u32(get_field_by_symbol("sfSponsorFlags"), 2);
+    assert_eq!(
+        open_ledger_batch_preflight_result(reserve_sponsored),
+        Ter::TEM_INVALID_FLAG
+    );
+
+    let mut fee_sponsored_inner = batch_policy_inner(AccountID::from_array([0x20; 20]), 1);
+    fee_sponsored_inner.set_account_id(
+        get_field_by_symbol("sfSponsor"),
+        AccountID::from_array([0x30; 20]),
+    );
+    fee_sponsored_inner.set_field_u32(get_field_by_symbol("sfSponsorFlags"), 1);
+    let fee_sponsored =
+        batch_policy_batch(outer, &[fee_sponsored_inner, batch_policy_inner(outer, 2)]);
+    assert_eq!(
+        open_ledger_batch_preflight_result(fee_sponsored),
+        Ter::TEM_INVALID_FLAG
+    );
 }

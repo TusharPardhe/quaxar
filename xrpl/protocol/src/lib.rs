@@ -334,6 +334,7 @@ pub use permissions::{Delegation, GranularPermissionType, Permission};
 pub use protocol::{
     BIPS_PER_UNITY, DIR_MAX_TOKENS_PER_PAGE, DIR_NODE_MAX_ENTRIES, DIR_NODE_MAX_PAGES,
     EXPIRED_OFFER_REMOVE_LIMIT, FLAG_LEDGER_INTERVAL, LedgerIndex, MAX_ASSET_CHECK_DEPTH,
+    MAX_BATCH_SIGNER_COUNT as PROTOCOL_MAX_BATCH_SIGNER_COUNT,
     MAX_BATCH_TX_COUNT as PROTOCOL_MAX_BATCH_TX_COUNT, MAX_CREDENTIAL_TYPE_LENGTH,
     MAX_CREDENTIAL_URI_LENGTH, MAX_CREDENTIALS_ARRAY_SIZE, MAX_DATA_PAYLOAD_LENGTH,
     MAX_DELETABLE_AMM_TRUST_LINES, MAX_DELETABLE_DIR_ENTRIES, MAX_DELETABLE_TOKEN_OFFER_ENTRIES,
@@ -416,7 +417,8 @@ pub use st_parsed_json::STParsedJSONObject;
 pub use st_path_set::{STPath, STPathElement, STPathSet, st_path_set_from_json};
 pub use st_takes_asset::{StTakesAsset, associate_asset};
 pub use st_tx::{
-    MAX_BATCH_TX_COUNT, STTx, TxnSql, build_multi_signing_data as build_sttx_multi_signing_data,
+    MAX_BATCH_SIGNER_COUNT, MAX_BATCH_TX_COUNT, STTx, TxnSql,
+    build_multi_signing_data as build_sttx_multi_signing_data,
     finish_multi_signing_data as finish_sttx_multi_signing_data, is_pseudo_tx, passes_local_checks,
     start_multi_signing_data as start_sttx_multi_signing_data, sterilize,
 };

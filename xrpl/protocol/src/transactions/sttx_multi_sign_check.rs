@@ -4,8 +4,8 @@
 //!
 //! - `STTx::checkMultiSign(...)` only rejecting self-multisigning for the
 //!   primary signature object, and
-//! - `STTx::checkBatchMultiSign(...)` always allowing the shared helper to run
-//!   with no primary-account self-multisign restriction.
+//! - `STTx::checkBatchMultiSign(...)` rejecting a nested signer equal to its
+//!   enclosing BatchSigner account.
 
 use crate::sttx_multi_sign::{StTxMultiSignObject, StTxMultiSigner, check_sttx_multi_sign};
 
@@ -59,6 +59,7 @@ pub fn run_sttx_check_batch_multi_sign<
     FormatAccountId,
 >(
     batch_signer: &SignatureObject,
+    batch_signer_account: &AccountId,
     message_seed: &MessageSeed,
     mut build_message: BuildMessage,
     mut verify_signer: VerifySigner,
@@ -74,7 +75,7 @@ where
 {
     check_sttx_multi_sign(
         batch_signer,
-        None,
+        Some(batch_signer_account),
         |signer| {
             let account_id = signer.account_id();
             verify_signer(signer, build_message(message_seed, &account_id))
@@ -174,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn sttx_check_batch_multi_sign_passes_built_messages_without_self_multisign_rejection() {
+    fn sttx_check_batch_multi_sign_passes_built_messages_for_distinct_signer() {
         let mut seen = Vec::new();
 
         let result = run_sttx_check_batch_multi_sign(
@@ -186,6 +187,7 @@ mod tests {
                 }],
             },
             &"batch",
+            &"batch",
             |seed, account_id| format!("{seed}-{account_id}"),
             |_, message| {
                 seen.push(message);
@@ -196,6 +198,26 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert_eq!(seen, vec!["batch-alice".to_owned()]);
+    }
+
+    #[test]
+    fn sttx_check_batch_multi_sign_rejects_batch_signer_as_its_own_multisigner() {
+        let result = run_sttx_check_batch_multi_sign(
+            &TestSignatureObject {
+                signers_present: true,
+                txn_signature_present: false,
+                signers: vec![TestSigner {
+                    account_id: "batch",
+                }],
+            },
+            &"batch",
+            &"seed",
+            |seed, account_id| format!("{seed}-{account_id}"),
+            |_, _| Ok(()),
+            |account_id| (*account_id).to_owned(),
+        );
+
+        assert_eq!(result, Err(INVALID_MULTISIGNER_ERROR.to_owned()));
     }
 
     #[test]

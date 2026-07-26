@@ -47,6 +47,7 @@ pub const MAX_PRICE_SCALE: usize = 20;
 pub const MAX_TRIM: usize = 25;
 pub const PERMISSION_MAX_SIZE: usize = 10;
 pub const MAX_BATCH_TX_COUNT: usize = 8;
+pub const MAX_BATCH_SIGNER_COUNT: usize = MAX_BATCH_TX_COUNT * 3;
 
 pub mod lending {
     use crate::{TenthBips16, TenthBips32, ValueUnit, percentage_to_tenth_bips};

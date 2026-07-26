@@ -56,10 +56,68 @@ use crate::state::time_keeper::{SystemTimeKeeperClock, TimeKeeper};
 use crate::tx_queue::transaction_master::TransactionMaster;
 use crate::validator::validator_keys::ValidatorKeys;
 use crate::validator::validator_list::ValidatorList;
+use ledger::CanonicalTXSet;
 use overlay::Overlay;
 
 pub type RclCxTx = consensus::RclCxTx;
 pub type RclCxLedger = consensus::RclCxLedger;
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+        })
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
+
+/// Decode peer-supplied consensus transaction bytes at the same boundary where
+/// rippled constructs its canonical consensus transaction set. A malformed
+/// entry is reported but does not prevent valid entries from being applied.
+fn decode_consensus_accept_transactions<'a>(
+    tx_set_id: Uint256,
+    items: impl IntoIterator<Item = (usize, &'a [u8])>,
+) -> (Vec<Arc<protocol::STTx>>, Vec<(usize, String)>) {
+    let mut txns = CanonicalTXSet::new(tx_set_id);
+    let mut malformed = Vec::new();
+
+    for (payload_len, bytes) in items {
+        if !(protocol::TX_MIN_SIZE_BYTES..=protocol::TX_MAX_SIZE_BYTES).contains(&payload_len) {
+            malformed.push((
+                payload_len,
+                format!("transaction payload length {payload_len} is outside the legal range"),
+            ));
+            continue;
+        }
+
+        let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut sit: protocol::SerialIter<'_> = bytes.into();
+            let tx = protocol::STTx::from_serial_iter(&mut sit);
+            if !sit.empty() {
+                return Err("transaction payload has trailing bytes".to_owned());
+            }
+            Ok(tx)
+        }));
+        match parsed {
+            Ok(Ok(tx)) => txns.insert(Arc::new(tx)),
+            Ok(Err(message)) => malformed.push((payload_len, message)),
+            Err(payload) => malformed.push((payload_len, panic_payload_message(payload))),
+        }
+    }
+
+    (txns.drain_ordered(), malformed)
+}
+
+fn pseudo_transaction_voting_enabled(options: AppRclConsensusOptions, mode: ConsensusMode) -> bool {
+    options.standalone || mode == ConsensusMode::Proposing
+}
+
+fn trusted_validation_quorum_reached(validations: usize, quorum: usize) -> bool {
+    validations >= quorum
+}
 
 /// The open-ledger view consensus reads current (not-yet-consensus-agreed)
 /// transactions from, and resets once a round is accepted.
@@ -71,7 +129,8 @@ pub trait RclConsensusOpenLedgerSource {
         next_seq: u32,
         base_fee: u64,
         parent_hash: &Uint256,
-        accepted_ids: &std::collections::HashSet<Uint256>,
+        completed_transaction_ids: &std::collections::HashSet<Uint256>,
+        retry_transactions: &[Arc<protocol::STTx>],
     );
 }
 
@@ -543,7 +602,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         &self,
         prev_ledger: &Self::Ledger,
         now: NetClockTimePoint,
-        _mode: ConsensusMode,
+        mode: ConsensusMode,
     ) -> consensus::algorithm::consensus::ConsensusResultOf<Self> {
         // Acquire the close gate to prevent the tx-batch-apply thread from
         // applying transactions while we capture the open ledger's transaction
@@ -570,7 +629,9 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             // Rippled injects amendment and fee pseudo-transactions after a
             // flag LCL. Negative-UNL voting runs after the preceding voting
             // LCL, for the consensus session that produces the flag ledger.
-            if prev_ledger.ledger().is_flag_ledger() {
+            if pseudo_transaction_voting_enabled(self.options, mode)
+                && prev_ledger.ledger().is_flag_ledger()
+            {
                 // Amendment voting — creates ttAMENDMENT pseudo-txs for
                 // amendments gaining/losing majority or activating.
                 if let Some(ref amendment_status) = self.amendment_status {
@@ -584,11 +645,16 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                         .validators
                         .negative_unl_filter_validations(parent_validations);
                     let mut vote_set: Vec<protocol::STTx> = Vec::new();
-                    amendment_status.do_voting_for_ledger(
-                        &prev_ledger.ledger(),
-                        &parent_validations,
-                        &mut vote_set,
-                    );
+                    if trusted_validation_quorum_reached(
+                        parent_validations.len(),
+                        self.validators.quorum(),
+                    ) {
+                        amendment_status.do_voting_for_ledger(
+                            &prev_ledger.ledger(),
+                            &parent_validations,
+                            &mut vote_set,
+                        );
+                    }
                     for pseudo_tx in &vote_set {
                         editable.insert(&consensus::RclCxTxRef::from_transaction(pseudo_tx));
                     }
@@ -615,7 +681,12 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                         .negative_unl_filter_validations(parent_validations);
                     let mut fee_vote_set: Vec<protocol::STTx> = Vec::new();
                     let ledger_ref = prev_ledger.ledger();
-                    fee_vote.do_voting(&*ledger_ref, &parent_validations, &mut fee_vote_set);
+                    if trusted_validation_quorum_reached(
+                        parent_validations.len(),
+                        self.validators.quorum(),
+                    ) {
+                        fee_vote.do_voting(&*ledger_ref, &parent_validations, &mut fee_vote_set);
+                    }
                     for pseudo_tx in &fee_vote_set {
                         editable.insert(&consensus::RclCxTxRef::from_transaction(pseudo_tx));
                     }
@@ -627,7 +698,9 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                         );
                     }
                 }
-            } else if prev_ledger.ledger().is_voting_ledger() {
+            } else if pseudo_transaction_voting_enabled(self.options, mode)
+                && prev_ledger.ledger().is_voting_ledger()
+            {
                 // NegativeUNLVote — injects ttUNL_MODIFY pseudo-txs for
                 // validator disable/re-enable when reliability thresholds
                 // are crossed.
@@ -706,26 +779,33 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             .map(|l| l.fees().base)
             .unwrap_or(10);
 
-        let txns: Vec<Arc<protocol::STTx>> = result
-            .txns
-            .all_items()
-            .into_iter()
-            .map(|item| {
-                let mut sit: protocol::SerialIter<'_> = item.data().into();
-                Arc::new(protocol::STTx::from_serial_iter(&mut sit))
-            })
-            .collect();
-        let accepted_ids: std::collections::HashSet<Uint256> =
-            txns.iter().map(|tx| tx.get_transaction_id()).collect();
-
-        RclConsensusOpenLedgerSource::accept_consensus_ledger(
-            &self.open_ledger,
-            next_seq,
-            base_fee,
-            &prev_ledger.id(),
-            &accepted_ids,
+        // Consensus transaction-set bytes originate from peers. rippled catches
+        // STTx construction failures here, marks that entry failed, and keeps
+        // building the remaining canonical set. Do the same before handing
+        // acceptance work to the dedicated consensus strand.
+        let items = result.txns.all_items();
+        let (txns, malformed_txns) = decode_consensus_accept_transactions(
+            result.txns.id(),
+            items.iter().map(|item| (item.data().len(), item.data())),
         );
-
+        let malformed_tx_count = malformed_txns.len();
+        for (payload_len, message) in malformed_txns {
+            tracing::warn!(
+                target: "consensus",
+                tx_set = %result.txns.id(),
+                payload_len,
+                %message,
+                "discarded malformed consensus transaction"
+            );
+        }
+        if malformed_tx_count > 0 {
+            tracing::warn!(
+                target: "consensus",
+                tx_set = %result.txns.id(),
+                malformed_tx_count,
+                "consensus transaction set contains malformed entries"
+            );
+        }
         let raw_close_time = result.position.close_time();
         let close_time_correct = raw_close_time != NetClockTimePoint::default();
         let effective_close_time = if !close_time_correct {
@@ -968,7 +1048,7 @@ impl AppConsensus {
         let closed_seq = work.closed_seq;
         let root = self.adaptor.app_root.clone();
 
-        match root.accept_ledger_with_txns(
+        match root.accept_ledger_with_txns_outcome(
             work.closed_seq,
             work.close_time,
             work.close_resolution,
@@ -976,7 +1056,19 @@ impl AppConsensus {
             work.base_fee_drops,
             work.txns,
         ) {
-            Ok(_) => {
+            Ok(outcome) => {
+                if let Some(closed) = root.closed_ledger() {
+                    RclConsensusOpenLedgerSource::accept_consensus_ledger(
+                        &self.adaptor.open_ledger,
+                        outcome.next_open_index,
+                        work.base_fee_drops,
+                        closed.header().hash.as_uint256(),
+                        &outcome.completed_transaction_ids,
+                        &outcome.retry_transactions,
+                    );
+                    root.set_status_rpc_current_ledger_index(Some(outcome.next_open_index));
+                    root.set_status_rpc_queue_report(Some(root.tx_q_rpc_report()));
+                }
                 // Clear pending transactions from the network ops queue to
                 // prevent stale txns from contaminating the next consensus
                 // round. Matches rippled's endConsensus which clears the
@@ -1302,6 +1394,77 @@ impl AppConsensus {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AppRclConsensusOptions, decode_consensus_accept_transactions,
+        pseudo_transaction_voting_enabled, trusted_validation_quorum_reached,
+    };
+    use basics::base_uint::Uint256;
+    use consensus::algorithm::types::ConsensusMode;
+    use protocol::{AccountID, STAmount, STTx, TxType, get_field_by_symbol};
+
+    #[test]
+    fn consensus_pseudo_transaction_voting_requires_proposing_or_standalone_and_quorum() {
+        assert!(pseudo_transaction_voting_enabled(
+            AppRclConsensusOptions::default(),
+            ConsensusMode::Proposing,
+        ));
+        assert!(!pseudo_transaction_voting_enabled(
+            AppRclConsensusOptions::default(),
+            ConsensusMode::Observing,
+        ));
+        assert!(pseudo_transaction_voting_enabled(
+            AppRclConsensusOptions {
+                standalone: true,
+                ..Default::default()
+            },
+            ConsensusMode::WrongLedger,
+        ));
+        assert!(trusted_validation_quorum_reached(3, 3));
+        assert!(!trusted_validation_quorum_reached(2, 3));
+    }
+
+    #[test]
+    fn consensus_decode_discards_malformed_entries_and_keeps_valid_transactions() {
+        let source = AccountID::from_hex("1111111111111111111111111111111111111111")
+            .expect("source account");
+        let destination = AccountID::from_hex("2222222222222222222222222222222222222222")
+            .expect("destination account");
+        let valid = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+            tx.set_account_id(get_field_by_symbol("sfDestination"), destination);
+            tx.set_field_amount(
+                get_field_by_symbol("sfAmount"),
+                STAmount::new_native(1_000_000, false),
+            );
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+            tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        });
+        let valid_bytes = valid.get_serializer().data().to_vec();
+        let malformed_bytes = [0; protocol::TX_MIN_SIZE_BYTES - 1];
+
+        let (transactions, malformed) = decode_consensus_accept_transactions(
+            Uint256::zero(),
+            [
+                (valid_bytes.len(), valid_bytes.as_slice()),
+                (malformed_bytes.len(), &malformed_bytes),
+            ],
+        );
+
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(
+            transactions[0].get_transaction_id(),
+            valid.get_transaction_id()
+        );
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(malformed[0].0, malformed_bytes.len());
     }
 }
 

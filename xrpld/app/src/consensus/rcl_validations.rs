@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use basics::base_uint::Uint256;
 use consensus::rcl_support::Validations;
-use protocol::{PublicKey, STValidation};
+use protocol::{PublicKey, STValidation, calc_node_id};
 
 use crate::consensus::rcl_validation::{RclValidatedLedger, RclValidation, RclValidationsAdaptor};
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
@@ -298,10 +298,7 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
 
     /// Provide the overlay to the inner validation adaptor so it can resolve
     /// ledger sequence numbers from peers when the local cache misses.
-    pub fn set_overlay(
-        &self,
-        overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>,
-    ) {
+    pub fn set_overlay(&self, overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>) {
         self.inner
             .lock()
             .expect("shared app validations mutex must not be poisoned")
@@ -338,13 +335,19 @@ pub fn handle_new_validation_with_store(
     // currently trusted) or unrecognized entirely both result in an
     // untrusted validation -- listing only affects whether it is worth
     // tracking at all, which this port always does regardless.
-    if trust_source.get_trusted_key(&signing_key).is_some() {
+    let trusted_master_key = trust_source.get_trusted_key(&signing_key);
+    if trusted_master_key.is_some() {
         validation.set_trusted();
     } else {
         validation.set_untrusted();
     }
 
-    let node_id = validation.get_node_id();
+    // Rippled tracks a validator under its master key for either trusted or
+    // listed signing keys. Falling back to the signing key only when neither
+    // mapping exists preserves identity across signing-key rotations while
+    // still retaining unknown validations for diagnostics.
+    let master_key = trusted_master_key.or_else(|| trust_source.get_listed_key(&signing_key));
+    let node_id = calc_node_id(&master_key.unwrap_or(signing_key));
     let wrapped = RclValidation::new(Arc::new(validation.clone()));
     let status = validations.add(node_id, wrapped);
 
@@ -424,6 +427,20 @@ mod tests {
         }
     }
 
+    struct SharedMasterKey {
+        master_key: PublicKey,
+    }
+
+    impl RclValidationTrustSource for SharedMasterKey {
+        fn get_trusted_key(&self, _identity: &PublicKey) -> Option<PublicKey> {
+            Some(self.master_key)
+        }
+
+        fn get_listed_key(&self, _identity: &PublicKey) -> Option<PublicKey> {
+            Some(self.master_key)
+        }
+    }
+
     fn signed_validation(ledger_hash: Uint256, seq: u32, sign_time: u32) -> STValidation {
         let seed = random_seed();
         let secret_key = generate_secret_key(KeyType::Secp256k1, &seed)
@@ -498,6 +515,56 @@ mod tests {
         );
 
         assert!(!validation.is_trusted());
+    }
+
+    #[test]
+    fn handle_new_validation_uses_master_key_identity_for_rotated_signing_keys() {
+        let (shared, now) = shared_validations();
+        let mut first_ledger = ledger::Ledger::from_ledger_seq_and_close_time(1, 100, false);
+        let mut first_header = first_ledger.header();
+        first_header.hash = basics::sha_map_hash::SHAMapHash::new(Uint256::from_u64(1));
+        first_ledger.set_ledger_info(first_header);
+        let mut second_ledger = ledger::Ledger::from_ledger_seq_and_close_time(1, 101, false);
+        let mut second_header = second_ledger.header();
+        second_header.hash = basics::sha_map_hash::SHAMapHash::new(Uint256::from_u64(2));
+        second_ledger.set_ledger_info(second_header);
+        shared.register_ledger(&first_ledger);
+        shared.register_ledger(&second_ledger);
+
+        let master_secret = generate_secret_key(KeyType::Secp256k1, &random_seed())
+            .expect("master secret key generation should succeed");
+        let master_key = derive_public_key(KeyType::Secp256k1, &master_secret)
+            .expect("master public key derivation should succeed");
+        let trust_source = SharedMasterKey { master_key };
+
+        let mut first = signed_validation(*first_ledger.header().hash.as_uint256(), 1, now);
+        let mut second = signed_validation(*second_ledger.header().hash.as_uint256(), 1, now);
+        let mut inner = shared.validations().lock().unwrap();
+
+        assert_eq!(
+            handle_new_validation_with_store(
+                &trust_source,
+                &mut inner,
+                &mut first,
+                false,
+                None,
+                None,
+            )
+            .0,
+            consensus::ValidationStatus::Current
+        );
+        assert_eq!(
+            handle_new_validation_with_store(
+                &trust_source,
+                &mut inner,
+                &mut second,
+                false,
+                None,
+                None,
+            )
+            .0,
+            consensus::ValidationStatus::Conflicting
+        );
     }
 
     #[test]

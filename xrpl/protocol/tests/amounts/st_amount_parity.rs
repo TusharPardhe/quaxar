@@ -2,7 +2,7 @@ use basics::str_hex::str_hex;
 use protocol::{
     IOUAmount, JsonOptions, JsonValue, MPTAmount, MPTIssue, STAmount, STVar, Serializer, StBase,
     currency_from_string, get_field_by_symbol, issued_zero_header_word, make_mpt_id,
-    parse_base58_account_id, xrp_currency,
+    parse_base58_account_id, xrp_currency, xrp_issue,
 };
 
 #[test]
@@ -176,6 +176,46 @@ fn amount_comparison_and_stvar_support_match_current_surface() {
         protocol::Issue::new(currency_from_string("USD"), issuer_two),
     );
     assert_eq!(first, second);
+}
+
+#[test]
+fn integral_amount_canonicalization_rounds_and_rejects_out_of_range_values() {
+    let field = get_field_by_symbol("sfAmount");
+
+    // rippled canonicalizes integral amounts through Number, rather than
+    // truncating their mantissa while manually shifting the exponent.
+    let rounded = STAmount::new_with_asset(field, xrp_issue(), 15, -1, false);
+    assert_eq!(rounded.xrp(), protocol::XRPAmount::from(2));
+
+    let native_max = protocol::ST_AMOUNT_MAX_NATIVE_NETWORK;
+    let native_at_limit = STAmount::new_with_asset(field, xrp_issue(), native_max / 10, 1, false);
+    assert_eq!(
+        native_at_limit.xrp(),
+        protocol::XRPAmount::from(native_max as i64)
+    );
+    assert!(
+        std::panic::catch_unwind(|| {
+            STAmount::new_with_asset(field, xrp_issue(), native_max / 10 + 1, 1, false)
+        })
+        .is_err()
+    );
+    assert!(
+        std::panic::catch_unwind(|| { STAmount::new_with_asset(field, xrp_issue(), 1, 18, false) })
+            .is_err()
+    );
+
+    let issuer =
+        parse_base58_account_id("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").expect("issuer account");
+    let mpt = MPTIssue::new(make_mpt_id(7, issuer));
+    let mpt_in_range = STAmount::new_with_asset(field, mpt, 1, 18, false);
+    assert_eq!(
+        mpt_in_range.mpt(),
+        MPTAmount::from_value(1_000_000_000_000_000_000)
+    );
+    assert!(
+        std::panic::catch_unwind(|| { STAmount::new_with_asset(field, mpt, 10, 18, false) })
+            .is_err()
+    );
 }
 
 #[test]

@@ -12,7 +12,7 @@ use crate::{
     STAmount, STBlob, STCurrency, STInt32, STIssue, STNumber, STPathSet, STUInt8, STUInt16,
     STUInt32, STUInt64, STUInt128, STUInt160, STUInt192, STUInt256, STVar, STVector256,
     STXChainBridge, SerialIter, SerializedTypeId, Serializer, StBase, StBaseCore, ValidationError,
-    downcast_stbase_mut, downcast_stbase_ref, fix_inner_obj_template, fix_inner_obj_template2,
+    downcast_stbase_mut, downcast_stbase_ref, fix_inner_obj_template2,
     get_current_transaction_rules, get_field_by_symbol, sf_generic,
 };
 
@@ -59,10 +59,10 @@ impl STObject {
             || field == get_field_by_symbol("sfVoteEntry");
 
         if (rules.is_none()
-            || rules.as_ref().is_some_and(|rules| {
-                (rules.enabled(&fix_inner_obj_template()) && is_amm_obj)
-                    || (rules.enabled(&fix_inner_obj_template2()) && !is_amm_obj)
-            }))
+            || is_amm_obj
+            || rules
+                .as_ref()
+                .is_some_and(|rules| rules.enabled(&fix_inner_obj_template2())))
             && let Some(template) =
                 InnerObjectFormats::get_instance().find_so_template_by_sfield(field)
         {

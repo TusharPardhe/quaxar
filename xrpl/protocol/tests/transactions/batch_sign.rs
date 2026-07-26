@@ -50,6 +50,12 @@ impl StTxMultiSignObject<&'static str, TestMultiSigner> for TestSigner {
     }
 }
 
+impl StTxMultiSigner<&'static str> for TestSigner {
+    fn account_id(&self) -> &'static str {
+        "batch"
+    }
+}
+
 impl BatchSigner<&'static str, TestMultiSigner> for TestSigner {
     fn signing_pub_key_is_empty(&self) -> bool {
         assert!(
@@ -72,7 +78,7 @@ fn protocol_batch_sign_rejects_non_batch_transactions() {
             panic_on_pub_key_lookup: false,
         }],
         |_| true,
-        |_| Ok(()),
+        |_, _| Ok(()),
         |account_id| format!("r{account_id}"),
     );
 
@@ -99,7 +105,7 @@ fn protocol_batch_sign_uses_multi_sign_callback_for_empty_signing_pub_key() {
             single_called.set(true);
             true
         },
-        |_| {
+        |_, _| {
             multi_called.set(true);
             Ok(())
         },
@@ -129,7 +135,7 @@ fn protocol_batch_sign_uses_single_sign_callback_for_present_signing_pub_key() {
             single_called.set(true);
             true
         },
-        |_| {
+        |_, _| {
             multi_called.set(true);
             Ok(())
         },
@@ -164,7 +170,7 @@ fn protocol_batch_sign_returns_first_callback_failure_unchanged() {
             },
         ],
         |_| true,
-        |_| {
+        |_, _| {
             later_callback_ran.set(true);
             Ok(())
         },
@@ -190,7 +196,7 @@ fn protocol_batch_sign_maps_signer_access_panics_to_internal_failure() {
             panic_on_pub_key_lookup: true,
         }],
         |_| true,
-        |_| Ok(()),
+        |_, _| Ok(()),
         |account_id| format!("r{account_id}"),
     );
 

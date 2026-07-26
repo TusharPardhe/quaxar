@@ -42,6 +42,7 @@ pub use domain::pending_saves;
 pub use domain::persistence;
 pub use domain::ripple_calc;
 pub use domain::setup;
+pub use domain::sponsor_helpers::{is_fee_sponsored, is_reserve_sponsored};
 pub use domain::timeout_counter;
 pub use domain::token_helpers;
 pub use domain::transaction_state_sf;

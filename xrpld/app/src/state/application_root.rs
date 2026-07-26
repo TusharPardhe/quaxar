@@ -72,9 +72,9 @@ use overlay::{OverlayHandoff, OverlayImpl, PeerReservationSource};
 use perflog::PerfLogImp;
 use protocol::{
     AccountID, BatchTransactionFlags, JsonOptions, JsonValue, NotTec, PublicKey, Rules, STAmount,
-    STLedgerEntry, STTx, SecretKey, SeqProxy, Serializer, Ter, TxType, XRPAmount, account_keylet,
-    calc_node_id, feature_xrp_fees, get_field_by_symbol, is_tec_claim, is_tef_failure,
-    is_tem_malformed, is_tes_success,
+    STLedgerEntry, STObject, STTx, SecretKey, SeqProxy, Serializer, Ter, TxType, XRPAmount,
+    account_keylet, calc_account_id, calc_node_id, feature_xrp_fees, get_field_by_symbol,
+    is_tec_claim, is_tef_failure, is_tem_malformed, is_tes_success, lsfDisableMaster,
 };
 use shamap::family::{NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
 use shamap::tree_node_cache::TreeNodeCache;
@@ -419,19 +419,16 @@ pub trait LedgerAcceptor: Send + Sync + 'static {
     /// (the reference's `result.txns`, captured by `onClose` from the open
     /// ledger's contents at that earlier point in time and passed down
     /// through `doAccept` unchanged). This must NOT be re-derived by
-    /// re-reading the open ledger's CURRENT contents at accept time: the
-    /// open ledger is reset for the next round (see
-    /// `accept_consensus_ledger`) synchronously, at the START of
-    /// `on_accept`, before this (async, JobQueue-dispatched) call's inner
-    /// job actually runs -- re-reading it here would race that reset and
-    /// see the wrong (usually empty, freshly-reset) set.
+    /// re-reading the open ledger's current contents at accept time: new
+    /// local transactions may have arrived since `onClose` captured the
+    /// consensus set.
     fn accept_ledger(
         &self,
         closed_seq: u32,
         close_time: u32,
         close_resolution: u8,
         correct_close_time: bool,
-        base_fee_drops: u64,
+        _base_fee_drops: u64,
         txns: Vec<Arc<protocol::STTx>>,
         validation: Option<PendingValidation>,
     ) -> Result<u32, String>;
@@ -621,6 +618,327 @@ impl HasTxnType for AcceptLedgerPendingTransaction {
 
 struct AcceptLedgerPendingRuntime;
 
+/// Concrete ledger-state adapters for the shared Batch signer authorization
+/// helpers. Keeping the authorization algorithm in `tx` makes Batch follow
+/// the same regular-key, disabled-master, and signer-list rules as ordinary
+/// transactions.
+#[derive(Clone)]
+struct BatchPreclaimAccountState {
+    regular_key: Option<AccountID>,
+    master_disabled: bool,
+}
+
+impl tx::TransactorSingleSignAccountState<AccountID> for BatchPreclaimAccountState {
+    fn regular_key(&self) -> Option<&AccountID> {
+        self.regular_key.as_ref()
+    }
+
+    fn is_master_disabled(&self) -> bool {
+        self.master_disabled
+    }
+}
+
+#[derive(Clone)]
+struct BatchPreclaimAccountSigner {
+    account: AccountID,
+    weight: u32,
+}
+
+impl tx::TransactorMultiSignAccountSigner<AccountID> for BatchPreclaimAccountSigner {
+    fn account_id(&self) -> &AccountID {
+        &self.account
+    }
+
+    fn weight(&self) -> u32 {
+        self.weight
+    }
+}
+
+#[derive(Clone)]
+struct BatchPreclaimSignerList {
+    signer_list_id_present: bool,
+    signer_list_id: u32,
+    quorum: u32,
+    entries: Vec<BatchPreclaimAccountSigner>,
+}
+
+impl tx::TransactorMultiSignSignerList<BatchPreclaimAccountSigner> for BatchPreclaimSignerList {
+    type Entries = Vec<BatchPreclaimAccountSigner>;
+
+    fn signer_list_id_present(&self) -> bool {
+        self.signer_list_id_present
+    }
+
+    fn signer_list_id(&self) -> u32 {
+        self.signer_list_id
+    }
+
+    fn signer_quorum(&self) -> u32 {
+        self.quorum
+    }
+
+    fn signer_entries(self) -> Result<Self::Entries, NotTec> {
+        Ok(self.entries)
+    }
+}
+
+#[derive(Clone)]
+struct BatchPreclaimTxSigner {
+    object: STObject,
+}
+
+impl tx::TransactorMultiSignTxSigner<AccountID> for BatchPreclaimTxSigner {
+    fn account_id(&self) -> AccountID {
+        self.object.get_account_id(get_field_by_symbol("sfAccount"))
+    }
+
+    fn signing_pub_key_is_empty(&self) -> bool {
+        self.object
+            .get_field_vl(get_field_by_symbol("sfSigningPubKey"))
+            .is_empty()
+    }
+}
+
+#[derive(Clone)]
+struct BatchPreclaimSigner {
+    object: STObject,
+}
+
+impl tx::TransactorBatchSigner for BatchPreclaimSigner {
+    type AccountId = AccountID;
+
+    fn account_id(&self) -> Self::AccountId {
+        self.object.get_account_id(get_field_by_symbol("sfAccount"))
+    }
+
+    fn signing_pub_key_is_empty(&self) -> bool {
+        self.object
+            .get_field_vl(get_field_by_symbol("sfSigningPubKey"))
+            .is_empty()
+    }
+}
+
+impl tx::TransactorBatchMultiSigner<AccountID> for BatchPreclaimSigner {
+    type TxSigner = BatchPreclaimTxSigner;
+    type TxSigners = Vec<BatchPreclaimTxSigner>;
+
+    fn tx_signers(&self) -> Self::TxSigners {
+        self.object
+            .get_field_array(get_field_by_symbol("sfSigners"))
+            .iter()
+            .cloned()
+            .map(|object| BatchPreclaimTxSigner { object })
+            .collect()
+    }
+}
+
+struct BatchPreclaimTx<'a> {
+    tx: &'a STTx,
+}
+
+impl tx::TransactorBatchSignTx for BatchPreclaimTx<'_> {
+    type AccountId = AccountID;
+    type Signer = BatchPreclaimSigner;
+    type Signers = Vec<BatchPreclaimSigner>;
+
+    fn batch_signers(&self) -> Self::Signers {
+        self.tx
+            .get_field_array(get_field_by_symbol("sfBatchSigners"))
+            .iter()
+            .cloned()
+            .map(|object| BatchPreclaimSigner { object })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BatchFeeInnerTransaction<'a>(&'a STTx);
+
+impl tx::BatchBaseFeeInnerTransaction for BatchFeeInnerTransaction<'_> {
+    fn txn_type(&self) -> TxType {
+        self.0.get_txn_type()
+    }
+}
+
+#[derive(Clone)]
+struct BatchFeeSignerEntry(STObject);
+
+impl tx::BatchBaseFeeSignerEntry for BatchFeeSignerEntry {
+    fn has_txn_signature(&self) -> bool {
+        self.0
+            .is_field_present(get_field_by_symbol("sfTxnSignature"))
+    }
+
+    fn multisigner_count(&self) -> usize {
+        self.0
+            .get_field_array(get_field_by_symbol("sfSigners"))
+            .len()
+    }
+}
+
+const INVALID_BATCH_BASE_FEE: u64 = u64::MAX;
+
+fn batch_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
+    let raw_transactions_field = get_field_by_symbol("sfRawTransactions");
+    if !tx.is_field_present(raw_transactions_field) {
+        return INVALID_BATCH_BASE_FEE;
+    }
+    let inner_transactions = match tx::canonical_batch_inner_transactions(tx) {
+        Ok(inner_transactions) => inner_transactions,
+        Err(_) => return INVALID_BATCH_BASE_FEE,
+    };
+    let batch_signers_field = get_field_by_symbol("sfBatchSigners");
+    let batch_signers = tx.is_field_present(batch_signers_field).then(|| {
+        tx.get_field_array(batch_signers_field)
+            .iter()
+            .cloned()
+            .map(BatchFeeSignerEntry)
+            .collect::<Vec<_>>()
+    });
+    let ledger_base_fee = view.fees().base;
+    let owner_reserve_fee = view.fees().increment;
+
+    tx::run_batch_calculate_base_fee(
+        INVALID_BATCH_BASE_FEE,
+        ledger_base_fee,
+        ledger_base_fee,
+        Some(
+            inner_transactions
+                .iter()
+                .map(BatchFeeInnerTransaction)
+                .collect::<Vec<_>>(),
+        ),
+        batch_signers,
+        |inner| match inner.0.get_txn_type() {
+            TxType::ACCOUNT_DELETE => {
+                tx::run_account_delete_calculate_base_fee(ledger_base_fee, owner_reserve_fee)
+            }
+            TxType::AMM_CREATE => {
+                tx::run_amm_create_calculate_base_fee(ledger_base_fee, owner_reserve_fee)
+            }
+            TxType::ESCROW_FINISH => tx::run_escrow_finish_calculate_base_fee(
+                ledger_base_fee,
+                ledger_base_fee,
+                inner
+                    .0
+                    .is_field_present(get_field_by_symbol("sfFulfillment"))
+                    .then(|| {
+                        inner
+                            .0
+                            .get_field_vl(get_field_by_symbol("sfFulfillment"))
+                            .len()
+                    }),
+            ),
+            TxType::LEDGER_STATE_FIX => {
+                tx::run_ledger_state_fix_calculate_base_fee(ledger_base_fee, owner_reserve_fee)
+            }
+            // Nested Batch and loan fee owners are rejected from RawTransactions;
+            // the remaining specialized fee owners require account state that
+            // Batch does not have at this aggregate-fee boundary.
+            _ => ledger_base_fee,
+        },
+        u64::checked_add,
+        |fee, count| fee.checked_mul(u64::try_from(count).ok()?),
+    )
+}
+
+fn batch_preclaim_ter(view: &impl ReadView, tx: &STTx, flags: ApplyFlags) -> Ter {
+    if tx.get_txn_type() != TxType::BATCH {
+        return Ter::TES_SUCCESS;
+    }
+
+    // `Batch::calculateBaseFee` returns a payable placeholder on failure, but
+    // `Batch::preclaim` rejects that same invalid calculation.
+    if batch_base_fee(view, tx) == INVALID_BATCH_BASE_FEE {
+        return Ter::TEC_INSUFF_FEE;
+    }
+
+    let batch_signers_field = get_field_by_symbol("sfBatchSigners");
+    if !tx.is_field_present(batch_signers_field) {
+        return Ter::TES_SUCCESS;
+    }
+
+    tx::run_transactor_preclaim_check_batch_sign(
+        flags,
+        &BatchPreclaimTx { tx },
+        |account| {
+            view.read(account_keylet(
+                Uint160::from_slice(account.data()).expect("account width should match Uint160"),
+            ))
+            .ok()
+            .flatten()
+            .map(|account_root| {
+                let regular_key_field = get_field_by_symbol("sfRegularKey");
+                BatchPreclaimAccountState {
+                    regular_key: account_root
+                        .is_field_present(regular_key_field)
+                        .then(|| account_root.get_account_id(regular_key_field)),
+                    master_disabled: account_root.get_field_u32(get_field_by_symbol("sfFlags"))
+                        & lsfDisableMaster
+                        != 0,
+                }
+            })
+        },
+        |account| {
+            view.read(protocol::signers_keylet(
+                Uint160::from_slice(account.data()).expect("account width should match Uint160"),
+            ))
+            .ok()
+            .flatten()
+            .map(|signer_list| BatchPreclaimSignerList {
+                signer_list_id_present: signer_list
+                    .is_field_present(get_field_by_symbol("sfSignerListID")),
+                signer_list_id: signer_list.get_field_u32(get_field_by_symbol("sfSignerListID")),
+                quorum: signer_list.get_field_u32(get_field_by_symbol("sfSignerQuorum")),
+                entries: signer_list
+                    .get_field_array(get_field_by_symbol("sfSignerEntries"))
+                    .iter()
+                    .map(|entry| BatchPreclaimAccountSigner {
+                        account: entry.get_account_id(get_field_by_symbol("sfAccount")),
+                        weight: u32::from(
+                            entry.get_field_u16(get_field_by_symbol("sfSignerWeight")),
+                        ),
+                    })
+                    .collect(),
+            })
+        },
+        |signer| {
+            PublicKey::from_slice(
+                &signer
+                    .object
+                    .get_field_vl(get_field_by_symbol("sfSigningPubKey")),
+            )
+            .is_ok()
+        },
+        |signer| {
+            let key = PublicKey::from_slice(
+                &signer
+                    .object
+                    .get_field_vl(get_field_by_symbol("sfSigningPubKey")),
+            )
+            .expect("public-key type was checked before deriving its account");
+            calc_account_id(key.as_bytes())
+        },
+        |signer| {
+            PublicKey::from_slice(
+                &signer
+                    .object
+                    .get_field_vl(get_field_by_symbol("sfSigningPubKey")),
+            )
+            .is_ok()
+        },
+        |signer| {
+            let key = PublicKey::from_slice(
+                &signer
+                    .object
+                    .get_field_vl(get_field_by_symbol("sfSigningPubKey")),
+            )
+            .expect("public-key type was checked before deriving its account");
+            calc_account_id(key.as_bytes())
+        },
+    )
+}
+
 #[derive(Clone, Copy)]
 struct QueueApplyPreclaimTx<'a> {
     tx: &'a STTx,
@@ -766,9 +1084,21 @@ impl<'a> AppOpenLedgerTxQApplyRuntime<'a> {
         } else {
             0
         };
-        let preflight_ter = match tx.check_sign(&rules) {
-            Ok(()) => Ter::TES_SUCCESS,
-            Err(_) => Ter::TEM_BAD_SIGNATURE,
+        let preflight_ter = if tx.get_txn_type() == TxType::BATCH {
+            let batch_preflight = tx::validate_sttx_batch_preflight_with_rules(tx.as_ref(), &rules);
+            if !is_tes_success(batch_preflight) {
+                batch_preflight
+            } else {
+                match tx.check_sign(&rules) {
+                    Ok(()) => Ter::TES_SUCCESS,
+                    Err(_) => Ter::TEM_BAD_SIGNATURE,
+                }
+            }
+        } else {
+            match tx.check_sign(&rules) {
+                Ok(()) => Ter::TES_SUCCESS,
+                Err(_) => Ter::TEM_BAD_SIGNATURE,
+            }
         };
         let consequences = if is_tes_success(preflight_ter) {
             TxConsequences::new(fee_drops, tx.get_seq_proxy())
@@ -869,6 +1199,18 @@ struct StandaloneAcceptedTx {
 }
 
 #[derive(Clone)]
+pub(crate) struct AcceptedLedgerOutcome {
+    pub next_open_index: u32,
+    /// IDs that must be removed from the previous open ledger because they
+    /// were already included, were terminal failures, or were duplicates in
+    /// the parent ledger.
+    pub completed_transaction_ids: std::collections::HashSet<Uint256>,
+    /// Retry-class transactions that BuildLedger leaves for the next open
+    /// ledger, including entries received from a peer consensus set.
+    pub retry_transactions: Vec<Arc<STTx>>,
+}
+
+#[derive(Clone)]
 struct StandaloneLedgerBuildView {
     inner: OpenView<Ledger>,
 }
@@ -920,7 +1262,9 @@ impl AcceptLedgerPendingRuntime {
 }
 
 fn queue_apply_preclaim_ter(view: &impl ReadView, tx: &STTx, current_ledger_seq: u32) -> Ter {
-    if AcceptLedgerPendingRuntime::is_system_transaction(tx.get_txn_type()) {
+    if tx.get_txn_type() != TxType::BATCH
+        && AcceptLedgerPendingRuntime::is_system_transaction(tx.get_txn_type())
+    {
         return Ter::TES_SUCCESS;
     }
 
@@ -948,7 +1292,7 @@ fn queue_apply_preclaim_ter(view: &impl ReadView, tx: &STTx, current_ledger_seq:
         return seq_check;
     }
 
-    tx::run_transactor_check_prior_tx_and_last_ledger(
+    let prior_tx_check = tx::run_transactor_check_prior_tx_and_last_ledger(
         current_ledger_seq,
         &preclaim_tx,
         |account| {
@@ -966,7 +1310,12 @@ fn queue_apply_preclaim_ter(view: &impl ReadView, tx: &STTx, current_ledger_seq:
             }
         },
         |tx_id| view.tx_exists(*tx_id).unwrap_or(false),
-    )
+    );
+    if !is_tes_success(prior_tx_check) {
+        return prior_tx_check;
+    }
+
+    batch_preclaim_ter(view, tx, ApplyFlags::NONE)
 }
 
 struct SubmitOracleSetReserveSink {
@@ -1187,6 +1536,21 @@ pub fn apply_submit_transactor_shell_with_delivered_amount<V: ledger::ApplyView>
     txn_type: TxType,
 ) -> (Ter, Option<STAmount>) {
     let rules = view.rules();
+    // Accepted-ledger replay and BuildLedger call this public shell directly,
+    // bypassing the open-ledger TxQ gates. Validate an outer Batch before
+    // opening a sandbox or touching sequence, fee, or ledger state.
+    if txn_type == TxType::BATCH {
+        let preflight = tx::validate_sttx_batch_preflight_with_rules(tx, &rules);
+        if !is_tes_success(preflight) {
+            return (preflight, None);
+        }
+
+        let preclaim = batch_preclaim_ter(view, tx, ApplyFlags::NONE);
+        if !is_tes_success(preclaim) {
+            return (preclaim, None);
+        }
+    }
+
     tx::with_transaction_apply_runtime(&rules, || {
         // ApplyContext owns DeliveredAmount in rippled. Scope its Rust
         // equivalent to this outer Payment only so batch inner payments cannot
@@ -1196,9 +1560,35 @@ pub fn apply_submit_transactor_shell_with_delivered_amount<V: ledger::ApplyView>
 
         // Match rippled's ApplyContext: every mutation, including the common
         // sequence/ticket and fee preamble, stays in a per-transaction view
-        // until the final TER says the transaction is applied.
+        // until the final TER says the transaction is applied. rippled's
+        // Transactor/BuildLedger catches arithmetic exceptions at this
+        // transaction boundary; retain the same atomicity here by dropping the
+        // unapplied FlowSandbox and reporting tefEXCEPTION.
         let mut tx_view = ledger::FlowSandbox::new(view);
-        let result = apply_submit_transactor_shell_impl(&mut tx_view, tx, txn_type, true);
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            apply_submit_transactor_shell_impl(&mut tx_view, tx, txn_type, true)
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        payload
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_owned())
+                    })
+                    .unwrap_or_else(|| "non-string panic payload".to_owned());
+                tracing::error!(
+                    target: "tx",
+                    tx_id = %tx.get_transaction_id(),
+                    ?txn_type,
+                    %message,
+                    "transaction execution panicked; mapped to tefEXCEPTION"
+                );
+                return (Ter::TEF_EXCEPTION, None);
+            }
+        };
         if is_tes_success(result) || is_tec_claim(result) {
             let _ = tx_view.apply();
         }
@@ -1584,12 +1974,12 @@ fn apply_submit_batch_followup<V: ledger::ApplyView>(view: &mut V, batch_tx: &ST
     let mut whole_batch = ledger::FlowSandbox::new(view);
     let mut applied = 0_usize;
 
-    for raw_tx in batch_tx
-        .get_field_array(get_field_by_symbol("sfRawTransactions"))
-        .iter()
-        .cloned()
-    {
-        let inner_tx = STTx::from_stobject(raw_tx);
+    let inner_transactions = match tx::canonical_batch_inner_transactions(batch_tx) {
+        Ok(inner_transactions) => inner_transactions,
+        Err(error) => return error,
+    };
+
+    for inner_tx in inner_transactions {
         let whole_batch_view: &mut dyn ledger::ApplyView = &mut whole_batch;
         let mut per_tx_batch_view = ledger::FlowSandbox::new(whole_batch_view);
         let result = apply_submit_transactor_shell_impl(
@@ -1668,9 +2058,21 @@ impl
                 0
             }),
         );
-        let result = match sttx.check_sign(&ctx.rules) {
-            Ok(()) => Ter::TES_SUCCESS,
-            Err(_) => Ter::TEM_BAD_SIGNATURE,
+        let result = if sttx.get_txn_type() == TxType::BATCH {
+            let batch_preflight = tx::validate_sttx_batch_preflight_with_rules(&sttx, &ctx.rules);
+            if !is_tes_success(batch_preflight) {
+                batch_preflight
+            } else {
+                match sttx.check_sign(&ctx.rules) {
+                    Ok(()) => Ter::TES_SUCCESS,
+                    Err(_) => Ter::TEM_BAD_SIGNATURE,
+                }
+            }
+        } else {
+            match sttx.check_sign(&ctx.rules) {
+                Ok(()) => Ter::TES_SUCCESS,
+                Err(_) => Ter::TEM_BAD_SIGNATURE,
+            }
         };
 
         Ok((
@@ -1720,7 +2122,7 @@ impl
         >,
         txn_type: TxType,
     ) -> Result<Ter, Self::PreclaimError> {
-        if Self::is_system_transaction(txn_type) {
+        if txn_type != TxType::BATCH && Self::is_system_transaction(txn_type) {
             return Ok(Ter::TES_SUCCESS);
         }
 
@@ -1742,20 +2144,24 @@ impl
             return Ok(Ter::TER_NO_ACCOUNT);
         };
 
-        if !sttx.is_field_present(sequence_field) {
-            return Ok(Ter::TES_SUCCESS);
-        }
-
-        let tx_sequence = sttx.get_field_u32(sequence_field);
-        let account_sequence = account_root.get_field_u32(sequence_field);
-
-        Ok(if tx_sequence < account_sequence {
-            Ter::TEF_PAST_SEQ
-        } else if tx_sequence > account_sequence {
-            Ter::TER_PRE_SEQ
+        let sequence_ter = if sttx.is_field_present(sequence_field) {
+            let tx_sequence = sttx.get_field_u32(sequence_field);
+            let account_sequence = account_root.get_field_u32(sequence_field);
+            if tx_sequence < account_sequence {
+                Ter::TEF_PAST_SEQ
+            } else if tx_sequence > account_sequence {
+                Ter::TER_PRE_SEQ
+            } else {
+                Ter::TES_SUCCESS
+            }
         } else {
             Ter::TES_SUCCESS
-        })
+        };
+        if !is_tes_success(sequence_ter) {
+            return Ok(sequence_ter);
+        }
+
+        Ok(batch_preclaim_ter(view.as_ref(), &sttx, ctx.flags))
     }
 
     fn calculate_base_fee(
@@ -1768,6 +2174,18 @@ impl
             return 0;
         };
         let normal_cost = ledger.fees().base;
+        if txn_type == TxType::BATCH {
+            let sttx = Self::read_sttx(tx);
+            let calculated = batch_base_fee(ledger.as_ref(), sttx.as_ref());
+            // Match Batch::calculateBaseFee: its public calculation provides a
+            // payable placeholder while preclaim returns tecINSUFF_FEE for an
+            // invalid aggregate fee.
+            return if calculated == INVALID_BATCH_BASE_FEE {
+                normal_cost
+            } else {
+                calculated
+            };
+        }
         if txn_type == TxType::LOAN_PAY {
             let sttx = Self::read_sttx(tx);
             return crate::state::lending::calculate_loan_pay_base_fee(
@@ -5386,12 +5804,11 @@ impl ApplicationRoot {
     /// `onClose`, from `app_.getOpenLedger().current()->txs`). Callers
     /// driven by live consensus MUST pass the transaction set captured at
     /// `on_close` time, NOT a fresh read of the open ledger's current
-    /// contents -- by the time this runs (asynchronously, on a JobQueue
-    /// worker), the open ledger has typically already been reset for the
-    /// next round by `accept_consensus_ledger` (called synchronously at
-    /// the START of `on_accept`, before this job is even enqueued), so
-    /// re-reading it here would almost always see the wrong (freshly
-    /// emptied) set.
+    /// contents -- by the time this runs asynchronously on a JobQueue worker,
+    /// new local transactions may already have been added. The caller must
+    /// therefore apply exactly the captured set. Live consensus callers use
+    /// `accept_ledger_with_txns_outcome` and rebuild the shared open ledger
+    /// only after filtering completed transactions and carrying retries.
     ///
     /// Matches rippled's `doAccept` → `buildLCL` → `stateMap().flushDirty()`
     /// which persists all dirty SHAMap nodes to the node store after building.
@@ -5404,6 +5821,36 @@ impl ApplicationRoot {
         base_fee_drops: u64,
         txns: Vec<Arc<protocol::STTx>>,
     ) -> Result<u32, String> {
+        let outcome = self.accept_ledger_with_txns_outcome(
+            closed_seq,
+            close_time,
+            close_resolution,
+            correct_close_time,
+            base_fee_drops,
+            txns,
+        )?;
+        let closed = self
+            .closed_ledger()
+            .ok_or_else(|| "accepted ledger missing after build".to_owned())?;
+        self.rebuild_open_ledger_after_close(
+            outcome.next_open_index,
+            base_fee_drops,
+            *closed.header().hash.as_uint256(),
+        );
+        self.set_status_rpc_current_ledger_index(Some(outcome.next_open_index));
+        self.set_status_rpc_queue_report(Some(self.tx_q_rpc_report()));
+        Ok(outcome.next_open_index)
+    }
+
+    pub(crate) fn accept_ledger_with_txns_outcome(
+        &self,
+        closed_seq: u32,
+        close_time: u32,
+        close_resolution: u8,
+        correct_close_time: bool,
+        _base_fee_drops: u64,
+        txns: Vec<Arc<protocol::STTx>>,
+    ) -> Result<AcceptedLedgerOutcome, String> {
         let parent_ledger = self.closed_ledger().or_else(|| self.validated_ledger());
         // Ensure the parent ledger has a node_fetcher attached. The
         // closed_ledger slot may hold a ledger whose fetcher was not set
@@ -5455,6 +5902,13 @@ impl ApplicationRoot {
 
         let _ = self.apply_held_transactions_to_network_ops(next_open_parent_hash, |_sync| {});
         let mut accepted_entries = Vec::new();
+        // rippled BuildLedger retries once while progress is possible, then
+        // performs a final non-retry pass that classifies remaining TERs as
+        // failures. Use the shared OpenLedger/BuildLedger parity constants.
+        let mut pending_txs = txns;
+        let mut certain_retry = true;
+        let mut completed_transaction_ids = std::collections::HashSet::new();
+        let mut failed_txns: Vec<(Uint256, protocol::Ter)> = Vec::new();
 
         // Create a mutable view on the parent ledger to accumulate state changes
         let state_view_base = parent_ledger
@@ -5480,80 +5934,161 @@ impl ApplicationRoot {
         // won, and since RPC submit runs synchronously on every single
         // submit call, it almost always won, silently starving every
         // accept_ledger call of the transactions it needed to persist.
-        let open_txs = txns;
-        for sttx in &open_txs {
-            let transaction_id = sttx.get_hash(protocol::HashPrefix::TransactionId);
-            let mut view = state_view
-                .lock()
-                .expect("state view mutex must not be poisoned");
-            let txn_type = sttx.get_txn_type();
-            // `apply_submit_transactor_shell` (not the bare
-            // `handle_real_dispatch`) is required here: it implements the
-            // reference's `Transactor::apply` generic preamble --
-            // `consumeSeqProxy` (incrementing the SOURCE account's own
-            // `sfSequence`, which no per-transaction-type handler does on
-            // its own) and `payFee` (deducting the fee from the source's
-            // balance) -- BEFORE dispatching to the transaction-type
-            // handler. Calling `handle_real_dispatch` directly here (as an
-            // earlier version of this function did) skipped that preamble
-            // entirely, so successfully-applied transactions never
-            // incremented their sender's sequence number.
-            let (result, delivered_amount) =
-                apply_submit_transactor_shell_with_delivered_amount(&mut *view, sttx, txn_type);
-            drop(view);
-            let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
-            if !applied {
-                continue;
+        for pass in 0..crate::LEDGER_TOTAL_PASSES {
+            if pending_txs.is_empty() {
+                break;
             }
 
-            let index = accepted_entries.len();
-            let _ = self.transaction_master.in_ledger(
-                transaction_id,
+            tracing::debug!(
+                target: "ledger",
                 closed_seq,
-                Some(index as u32),
-                Some(self.registry.network_id_service.get_network_id()),
+                pass,
+                certain_retry,
+                transaction_count = pending_txs.len(),
+                "consensus ledger application pass started"
             );
-
-            let mut meta = protocol::TxMeta::new(transaction_id, closed_seq);
-            meta.set_delivered_amount(delivered_amount);
-            let mut serializer = protocol::Serializer::default();
-            meta.add_raw(&mut serializer, result, index as u32);
-
-            use protocol::StBase;
-            if let Some(publisher) = &self.ledger_delta_publisher {
-                let mut tx_json = protocol::JsonValue::Object(std::collections::BTreeMap::new());
-                if let protocol::JsonValue::Object(map) = &mut tx_json {
-                    map.insert(
-                        "transaction".to_string(),
-                        protocol::JsonValue::String(transaction_id.to_string()),
-                    );
-                    map.insert(
-                        "meta".to_string(),
-                        meta.get_nodes().json(protocol::JsonOptions::NONE),
-                    );
+            let mut changes = 0usize;
+            let mut retry_txs = Vec::new();
+            let open_txs = std::mem::take(&mut pending_txs);
+            for sttx in open_txs {
+                let transaction_id = sttx.get_hash(protocol::HashPrefix::TransactionId);
+                if pass == 0
+                    && parent_ledger
+                        .as_ref()
+                        .is_some_and(|parent| parent.tx_exists(transaction_id))
+                {
+                    completed_transaction_ids.insert(transaction_id);
+                    continue;
                 }
-                let mut delta_msg = protocol::JsonValue::Object(std::collections::BTreeMap::new());
-                if let protocol::JsonValue::Object(map) = &mut delta_msg {
-                    map.insert(
-                        "type".to_string(),
-                        protocol::JsonValue::String("ledgerDelta".to_string()),
+                let mut view = state_view
+                    .lock()
+                    .expect("state view mutex must not be poisoned");
+                let txn_type = sttx.get_txn_type();
+                // `apply_submit_transactor_shell` (not the bare
+                // `handle_real_dispatch`) is required here: it implements the
+                // reference's `Transactor::apply` generic preamble --
+                // `consumeSeqProxy` (incrementing the SOURCE account's own
+                // `sfSequence`, which no per-transaction-type handler does on
+                // its own) and `payFee` (deducting the fee from the source's
+                // balance) -- BEFORE dispatching to the transaction-type
+                // handler. Calling `handle_real_dispatch` directly here (as an
+                // earlier version of this function did) skipped that preamble
+                // entirely, so successfully-applied transactions never
+                // incremented their sender's sequence number.
+                let retry_flags = if certain_retry {
+                    protocol::ApplyFlags::RETRY
+                } else {
+                    protocol::ApplyFlags::NONE
+                };
+                let mut attempt_view = ledger::FlowSandbox::new_with_flags(&mut *view, retry_flags);
+                let (result, delivered_amount) =
+                    apply_submit_transactor_shell_with_delivered_amount(
+                        &mut attempt_view,
+                        &sttx,
+                        txn_type,
                     );
-                    map.insert(
-                        "ledger_index".to_string(),
-                        protocol::JsonValue::Unsigned(closed_seq as u64),
-                    );
-                    map.insert("transaction".to_string(), tx_json);
+                let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
+                if applied {
+                    let _ = attempt_view.apply();
                 }
-                publisher(delta_msg);
+                drop(view);
+                if !applied {
+                    if protocol::is_ter_retry(result) {
+                        retry_txs.push(sttx);
+                    } else {
+                        completed_transaction_ids.insert(transaction_id);
+                        failed_txns.push((transaction_id, result));
+                        tracing::debug!(
+                            target: "ledger",
+                            closed_seq,
+                            pass,
+                            tx_id = %transaction_id,
+                            ?txn_type,
+                            ?result,
+                            "consensus transaction failed"
+                        );
+                    }
+                    continue;
+                }
+                changes += 1;
+                completed_transaction_ids.insert(transaction_id);
+
+                let index = accepted_entries.len();
+                let _ = self.transaction_master.in_ledger(
+                    transaction_id,
+                    closed_seq,
+                    Some(index as u32),
+                    Some(self.registry.network_id_service.get_network_id()),
+                );
+
+                let mut meta = protocol::TxMeta::new(transaction_id, closed_seq);
+                meta.set_delivered_amount(delivered_amount);
+                let mut serializer = protocol::Serializer::default();
+                meta.add_raw(&mut serializer, result, index as u32);
+
+                use protocol::StBase;
+                if let Some(publisher) = &self.ledger_delta_publisher {
+                    let mut tx_json =
+                        protocol::JsonValue::Object(std::collections::BTreeMap::new());
+                    if let protocol::JsonValue::Object(map) = &mut tx_json {
+                        map.insert(
+                            "transaction".to_string(),
+                            protocol::JsonValue::String(transaction_id.to_string()),
+                        );
+                        map.insert(
+                            "meta".to_string(),
+                            meta.get_nodes().json(protocol::JsonOptions::NONE),
+                        );
+                    }
+                    let mut delta_msg =
+                        protocol::JsonValue::Object(std::collections::BTreeMap::new());
+                    if let protocol::JsonValue::Object(map) = &mut delta_msg {
+                        map.insert(
+                            "type".to_string(),
+                            protocol::JsonValue::String("ledgerDelta".to_string()),
+                        );
+                        map.insert(
+                            "ledger_index".to_string(),
+                            protocol::JsonValue::Unsigned(closed_seq as u64),
+                        );
+                        map.insert("transaction".to_string(), tx_json);
+                    }
+                    publisher(delta_msg);
+                }
+
+                accepted_entries.push(StandaloneAcceptedTx {
+                    transaction_id,
+                    txn: Arc::new(protocol::Serializer::from_bytes(
+                        sttx.get_serializer().data(),
+                    )),
+                    metadata: Arc::new(serializer),
+                });
             }
 
-            accepted_entries.push(StandaloneAcceptedTx {
-                transaction_id,
-                txn: Arc::new(protocol::Serializer::from_bytes(
-                    sttx.get_serializer().data(),
-                )),
-                metadata: Arc::new(serializer),
-            });
+            tracing::debug!(
+                target: "ledger",
+                closed_seq,
+                pass,
+                changes,
+                retries = retry_txs.len(),
+                "consensus ledger application pass completed"
+            );
+            pending_txs = retry_txs;
+            if changes == 0 && !certain_retry {
+                break;
+            }
+            if changes == 0 || pass >= crate::LEDGER_RETRY_PASSES {
+                certain_retry = false;
+            }
+        }
+
+        if !failed_txns.is_empty() {
+            tracing::warn!(
+                target: "ledger",
+                closed_seq,
+                failed_count = failed_txns.len(),
+                "consensus ledger application discarded failed transactions"
+            );
         }
 
         let closed = match parent_ledger {
@@ -5686,15 +6221,16 @@ impl ApplicationRoot {
         }
 
         let next_open_index = closed_seq.saturating_add(1);
-        self.rebuild_open_ledger_after_close(
-            next_open_index,
-            base_fee_drops,
-            *closed.header().hash.as_uint256(),
-        );
-        self.set_status_rpc_current_ledger_index(Some(next_open_index));
-        self.set_status_rpc_queue_report(Some(self.tx_q_rpc_report()));
+        // The live consensus caller rebuilds the shared open ledger exactly
+        // once, after it receives these completed and retry outcomes. Doing
+        // so here would discard peer-sourced retry candidates before they
+        // can be retained for the next open ledger.
 
-        Ok(next_open_index)
+        Ok(AcceptedLedgerOutcome {
+            next_open_index,
+            completed_transaction_ids,
+            retry_transactions: pending_txs,
+        })
     }
 
     pub fn is_shamap_store_stopping(&self) -> Option<bool> {

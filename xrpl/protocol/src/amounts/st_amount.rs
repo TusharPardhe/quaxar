@@ -4,6 +4,8 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Sub, SubAssign};
 
+use basics::number::NumberParts as RuntimeNumber;
+
 use crate::{
     Asset, IOUAmount, Issue, JsonOptions, JsonValue, MPTAmount, MPTIssue, SField, STArray,
     STObject, SerialIter, SerializedTypeId, Serializer, StBase, StBaseCore, ValidationError,
@@ -312,6 +314,12 @@ impl STAmount {
 
     fn canonicalize(&mut self) {
         if self.integral() {
+            // Match rippled STAmount::canonicalize. XRP and MPT are integral
+            // values, but arithmetic can temporarily represent them using an
+            // exponent. Convert through NumberParts under the active rounding
+            // mode and reject, rather than saturate, a result outside the
+            // protocol's legal range. The transaction application boundary
+            // translates this failure into tefEXCEPTION.
             if self.value == 0 || self.offset <= -20 {
                 self.value = 0;
                 self.offset = 0;
@@ -319,30 +327,34 @@ impl STAmount {
                 return;
             }
 
-            while self.offset < 0 {
-                self.value /= 10;
-                self.offset += 1;
+            if self.native() && self.offset > 17 {
+                panic!("Native currency amount out of range");
+            }
+            if self.holds_mpt_issue() && self.offset > 18 {
+                panic!("MPT amount out of range");
             }
 
-            while self.offset > 0 {
-                if self.native() && self.value > ST_AMOUNT_MAX_NATIVE_NETWORK {
+            let number = RuntimeNumber::unchecked(self.is_negative, self.value, self.offset);
+            if self.native() {
+                let amount = XRPAmount::from_number(number)
+                    .unwrap_or_else(|_| panic!("Native currency amount out of range"));
+                self.is_negative = amount.drops() < 0;
+                self.value = amount.drops().unsigned_abs();
+                self.offset = 0;
+                if self.value > ST_AMOUNT_MAX_NATIVE_NETWORK {
                     panic!("Native currency amount out of range");
                 }
-                if self.holds_mpt_issue() && self.value > crate::MAX_MP_TOKEN_AMOUNT as u64 {
-                    self.value = crate::MAX_MP_TOKEN_AMOUNT as u64;
+            } else if self.holds_mpt_issue() {
+                let amount = MPTAmount::from_number(number)
+                    .unwrap_or_else(|_| panic!("MPT amount out of range"));
+                self.is_negative = amount.value() < 0;
+                self.value = amount.value().unsigned_abs();
+                self.offset = 0;
+                if self.value > crate::MAX_MP_TOKEN_AMOUNT as u64 {
+                    panic!("MPT amount out of range");
                 }
-                self.value *= 10;
-                self.offset -= 1;
-            }
-
-            if self.native() && self.value > ST_AMOUNT_MAX_NATIVE_NETWORK {
-                // C++ throws std::runtime_error which propagates and fails the tx.
-                // Saturate instead of panicking — the tx will produce wrong results
-                // and be rejected during consensus validation.
-                self.value = ST_AMOUNT_MAX_NATIVE_NETWORK;
-            }
-            if self.holds_mpt_issue() && self.value > crate::MAX_MP_TOKEN_AMOUNT as u64 {
-                self.value = crate::MAX_MP_TOKEN_AMOUNT as u64;
+            } else {
+                unreachable!("integral STAmount must hold XRP or MPT");
             }
             return;
         }

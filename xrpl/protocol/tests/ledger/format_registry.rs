@@ -13,7 +13,7 @@ fn tx_formats_registry_matches_current_cpp_catalog_shape() {
     let registry_names = formats.iter().map(|item| item.name()).collect::<Vec<_>>();
 
     assert_eq!(formats.iter().count(), 75);
-    assert_eq!(formats.get_common_fields().len(), 17);
+    assert_eq!(formats.get_common_fields().len(), 20);
     assert_eq!(
         common_symbols,
         vec![
@@ -34,6 +34,9 @@ fn tx_formats_registry_matches_current_cpp_catalog_shape() {
             "sfSigners",
             "sfNetworkID",
             "sfDelegate",
+            "sfSponsor",
+            "sfSponsorFlags",
+            "sfSponsorSignature",
         ]
     );
     assert_eq!(registry_names.first(), Some(&"Payment"));
@@ -52,7 +55,7 @@ fn tx_formats_registry_matches_current_cpp_catalog_shape() {
     assert_eq!(payment.name(), "Payment");
     assert_eq!(payment.metadata().tag_name, "ttPAYMENT");
     assert_eq!(payment.metadata().privileges, "createAcct");
-    assert_eq!(payment.so_template().size(), 26);
+    assert_eq!(payment.so_template().size(), 29);
 
     let amount_index = payment
         .so_template()
@@ -75,6 +78,13 @@ fn tx_formats_registry_matches_current_cpp_catalog_shape() {
 fn ledger_formats_registry_preserves_name_and_rpc_name_independently() {
     let ledger_formats = LedgerFormats::get_instance();
     let tx_formats = TxFormats::get_instance();
+
+    let ledger_common_symbols = ledger_formats
+        .get_common_fields()
+        .iter()
+        .map(|element| element.sfield().symbol_name())
+        .collect::<Vec<_>>();
+    assert!(ledger_common_symbols.contains(&"sfSponsor"));
 
     let account_root = ledger_formats
         .find_by_type(LedgerEntryType::AccountRoot)

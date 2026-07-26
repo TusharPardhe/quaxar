@@ -45,10 +45,10 @@ pub fn check_batch_sign<
 where
     AccountId: Clone + Eq + Ord,
     Signers: IntoIterator<Item = BatchSignatureObject>,
-    BatchSignatureObject: BatchSigner<AccountId, Signer>,
+    BatchSignatureObject: BatchSigner<AccountId, Signer> + StTxMultiSigner<AccountId>,
     Signer: StTxMultiSigner<AccountId>,
     VerifySingleSign: FnMut(&BatchSignatureObject) -> bool,
-    VerifyMultiSigner: FnMut(&Signer) -> Result<(), String>,
+    VerifyMultiSigner: FnMut(&BatchSignatureObject, &Signer) -> Result<(), String>,
     FormatAccountId: FnMut(&AccountId) -> String,
 {
     catch_unwind(AssertUnwindSafe(|| {
@@ -58,10 +58,11 @@ where
 
         for signer in signers {
             let result = if signer.signing_pub_key_is_empty() {
+                let batch_signer_account = signer.account_id();
                 check_sttx_multi_sign(
                     &signer,
-                    None,
-                    &mut verify_multi_signer,
+                    Some(&batch_signer_account),
+                    |inner_signer| verify_multi_signer(&signer, inner_signer),
                     &mut format_account_id,
                 )
             } else {
@@ -86,7 +87,8 @@ mod tests {
     };
     use crate::TxType;
     use crate::sttx_multi_sign::{
-        EMPTY_SIGNING_PUB_KEY_ERROR, StTxMultiSignObject, StTxMultiSigner,
+        EMPTY_SIGNING_PUB_KEY_ERROR, INVALID_MULTISIGNER_ERROR, StTxMultiSignObject,
+        StTxMultiSigner,
     };
     use crate::sttx_single_sign::{CANNOT_BOTH_SINGLE_AND_MULTI_SIGN_ERROR, StTxSingleSignObject};
 
@@ -141,6 +143,12 @@ mod tests {
         }
     }
 
+    impl StTxMultiSigner<&'static str> for TestSigner {
+        fn account_id(&self) -> &'static str {
+            "batch"
+        }
+    }
+
     impl BatchSigner<&'static str, TestMultiSigner> for TestSigner {
         fn signing_pub_key_is_empty(&self) -> bool {
             assert!(
@@ -164,7 +172,7 @@ mod tests {
                 panic_on_signers_present: false,
             }],
             |_| true,
-            |_| Ok(()),
+            |_, _| Ok(()),
             |account_id| (*account_id).to_owned(),
         );
 
@@ -192,7 +200,7 @@ mod tests {
                 single_called.set(true);
                 true
             },
-            |_| {
+            |_, _| {
                 multi_called.set(true);
                 Ok(())
             },
@@ -223,7 +231,7 @@ mod tests {
                 single_called.set(true);
                 true
             },
-            |_| {
+            |_, _| {
                 multi_called.set(true);
                 Ok(())
             },
@@ -248,7 +256,7 @@ mod tests {
                 panic_on_signers_present: false,
             }],
             |_| true,
-            |_| Ok(()),
+            |_, _| Ok(()),
             |account_id| (*account_id).to_owned(),
         );
 
@@ -271,7 +279,7 @@ mod tests {
                 panic_on_signers_present: false,
             }],
             |_| true,
-            |_| Ok(()),
+            |_, _| Ok(()),
             |account_id| (*account_id).to_owned(),
         );
 
@@ -303,7 +311,7 @@ mod tests {
                 },
             ],
             |_| true,
-            |_| {
+            |_, _| {
                 later_callback_ran.set(true);
                 Ok(())
             },
@@ -315,6 +323,28 @@ mod tests {
             Err(CANNOT_BOTH_SINGLE_AND_MULTI_SIGN_ERROR.to_owned())
         );
         assert!(!later_callback_ran.get());
+    }
+
+    #[test]
+    fn check_batch_sign_rejects_batch_signer_as_its_own_multisigner() {
+        let result = check_batch_sign(
+            TxType::BATCH,
+            [TestSigner {
+                signing_pub_key_is_empty: true,
+                signers_present: true,
+                txn_signature_present: false,
+                signers: vec![TestMultiSigner {
+                    account_id: "batch",
+                }],
+                panic_on_pub_key_lookup: false,
+                panic_on_signers_present: false,
+            }],
+            |_| true,
+            |_, _| Ok(()),
+            |account_id| (*account_id).to_owned(),
+        );
+
+        assert_eq!(result, Err(INVALID_MULTISIGNER_ERROR.to_owned()));
     }
 
     #[test]
@@ -330,7 +360,7 @@ mod tests {
                 panic_on_signers_present: false,
             }],
             |_| true,
-            |_| Ok(()),
+            |_, _| Ok(()),
             |account_id| (*account_id).to_owned(),
         );
 
@@ -355,7 +385,7 @@ mod tests {
                 panic_on_signers_present: true,
             }],
             |_| true,
-            |_| Ok(()),
+            |_, _| Ok(()),
             |account_id| (*account_id).to_owned(),
         );
 
