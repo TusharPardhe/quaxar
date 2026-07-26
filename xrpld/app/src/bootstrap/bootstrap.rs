@@ -702,7 +702,11 @@ pub fn build_bootstrap_root(
     // Rippled parity: setMaxDisallowedLedger — store the highest ledger seq
     // from the relational database so validators can reject stale proposals.
     if root.validation_public_key().is_some() {
-        if let Some(max_seq) = root.relational_database().as_ref().and_then(|db| db.max_ledger_seq()) {
+        if let Some(max_seq) = root
+            .relational_database()
+            .as_ref()
+            .and_then(|db| db.max_ledger_seq())
+        {
             root.set_max_disallowed_ledger(max_seq);
         }
     }
@@ -1009,7 +1013,7 @@ fn run_start_mode_consensus_loop(
             Arc::new(crate::ledger::inbound_ledgers::InboundLedgers::new(
                 Arc::clone(&app_tree_cache),
                 Arc::new(shamap::family::FullBelowCacheImpl::new(
-                    0,
+                    1,
                     basics::tagged_cache::MonotonicClock::default(),
                     basics::hardened_hash::HardenedHashBuilder::default(),
                     node_size_profile.full_below_target_size,
@@ -1017,12 +1021,6 @@ fn run_start_mode_consensus_loop(
                 Arc::new(ledger::FetchPackCache::new(
                     256,
                     time::Duration::seconds(120),
-                    basics::tagged_cache::MonotonicClock::default(),
-                )),
-                Arc::new(basics::tagged_cache::KeyCache::new(
-                    "driver-dedup",
-                    node_size_profile.full_below_target_size,
-                    time::Duration::seconds(30),
                     basics::tagged_cache::MonotonicClock::default(),
                 )),
                 shared_completed_tx.clone(),

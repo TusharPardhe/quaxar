@@ -2552,12 +2552,19 @@ impl Ledger {
                 self.header.account_hash,
             ));
         } else if parallel {
-            return self.state_map.walk_map_parallel_with_family(
+            if !self.state_map.walk_map_parallel_with_family(
                 SHAMapType::State,
                 &mut missing_nodes1,
                 WALK_LEDGER_MAX_MISSING_NODES,
                 family,
-            );
+            ) {
+                // Parallel walk failed operationally (worker panic or non-inner root).
+                // Treat as if we found missing nodes — don't trust the result.
+                missing_nodes1.push(SHAMapMissingNode::from_hash(
+                    SHAMapType::State,
+                    self.header.account_hash,
+                ));
+            }
         } else {
             self.state_map.walk_map_with_family(
                 SHAMapType::State,

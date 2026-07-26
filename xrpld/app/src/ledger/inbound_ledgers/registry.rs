@@ -7,7 +7,7 @@
 use basics::base_uint::Uint256;
 use basics::hardened_hash::HardenedHashBuilder;
 use basics::sha_map_hash::SHAMapHash;
-use basics::tagged_cache::{KeyCache, MonotonicClock};
+use basics::tagged_cache::MonotonicClock;
 use ledger::{FetchPackCache, InboundLedgerPacket, Ledger};
 use overlay::Peer;
 use shamap::family::{FullBelowCache, FullBelowCacheImpl};
@@ -88,7 +88,6 @@ pub struct InboundLedgers {
     tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
     full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
     fetch_pack: Arc<FetchPackCache>,
-    shared_stored: Arc<KeyCache<Uint256>>,
     overlay_rt: Arc<RwLock<Option<Arc<AppOverlayRuntime>>>>,
     completed_ledgers_tx: Sender<Arc<Ledger>>,
     stopping: AtomicBool,
@@ -102,7 +101,6 @@ impl InboundLedgers {
         tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
         full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
         fetch_pack: Arc<FetchPackCache>,
-        shared_stored: Arc<KeyCache<Uint256>>,
         completed_ledgers_tx: Sender<Arc<Ledger>>,
         need_network_ledger: Arc<AtomicBool>,
     ) -> Self {
@@ -116,7 +114,6 @@ impl InboundLedgers {
             tree_cache,
             full_below,
             fetch_pack,
-            shared_stored,
             overlay_rt: Arc::new(RwLock::new(None)),
             completed_ledgers_tx,
             stopping: AtomicBool::new(false),
@@ -231,7 +228,6 @@ impl InboundLedgers {
             node_store: ns,
             tree_cache: Arc::clone(&self.tree_cache),
             fetch_pack: Arc::clone(&self.fetch_pack),
-            shared_stored: Arc::clone(&self.shared_stored),
             store_tx: self.completed_ledgers_tx.clone(),
             full_below_generation: full_below_gen,
             worker_pool: Arc::clone(&self.worker_pool),

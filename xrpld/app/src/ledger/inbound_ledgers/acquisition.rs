@@ -8,7 +8,7 @@ use basics::base_uint::Uint256;
 use basics::hardened_hash::HardenedHashBuilder;
 use basics::random::rand_int_to;
 use basics::sha_map_hash::SHAMapHash;
-use basics::tagged_cache::{KeyCache, MonotonicClock};
+use basics::tagged_cache::MonotonicClock;
 use ledger::ledger_fetcher::INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP;
 use ledger::{
     FetchPackCache, FetchPackContainer, FetchPackStore, INBOUND_LEDGER_MAX_USEFUL_PEERS,
@@ -109,11 +109,12 @@ impl shamap::family::SHAMapNodeFetcher for WorkerNodeFetcher {
     }
 }
 
-/// Synchronous node-store adapter. `SHAMapSyncFilter::got_node` does not return
-/// until the accepted node is durable, matching rippled's `db_.store` call.
+/// Synchronous node-store adapter matching rippled's `AccountStateSF::gotNode`
+/// and `TransactionStateSF::gotNode`, which call `db_.store(...)` unconditionally
+/// on every accepted node with no dedup gate. NuDB's own bucket lookup safely
+/// no-ops on a true duplicate key.
 pub struct WorkerStore {
     node_store: SHAMapStoreNodeStore,
-    shared_stored: Arc<KeyCache<Uint256>>,
 }
 
 impl WorkerStore {
@@ -131,9 +132,6 @@ impl WorkerStore {
         hash: Uint256,
         seq: u32,
     ) {
-        if !self.shared_stored.insert(hash) {
-            return;
-        }
         match &self.node_store {
             SHAMapStoreNodeStore::Single(db) => db.store(object_type, data, hash, seq),
             SHAMapStoreNodeStore::Rotating(db) => db.store(object_type, data, hash, seq),
@@ -429,7 +427,6 @@ pub struct AcquisitionBuilder {
     pub node_store: SHAMapStoreNodeStore,
     pub tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
     pub fetch_pack: Arc<FetchPackCache>,
-    pub shared_stored: Arc<KeyCache<Uint256>>,
     pub store_tx: std::sync::mpsc::Sender<Arc<Ledger>>,
     pub full_below_generation: u32,
     pub worker_pool: Arc<WorkerPool>,
@@ -450,7 +447,6 @@ impl AcquisitionBuilder {
                 inbound: InboundLedgerLocal::new_with_reason(self.hash, self.seq, reason),
                 store: WorkerStore {
                     node_store: self.node_store.clone(),
-                    shared_stored: self.shared_stored,
                 },
                 fetch_pack: WorkerFetchPack {
                     cache: self.fetch_pack,

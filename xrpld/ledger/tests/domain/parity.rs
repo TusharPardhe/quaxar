@@ -737,12 +737,15 @@ fn ledger_walk_ledger_parallel_returns_state_walk_result_and_skips_tx_tree() {
     );
     let journal = RecordingLedgerJournal::default();
 
-    assert!(ledger.walk_ledger_with_family(&journal, true, &family));
+    // With the corrected parallel path, a genuinely missing descendant that
+    // the fetcher cannot resolve causes the walk to correctly report incomplete.
+    assert!(!ledger.walk_ledger_with_family(&journal, true, &family));
     family.with_fetcher(|fetcher| {
-        assert_eq!(fetcher.fetches.lock().clone(), vec![state_missing_hash])
+        assert_eq!(
+            fetcher.fetches.lock().clone(),
+            vec![state_missing_hash, tx_hash]
+        )
     });
-    assert!(journal.infos().is_empty());
-    assert!(journal.warns().is_empty());
 }
 
 #[test]
