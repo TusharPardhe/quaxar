@@ -531,6 +531,12 @@ impl SHAMapTreeNode {
     }
 
     pub fn clone_with_cowid(&self, cowid: u32) -> SharedIntrusive<Self> {
+        make_shared_intrusive(self.clone_value_with_cowid(cowid))
+    }
+
+    /// Clone this node's data into a standalone value for a caller that owns
+    /// the destination allocation, such as [`TreeNodeArena`](crate::arena::TreeNodeArena).
+    pub fn clone_value_with_cowid(&self, cowid: u32) -> Self {
         let hash = self.get_hash();
         let cloned = {
             let kind = self.kind.read();
@@ -579,7 +585,7 @@ impl SHAMapTreeNode {
             }
         };
 
-        make_shared_intrusive(cloned)
+        cloned
     }
 
     pub fn is_empty(&self) -> bool {

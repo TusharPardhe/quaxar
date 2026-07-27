@@ -1,7 +1,9 @@
 //! Current owner-side `SHAMap` cache/fetch/filter helpers such as
 //! `checkFilter` and `fetchNodeNT`.
 
+use crate::arena::TreeNodeArena;
 use crate::family::{MissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher};
+use crate::nodes::node_ref::NodeRef;
 use crate::sync::{SHAMapMissingNode, SHAMapType};
 use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
 use basics::blob::Blob;
@@ -134,15 +136,60 @@ where
     MR: MissingNodeReporter,
     REQ: FnMut(SHAMapHash, u32),
 {
+    descend_async_with_family_with_arena(
+        parent,
+        branch,
+        backed,
+        ledger_seq,
+        None,
+        family,
+        filter,
+        request_async_fetch,
+    )
+}
+
+/// Arena-aware async descend used by [`SyncTree`](crate::sync::SyncTree).
+/// The public compatibility wrapper above continues to use shared child refs.
+pub(crate) fn descend_async_with_family_with_arena<CLOCK, S, FB, F, MR, NS, REQ>(
+    parent: &SharedIntrusive<SHAMapTreeNode>,
+    branch: usize,
+    backed: bool,
+    ledger_seq: u32,
+    arena: Option<&TreeNodeArena>,
+    family: &SHAMapFamily<CLOCK, S, FB, F, MR, NS>,
+    filter: &mut Option<&mut dyn SHAMapSyncFilter>,
+    request_async_fetch: &mut REQ,
+) -> AsyncDescendResult
+where
+    CLOCK: CacheClock,
+    S: BuildHasher + Clone,
+    F: SHAMapNodeFetcher,
+    MR: MissingNodeReporter,
+    REQ: FnMut(SHAMapHash, u32),
+{
     descend_async_raw(
         parent,
         branch,
         backed,
         ledger_seq,
+        arena,
         family,
         filter,
         request_async_fetch,
     )
+}
+
+fn canonicalize_child_with_arena(
+    parent: &SHAMapTreeNode,
+    branch: usize,
+    node: SharedIntrusive<SHAMapTreeNode>,
+    arena: Option<&TreeNodeArena>,
+) -> NodeRef {
+    let node = match arena {
+        Some(arena) => NodeRef::Arena(arena.alloc_clone(&node)),
+        None => NodeRef::Shared(node),
+    };
+    parent.canonicalize_child_ref(branch, node)
 }
 
 /// Raw descend result — returns raw pointer, no ref counting.
@@ -158,6 +205,7 @@ pub fn descend_async_raw_nocopy<CLOCK, S, FB, F, MR, NS, REQ>(
     branch: usize,
     backed: bool,
     ledger_seq: u32,
+    arena: Option<&TreeNodeArena>,
     family: &SHAMapFamily<CLOCK, S, FB, F, MR, NS>,
     filter: &mut Option<&mut dyn SHAMapSyncFilter>,
     request_async_fetch: &mut REQ,
@@ -179,14 +227,12 @@ where
 
     let hash = parent.get_child_hash(branch);
     if let Some(found) = family.cache_lookup(hash) {
-        let canonical = parent.canonicalize_child(branch, found);
-        let ptr: *const SHAMapTreeNode = &*canonical;
+        let ptr = canonicalize_child_with_arena(parent, branch, found, arena).as_ptr();
         return AsyncDescendResultRaw::Ready(Some(ptr));
     }
 
     if let Some(found) = check_filter_with_family(hash, backed, ledger_seq, family, filter) {
-        let canonical = parent.canonicalize_child(branch, found);
-        let ptr: *const SHAMapTreeNode = &*canonical;
+        let ptr = canonicalize_child_with_arena(parent, branch, found, arena).as_ptr();
         return AsyncDescendResultRaw::Ready(Some(ptr));
     }
 
@@ -199,8 +245,7 @@ where
     // release_deep_children() would be re-downloaded from peers instead of
     // re-read from the local NuDB store where they were already persisted.
     if let Some(found) = family.fetch_cached_node_or_acquire_by_seq(hash, ledger_seq) {
-        let canonical = parent.canonicalize_child(branch, found);
-        let ptr: *const SHAMapTreeNode = &*canonical;
+        let ptr = canonicalize_child_with_arena(parent, branch, found, arena).as_ptr();
         return AsyncDescendResultRaw::Ready(Some(ptr));
     }
 
@@ -214,6 +259,7 @@ pub fn descend_async_raw<CLOCK, S, FB, F, MR, NS, REQ>(
     branch: usize,
     backed: bool,
     ledger_seq: u32,
+    arena: Option<&TreeNodeArena>,
     family: &SHAMapFamily<CLOCK, S, FB, F, MR, NS>,
     filter: &mut Option<&mut dyn SHAMapSyncFilter>,
     request_async_fetch: &mut REQ,
@@ -239,13 +285,17 @@ where
 
     let hash = parent.get_child_hash(branch);
     if let Some(found) = family.cache_lookup(hash) {
-        return AsyncDescendResult::Ready(Some(parent.canonicalize_child(branch, found)));
+        return AsyncDescendResult::Ready(Some(
+            canonicalize_child_with_arena(parent, branch, found, arena).into_shared(),
+        ));
     }
 
     // `descendAsync` intentionally checks the filter before scheduling a
     // backed read. This ordering differs from `fetchNodeNT(filter)`.
     if let Some(found) = check_filter_with_family(hash, backed, ledger_seq, family, filter) {
-        return AsyncDescendResult::Ready(Some(parent.canonicalize_child(branch, found)));
+        return AsyncDescendResult::Ready(Some(
+            canonicalize_child_with_arena(parent, branch, found, arena).into_shared(),
+        ));
     }
 
     if !backed {
@@ -256,7 +306,9 @@ where
     // Without this, nodes released by release_deep_children() are re-downloaded
     // from peers instead of re-read from NuDB where they already exist.
     if let Some(found) = family.fetch_cached_node_or_acquire_by_seq(hash, ledger_seq) {
-        return AsyncDescendResult::Ready(Some(parent.canonicalize_child(branch, found)));
+        return AsyncDescendResult::Ready(Some(
+            canonicalize_child_with_arena(parent, branch, found, arena).into_shared(),
+        ));
     }
 
     request_async_fetch(hash, ledger_seq);

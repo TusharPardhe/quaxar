@@ -68,6 +68,14 @@ impl TreeNodeArena {
         self.allocated_count.fetch_add(1, Ordering::Release);
         ptr.cast_const()
     }
+
+    /// Clone a fetched node's data directly into arena-owned storage.
+    ///
+    /// This deliberately clones the node value rather than retaining its
+    /// `SharedIntrusive` wrapper, so the attached child is owned by this arena.
+    pub fn alloc_clone(&self, node: &SHAMapTreeNode) -> *const SHAMapTreeNode {
+        self.alloc(node.clone_value_with_cowid(node.cowid()))
+    }
 }
 
 impl Drop for TreeNodeArena {

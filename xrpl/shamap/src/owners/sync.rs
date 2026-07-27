@@ -385,6 +385,22 @@ impl SyncTree {
         }
     }
 
+    /// Canonicalize a fetched child using arena storage when this tree has one.
+    /// The returned reference is the canonical child selected under the parent's
+    /// branch lock, so concurrent fetches retain the existing-child semantics.
+    pub fn arena_canonicalize(
+        &self,
+        parent: &SHAMapTreeNode,
+        branch: usize,
+        node: SharedIntrusive<SHAMapTreeNode>,
+    ) -> NodeRef {
+        let node = match &self.arena {
+            Some(arena) => NodeRef::Arena(arena.alloc_clone(&node)),
+            None => NodeRef::Shared(node),
+        };
+        parent.canonicalize_child_ref(branch, node)
+    }
+
     pub fn root(&self) -> SharedIntrusive<SHAMapTreeNode> {
         self.root.clone()
     }
@@ -800,7 +816,7 @@ impl SyncTree {
             child_hash,
             "owner-backed descend should preserve the requested child hash"
         );
-        Some(parent.canonicalize_child(branch, child))
+        Some(self.arena_canonicalize(parent, branch, child).into_shared())
     }
 
     pub fn descend_throw_with_family<CLOCK, S, FB, F, MR, NS>(
@@ -869,11 +885,12 @@ impl SyncTree {
         MR: MissingNodeReporter,
         REQ: FnMut(SHAMapHash, u32),
     {
-        crate::fetch::descend_async_with_family(
+        crate::fetch::descend_async_with_family_with_arena(
             parent,
             branch,
             self.backed,
             self.ledger_seq,
+            self.arena.as_deref(),
             family,
             filter,
             request_async_fetch,
@@ -1388,6 +1405,7 @@ impl SyncTree {
             full_below_cache,
             next_first_child,
         )
+        .with_tree_node_arena(self.arena.clone())
     }
 
     pub fn start_deferred_missing_node_scan_with_family<CLOCK, S, C, F, MR, NS, R>(
@@ -2335,6 +2353,8 @@ pub struct DeferredMissingNodeScan {
     stack: Vec<MissingNodeScanState>,
     pending_reads: Vec<PendingDeferredFetch>,
     deferred_resumes: BTreeMap<usize, DeferredResume>,
+    /// Keeps every arena-backed child installed during this scan alive.
+    arena: Option<Arc<TreeNodeArena>>,
     stats: DeferredMissingNodeScanStats,
 }
 
@@ -2381,8 +2401,14 @@ impl DeferredMissingNodeScan {
             stack,
             pending_reads: Vec::new(),
             deferred_resumes: BTreeMap::new(),
+            arena: None,
             stats: DeferredMissingNodeScanStats::default(),
         }
+    }
+
+    fn with_tree_node_arena(mut self, arena: Option<Arc<TreeNodeArena>>) -> Self {
+        self.arena = arena;
+        self
     }
 
     pub fn is_complete(&self) -> bool {
@@ -2487,6 +2513,7 @@ impl DeferredMissingNodeScan {
                 branch,
                 self.backed,
                 self.ledger_seq,
+                self.arena.as_deref(),
                 family,
                 filter,
                 request_async_fetch,
@@ -2571,6 +2598,7 @@ impl DeferredMissingNodeScan {
             &mut self.missing_hashes,
             &mut self.missing_nodes,
             &mut self.remaining,
+            self.arena.as_deref(),
             &mut self.stats,
         ) {
             self.deferred_resumes.insert(parent_key, resume);
@@ -2649,6 +2677,7 @@ fn process_deferred_sync_reads(
     missing_hashes: &mut BTreeSet<SHAMapHash>,
     missing_nodes: &mut Vec<(SHAMapNodeId, Uint256)>,
     remaining: &mut i32,
+    arena: Option<&TreeNodeArena>,
     stats: &mut DeferredMissingNodeScanStats,
 ) -> BTreeMap<usize, DeferredResume> {
     let mut resumes = BTreeMap::<usize, DeferredResume>::new();
@@ -2662,7 +2691,11 @@ fn process_deferred_sync_reads(
 
         let child_hash = parent.get_child_hash(deferred.branch);
         if let Some(node) = deferred.node {
-            parent.canonicalize_child(deferred.branch, node);
+            let node = match arena {
+                Some(arena) => NodeRef::Arena(arena.alloc_clone(&node)),
+                None => NodeRef::Shared(node),
+            };
+            parent.canonicalize_child_ref(deferred.branch, node);
             stats.completed_pending_reads += 1;
             let parent_key = deferred.parent as usize;
             resumes.insert(
@@ -4075,7 +4108,7 @@ mod tests {
     }
 
     #[test]
-    fn get_missing_nodes_with_family_prefers_shared_cache_before_filter_descend_async() {
+    fn get_missing_nodes_with_family_stores_cached_children_in_tree_arena() {
         let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
             SHAMapItem::new(sample_uint256(0x5A), vec![6; 12]),
@@ -4104,7 +4137,9 @@ mod tests {
         let mut cached = child.clone();
         assert!(!cache.canonicalize_replace_client(child.get_hash().as_uint256(), &mut cached));
 
-        let mut tree = SyncTree::from_root(root.clone(), true, 55, SyncState::Synching);
+        let arena = Arc::new(TreeNodeArena::new(19));
+        let mut tree = SyncTree::from_root(root.clone(), true, 55, SyncState::Synching)
+            .with_tree_node_arena(arena.clone());
         let mut filter = RecordingFilter {
             next_node: Some(child_prefix),
             got_nodes: Vec::new(),
@@ -4113,7 +4148,8 @@ mod tests {
         let missing = tree.get_missing_nodes_with_family(8, &mut filter_ref, &family, &mut || 0);
 
         assert!(missing.is_empty());
-        assert!(root.get_child(3).is_some());
+        assert!(matches!(root.get_child_ref(3), Some(NodeRef::Arena(_))));
+        assert_eq!(arena.allocated_count(), 1);
         assert!(filter.next_node.is_some());
         assert!(filter.got_nodes.is_empty());
     }
@@ -4591,6 +4627,7 @@ mod tests {
             &mut missing_hashes,
             &mut missing_nodes,
             &mut remaining,
+            None,
             &mut stats,
         );
 
@@ -4639,6 +4676,7 @@ mod tests {
             &mut missing_hashes,
             &mut missing_nodes,
             &mut remaining,
+            None,
             &mut stats,
         );
 
@@ -4706,7 +4744,9 @@ mod tests {
         root.set_child_hash(3, fetched_inner.get_hash());
         root.update_hash();
 
-        let tree = SyncTree::from_root(root, true, 55, SyncState::Synching);
+        let arena = Arc::new(TreeNodeArena::new(13));
+        let tree = SyncTree::from_root(root.clone(), true, 55, SyncState::Synching)
+            .with_tree_node_arena(arena.clone());
         let full_below = NullFullBelowCache::new(13);
         let family = SHAMapFamily::new(
             Arc::new(TreeNodeCache::new(
@@ -4741,6 +4781,8 @@ mod tests {
         );
 
         scan.complete_pending_reads(vec![Some(fetched_inner)]);
+        assert!(matches!(root.get_child_ref(3), Some(NodeRef::Arena(_))));
+        assert_eq!(arena.allocated_count(), 1);
         requests.clear();
 
         scan.run_with_family(
@@ -4816,6 +4858,7 @@ mod tests {
                         .expect("child id should exist"),
                 },
             )]),
+            arena: None,
             stats: super::DeferredMissingNodeScanStats::default(),
         };
         let mut no_filter: Option<&mut dyn SHAMapSyncFilter> = None;
