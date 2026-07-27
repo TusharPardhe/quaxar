@@ -422,10 +422,6 @@ impl SHAMapTreeNode {
     }
 
     pub fn new_leaf(node_type: SHAMapNodeType, item: SHAMapItem, cowid: u32) -> Self {
-        assert!(
-            item.size() >= MIN_SHAMAP_ITEM_BYTES,
-            "SHAMap leaf item payload below minimum size"
-        );
         let hash = compute_leaf_hash(node_type, &item);
         Self::new_leaf_with_hash(node_type, item, cowid, hash)
     }
@@ -436,10 +432,6 @@ impl SHAMapTreeNode {
         cowid: u32,
         hash: SHAMapHash,
     ) -> Self {
-        assert!(
-            item.size() >= MIN_SHAMAP_ITEM_BYTES,
-            "SHAMap leaf item payload below minimum size"
-        );
         Self {
             ref_counts: IntrusiveRefCounts::new(),
             hash: std::cell::UnsafeCell::new(hash),
