@@ -568,6 +568,17 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         self.now = now;
         self.check_ledger(adaptor);
 
+        // If check_ledger determined we're on the wrong chain, do NOT proceed
+        // with phase advancement. The node must acquire the network's preferred
+        // ledger before participating in consensus. Continuing to close on a
+        // stale ledger risks applying transactions that fail (e.g., amount
+        // overflow panics) and can leave the consensus driver unable to advance.
+        // rippled handles this implicitly through exception-resilient C++ tx
+        // application; Quaxar hardens explicitly by suppressing the close.
+        if self.mode.get() == ConsensusMode::WrongLedger {
+            return;
+        }
+
         match self.phase {
             ConsensusPhase::Open => self.phase_open(adaptor),
             ConsensusPhase::Establish => self.phase_establish(adaptor),
