@@ -3291,11 +3291,12 @@ fn build_loaded_ledger(
     ledger.set_fees(Fees::default());
     ledger.state_map_mut().set_ledger_seq(ledger_seq);
     ledger.tx_map_mut().set_ledger_seq(ledger_seq);
-    // Attach a shared arena to both maps so nodes decoded during acquisition
-    // are arena-allocated instead of individually heap-allocated.
-    let arena = Arc::new(shamap::arena::TreeNodeArena::new(ledger_seq as u64));
-    ledger.state_map_mut().set_arena(Arc::clone(&arena));
-    ledger.tx_map_mut().set_arena(arena);
+    // NOTE: Do NOT attach an arena here. Acquisition is a long-running phase
+    // (25+ minutes, millions of nodes) where the arena would grow unbounded
+    // until completion. Use normal heap allocation + TreeNodeCache sweep for
+    // acquisition. Arenas are used only in the short-lived consensus close
+    // path (3-5 seconds, ~1000 nodes per ledger) where they can be dropped
+    // immediately after the phase ends.
     ledger
 }
 
