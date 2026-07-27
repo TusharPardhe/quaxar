@@ -26,6 +26,7 @@ use shamap::fetch::SHAMapSyncFilter;
 use shamap::sync::{MissingNodeRef, SHAMapAddNode, SHAMapMissingNode, SHAMapType, SyncTree};
 use std::collections::BTreeMap;
 use std::hash::BuildHasher;
+use std::sync::Arc;
 use time::Duration;
 
 use crate::fetch_pack::LedgerSyncFilterStore;
@@ -3290,6 +3291,11 @@ fn build_loaded_ledger(
     ledger.set_fees(Fees::default());
     ledger.state_map_mut().set_ledger_seq(ledger_seq);
     ledger.tx_map_mut().set_ledger_seq(ledger_seq);
+    // Attach a shared arena to both maps so nodes decoded during acquisition
+    // are arena-allocated instead of individually heap-allocated.
+    let arena = Arc::new(shamap::arena::TreeNodeArena::new(ledger_seq as u64));
+    ledger.state_map_mut().set_arena(Arc::clone(&arena));
+    ledger.tx_map_mut().set_arena(arena);
     ledger
 }
 

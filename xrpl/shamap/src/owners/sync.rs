@@ -376,6 +376,12 @@ impl SyncTree {
         self.arena.clone()
     }
 
+    /// Attach an arena to this tree. Nodes resolved during missing-node scans
+    /// and traversal will be allocated from this arena.
+    pub fn set_arena(&mut self, arena: Arc<crate::arena::TreeNodeArena>) {
+        self.arena = Some(arena);
+    }
+
     /// Allocate a node from this tree's arena when configured. Without an
     /// arena, this returns the traditional intrusive shared owner.
     pub fn alloc_node(&self, node: SHAMapTreeNode) -> NodeRef {
@@ -499,6 +505,24 @@ impl SyncTree {
         if self.root.get_hash().is_zero() {
             return;
         }
+
+        // If an arena is attached, dropping it instantly frees all arena-allocated
+        // nodes in O(1) without walking the tree. Any remaining SharedIntrusive
+        // children (from cache or pre-arena paths) are released by the normal walk.
+        let arena_released = if let Some(arena) = &self.arena {
+            let count = arena.allocated_count();
+            if count > 0 {
+                tracing::debug!(
+                    target: "ledger",
+                    arena_nodes = count,
+                    "release_to_disk: arena holds nodes (will be freed on Arc drop)"
+                );
+            }
+            count > 0
+        } else {
+            false
+        };
+        let _ = arena_released;
         // Diagnostic: log root state before walk
         {
             let mut loaded_count = 0u32;
