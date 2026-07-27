@@ -1,6 +1,7 @@
 #![allow(clippy::unnecessary_mut_passed)]
 //! Missing-node scan and tree synchronization helpers used by `SHAMap` sync callers.
 
+use crate::arena::TreeNodeArena;
 use crate::compare::{
     DeepCompareEvent, Delta, compare as compare_trees, deep_compare as deep_compare_trees,
     deep_compare_with_events as deep_compare_with_events_impl,
@@ -16,6 +17,7 @@ use crate::iteration::{
     peek_next_item as peek_next_item_impl, upper_bound as upper_bound_impl,
 };
 use crate::node_id::SHAMapNodeId;
+use crate::nodes::node_ref::NodeRef;
 use crate::proof_path::{get_proof_path_backed, has_inner_node, has_leaf_node_backed};
 use crate::read::{
     has_item as has_item_impl, peek_item as peek_item_impl,
@@ -36,6 +38,7 @@ use std::error::Error;
 use std::fmt;
 use std::hash::BuildHasher;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
@@ -264,6 +267,8 @@ pub struct SyncTree {
     ledger_seq: u32,
     state: SyncState,
     owner_fetch_state: OwnerBackedFetchState,
+    /// Retains arena-backed child nodes for this tree and every snapshot.
+    arena: Option<Arc<TreeNodeArena>>,
 }
 
 impl SyncTree {
@@ -292,6 +297,7 @@ impl SyncTree {
             ledger_seq,
             state,
             owner_fetch_state: OwnerBackedFetchState::default(),
+            arena: None,
         }
     }
 
@@ -318,6 +324,7 @@ impl SyncTree {
             ledger_seq,
             state,
             owner_fetch_state: OwnerBackedFetchState::default(),
+            arena: None,
         }
     }
 
@@ -329,6 +336,7 @@ impl SyncTree {
             ledger_seq: self.ledger_seq,
             state: SyncState::Modifying,
             owner_fetch_state: OwnerBackedFetchState::default(),
+            arena: self.arena.clone(),
         }
     }
 
@@ -353,6 +361,27 @@ impl SyncTree {
             ledger_seq: self.ledger_seq,
             state: SyncState::Modifying,
             owner_fetch_state: OwnerBackedFetchState::default(),
+            arena: self.arena.clone(),
+        }
+    }
+
+    /// Attach a node arena before installing arena-backed children. Snapshots
+    /// retain this `Arc`, keeping all recorded raw pointers valid.
+    pub fn with_tree_node_arena(mut self, arena: Arc<TreeNodeArena>) -> Self {
+        self.arena = Some(arena);
+        self
+    }
+
+    pub fn tree_node_arena(&self) -> Option<Arc<TreeNodeArena>> {
+        self.arena.clone()
+    }
+
+    /// Allocate a node from this tree's arena when configured. Without an
+    /// arena, this returns the traditional intrusive shared owner.
+    pub fn alloc_node(&self, node: SHAMapTreeNode) -> NodeRef {
+        match &self.arena {
+            Some(arena) => NodeRef::Arena(arena.alloc(node)),
+            None => NodeRef::Shared(make_shared_intrusive(node)),
         }
     }
 
@@ -3518,12 +3547,14 @@ mod tests {
         SHAMapType, SyncState, SyncTree, enqueue_deferred_resumes, get_missing_nodes, get_node_fat,
         process_deferred_sync_reads, walk_map, walk_map_parallel,
     };
+    use crate::arena::TreeNodeArena;
     use crate::family::{
         FullBelowCache, MissingNodeReporter, NullFullBelowCache, NullMissingNodeReporter,
         NullNodeFetcher, SHAMapFamily,
     };
     use crate::item::SHAMapItem;
     use crate::node_id::SHAMapNodeId;
+    use crate::node_ref::NodeRef;
     use crate::tree_node::{SHAMapNodeType, SHAMapTreeNode};
     use crate::tree_node_cache::TreeNodeCache;
     use basics::base_uint::Uint256;
@@ -3673,6 +3704,28 @@ mod tests {
         assert!(!snapshot.is_full());
         assert_eq!(snapshot.root().get_hash(), root.get_hash());
         assert_eq!(snapshot.root().cowid(), 0);
+    }
+
+    #[test]
+    fn sync_tree_retains_arena_across_snapshots_and_allocates_arena_nodes() {
+        let arena = Arc::new(TreeNodeArena::new(31));
+        let tree = SyncTree::new(false, 77).with_tree_node_arena(arena.clone());
+
+        assert!(matches!(
+            tree.alloc_node(SHAMapTreeNode::new_inner(1)),
+            NodeRef::Arena(_)
+        ));
+        assert_eq!(arena.allocated_count(), 1);
+
+        let snapshot = tree.share_root_snapshot();
+        drop(arena);
+        assert_eq!(
+            snapshot
+                .tree_node_arena()
+                .expect("snapshots must retain the tree node arena")
+                .generation(),
+            31
+        );
     }
 
     #[test]
@@ -4066,7 +4119,7 @@ mod tests {
     }
 
     #[test]
-    fn get_missing_nodes_with_family_does_not_report_owner_missing_acquire_on_deferred_db_miss() {
+    fn get_missing_nodes_with_family_reports_owner_missing_acquire_on_deferred_db_miss() {
         let child_hash = sample_hash(0x6B);
         let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
         root.set_child_hash(3, child_hash);
@@ -4098,7 +4151,7 @@ mod tests {
                 *child_hash.as_uint256(),
             )]
         );
-        assert!(reporter.recorded().is_empty());
+        assert_eq!(reporter.recorded(), vec![(55, *child_hash.as_uint256())]);
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! trait-object intrusive pointers in the first SHAMap slice.
 
 use crate::item::SHAMapItem;
+use crate::nodes::node_ref::NodeRef;
 use basics::base_uint::Uint256;
 use basics::intrusive_pointer::{IntrusiveObject, SharedIntrusive, make_shared_intrusive};
 use basics::intrusive_ref_counts::IntrusiveRefCounts;
@@ -118,7 +119,7 @@ impl TaggedPointer {
         self.ptr().as_ptr().cast::<SHAMapHash>()
     }
 
-    fn children(&self) -> *mut Option<SharedIntrusive<SHAMapTreeNode>> {
+    fn children(&self) -> *mut Option<NodeRef> {
         children_ptr(self.ptr(), self.capacity())
     }
 
@@ -150,16 +151,21 @@ impl TaggedPointer {
 
     fn get_child_at_index(&self, index: usize) -> Option<SharedIntrusive<SHAMapTreeNode>> {
         debug_assert!(index < self.capacity());
-        unsafe { (&*self.children().add(index)).clone() }
+        unsafe {
+            (&*self.children().add(index))
+                .as_ref()
+                .map(NodeRef::get_child)
+        }
+    }
+
+    fn get_child_ref_at_index(&self, index: usize) -> Option<&NodeRef> {
+        debug_assert!(index < self.capacity());
+        unsafe { (&*self.children().add(index)).as_ref() }
     }
 
     unsafe fn get_child_ptr_at_index(&self, index: usize) -> Option<*const SHAMapTreeNode> {
         debug_assert!(index < self.capacity());
-        unsafe {
-            (&*self.children().add(index))
-                .as_ref()
-                .map(|si| &**si as *const SHAMapTreeNode)
-        }
+        unsafe { (&*self.children().add(index)).as_ref().map(NodeRef::as_ptr) }
     }
 
     fn has_child_at_index(&self, index: usize) -> bool {
@@ -167,7 +173,7 @@ impl TaggedPointer {
         unsafe { (&*self.children().add(index)).is_some() }
     }
 
-    fn set_child_at_index(&self, index: usize, child: Option<SharedIntrusive<SHAMapTreeNode>>) {
+    fn set_child_at_index(&self, index: usize, child: Option<NodeRef>) {
         debug_assert!(index < self.capacity());
         unsafe {
             *self.children().add(index) = child;
@@ -559,7 +565,7 @@ impl SHAMapTreeNode {
                             cloned
                                 .arrays()
                                 .tagged()
-                                .set_child_at_index(index, Some(child));
+                                .set_child_at_index(index, Some(NodeRef::Shared(child)));
                         }
                     });
                     cloned
@@ -632,6 +638,12 @@ impl SHAMapTreeNode {
     }
 
     pub fn set_child(&self, branch: usize, child: Option<SharedIntrusive<SHAMapTreeNode>>) {
+        self.set_child_ref(branch, child.map(NodeRef::Shared));
+    }
+
+    /// Store an arena-aware child reference. Arena callers must retain the
+    /// owning `Arc<TreeNodeArena>` for as long as this parent is reachable.
+    pub fn set_child_ref(&self, branch: usize, child: Option<NodeRef>) {
         validate_branch(branch);
         assert!(
             self.cowid() != 0,
@@ -644,7 +656,7 @@ impl SHAMapTreeNode {
         };
 
         let src_branches = inner.is_branch;
-        if let Some(ref child) = child {
+        if let Some(child) = child {
             let dst_branches = src_branches | (1 << branch);
             arrays.tagged_mut().rebuild(
                 src_branches,
@@ -660,9 +672,7 @@ impl SHAMapTreeNode {
             arrays
                 .tagged()
                 .set_hash_at_index(index, SHAMapHash::default());
-            arrays
-                .tagged()
-                .set_child_at_index(index, Some(child.clone()));
+            arrays.tagged().set_child_at_index(index, Some(child));
         } else {
             let dst_branches = src_branches & !(1 << branch);
             arrays.tagged_mut().rebuild(
@@ -693,10 +703,11 @@ impl SHAMapTreeNode {
             .expect("non-empty branch must have a child index");
         self.arrays()
             .tagged()
-            .set_child_at_index(index, Some(child.clone()));
+            .set_child_at_index(index, Some(NodeRef::Shared(child.clone())));
     }
 
     /// Per-branch child read — matches reference getChild (packed_spinlock per child).
+    /// Arena children are cloned into a shared owner for this compatibility path.
     pub fn get_child(&self, branch: usize) -> Option<SharedIntrusive<SHAMapTreeNode>> {
         validate_branch(branch);
         let is_branch = self.is_branch.load(Ordering::Relaxed);
@@ -722,6 +733,16 @@ impl SHAMapTreeNode {
             .children_lock()
             .fetch_and(!mask, Ordering::Release);
         result
+    }
+
+    /// Borrow the stored arena-aware child reference without converting it to a
+    /// shared node. The returned reference is intended for immutable traversal;
+    /// callers must not retain it across concurrent parent-child mutation.
+    pub fn get_child_ref(&self, branch: usize) -> Option<&NodeRef> {
+        validate_branch(branch);
+        let is_branch = self.is_branch.load(Ordering::Relaxed);
+        let index = self.arrays().tagged().child_index(is_branch, branch)?;
+        self.arrays().tagged().get_child_ref_at_index(index)
     }
 
     /// Evict all loaded children from this inner node, freeing their memory.
@@ -865,8 +886,20 @@ impl SHAMapTreeNode {
         branch: usize,
         node: SharedIntrusive<SHAMapTreeNode>,
     ) -> SharedIntrusive<SHAMapTreeNode> {
+        self.canonicalize_child_ref(branch, NodeRef::Shared(node))
+            .into_shared()
+    }
+
+    /// Canonicalize an arena-aware child reference without forcing cache/fetch
+    /// nodes through an arena allocation.
+    pub fn canonicalize_child_ref(&self, branch: usize, node: NodeRef) -> NodeRef {
         validate_branch(branch);
-        let node_hash = node.get_hash();
+        let node_hash = unsafe {
+            node.as_ptr()
+                .as_ref()
+                .expect("SHAMap child node references must be non-null")
+                .get_hash()
+        };
         let stored_hash = self.get_child_hash(branch);
         assert!(!self.is_empty_branch(branch), "branch must already exist");
         assert_eq!(
@@ -895,14 +928,17 @@ impl SHAMapTreeNode {
                 std::hint::spin_loop();
             }
         }
-        let existing = self.arrays().tagged().get_child_at_index(index);
+        let existing = self
+            .arrays()
+            .tagged()
+            .get_child_ref_at_index(index)
+            .cloned();
         let result = if let Some(existing) = existing {
-            existing.clone()
+            existing
         } else {
             self.arrays()
                 .tagged()
                 .set_child_at_index(index, Some(node.clone()));
-            // Also update inner data for serialization paths
             node
         };
         self.arrays()
@@ -1100,8 +1136,7 @@ fn boundary_index(num_children: usize) -> usize {
 
 fn tagged_arrays_layout(capacity: usize) -> Layout {
     let hashes = Layout::array::<SHAMapHash>(capacity).expect("valid hash array layout");
-    let children = Layout::array::<Option<SharedIntrusive<SHAMapTreeNode>>>(capacity)
-        .expect("valid child array layout");
+    let children = Layout::array::<Option<NodeRef>>(capacity).expect("valid child array layout");
     let (layout, _) = hashes
         .extend(children)
         .expect("valid tagged pointer layout");
@@ -1110,8 +1145,7 @@ fn tagged_arrays_layout(capacity: usize) -> Layout {
 
 fn child_offset(capacity: usize) -> usize {
     let hashes = Layout::array::<SHAMapHash>(capacity).expect("valid hash array layout");
-    let children = Layout::array::<Option<SharedIntrusive<SHAMapTreeNode>>>(capacity)
-        .expect("valid child array layout");
+    let children = Layout::array::<Option<NodeRef>>(capacity).expect("valid child array layout");
     let (_, offset) = hashes
         .extend(children)
         .expect("valid tagged pointer layout");
@@ -1127,7 +1161,7 @@ fn allocate_tagged_arrays(capacity: usize) -> (NonNull<u8>, Layout) {
     (ptr, layout)
 }
 
-fn children_ptr(ptr: NonNull<u8>, capacity: usize) -> *mut Option<SharedIntrusive<SHAMapTreeNode>> {
+fn children_ptr(ptr: NonNull<u8>, capacity: usize) -> *mut Option<NodeRef> {
     unsafe { ptr.as_ptr().add(child_offset(capacity)).cast() }
 }
 
@@ -1416,7 +1450,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        BRANCH_FACTOR, HASH_PREFIX_INNER_NODE, HASH_PREFIX_LEAF_NODE, HASH_PREFIX_TX_NODE,
+        BRANCH_FACTOR, HASH_PREFIX_INNER_NODE, HASH_PREFIX_LEAF_NODE, HASH_PREFIX_TX_NODE, NodeRef,
         SHAMapCodecError, SHAMapItem, SHAMapNodeType, SHAMapTreeNode, SHAMapTreeNodeKind,
         TaggedPointer, WIRE_TYPE_ACCOUNT_STATE, WIRE_TYPE_COMPRESSED_INNER, WIRE_TYPE_INNER,
     };
@@ -1504,7 +1538,7 @@ mod tests {
 
         tagged.set_hash_at_index(branch_1_index, sample_hash(1));
         tagged.set_hash_at_index(branch_5_index, sample_hash(5));
-        tagged.set_child_at_index(branch_5_index, Some(child));
+        tagged.set_child_at_index(branch_5_index, Some(NodeRef::Shared(child)));
         assert!(!child_weak.expired());
 
         let dst_branches = src_branches | (1 << 3) | (1 << 12);

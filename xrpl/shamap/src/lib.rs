@@ -7,6 +7,7 @@
 //! - deterministic leaf hash recomputation and child canonicalization,
 //! - comprehensive wire/prefix byte codecs for all node kinds.
 
+pub mod arena;
 pub mod cow_shamap;
 pub mod delta_tracker;
 pub mod nodes;

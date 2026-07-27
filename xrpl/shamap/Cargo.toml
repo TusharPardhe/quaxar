@@ -13,6 +13,7 @@ path = "src/lib.rs"
 shadow-hash = []
 
 [dependencies]
+bumpalo = "=3.20.2"
 parking_lot = "0.12"
 basics = { path = "../basics" }
 sha2 = { version = "0.10", features = ["asm"] }
