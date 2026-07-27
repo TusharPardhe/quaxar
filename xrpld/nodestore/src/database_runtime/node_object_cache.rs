@@ -12,10 +12,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// concurrent maintenance is intentionally not an instantaneous process-RSS
 /// limit. This value derives the default capacity when the operator has not
 /// supplied one.
-const DEFAULT_TARGET_NODES: u64 = 1_500_000;
+const DEFAULT_TARGET_NODES: u64 = 1_000_000;
 const DEFAULT_EXPECTED_NODE_BYTES: u64 = 512;
 const DEFAULT_MAX_ENTRY_BYTES: usize = 1_048_576;
 const ENTRY_METADATA_BYTES: usize = 128;
+/// Default idle timeout in seconds — entries not accessed for this duration
+/// are evicted. Matches rippled's `cache_age` for medium node_size (90s).
+const DEFAULT_CACHE_IDLE_SECONDS: u64 = 90;
+/// Default hard TTL in seconds — entries are evicted after this duration
+/// regardless of access, ensuring post-rotation stale data is flushed.
+const DEFAULT_CACHE_TTL_SECONDS: u64 = 300;
 
 #[derive(Debug)]
 enum CacheLoadError {
@@ -92,47 +98,54 @@ impl NodeObjectCache {
             "node_object_cache_expected_node_bytes",
             DEFAULT_EXPECTED_NODE_BYTES,
         );
+        // Operator can set capacity directly in MB (preferred), or fall back
+        // to legacy target_nodes × expected_node_bytes calculation.
+        let configured_capacity_mb: u64 = get(config, "cache_capacity_mb", 0);
         let configured_capacity = get(config, "node_object_cache_capacity_bytes", 0u64);
-        let max_entry_bytes = get(
-            config,
-            "node_object_cache_max_entry_bytes",
-            DEFAULT_MAX_ENTRY_BYTES,
-        );
+        let max_entry_bytes = get(config, "cache_max_entry_bytes", DEFAULT_MAX_ENTRY_BYTES);
+        let idle_seconds: u64 = get(config, "cache_idle_seconds", DEFAULT_CACHE_IDLE_SECONDS);
+        let ttl_seconds: u64 = get(config, "cache_ttl_seconds", DEFAULT_CACHE_TTL_SECONDS);
 
-        if target_nodes == 0 {
-            return Err("Invalid node_object_cache_target_nodes".to_owned());
-        }
-        if expected_node_bytes == 0 {
-            return Err("Invalid node_object_cache_expected_node_bytes".to_owned());
-        }
         if max_entry_bytes == 0 {
-            return Err("Invalid node_object_cache_max_entry_bytes".to_owned());
+            return Err("Invalid cache_max_entry_bytes".to_owned());
         }
 
-        let capacity_bytes = if configured_capacity == 0 {
+        let capacity_bytes = if configured_capacity_mb > 0 {
+            configured_capacity_mb * 1_048_576
+        } else if configured_capacity > 0 {
+            configured_capacity
+        } else {
             let expected_entry_bytes = expected_node_bytes
                 .checked_add(ENTRY_METADATA_BYTES as u64)
                 .ok_or_else(|| "NodeObject cache entry weight overflows u64".to_owned())?;
             target_nodes
                 .checked_mul(expected_entry_bytes)
                 .ok_or_else(|| "NodeObject cache capacity overflows u64".to_owned())?
-        } else {
-            configured_capacity
         };
         if capacity_bytes == 0 {
-            return Err("Invalid node_object_cache_capacity_bytes".to_owned());
+            return Err("Invalid cache capacity".to_owned());
         }
 
-        let cache = Cache::builder()
+        let mut builder = Cache::builder()
+            .name("node-object-cache")
             .max_capacity(capacity_bytes)
+            .initial_capacity((capacity_bytes / 800) as usize)
             .weigher(|_hash: &Uint256, object: &Arc<NodeObject>| {
                 object
                     .data()
                     .len()
                     .saturating_add(ENTRY_METADATA_BYTES)
                     .min(u32::MAX as usize) as u32
-            })
-            .build();
+            });
+
+        if idle_seconds > 0 {
+            builder = builder.time_to_idle(std::time::Duration::from_secs(idle_seconds));
+        }
+        if ttl_seconds > 0 {
+            builder = builder.time_to_live(std::time::Duration::from_secs(ttl_seconds));
+        }
+
+        let cache = builder.build();
 
         Ok(Self {
             cache,

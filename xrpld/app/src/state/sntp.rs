@@ -26,8 +26,8 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -125,9 +125,7 @@ impl SntpClient {
             // Pick the server that was queried longest ago.
             let target = server_state
                 .iter()
-                .filter(|(_, last)| {
-                    last.map_or(true, |t| t.elapsed() >= NTP_MIN_QUERY)
-                })
+                .filter(|(_, last)| last.map_or(true, |t| t.elapsed() >= NTP_MIN_QUERY))
                 .min_by_key(|(_, last)| *last)
                 .map(|(idx, _)| *idx);
 
@@ -156,7 +154,7 @@ impl SntpClient {
                 // Median filter.
                 let mut sorted: Vec<i64> = offsets.iter().copied().collect();
                 sorted.sort_unstable();
-        let median: i64 = sorted[sorted.len() / 2];
+                let median: i64 = sorted[sorted.len() / 2];
 
                 // Debounce ±1 s corrections.
                 let median = if median.abs() <= 1 { 0 } else { median };
@@ -205,10 +203,11 @@ impl SntpClient {
         }
 
         let mut buf = [0u8; 256];
-        let (_len, _from) = match tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await {
-            Ok(Ok(r)) => r,
-            _ => return None,
-        };
+        let (_len, _from) =
+            match tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buf)).await {
+                Ok(Ok(r)) => r,
+                _ => return None,
+            };
 
         // T4 = client receive time (immediately after recv_from returns).
         let t4 = unix_now_secs() as i64;
@@ -235,10 +234,10 @@ impl SntpClient {
         // T3 = server transmit timestamp, integer part (NTP epoch), bytes 40–43.
         // Both are in NTP epoch (seconds since 1900-01-01); subtract
         // NTP_UNIX_OFFSET to convert to Unix epoch before arithmetic.
-        let t2 = i64::from(u32::from_be_bytes([buf[32], buf[33], buf[34], buf[35]]))
-            - NTP_UNIX_OFFSET;
-        let t3 = i64::from(u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]]))
-            - NTP_UNIX_OFFSET;
+        let t2 =
+            i64::from(u32::from_be_bytes([buf[32], buf[33], buf[34], buf[35]])) - NTP_UNIX_OFFSET;
+        let t3 =
+            i64::from(u32::from_be_bytes([buf[40], buf[41], buf[42], buf[43]])) - NTP_UNIX_OFFSET;
 
         // RFC 4330 §5 offset formula: θ = ((T2−T1) + (T3−T4)) / 2.
         // Positive θ means the server is ahead of us (our clock is slow).

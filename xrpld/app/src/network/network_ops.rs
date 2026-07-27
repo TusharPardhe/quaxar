@@ -1,8 +1,8 @@
 use parking_lot::Mutex;
 use protocol::{Ter, is_tef_failure, is_tem_malformed, is_ter_retry, is_tes_success};
 use serde_json::{Map, Value};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use tx::{ApplyFlags, ApplyResult, CheckValidityResult, Validity};
 use xrpl_core::{HashRouterFlags, any};

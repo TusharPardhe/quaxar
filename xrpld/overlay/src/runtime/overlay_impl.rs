@@ -769,7 +769,9 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             );
             return crate::router::RouteAction::Continue;
         }
-        self.overlay.inbound_handler.on_propose_ledger(self.peer, peer_pos);
+        self.overlay
+            .inbound_handler
+            .on_propose_ledger(self.peer, peer_pos);
         crate::router::RouteAction::Continue
     }
 
@@ -1390,7 +1392,10 @@ impl OverlayImpl {
         // Basic Resource Management (IP Throttling)
         // Prevent connection floods by limiting active peers from the same IP.
         let remote_ip = remote_address.ip();
-        let active_count = self.active_peers.read().expect("active peers rwlock")
+        let active_count = self
+            .active_peers
+            .read()
+            .expect("active peers rwlock")
             .values()
             .filter(|p| p.remote_address().ip() == remote_ip)
             .count();
@@ -1401,7 +1406,10 @@ impl OverlayImpl {
                 .body(())
                 .map_err(|e| OverlayError::InvalidRequest(e.to_string()))?;
             let response_wire = serialize_response(&response);
-            tls_stream.write_all(&response_wire).await.map_err(|e| OverlayError::Io(e))?;
+            tls_stream
+                .write_all(&response_wire)
+                .await
+                .map_err(|e| OverlayError::Io(e))?;
             return Ok(());
         }
 
@@ -1415,7 +1423,10 @@ impl OverlayImpl {
                 body.len(),
                 body
             );
-            tls_stream.write_all(response_str.as_bytes()).await.map_err(|e| OverlayError::Io(e))?;
+            tls_stream
+                .write_all(response_str.as_bytes())
+                .await
+                .map_err(|e| OverlayError::Io(e))?;
             return Ok(());
         }
 

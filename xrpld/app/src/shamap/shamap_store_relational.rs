@@ -229,11 +229,9 @@ impl SqliteSHAMapStoreRelational {
         use rusqlite::OptionalExtension;
         let connection = self.ledger_db.get_session();
         connection
-            .query_row(
-                "SELECT MAX(LedgerSeq) FROM Ledgers",
-                [],
-                |row| row.get::<_, u32>(0),
-            )
+            .query_row("SELECT MAX(LedgerSeq) FROM Ledgers", [], |row| {
+                row.get::<_, u32>(0)
+            })
             .optional()
             .ok()
             .flatten()

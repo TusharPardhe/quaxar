@@ -712,9 +712,7 @@ impl<A: ValidationsAdaptor> Validations<A> {
         // round -- which immediately gets killed again on the next tick,
         // creating an infinite deadlock.
         const MAX_PREFERRED_DISTANCE: u32 = 256;
-        if preferred.seq > curr.seq()
-            && preferred.seq <= curr.seq() + MAX_PREFERRED_DISTANCE
-        {
+        if preferred.seq > curr.seq() && preferred.seq <= curr.seq() + MAX_PREFERRED_DISTANCE {
             return Some((preferred.seq, preferred.id));
         }
 

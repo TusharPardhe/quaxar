@@ -76,7 +76,8 @@ where
     /// Update the SNTP-reported offset.  Called by the SNTP client when a
     /// new median offset is computed.  Positive = our clock is slow.
     pub fn set_sntp_offset(&self, offset_secs: i64) {
-        self.sntp_offset_seconds.store(offset_secs, Ordering::Release);
+        self.sntp_offset_seconds
+            .store(offset_secs, Ordering::Release);
     }
 
     /// Current SNTP offset in seconds.
