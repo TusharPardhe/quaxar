@@ -1,4 +1,4 @@
-// Phase 5: Legacy catchup loop removed; NetworkOpsStrand handles all duties.
+// Legacy catchup loop removed; NetworkOpsStrand handles all consensus duties.
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]

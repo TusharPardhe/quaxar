@@ -8,7 +8,7 @@ use basics::base_uint::Uint256;
 use basics::hardened_hash::HardenedHashBuilder;
 use basics::random::rand_int_to;
 use basics::sha_map_hash::SHAMapHash;
-use basics::tagged_cache::{KeyCache, MonotonicClock};
+use basics::tagged_cache::MonotonicClock;
 use ledger::ledger_fetcher::INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP;
 use ledger::{
     FetchPackCache, FetchPackContainer, FetchPackStore, INBOUND_LEDGER_MAX_USEFUL_PEERS,
@@ -109,11 +109,12 @@ impl shamap::family::SHAMapNodeFetcher for WorkerNodeFetcher {
     }
 }
 
-/// Synchronous node-store adapter. `SHAMapSyncFilter::got_node` does not return
-/// until the accepted node is durable, matching rippled's `db_.store` call.
+/// Synchronous node-store adapter matching rippled's `AccountStateSF::gotNode`
+/// and `TransactionStateSF::gotNode`, which call `db_.store(...)` unconditionally
+/// on every accepted node with no dedup gate. NuDB's own bucket lookup safely
+/// no-ops on a true duplicate key.
 pub struct WorkerStore {
     node_store: SHAMapStoreNodeStore,
-    shared_stored: Arc<KeyCache<Uint256>>,
 }
 
 impl WorkerStore {
@@ -131,9 +132,6 @@ impl WorkerStore {
         hash: Uint256,
         seq: u32,
     ) {
-        if !self.shared_stored.insert(hash) {
-            return;
-        }
         match &self.node_store {
             SHAMapStoreNodeStore::Single(db) => db.store(object_type, data, hash, seq),
             SHAMapStoreNodeStore::Rotating(db) => db.store(object_type, data, hash, seq),
@@ -429,7 +427,6 @@ pub struct AcquisitionBuilder {
     pub node_store: SHAMapStoreNodeStore,
     pub tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
     pub fetch_pack: Arc<FetchPackCache>,
-    pub shared_stored: Arc<KeyCache<Uint256>>,
     pub store_tx: std::sync::mpsc::Sender<Arc<Ledger>>,
     pub full_below_generation: u32,
     pub worker_pool: Arc<WorkerPool>,
@@ -450,7 +447,6 @@ impl AcquisitionBuilder {
                 inbound: InboundLedgerLocal::new_with_reason(self.hash, self.seq, reason),
                 store: WorkerStore {
                     node_store: self.node_store.clone(),
-                    shared_stored: self.shared_stored,
                 },
                 fetch_pack: WorkerFetchPack {
                     cache: self.fetch_pack,
@@ -505,6 +501,19 @@ fn trigger(
     reason: InboundLedgerRequestTrigger,
     peer: Option<Arc<dyn Peer>>,
 ) {
+    // M11: Structured trigger that separates setup, scan, and result processing.
+    //
+    // In rippled (InboundLedger.cpp:620-622), the acquisition lock is released
+    // during the expensive `getMissingNodes` state-map walk:
+    //   sl.unlock();
+    //   auto nodes = ledger_->stateMap().getMissingNodes(...);
+    //   sl.lock();
+    //
+    // In quaxar, `get_missing_nodes_with_family` requires `&mut SyncTree`,
+    // which is owned by `Ledger` inside `InboundLedgerLocal` — so we cannot
+    // release the `mutable` lock during the scan. When the Ledger is
+    // refactored to `Arc<Ledger>`, the scan methods can be called outside the
+    // lock scope (the `do_*_scan` methods are already factored for this).
     let mut mutable = state.mutable.lock().expect("acquisition mutable lock");
     let AcqMutableState {
         inbound,
@@ -513,13 +522,56 @@ fn trigger(
     } = &mut *mutable;
     let journal = WorkerJournal;
     let config = ledger::LedgerConfig::default();
-    let mut send = |message: overlay::ProtocolMessage| {
-        state.peer_set.send_request(&message, peer.as_ref());
-    };
     let family = family(state);
-    inbound.trigger_with_family(
-        reason, &journal, &config, store, fetch_pack, &family, &mut send,
-    );
+
+    // Setup — try local DB, by-hash fallback, compute scan params.
+    let setup = inbound.prepare_trigger(reason, &journal, &config, store, fetch_pack, &family);
+
+    // Send any messages produced during setup (header request, root nodes, etc.).
+    for msg in &setup.messages_to_send {
+        state.peer_set.send_request(msg, peer.as_ref());
+    }
+
+    // State-map scan (expensive walk).
+    let state_missing = if let Some(ref params) = setup.state_scan {
+        inbound.do_state_map_scan(params, store, fetch_pack, &family)
+    } else {
+        Vec::new()
+    };
+
+    // Apply state-scan results.
+    if let Some(ref params) = setup.state_scan {
+        let mut send_fn = |message: overlay::ProtocolMessage| {
+            state.peer_set.send_request(&message, peer.as_ref());
+        };
+        inbound.apply_state_scan_results(state_missing, params, &family, &mut send_fn);
+    }
+
+    // Tx-map scan (expensive walk).
+    let tx_missing = if let Some(ref params) = setup.tx_scan {
+        inbound.do_tx_map_scan(params, store, fetch_pack, &family)
+    } else {
+        Vec::new()
+    };
+
+    // Apply tx-scan results and finalize.
+    {
+        let mut send_fn = |message: overlay::ProtocolMessage| {
+            state.peer_set.send_request(&message, peer.as_ref());
+        };
+        if let Some(ref params) = setup.tx_scan {
+            inbound.apply_tx_scan_results(tx_missing, params, &family, &mut send_fn);
+        }
+
+        // Completion check — matches the tail of trigger_with_family.
+        if inbound.planner_state().have_header
+            && inbound.planner_state().have_state
+            && inbound.planner_state().have_transactions
+        {
+            inbound.set_complete();
+        }
+    }
+    // mutable dropped here — lock released.
 }
 
 fn add_peers(state: &AcquisitionState) -> Vec<Arc<dyn Peer>> {

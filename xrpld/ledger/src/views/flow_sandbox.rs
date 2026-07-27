@@ -32,6 +32,7 @@ pub struct FlowSandbox<'a, V: ApplyView + ?Sized> {
     parent: &'a mut V,
     items: BTreeMap<Uint256, Entry>,
     drops_destroyed: XRPAmount,
+    flags: Option<ApplyFlags>,
 }
 
 impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
@@ -40,6 +41,19 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
             parent,
             items: BTreeMap::new(),
             drops_destroyed: XRPAmount::from_drops(0),
+            flags: None,
+        }
+    }
+
+    /// Create a child view with explicit apply flags for this transaction
+    /// attempt. Used by consensus retry passes to provide rippled's TapRetry
+    /// semantics while retaining the parent accumulator's normal flags.
+    pub fn new_with_flags(parent: &'a mut V, flags: ApplyFlags) -> Self {
+        Self {
+            parent,
+            items: BTreeMap::new(),
+            drops_destroyed: XRPAmount::from_drops(0),
+            flags: Some(flags),
         }
     }
 
@@ -221,7 +235,7 @@ impl<'a, V: ApplyView + ?Sized> RawView for FlowSandbox<'a, V> {
 
 impl<'a, V: ApplyView + ?Sized> ApplyView for FlowSandbox<'a, V> {
     fn flags(&self) -> ApplyFlags {
-        self.parent.flags()
+        self.flags.unwrap_or_else(|| self.parent.flags())
     }
     fn peek(&mut self, k: Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
         if let Some(entry) = self.items.get(&k.key) {

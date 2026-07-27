@@ -4,21 +4,27 @@
 
 use protocol::{Ter, trans_token};
 use tx::{
-    BatchInnerTransaction, BatchSignatureFacts, BatchSignerEntry,
+    BatchInnerTransaction, BatchSignatureFacts, BatchSignerEntry, MAX_BATCH_SIGNER_COUNT,
     validate_batch_preflight_sig_validated,
 };
 
 #[derive(Clone)]
 struct StubInnerTx {
     account: &'static str,
+    initiator: Option<&'static str>,
     counterparty: Option<&'static str>,
+    sponsor: Option<&'static str>,
+    sponsor_signature_facts: Option<BatchSignatureFacts>,
 }
 
 impl StubInnerTx {
     fn new(account: &'static str) -> Self {
         Self {
             account,
+            initiator: None,
             counterparty: None,
+            sponsor: None,
+            sponsor_signature_facts: None,
         }
     }
 }
@@ -59,6 +65,18 @@ impl BatchInnerTransaction for StubInnerTx {
         self.counterparty
     }
 
+    fn initiator(&self) -> Self::Account {
+        self.initiator.unwrap_or(self.account)
+    }
+
+    fn sponsor(&self) -> Option<Self::Account> {
+        self.sponsor
+    }
+
+    fn sponsor_signature_facts(&self) -> Option<BatchSignatureFacts> {
+        self.sponsor_signature_facts
+    }
+
     fn sequence(&self) -> u32 {
         0
     }
@@ -82,18 +100,75 @@ impl BatchSignerEntry for StubBatchSigner {
 }
 
 #[test]
+fn tx_batch_preflight_sig_validated_uses_delegate_as_required_authorizer() {
+    let mut delegated = StubInnerTx::new("account");
+    delegated.initiator = Some("delegate");
+
+    let result = validate_batch_preflight_sig_validated(
+        "outer",
+        [delegated.clone(), StubInnerTx::new("outer")],
+        Some([StubBatchSigner { account: "account" }]),
+        || true,
+    );
+    assert_eq!(result, Ter::TEM_BAD_SIGNER);
+
+    let result = validate_batch_preflight_sig_validated(
+        "outer",
+        [delegated, StubInnerTx::new("outer")],
+        Some([StubBatchSigner {
+            account: "delegate",
+        }]),
+        || true,
+    );
+    assert_eq!(result, Ter::TES_SUCCESS);
+}
+
+#[test]
+fn tx_batch_preflight_sig_validated_requires_sponsor_only_with_sponsor_signature() {
+    let mut sponsored = StubInnerTx::new("alice");
+    sponsored.sponsor = Some("sponsor");
+
+    let result = validate_batch_preflight_sig_validated(
+        "outer",
+        [sponsored.clone(), StubInnerTx::new("outer")],
+        Some([StubBatchSigner { account: "alice" }]),
+        || true,
+    );
+    assert_eq!(result, Ter::TES_SUCCESS);
+
+    sponsored.sponsor_signature_facts = Some(BatchSignatureFacts {
+        signing_pub_key_is_empty: true,
+        ..BatchSignatureFacts::default()
+    });
+    let result = validate_batch_preflight_sig_validated(
+        "outer",
+        [sponsored.clone(), StubInnerTx::new("outer")],
+        Some([StubBatchSigner { account: "alice" }]),
+        || true,
+    );
+    assert_eq!(result, Ter::TEM_BAD_SIGNER);
+
+    let result = validate_batch_preflight_sig_validated(
+        "outer",
+        [sponsored, StubInnerTx::new("outer")],
+        Some([
+            StubBatchSigner { account: "alice" },
+            StubBatchSigner { account: "sponsor" },
+        ]),
+        || true,
+    );
+    assert_eq!(result, Ter::TES_SUCCESS);
+}
+
+#[test]
 fn tx_batch_preflight_sig_validated_rejects_signers_array_above_cpp_limit() {
     let signers = vec![
-        StubBatchSigner { account: "a1" },
-        StubBatchSigner { account: "a2" },
-        StubBatchSigner { account: "a3" },
-        StubBatchSigner { account: "a4" },
-        StubBatchSigner { account: "a5" },
-        StubBatchSigner { account: "a6" },
-        StubBatchSigner { account: "a7" },
-        StubBatchSigner { account: "a8" },
-        StubBatchSigner { account: "a9" },
+        StubBatchSigner {
+            account: "oversized",
+        };
+        MAX_BATCH_SIGNER_COUNT + 1
     ];
+    assert_eq!(signers.len(), 25);
 
     let result = validate_batch_preflight_sig_validated(
         "outer",
@@ -129,7 +204,25 @@ fn tx_batch_preflight_sig_validated_rejects_duplicate_batch_signers() {
         || true,
     );
 
-    assert_eq!(result, Ter::TEM_REDUNDANT);
+    assert_eq!(result, Ter::TEM_BAD_SIGNER);
+}
+
+#[test]
+fn tx_batch_preflight_sig_validated_rejects_descending_batch_signers() {
+    let mut with_counterparty = StubInnerTx::new("alice");
+    with_counterparty.counterparty = Some("carol");
+
+    let result = validate_batch_preflight_sig_validated(
+        "outer",
+        [with_counterparty, StubInnerTx::new("outer")],
+        Some([
+            StubBatchSigner { account: "carol" },
+            StubBatchSigner { account: "alice" },
+        ]),
+        || true,
+    );
+
+    assert_eq!(result, Ter::TEM_BAD_SIGNER);
 }
 
 #[test]

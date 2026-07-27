@@ -660,6 +660,28 @@ pub fn build_bootstrap_root(
             root.attach_configured_overlay_runtime(config, Arc::new(BootstrapOverlayHandoff))?;
     }
 
+    // Start built-in SNTP client if [sntp_servers] is configured.  This
+    // allows nodes in LXC containers, Docker, or managed VPS environments
+    // (where host NTP cannot be configured by the operator) to discipline
+    // their clock independently, matching rippled's former [sntp_servers]
+    // support.
+    if !options.standalone {
+        let sntp_servers: Vec<String> = config
+            .section("sntp_servers")
+            .values()
+            .iter()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !sntp_servers.is_empty() {
+            tracing::info!(target: "bootstrap",
+                count = sntp_servers.len(),
+                "Starting built-in SNTP client ([sntp_servers] configured)"
+            );
+            root.start_sntp_client(sntp_servers);
+        }
+    }
+
     // Load validation seed into config BEFORE consensus runtime is created,
     // so the consensus adaptor can read it.
     if let Ok(seed) = config.legacy("validation_seed") {
@@ -676,6 +698,19 @@ pub fn build_bootstrap_root(
     }
 
     let _ = root.attach_default_consensus_runtime();
+
+    // Rippled parity: setMaxDisallowedLedger — store the highest ledger seq
+    // from the relational database so validators can reject stale proposals.
+    if root.validation_public_key().is_some() {
+        if let Some(max_seq) = root
+            .relational_database()
+            .as_ref()
+            .and_then(|db| db.max_ledger_seq())
+        {
+            root.set_max_disallowed_ledger(max_seq);
+        }
+    }
+
     let node_store_kind = attach_shamap_store_if_configured(
         &mut root,
         config,
@@ -978,7 +1013,7 @@ fn run_start_mode_consensus_loop(
             Arc::new(crate::ledger::inbound_ledgers::InboundLedgers::new(
                 Arc::clone(&app_tree_cache),
                 Arc::new(shamap::family::FullBelowCacheImpl::new(
-                    0,
+                    1,
                     basics::tagged_cache::MonotonicClock::default(),
                     basics::hardened_hash::HardenedHashBuilder::default(),
                     node_size_profile.full_below_target_size,
@@ -988,13 +1023,8 @@ fn run_start_mode_consensus_loop(
                     time::Duration::seconds(120),
                     basics::tagged_cache::MonotonicClock::default(),
                 )),
-                Arc::new(basics::tagged_cache::KeyCache::new(
-                    "driver-dedup",
-                    node_size_profile.full_below_target_size,
-                    time::Duration::seconds(30),
-                    basics::tagged_cache::MonotonicClock::default(),
-                )),
                 shared_completed_tx.clone(),
+                runtime.root().network_ops_state().need_network_ledger_arc(),
             ))
         });
 
@@ -1501,6 +1531,12 @@ fn run_start_mode_consensus_loop(
                                 "TreeNodeCache sweep (matching rippled doSweep)"
                             );
                         }
+
+                        // TransactionMaster sweep — matching rippled's doSweep which
+                        // sweeps the MasterTransaction TaggedCache (65,536 entries, 30min TTL).
+                        // Without this, completed transactions accumulate indefinitely.
+                        root.transaction_master().sweep();
+
                         last_cache_sweep = std::time::Instant::now();
                     }
 
@@ -1520,6 +1556,19 @@ fn run_start_mode_consensus_loop(
                         let tick = IDLE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if tick % 4 == 0 {
                             overlay_rt.overlay().delete_idle_peers();
+                        }
+
+                        // relay_history sweep every 60s — prunes entries for disconnected peers
+                        // preventing unbounded memory growth on long-lived nodes.
+                        static LAST_RELAY_SWEEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let last_sweep = LAST_RELAY_SWEEP.load(std::sync::atomic::Ordering::Relaxed);
+                        if now_secs.saturating_sub(last_sweep) >= 60 {
+                            LAST_RELAY_SWEEP.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                            overlay_rt.overlay().sweep_relay_history(5000);
                         }
 
                         // Ping every 60 seconds
@@ -2358,9 +2407,8 @@ fn initialize_startup_ledger_state(
             }
         }
         StartUpType::Fresh | StartUpType::Snapshot => {
-            if options.start_type == StartUpType::Snapshot && !root.config().standalone {
-                root.set_need_network_ledger(true);
-            }
+            // Rippled parity: --start (Fresh) does NOT set need_network_ledger.
+            // Only Network and Normal modes require network ledger acquisition.
             seed_startup_ledger_state(root, options, config)
         }
     }
@@ -2496,15 +2544,29 @@ fn load_complete_ledger_from_storage(
         return Ok(None);
     };
 
-    if !loaded.walk_ledger_with_family(&journal, false, &family) {
-        return Err(format!(
-            "Startup ledger {} is incomplete in local NodeStore",
-            loaded.header().seq
-        ));
+    // Match rippled's `getLastFullLedger` (Application.cpp:1694-1735): do NOT
+    // walk the full state tree on normal startup. rippled only verifies the
+    // header hash matches and that FeeSettings is readable (via the normal
+    // `ledger->read(keylet::feeSettings())` path). The expensive walkLedger
+    // call in rippled's `loadOldLedger` is guarded by UNREACHABLE — it's an
+    // assertion, not a graceful recovery path.
+    //
+    // If `finish_load_by_index_or_hash` fails (which reads FeeSettings via
+    // the family-backed state map), the ledger's critical path nodes are
+    // genuinely missing, and we return None so the caller falls back to
+    // network acquisition — matching rippled's SHAMapMissingNode catch that
+    // returns empty and triggers setNeedNetworkLedger.
+    match loaded.finish_load_by_index_or_hash(&journal) {
+        Ok(()) => {}
+        Err(error) => {
+            tracing::warn!(target: "bootstrap",
+                seq = loaded.header().seq,
+                error = ?error,
+                "Startup ledger FeeSettings/setup not resolvable from local NodeStore; falling back to network"
+            );
+            return Ok(None);
+        }
     }
-    loaded
-        .finish_load_by_index_or_hash(&journal)
-        .map_err(|error| format!("startup ledger setup failed: {error:?}"))?;
     loaded.assert_sensible();
     Ok(Some(loaded))
 }

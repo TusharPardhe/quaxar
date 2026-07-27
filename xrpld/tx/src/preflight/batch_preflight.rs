@@ -20,12 +20,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use basics::base_uint::Uint256;
+use ledger::{is_fee_sponsored, is_reserve_sponsored};
 
 use protocol::{
-    BatchTransactionFlags, INNER_BATCH_TRANSACTION_FLAG, NotTec, Ter, TxType, is_tes_success,
+    AccountID, BATCH_FLAGS_MASK, BatchTransactionFlags, INNER_BATCH_TRANSACTION_FLAG, NotTec,
+    Rules, STObject, STTx, Ter, TxFormats, TxType, get_field_by_symbol, is_tes_success,
 };
 
 pub const MAX_BATCH_TX_COUNT: usize = 8;
+pub const MAX_BATCH_SIGNER_COUNT: usize = MAX_BATCH_TX_COUNT * 3;
 
 pub const DISABLED_INNER_BATCH_TX_TYPES: [TxType; 15] = [
     TxType::VAULT_CREATE,
@@ -63,7 +69,19 @@ pub trait BatchInnerTransaction {
     fn counterparty_signature_facts(&self) -> Option<BatchSignatureFacts>;
     fn fee_is_native_zero(&self) -> bool;
     fn account(&self) -> Self::Account;
+    fn initiator(&self) -> Self::Account {
+        self.account()
+    }
     fn counterparty(&self) -> Option<Self::Account>;
+    fn sponsor(&self) -> Option<Self::Account> {
+        None
+    }
+    fn sponsor_signature_facts(&self) -> Option<BatchSignatureFacts> {
+        None
+    }
+    fn fee_is_sponsored(&self) -> bool {
+        false
+    }
     fn sequence(&self) -> u32;
     fn ticket_sequence(&self) -> Option<u32>;
 }
@@ -129,6 +147,16 @@ where
             return error;
         }
 
+        if let Some(sponsor_signature) = inner_transaction.sponsor_signature_facts()
+            && let Some(error) = validate_signature_facts(sponsor_signature)
+        {
+            return error;
+        }
+
+        if inner_transaction.sponsor().is_some() && inner_transaction.fee_is_sponsored() {
+            return Ter::TEM_INVALID_FLAG;
+        }
+
         if !inner_transaction.fee_is_native_zero() {
             return Ter::TEM_BAD_FEE;
         }
@@ -173,42 +201,59 @@ pub fn validate_batch_preflight_sig_validated<InnerTx, Signer, CheckBatchSign>(
 ) -> NotTec
 where
     InnerTx: BatchInnerTransaction,
+    InnerTx::Account: Ord,
     Signer: BatchSignerEntry<Account = InnerTx::Account>,
     CheckBatchSign: FnOnce() -> bool,
 {
-    let mut required_signers = HashSet::new();
+    let mut required_signers = Vec::new();
 
     for inner_transaction in inner_transactions {
-        let inner_account = inner_transaction.account();
-        if inner_account != outer_account {
-            required_signers.insert(inner_account);
+        let initiator = inner_transaction.initiator();
+        if initiator != outer_account {
+            required_signers.push(initiator);
         }
 
         if let Some(counterparty) = inner_transaction.counterparty()
             && counterparty != outer_account
         {
-            required_signers.insert(counterparty);
+            required_signers.push(counterparty);
+        }
+
+        if let (Some(sponsor), Some(_)) = (
+            inner_transaction.sponsor(),
+            inner_transaction.sponsor_signature_facts(),
+        ) && sponsor != outer_account
+        {
+            required_signers.push(sponsor);
         }
     }
+    required_signers.sort();
+    required_signers.dedup();
 
+    let mut matched_required_signers = 0usize;
     if let Some(batch_signers) = batch_signers {
         let batch_signers: Vec<_> = batch_signers.into_iter().collect();
-        if batch_signers.len() > MAX_BATCH_TX_COUNT {
+        if batch_signers.len() > MAX_BATCH_SIGNER_COUNT {
             return Ter::TEM_ARRAY_TOO_LARGE;
         }
 
-        let mut unique_batch_signers = HashSet::new();
+        let mut last_batch_signer = None;
         for signer in batch_signers {
             let signer_account = signer.account();
-            if signer_account == outer_account {
+            if signer_account == outer_account
+                || last_batch_signer.as_ref() == Some(&signer_account)
+                || last_batch_signer
+                    .as_ref()
+                    .is_some_and(|last| last > &signer_account)
+            {
                 return Ter::TEM_BAD_SIGNER;
             }
-            if !unique_batch_signers.insert(signer_account.clone()) {
-                return Ter::TEM_REDUNDANT;
-            }
-            if !required_signers.remove(&signer_account) {
+            last_batch_signer = Some(signer_account.clone());
+
+            if required_signers.get(matched_required_signers) != Some(&signer_account) {
                 return Ter::TEM_BAD_SIGNER;
             }
+            matched_required_signers += 1;
         }
 
         if !check_batch_sign() {
@@ -216,11 +261,189 @@ where
         }
     }
 
-    if !required_signers.is_empty() {
+    if matched_required_signers != required_signers.len() {
         return Ter::TEM_BAD_SIGNER;
     }
 
     Ter::TES_SUCCESS
+}
+
+pub fn validate_sttx_batch_preflight(tx: &STTx) -> NotTec {
+    validate_sttx_batch_preflight_with_inner_preflight(tx, |_| Ter::TES_SUCCESS)
+}
+
+pub fn validate_sttx_batch_preflight_with_rules(tx: &STTx, rules: &Rules) -> NotTec {
+    validate_sttx_batch_preflight_with_inner_preflight(tx, |inner| {
+        validate_sttx_inner_batch_preflight_with_rules(inner, rules)
+    })
+}
+
+pub fn canonical_batch_inner_transactions(tx: &STTx) -> Result<Vec<STTx>, NotTec> {
+    if tx.get_txn_type() != TxType::BATCH {
+        return Err(Ter::TEM_INVALID);
+    }
+
+    let raw_transactions = tx.get_field_array(get_field_by_symbol("sfRawTransactions"));
+    let transaction_type = get_field_by_symbol("sfTransactionType");
+    catch_unwind(AssertUnwindSafe(|| {
+        raw_transactions
+            .iter()
+            .map(|raw_transaction| {
+                let tx_type = TxType::from_u16(raw_transaction.get_field_u16(transaction_type));
+                let Some(format) = TxFormats::get_instance().find_by_type(tx_type) else {
+                    return Err(Ter::TEM_INVALID);
+                };
+                let mut canonical = raw_transaction.clone();
+                canonical.apply_template(format.so_template());
+                Ok(STTx::from_stobject(canonical))
+            })
+            .collect()
+    }))
+    .unwrap_or(Err(Ter::TEM_INVALID))
+}
+
+fn validate_sttx_batch_preflight_with_inner_preflight(
+    tx: &STTx,
+    mut preflight_inner: impl FnMut(&STTx) -> NotTec,
+) -> NotTec {
+    if tx.get_txn_type() != TxType::BATCH {
+        return Ter::TEM_INVALID;
+    }
+
+    if tx.get_flags() & BATCH_FLAGS_MASK != 0 {
+        return Ter::TEM_INVALID_FLAG;
+    }
+
+    let sponsor_flags = get_field_by_symbol("sfSponsorFlags");
+    if tx.is_field_present(sponsor_flags) && is_reserve_sponsored(tx.get_field_u32(sponsor_flags)) {
+        return Ter::TEM_INVALID_FLAG;
+    }
+
+    let inner_transactions = match canonical_batch_inner_transactions(tx) {
+        Ok(inner_transactions) => inner_transactions,
+        Err(error) => return error,
+    };
+
+    let structure =
+        validate_batch_preflight_structure(tx.get_flags(), inner_transactions.iter(), |inner| {
+            preflight_inner(inner)
+        });
+    if !is_tes_success(structure) {
+        return structure;
+    }
+
+    let batch_signers = get_field_by_symbol("sfBatchSigners");
+    if tx.is_field_present(batch_signers) {
+        validate_batch_preflight_sig_validated(
+            tx.get_account_id(get_field_by_symbol("sfAccount")),
+            inner_transactions.iter(),
+            Some(tx.get_field_array(batch_signers).iter()),
+            || true,
+        )
+    } else {
+        validate_batch_preflight_sig_validated(
+            tx.get_account_id(get_field_by_symbol("sfAccount")),
+            inner_transactions.iter(),
+            None::<std::iter::Empty<&STObject>>,
+            || true,
+        )
+    }
+}
+
+/// Delegates Batch inner validation to the shared, amendment-aware, stateless
+/// transaction semantic-preflight dispatcher.
+pub fn validate_sttx_inner_batch_preflight_with_rules(inner: &STTx, rules: &Rules) -> NotTec {
+    crate::validate_sttx_semantic_preflight_with_rules(inner, rules)
+}
+
+fn st_object_signature_facts(object: &STObject) -> BatchSignatureFacts {
+    BatchSignatureFacts {
+        has_txn_signature: object.is_field_present(get_field_by_symbol("sfTxnSignature")),
+        has_signers: object.is_field_present(get_field_by_symbol("sfSigners")),
+        signing_pub_key_is_empty: object
+            .get_field_vl(get_field_by_symbol("sfSigningPubKey"))
+            .is_empty(),
+    }
+}
+
+impl BatchInnerTransaction for &STTx {
+    type TxId = Uint256;
+    type Account = AccountID;
+
+    fn transaction_id(&self) -> Self::TxId {
+        self.get_transaction_id()
+    }
+
+    fn txn_type(&self) -> TxType {
+        self.get_txn_type()
+    }
+
+    fn flags(&self) -> u32 {
+        self.get_flags()
+    }
+
+    fn signature_facts(&self) -> BatchSignatureFacts {
+        st_object_signature_facts(self)
+    }
+
+    fn counterparty_signature_facts(&self) -> Option<BatchSignatureFacts> {
+        let field = get_field_by_symbol("sfCounterpartySignature");
+        self.is_field_present(field)
+            .then(|| st_object_signature_facts(&self.get_field_object(field)))
+    }
+
+    fn fee_is_native_zero(&self) -> bool {
+        let fee = self.get_field_amount(get_field_by_symbol("sfFee"));
+        fee.native() && fee.xrp().drops() == 0
+    }
+
+    fn account(&self) -> Self::Account {
+        self.get_account_id(get_field_by_symbol("sfAccount"))
+    }
+
+    fn initiator(&self) -> Self::Account {
+        self.get_initiator()
+    }
+
+    fn counterparty(&self) -> Option<Self::Account> {
+        let field = get_field_by_symbol("sfCounterparty");
+        self.is_field_present(field)
+            .then(|| self.get_account_id(field))
+    }
+
+    fn sponsor(&self) -> Option<Self::Account> {
+        let field = get_field_by_symbol("sfSponsor");
+        self.is_field_present(field)
+            .then(|| self.get_account_id(field))
+    }
+
+    fn sponsor_signature_facts(&self) -> Option<BatchSignatureFacts> {
+        let field = get_field_by_symbol("sfSponsorSignature");
+        self.is_field_present(field)
+            .then(|| st_object_signature_facts(&self.get_field_object(field)))
+    }
+
+    fn fee_is_sponsored(&self) -> bool {
+        is_fee_sponsored(self.get_field_u32(get_field_by_symbol("sfSponsorFlags")))
+    }
+
+    fn sequence(&self) -> u32 {
+        self.get_field_u32(get_field_by_symbol("sfSequence"))
+    }
+
+    fn ticket_sequence(&self) -> Option<u32> {
+        let field = get_field_by_symbol("sfTicketSequence");
+        self.is_field_present(field)
+            .then(|| self.get_field_u32(field))
+    }
+}
+
+impl BatchSignerEntry for &STObject {
+    type Account = AccountID;
+
+    fn account(&self) -> Self::Account {
+        self.get_account_id(get_field_by_symbol("sfAccount"))
+    }
 }
 
 fn validate_signature_facts(signature_facts: BatchSignatureFacts) -> Option<NotTec> {
@@ -245,8 +468,8 @@ mod tests {
 
     use super::{
         BatchInnerTransaction, BatchSignatureFacts, BatchSignerEntry,
-        DISABLED_INNER_BATCH_TX_TYPES, MAX_BATCH_TX_COUNT, validate_batch_preflight_sig_validated,
-        validate_batch_preflight_structure,
+        DISABLED_INNER_BATCH_TX_TYPES, MAX_BATCH_SIGNER_COUNT, MAX_BATCH_TX_COUNT,
+        validate_batch_preflight_sig_validated, validate_batch_preflight_structure,
     };
 
     #[derive(Clone)]
@@ -344,6 +567,7 @@ mod tests {
     #[test]
     fn batch_preflight_constants_match_cpp_batch_h() {
         assert_eq!(MAX_BATCH_TX_COUNT, 8);
+        assert_eq!(MAX_BATCH_SIGNER_COUNT, 24);
         assert_eq!(DISABLED_INNER_BATCH_TX_TYPES.len(), 15);
         assert!(DISABLED_INNER_BATCH_TX_TYPES.contains(&protocol::TxType::VAULT_CREATE));
         assert!(DISABLED_INNER_BATCH_TX_TYPES.contains(&protocol::TxType::LOAN_PAY));

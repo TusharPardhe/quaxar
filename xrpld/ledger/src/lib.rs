@@ -42,6 +42,7 @@ pub use domain::pending_saves;
 pub use domain::persistence;
 pub use domain::ripple_calc;
 pub use domain::setup;
+pub use domain::sponsor_helpers::{is_fee_sponsored, is_reserve_sponsored};
 pub use domain::timeout_counter;
 pub use domain::token_helpers;
 pub use domain::transaction_state_sf;
@@ -146,9 +147,10 @@ pub use ledger_fetcher::{
     InboundLedgerPacketShape, InboundLedgerPeerScore, InboundLedgerPlannerState,
     InboundLedgerReason, InboundLedgerReceivedPacket, InboundLedgerRequest,
     InboundLedgerRequestTrigger, InboundLedgerRunDataResult, InboundLedgerStore,
-    InboundLedgerTimerResult, NullInboundLedgerJournal, get_needed_hashes_with_family,
-    make_inbound_get_ledger_request, make_inbound_needed_by_hash_request,
-    needed_hashes_with_family, needed_hashes_with_family_and_first_child,
+    InboundLedgerTimerResult, NullInboundLedgerJournal, StateScanParams, TriggerSetup,
+    TxScanParams, get_needed_hashes_with_family, make_inbound_get_ledger_request,
+    make_inbound_needed_by_hash_request, needed_hashes_with_family,
+    needed_hashes_with_family_and_first_child,
 };
 // Removed: InboundLedgersLocal, InboundLedgerRoute, stash_stale_packet
 // These will be reimplemented in app::ledger::inbound_ledgers
@@ -2550,12 +2552,19 @@ impl Ledger {
                 self.header.account_hash,
             ));
         } else if parallel {
-            return self.state_map.walk_map_parallel_with_family(
+            if !self.state_map.walk_map_parallel_with_family(
                 SHAMapType::State,
                 &mut missing_nodes1,
                 WALK_LEDGER_MAX_MISSING_NODES,
                 family,
-            );
+            ) {
+                // Parallel walk failed operationally (worker panic or non-inner root).
+                // Treat as if we found missing nodes — don't trust the result.
+                missing_nodes1.push(SHAMapMissingNode::from_hash(
+                    SHAMapType::State,
+                    self.header.account_hash,
+                ));
+            }
         } else {
             self.state_map.walk_map_with_family(
                 SHAMapType::State,

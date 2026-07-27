@@ -46,6 +46,27 @@ pub enum SnapshotError {
         computed_hex: String,
     },
 
+    /// The advertised ledger header fields do not hash to `ledger_hash`.
+    LedgerHashMismatch {
+        expected_hex: String,
+        computed_hex: String,
+    },
+
+    /// A snapshot declaration exceeds a fixed loader resource bound.
+    ResourceLimitExceeded {
+        resource: &'static str,
+        actual: u64,
+        limit: u64,
+    },
+
+    /// A node reachable from a manifest SHAMap root was missing, malformed, or
+    /// did not decode to the content-addressed hash expected by its parent.
+    ShamapVerificationFailed {
+        map: &'static str,
+        hash_hex: String,
+        reason: String,
+    },
+
     /// A node record inside a chunk was malformed.
     MalformedNodeRecord {
         chunk_index: usize,
@@ -135,6 +156,32 @@ impl fmt::Display for SnapshotError {
                 write!(
                     f,
                     "snapshot post-load account root mismatch: expected {expected_hex}, got {computed_hex}"
+                )
+            }
+            Self::LedgerHashMismatch {
+                expected_hex,
+                computed_hex,
+            } => {
+                write!(
+                    f,
+                    "snapshot manifest ledger hash mismatch: expected {expected_hex}, got {computed_hex}"
+                )
+            }
+            Self::ResourceLimitExceeded {
+                resource,
+                actual,
+                limit,
+            } => {
+                write!(f, "snapshot {resource} limit exceeded: {actual} > {limit}")
+            }
+            Self::ShamapVerificationFailed {
+                map,
+                hash_hex,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "snapshot post-load {map} SHAMap verification failed at {hash_hex}: {reason}"
                 )
             }
             Self::MalformedNodeRecord {

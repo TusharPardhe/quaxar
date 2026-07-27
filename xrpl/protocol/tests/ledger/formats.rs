@@ -73,14 +73,14 @@ fn protocol_tx_and_ledger_formats_resolve_names_through_shared_registry_shape() 
         "deposit_preauth"
     );
     assert_eq!(tx_formats.iter().count(), 75);
-    assert_eq!(tx_formats.get_common_fields().len(), 17);
+    assert_eq!(tx_formats.get_common_fields().len(), 20);
     assert_eq!(
         tx_formats
             .find_by_type(TxType::PAYMENT)
             .expect("payment type should resolve")
             .so_template()
             .size(),
-        26
+        29
     );
     let amount_index = tx_formats
         .find_by_type(TxType::PAYMENT)

@@ -18869,7 +18869,7 @@ fn nfe_ai50() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2A-P1: Direct ports from C++ NFToken_test.cpp
+// Direct ports from C++ NFToken_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // --- testcase("Mint invalid") ---
@@ -18993,7 +18993,7 @@ fn cpp_nft_mint_empty_uri() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2A-P2: Direct ports from C++ NFTokenBurn_test.cpp
+// Direct ports from C++ NFTokenBurn_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// C++: NFTokenBurn with no NFTokenID -> temMALFORMED

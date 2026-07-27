@@ -106,6 +106,7 @@ pub trait Overlay: Send + Sync {
     fn network_id(&self) -> Option<u32>;
     fn verify_endpoints(&self) -> bool;
     fn tx_metrics(&self) -> JsonValue;
+    fn sweep_relay_history(&self, max_entries: u64);
     fn stats(&self) -> OverlayStats {
         OverlayStats {
             active_peers: self.size(),

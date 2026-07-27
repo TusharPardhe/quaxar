@@ -4934,7 +4934,7 @@ fn esc_ag212() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2A-P1: Direct ports from C++ Escrow_test.cpp
+// Direct ports from C++ Escrow_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // --- testcase("Failure Cases") ---
@@ -5056,7 +5056,7 @@ fn cpp_escrow_create_invalid_flags() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2A-P2: Direct ports from C++ EscrowToken_test.cpp
+// Direct ports from C++ EscrowToken_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// C++: testcase("IOU Create Preflight") — escrow with neither FinishAfter nor Condition

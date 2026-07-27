@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use protocol::{Ter, is_tef_failure, is_tem_malformed, is_ter_retry, is_tes_success};
 use serde_json::{Map, Value};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use tx::{ApplyFlags, ApplyResult, CheckValidityResult, Validity};
@@ -184,7 +185,7 @@ impl StateAccounting {
 pub struct SharedNetworkOpsState {
     operating_mode: AtomicU8,
     consensus_mode: AtomicU8,
-    need_network_ledger: AtomicBool,
+    need_network_ledger: Arc<AtomicBool>,
     amendment_blocked: AtomicBool,
     unl_blocked: AtomicBool,
     state_accounting: Mutex<StateAccounting>,
@@ -201,7 +202,7 @@ impl SharedNetworkOpsState {
         Self {
             operating_mode: AtomicU8::new(encode_operating_mode(operating_mode)),
             consensus_mode: AtomicU8::new(NetworkOpsConsensusMode::Observing as u8),
-            need_network_ledger: AtomicBool::new(false),
+            need_network_ledger: Arc::new(AtomicBool::new(false)),
             amendment_blocked: AtomicBool::new(false),
             unl_blocked: AtomicBool::new(false),
             state_accounting: Mutex::new(StateAccounting::new(operating_mode)),
@@ -257,6 +258,10 @@ impl SharedNetworkOpsState {
 
     pub fn need_network_ledger(&self) -> bool {
         self.need_network_ledger.load(Ordering::Acquire)
+    }
+
+    pub fn need_network_ledger_arc(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.need_network_ledger)
     }
 
     pub fn set_amendment_blocked(&self, amendment_blocked: bool) {

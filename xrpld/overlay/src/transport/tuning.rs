@@ -11,3 +11,7 @@ pub const SEND_QUEUE_LOG_FREQ: usize = 64;
 pub const CHECK_IDLE_PEERS: usize = 4;
 pub const MAX_QUERY_DEPTH: usize = 3;
 pub const READ_BUFFER_BYTES: usize = 16_384;
+
+// Differential Pricing Constants (protects against node-store seek attacks)
+pub const FREE_OBJECTS_PER_REQUEST: usize = 16;
+pub const COST_PER_LOOKUP_MISS: usize = 8;

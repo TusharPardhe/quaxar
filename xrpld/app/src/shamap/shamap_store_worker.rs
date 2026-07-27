@@ -122,6 +122,7 @@ pub fn run_shamap_store_worker_step(
         }));
     }
 
+    let _rotation_window = runtime.begin_rotation_window()?;
     runtime.freshen_caches()?;
     if wait_for_health(&health_policy, runtime, |runtime, duration| {
         runtime.sleep(duration)

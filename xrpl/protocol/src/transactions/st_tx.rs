@@ -5,13 +5,15 @@ use std::{
     fmt,
     ops::{Deref, DerefMut},
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::OnceLock,
 };
 
 use basics::string_utilities::sql_blob_literal;
 use basics::{base_uint::Uint256, str_hex::str_hex, string_utilities::str_unhex};
 
-use crate::batch_sign::{BatchSigner, check_batch_sign};
+use crate::batch_sign::{
+    BatchSigner, INTERNAL_BATCH_SIGNATURE_CHECK_FAILURE, NOT_A_BATCH_TRANSACTION_ERROR,
+    check_batch_sign,
+};
 use crate::signature_check::{
     SignatureCheckObject, check_signature, check_signature_with_counterparty,
 };
@@ -61,7 +63,6 @@ pub struct STTx {
     object: STObject,
     transaction_id: Uint256,
     tx_type: TxType,
-    batch_transaction_ids: OnceLock<Vec<Uint256>>,
 }
 
 impl Clone for STTx {
@@ -70,7 +71,6 @@ impl Clone for STTx {
             object: self.object.clone(),
             transaction_id: self.transaction_id,
             tx_type: self.tx_type,
-            batch_transaction_ids: OnceLock::new(),
         }
     }
 }
@@ -166,7 +166,6 @@ impl STTx {
                 tx_type: TxType::PAYMENT,
                 object: STObject::new(get_field_by_symbol("sfTransaction")),
                 transaction_id: Default::default(),
-                batch_transaction_ids: Default::default(),
             };
         }
 
@@ -299,58 +298,138 @@ impl STTx {
             )?;
         }
 
+        let sponsor_signature_field = get_field_by_symbol("sfSponsorSignature");
+        if self.is_field_present(sponsor_signature_field) {
+            let sponsor_signature = self.get_field_object(sponsor_signature_field);
+            self.check_sign_for_object(rules, &sponsor_signature)
+                .map_err(|error| format!("Sponsor: {error}"))?;
+        }
+
+        if self.is_field_present(get_field_by_symbol("sfBatchSigners")) {
+            self.check_batch_sign(rules)?;
+        }
+
         Ok(())
     }
 
     pub fn check_batch_sign(&self, _rules: &Rules) -> Result<(), String> {
-        let batch_message =
-            serialize_batch_message(self.get_flags(), &self.get_batch_transaction_ids());
-        let batch_signers = self.get_field_array(get_field_by_symbol("sfBatchSigners"));
+        catch_unwind(AssertUnwindSafe(|| {
+            if self.tx_type != TxType::BATCH {
+                return Err(NOT_A_BATCH_TRANSACTION_ERROR.to_owned());
+            }
 
-        check_batch_sign(
-            self.tx_type,
-            batch_signers.iter().cloned().collect::<Vec<_>>(),
-            |batch_signer| verify_signature_bytes(batch_signer, batch_message.data()),
-            |signer: &STObject| {
-                let mut message = batch_message.clone();
-                crate::finish_multi_signing_data(signer.account_id(), &mut message);
-                if verify_signature_bytes(signer, message.data()) {
-                    Ok(())
-                } else {
-                    Err(String::new())
-                }
-            },
-            |account_id| to_base58(*account_id),
-        )
+            let batch_signers_field = get_field_by_symbol("sfBatchSigners");
+            if !self.is_field_present(batch_signers_field) {
+                return Err("Missing BatchSigners field.".to_owned());
+            }
+            let batch_signers = self.get_field_array(batch_signers_field);
+            if batch_signers.len() > MAX_BATCH_SIGNER_COUNT {
+                return Err("BatchSigners array exceeds max entries.".to_owned());
+            }
+
+            let raw_transactions_field = get_field_by_symbol("sfRawTransactions");
+            if !self.is_field_present(raw_transactions_field) {
+                return Err("Missing inner transactions.".to_owned());
+            }
+            let raw_transactions = self.get_field_array(raw_transactions_field);
+            if raw_transactions.is_empty() {
+                return Err("Missing inner transactions.".to_owned());
+            }
+            if raw_transactions.len() > MAX_BATCH_TX_COUNT {
+                return Err("Raw Transactions array exceeds max entries.".to_owned());
+            }
+
+            // Rippled constructs each raw entry as an STTx after applying its
+            // transaction template, before deriving the inner ID. Do that
+            // before any signature work so malformed/nested input cannot be
+            // hashed as an arbitrary STObject representation.
+            let tx_type_field = get_field_by_symbol("sfTransactionType");
+            let transaction_ids = raw_transactions
+                .iter()
+                .map(|raw_transaction| {
+                    let tx_type = TxType::from_u16(raw_transaction.get_field_u16(tx_type_field));
+                    if tx_type == TxType::BATCH {
+                        return Err("Batch inner transaction cannot be a Batch.".to_owned());
+                    }
+                    let Some(format) = TxFormats::get_instance().find_by_type(tx_type) else {
+                        return Err("Invalid batch inner transaction type.".to_owned());
+                    };
+                    let mut canonical = raw_transaction.clone();
+                    canonical.apply_template(format.so_template());
+                    Ok(STTx::from_stobject(canonical).get_transaction_id())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let batch_message = serialize_batch_message(
+                self.get_account_id(get_field_by_symbol("sfAccount")),
+                self.get_seq_value(),
+                self.get_flags(),
+                &transaction_ids,
+            );
+
+            check_batch_sign(
+                self.tx_type,
+                batch_signers.iter().cloned().collect::<Vec<_>>(),
+                |batch_signer| {
+                    let mut message = batch_message.clone();
+                    crate::finish_multi_signing_data(batch_signer.account_id(), &mut message);
+                    verify_signature_bytes(batch_signer, message.data())
+                },
+                |batch_signer, signer: &STObject| {
+                    let mut message = batch_message.clone();
+                    crate::finish_multi_signing_data(batch_signer.account_id(), &mut message);
+                    crate::finish_multi_signing_data(signer.account_id(), &mut message);
+                    if verify_signature_bytes(signer, message.data()) {
+                        Ok(())
+                    } else {
+                        Err(String::new())
+                    }
+                },
+                |account_id| to_base58(*account_id),
+            )
+        }))
+        .unwrap_or_else(|_| Err(INTERNAL_BATCH_SIGNATURE_CHECK_FAILURE.to_owned()))
     }
 
     pub fn get_batch_transaction_ids(&self) -> Vec<Uint256> {
-        assert_eq!(
-            self.tx_type,
-            TxType::BATCH,
-            "STTx::getBatchTransactionIDs : not a batch transaction"
-        );
+        catch_unwind(AssertUnwindSafe(|| self.canonical_batch_transaction_ids()))
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+    }
 
-        let raw_transactions = self.get_field_array(get_field_by_symbol("sfRawTransactions"));
-        assert!(
-            !raw_transactions.is_empty(),
-            "STTx::getBatchTransactionIDs : empty raw transactions"
-        );
+    fn canonical_batch_transaction_ids(&self) -> Result<Vec<Uint256>, String> {
+        if self.tx_type != TxType::BATCH {
+            return Err(NOT_A_BATCH_TRANSACTION_ERROR.to_owned());
+        }
 
-        let batch_transaction_ids = self.batch_transaction_ids.get_or_init(|| {
-            raw_transactions
-                .iter()
-                .map(|raw_transaction| raw_transaction.get_hash(HashPrefix::TransactionId))
-                .collect()
-        });
+        let raw_transactions_field = get_field_by_symbol("sfRawTransactions");
+        if !self.is_field_present(raw_transactions_field) {
+            return Err("Missing inner transactions.".to_owned());
+        }
+        let raw_transactions = self.get_field_array(raw_transactions_field);
+        if raw_transactions.is_empty() {
+            return Err("Missing inner transactions.".to_owned());
+        }
+        if raw_transactions.len() > MAX_BATCH_TX_COUNT {
+            return Err("Raw Transactions array exceeds max entries.".to_owned());
+        }
 
-        assert_eq!(
-            batch_transaction_ids.len(),
-            raw_transactions.len(),
-            "STTx::getBatchTransactionIDs : batch transaction IDs size mismatch"
-        );
-
-        batch_transaction_ids.clone()
+        let tx_type_field = get_field_by_symbol("sfTransactionType");
+        raw_transactions
+            .iter()
+            .map(|raw_transaction| {
+                let tx_type = TxType::from_u16(raw_transaction.get_field_u16(tx_type_field));
+                if tx_type == TxType::BATCH {
+                    return Err("Batch inner transaction cannot be a Batch.".to_owned());
+                }
+                let Some(format) = TxFormats::get_instance().find_by_type(tx_type) else {
+                    return Err("Invalid batch inner transaction type.".to_owned());
+                };
+                let mut canonical = raw_transaction.clone();
+                canonical.apply_template(format.so_template());
+                Ok(STTx::from_stobject(canonical).get_transaction_id())
+            })
+            .collect()
     }
 
     pub fn get_meta_sql_insert_replace_header() -> &'static str {
@@ -423,7 +502,6 @@ impl STTx {
             object,
             transaction_id,
             tx_type,
-            batch_transaction_ids: OnceLock::new(),
         }
     }
 
@@ -567,9 +645,16 @@ fn verify_signature_bytes(signature_object: &STObject, message: &[u8]) -> bool {
     )
 }
 
-fn serialize_batch_message(flags: u32, txids: &[Uint256]) -> Serializer {
+fn serialize_batch_message(
+    outer_account: AccountID,
+    outer_seq_value: u32,
+    flags: u32,
+    txids: &[Uint256],
+) -> Serializer {
     let mut message = Serializer::default();
     message.add32_prefix(HashPrefix::Batch);
+    message.add_bit_string(outer_account);
+    message.add32(outer_seq_value);
     message.add32(flags);
     message.add32(txids.len() as u32);
     for txid in txids {
@@ -579,6 +664,7 @@ fn serialize_batch_message(flags: u32, txids: &[Uint256]) -> Serializer {
 }
 
 pub const MAX_BATCH_TX_COUNT: usize = 8;
+pub const MAX_BATCH_SIGNER_COUNT: usize = MAX_BATCH_TX_COUNT * 3;
 
 pub fn build_multi_signing_data(object: &STObject, signing_id: AccountID) -> Serializer {
     crate::build_multi_signing_data(object, signing_id)
@@ -768,9 +854,14 @@ fn is_raw_transaction_okay(st: &STObject) -> Result<(), String> {
         return Ok(());
     }
 
+    let tx_type_field = get_field_by_symbol("sfTransactionType");
+    if TxType::from_u16(st.get_field_u16(tx_type_field)) != TxType::BATCH {
+        return Err("Only Batch transactions may contain raw transactions.".to_owned());
+    }
+
     let batch_signers_field = get_field_by_symbol("sfBatchSigners");
     if st.is_field_present(batch_signers_field)
-        && st.get_field_array(batch_signers_field).len() > MAX_BATCH_TX_COUNT
+        && st.get_field_array(batch_signers_field).len() > MAX_BATCH_SIGNER_COUNT
     {
         return Err("Batch Signers array exceeds max entries.".to_owned());
     }
@@ -781,14 +872,18 @@ fn is_raw_transaction_okay(st: &STObject) -> Result<(), String> {
     }
 
     for raw in raw_transactions.iter() {
-        let tx_type_field = get_field_by_symbol("sfTransactionType");
         let tx_type = TxType::from_u16(raw.get_field_u16(tx_type_field));
         if tx_type == TxType::BATCH {
             return Err("Raw Transactions may not contain batch transactions.".to_owned());
         }
 
+        let Some(format) = TxFormats::get_instance().find_by_type(tx_type) else {
+            return Err("Invalid raw transaction type.".to_owned());
+        };
         let mut candidate = raw.clone();
-        candidate.apply_template(tx_format(tx_type).so_template());
+        candidate.apply_template(format.so_template());
+        let inner = STTx::from_stobject(candidate);
+        passes_local_checks(&inner)?;
     }
 
     Ok(())

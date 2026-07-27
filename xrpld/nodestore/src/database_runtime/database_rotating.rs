@@ -45,6 +45,13 @@ impl DatabaseDelegate for DatabaseRotatingCore {
         true
     }
 
+    fn cache_read_allowed(&self, duplicate: bool) -> bool {
+        !duplicate
+            && !self
+                .rotation_in_flight
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn fetch_node_object(
         &self,
         hash: &Uint256,
@@ -180,6 +187,11 @@ impl DatabaseRotatingImp {
     pub fn set_rotation_in_flight(&self, in_flight: bool) {
         self.rotation_in_flight
             .store(in_flight, std::sync::atomic::Ordering::Release);
+        if in_flight {
+            // Archive-resident entries must not hide copy-forward reads while
+            // the old archive is being retired.
+            self.database.invalidate_node_object_cache();
+        }
     }
 
     /// Returns and resets the count of nodes copied forward during rotation.
@@ -189,6 +201,14 @@ impl DatabaseRotatingImp {
     }
 
     fn rotate_impl(&self, new_backend: Box<dyn Backend>, callback: &mut dyn FnMut(&str, &str)) {
+        // A caller normally enables rotation_in_flight before copying. Set it
+        // defensively here as well so a direct rotate cannot serve entries
+        // sourced solely from the outgoing archive.
+        let already_in_flight = self
+            .rotation_in_flight
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+        self.database.invalidate_node_object_cache();
+
         let new_writable_backend_name = new_backend.get_name();
         let new_writable_backend: Arc<dyn Backend> = Arc::from(new_backend);
 
@@ -208,6 +228,10 @@ impl DatabaseRotatingImp {
 
         callback(&new_writable_backend_name, &new_archive_backend_name);
         drop(old_archive_backend);
+        if !already_in_flight {
+            self.rotation_in_flight
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 
     pub fn rotate<F>(&self, new_backend: Box<dyn Backend>, callback: F)
@@ -274,6 +298,7 @@ impl DatabaseRotatingImp {
         backend.store(Arc::clone(&node_object));
         self.database
             .store_stats(1, node_object.data().len() as u64);
+        self.database.promote_node_object(node_object);
     }
 
     pub fn fetch_node_object(
@@ -465,6 +490,10 @@ impl DatabaseTrait for DatabaseRotatingImp {
 }
 
 impl DatabaseRotatingTrait for DatabaseRotatingImp {
+    fn set_rotation_in_flight(&self, in_flight: bool) {
+        DatabaseRotatingImp::set_rotation_in_flight(self, in_flight);
+    }
+
     fn rotate(&self, new_backend: Box<dyn Backend>, callback: &mut dyn FnMut(&str, &str)) {
         self.rotate_impl(new_backend, callback);
     }
@@ -636,6 +665,80 @@ mod tests {
         );
         assert_eq!(database.fd_required(), 14);
 
+        database.stop();
+    }
+
+    #[test]
+    fn rotating_duplicate_fetch_bypasses_cached_archive_hit_and_copies_forward() {
+        let writable = Arc::new(TestBackend::new("writable"));
+        let archive = Arc::new(TestBackend::new("archive"));
+        let object = sample_object(0x45);
+        archive.store(Arc::clone(&object));
+
+        let database = DatabaseRotatingImp::new(
+            Arc::new(DummyScheduler),
+            1,
+            Arc::clone(&writable) as Arc<dyn Backend>,
+            Arc::clone(&archive) as Arc<dyn Backend>,
+            &config(),
+            Arc::new(NullJournal),
+        )
+        .expect("rotating database");
+
+        // Populate Moka from the archive without the duplicate side effect.
+        assert!(
+            database
+                .fetch_node_object(object.hash(), 0, FetchType::Synchronous, false)
+                .is_some()
+        );
+        assert_eq!(writable.store_count.load(Ordering::Relaxed), 0);
+
+        // A duplicate request must still reach the rotating delegate and copy
+        // the archive value into writable storage.
+        assert!(
+            database
+                .fetch_node_object(object.hash(), 0, FetchType::Synchronous, true)
+                .is_some()
+        );
+        assert_eq!(writable.store_count.load(Ordering::Relaxed), 1);
+
+        database.stop();
+    }
+
+    #[test]
+    fn rotation_in_flight_invalidates_cache_and_copies_archive_reads_forward() {
+        let writable = Arc::new(TestBackend::new("writable"));
+        let archive = Arc::new(TestBackend::new("archive"));
+        let object = sample_object(0x46);
+        archive.store(Arc::clone(&object));
+
+        let database = DatabaseRotatingImp::new(
+            Arc::new(DummyScheduler),
+            1,
+            Arc::clone(&writable) as Arc<dyn Backend>,
+            Arc::clone(&archive) as Arc<dyn Backend>,
+            &config(),
+            Arc::new(NullJournal),
+        )
+        .expect("rotating database");
+
+        assert!(
+            database
+                .fetch_node_object(object.hash(), 0, FetchType::Synchronous, false)
+                .is_some()
+        );
+        assert_eq!(writable.store_count.load(Ordering::Relaxed), 0);
+
+        database.set_rotation_in_flight(true);
+        assert!(
+            database
+                .fetch_node_object(object.hash(), 0, FetchType::Synchronous, false)
+                .is_some()
+        );
+        assert_eq!(writable.store_count.load(Ordering::Relaxed), 1);
+        assert_eq!(database.take_copy_forward_count(), 1);
+
+        database.set_rotation_in_flight(false);
         database.stop();
     }
 

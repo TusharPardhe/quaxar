@@ -49,6 +49,11 @@ pub trait Backend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Mark an import as failed after it has started. Backends with an
+    /// incomplete-import marker must keep or restore that marker so an invalid
+    /// post-finalization snapshot cannot be reopened as a successful import.
+    fn bulk_import_abort(&self) {}
+
     fn for_each(&self, callback: &mut dyn FnMut(Arc<NodeObject>));
 
     fn get_write_load(&self) -> i32;

@@ -242,17 +242,33 @@ A non-validator node normally progresses through `connected`, `syncing`, `tracki
 
 ### System Time
 
-Quaxar reads the host operating system's UTC clock. It does not currently consume
-rippled-style `[sntp_servers]` entries, so configure and monitor host NTP rather
-than adding an inert configuration section. On supported Linux hosts:
+Quaxar reads the host operating system's UTC clock. On hosts where NTP can be
+configured, use your platform's standard time synchronisation:
 
 ```bash
 timedatectl status
 sudo timedatectl set-ntp true
 ```
 
-Use your platform's standard NTP service or a managed time source before running
-a production node.
+**For LXC containers, Docker, or managed VPS** where host NTP cannot be
+configured, quaxar supports a built-in SNTP client via the `[sntp_servers]`
+configuration section (matching rippled's former `[sntp_servers]` support):
+
+```ini
+[sntp_servers]
+time.windows.com
+time.apple.com
+time.nist.gov
+pool.ntp.org
+```
+
+When configured, quaxar queries these servers in the background and applies the
+computed clock offset to the node's time. This ensures correct time
+synchronisation even in containerised environments where the host kernel's NTP
+daemon is inaccessible.
+
+Use your platform's standard NTP service or the `[sntp_servers]` section before
+running a production node.
 
 ### Database Usage
 

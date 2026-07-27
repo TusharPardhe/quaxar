@@ -7,12 +7,12 @@
 use basics::base_uint::Uint256;
 use basics::hardened_hash::HardenedHashBuilder;
 use basics::sha_map_hash::SHAMapHash;
-use basics::tagged_cache::{KeyCache, MonotonicClock};
+use basics::tagged_cache::MonotonicClock;
 use ledger::{FetchPackCache, InboundLedgerPacket, Ledger};
 use overlay::Peer;
 use shamap::family::{FullBelowCache, FullBelowCacheImpl};
 use shamap::tree_node_cache::TreeNodeCache;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, RwLock};
@@ -30,7 +30,11 @@ use super::worker_pool::WorkerPool;
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
 /// Entries idle longer than this are swept.
-const SWEEP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const SWEEP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn response_sequence_matches_request(expected_seq: u32, response_seq: u32) -> bool {
+    expected_seq == 0 || response_seq == 0 || expected_seq == response_seq
+}
 
 /// Rust worker count for the `JtLedgerData`-equivalent queue. This does not
 /// limit the number of tracked acquisitions.
@@ -84,10 +88,11 @@ pub struct InboundLedgers {
     tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
     full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
     fetch_pack: Arc<FetchPackCache>,
-    shared_stored: Arc<KeyCache<Uint256>>,
     overlay_rt: Arc<RwLock<Option<Arc<AppOverlayRuntime>>>>,
     completed_ledgers_tx: Sender<Arc<Ledger>>,
     stopping: AtomicBool,
+    need_network_ledger: Arc<AtomicBool>,
+    pending_acquires: Arc<Mutex<HashSet<Uint256>>>,
 }
 
 impl InboundLedgers {
@@ -96,8 +101,8 @@ impl InboundLedgers {
         tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
         full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
         fetch_pack: Arc<FetchPackCache>,
-        shared_stored: Arc<KeyCache<Uint256>>,
         completed_ledgers_tx: Sender<Arc<Ledger>>,
+        need_network_ledger: Arc<AtomicBool>,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
@@ -109,10 +114,11 @@ impl InboundLedgers {
             tree_cache,
             full_below,
             fetch_pack,
-            shared_stored,
             overlay_rt: Arc::new(RwLock::new(None)),
             completed_ledgers_tx,
             stopping: AtomicBool::new(false),
+            need_network_ledger,
+            pending_acquires: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -151,6 +157,13 @@ impl InboundLedgers {
             tracing::warn!(target: "inbound_ledger", %hash, "acquire: REJECTED stopping");
             return None;
         }
+        if self.need_network_ledger.load(Ordering::Acquire)
+            && reason != AcquireReason::Generic
+            && reason != AcquireReason::Consensus
+        {
+            tracing::info!(target: "inbound_ledger", %hash, seq, "acquire: REJECTED need_network_ledger");
+            return None;
+        }
 
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
 
@@ -184,30 +197,6 @@ impl InboundLedgers {
             return entry.completed_ledger.clone();
         }
 
-        // Cold bootstrap must complete one account-state acquisition before
-        // following later validation tips. Without this admission guard, every
-        // newly validated hash starts another full-state download while the
-        // node has no completed ledger, splitting the same peers and store
-        // across moving targets indefinitely. Once any ledger is complete,
-        // normal hash-deduplicated consensus acquisition resumes.
-        let has_completed_ledger = inner
-            .entries
-            .values()
-            .any(|entry| entry.state.completed.load(Ordering::Acquire));
-        let has_active_acquisition = inner.entries.values().any(|entry| {
-            !entry.failed
-                && !entry.state.failed.load(Ordering::Acquire)
-                && !entry.state.completed.load(Ordering::Acquire)
-        });
-        if reason == AcquireReason::Consensus && !has_completed_ledger && has_active_acquisition {
-            tracing::debug!(
-                target: "inbound_ledger",
-                %hash,
-                "acquire: deferred moving consensus target during cold bootstrap"
-            );
-            return None;
-        }
-
         // Validate required resources
         let ns = {
             let guard = self.node_store.read().expect("node_store read");
@@ -239,7 +228,6 @@ impl InboundLedgers {
             node_store: ns,
             tree_cache: Arc::clone(&self.tree_cache),
             fetch_pack: Arc::clone(&self.fetch_pack),
-            shared_stored: Arc::clone(&self.shared_stored),
             store_tx: self.completed_ledgers_tx.clone(),
             full_below_generation: full_below_gen,
             worker_pool: Arc::clone(&self.worker_pool),
@@ -268,8 +256,29 @@ impl InboundLedgers {
     }
 
     /// Fire-and-forget acquire (for consensus/validation callers).
+    /// Checks a pending set to avoid duplicate acquisitions.
     pub fn acquire_async(&self, hash: Uint256, seq: u32, reason: AcquireReason) {
+        {
+            let mut pending = self.pending_acquires.lock().expect("pending_acquires lock");
+            if !pending.insert(hash) {
+                return;
+            }
+        }
         let _ = self.acquire(hash, seq, reason);
+        self.pending_acquires
+            .lock()
+            .expect("pending_acquires lock")
+            .remove(&hash);
+    }
+
+    /// Start a closed-ledger acquisition when only its hash is known.
+    ///
+    /// A peer's advertised history range is not a reliable sequence binding
+    /// for its current closed-ledger hash. Keep the sequence unknown until the
+    /// response header establishes it, while retaining the hash as the primary
+    /// acquisition key.
+    pub fn acquire_closed_ledger_async(&self, hash: Uint256, reason: AcquireReason) {
+        self.acquire_async(hash, 0, reason);
     }
 
     /// Route a TMLedgerData response to the correct acquisition.
@@ -297,9 +306,7 @@ impl InboundLedgers {
                 return false;
             };
             if let Some(response_seq) = response_seq
-                && entry.seq != 0
-                && response_seq != 0
-                && entry.seq != response_seq
+                && !response_sequence_matches_request(entry.seq, response_seq)
             {
                 tracing::warn!(
                     target: "inbound_ledger",
@@ -327,8 +334,8 @@ impl InboundLedgers {
         true
     }
 
-    /// Remove entries idle for more than one minute, matching
-    /// `InboundLedgersImp::sweep`.
+    /// Remove entries idle for more than 5 minutes, matching
+    /// `InboundLedgersImp::sweep` (5-minute idle timeout).
     pub fn sweep(&self) {
         let now = Instant::now();
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
@@ -345,7 +352,7 @@ impl InboundLedgers {
             if let Some(entry) = inner.entries.remove(&hash) {
                 entry.state.stopped.store(true, Ordering::Release);
             }
-            if failed {
+            if failed && !inner.recent_failures.contains_key(&hash) {
                 inner.recent_failures.insert(hash, now);
             }
         }
@@ -387,6 +394,32 @@ impl InboundLedgers {
             entry.failed = true;
             entry.state.stopped.store(true, Ordering::Release);
         }
+    }
+
+    /// Log a failure for the given hash/seq (matches rippled's `logFailure`).
+    pub fn log_failure(&self, hash: Uint256, _seq: u32) {
+        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+        inner.recent_failures.insert(hash, Instant::now());
+    }
+
+    /// Check whether a hash is recorded as a recent failure (matches rippled's
+    /// `isFailure`). Expires entries older than `FAILURE_COOLDOWN` (5 minutes).
+    pub fn is_failure(&self, hash: &Uint256) -> bool {
+        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+        inner
+            .recent_failures
+            .retain(|_, t| t.elapsed() < FAILURE_COOLDOWN);
+        inner
+            .recent_failures
+            .get(hash)
+            .is_some_and(|t| t.elapsed() < FAILURE_COOLDOWN)
+    }
+
+    /// Clear both `recent_failures` and `ledgers_` (matches rippled's
+    /// `clearFailures`).
+    pub fn clear_failures(&self) {
+        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+        inner.recent_failures.clear();
     }
 
     /// Send current peers to all active acquisition workers.
@@ -761,5 +794,18 @@ impl InboundLedgers {
 impl std::fmt::Debug for InboundLedgers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InboundLedgers").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::response_sequence_matches_request;
+
+    #[test]
+    fn unknown_closed_ledger_sequence_accepts_authoritative_response_sequence() {
+        assert!(response_sequence_matches_request(0, 105_847_104));
+        assert!(response_sequence_matches_request(105_847_104, 0));
+        assert!(response_sequence_matches_request(105_847_104, 105_847_104));
+        assert!(!response_sequence_matches_request(105_847_103, 105_847_104));
     }
 }

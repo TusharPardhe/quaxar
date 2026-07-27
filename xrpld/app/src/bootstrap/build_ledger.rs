@@ -644,7 +644,7 @@ pub fn build_ledger_from_acquired_tx(
         }));
 
         match apply_result {
-            Ok(ter) => {
+            Ok(ter) if protocol::is_tes_success(ter) || protocol::is_tec_claim(ter) => {
                 // === DEBUG: Log sandbox modifications before apply ===
                 let mods = view.modification_summary();
                 tracing::debug!(target: "ledger",
@@ -715,6 +715,12 @@ pub fn build_ledger_from_acquired_tx(
                         hash_probe.header().drops
                     );
                 }
+            }
+            Ok(ter) => {
+                tracing::debug!(target: "ledger",
+                    "[build] SKIP unapplied tx_index={}/{} type={} ter={:?}",
+                    tx_index, tx_count, tx_type_name, ter
+                );
             }
             Err(panic_info) => {
                 let panic_msg = if let Some(s) = panic_info.downcast_ref::<String>() {
@@ -1000,11 +1006,14 @@ pub fn build_ledger_from_consensus(
         }));
 
         match apply_result {
-            Ok(_ter) => {
+            Ok(ter) if protocol::is_tes_success(ter) || protocol::is_tec_claim(ter) => {
                 let rules = built.rules().clone();
                 if let Err(e) = view.apply_with_tx_thread(&mut accum, tx_id, header.seq, &rules) {
                     tracing::info!(target: "consensus", "APPLY ERROR tx={} error={:?}", tx_id, e);
                 }
+            }
+            Ok(ter) => {
+                tracing::debug!(target: "consensus", "SKIP unapplied replay tx={} ter={:?}", tx_id, ter);
             }
             Err(_) => {
                 // Skip panicking transactions (reference catches exceptions)

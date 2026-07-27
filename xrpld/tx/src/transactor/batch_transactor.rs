@@ -67,7 +67,7 @@ where
 impl<InnerTx, Signer> BatchSigValidatedCarrier<InnerTx, Signer>
 where
     InnerTx: BatchInnerTransaction,
-    InnerTx::Account: Clone + Eq + Hash,
+    InnerTx::Account: Clone + Eq + Hash + Ord,
     Signer: BatchSignerEntry<Account = InnerTx::Account>,
 {
     pub fn new(

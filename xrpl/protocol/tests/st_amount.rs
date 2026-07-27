@@ -468,7 +468,7 @@ fn acct_same() {
 // ─── Issue: Construction ────────────────────────────────────────────────────
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2C-P1: Direct ports from C++ STAmount_test.cpp
+// Direct ports from C++ STAmount_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // --- testcase("native currency") — comparison operators ---
@@ -879,7 +879,7 @@ fn cpp_stamount_iou_amount_conversion() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Phase 2C-P2: Direct ports from C++ STInteger_test.cpp + Seed_test.cpp
+// Direct ports from C++ STInteger_test.cpp + Seed_test.cpp
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // --- From STInteger_test.cpp ---

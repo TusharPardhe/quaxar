@@ -125,6 +125,7 @@ fn protocol_stobject_inner_object_templates_follow_current_rule_gates() {
 
     let amm_only = CurrentTransactionRulesGuard::new(Rules::new([feature_amm()]));
     assert_eq!(STObject::make_inner_object(signer_entry).get_count(), 0);
+    assert_eq!(STObject::make_inner_object(vote_entry).get_count(), 3);
     drop(amm_only);
 
     let fixed_signer =

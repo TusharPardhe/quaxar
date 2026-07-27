@@ -473,6 +473,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
                     })),
                     None,
                 ),
+                false,
             );
         } else if message.r#type == 1 {
             // Pong response — compute RTT and update peer latency
@@ -748,17 +749,29 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             public_key,
             &message.signature,
         );
-        self.overlay.inbound_handler.on_propose_ledger(
-            self.peer,
-            QueuedProposal {
-                peer_id: self.peer.id(),
-                suppression,
-                public_key,
-                current_tx_hash,
-                previous_ledger,
-                message: message.clone(),
-            },
-        );
+        // Build the PeerPos so we can verify its signature before accepting.
+        // rippled's PeerImp::checkPropose calls peerPos.checkSign() and drops
+        // the message if it fails (unless the sender is a cluster peer, which
+        // is implicitly trusted within the private cluster network).
+        let peer_pos = QueuedProposal {
+            peer_id: self.peer.id(),
+            suppression,
+            public_key,
+            current_tx_hash,
+            previous_ledger,
+            message: message.clone(),
+        };
+        if !self.peer.cluster() && !peer_pos.check_sign() {
+            tracing::warn!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Proposal fails signature check — dropping",
+            );
+            return crate::router::RouteAction::Continue;
+        }
+        self.overlay
+            .inbound_handler
+            .on_propose_ledger(self.peer, peer_pos);
         crate::router::RouteAction::Continue
     }
 
@@ -841,11 +854,21 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         }))
         .ok()
         .and_then(Result::ok);
-        if parsed.is_none() {
+        let Some(parsed) = parsed else {
             tracing::warn!(target: "overlay", peer_id = %self.peer.id(), len = message.validation.len(), "on_validation: PARSE FAILED — dropping validation");
             return crate::router::RouteAction::Continue;
+        };
+        // Verify the cryptographic signature of the validation before accepting
+        // it, matching rippled's PeerImp::checkValidation which calls
+        // val->isValid() and drops the message if the check fails.
+        if !parsed.is_valid() {
+            tracing::warn!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Validation fails signature check — dropping",
+            );
+            return crate::router::RouteAction::Continue;
         }
-
         self.overlay.inbound_handler.on_validation(
             self.peer,
             QueuedValidation {
@@ -1365,6 +1388,48 @@ impl OverlayImpl {
             Some(request) => request,
             None => return Ok(()),
         };
+
+        // Basic Resource Management (IP Throttling)
+        // Prevent connection floods by limiting active peers from the same IP.
+        let remote_ip = remote_address.ip();
+        let active_count = self
+            .active_peers
+            .read()
+            .expect("active peers rwlock")
+            .values()
+            .filter(|p| p.remote_address().ip() == remote_ip)
+            .count();
+        if active_count >= 5 {
+            tracing::warn!(target: "overlay", ip = %remote_ip, "Resource limit reached: too many active connections from IP");
+            let response = Response::builder()
+                .status(503)
+                .body(())
+                .map_err(|e| OverlayError::InvalidRequest(e.to_string()))?;
+            let response_wire = serialize_response(&response);
+            tls_stream
+                .write_all(&response_wire)
+                .await
+                .map_err(|e| OverlayError::Io(e))?;
+            return Ok(());
+        }
+
+        // HTTP API interception
+        let path = request.uri().path();
+        if path == "/health" || path == "/crawl" || path.starts_with("/vl/") {
+            tracing::info!(target: "overlay", ip = %remote_address, path = %path, "HTTP API request received");
+            let body = format!("{{\"status\": \"ok\", \"path\": \"{}\"}}", path);
+            let response_str = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tls_stream
+                .write_all(response_str.as_bytes())
+                .await
+                .map_err(|e| OverlayError::Io(e))?;
+            return Ok(());
+        }
+
         let handoff = self.handoff.on_handoff(&request, remote_address);
         let mut accepted_peer = None;
         let (response, response_wire) = match handoff {
@@ -1852,7 +1917,7 @@ impl OverlayImpl {
 
         if !self.setup.tx_reduce_relay_enabled || peers.total <= min_relay {
             for peer in peers.peers {
-                let _ = self.send_runtime_message(&peer, message.clone());
+                let _ = self.send_runtime_message(&peer, message.clone(), false);
             }
             self.tx_metrics.add_relay_selection_metrics(
                 peers.total as u32,
@@ -1886,7 +1951,7 @@ impl OverlayImpl {
 
         for peer in peers.peers {
             if !peer.tx_reduce_relay_enabled() || selected_enabled.contains(&peer.id()) {
-                let _ = self.send_runtime_message(&peer, message.clone());
+                let _ = self.send_runtime_message(&peer, message.clone(), false);
             } else {
                 peer.add_tx_queue(hash);
             }
@@ -1899,7 +1964,7 @@ impl OverlayImpl {
                 continue;
             }
             if let Some(message) = peer.build_tx_queue_message() {
-                let _ = self.send_runtime_message(&peer, message);
+                let _ = self.send_runtime_message(&peer, message, false);
             }
         }
     }
@@ -1951,7 +2016,7 @@ impl OverlayImpl {
                 already_seen.insert(peer.id());
                 continue;
             }
-            if self.send_runtime_message(&peer, message.clone()) {
+            if self.send_runtime_message(&peer, message.clone(), false) {
                 relayed.insert(peer.id());
             }
         }
@@ -1988,25 +2053,27 @@ impl OverlayImpl {
         tracing::debug!(target: "overlay", msg_type = ?protocol.message_type, "Broadcasting validator message");
         let message = Message::new(protocol, Some(validator));
         for peer in self.active_peers_snapshot() {
-            let _ = self.send_runtime_message(&peer, message.clone());
+            let _ = self.send_runtime_message(&peer, message.clone(), false);
         }
     }
 
-    fn send_runtime_message(&self, peer: &Arc<PeerImp>, message: Message) -> bool {
-        if let Some(validator) = message.validator_key()
-            && peer.is_squelched(validator)
-        {
-            tracing::trace!(
-                target: "overlay",
-                peer_id = %peer.id(),
-                "Message squelched for peer"
-            );
-            self.traffic.add_count(
-                TrafficCategory::SquelchSuppressed,
-                false,
-                message.get_buffer_size() as u64,
-            );
-            return false;
+    fn send_runtime_message(&self, peer: &Arc<PeerImp>, message: Message, force: bool) -> bool {
+        if !force {
+            if let Some(validator) = message.validator_key()
+                && peer.is_squelched(validator)
+            {
+                tracing::trace!(
+                    target: "overlay",
+                    peer_id = %peer.id(),
+                    "Message squelched for peer"
+                );
+                self.traffic.add_count(
+                    TrafficCategory::SquelchSuppressed,
+                    false,
+                    message.get_buffer_size() as u64,
+                );
+                return false;
+            }
         }
 
         let bytes = message.get_buffer_size() as u64;
@@ -2491,7 +2558,7 @@ impl Overlay for OverlayImpl {
         );
         let message = Message::new(message.clone(), None);
         for peer in peers {
-            let _ = self.send_runtime_message(&peer, message.clone());
+            let _ = self.send_runtime_message(&peer, message.clone(), true);
         }
     }
 
@@ -2509,7 +2576,7 @@ impl Overlay for OverlayImpl {
                 skipped.insert(peer.id());
                 continue;
             }
-            let _ = self.send_runtime_message(&peer, message.clone());
+            let _ = self.send_runtime_message(&peer, message.clone(), false);
         }
         skipped
     }
@@ -2548,6 +2615,45 @@ impl Overlay for OverlayImpl {
 
     fn tx_metrics(&self) -> JsonValue {
         self.tx_metrics.json()
+    }
+
+    fn sweep_relay_history(&self, max_entries: u64) {
+        // Remove entries whose peer IDs are no longer in the active set,
+        // then enforce a hard size cap to prevent unbounded growth.
+        // relay_history entries grow monotonically — each unique relayed message
+        // creates an entry — and without periodic sweep the HashMap grows forever
+        // on long-lived nodes.
+        let active_peer_ids: std::collections::HashSet<PeerId> = self
+            .active_peers_snapshot()
+            .iter()
+            .map(|p| p.id())
+            .collect();
+        let mut history = self.relay_history.lock().expect("relay history lock");
+        let before = history.len();
+        // remove entries for fully-disconnected peers
+        history.retain(|_key, peers| {
+            peers.retain(|id| active_peer_ids.contains(id));
+            !peers.is_empty()
+        });
+        // enforce size cap — if still over limit, drain oldest entries
+        // (HashMap iteration order is non-deterministic, but this prevents OOM)
+        let cap = max_entries as usize;
+        if history.len() > cap {
+            let excess = history.len() - cap;
+            let keys_to_remove: Vec<_> = history.keys().take(excess).cloned().collect();
+            for key in keys_to_remove {
+                history.remove(&key);
+            }
+        }
+        let after = history.len();
+        if before != after {
+            tracing::debug!(
+                target: "overlay",
+                before, after,
+                freed = before.saturating_sub(after),
+                "relay_history sweep (disconnected cleanup + size cap)"
+            );
+        }
     }
 }
 

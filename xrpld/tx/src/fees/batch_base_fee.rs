@@ -13,9 +13,9 @@
 //! - and returning the invalid-fee sentinel when any guarded add
 //!   or multiply overflows.
 
-use protocol::TxType;
+use protocol::{MAX_MULTI_SIGNERS, TxType};
 
-use crate::MAX_BATCH_TX_COUNT;
+use crate::{MAX_BATCH_SIGNER_COUNT, MAX_BATCH_TX_COUNT};
 
 pub trait BatchBaseFeeInnerTransaction {
     fn txn_type(&self) -> TxType;
@@ -77,17 +77,26 @@ where
         .into_iter()
         .flatten()
         .collect();
-    if batch_signers.len() > MAX_BATCH_TX_COUNT {
+    if batch_signers.len() > MAX_BATCH_SIGNER_COUNT {
         return invalid_fee;
     }
 
-    let signer_count = batch_signers.into_iter().fold(0usize, |count, signer| {
-        if signer.has_txn_signature() {
-            count.saturating_add(1)
+    let mut signer_count = 0usize;
+    for signer in batch_signers {
+        let count = if signer.has_txn_signature() {
+            1
         } else {
-            count.saturating_add(signer.multisigner_count())
-        }
-    });
+            let multisigner_count = signer.multisigner_count();
+            if multisigner_count > MAX_MULTI_SIGNERS {
+                return invalid_fee;
+            }
+            multisigner_count
+        };
+        let Some(next_count) = signer_count.checked_add(count) else {
+            return invalid_fee;
+        };
+        signer_count = next_count;
+    }
 
     let Some(signer_fees) = checked_mul_fee_by_usize(ledger_base_fee, signer_count) else {
         return invalid_fee;
@@ -107,8 +116,8 @@ mod tests {
     use super::{
         BatchBaseFeeInnerTransaction, BatchBaseFeeSignerEntry, run_batch_calculate_base_fee,
     };
-    use crate::MAX_BATCH_TX_COUNT;
-    use protocol::TxType;
+    use crate::{MAX_BATCH_SIGNER_COUNT, MAX_BATCH_TX_COUNT};
+    use protocol::{MAX_MULTI_SIGNERS, TxType};
 
     #[derive(Clone, Copy)]
     struct TestInnerTx {
@@ -206,10 +215,29 @@ mod tests {
                     fee: 10,
                 },
             ]),
-            Some((0..=MAX_BATCH_TX_COUNT).map(|_| TestSigner {
+            Some((0..=MAX_BATCH_SIGNER_COUNT).map(|_| TestSigner {
                 has_txn_signature: true,
                 multisigner_count: 0,
             })),
+            |inner| inner.fee,
+            checked_add,
+            checked_mul_fee_by_usize,
+        );
+
+        assert_eq!(fee, 100_000_000_000);
+    }
+
+    #[test]
+    fn batch_calculate_base_fee_rejects_too_many_nested_multisigners() {
+        let fee = run_batch_calculate_base_fee(
+            100_000_000_000_u64,
+            10,
+            10,
+            None::<[TestInnerTx; 0]>,
+            Some([TestSigner {
+                has_txn_signature: false,
+                multisigner_count: MAX_MULTI_SIGNERS + 1,
+            }]),
             |inner| inner.fee,
             checked_add,
             checked_mul_fee_by_usize,

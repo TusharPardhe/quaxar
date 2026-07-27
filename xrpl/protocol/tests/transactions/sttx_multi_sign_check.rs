@@ -89,7 +89,7 @@ fn protocol_sttx_check_multi_sign_skips_self_multisigning_rejection_for_non_prim
 }
 
 #[test]
-fn protocol_sttx_check_batch_multi_sign_passes_built_messages() {
+fn protocol_sttx_check_batch_multi_sign_passes_built_messages_for_distinct_signer() {
     let mut seen = Vec::new();
 
     let result = run_sttx_check_batch_multi_sign(
@@ -100,6 +100,7 @@ fn protocol_sttx_check_batch_multi_sign_passes_built_messages() {
                 account_id: "alice",
             }],
         },
+        &"batch",
         &"batch",
         |seed, account_id| format!("{seed}-{account_id}"),
         |_, message| {

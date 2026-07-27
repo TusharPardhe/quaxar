@@ -1,3 +1,4 @@
+use crate::database_runtime::node_object_cache::NodeObjectCache;
 use crate::{
     Backend, FetchReport, FetchType, JournalLevel, NodeObject, NodeObjectType, NodeStoreJournal,
     Scheduler, batch_write_preallocation_size,
@@ -78,6 +79,10 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
 
 /// reference-style rotating owner extension.
 pub trait DatabaseRotating: Database {
+    /// Enable archive-read copy-forward for the complete rotation exposure
+    /// window, from cache freshening until `rotate` returns.
+    fn set_rotation_in_flight(&self, in_flight: bool);
+
     fn rotate(&self, new_backend: Box<dyn Backend>, callback: &mut dyn FnMut(&str, &str));
 }
 
@@ -89,6 +94,13 @@ impl<T> DatabaseSurface for T where T: Database + ?Sized {}
 
 pub trait DatabaseDelegate: Send + Sync + 'static {
     fn is_same_db(&self, first: u32, second: u32) -> bool;
+
+    /// Whether this request may be satisfied by the encoded-object cache.
+    /// Copy-on-read (`duplicate`) requests are durable side-effect operations,
+    /// so they always bypass the cache by default.
+    fn cache_read_allowed(&self, duplicate: bool) -> bool {
+        !duplicate
+    }
 
     fn fetch_node_object(
         &self,
@@ -116,6 +128,7 @@ struct DatabaseInner {
     journal: Arc<dyn NodeStoreJournal>,
     earliest_ledger_seq: u32,
     request_bundle: usize,
+    node_object_cache: NodeObjectCache,
     read_state: Mutex<ReadState>,
     read_condvar: Condvar,
     read_stopping: AtomicBool,
@@ -162,11 +175,20 @@ impl DatabaseInner {
         self.store_size.fetch_add(size, Ordering::Relaxed);
     }
 
-    fn update_fetch_metrics(&self, fetches: u64, hits: u64, duration_us: u64) {
-        self.fetch_total_count.fetch_add(fetches, Ordering::Relaxed);
-        self.fetch_hit_count.fetch_add(hits, Ordering::Relaxed);
-        self.fetch_duration_us
-            .fetch_add(duration_us, Ordering::Relaxed);
+    fn fetch_node_object_from_delegate(
+        &self,
+        hash: &Uint256,
+        ledger_seq: u32,
+        fetch_report: &mut FetchReport,
+        duplicate: bool,
+    ) -> Option<Arc<NodeObject>> {
+        self.delegate.fetch_node_object(
+            hash,
+            ledger_seq,
+            fetch_report,
+            duplicate,
+            self.journal.as_ref(),
+        )
     }
 
     fn fetch_node_object(
@@ -178,13 +200,45 @@ impl DatabaseInner {
     ) -> Option<Arc<NodeObject>> {
         let mut fetch_report = FetchReport::new(fetch_type);
         let begin = Instant::now();
-        let node_object = self.delegate.fetch_node_object(
-            hash,
-            ledger_seq,
-            &mut fetch_report,
-            duplicate,
-            self.journal.as_ref(),
-        );
+        let node_object = if self.delegate.cache_read_allowed(duplicate) {
+            let cache_generation = self.node_object_cache.generation();
+            let cached = self.node_object_cache.get_or_load(*hash, || {
+                self.fetch_node_object_from_delegate(hash, ledger_seq, &mut fetch_report, duplicate)
+            });
+
+            // A rotation can start after this request accepted a cacheable
+            // read. Do not return an archive-sourced hit across that fence:
+            // retry through the delegate so its copy-forward path runs.
+            if self.node_object_cache.generation() == cache_generation
+                && self.delegate.cache_read_allowed(duplicate)
+            {
+                cached
+            } else {
+                let node_object = self.fetch_node_object_from_delegate(
+                    hash,
+                    ledger_seq,
+                    &mut fetch_report,
+                    duplicate,
+                );
+                if let Some(object) = &node_object {
+                    self.node_object_cache
+                        .promote_for_hash(hash, Arc::clone(object));
+                }
+                node_object
+            }
+        } else {
+            let node_object = self.fetch_node_object_from_delegate(
+                hash,
+                ledger_seq,
+                &mut fetch_report,
+                duplicate,
+            );
+            if let Some(object) = &node_object {
+                self.node_object_cache
+                    .promote_for_hash(hash, Arc::clone(object));
+            }
+            node_object
+        };
         let elapsed = begin.elapsed();
         let elapsed_us = elapsed.as_micros() as u64;
 
@@ -232,12 +286,15 @@ impl DatabaseRuntime {
             return Err("Invalid rq_bundle".to_owned());
         }
 
+        let node_object_cache = NodeObjectCache::from_config(config)?;
+
         let inner = Arc::new(DatabaseInner {
             delegate,
             scheduler,
             journal,
             earliest_ledger_seq,
             request_bundle: request_bundle as usize,
+            node_object_cache,
             read_state: Mutex::new(ReadState::default()),
             read_condvar: Condvar::new(),
             read_stopping: AtomicBool::new(false),
@@ -320,6 +377,11 @@ impl DatabaseRuntime {
                         .map(|node_object| node_object.data().len() as u64)
                         .sum();
                     self.inner.store_stats(batch.len() as u64, size);
+                    for node_object in batch.iter() {
+                        self.inner
+                            .node_object_cache
+                            .promote(Arc::clone(node_object));
+                    }
                     self.inner
                         .store_duration_us
                         .fetch_add(begin.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -484,6 +546,7 @@ impl DatabaseRuntime {
                     .to_string(),
             ),
         );
+        self.inner.node_object_cache.add_counts_json(obj);
     }
 
     pub fn get_counts_json(&self) -> JsonValue {
@@ -496,8 +559,12 @@ impl DatabaseRuntime {
         self.inner.store_stats(count, size);
     }
 
-    pub(crate) fn update_fetch_metrics(&self, fetches: u64, hits: u64, duration_us: u64) {
-        self.inner.update_fetch_metrics(fetches, hits, duration_us);
+    pub(crate) fn promote_node_object(&self, object: Arc<NodeObject>) {
+        self.inner.node_object_cache.promote(object);
+    }
+
+    pub(crate) fn invalidate_node_object_cache(&self) {
+        self.inner.node_object_cache.invalidate_all();
     }
 
     pub fn journal(&self) -> Arc<dyn NodeStoreJournal> {
@@ -620,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn get_counts_json_matches_current_cpp_field_set_and_types() {
+    fn get_counts_json_includes_node_object_cache_metrics() {
         let hash = Uint256::from_array([0xA5; 32]);
         let object = Arc::new(NodeObject::new(NodeObjectType::Ledger, vec![1, 2, 3], hash));
         let delegate = Arc::new(TestDelegate {
@@ -644,6 +711,15 @@ mod tests {
         assert_eq!(
             keys,
             vec![
+                "node_object_cache_capacity_bytes",
+                "node_object_cache_durable_loads",
+                "node_object_cache_entries",
+                "node_object_cache_hits",
+                "node_object_cache_invalidations",
+                "node_object_cache_misses",
+                "node_object_cache_oversized",
+                "node_object_cache_promotions",
+                "node_object_cache_rejected",
                 "node_read_bytes",
                 "node_reads_duration_us",
                 "node_reads_hit",
@@ -693,6 +769,208 @@ mod tests {
             counts.get("node_reads_duration_us"),
             Some(JsonValue::String(value)) if value.parse::<u64>().is_ok()
         ));
+
+        database.stop();
+    }
+
+    struct CountingDelegate {
+        object: Option<Arc<NodeObject>>,
+        calls: std::sync::atomic::AtomicUsize,
+        delay: std::time::Duration,
+    }
+
+    impl DatabaseDelegate for CountingDelegate {
+        fn is_same_db(&self, _first: u32, _second: u32) -> bool {
+            true
+        }
+
+        fn fetch_node_object(
+            &self,
+            _hash: &Uint256,
+            _ledger_seq: u32,
+            _fetch_report: &mut FetchReport,
+            _duplicate: bool,
+            _journal: &dyn NodeStoreJournal,
+        ) -> Option<Arc<NodeObject>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !self.delay.is_zero() {
+                std::thread::sleep(self.delay);
+            }
+            self.object.clone()
+        }
+    }
+
+    #[test]
+    fn node_object_cache_serves_repeated_reads_without_a_second_delegate_fetch() {
+        let hash = Uint256::from_array([0xC1; 32]);
+        let delegate = Arc::new(CountingDelegate {
+            object: Some(Arc::new(NodeObject::new(
+                NodeObjectType::AccountNode,
+                vec![1, 2, 3],
+                hash,
+            ))),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            delay: std::time::Duration::ZERO,
+        });
+        let database = DatabaseRuntime::new(
+            Arc::clone(&delegate) as Arc<dyn DatabaseDelegate>,
+            Arc::new(DummyScheduler),
+            1,
+            &Section::new("node_db"),
+            Arc::new(NullJournal),
+        )
+        .expect("database");
+
+        assert!(
+            database
+                .fetch_node_object(&hash, 1, FetchType::Synchronous, false)
+                .is_some()
+        );
+        assert!(
+            database
+                .fetch_node_object(&hash, 1, FetchType::Synchronous, false)
+                .is_some()
+        );
+        assert_eq!(delegate.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        database.stop();
+    }
+
+    #[test]
+    fn node_object_cache_coalesces_concurrent_same_hash_misses() {
+        let hash = Uint256::from_array([0xC2; 32]);
+        let delegate = Arc::new(CountingDelegate {
+            object: Some(Arc::new(NodeObject::new(
+                NodeObjectType::AccountNode,
+                vec![4, 5, 6],
+                hash,
+            ))),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            delay: std::time::Duration::from_millis(25),
+        });
+        let database = Arc::new(
+            DatabaseRuntime::new(
+                Arc::clone(&delegate) as Arc<dyn DatabaseDelegate>,
+                Arc::new(DummyScheduler),
+                1,
+                &Section::new("node_db"),
+                Arc::new(NullJournal),
+            )
+            .expect("database"),
+        );
+        let start = Arc::new(std::sync::Barrier::new(9));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let database = Arc::clone(&database);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                assert!(
+                    database
+                        .fetch_node_object(&hash, 1, FetchType::Synchronous, false)
+                        .is_some()
+                );
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            worker.join().expect("cache worker must not panic");
+        }
+        assert_eq!(delegate.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        database.stop();
+    }
+
+    #[test]
+    fn node_object_cache_does_not_negative_cache_misses() {
+        let hash = Uint256::from_array([0xC3; 32]);
+        let delegate = Arc::new(CountingDelegate {
+            object: None,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            delay: std::time::Duration::ZERO,
+        });
+        let database = DatabaseRuntime::new(
+            Arc::clone(&delegate) as Arc<dyn DatabaseDelegate>,
+            Arc::new(DummyScheduler),
+            1,
+            &Section::new("node_db"),
+            Arc::new(NullJournal),
+        )
+        .expect("database");
+
+        assert!(
+            database
+                .fetch_node_object(&hash, 1, FetchType::Synchronous, false)
+                .is_none()
+        );
+        assert!(
+            database
+                .fetch_node_object(&hash, 1, FetchType::Synchronous, false)
+                .is_none()
+        );
+        assert_eq!(delegate.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        database.stop();
+    }
+
+    struct PanicOnceDelegate {
+        object: Arc<NodeObject>,
+        panics: std::sync::atomic::AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DatabaseDelegate for PanicOnceDelegate {
+        fn is_same_db(&self, _first: u32, _second: u32) -> bool {
+            true
+        }
+
+        fn fetch_node_object(
+            &self,
+            _hash: &Uint256,
+            _ledger_seq: u32,
+            _fetch_report: &mut FetchReport,
+            _duplicate: bool,
+            _journal: &dyn NodeStoreJournal,
+        ) -> Option<Arc<NodeObject>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.panics.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                panic!("test durable fetch panic");
+            }
+            Some(Arc::clone(&self.object))
+        }
+    }
+
+    #[test]
+    fn node_object_cache_releases_single_flight_after_loader_panic() {
+        let hash = Uint256::from_array([0xC4; 32]);
+        let delegate = Arc::new(PanicOnceDelegate {
+            object: Arc::new(NodeObject::new(NodeObjectType::AccountNode, vec![7], hash)),
+            panics: std::sync::atomic::AtomicBool::new(true),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let database = DatabaseRuntime::new(
+            Arc::clone(&delegate) as Arc<dyn DatabaseDelegate>,
+            Arc::new(DummyScheduler),
+            1,
+            &Section::new("node_db"),
+            Arc::new(NullJournal),
+        )
+        .expect("database");
+
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                database.fetch_node_object(&hash, 1, FetchType::Synchronous, false)
+            }))
+            .is_err()
+        );
+        assert!(
+            database
+                .fetch_node_object(&hash, 1, FetchType::Synchronous, false)
+                .is_some()
+        );
+        assert_eq!(delegate.calls.load(std::sync::atomic::Ordering::Relaxed), 2);
 
         database.stop();
     }

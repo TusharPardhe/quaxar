@@ -2,17 +2,27 @@ use basics::base_uint::Uint256;
 use basics::intrusive_pointer::make_shared_intrusive;
 use basics::sha_map_hash::SHAMapHash;
 use ledger::{
-    ApplyView, Fees, Ledger, LedgerHeader, SLCF_NO_CONSENSUS_TIME, Sandbox, amendments_key,
-    calculate_ledger_hash, encode_amendments_entry, encode_fee_settings_entry, fees_key,
+    ApplyView, Fees, FlowSandbox, Ledger, LedgerHeader, SLCF_NO_CONSENSUS_TIME, Sandbox,
+    amendments_key, calculate_ledger_hash, encode_amendments_entry, encode_fee_settings_entry,
+    fees_key,
 };
 use protocol::{
-    AccountID, STAmount, STLedgerEntry, XRPAmount, account_keylet, feature_xrp_fees,
+    AccountID, ApplyFlags, STAmount, STLedgerEntry, XRPAmount, account_keylet, feature_xrp_fees,
     get_field_by_symbol,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
 use shamap::sync::{SHAMapType, SyncState, SyncTree};
 use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
+
+#[test]
+fn flow_sandbox_explicit_flags_override_parent_flags() {
+    let base = std::sync::Arc::new(Ledger::new(LedgerHeader::default(), false));
+    let mut parent = Sandbox::new(base, ApplyFlags::NONE);
+    let retry_attempt = FlowSandbox::new_with_flags(&mut parent, ApplyFlags::RETRY);
+
+    assert_eq!(retry_attempt.flags(), ApplyFlags::RETRY);
+}
 
 fn sample_hash(fill: u8) -> SHAMapHash {
     SHAMapHash::new(Uint256::from_array([fill; 32]))
