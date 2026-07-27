@@ -2544,15 +2544,29 @@ fn load_complete_ledger_from_storage(
         return Ok(None);
     };
 
-    if !loaded.walk_ledger_with_family(&journal, false, &family) {
-        return Err(format!(
-            "Startup ledger {} is incomplete in local NodeStore",
-            loaded.header().seq
-        ));
+    // Match rippled's `getLastFullLedger` (Application.cpp:1694-1735): do NOT
+    // walk the full state tree on normal startup. rippled only verifies the
+    // header hash matches and that FeeSettings is readable (via the normal
+    // `ledger->read(keylet::feeSettings())` path). The expensive walkLedger
+    // call in rippled's `loadOldLedger` is guarded by UNREACHABLE — it's an
+    // assertion, not a graceful recovery path.
+    //
+    // If `finish_load_by_index_or_hash` fails (which reads FeeSettings via
+    // the family-backed state map), the ledger's critical path nodes are
+    // genuinely missing, and we return None so the caller falls back to
+    // network acquisition — matching rippled's SHAMapMissingNode catch that
+    // returns empty and triggers setNeedNetworkLedger.
+    match loaded.finish_load_by_index_or_hash(&journal) {
+        Ok(()) => {}
+        Err(error) => {
+            tracing::warn!(target: "bootstrap",
+                seq = loaded.header().seq,
+                error = ?error,
+                "Startup ledger FeeSettings/setup not resolvable from local NodeStore; falling back to network"
+            );
+            return Ok(None);
+        }
     }
-    loaded
-        .finish_load_by_index_or_hash(&journal)
-        .map_err(|error| format!("startup ledger setup failed: {error:?}"))?;
     loaded.assert_sensible();
     Ok(Some(loaded))
 }
