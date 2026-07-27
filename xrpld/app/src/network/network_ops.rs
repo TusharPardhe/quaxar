@@ -1345,6 +1345,17 @@ pub fn run_networkops_begin_apply_batch<T>(
 
     let mut transactions = Vec::new();
     std::mem::swap(&mut transactions, pending_transactions);
+    // Cap the batch to prevent the consensus strand from blocking indefinitely
+    // when peers flood transactions faster than they can be processed. Excess
+    // transactions remain in pending_transactions for the next batch cycle.
+    // This ensures the consensus timer tick fires within a bounded interval,
+    // which is critical for switchLastClosedLedger recovery after a chain fork
+    // or when transactions consistently fail (e.g., amount overflow panics).
+    const MAX_BATCH_SIZE: usize = 256;
+    if transactions.len() > MAX_BATCH_SIZE {
+        let excess = transactions.split_off(MAX_BATCH_SIZE);
+        *pending_transactions = excess;
+    }
     let taken_transactions = transactions.len();
     unlock();
 
