@@ -382,9 +382,30 @@ impl SyncTree {
         self.arena = Some(arena);
     }
 
+    /// Maximum arena size before rotation (256 MB). When exceeded, a fresh
+    /// arena is created. The old one stays alive (via Arc) until the
+    /// TreeNodeCache sweep releases all parent nodes pointing into it.
+    const ARENA_ROTATION_BYTES: u64 = 256 * 1024 * 1024;
+
+    /// Rotate the arena if it exceeds the size cap. Returns the active arena.
+    fn ensure_arena_capacity(&mut self) {
+        if let Some(ref arena) = self.arena {
+            if arena.allocated_count() > 0
+                && (arena.allocated_count() as u64 * 400) > Self::ARENA_ROTATION_BYTES
+            {
+                // Old arena stays alive via Arc held by NodeRef::Arena pointers
+                // in parent nodes. It will be freed when sweep evicts those parents.
+                let new_gen = arena.generation() + 1;
+                self.arena = Some(Arc::new(crate::arena::TreeNodeArena::new(new_gen)));
+            }
+        }
+    }
+
     /// Allocate a node from this tree's arena when configured. Without an
     /// arena, this returns the traditional intrusive shared owner.
-    pub fn alloc_node(&self, node: SHAMapTreeNode) -> NodeRef {
+    /// Automatically rotates the arena if it exceeds the size cap.
+    pub fn alloc_node(&mut self, node: SHAMapTreeNode) -> NodeRef {
+        self.ensure_arena_capacity();
         match &self.arena {
             Some(arena) => NodeRef::Arena(arena.alloc(node)),
             None => NodeRef::Shared(make_shared_intrusive(node)),
@@ -3766,7 +3787,7 @@ mod tests {
     #[test]
     fn sync_tree_retains_arena_across_snapshots_and_allocates_arena_nodes() {
         let arena = Arc::new(TreeNodeArena::new(31));
-        let tree = SyncTree::new(false, 77).with_tree_node_arena(arena.clone());
+        let mut tree = SyncTree::new(false, 77).with_tree_node_arena(arena.clone());
 
         assert!(matches!(
             tree.alloc_node(SHAMapTreeNode::new_inner(1)),
