@@ -702,26 +702,10 @@ impl<A: ValidationsAdaptor> Validations<A> {
             return Some((curr.seq(), curr.id()));
         }
 
-        // A ledger ahead of us is preferred regardless of chain, but cap the
-        // distance to prevent runaway restart loops: if the preferred ledger
-        // is more than 256 sequences ahead of our current ledger, we stay
-        // put.  This bounds the damage from a stale `valid_ledger_seq`
-        // (which feeds `min_valid_seq` via `get_preferred_min_seq`), because
-        // without this guard `check_ledger` would see a `net_lgr` far ahead
-        // of `prev_ledger_id`, call `handle_wrong_ledger`, and restart the
-        // round -- which immediately gets killed again on the next tick,
-        // creating an infinite deadlock.
-        const MAX_PREFERRED_DISTANCE: u32 = 256;
-        if preferred.seq > curr.seq() && preferred.seq <= curr.seq() + MAX_PREFERRED_DISTANCE {
-            return Some((preferred.seq, preferred.id));
-        }
-
+        // A ledger ahead of us is preferred regardless of chain.
+        // Matches rippled: `if (preferred->seq > curr.seq()) return {preferred->seq, preferred->id};`
         if preferred.seq > curr.seq() {
-            tracing::info!(
-                target: "consensus",
-                max = MAX_PREFERRED_DISTANCE,
-                "get_preferred: preferred too far ahead, capping to curr"
-            );
+            return Some((preferred.seq, preferred.id));
         }
 
         // Only switch to an earlier/same sequence if it's a different chain.
