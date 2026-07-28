@@ -3093,6 +3093,97 @@ impl ApplicationRoot {
         self.on_closed_ledger(Arc::clone(&ledger));
         self.set_status_rpc_current_ledger_index(Some(next_open_index));
         self.set_status_rpc_queue_report(Some(self.tx_q_rpc_report()));
+
+        // ── rippled parity: LedgerMaster::consensusBuilt ──────────────────
+        // After building a ledger, check if it (or any other ledger with
+        // sufficient validations) can advance the validated ledger. This is
+        // critical for nodes that build a different hash than the network
+        // (e.g., due to empty tx set or different close time when behind):
+        // without this scan, the node never discovers the network's validated
+        // ledger and remains on a permanent fork.
+        //
+        // Matches rippled LedgerMaster.cpp:1090-1185:
+        //   1. checkAccept(built_ledger)
+        //   2. If that didn't advance, scan all current trusted validations
+        //   3. Find the highest-seq ledger hash with quorum validations
+        //   4. checkAccept(maxLedger, maxSeq) to advance to the network's chain
+        self.consensus_built_check_accept(&ledger);
+    }
+
+    /// Matches rippled's `LedgerMaster::consensusBuilt` validation scan.
+    /// After building a local ledger, check whether the network has validated
+    /// a different (or the same) ledger at a higher sequence than our current
+    /// validated ledger, and advance to it.
+    fn consensus_built_check_accept(&self, built_ledger: &Arc<Ledger>) {
+        let Some(lm_rt) = self.ledger_master_runtime() else {
+            return;
+        };
+        let lm = lm_rt.ledger_master();
+        let valid_seq = lm.valid_ledger_seq();
+
+        // If the built ledger is at or below the validated sequence, nothing
+        // to do (we already validated past it).
+        if built_ledger.header().seq <= valid_seq {
+            return;
+        }
+
+        // Step 1: Try to validate our own built ledger directly.
+        let built_hash = *built_ledger.header().hash.as_uint256();
+        self.check_accept_hash_seq(built_hash, built_ledger.header().seq);
+
+        // If that advanced us, we're done.
+        if lm.valid_ledger_seq() >= built_ledger.header().seq {
+            return;
+        }
+
+        // Step 2: Our built ledger didn't match the network. Scan all current
+        // trusted validations to find the highest-sequence ledger with quorum.
+        let quorum = self.validators().quorum();
+        if quorum == 0 {
+            return;
+        }
+
+        let validations_guard = self
+            .validations()
+            .validations()
+            .lock()
+            .expect("validations mutex must not be poisoned");
+        let current_trusted = validations_guard.current_trusted();
+        drop(validations_guard);
+
+        // Count validations by ledger hash, tracking sequence.
+        let mut counts: std::collections::HashMap<Uint256, (usize, u32)> =
+            std::collections::HashMap::new();
+        for val in &current_trusted {
+            let hash = val.get_ledger_hash();
+            let seq = val.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence"));
+            let entry = counts.entry(hash).or_insert((0, seq));
+            entry.0 += 1;
+            if seq != 0 && entry.1 == 0 {
+                entry.1 = seq;
+            }
+        }
+
+        // Find the ledger with the highest sequence that exceeds quorum.
+        let mut max_seq = valid_seq;
+        let mut max_hash = built_hash;
+        for (hash, (count, seq)) in &counts {
+            if *count >= quorum && *seq > max_seq {
+                max_seq = *seq;
+                max_hash = *hash;
+            }
+        }
+
+        if max_seq > valid_seq {
+            tracing::info!(
+                target: "consensus",
+                max_seq,
+                max_hash = %max_hash,
+                built_seq = built_ledger.header().seq,
+                "consensus_built: network validated a different ledger, advancing"
+            );
+            self.check_accept_hash_seq(max_hash, max_seq);
+        }
     }
 
     pub fn perf_log(&self) -> Arc<PerfLogImp> {
