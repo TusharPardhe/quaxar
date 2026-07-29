@@ -5878,7 +5878,7 @@ impl ApplicationRoot {
             preferred_lcl_matches_local_or_parent(local_hash, local_parent_hash, preferred_hash);
 
         if !matches {
-            tracing::info!(
+            tracing::debug!(
                 target: "consensus",
                 %local_hash,
                 %preferred_hash,
