@@ -51,8 +51,20 @@ impl SharedLedgerMasterState {
         }
     }
 
-    pub fn note_closed_ledger(&self, ledger: Arc<Ledger>) {
+    pub(crate) fn note_closed_ledger(&self, ledger: Arc<Ledger>) {
         self.closed_ledger.store(Some(ledger));
+    }
+
+    /// Atomically replace the closed ledger only when `expected` is still the
+    /// exact currently installed ledger. This closes the gap between a
+    /// consensus accept job checking its parent and publishing its child.
+    pub(crate) fn replace_closed_ledger_if_current(
+        &self,
+        expected: &Arc<Ledger>,
+        ledger: Arc<Ledger>,
+    ) -> bool {
+        let previous = self.closed_ledger.compare_and_swap(expected, Some(ledger));
+        matches!(&*previous, Some(current) if Arc::ptr_eq(current, expected))
     }
 
     pub fn note_validated_ledger(&self, ledger: Arc<Ledger>) {
@@ -232,6 +244,25 @@ mod tests {
 
         state.set_published_close_time(520);
         assert_eq!(state.is_caught_up(), LedgerMasterCaughtUp::Yes);
+    }
+
+    #[test]
+    fn consensus_child_cannot_replace_a_newer_closed_ledger() {
+        let state = SharedLedgerMasterState::new(Arc::new(FixedCloseTimeProvider::new(200)));
+        let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(100, 100, false));
+        let authoritative = Arc::new(Ledger::from_ledger_seq_and_close_time(101, 101, false));
+        let stale_child = Arc::new(Ledger::from_ledger_seq_and_close_time(101, 102, false));
+
+        state.note_closed_ledger(Arc::clone(&parent));
+        // This simulates a validation/acquisition update arriving while the
+        // consensus child is being built on `parent`.
+        state.note_closed_ledger(Arc::clone(&authoritative));
+
+        assert!(!state.replace_closed_ledger_if_current(&parent, stale_child));
+        let current = state
+            .closed_ledger()
+            .expect("authoritative LCL remains installed");
+        assert!(Arc::ptr_eq(&current, &authoritative));
     }
 
     #[test]

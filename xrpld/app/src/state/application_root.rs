@@ -256,6 +256,10 @@ pub struct ApplicationRoot {
     /// locks; the Rust runtime uses this narrow gate around the same mutable
     /// open-ledger transition.
     close_gate: Arc<std::sync::Mutex<()>>,
+    /// Serializes each LCL promotion with the complete consensus accept and
+    /// next-round handoff. It is re-entrant because consensus-built checking
+    /// can synchronously promote a preferred LCL on the same strand.
+    lcl_transition_gate: Arc<parking_lot::ReentrantMutex<()>>,
     /// Condvar to wake the consensus strand loop immediately when proposals
     /// arrive from the overlay, removing the 50ms poll latency. Matches
     /// rippled's strand-based immediate dispatch of proposals.
@@ -1210,6 +1214,10 @@ struct StandaloneAcceptedTx {
 
 #[derive(Clone)]
 pub(crate) struct AcceptedLedgerOutcome {
+    /// Exact locally built child that atomically replaced its captured parent.
+    /// Consensus post-accept work must use this snapshot rather than re-read
+    /// the moving global LCL.
+    pub closed: Arc<Ledger>,
     pub next_open_index: u32,
     /// IDs that must be removed from the previous open ledger because they
     /// were already included, were terminal failures, or were duplicates in
@@ -2756,6 +2764,7 @@ impl ApplicationRoot {
             )),
             open_ledger_sandbox: Arc::new(std::sync::Mutex::new(None)),
             close_gate: Arc::new(std::sync::Mutex::new(())),
+            lcl_transition_gate: Arc::new(parking_lot::ReentrantMutex::new(())),
             consensus_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             shared_tree_cache: std::sync::OnceLock::new(),
             shared_full_below_cache: std::sync::OnceLock::new(),
@@ -2798,6 +2807,13 @@ impl ApplicationRoot {
     /// with open-ledger capture — matching rippled's single-strand guarantee.
     pub fn close_gate(&self) -> &std::sync::Mutex<()> {
         &self.close_gate
+    }
+
+    /// Gate all LCL writers and the complete consensus accept handoff. The
+    /// re-entrant mutex permits consensus-built reconciliation to install a
+    /// preferred LCL while the consensus strand owns the outer transition.
+    pub fn lcl_transition_gate(&self) -> &parking_lot::ReentrantMutex<()> {
+        &self.lcl_transition_gate
     }
 
     /// Enqueue an already-authorized `JtBatch` job. Async ingress invokes
@@ -5034,6 +5050,28 @@ impl ApplicationRoot {
     }
 
     pub fn on_closed_ledger(&self, ledger: Arc<Ledger>) {
+        self.on_closed_ledger_inner(ledger, None)
+            .expect("unconditional closed-ledger promotion cannot fail");
+    }
+
+    /// Install a locally built consensus child only if the exact LCL snapshot
+    /// used as its parent is still current. A failed compare means a trusted
+    /// validation or acquired ledger won the race and the child must be
+    /// discarded rather than rolling the LCL back.
+    fn on_closed_ledger_if_current(
+        &self,
+        expected_current: &Arc<Ledger>,
+        ledger: Arc<Ledger>,
+    ) -> Result<(), String> {
+        self.on_closed_ledger_inner(ledger, Some(expected_current))
+    }
+
+    fn on_closed_ledger_inner(
+        &self,
+        ledger: Arc<Ledger>,
+        expected_current: Option<&Arc<Ledger>>,
+    ) -> Result<(), String> {
+        let _lcl_transition_guard = self.lcl_transition_gate.lock();
         // Diagnostic: check incoming tree state before clone
         {
             let mut loaded = 0u32;
@@ -5059,20 +5097,42 @@ impl ApplicationRoot {
         let closed_ledger_changed = self
             .closed_ledger()
             .is_none_or(|previous| previous.header().hash != normalized.header().hash);
-        if closed_ledger_changed {
-            // A Sandbox owns its parent view. Reusing one after a LCL switch
-            // makes submit preclaim read the old state and can turn an account
-            // that is visible through validated RPC into a false terNO_ACCOUNT.
-            // Serialize against direct submit application; consensus on_close
-            // already uses this same gate while it captures its tx set.
+        if let Some(expected_current) = expected_current {
+            // Hold the submit/close gate while atomically installing the new
+            // parent view and clearing state derived from the old one.
             let _close_guard = self
                 .close_gate
                 .lock()
                 .expect("close_gate mutex must not be poisoned");
+            if !self
+                .ledger_master_state
+                .replace_closed_ledger_if_current(expected_current, Arc::clone(&normalized))
+            {
+                return Err(format!(
+                    "stale consensus parent: captured={} current={}",
+                    expected_current.header().hash,
+                    self.closed_ledger()
+                        .map(|current| current.header().hash.to_string())
+                        .unwrap_or_else(|| "none".to_owned())
+                ));
+            }
             self.clear_open_ledger_account_seqs();
+        } else {
+            if closed_ledger_changed {
+                // A Sandbox owns its parent view. Reusing one after a LCL switch
+                // makes submit preclaim read the old state and can turn an account
+                // that is visible through validated RPC into a false terNO_ACCOUNT.
+                // Serialize against direct submit application; consensus on_close
+                // already uses this same gate while it captures its tx set.
+                let _close_guard = self
+                    .close_gate
+                    .lock()
+                    .expect("close_gate mutex must not be poisoned");
+                self.clear_open_ledger_account_seqs();
+            }
+            self.ledger_master_state
+                .note_closed_ledger(Arc::clone(&normalized));
         }
-        self.ledger_master_state
-            .note_closed_ledger(Arc::clone(&normalized));
 
         // Release in-memory tree nodes IMMEDIATELY after promotion.
         // The normalized ledger (clone with fetcher attached) shares the same
@@ -5161,6 +5221,7 @@ impl ApplicationRoot {
         // dispatch state for retry. Now that this closed ledger is visible,
         // schedule existing async work through NetworkOps' guarded transition.
         let _ = self.schedule_network_ops_transaction_batch();
+        Ok(())
     }
 
     pub fn closed_ledger(&self) -> Option<Arc<Ledger>> {
@@ -5888,10 +5949,17 @@ impl ApplicationRoot {
         matches
     }
 
-    /// Promotes `NetworkOpsOperatingMode` past CONNECTED/SYNCING only after
-    /// the local closed ledger has been reconciled with the network-preferred
-    /// LCL. This mirrors the reference `NetworkOPsImp::endConsensus` ordering.
+    /// Promotes `NetworkOpsOperatingMode` only after the exact accepted LCL
+    /// has been published and reconciled with the network-preferred LCL. This
+    /// mirrors rippled's endConsensus ordering and prevents a fresh but
+    /// unvalidated peer-LCL fallback from reporting FULL.
     pub fn promote_operating_mode_after_accepted_ledger(&self, ledger: &Ledger) {
+        let Some(published) = self.published_ledger() else {
+            return;
+        };
+        if published.header().hash != ledger.header().hash {
+            return;
+        }
         if !self.preferred_lcl_allows_mode_promotion(ledger) {
             return;
         }
@@ -6221,10 +6289,75 @@ impl ApplicationRoot {
         close_time: u32,
         close_resolution: u8,
         correct_close_time: bool,
+        base_fee_drops: u64,
+        txns: Vec<Arc<protocol::STTx>>,
+    ) -> Result<AcceptedLedgerOutcome, String> {
+        self.accept_ledger_with_txns_outcome_on_parent(
+            self.closed_ledger().or_else(|| self.validated_ledger()),
+            None,
+            closed_seq,
+            close_time,
+            close_resolution,
+            correct_close_time,
+            base_fee_drops,
+            txns,
+        )
+    }
+
+    /// Builds a consensus result on the exact parent captured by `on_accept`.
+    ///
+    /// The accept job runs asynchronously, so re-reading `closed_ledger` here
+    /// can select a ledger installed by a concurrent validation or LCL switch.
+    /// Rippled builds against the round's `prevLedger`; preserve that parent
+    /// rather than combining an old consensus result with a new chain tip.
+    pub(crate) fn accept_ledger_with_txns_outcome_from_consensus_parent(
+        &self,
+        parent_ledger: Arc<Ledger>,
+        closed_seq: u32,
+        close_time: u32,
+        close_resolution: u8,
+        correct_close_time: bool,
+        base_fee_drops: u64,
+        txns: Vec<Arc<protocol::STTx>>,
+    ) -> Result<AcceptedLedgerOutcome, String> {
+        // Keep all build-time effects (transaction-master state, TxQ, and
+        // delta publication) within the same transition as the conditional
+        // LCL install. An authoritative promotion therefore cannot turn a
+        // discarded child into partially committed local state.
+        let _lcl_transition_guard = self.lcl_transition_gate.lock();
+        let Some(expected_current) = self.closed_ledger() else {
+            return Err("stale consensus parent: no current closed ledger".to_owned());
+        };
+        if expected_current.header().hash != parent_ledger.header().hash {
+            return Err(format!(
+                "stale consensus parent: captured={} current={}",
+                parent_ledger.header().hash,
+                expected_current.header().hash
+            ));
+        }
+        self.accept_ledger_with_txns_outcome_on_parent(
+            Some(parent_ledger),
+            Some(expected_current),
+            closed_seq,
+            close_time,
+            close_resolution,
+            correct_close_time,
+            base_fee_drops,
+            txns,
+        )
+    }
+
+    fn accept_ledger_with_txns_outcome_on_parent(
+        &self,
+        parent_ledger: Option<Arc<Ledger>>,
+        expected_current: Option<Arc<Ledger>>,
+        closed_seq: u32,
+        close_time: u32,
+        close_resolution: u8,
+        correct_close_time: bool,
         _base_fee_drops: u64,
         txns: Vec<Arc<protocol::STTx>>,
     ) -> Result<AcceptedLedgerOutcome, String> {
-        let parent_ledger = self.closed_ledger().or_else(|| self.validated_ledger());
         // Ensure the parent ledger has a node_fetcher attached. The
         // closed_ledger slot may hold a ledger whose fetcher was not set
         // (e.g. when check_accept_ledger promotes an acquired ledger via
@@ -6567,9 +6700,16 @@ impl ApplicationRoot {
         // immediately after construction, where the insert and built-ledger
         // bookkeeping occur atomically with the required checkAccept scan.
 
-        self.on_closed_ledger(Arc::clone(&closed));
-        self.on_published_ledger(Arc::clone(&closed));
-        self.promote_operating_mode_after_accepted_ledger(closed.as_ref());
+        // A locally accepted consensus result is an LCL candidate, not proof
+        // that this exact ledger has network quorum. `check_accept_ledger`
+        // alone publishes/promotes a trusted validated ledger. Publishing or
+        // promoting here allowed a stale local branch to report FULL before
+        // post-accept preferred-LCL reconciliation completed.
+        if let Some(expected_current) = expected_current.as_ref() {
+            self.on_closed_ledger_if_current(expected_current, Arc::clone(&closed))?;
+        } else {
+            self.on_closed_ledger(Arc::clone(&closed));
+        }
 
         // Sweep local_txs: remove transactions that are now in the closed ledger.
         // Without this, rebuild_open_ledger_after_close would re-add them to the
@@ -6593,6 +6733,7 @@ impl ApplicationRoot {
         // can be retained for the next open ledger.
 
         Ok(AcceptedLedgerOutcome {
+            closed,
             next_open_index,
             completed_transaction_ids,
             retry_transactions: pending_txs,

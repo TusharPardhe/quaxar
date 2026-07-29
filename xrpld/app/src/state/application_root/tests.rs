@@ -1907,6 +1907,78 @@ fn consensus_outcome_defers_open_ledger_reset_to_outcome_handoff() {
 }
 
 #[test]
+fn stale_consensus_outcome_does_not_overwrite_a_newer_lcl() {
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let consensus_parent = {
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(10, 1_000, false);
+        ledger.set_accepted(1_000, 30, true);
+        Arc::new(ledger)
+    };
+    let newer_lcl = {
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(20, 1_020, false);
+        ledger.set_accepted(1_020, 30, true);
+        Arc::new(ledger)
+    };
+    app.on_closed_ledger(Arc::clone(&consensus_parent));
+
+    // The JtAccept task may execute after validation or acquisition has
+    // changed the global LCL. The old round must be discarded rather than
+    // building a child of its stale parent and rolling the LCL backwards.
+    app.on_closed_ledger(Arc::clone(&newer_lcl));
+    let error = match app.accept_ledger_with_txns_outcome_from_consensus_parent(
+        Arc::clone(&consensus_parent),
+        11,
+        1_010,
+        30,
+        true,
+        consensus_parent.fees().base,
+        Vec::new(),
+    ) {
+        Ok(_) => panic!("stale consensus acceptance must not overwrite newer LCL"),
+        Err(error) => error,
+    };
+
+    assert!(error.contains("stale consensus parent"));
+    let closed = app
+        .closed_ledger()
+        .expect("newer LCL should remain installed");
+    assert_eq!(closed.header().seq, newer_lcl.header().seq);
+    assert_eq!(closed.header().hash, newer_lcl.header().hash);
+    assert!(app.published_ledger().is_none());
+}
+
+#[test]
+fn lcl_transition_gate_serializes_authoritative_promotions() {
+    let app = Arc::new(ApplicationRoot::new(0).expect("root shell should build"));
+    let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(10, 1_000, false));
+    let authoritative = Arc::new(Ledger::from_ledger_seq_and_close_time(11, 1_010, false));
+    app.on_closed_ledger(Arc::clone(&parent));
+
+    let gate = app.lcl_transition_gate().lock();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let writer_app = Arc::clone(&app);
+    let writer = std::thread::spawn(move || {
+        writer_app.on_closed_ledger(authoritative);
+        done_tx
+            .send(())
+            .expect("writer completion should be observed");
+    });
+
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "closed-ledger writer must wait for the active LCL transition"
+    );
+    drop(gate);
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("closed-ledger writer should proceed after transition completes");
+    writer.join().expect("writer thread should not panic");
+    assert_eq!(app.closed_ledger_seq(), Some(11));
+}
+
+#[test]
 fn live_consensus_accept_runs_consensus_built_lifecycle_before_next_round() {
     let mut app = ApplicationRoot::new(0).expect("root shell should build");
     let runtime = Arc::new(AppLedgerMasterRuntime::default());
@@ -1986,6 +2058,12 @@ fn consensus_built_switches_lcl_without_promoting_validated_or_published() {
     assert_eq!(app.closed_ledger_seq(), Some(11));
     assert_eq!(app.published_ledger_seq(), Some(10));
     assert_eq!(app.validated_ledger_seq(), Some(10));
+    app.set_network_ops_operating_mode(NetworkOpsOperatingMode::Connected);
+    app.promote_operating_mode_after_accepted_ledger(built.as_ref());
+    assert_ne!(
+        app.network_ops_operating_mode(),
+        NetworkOpsOperatingMode::Full
+    );
     assert_eq!(
         ledger_master_runtime
             .ledger_master()

@@ -341,6 +341,9 @@ impl RclConsensusRelay for AppRclConsensusRelay {
 /// consensus strand, matching rippled's single-threaded
 /// `doAccept → endConsensus → beginConsensus` call chain.
 pub struct PendingAcceptWork {
+    /// Exact `prevLedger` used by the consensus round. The asynchronous accept
+    /// job must build on this snapshot, never on a moving global closed LCL.
+    pub parent_ledger: Arc<ledger::Ledger>,
     pub closed_seq: u32,
     pub close_time: u32,
     pub close_resolution: u8,
@@ -808,12 +811,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         mode: ConsensusMode,
     ) {
         let next_seq = prev_ledger.seq() + 1;
-        let base_fee = self
-            .ledger_master_runtime
-            .ledger_master()
-            .closed_ledger()
-            .map(|l| l.fees().base)
-            .unwrap_or(10);
+        let base_fee = prev_ledger.ledger().fees().base;
 
         // Consensus transaction-set bytes originate from peers. rippled catches
         // STTx construction failures here, marks that entry failed, and keeps
@@ -906,6 +904,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 .lock()
                 .expect("pending_accept mutex must not be poisoned");
             *pending = Some(PendingAcceptWork {
+                parent_ledger: prev_ledger.ledger(),
                 closed_seq,
                 close_time,
                 close_resolution: close_resolution_secs,
@@ -1114,6 +1113,47 @@ impl AppConsensus {
         combined
     }
 
+    fn restart_stale_accept_on_current_lcl(
+        &mut self,
+        now: NetClockTimePoint,
+        captured_parent: &ledger::Ledger,
+    ) -> bool {
+        let root = self.adaptor.app_root.clone();
+        let Some(current_lcl) = root.closed_ledger() else {
+            return false;
+        };
+        if current_lcl.header().hash == captured_parent.header().hash {
+            return false;
+        }
+
+        let current_hash = *current_lcl.header().hash.as_uint256();
+        root.process_closed_ledger_txq(current_lcl.as_ref(), true);
+        root.rebuild_open_ledger_after_consensus(
+            current_lcl.header().seq.saturating_add(1),
+            current_lcl.fees().base,
+            current_hash,
+        );
+        root.set_status_rpc_current_ledger_index(Some(current_lcl.header().seq.saturating_add(1)));
+        root.set_status_rpc_queue_report(Some(root.tx_q_rpc_report()));
+        if let Some(inbound_tx) = root.inbound_transactions().lock().ok().as_mut() {
+            inbound_tx.new_round(current_lcl.header().seq);
+        }
+        let proposing = self.adaptor.is_validator()
+            && !self.adaptor.options.standalone
+            && self.adaptor.network_ops_mode_owner.operating_mode()
+                == crate::network::network_ops::NetworkOpsOperatingMode::Full;
+        let prev_cx = crate::consensus_ledger_from_ledger(&current_lcl);
+        self.start_round(now, current_hash, prev_cx, proposing);
+        tracing::info!(
+            target: "consensus",
+            captured_parent = %captured_parent.header().hash,
+            current_parent = %current_hash,
+            current_seq = current_lcl.header().seq,
+            "synchronous accept: discarded stale work and restarted on current LCL"
+        );
+        true
+    }
+
     /// Execute the accept-ledger work and start the next consensus round,
     /// matching rippled's single-threaded flow:
     ///   doAccept (build ledger) → endConsensus (checkLastClosedLedger) →
@@ -1121,8 +1161,14 @@ impl AppConsensus {
     fn do_accept_and_start_next_round(&mut self, now: NetClockTimePoint, work: PendingAcceptWork) {
         let closed_seq = work.closed_seq;
         let root = self.adaptor.app_root.clone();
+        let _lcl_transition_guard = root.lcl_transition_gate().lock();
 
-        match root.accept_ledger_with_txns_outcome(
+        if self.restart_stale_accept_on_current_lcl(now, work.parent_ledger.as_ref()) {
+            return;
+        }
+
+        match root.accept_ledger_with_txns_outcome_from_consensus_parent(
+            Arc::clone(&work.parent_ledger),
             work.closed_seq,
             work.close_time,
             work.close_resolution,
@@ -1131,16 +1177,16 @@ impl AppConsensus {
             work.txns,
         ) {
             Ok(outcome) => {
-                // This is the live `doAccept` handoff. Run the exact
-                // LedgerMaster::consensusBuilt lifecycle once, after the
-                // ledger exists and before open-ledger or next-round work.
-                // The helper clears building state, records built-history
-                // metadata, checks this ledger, then scans alternate trusted
-                // candidates.
-                if let Some(closed) = root.closed_ledger() {
-                    root.record_consensus_built_ledger(Arc::clone(&closed), work.consensus_hash);
+                // Carry the exact child that atomically replaced the captured
+                // parent through all post-accept processing. Re-reading the
+                // mutable LCL here could attach this consensus result to a
+                // later validation/acquisition switch.
+                let closed = Arc::clone(&outcome.closed);
+                root.record_consensus_built_ledger(Arc::clone(&closed), work.consensus_hash);
+                if self.restart_stale_accept_on_current_lcl(now, closed.as_ref()) {
+                    return;
                 }
-                if let Some(closed) = root.closed_ledger() {
+                {
                     RclConsensusOpenLedgerSource::accept_consensus_ledger(
                         &self.adaptor.open_ledger,
                         outcome.next_open_index,
@@ -1161,7 +1207,7 @@ impl AppConsensus {
                 }
 
                 // Broadcast StatusChange (neACCEPTED_LEDGER) and sign/publish validation.
-                if let Some(closed) = root.closed_ledger() {
+                {
                     let hdr = closed.header();
                     root.broadcast_consensus_status_change(
                         closed.as_ref(),
@@ -1264,7 +1310,7 @@ impl AppConsensus {
                 }
 
                 // checkLastClosedLedger → beginConsensus
-                let closed = root.closed_ledger();
+                let closed = Some(closed);
                 if let Some(closed) = closed {
                     let closed_id = *closed.header().hash.as_uint256();
                     let network_closed = {
@@ -1430,6 +1476,11 @@ impl AppConsensus {
             }
             Err(err) => {
                 tracing::error!(target: "consensus", closed_seq, %err, "synchronous accept: accept_ledger_with_txns failed");
+                if err.starts_with("stale consensus parent")
+                    && self.restart_stale_accept_on_current_lcl(now, work.parent_ledger.as_ref())
+                {
+                    return;
+                }
                 // Don't leave consensus stuck in Accepted phase — start a
                 // round on whatever closed ledger we have. timer_entry is a
                 // no-op in Accepted, so without this the node never recovers.
