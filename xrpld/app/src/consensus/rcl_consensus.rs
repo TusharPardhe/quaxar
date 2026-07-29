@@ -1281,12 +1281,13 @@ impl AppConsensus {
                             }
                         }
 
-                        // H3: Include our own closed ledger in the tally so
-                        // getPreferredLCL accounts for our view.  Matches
-                        // rippled where checkLastClosedLedger counts the node's
-                        // own closed ledger hash among peers.
-                        if let Some(our_closed_lcl) = root.closed_ledger() {
-                            let our_h = *our_closed_lcl.header().hash.as_uint256();
+                        // Match rippled: count our own LCL only after the
+                        // node has reached TRACKING; otherwise peer reports
+                        // remain a fallback behind trusted validations.
+                        if root.network_ops_operating_mode()
+                            >= crate::network::network_ops::NetworkOpsOperatingMode::Tracking
+                        {
+                            let our_h = *closed.header().hash.as_uint256();
                             if !our_h.is_zero() {
                                 *peer_counts.entry(our_h).or_insert(0) += 1;
                             }

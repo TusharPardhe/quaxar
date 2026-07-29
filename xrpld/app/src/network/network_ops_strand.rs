@@ -897,42 +897,47 @@ fn check_accept_and_advance(
     }
 
     // ── Operating mode promotion ─────────────────────────────────────────
-    {
-        let current_mode = root.network_ops_state().operating_mode();
-        let need_network = root.need_network_ledger();
-        let mut next_mode = current_mode;
+    // Use the same preferred-LCL precondition as accepted-ledger promotion;
+    // otherwise a strand tick can report FULL before consensus observes that
+    // peers and trusted validations prefer a different chain.
+    if let Some(promotion_lcl) = root.published_ledger().or_else(|| root.closed_ledger()) {
+        if root.preferred_lcl_allows_mode_promotion(promotion_lcl.as_ref()) {
+            let current_mode = root.network_ops_state().operating_mode();
+            let need_network = root.need_network_ledger();
+            let mut next_mode = current_mode;
 
-        // Connected/Syncing → Tracking
-        if matches!(
-            next_mode,
-            NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Syncing
-        ) && !need_network
-        {
-            next_mode = NetworkOpsOperatingMode::Tracking;
-        }
-
-        // Connected/Tracking → Full when published ledger is fresh
-        if matches!(
-            next_mode,
-            NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Tracking
-        ) && !need_network
-        {
-            let valid_seq = lm.valid_ledger_seq();
-            let fresh = root.published_ledger().map_or(false, |pub_ledger| {
-                let now_close = root.current_close_time_seconds();
-                let pub_close = pub_ledger.header().close_time;
-                let resolution = u32::from(pub_ledger.header().close_time_resolution);
-                now_close < pub_close.saturating_add(resolution.saturating_mul(2))
-            });
-            let have_prev = valid_seq > 1 && lm.have_ledger(valid_seq - 1);
-            if fresh || have_prev {
-                next_mode = NetworkOpsOperatingMode::Full;
+            // Connected/Syncing → Tracking
+            if matches!(
+                next_mode,
+                NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Syncing
+            ) && !need_network
+            {
+                next_mode = NetworkOpsOperatingMode::Tracking;
             }
-        }
 
-        if next_mode != current_mode {
-            tracing::info!(target: "app", ?current_mode, ?next_mode, "strand: operating mode promoted");
-            root.set_network_ops_operating_mode(next_mode);
+            // Connected/Tracking → Full when published ledger is fresh
+            if matches!(
+                next_mode,
+                NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Tracking
+            ) && !need_network
+            {
+                let valid_seq = lm.valid_ledger_seq();
+                let fresh = root.published_ledger().map_or(false, |pub_ledger| {
+                    let now_close = root.current_close_time_seconds();
+                    let pub_close = pub_ledger.header().close_time;
+                    let resolution = u32::from(pub_ledger.header().close_time_resolution);
+                    now_close < pub_close.saturating_add(resolution.saturating_mul(2))
+                });
+                let have_prev = valid_seq > 1 && lm.have_ledger(valid_seq - 1);
+                if fresh || have_prev {
+                    next_mode = NetworkOpsOperatingMode::Full;
+                }
+            }
+
+            if next_mode != current_mode {
+                tracing::info!(target: "app", ?current_mode, ?next_mode, "strand: operating mode promoted");
+                root.set_network_ops_operating_mode(next_mode);
+            }
         }
     }
 

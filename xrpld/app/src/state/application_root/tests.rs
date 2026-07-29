@@ -1,7 +1,8 @@
 use super::{
     AcceptLedgerPendingRuntime, AcceptLedgerPendingTransaction, AppOpenLedgerTxQApplyRuntime,
     ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, apply_submit_transactor_shell,
-    batch_base_fee, consensus_status_event, queue_apply_preclaim_ter,
+    batch_base_fee, consensus_status_event, preferred_lcl_matches_local_or_parent,
+    queue_apply_preclaim_ter,
 };
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::network::network_ops_runtime::AppNetworkOpsApplyHeldOutcome;
@@ -1427,6 +1428,28 @@ fn application_root_tracks_network_ops_operating_mode_strings() {
         NetworkOpsOperatingMode::Tracking
     );
     assert_eq!(app.network_ops_operating_mode_string(), "tracking");
+}
+
+#[test]
+fn mode_promotion_rejects_a_divergent_preferred_lcl() {
+    let local_hash = Uint256::from_u64(105_928_787);
+    let parent_hash = Uint256::from_u64(105_928_786);
+
+    assert!(preferred_lcl_matches_local_or_parent(
+        local_hash,
+        parent_hash,
+        local_hash
+    ));
+    assert!(preferred_lcl_matches_local_or_parent(
+        local_hash,
+        parent_hash,
+        parent_hash
+    ));
+    assert!(!preferred_lcl_matches_local_or_parent(
+        local_hash,
+        parent_hash,
+        Uint256::from_u64(105_928_792)
+    ));
 }
 
 #[test]

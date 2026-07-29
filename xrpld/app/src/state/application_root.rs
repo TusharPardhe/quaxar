@@ -1,7 +1,8 @@
 //! Honest application-root owner for the migrated runtime shell.
 
 use crate::amendments::amendment_status::{AmendmentStatus, UnsupportedMajorityWarningDetails};
-use crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource;
+use crate::consensus::rcl_consensus::{RclConsensusOpenLedgerSource, RclConsensusValidationSource};
+use crate::consensus::rcl_validation::RclValidatedLedger;
 use crate::consensus::rcl_validations::SharedAppValidations;
 use crate::job::job_queue::JobQueue;
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
@@ -100,6 +101,16 @@ fn to_nodestore_type(object_type: LedgerNodeObjectType) -> nodestore::NodeObject
         LedgerNodeObjectType::AccountNode => nodestore::NodeObjectType::AccountNode,
         LedgerNodeObjectType::TransactionNode => nodestore::NodeObjectType::TransactionNode,
     }
+}
+
+/// Matches rippled `checkLastClosedLedger`: a peer/validation preference for
+/// our immediate parent is not an abnormal LCL switch, but every other hash is.
+fn preferred_lcl_matches_local_or_parent(
+    local_hash: Uint256,
+    local_parent_hash: Uint256,
+    preferred_hash: Uint256,
+) -> bool {
+    preferred_hash.is_zero() || preferred_hash == local_hash || preferred_hash == local_parent_hash
 }
 
 fn consensus_status_event(event: i32, have_correct_lcl: bool) -> i32 {
@@ -5827,18 +5838,64 @@ impl ApplicationRoot {
             .note_validated_ledger(self.ledger_with_node_fetcher(ledger));
     }
 
-    /// Promotes `NetworkOpsOperatingMode` past CONNECTED/SYNCING once the
-    /// node has a fresh, network-required ledger. This mirrors the reference
-    /// `NetworkOPsImp::endConsensus`'s CONNECTED/SYNCING -> TRACKING -> FULL
-    /// promotion (and `xrpld/main/src/main.rs`'s
-    /// `select_post_acquisition_operating_mode`, which this duplicates for
-    /// the live per-round consensus-accept path that actually runs in this
-    /// build: `accept_ledger_with_txns`/its standalone-empty sibling call
-    /// `on_validated_ledger` directly and never go through
-    /// `promote_current_ledger`, so without this hook the operating mode is
-    /// permanently stuck at CONNECTED/SYNCING regardless of how many ledgers
-    /// validate).
+    /// Returns whether this local LCL agrees with the network's preferred LCL.
+    ///
+    /// This is the read-only `checkLastClosedLedger` precondition for mode
+    /// promotion. The authoritative consensus path owns switching, acquisition,
+    /// and `need_network_ledger`; a promotion preflight must not make that flag
+    /// sticky when the later compatibility check keeps the local ledger.
+    pub(crate) fn preferred_lcl_allows_mode_promotion(&self, ledger: &Ledger) -> bool {
+        let local_hash = *ledger.header().hash.as_uint256();
+        let local_parent_hash = *ledger.header().parent_hash.as_uint256();
+        let current_mode = self.network_ops_operating_mode();
+        let mut peer_counts = std::collections::BTreeMap::<Uint256, u32>::new();
+
+        // Match rippled: count our own LCL only once we are already tracking.
+        if current_mode >= NetworkOpsOperatingMode::Tracking {
+            *peer_counts.entry(local_hash).or_default() += 1;
+        }
+        if let Some(overlay_rt) = self.overlay_runtime() {
+            use overlay::Overlay;
+            for peer in overlay_rt.overlay().active_peers() {
+                let peer_hash = peer.closed_ledger_hash();
+                if !peer_hash.is_zero() {
+                    *peer_counts.entry(peer_hash).or_default() += 1;
+                }
+            }
+        }
+
+        let min_valid_seq = self
+            .ledger_master_runtime()
+            .map_or(ledger.header().seq, |runtime| {
+                runtime.ledger_master().valid_ledger_seq()
+            });
+        let preferred_hash = self.validations().preferred_lcl(
+            &RclValidatedLedger::from_ledger(ledger),
+            min_valid_seq,
+            &peer_counts,
+        );
+        let matches =
+            preferred_lcl_matches_local_or_parent(local_hash, local_parent_hash, preferred_hash);
+
+        if !matches {
+            tracing::info!(
+                target: "consensus",
+                %local_hash,
+                %preferred_hash,
+                "mode promotion deferred: network prefers a different closed ledger"
+            );
+        }
+        matches
+    }
+
+    /// Promotes `NetworkOpsOperatingMode` past CONNECTED/SYNCING only after
+    /// the local closed ledger has been reconciled with the network-preferred
+    /// LCL. This mirrors the reference `NetworkOPsImp::endConsensus` ordering.
     pub fn promote_operating_mode_after_accepted_ledger(&self, ledger: &Ledger) {
+        if !self.preferred_lcl_allows_mode_promotion(ledger) {
+            return;
+        }
+
         let current_mode = self.network_ops_operating_mode();
         let need_network_ledger = self.need_network_ledger();
 
