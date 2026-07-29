@@ -205,6 +205,17 @@ fn drain_bounded<T>(
     }
 }
 
+/// Prefer the currently advertised LCL if it is cached. If that advertisement
+/// advanced while a recovery acquisition was running, use the completed
+/// candidate once; `switchLastClosedLedger` still applies currentness and
+/// compatibility checks before installation.
+fn select_recovery_lcl(
+    cached_preferred: Option<Arc<ledger::Ledger>>,
+    completed_consensus_recovery_ledger: &mut Option<Arc<ledger::Ledger>>,
+) -> Option<Arc<ledger::Ledger>> {
+    cached_preferred.or_else(|| completed_consensus_recovery_ledger.take())
+}
+
 /// Dependencies the strand needs (passed at construction).
 pub struct NetworkOpsStrandDeps {
     pub root: ApplicationRoot,
@@ -334,6 +345,11 @@ fn strand_loop(
     let mut last_timer_tick = Instant::now();
     let mut last_round_ledger_id: Option<Uint256> = None;
     let mut last_history_tick = Instant::now();
+    // A peer closed-ledger advertisement can advance while its full ledger is
+    // downloading. Retain the completed candidate so recovery can still
+    // evaluate it as a compatible LCL instead of serially chasing each newer
+    // advertisement forever.
+    let mut completed_consensus_recovery_ledger: Option<Arc<ledger::Ledger>> = None;
 
     // Detect startup: always start consensus immediately on the closed
     // ledger, matching rippled's Application::run() which calls
@@ -591,6 +607,9 @@ fn strand_loop(
                 shared_inbound.poll_results_bounded(MAX_LEDGER_COMPLETIONS_PER_TURN)
             {
                 let ledger = Arc::new(ledger);
+                if reason == AcquireReason::Consensus && root.need_network_ledger() {
+                    completed_consensus_recovery_ledger = Some(Arc::clone(&ledger));
+                }
                 let inserted = persist_completed_inbound_ledger(&root, &lm, &ledger, reason);
                 root.check_accept_hash_seq(*ledger.header().hash.as_uint256(), ledger.header().seq);
                 if inserted {
@@ -611,6 +630,7 @@ fn strand_loop(
             &mut runner,
             &consensus_rt,
             &mut last_round_ledger_id,
+            &mut completed_consensus_recovery_ledger,
             configured_ledger_history,
             &mut last_history_tick,
         );
@@ -627,6 +647,9 @@ fn strand_loop(
             if let Some(rx) = rx_guard.as_ref() {
                 drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |completion| {
                     let ledger = completion.ledger;
+                    if completion.reason == AcquireReason::Consensus && root.need_network_ledger() {
+                        completed_consensus_recovery_ledger = Some(Arc::clone(&ledger));
+                    }
                     let lm = lm_rt.ledger_master();
                     let inserted =
                         persist_completed_inbound_ledger(&root, &lm, &ledger, completion.reason);
@@ -649,6 +672,9 @@ fn strand_loop(
         if let Some(ref rx) = shared_completed_rx {
             drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |completion| {
                 let ledger = completion.ledger;
+                if completion.reason == AcquireReason::Consensus && root.need_network_ledger() {
+                    completed_consensus_recovery_ledger = Some(Arc::clone(&ledger));
+                }
                 let inserted = root.ledger_master_runtime().is_some_and(|lm_rt| {
                     let lm = lm_rt.ledger_master();
                     persist_completed_inbound_ledger(&root, &lm, &ledger, completion.reason)
@@ -689,6 +715,7 @@ fn check_accept_and_advance(
     runner: &mut dyn ConsensusRunner,
     consensus_rt: &AppConsensusRuntime,
     last_round_ledger_id: &mut Option<Uint256>,
+    completed_consensus_recovery_ledger: &mut Option<Arc<ledger::Ledger>>,
     configured_ledger_history: u32,
     last_history_tick: &mut Instant,
 ) {
@@ -764,10 +791,19 @@ fn check_accept_and_advance(
                 shared_inbound.acquire_closed_ledger_async(hash, AcquireReason::Consensus);
             }
 
-            if let Some(network_ledger) = lm
-                .ledger_history()
-                .get_cached_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash))
-            {
+            // Prefer the presently advertised LCL when it is cached. If it
+            // advanced while the previous preferred ledger was downloading,
+            // evaluate that just-completed candidate instead. `is_compatible`
+            // and `can_be_current` below remain the authority for whether it
+            // is safe to install, so this fallback cannot promote a divergent
+            // or stale chain merely to escape acquisition churn.
+            let network_ledger = select_recovery_lcl(
+                lm.ledger_history().get_cached_ledger_by_hash(
+                    basics::sha_map_hash::SHAMapHash::new(preferred_hash),
+                ),
+                completed_consensus_recovery_ledger,
+            );
+            if let Some(network_ledger) = network_ledger {
                 let state_complete = !network_ledger.state_map().is_synching();
                 let tx_complete = network_ledger.header().tx_hash.is_zero()
                     || !network_ledger.tx_map().is_synching();
@@ -1150,6 +1186,7 @@ mod tests {
     use super::{
         ConsensusJobScheduler, MAX_LEDGER_COMPLETIONS_PER_TURN, MAX_PROPOSALS_PER_TURN,
         drain_bounded, persist_completed_inbound_ledger, record_completed_inbound_ledger,
+        select_recovery_lcl,
     };
     use crate::ApplicationRoot;
     use crate::consensus::rcl_consensus::PendingAcceptWork;
@@ -1370,6 +1407,28 @@ mod tests {
         assert!(!scheduler.has_pending_accept());
         scheduler.accept_consumed();
         queue.stop();
+    }
+
+    #[test]
+    fn completed_recovery_candidate_is_selected_when_peer_preference_advances() {
+        let completed = immutable_ledger(101, 0xA1);
+        let mut pending = Some(Arc::clone(&completed));
+
+        // The peer has advanced to a new hash that is not cached yet. Use the
+        // completed candidate rather than serially chasing the new advert.
+        let selected = select_recovery_lcl(None, &mut pending)
+            .expect("completed recovery candidate should remain eligible");
+        assert_eq!(selected.header().hash, completed.header().hash);
+        assert!(pending.is_none());
+
+        // If the newer peer LCL has already arrived, it remains preferred and
+        // the older completion is not consumed for this decision.
+        let newer = immutable_ledger(102, 0xA2);
+        let mut pending = Some(completed);
+        let selected = select_recovery_lcl(Some(Arc::clone(&newer)), &mut pending)
+            .expect("cached preferred LCL should win");
+        assert_eq!(selected.header().hash, newer.header().hash);
+        assert!(pending.is_some());
     }
 
     #[test]

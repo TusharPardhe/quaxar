@@ -37,6 +37,22 @@ fn response_sequence_matches_request(expected_seq: u32, response_seq: u32) -> bo
     expected_seq == 0 || response_seq == 0 || expected_seq == response_seq
 }
 
+/// While joining a different network chain, peer closed-ledger advertisements
+/// move every close. Admit one hash-only consensus acquisition at a time so a
+/// changing preferred hash cannot consume the shared worker pool before any
+/// candidate finishes and is evaluated by switchLastClosedLedger.
+fn admits_new_consensus_recovery_acquisition(
+    need_network_ledger: bool,
+    seq: u32,
+    reason: AcquireReason,
+    active_hash_only_consensus_recovery_acquisitions: usize,
+) -> bool {
+    !need_network_ledger
+        || reason != AcquireReason::Consensus
+        || seq != 0
+        || active_hash_only_consensus_recovery_acquisitions == 0
+}
+
 /// Rust worker count for the `JtLedgerData`-equivalent queue. This does not
 /// limit the number of tracked acquisitions.
 const WORKER_COUNT: usize = 64;
@@ -212,10 +228,46 @@ impl InboundLedgers {
             return entry.completed_ledger.clone();
         }
 
-        // rippled admits one InboundLedger per hash and bounds retention by
-        // progress/failure lifecycle plus the five-minute idle sweep below.
-        // Do not reject a distinct acquisition merely because other active
-        // hashes are present.
+        // During normal operation rippled admits one InboundLedger per hash
+        // and bounds retention by progress/failure lifecycle plus the
+        // five-minute idle sweep below. During preferred-LCL recovery,
+        // however, every peer advertises a new *hash-only* ledger each close.
+        // Restrict only that seq=0 consensus stream to one live acquisition:
+        // otherwise it can fill the shared worker pool before a completed
+        // candidate is considered by switchLastClosedLedger. A known-sequence
+        // consensus acquisition remains admissible because it is a more
+        // authoritative recovery input.
+        let need_network_ledger = self.need_network_ledger.load(Ordering::Acquire);
+        if need_network_ledger && reason == AcquireReason::Consensus && seq == 0 {
+            let active_hash_only_consensus_recovery_acquisitions = inner
+                .entries
+                .values()
+                .filter(|entry| {
+                    entry.reason == AcquireReason::Consensus
+                        && entry.seq == 0
+                        && !entry.failed
+                        && !entry.state.failed.load(Ordering::Acquire)
+                        && !entry.state.completed.load(Ordering::Acquire)
+                        && !entry.state.stopped.load(Ordering::Acquire)
+                        && entry.completed_ledger.is_none()
+                })
+                .count();
+            if !admits_new_consensus_recovery_acquisition(
+                need_network_ledger,
+                seq,
+                reason,
+                active_hash_only_consensus_recovery_acquisitions,
+            ) {
+                tracing::debug!(
+                    target: "inbound_ledger",
+                    %hash,
+                    seq,
+                    active_hash_only_consensus_recovery_acquisitions,
+                    "acquire: deferred while preferred LCL recovery is in progress"
+                );
+                return None;
+            }
+        }
 
         // Validate required resources
         let ns = {
@@ -864,7 +916,9 @@ impl std::fmt::Debug for InboundLedgers {
 
 #[cfg(test)]
 mod tests {
-    use super::response_sequence_matches_request;
+    use super::{
+        AcquireReason, admits_new_consensus_recovery_acquisition, response_sequence_matches_request,
+    };
 
     #[test]
     fn unknown_closed_ledger_sequence_accepts_authoritative_response_sequence() {
@@ -872,5 +926,39 @@ mod tests {
         assert!(response_sequence_matches_request(105_847_104, 0));
         assert!(response_sequence_matches_request(105_847_104, 105_847_104));
         assert!(!response_sequence_matches_request(105_847_103, 105_847_104));
+    }
+
+    #[test]
+    fn preferred_lcl_recovery_admits_only_one_live_consensus_acquisition() {
+        assert!(admits_new_consensus_recovery_acquisition(
+            true,
+            0,
+            AcquireReason::Consensus,
+            0,
+        ));
+        assert!(!admits_new_consensus_recovery_acquisition(
+            true,
+            0,
+            AcquireReason::Consensus,
+            1,
+        ));
+        assert!(admits_new_consensus_recovery_acquisition(
+            true,
+            105_930_596,
+            AcquireReason::Consensus,
+            1,
+        ));
+        assert!(admits_new_consensus_recovery_acquisition(
+            false,
+            0,
+            AcquireReason::Consensus,
+            1,
+        ));
+        assert!(admits_new_consensus_recovery_acquisition(
+            true,
+            0,
+            AcquireReason::History,
+            1,
+        ));
     }
 }
