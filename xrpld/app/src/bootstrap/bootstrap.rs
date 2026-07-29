@@ -1208,35 +1208,48 @@ fn run_start_mode_consensus_loop(
             .expect("spawn validation-forwarder thread");
     }
 
-    // Transaction relay router
+    // Transaction relay router. PeerImp schedules `RcvCheckTx` on the JobQueue;
+    // the worker stages the transaction and NetworkOPs schedules `JtBatch`.
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         let router_root = runtime.root().clone();
+        let job_queue = router_root.job_queue().clone();
         overlay_rt
             .overlay()
             .queued_inbound()
             .set_transaction_router(Box::new(move |_peer_id, message| {
-                let mut serial = protocol::SerialIter::new(&message.message.raw_transaction);
-                let st_tx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    protocol::STTx::from_serial_iter(&mut serial)
-                })) {
-                    Ok(tx) => tx,
-                    Err(_) => return,
-                };
-                let st_tx = Arc::new(st_tx);
-                let mut transaction: crate::SharedTransaction = Arc::new(std::sync::Mutex::new(
-                    crate::tx_queue::transaction::Transaction::new(Arc::clone(&st_tx)),
-                ));
-                if let Some(network_ops_runtime) = router_root.network_ops_runtime() {
-                    let _ = network_ops_runtime.process_transaction(
-                        &mut transaction,
-                        false,
-                        false,
-                        false,
-                        || false,
-                        || {},
-                    );
-                    router_root.notify_tx_pending();
-                }
+                let root = router_root.clone();
+                let queue = job_queue.clone();
+                let raw_transaction = message.message.raw_transaction;
+                let _ = queue.add_job(
+                    crate::job::job_types::JobType::JtTransaction,
+                    "RcvCheckTx",
+                    move || {
+                        let mut serial = protocol::SerialIter::new(&raw_transaction);
+                        let st_tx =
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                protocol::STTx::from_serial_iter(&mut serial)
+                            })) {
+                                Ok(tx) => tx,
+                                Err(_) => return,
+                            };
+                        let st_tx = Arc::new(st_tx);
+                        let mut transaction: crate::SharedTransaction =
+                            Arc::new(std::sync::Mutex::new(
+                                crate::tx_queue::transaction::Transaction::new(Arc::clone(&st_tx)),
+                            ));
+                        if let Some(network_ops_runtime) = root.network_ops_runtime() {
+                            let batch_root = root.clone();
+                            let _ = network_ops_runtime.process_transaction(
+                                &mut transaction,
+                                false,
+                                false,
+                                false,
+                                || batch_root.enqueue_network_ops_transaction_batch(),
+                                || {},
+                            );
+                        }
+                    },
+                );
             }));
     }
 
@@ -1332,89 +1345,6 @@ fn run_start_mode_consensus_loop(
         if drained > 0 {
             tracing::info!(target: "consensus", drained, "Replayed buffered ledger-data packets after router installation");
         }
-    }
-
-    // Batch apply thread (matches rippled's JtBatch worker)
-    let batch_root = runtime.root().clone();
-    let batch_overlay = runtime
-        .root()
-        .overlay_runtime()
-        .map(|rt| rt.overlay().clone());
-    let batch_network_ops: Option<Arc<crate::network::network_ops_runtime::AppNetworkOpsRuntime>> =
-        runtime.root().network_ops_runtime();
-    let batch_stop = Arc::clone(&stop);
-    let _batch_thread = std::thread::Builder::new()
-        .name("tx-batch-apply".to_string())
-        .spawn(move || {
-            while !batch_stop.load(Ordering::Acquire) {
-                batch_root.wait_tx_or_timeout(Duration::from_millis(50));
-                if batch_stop.load(Ordering::Acquire) {
-                    break;
-                }
-                loop {
-                    if let Some(ref overlay) = batch_overlay {
-                        let relayed = overlay.take_transactions();
-                        if let Some(ref network_ops_rt) = batch_network_ops {
-                            for message in relayed {
-                                let mut serial =
-                                    protocol::SerialIter::new(&message.message.raw_transaction);
-                                let st_tx =
-                                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                        || protocol::STTx::from_serial_iter(&mut serial),
-                                    )) {
-                                        Ok(tx) => tx,
-                                        Err(_) => continue,
-                                    };
-                                let st_tx = Arc::new(st_tx);
-                                let mut transaction: crate::SharedTransaction =
-                                    Arc::new(std::sync::Mutex::new(
-                                        crate::tx_queue::transaction::Transaction::new(Arc::clone(
-                                            &st_tx,
-                                        )),
-                                    ));
-                                let _ = network_ops_rt.process_transaction(
-                                    &mut transaction,
-                                    false,
-                                    false,
-                                    false,
-                                    || false,
-                                    || {},
-                                );
-                            }
-                        }
-                    }
-                    // Acquire close_gate: if on_close is capturing the
-                    // transaction set for consensus, skip this iteration to
-                    // avoid racing the open ledger capture. Matches rippled's
-                    // single-strand guarantee where the batch-apply path and
-                    // timerEntry (which calls onClose) cannot interleave.
-                    let _close_guard = batch_root
-                        .close_gate()
-                        .lock()
-                        .expect("close_gate mutex must not be poisoned");
-                    let report = batch_root.apply_network_ops_pending_to_open_ledger();
-                    drop(_close_guard);
-                    let applied = report.as_ref().map_or(0, |r| r.entries.len());
-                    let overlay_empty = batch_overlay
-                        .as_ref()
-                        .map_or(true, |o| o.queued_inbound().transaction_count() == 0);
-                    if applied == 0 && overlay_empty {
-                        break;
-                    }
-                }
-            }
-        })
-        .expect("failed to spawn tx-batch-apply thread");
-
-    // Wire instant-wake notification for relay
-    if let Some(overlay_rt) = runtime.root().overlay_runtime() {
-        let notify_root = runtime.root().clone();
-        overlay_rt
-            .overlay()
-            .queued_inbound()
-            .set_transaction_notify(Box::new(move || {
-                notify_root.notify_tx_pending();
-            }));
     }
 
     // Wire instant-wake notification for proposals arriving from peers.

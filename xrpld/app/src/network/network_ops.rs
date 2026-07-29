@@ -639,6 +639,37 @@ impl<Pending, Held> NetworkOpsRuntimeState<Pending, Held> {
         dispatch
     }
 
+    pub fn schedule_pending_transaction_batch(
+        &mut self,
+        add_batch_job: impl FnOnce() -> bool,
+    ) -> bool {
+        if self.pending_transactions.is_empty()
+            || self.dispatch_state != NetworkOpsDispatchState::None
+        {
+            return false;
+        }
+
+        if add_batch_job() {
+            self.dispatch_state = NetworkOpsDispatchState::Scheduled;
+            return true;
+        }
+
+        false
+    }
+
+    /// Release a scheduled async batch that could not begin because there was
+    /// no base ledger. The queue and each transaction's applying flag stay
+    /// intact; the next ingress or ledger transition can schedule one fresh
+    /// JtBatch from `None`.
+    pub fn release_scheduled_transaction_batch_for_retry(&mut self) -> bool {
+        if self.dispatch_state != NetworkOpsDispatchState::Scheduled {
+            return false;
+        }
+
+        self.dispatch_state = NetworkOpsDispatchState::None;
+        true
+    }
+
     pub fn transaction_batch(
         &mut self,
         mut apply_batch: impl FnMut(&mut Vec<Pending>),
@@ -1343,19 +1374,11 @@ pub fn run_networkops_begin_apply_batch<T>(
         "xrpl::NetworkOPsImp::apply : is not running"
     );
 
+    // rippled swaps the complete pending vector into the running batch. Do not
+    // impose a Rust-only cap here: `transactionBatch` drains until the queue
+    // is empty, and a split batch changes observable application ordering.
     let mut transactions = Vec::new();
     std::mem::swap(&mut transactions, pending_transactions);
-    // Cap the batch to prevent the consensus strand from blocking indefinitely
-    // when peers flood transactions faster than they can be processed. Excess
-    // transactions remain in pending_transactions for the next batch cycle.
-    // This ensures the consensus timer tick fires within a bounded interval,
-    // which is critical for switchLastClosedLedger recovery after a chain fork
-    // or when transactions consistently fail (e.g., amount overflow panics).
-    const MAX_BATCH_SIZE: usize = 256;
-    if transactions.len() > MAX_BATCH_SIZE {
-        let excess = transactions.split_off(MAX_BATCH_SIZE);
-        *pending_transactions = excess;
-    }
     let taken_transactions = transactions.len();
     unlock();
 

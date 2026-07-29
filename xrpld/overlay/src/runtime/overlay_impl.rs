@@ -978,9 +978,9 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             count = message.transactions.len(),
             "Batch transactions received"
         );
-        self.overlay
-            .inbound_handler
-            .on_transactions(self.peer, message.clone());
+        // rippled expands every TMTransactions member through
+        // handleTransaction(..., eraseTxQueue = false, batch = true), so each
+        // member enters the same direct JtTransaction path as a normal relay.
         for transaction in &message.transactions {
             self.queue_transaction(transaction, true);
         }

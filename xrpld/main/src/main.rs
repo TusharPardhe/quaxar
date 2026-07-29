@@ -516,34 +516,6 @@ fn spawn_overlay_timer(deps: OverlayTimerDeps) -> thread::JoinHandle<()> {
         .expect("spawn xrpld-overlay-timer")
 }
 
-/// Process a single inbound peer transaction, matching reference
-/// PeerImp::checkTransaction (called from a JobQueue JtTransaction worker).
-/// Applies the transaction to the open ledger via NetworkOPs::processTransaction.
-fn process_inbound_transaction(app: &app::ApplicationRoot, raw_transaction: &[u8]) {
-    let mut serial = protocol::SerialIter::new(raw_transaction);
-    let st_tx = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        protocol::STTx::from_serial_iter(&mut serial)
-    })) {
-        Ok(tx) => tx,
-        Err(_) => return,
-    };
-    let st_tx = std::sync::Arc::new(st_tx);
-    let mut transaction: app::SharedTransaction = std::sync::Arc::new(std::sync::Mutex::new(
-        app::tx_queue::transaction::Transaction::new(std::sync::Arc::clone(&st_tx)),
-    ));
-    if let Some(network_ops_runtime) = app.network_ops_runtime() {
-        let _ = network_ops_runtime.process_transaction(
-            &mut transaction,
-            false,
-            false,
-            false,
-            || false,
-            || {},
-        );
-        let _ = app.apply_network_ops_pending_to_open_ledger();
-    }
-}
-
 /// Per-60s ping tick tracked via a thread-local-style static using an atomic
 /// timestamp, since the overlay-timer thread owns its own 1s loop and has no
 /// access to the main loop's `last_ping_at` local variable.

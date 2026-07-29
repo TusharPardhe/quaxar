@@ -638,10 +638,19 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             );
             let next_seq = prev_ledger.seq().saturating_add(1);
             self.ledger_master_runtime.set_building_ledger(next_seq);
+            let mut run_sync_batch = false;
             let _ = self
                 .app_root
-                .apply_held_transactions_to_network_ops(SHAMapHash::new(prev_ledger.id()), |_| {});
-            let _ = self.app_root.apply_network_ops_pending_to_open_ledger();
+                .apply_held_transactions_to_network_ops(SHAMapHash::new(prev_ledger.id()), |_| {
+                    run_sync_batch = true
+                });
+            // rippled's LedgerMaster::applyHeldTransactions calls
+            // processTransactionSet only for a non-empty held set. Its sync
+            // batch may also consume previously queued work; do the same, but
+            // never unconditionally flush normal async peer ingress here.
+            if run_sync_batch {
+                let _ = self.app_root.apply_network_ops_pending_to_open_ledger();
+            }
             RclConsensusOpenLedgerSource::current_open_transactions(&self.open_ledger)
         };
         // close_gate released — batch-apply can resume while we build the set.
@@ -1415,7 +1424,7 @@ impl AppConsensus {
                         );
                     }
                 } else {
-                    root.notify_tx_pending();
+                    let _ = root.schedule_network_ops_transaction_batch();
                 }
             }
             Err(err) => {

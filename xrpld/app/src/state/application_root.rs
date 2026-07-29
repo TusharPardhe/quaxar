@@ -240,18 +240,11 @@ pub struct ApplicationRoot {
     /// Persistent submit sandbox matching rippled's OpenView. Accumulates state changes
     /// across submit calls within the same open ledger period. Reset on ledger_accept.
     open_ledger_sandbox: Arc<std::sync::Mutex<Option<Sandbox<Ledger>>>>,
-    /// Close gate: serializes on_close's apply+capture with the relay router's
-    /// process_transaction+apply. Matches rippled's single-strand guarantee where
-    /// timerEntry (which calls onClose) and PeerImp::onMessage(TMTransaction)
-    /// cannot interleave. The relay router acquires this briefly during
-    /// process+apply, and on_close acquires it around apply+capture.
+    /// Close gate: serializes on_close's apply+capture with NetworkOPs batch
+    /// application. rippled protects this work with its application and ledger
+    /// locks; the Rust runtime uses this narrow gate around the same mutable
+    /// open-ledger transition.
     close_gate: Arc<std::sync::Mutex<()>>,
-    /// Condvar to wake the bootstrap loop immediately when relay transactions
-    /// arrive, replacing the fixed 50ms sleep. Matches rippled's JtBatch
-    /// scheduling: doTransactionAsync sets dispatchState and the batch job
-    /// runs immediately. Our router notifies this condvar after process_transaction,
-    /// waking the loop to drain+apply within <1ms instead of up to 50ms.
-    tx_notify: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     /// Condvar to wake the consensus strand loop immediately when proposals
     /// arrive from the overlay, removing the 50ms poll latency. Matches
     /// rippled's strand-based immediate dispatch of proposals.
@@ -2482,7 +2475,7 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                         // (runtimes not yet attached), wake the bootstrap
                         // loop to handle it via polling.
                         if !started_next {
-                            root.notify_tx_pending();
+                            let _ = root.schedule_network_ops_transaction_batch();
                         }
                     }
                     Err(err) => {
@@ -2752,7 +2745,6 @@ impl ApplicationRoot {
             )),
             open_ledger_sandbox: Arc::new(std::sync::Mutex::new(None)),
             close_gate: Arc::new(std::sync::Mutex::new(())),
-            tx_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             consensus_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             shared_tree_cache: std::sync::OnceLock::new(),
             shared_full_below_cache: std::sync::OnceLock::new(),
@@ -2797,29 +2789,48 @@ impl ApplicationRoot {
         &self.close_gate
     }
 
-    /// Notify the bootstrap loop that relay transactions are pending.
-    /// Called by the router after process_transaction. Wakes the loop
-    /// from its condvar wait so drain+apply happens within <1ms.
-    pub fn notify_tx_pending(&self) {
-        let (lock, cvar) = &*self.tx_notify;
-        let mut pending = lock.lock().expect("tx_notify lock");
-        *pending = true;
-        cvar.notify_one();
+    /// Enqueue an already-authorized `JtBatch` job. Async ingress invokes
+    /// this while it holds NetworkOps' state mutex and has atomically moved
+    /// the dispatch state from `None` to `Scheduled`.
+    pub fn enqueue_network_ops_transaction_batch(&self) -> bool {
+        let root = self.clone();
+        self.job_queue.add_job(
+            crate::job::job_types::JobType::JtBatch,
+            "TxBatchAsync",
+            move || root.run_network_ops_transaction_batch(),
+        )
     }
 
-    /// Wait for tx notification or timeout. Returns true if notified.
-    pub fn wait_tx_or_timeout(&self, timeout: std::time::Duration) -> bool {
-        let (lock, cvar) = &*self.tx_notify;
-        let mut pending = lock.lock().expect("tx_notify lock");
-        if *pending {
-            *pending = false;
-            return true;
+    /// Schedule pending async work only through NetworkOps' guarded
+    /// `None -> Scheduled` transition. This is for retry and ledger paths;
+    /// normal ingress already owns that transition and uses the enqueue helper.
+    pub fn schedule_network_ops_transaction_batch(&self) -> bool {
+        let Some(runtime) = self.network_ops_runtime() else {
+            return false;
+        };
+        let root = self.clone();
+        runtime.schedule_pending_transaction_batch(|| root.enqueue_network_ops_transaction_batch())
+    }
+
+    /// Execute the complete `NetworkOPsImp::transactionBatch` drain loop on a
+    /// JobQueue worker. This is intentionally not a consensus-strand task.
+    pub fn run_network_ops_transaction_batch(&self) {
+        while self.network_ops_pending_transaction_count().unwrap_or(0) != 0 {
+            let _close_guard = self
+                .close_gate()
+                .lock()
+                .expect("close_gate mutex must not be poisoned");
+            if self.apply_network_ops_pending_to_open_ledger().is_none() {
+                // `apply` has not swapped the queue when no base ledger is
+                // available. Return to `None` so the next ingress or closed
+                // ledger transition can schedule a fresh JtBatch rather than
+                // stranding transactions in `Scheduled`.
+                if let Some(runtime) = self.network_ops_runtime() {
+                    let _ = runtime.release_scheduled_transaction_batch_for_retry();
+                }
+                break;
+            }
         }
-        let (mut guard, _timeout_result) =
-            cvar.wait_timeout(pending, timeout).expect("tx_notify wait");
-        let was_notified = *guard;
-        *guard = false;
-        was_notified
     }
 
     /// Notify the consensus strand loop that proposals or other consensus-
@@ -4110,6 +4121,7 @@ impl ApplicationRoot {
     ) -> Option<AppNetworkOpsSubmitReport> {
         let runtime = self.network_ops_runtime.as_ref()?.clone();
         let queued_runtime = Arc::clone(&runtime);
+        let batch_root = self.clone();
         let job_queue = self.job_queue.clone();
 
         Some(
@@ -4125,7 +4137,7 @@ impl ApplicationRoot {
                             false,
                             false,
                             false,
-                            || false,
+                            || batch_root.enqueue_network_ops_transaction_batch(),
                             || {},
                         );
                     },
@@ -5133,6 +5145,11 @@ impl ApplicationRoot {
             // `acquire` doesn't need the slower ledger_history fallback.
             self.validations().register_ledger(&normalized);
         }
+
+        // A prior JtBatch may have found no base ledger and released its
+        // dispatch state for retry. Now that this closed ledger is visible,
+        // schedule existing async work through NetworkOps' guarded transition.
+        let _ = self.schedule_network_ops_transaction_batch();
     }
 
     pub fn closed_ledger(&self) -> Option<Arc<Ledger>> {
@@ -5892,11 +5909,16 @@ impl ApplicationRoot {
             .clone()
             .unwrap_or_else(|| Arc::new(Ledger::from_ledger_seq_and_close_time(1, 0, false)));
 
-        // Flush any held transactions into the open ledger before closing.
+        // rippled only enters the synchronous NetworkOps batch from ledger
+        // close when LedgerMaster has a held transaction set to process.
         let parent_hash = parent.header().hash;
-        let _ = self.apply_held_transactions_to_network_ops(parent_hash, |_sync| {});
-        // Apply any pending (from held flush) into the open ledger.
-        let _ = self.apply_network_ops_pending_to_open_ledger();
+        let mut run_sync_batch = false;
+        let _ = self.apply_held_transactions_to_network_ops(parent_hash, |_| {
+            run_sync_batch = true;
+        });
+        if run_sync_batch {
+            let _ = self.apply_network_ops_pending_to_open_ledger();
+        }
 
         // Re-read open ledger txs after held transactions were applied.
         use crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource;

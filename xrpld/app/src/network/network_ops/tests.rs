@@ -769,6 +769,18 @@ fn begin_apply_batch_swaps_sets_running_and_unlocks() {
 }
 
 #[test]
+fn begin_apply_batch_swaps_the_entire_pending_vector() {
+    let mut pending = (0u16..=256).collect::<Vec<_>>();
+
+    let (transactions, start) =
+        run_networkops_begin_apply_batch(&mut pending, NetworkOpsDispatchState::Scheduled, || {});
+
+    assert_eq!(start.taken_transactions, 257);
+    assert_eq!(transactions, (0u16..=256).collect::<Vec<_>>());
+    assert!(pending.is_empty());
+}
+
+#[test]
 fn finish_apply_batch_relocks_before_tail() {
     let calls = RefCell::new(Vec::new());
     let transactions = vec![
@@ -1237,6 +1249,32 @@ fn transaction_async_schedules_batch_only_from_none_state() {
     assert_eq!(dispatch, NetworkOpsAsyncDispatch::Scheduled);
     assert_eq!(state, NetworkOpsDispatchState::Scheduled);
     assert_eq!(calls.into_inner(), vec!["push", "set", "job"]);
+}
+
+#[test]
+fn scheduled_batch_retry_returns_to_none_and_reenqueues_once() {
+    let mut state = NetworkOpsRuntimeState::new(
+        vec![7u8],
+        Vec::<u8>::new(),
+        NetworkOpsDispatchState::Scheduled,
+    );
+
+    assert!(state.release_scheduled_transaction_batch_for_retry());
+    assert_eq!(state.dispatch_state(), NetworkOpsDispatchState::None);
+
+    let jobs = RefCell::new(0usize);
+    assert!(state.schedule_pending_transaction_batch(|| {
+        *jobs.borrow_mut() += 1;
+        true
+    }));
+    assert_eq!(*jobs.borrow(), 1);
+    assert_eq!(state.dispatch_state(), NetworkOpsDispatchState::Scheduled);
+
+    assert!(!state.schedule_pending_transaction_batch(|| {
+        *jobs.borrow_mut() += 1;
+        true
+    }));
+    assert_eq!(*jobs.borrow(), 1);
 }
 
 #[test]

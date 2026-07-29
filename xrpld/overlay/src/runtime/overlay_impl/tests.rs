@@ -1373,7 +1373,6 @@ async fn inbound_session_queues_remaining_heavy_families() {
                 && snapshot.validator_list_collections.len() == 1
                 && snapshot.get_objects.len() == 1
                 && snapshot.have_transactions.len() == 1
-                && snapshot.transactions_batches.len() == 1
                 && snapshot.proof_path_requests.len() == 1
                 && snapshot.proof_path_responses.len() == 1
                 && snapshot.replay_delta_requests.len() == 1
@@ -1401,6 +1400,7 @@ async fn inbound_session_queues_remaining_heavy_families() {
     );
     assert!(!snapshot.transactions[0].batch);
     assert!(snapshot.transactions[1].batch);
+    assert!(snapshot.transactions[2].batch);
     assert_eq!(
         snapshot.proposals[0].current_tx_hash,
         Uint256::from_u64(800)
@@ -1408,10 +1408,6 @@ async fn inbound_session_queues_remaining_heavy_families() {
     assert_eq!(
         snapshot.have_transactions[0].hashes,
         vec![Uint256::from_u64(803)]
-    );
-    assert_eq!(
-        snapshot.transactions_batches[0].message.transactions.len(),
-        2
     );
 }
 

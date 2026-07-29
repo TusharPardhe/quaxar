@@ -271,6 +271,22 @@ impl AppNetworkOpsRuntime {
         self.snapshot().dispatch_state
     }
 
+    pub fn schedule_pending_transaction_batch(&self, add_batch_job: impl FnOnce() -> bool) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .expect("network ops runtime state mutex must not be poisoned");
+        state.schedule_pending_transaction_batch(add_batch_job)
+    }
+
+    pub fn release_scheduled_transaction_batch_for_retry(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .expect("network ops runtime state mutex must not be poisoned");
+        state.release_scheduled_transaction_batch_for_retry()
+    }
+
     pub fn reset_consensus_bootstrap(&self) {
         self.consensus_bootstrap_started
             .store(false, Ordering::Release);

@@ -7,8 +7,7 @@ use protocol::{HashPrefix, PublicKey, STValidation, sha512_half, verify_digest};
 use crate::message::{
     TmEndpoints, TmGetLedger, TmGetObjectByHash, TmHaveTransactions, TmLedgerData, TmManifests,
     TmProofPathRequest, TmProofPathResponse, TmProposeSet, TmReplayDeltaRequest,
-    TmReplayDeltaResponse, TmTransaction, TmTransactions, TmValidation, TmValidatorList,
-    TmValidatorListCollection,
+    TmReplayDeltaResponse, TmTransaction, TmValidation, TmValidatorList, TmValidatorListCollection,
 };
 use crate::peer::{Peer, PeerId, ProtocolFeature};
 use crate::peer_imp::PeerImp;
@@ -123,7 +122,6 @@ pub struct OverlayInboundSnapshot {
     pub validator_list_collections: Vec<PeerMessage<TmValidatorListCollection>>,
     pub get_objects: Vec<PeerMessage<TmGetObjectByHash>>,
     pub have_transactions: Vec<QueuedHaveTransactions>,
-    pub transactions_batches: Vec<PeerMessage<TmTransactions>>,
     pub proof_path_requests: Vec<PeerMessage<TmProofPathRequest>>,
     pub proof_path_responses: Vec<PeerMessage<TmProofPathResponse>>,
     pub replay_delta_requests: Vec<PeerMessage<TmReplayDeltaRequest>>,
@@ -147,7 +145,6 @@ pub trait OverlayInboundHandler: Send + Sync {
     }
     fn on_get_objects(&self, _peer: &Arc<PeerImp>, _message: TmGetObjectByHash) {}
     fn on_have_transactions(&self, _peer: &Arc<PeerImp>, _message: QueuedHaveTransactions) {}
-    fn on_transactions(&self, _peer: &Arc<PeerImp>, _message: TmTransactions) {}
     fn on_proof_path_request(&self, _peer: &Arc<PeerImp>, _message: TmProofPathRequest) {}
     fn on_proof_path_response(&self, _peer: &Arc<PeerImp>, _message: TmProofPathResponse) {}
     fn on_replay_delta_request(&self, _peer: &Arc<PeerImp>, _message: TmReplayDeltaRequest) {}
@@ -174,7 +171,7 @@ pub struct QueuedOverlayInboundHandler {
     /// the next 1s overlay timer tick, which is too slow relative to
     /// consensus round-close timing and causes sporadic quorum misses.
     #[allow(clippy::type_complexity)]
-    transaction_router: Mutex<Option<Box<dyn Fn(PeerId, QueuedTransaction) + Send + Sync>>>,
+    transaction_router: Mutex<Option<Arc<dyn Fn(PeerId, QueuedTransaction) + Send + Sync>>>,
     /// Direct routing callback for validations. Runtime wiring uses a blocking
     /// downstream handoff so consensus work is retained under queue pressure,
     /// matching rippled's JobQueue dispatch rather than dropping messages.
@@ -185,10 +182,6 @@ pub struct QueuedOverlayInboundHandler {
     /// instead of polling every 500ms. Matches reference where validations trigger
     /// checkAccept synchronously on the network thread.
     validation_notify_tx: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
-    /// Notify callback for instant batch-thread wake when a relay transaction
-    /// arrives and no router is set. Matches rippled's doTransactionAsync
-    /// scheduling a JtBatch job on first arrival.
-    transaction_notify: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Notify callback to wake the consensus strand loop immediately when a
     /// proposal arrives. Removes the 50ms poll latency, matching rippled's
     /// strand-based immediate dispatch of proposals.
@@ -217,7 +210,6 @@ impl Default for QueuedOverlayInboundHandler {
             transaction_router: Mutex::new(None),
             validation_router: Mutex::new(None),
             validation_notify_tx: Mutex::new(None),
-            transaction_notify: Mutex::new(None),
             proposal_notify: Mutex::new(None),
             proposal_router: Mutex::new(None),
             get_ledger_router: Mutex::new(None),
@@ -323,29 +315,32 @@ impl QueuedOverlayInboundHandler {
         &self,
         router: Box<dyn Fn(PeerId, QueuedTransaction) + Send + Sync>,
     ) {
-        *self
-            .transaction_router
-            .lock()
-            .expect("transaction_router lock") = Some(router);
+        let router: Arc<dyn Fn(PeerId, QueuedTransaction) + Send + Sync> = Arc::from(router);
+        let queued = {
+            // Install and drain under router -> inbound locking so an incoming
+            // transaction cannot slip between the direct-router check and the
+            // fallback enqueue. This mirrors direct JtTransaction handoff once
+            // the runtime is available.
+            let mut router_guard = self
+                .transaction_router
+                .lock()
+                .expect("transaction_router lock");
+            let mut inbound = self.inner.lock().expect("overlay inbound lock");
+            *router_guard = Some(Arc::clone(&router));
+            std::mem::take(&mut inbound.transactions)
+        };
+        for transaction in queued {
+            router(transaction.peer_id, transaction);
+        }
     }
 
     /// Clear the transaction router so that incoming transactions accumulate
-    /// in the queue (retrieved via `take_transactions`). Used when consensus
-    /// starts and the bootstrap loop takes over transaction processing.
+    /// in the queue until a runtime router is installed.
     pub fn clear_transaction_router(&self) {
         *self
             .transaction_router
             .lock()
             .expect("transaction_router lock") = None;
-    }
-
-    /// Set a notify callback for when relay transactions are queued (no router set).
-    /// Called by the batch-apply thread setup to get instant wake on relay arrival.
-    pub fn set_transaction_notify(&self, notify: Box<dyn Fn() + Send + Sync>) {
-        *self
-            .transaction_notify
-            .lock()
-            .expect("transaction_notify lock") = Some(notify);
     }
 
     /// Set a notify callback for when proposals arrive from peers. Called by
@@ -558,24 +553,26 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     }
 
     fn on_transaction(&self, peer: &Arc<PeerImp>, message: QueuedTransaction) {
-        let router_guard = self
-            .transaction_router
-            .lock()
-            .expect("transaction_router lock");
-        if let Some(router) = router_guard.as_ref() {
-            router(peer.id(), message);
-            return;
-        }
-        drop(router_guard);
-        let mut guard = self.inner.lock().expect("overlay inbound lock");
-        push_bounded(&mut guard.transactions, message, "transactions");
-        drop(guard);
-        // Wake the batch-apply thread immediately (matches rippled's
-        // doTransactionAsync scheduling JtBatch on first arrival)
-        if let Ok(notify) = self.transaction_notify.lock() {
-            if let Some(ref f) = *notify {
-                f();
+        let mut message = Some(message);
+        let router = {
+            let router_guard = self
+                .transaction_router
+                .lock()
+                .expect("transaction_router lock");
+            if let Some(router) = router_guard.as_ref().map(Arc::clone) {
+                Some(router)
+            } else {
+                let mut inbound = self.inner.lock().expect("overlay inbound lock");
+                push_bounded(
+                    &mut inbound.transactions,
+                    message.take().expect("transaction present"),
+                    "transactions",
+                );
+                None
             }
+        };
+        if let Some(router) = router {
+            router(peer.id(), message.take().expect("transaction present"));
         }
     }
 
@@ -821,18 +818,6 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
         );
     }
 
-    fn on_transactions(&self, peer: &Arc<PeerImp>, message: TmTransactions) {
-        let mut inner = self.inner.lock().expect("overlay inbound lock");
-        push_bounded(
-            &mut inner.transactions_batches,
-            PeerMessage {
-                peer_id: peer.id(),
-                message,
-            },
-            "transactions_batches",
-        );
-    }
-
     fn on_proof_path_request(&self, peer: &Arc<PeerImp>, message: TmProofPathRequest) {
         let mut inner = self.inner.lock().expect("overlay inbound lock");
         push_bounded(
@@ -939,6 +924,12 @@ mod tests {
                 peer_id: 14,
                 message: TmGetObjectByHash::default(),
             });
+            snapshot.transactions.push(QueuedTransaction {
+                peer_id: 16,
+                id: Uint256::from_u64(5),
+                batch: false,
+                message: TmTransaction::default(),
+            });
         }
 
         let proposals = Arc::new(Mutex::new(Vec::new()));
@@ -946,6 +937,16 @@ mod tests {
         let get_ledgers = Arc::new(Mutex::new(Vec::new()));
         let ledger_data = Arc::new(Mutex::new(Vec::new()));
         let get_objects = Arc::new(Mutex::new(Vec::new()));
+        let transactions = Arc::new(Mutex::new(Vec::new()));
+        handler.set_transaction_router(Box::new({
+            let received = Arc::clone(&transactions);
+            move |peer_id, _| {
+                received
+                    .lock()
+                    .expect("transaction replay lock")
+                    .push(peer_id)
+            }
+        }));
         handler.set_proposal_router(Box::new({
             let received = Arc::clone(&proposals);
             move |proposal| {
@@ -1009,12 +1010,17 @@ mod tests {
             *get_objects.lock().expect("get-object replay lock"),
             vec![14]
         );
+        assert_eq!(
+            *transactions.lock().expect("transaction replay lock"),
+            vec![16]
+        );
         let snapshot = handler.snapshot();
         assert!(snapshot.proposals.is_empty());
         assert!(snapshot.validations.is_empty());
         assert!(snapshot.get_ledgers.is_empty());
         assert!(snapshot.ledger_data.is_empty());
         assert!(snapshot.get_objects.is_empty());
+        assert!(snapshot.transactions.is_empty());
     }
 
     #[test]
