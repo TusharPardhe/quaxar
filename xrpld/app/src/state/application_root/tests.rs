@@ -1,7 +1,7 @@
 use super::{
     AcceptLedgerPendingRuntime, AcceptLedgerPendingTransaction, AppOpenLedgerTxQApplyRuntime,
     ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, apply_submit_transactor_shell,
-    batch_base_fee, queue_apply_preclaim_ter,
+    batch_base_fee, consensus_status_event, queue_apply_preclaim_ter,
 };
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::network::network_ops_runtime::AppNetworkOpsApplyHeldOutcome;
@@ -1884,6 +1884,46 @@ fn consensus_outcome_defers_open_ledger_reset_to_outcome_handoff() {
 }
 
 #[test]
+fn live_consensus_accept_runs_consensus_built_lifecycle_before_next_round() {
+    let mut app = ApplicationRoot::new(0).expect("root shell should build");
+    let runtime = Arc::new(AppLedgerMasterRuntime::default());
+    let _ = app.attach_ledger_master_runtime(Arc::clone(&runtime));
+    let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(10, 1_000, false));
+    app.on_closed_ledger(Arc::clone(&parent));
+    runtime.set_building_ledger(11);
+
+    let outcome = app
+        .accept_ledger_with_txns_outcome(11, 1_010, 30, true, parent.fees().base, Vec::new())
+        .expect("live consensus build should complete");
+    let built = app.closed_ledger().expect("built LCL should be installed");
+
+    // This is the exact handoff AppConsensus performs before rebuilding the
+    // next open ledger or selecting the next preferred LCL.
+    let consensus_hash = Uint256::from_u64(0xCAFE);
+    let recorded = app.record_consensus_built_ledger(Arc::clone(&built), consensus_hash);
+    assert_eq!(recorded.header().hash, built.header().hash);
+    assert_eq!(runtime.building_ledger(), None);
+    let entry = runtime
+        .ledger_master()
+        .ledger_history()
+        .consensus_entry(built.header().seq)
+        .expect("built-ledger bookkeeping should be retained");
+    assert_eq!(entry.built, Some(built.header().hash));
+    assert_eq!(entry.built_consensus_hash, Some(consensus_hash));
+
+    use crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource;
+    RclConsensusOpenLedgerSource::accept_consensus_ledger(
+        app.open_ledger(),
+        outcome.next_open_index,
+        parent.fees().base,
+        built.header().hash.as_uint256(),
+        &outcome.completed_transaction_ids,
+        &outcome.retry_transactions,
+    );
+    assert_eq!(app.open_ledger().current().ledger_current_index, 12);
+}
+
+#[test]
 fn consensus_built_switches_lcl_without_promoting_validated_or_published() {
     let mut app = ApplicationRoot::new(0).expect("root shell should build");
     let ledger_master_runtime = Arc::new(AppLedgerMasterRuntime::default());
@@ -2196,4 +2236,10 @@ fn open_ledger_batch_preflight_rejects_sponsorship_before_direct_apply() {
         open_ledger_batch_preflight_result(fee_sponsored),
         Ter::TEM_INVALID_FLAG
     );
+}
+
+#[test]
+fn consensus_status_event_uses_lost_sync_for_a_wrong_lcl() {
+    assert_eq!(consensus_status_event(2, true), 2); // neACCEPTED_LEDGER
+    assert_eq!(consensus_status_event(1, false), 4); // neLOST_SYNC
 }

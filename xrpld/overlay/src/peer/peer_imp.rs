@@ -1,6 +1,6 @@
 //! First concrete peer owner aligned with the current `PeerImp` role.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -17,6 +17,8 @@ use crate::protocol_version::ProtocolVersion;
 use crate::slot::{MAX_TX_QUEUE_SIZE, SystemClock};
 use crate::squelch::Squelch;
 use crate::tuning::{CONVERGED_LEDGER_LIMIT, DIVERGED_LEDGER_LIMIT};
+
+const RECENT_PEER_KNOWLEDGE_CAPACITY: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tracking {
@@ -67,8 +69,8 @@ pub struct PeerImp {
     publisher_list_sequences: Mutex<HashMap<PublicKey, usize>>,
     outbound_state: Mutex<PeerOutboundState>,
     tx_queue: Mutex<HashSet<Uint256>>,
-    known_ledgers: Mutex<HashSet<(Uint256, u32)>>,
-    known_tx_sets: Mutex<HashSet<Uint256>>,
+    known_ledgers: Mutex<VecDeque<(Uint256, u32)>>,
+    known_tx_sets: Mutex<VecDeque<Uint256>>,
     features: RwLock<HashSet<ProtocolFeature>>,
     protocol_version: RwLock<ProtocolVersion>,
     last_status: Mutex<Option<i32>>,
@@ -150,8 +152,8 @@ impl PeerImp {
             publisher_list_sequences: Mutex::new(HashMap::new()),
             outbound_state: Mutex::new(PeerOutboundState::default()),
             tx_queue: Mutex::new(HashSet::new()),
-            known_ledgers: Mutex::new(HashSet::new()),
-            known_tx_sets: Mutex::new(HashSet::new()),
+            known_ledgers: Mutex::new(VecDeque::with_capacity(RECENT_PEER_KNOWLEDGE_CAPACITY)),
+            known_tx_sets: Mutex::new(VecDeque::with_capacity(RECENT_PEER_KNOWLEDGE_CAPACITY)),
             features: RwLock::new(HashSet::new()),
             protocol_version: RwLock::new(ProtocolVersion::new(2, 2)),
             last_status: Mutex::new(None),
@@ -262,10 +264,16 @@ impl PeerImp {
     }
 
     pub fn record_ledger(&self, hash: Uint256, sequence: u32) {
-        self.known_ledgers
-            .lock()
-            .expect("peer known ledgers lock")
-            .insert((hash, sequence));
+        let mut known_ledgers = self.known_ledgers.lock().expect("peer known ledgers lock");
+        if !known_ledgers
+            .iter()
+            .any(|(known_hash, _)| *known_hash == hash)
+        {
+            if known_ledgers.len() == RECENT_PEER_KNOWLEDGE_CAPACITY {
+                known_ledgers.pop_front();
+            }
+            known_ledgers.push_back((hash, sequence));
+        }
         *self
             .closed_ledger_hash
             .lock()
@@ -281,10 +289,13 @@ impl PeerImp {
     }
 
     pub fn record_tx_set(&self, hash: Uint256) {
-        self.known_tx_sets
-            .lock()
-            .expect("peer known tx sets lock")
-            .insert(hash);
+        let mut known_tx_sets = self.known_tx_sets.lock().expect("peer known tx sets lock");
+        if !known_tx_sets.contains(&hash) {
+            if known_tx_sets.len() == RECENT_PEER_KNOWLEDGE_CAPACITY {
+                known_tx_sets.pop_front();
+            }
+            known_tx_sets.push_back(hash);
+        }
     }
 
     pub fn set_closed_ledger_hash(&self, hash: Uint256) {
@@ -725,7 +736,8 @@ impl Peer for PeerImp {
         self.known_tx_sets
             .lock()
             .expect("peer known tx sets lock")
-            .contains(&hash)
+            .iter()
+            .any(|known_hash| *known_hash == hash)
     }
 
     fn cycle_status(&self) {
@@ -887,6 +899,26 @@ mod tests {
         peer.check_tracking(210);
         assert_eq!(peer.tracking(), Tracking::Converged);
         assert!(peer.has_range(200, 200));
+    }
+
+    #[test]
+    fn peer_recent_ledger_and_txset_knowledge_is_capped_at_rippled_capacity() {
+        let secret = SecretKey::from_bytes([9u8; 32]);
+        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+        let peer = PeerImp::new(
+            9,
+            "127.0.0.1:51235".parse().expect("endpoint"),
+            public,
+            "recent-cap",
+        );
+        for value in 0..129u64 {
+            peer.record_ledger(Uint256::from_u64(value), value as u32 + 1);
+            peer.record_tx_set(Uint256::from_u64(value));
+        }
+        assert!(!peer.has_ledger(Uint256::from_u64(0), 0));
+        assert!(peer.has_ledger(Uint256::from_u64(128), 0));
+        assert!(!peer.has_tx_set(Uint256::from_u64(0)));
+        assert!(peer.has_tx_set(Uint256::from_u64(128)));
     }
 
     #[test]

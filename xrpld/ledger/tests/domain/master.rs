@@ -386,6 +386,39 @@ fn set_full_ledger_keeps_history_backfill_separate_from_published_and_validated(
 }
 
 #[test]
+fn last_valid_ledger_rejects_conflicting_cached_and_acquired_lcl_candidates() {
+    let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
+    let quorum_backed = immutable_ledger(40, 0x10, 0x40);
+    master.note_last_valid_ledger(
+        *quorum_backed.header().hash.as_uint256(),
+        quorum_backed.header().seq,
+    );
+
+    let compatible = linked_ledger(&quorum_backed, 141);
+    let cached_conflict = immutable_ledger(41, 0x99, 0x41);
+    let acquired_conflict = immutable_ledger(42, 0x98, 0x42);
+    master
+        .ledger_history()
+        .insert(Arc::clone(&cached_conflict), false);
+
+    assert_eq!(
+        master.last_valid_ledger(),
+        Some((*quorum_backed.header().hash.as_uint256(), 40))
+    );
+    assert!(master.is_compatible(compatible.as_ref()));
+    assert!(
+        master
+            .ledger_history()
+            .get_cached_ledger_by_hash(cached_conflict.header().hash)
+            .is_some()
+    );
+    assert!(!master.is_compatible(cached_conflict.as_ref()));
+    // Acquired candidates take the identical guard after they enter the
+    // history cache; a conflicting acquired parent is still rejected.
+    assert!(!master.is_compatible(acquired_conflict.as_ref()));
+}
+
+#[test]
 fn set_full_ledger_current_acquisition_advances_validated_before_publish() {
     let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
     let persistence = LedgerPersistence::new(Arc::new(NoopPersistenceRuntime));

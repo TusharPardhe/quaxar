@@ -5,6 +5,7 @@
 //! default node-family ownership, optional SHAMap store ownership, and the
 //! `MainRuntime` shell.
 
+use crate::state::app_registry::RelayUntrustedPolicy;
 use crate::{
     ApplicationRoot, ApplicationRootOptions, BootstrapOverlayHandoff, DescriptorLimitProvider,
     LedgerReplay, MainRuntime, SHAMapStoreComponent, SHAMapStoreComponentRuntime,
@@ -13,6 +14,7 @@ use crate::{
 };
 use basics::base_uint::Uint256;
 use basics::basic_config::{BasicConfig, IniFileSections};
+use basics::chrono::NetClockTimePoint;
 use basics::string_utilities::str_unhex;
 use basics::tagged_cache::MonotonicClock;
 use ledger::{
@@ -20,6 +22,7 @@ use ledger::{
     NullOrderBookDBJournal, NullOrderBookDBRuntime, load_by_hash, load_by_index,
 };
 use nodestore::{FetchType, ManagerImp, NodeObjectType as NodeStoreObjectType};
+use overlay::Overlay;
 use protocol::{
     JsonValue, REGISTERED_FEATURES, STLedgerEntry, STParsedJSONObject, STTx, SerialIter, TxMeta,
     feature_id,
@@ -634,6 +637,18 @@ pub fn build_bootstrap_root(
 
     root.set_path_search_levels(path_search_old, path_search, path_search_fast);
     let _ = root.set_path_search_max(path_search_max);
+    for (section, is_validation) in [("relay_validations", true), ("relay_proposals", false)] {
+        if config.exists(section) {
+            let value = config.section(section).legacy().unwrap_or_default();
+            let policy = RelayUntrustedPolicy::parse(&value)
+                .map_err(|_| format!("invalid value specified in [{section}] section"))?;
+            if is_validation {
+                root.set_relay_untrusted_validations_policy(policy);
+            } else {
+                root.set_relay_untrusted_proposals_policy(policy);
+            }
+        }
+    }
     // Configure TxQ for standalone mode (higher min_txn prevents fee escalation).
     if options.standalone {
         root.tx_q().set_standalone(true);
@@ -982,8 +997,9 @@ fn run_start_mode_consensus_loop(
 
     // Consensus event channel for validations and ledger promotions
     let (event_tx, event_rx) = crate::consensus::driver::consensus_event_channel();
-    let (shared_completed_tx, shared_completed_rx) =
-        std::sync::mpsc::channel::<Arc<ledger::Ledger>>();
+    let (shared_completed_tx, shared_completed_rx) = std::sync::mpsc::sync_channel::<
+        crate::ledger::inbound_ledgers::CompletedInboundLedger,
+    >(1_024);
 
     let lm_rt_for_shared_inbound = runtime.root().ledger_master_runtime();
     // Use the app's shared TreeNodeCache (properly sized per node_size profile,
@@ -1085,6 +1101,87 @@ fn run_start_mode_consensus_loop(
         let fwd_stop = Arc::clone(&stop);
         let fwd_runtime = Arc::clone(&runtime);
         let fwd_event_tx = event_tx.clone();
+        if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+            let direct_event_tx = event_tx.clone();
+            let validation_root = runtime.root().clone();
+            let validation_overlay = overlay_rt.overlay();
+            overlay_rt
+                .overlay()
+                .queued_inbound()
+                .set_validation_router(Box::new(move |mut queued| {
+                    // Match PeerImp::onMessage(TMValidation): parse only far
+                    // enough to establish time and trust, then apply the
+                    // drop_untrusted policy before source retention or crypto.
+                    let mut serial = protocol::SerialIter::new(&queued.message.validation);
+                    let mut validation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        protocol::STValidation::from_serial_iter_default_node_id(&mut serial, false)
+                    }))
+                    .ok()
+                    .and_then(Result::ok);
+                    let Some(ref mut parsed_validation) = validation else {
+                        return;
+                    };
+                    let now = validation_root.shared_time_keeper().close_time();
+                    parsed_validation.set_seen(now.as_seconds());
+                    let current = {
+                        let validations = validation_root
+                            .validations()
+                            .validations()
+                            .lock()
+                            .expect("shared app validations mutex must not be poisoned");
+                        consensus::rcl_support::is_current(
+                            validations.parms(),
+                            now,
+                            NetClockTimePoint::from(parsed_validation.get_sign_time()),
+                            NetClockTimePoint::from(parsed_validation.get_seen_time()),
+                        )
+                    };
+                    if !current {
+                        return;
+                    }
+                    let signer = *parsed_validation.get_signer_public();
+                    let trusted = validation_root.validators().trusted(signer);
+                    if !trusted
+                        && validation_root
+                            .relay_untrusted_validations_policy()
+                            .should_drop()
+                    {
+                        return;
+                    }
+                    if !validation_overlay.admit_validation_source(
+                        queued.suppression,
+                        signer,
+                        queued.peer_id,
+                    ) {
+                        return;
+                    }
+                    if !trusted
+                        && (validation_overlay.peer_is_diverged(queued.peer_id)
+                            || validation_root.load_fee_track_loaded_local())
+                    {
+                        return;
+                    }
+                    let job_type = if trusted {
+                        crate::job::job_types::JobType::JtValidationT
+                    } else {
+                        crate::job::job_types::JobType::JtValidationUt
+                    };
+                    let event_tx = direct_event_tx.clone();
+                    queued.validation = validation;
+                    if !validation_root.job_queue().add_job(
+                        job_type,
+                        "checkValidation",
+                        move || {
+                            // The event-loop parser performs the signature
+                            // check after scheduling, matching checkValidation.
+                            let _ = event_tx
+                                .send(crate::consensus::driver::ConsensusEvent::Validation(queued));
+                        },
+                    ) {
+                        tracing::debug!(target: "consensus", "validation job rejected during shutdown");
+                    }
+                }));
+        }
         std::thread::Builder::new()
             .name("validation-forwarder".into())
             .spawn(move || {
@@ -1099,11 +1196,11 @@ fn run_start_mode_consensus_loop(
                     };
                     let validations = overlay_rt.overlay().take_validations();
                     for queued in validations {
-                        if fwd_event_tx
+                        match fwd_event_tx
                             .send(crate::consensus::driver::ConsensusEvent::Validation(queued))
-                            .is_err()
                         {
-                            return;
+                            Ok(()) => {}
+                            Err(_) => return,
                         }
                     }
                 }
@@ -1354,11 +1451,66 @@ fn run_start_mode_consensus_loop(
     // ===================================================================
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         let prop_tx = strand.proposal_tx.clone();
+        let proposal_root = runtime.root().clone();
+        let proposal_overlay = overlay_rt.overlay();
         overlay_rt
             .overlay()
             .queued_inbound()
             .set_proposal_router(Box::new(move |proposal| {
-                let _ = prop_tx.send(proposal);
+                let trusted = proposal_root.validators().trusted(proposal.public_key);
+                let policy = proposal_root.relay_untrusted_proposals_policy();
+                // Drop policy precedes HashRouter source admission and the
+                // later signature check, exactly as in PeerImp::onMessage.
+                if !trusted && policy.should_drop() {
+                    return;
+                }
+                if !proposal_overlay.admit_proposal_source(
+                    proposal.suppression,
+                    proposal.public_key,
+                    proposal.peer_id,
+                ) {
+                    return;
+                }
+                let cluster = proposal_overlay
+                    .find_peer_by_short_id(proposal.peer_id)
+                    .is_some_and(|peer| peer.cluster());
+                if !trusted
+                    && (proposal_overlay.peer_is_diverged(proposal.peer_id)
+                        || (!cluster && proposal_root.load_fee_track_loaded_local()))
+                {
+                    return;
+                }
+                let proposal_tx = prop_tx.clone();
+                let job_root = proposal_root.clone();
+                let job_type = if trusted {
+                    crate::job::job_types::JobType::JtProposalT
+                } else {
+                    crate::job::job_types::JobType::JtProposalUt
+                };
+                if !proposal_root
+                    .job_queue()
+                    .add_job(job_type, "checkPropose", move || {
+                        // Only cluster traffic bypasses the scheduled
+                        // signature check. Untrusted traffic never enters the
+                        // consensus strand; it may still relay under `all`.
+                        if !cluster && !proposal.check_sign() {
+                            return;
+                        }
+                        if trusted {
+                            let _ = proposal_tx.send(proposal);
+                        } else if policy.should_relay() || cluster {
+                            if let Some(overlay_runtime) = job_root.overlay_runtime() {
+                                overlay_runtime.overlay().relay_proposal(
+                                    proposal.message,
+                                    proposal.suppression,
+                                    proposal.public_key,
+                                );
+                            }
+                        }
+                    })
+                {
+                    tracing::debug!(target: "consensus", "proposal job rejected during shutdown");
+                }
             }));
     }
 
@@ -1466,15 +1618,29 @@ fn run_start_mode_consensus_loop(
         std::thread::Builder::new()
             .name("map-complete-fwd".into())
             .spawn(move || {
+                let mut pending = None;
                 loop {
-                    match rx.recv() {
-                        Ok(item) => {
-                            if fwd_stop.load(Ordering::Acquire) {
-                                break;
-                            }
-                            let _ = txset_tx.send(item);
+                    if fwd_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let item = match pending.take() {
+                        Some(item) => item,
+                        None => match rx.recv_timeout(Duration::from_millis(25)) {
+                            Ok(item) => item,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        },
+                    };
+                    match txset_tx.try_send(item) {
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::TrySendError::Full(item)) => {
+                            // Keep the one item in hand and retry. Further
+                            // producer-side overflows are retained by
+                            // InboundTransactions' durable completion map.
+                            pending = Some(item);
+                            std::thread::sleep(Duration::from_millis(1));
                         }
-                        Err(_) => break,
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                     }
                 }
             })

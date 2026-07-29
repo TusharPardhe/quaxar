@@ -161,6 +161,14 @@ impl ManagedComponent for AppLedgerRuntime {
 
 /// Command sent from external code to the consensus strand thread.
 pub enum ConsensusCommand {
+    /// A `JtNetopTimer` job reached the consensus strand. The strand, rather
+    /// than the worker, executes `timer_tick` because it exclusively owns the
+    /// consensus state machine.
+    Heartbeat,
+    /// A `JtAccept` job reached the consensus strand. Keeping the ledger build
+    /// and its `endConsensus → startRound` tail on the owner strand prevents a
+    /// JobQueue worker from racing a timer or peer-proposal mutation.
+    Accept(crate::consensus::rcl_consensus::PendingAcceptWork),
     StartRound {
         now: basics::chrono::NetClockTimePoint,
         prev_ledger_id: basics::base_uint::Uint256,
@@ -186,7 +194,7 @@ pub struct AppConsensusRuntime {
     /// Updated by the strand thread after each state transition
     prev_ledger_id: Arc<parking_lot::Mutex<basics::base_uint::Uint256>>,
     /// Channel to send commands to the strand thread
-    cmd_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<ConsensusCommand>>>>,
+    cmd_tx: Arc<Mutex<Option<std::sync::mpsc::SyncSender<ConsensusCommand>>>>,
     /// Receiver for map-complete events (tx-set acquisitions)
     map_complete_rx: Arc<
         Mutex<
@@ -239,7 +247,7 @@ impl AppConsensusRuntime {
     }
 
     /// Set the command sender (strand thread provides this after starting).
-    pub fn set_cmd_sender(&self, tx: std::sync::mpsc::Sender<ConsensusCommand>) {
+    pub fn set_cmd_sender(&self, tx: std::sync::mpsc::SyncSender<ConsensusCommand>) {
         *self.cmd_tx.lock().expect("cmd_tx mutex") = Some(tx);
     }
 
@@ -251,7 +259,7 @@ impl AppConsensusRuntime {
         prev_ledger: consensus::RclCxLedger,
     ) {
         if let Some(tx) = self.cmd_tx.lock().expect("cmd_tx mutex").as_ref() {
-            let _ = tx.send(ConsensusCommand::StartRound {
+            let _ = tx.try_send(ConsensusCommand::StartRound {
                 now,
                 prev_ledger_id,
                 prev_ledger,
@@ -262,7 +270,7 @@ impl AppConsensusRuntime {
     /// Send a stop command to the strand thread.
     pub fn send_stop(&self) {
         if let Some(tx) = self.cmd_tx.lock().expect("cmd_tx mutex").as_ref() {
-            let _ = tx.send(ConsensusCommand::Stop);
+            let _ = tx.try_send(ConsensusCommand::Stop);
         }
     }
 

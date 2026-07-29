@@ -314,11 +314,9 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
 /// persist it via `store` regardless of trust (matching the reference's
 /// unconditional store-on-accept behavior).
 ///
-/// `bypass_accept` mirrors the reference's `NetworkOPsImp::recvValidation`
-/// dedup rule: when a validation for the same ledger hash is already
-/// mid-flight, later arrivals are still added to the tracker but skip the
-/// acceptance-sink notification (since the first arrival already
-/// triggered it).
+/// Every current trusted validation returns acceptance work. The caller must
+/// run that work after releasing the validations mutex so each arrival can
+/// re-evaluate quorum without self-deadlocking.
 pub fn handle_new_validation_with_store(
     trust_source: &dyn RclValidationTrustSource,
     validations: &mut RclValidationsInner,
@@ -360,7 +358,7 @@ pub fn handle_new_validation_with_store(
 
     let mut check_accept_args = None;
     if status == consensus::ValidationStatus::Current {
-        if !bypass_accept && validation.is_trusted() {
+        if validation.is_trusted() && !bypass_accept {
             // Matches the reference (RCLValidations.cpp:193):
             // `if (outcome == ValStatus::current && isTrusted)`
             //     `app.getLedgerMaster().checkAccept(...)`.

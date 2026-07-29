@@ -19,6 +19,7 @@ use basics::tagged_cache::MonotonicClock;
 use ledger::{CanonicalTXSet, Ledger, LedgerMaster, LedgerMasterConfig, NullLedgerJournal};
 use protocol::STTx;
 use shamap::traversal::TraversalError;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub type AppLedgerMaster = LedgerMaster<MonotonicClock, HardenedHashBuilder>;
@@ -27,9 +28,17 @@ pub type AppLedgerMaster = LedgerMaster<MonotonicClock, HardenedHashBuilder>;
 pub struct AppLedgerMasterRuntime {
     ledger_master: Arc<AppLedgerMaster>,
     pub(crate) pending_consensus_ledger: Arc<Mutex<Option<Uint256>>>,
-    pub(crate) completed_ledgers_rx:
-        Arc<Mutex<Option<std::sync::mpsc::Receiver<Arc<ledger::Ledger>>>>>,
+    pub(crate) completed_ledgers_rx: Arc<
+        Mutex<
+            Option<
+                std::sync::mpsc::Receiver<crate::ledger::inbound_ledgers::CompletedInboundLedger>,
+            >,
+        >,
+    >,
     pub inbound_ledgers: Arc<Mutex<Option<Arc<crate::ledger::inbound_ledgers::InboundLedgers>>>>,
+    /// Sequence of the ledger currently being built by consensus. This lets
+    /// acquisition avoid racing the close path for the same next ledger.
+    building_ledger_seq: Arc<AtomicU32>,
 }
 
 const APP_LEDGER_MASTER_MAX_PUBLISH_GAP: u32 = 100;
@@ -75,6 +84,7 @@ impl AppLedgerMasterRuntime {
             pending_consensus_ledger: Arc::new(Mutex::new(None)),
             completed_ledgers_rx: Arc::new(Mutex::new(None)),
             inbound_ledgers: Arc::new(Mutex::new(None)),
+            building_ledger_seq: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -156,6 +166,19 @@ impl AppLedgerMasterRuntime {
             *next_open_ledger_parent_hash.as_uint256(),
             process_transaction_set,
         )
+    }
+
+    /// Mark the next ledger sequence that consensus is about to build.
+    /// Mirrors `LedgerMaster::setBuildingLedger` in rippled.
+    pub fn set_building_ledger(&self, seq: u32) {
+        self.building_ledger_seq.store(seq, Ordering::Release);
+    }
+
+    pub fn building_ledger(&self) -> Option<u32> {
+        match self.building_ledger_seq.load(Ordering::Acquire) {
+            0 => None,
+            seq => Some(seq),
+        }
     }
 
     pub fn check_accept(&self, hash: Uint256, seq: u32) -> bool {

@@ -787,6 +787,45 @@ fn default_app_tx_q() -> SharedAppTxQ {
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i8)]
+pub enum RelayUntrustedPolicy {
+    DropUntrusted = -1,
+    Trusted = 0,
+    All = 1,
+}
+
+impl RelayUntrustedPolicy {
+    pub const fn should_drop(self) -> bool {
+        matches!(self, Self::DropUntrusted)
+    }
+
+    pub const fn should_relay(self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    pub fn from_i8(value: i8) -> Self {
+        match value {
+            -1 => Self::DropUntrusted,
+            0 => Self::Trusted,
+            1 => Self::All,
+            _ => Self::Trusted,
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        if value.eq_ignore_ascii_case("all") {
+            Ok(Self::All)
+        } else if value.eq_ignore_ascii_case("trusted") {
+            Ok(Self::Trusted)
+        } else if value.eq_ignore_ascii_case("drop_untrusted") {
+            Ok(Self::DropUntrusted)
+        } else {
+            Err(format!("invalid untrusted relay policy: {value}"))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub wallet_db_path: PathBuf,
@@ -794,7 +833,8 @@ pub struct AppConfig {
     pub path_search: u32,
     pub path_search_fast: u32,
     pub path_search_max: u32,
-    pub relay_untrusted_validations: bool,
+    pub relay_untrusted_validations: RelayUntrustedPolicy,
+    pub relay_untrusted_proposals: RelayUntrustedPolicy,
     pub standalone: bool,
     pub start_up: xrpl_core::StartUpType,
     pub start_ledger: Option<String>,
@@ -812,7 +852,8 @@ impl Default for AppConfig {
             path_search: 2,
             path_search_fast: 2,
             path_search_max: 2,
-            relay_untrusted_validations: false,
+            relay_untrusted_validations: RelayUntrustedPolicy::All,
+            relay_untrusted_proposals: RelayUntrustedPolicy::Trusted,
             standalone: false,
             start_up: xrpl_core::StartUpType::Fresh,
             start_ledger: None,
@@ -1168,7 +1209,8 @@ impl ApplicationRegistryOwners {
                 path_search: 2,
                 path_search_fast: 2,
                 path_search_max: 3,
-                relay_untrusted_validations: false,
+                relay_untrusted_validations: RelayUntrustedPolicy::All,
+                relay_untrusted_proposals: RelayUntrustedPolicy::Trusted,
                 standalone: false,
                 start_up: xrpl_core::StartUpType::Fresh,
                 start_ledger: None,
@@ -1200,14 +1242,35 @@ fn unique_wallet_db_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_OPEN_LEDGER_DEFAULT_BASE_FEE_DROPS, AppLogs, AppOpenLedgerTxRecord, AppPlaceholder,
-        unique_wallet_db_dir,
+        APP_OPEN_LEDGER_DEFAULT_BASE_FEE_DROPS, AppConfig, AppLogs, AppOpenLedgerTxRecord,
+        AppPlaceholder, RelayUntrustedPolicy, unique_wallet_db_dir,
     };
     use crate::load::load_manager::LoadManagerJournal;
     use basics::base_uint::Uint256;
     use protocol::JsonValue;
     use std::sync::Arc;
     use xrpl_core::{HashRouterFlags, LoadMonitorJournalFactory, NetworkIDService};
+
+    #[test]
+    fn relay_untrusted_policy_defaults_and_parser_match_rippled() {
+        let config = AppConfig::default();
+        assert_eq!(
+            config.relay_untrusted_validations,
+            RelayUntrustedPolicy::All
+        );
+        assert_eq!(
+            config.relay_untrusted_proposals,
+            RelayUntrustedPolicy::Trusted
+        );
+        for (name, policy) in [
+            ("ALL", RelayUntrustedPolicy::All),
+            ("TrUsTeD", RelayUntrustedPolicy::Trusted),
+            ("DROP_UNTRUSTED", RelayUntrustedPolicy::DropUntrusted),
+        ] {
+            assert_eq!(RelayUntrustedPolicy::parse(name), Ok(policy));
+        }
+        assert!(RelayUntrustedPolicy::parse("relay").is_err());
+    }
 
     #[test]
     fn app_logs_reuse_named_journals_and_keep_entries() {

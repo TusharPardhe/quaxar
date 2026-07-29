@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use basics::base_uint::Uint256;
 use protocol::{JsonValue, PublicKey};
 use rustls::{ClientConfig, ServerConfig};
 
@@ -106,6 +107,18 @@ pub trait Overlay: Send + Sync {
     fn network_id(&self) -> Option<u32>;
     fn verify_endpoints(&self) -> bool;
     fn tx_metrics(&self) -> JsonValue;
+    /// Admit a proposal source into relay history, including duplicate
+    /// source-slot accounting. Returns false for an existing suppression key.
+    fn admit_proposal_source(&self, uid: Uint256, validator: PublicKey, peer_id: PeerId) -> bool;
+    /// Admit a validation source into relay history, including duplicate
+    /// source-slot accounting. Returns false for an existing suppression key.
+    fn admit_validation_source(&self, uid: Uint256, validator: PublicKey, peer_id: PeerId) -> bool;
+    /// Whether the peer has diverged far enough to reject untrusted consensus
+    /// traffic before scheduling expensive verification work.
+    fn peer_is_diverged(&self, peer_id: PeerId) -> bool;
+    /// Add a local validation suppression entry without recording an ingress
+    /// source or a relay timestamp, matching HashRouter::addSuppression.
+    fn suppress_validation(&self, uid: Uint256);
     fn sweep_relay_history(&self, max_entries: u64);
     fn stats(&self) -> OverlayStats {
         OverlayStats {

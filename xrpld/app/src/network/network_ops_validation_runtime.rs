@@ -2,7 +2,6 @@
 //!
 //! This ports the narrow `NetworkOPsImp::recvValidation(...)` /
 //! `pubValidation(...)` ownership that now has enough landed Rust seams:
-//! - dedupe through the current `pendingValidations_` rule keyed by ledger hash,
 //! - trust / listing / validation-store updates through the shared app validations owner,
 //! - current `validationReceived` JSON shaping for downstream subscribers,
 //! - and the relay gate for trusted versus optionally-untrusted validations.
@@ -11,14 +10,14 @@ use crate::consensus::rcl_validations::{
     RclValidationAcceptanceSink, RclValidationJournal, SharedAppValidations,
     handle_new_validation_with_store,
 };
-use crate::state::app_registry::AppJournal;
+use crate::state::app_registry::{AppJournal, RelayUntrustedPolicy};
 use crate::state::application_root::ApplicationRoot;
 use crate::validator::validator_list::{SystemValidatorListClock, ValidatorList};
 use basics::base_uint::Uint256;
 use basics::str_hex::str_hex;
 use protocol::{JsonValue, PublicKey, STValidation, get_field_by_symbol};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use xrpl_core::{NetworkIDService, ServiceRegistry};
 
@@ -56,10 +55,10 @@ pub struct AppNetworkOpsValidationReceiveReport {
 pub struct AppNetworkOpsValidationRuntime {
     validations: SharedAppValidations<crate::state::time_keeper::SystemTimeKeeperClock>,
     validators: Arc<ValidatorList<SystemValidatorListClock>>,
-    pending_validations: Mutex<BTreeSet<Uint256>>,
     publisher: Mutex<Option<Arc<dyn NetworkOpsValidationPublisher>>>,
+    pending_validations: Mutex<BTreeSet<Uint256>>,
     network_id: AtomicU32,
-    relay_untrusted_validations: AtomicBool,
+    relay_untrusted_validations: AtomicI8,
     journal: Arc<AppJournal>,
 }
 
@@ -83,22 +82,44 @@ impl AppNetworkOpsValidationRuntime {
         Self {
             validations,
             validators,
-            pending_validations: Mutex::new(BTreeSet::new()),
             publisher: Mutex::new(None),
+            pending_validations: Mutex::new(BTreeSet::new()),
             network_id: AtomicU32::new(network_id),
-            relay_untrusted_validations: AtomicBool::new(relay_untrusted_validations),
+            relay_untrusted_validations: AtomicI8::new(if relay_untrusted_validations {
+                1
+            } else {
+                0
+            }),
             journal,
         }
     }
 
     pub fn from_application_root(root: &ApplicationRoot) -> Self {
-        Self::new(
+        Self::new_with_policy(
             root.validations().clone(),
             root.validators(),
             root.get_network_id_service().get_network_id(),
-            root.relay_untrusted_validations(),
+            root.relay_untrusted_validations_policy(),
             root.logs().journal("NetworkOPs"),
         )
+    }
+
+    pub fn new_with_policy(
+        validations: SharedAppValidations<crate::state::time_keeper::SystemTimeKeeperClock>,
+        validators: Arc<ValidatorList<SystemValidatorListClock>>,
+        network_id: u32,
+        relay_untrusted_validations: RelayUntrustedPolicy,
+        journal: Arc<AppJournal>,
+    ) -> Self {
+        Self {
+            validations,
+            validators,
+            publisher: Mutex::new(None),
+            pending_validations: Mutex::new(BTreeSet::new()),
+            network_id: AtomicU32::new(network_id),
+            relay_untrusted_validations: AtomicI8::new(relay_untrusted_validations as i8),
+            journal,
+        }
     }
 
     pub fn validations(
@@ -120,24 +141,25 @@ impl AppNetworkOpsValidationRuntime {
         }
     }
 
+    /// Number of ledgers currently being processed through recvValidation.
     pub fn pending_validation_count(&self) -> usize {
         self.pending_validations
             .lock()
-            .expect("network ops validation pending set mutex must not be poisoned")
+            .expect("pending validations mutex must not be poisoned")
             .len()
     }
 
     pub fn insert_pending_validation(&self, ledger_hash: Uint256) -> bool {
         self.pending_validations
             .lock()
-            .expect("network ops validation pending set mutex must not be poisoned")
+            .expect("pending validations mutex must not be poisoned")
             .insert(ledger_hash)
     }
 
     pub fn remove_pending_validation(&self, ledger_hash: &Uint256) -> bool {
         self.pending_validations
             .lock()
-            .expect("network ops validation pending set mutex must not be poisoned")
+            .expect("pending validations mutex must not be poisoned")
             .remove(ledger_hash)
     }
 
@@ -168,12 +190,30 @@ impl AppNetworkOpsValidationRuntime {
     }
 
     pub fn relay_untrusted_validations(&self) -> bool {
-        self.relay_untrusted_validations.load(Ordering::Acquire)
+        self.relay_untrusted_validations_policy().should_relay()
+    }
+
+    pub fn relay_untrusted_validations_policy(&self) -> RelayUntrustedPolicy {
+        RelayUntrustedPolicy::from_i8(self.relay_untrusted_validations.load(Ordering::Acquire))
     }
 
     pub fn set_relay_untrusted_validations(&self, relay_untrusted_validations: bool) -> bool {
-        self.relay_untrusted_validations
-            .swap(relay_untrusted_validations, Ordering::AcqRel)
+        self.set_relay_untrusted_validations_policy(if relay_untrusted_validations {
+            RelayUntrustedPolicy::All
+        } else {
+            RelayUntrustedPolicy::Trusted
+        })
+        .should_relay()
+    }
+
+    pub fn set_relay_untrusted_validations_policy(
+        &self,
+        relay_untrusted_validations: RelayUntrustedPolicy,
+    ) -> RelayUntrustedPolicy {
+        RelayUntrustedPolicy::from_i8(
+            self.relay_untrusted_validations
+                .swap(relay_untrusted_validations as i8, Ordering::AcqRel),
+        )
     }
 
     pub fn publish_validation(&self, validation: &STValidation) -> bool {
@@ -220,18 +260,10 @@ impl AppNetworkOpsValidationRuntime {
         // the local-receipt-time staleness check. This is acceptable for
         // --start mode clusters where all nodes share the same network.
 
-        let bypass_accept = {
-            let mut pending = self
-                .pending_validations
-                .lock()
-                .expect("network ops validation pending set mutex must not be poisoned");
-            if pending.contains(&ledger_hash) {
-                true
-            } else {
-                pending.insert(ledger_hash);
-                false
-            }
-        };
+        // `NetworkOPsImp::recvValidation` keeps the hash pending while the
+        // first handler runs. Concurrent same-ledger arrivals remain tracked
+        // and published, but bypass a nested checkAccept.
+        let bypass_accept = !self.insert_pending_validation(ledger_hash);
 
         let (current, check_accept_args) = {
             let mut validations = self
@@ -262,14 +294,10 @@ impl AppNetworkOpsValidationRuntime {
             sink.check_accept(hash, seq);
         }
 
-        if !bypass_accept {
-            self.pending_validations
-                .lock()
-                .expect("network ops validation pending set mutex must not be poisoned")
-                .remove(&ledger_hash);
-        }
-
         let published = self.publish_validation(validation);
+        if !bypass_accept {
+            self.remove_pending_validation(&ledger_hash);
+        }
         let relay = self.relay_untrusted_validations() || validation.is_trusted();
 
         AppNetworkOpsValidationReceiveReport {

@@ -36,11 +36,13 @@
 //! *different* concrete type with its own eagerly-cached ancestor vector.
 
 use basics::unordered_containers::HashSet;
+use std::collections::HashSet as StdHashSet;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration as StdDuration;
 
 use basics::base_uint::Uint256;
 use basics::chrono::NetClockTimePoint;
+use basics::sha_map_hash::SHAMapHash;
 use consensus::algorithm::types::{ConsensusCloseTimes, ConsensusMode};
 use consensus::{Consensus, ConsensusParms};
 use protocol::PublicKey;
@@ -49,7 +51,7 @@ use crate::consensus::rcl_cx_peer_pos::{Proposal, RclCxPeerPos, sign_proposal};
 use crate::consensus::rcl_validations::SharedAppValidations;
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::load::fee_vote::FeeVote;
-use crate::network::network_ops::AppNetworkOpsModeOwner;
+use crate::network::network_ops::{AppNetworkOpsModeOwner, NetworkOpsOperatingMode};
 use crate::state::app_registry::{AppInboundTransactions, SharedAppOpenLedger};
 use crate::state::application_root::{ApplicationRoot, LedgerAcceptor};
 use crate::state::time_keeper::{SystemTimeKeeperClock, TimeKeeper};
@@ -117,6 +119,15 @@ fn pseudo_transaction_voting_enabled(options: AppRclConsensusOptions, mode: Cons
 
 fn trusted_validation_quorum_reached(validations: usize, quorum: usize) -> bool {
     validations >= quorum
+}
+
+fn update_operating_mode_after_accept(
+    network_ops_mode_owner: &AppNetworkOpsModeOwner,
+    positions: usize,
+) {
+    if positions == 0 && network_ops_mode_owner.operating_mode() == NetworkOpsOperatingMode::Full {
+        network_ops_mode_owner.set_operating_mode_direct(NetworkOpsOperatingMode::Connected);
+    }
 }
 
 /// The open-ledger view consensus reads current (not-yet-consensus-agreed)
@@ -334,6 +345,11 @@ pub struct PendingAcceptWork {
     pub close_time: u32,
     pub close_resolution: u8,
     pub correct_close_time: bool,
+    /// Hash of the consensus transaction set that built this ledger.
+    pub consensus_hash: Uint256,
+    /// `false` means consensus accepted while on a wrong LCL, so the
+    /// outward status event must be `neLOST_SYNC`.
+    pub have_correct_lcl: bool,
     pub base_fee_drops: u64,
     pub txns: Vec<Arc<protocol::STTx>>,
     pub validation: Option<crate::state::application_root::PendingValidation>,
@@ -604,16 +620,27 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         now: NetClockTimePoint,
         mode: ConsensusMode,
     ) -> consensus::algorithm::consensus::ConsensusResultOf<Self> {
-        // Acquire the close gate to prevent the tx-batch-apply thread from
-        // applying transactions while we capture the open ledger's transaction
-        // set. This matches rippled's single-strand guarantee where timerEntry
-        // (which calls onClose) and the batch-apply path cannot interleave.
+        // Match RCLConsensus::Adaptor::onClose ordering: advertise that we
+        // are closing, re-inject held transactions, mark the ledger being
+        // built, then take one immutable transaction snapshot under the close
+        // gate. This prevents the submission path from interleaving with the
+        // snapshot.
         let txs = {
             let _close_guard = self
                 .app_root
                 .close_gate()
                 .lock()
                 .expect("close_gate mutex must not be poisoned");
+            self.app_root.broadcast_consensus_status_change(
+                prev_ledger.ledger().as_ref(),
+                1, // neCLOSING_LEDGER
+                mode != ConsensusMode::WrongLedger,
+            );
+            let next_seq = prev_ledger.seq().saturating_add(1);
+            self.ledger_master_runtime.set_building_ledger(next_seq);
+            let _ = self
+                .app_root
+                .apply_held_transactions_to_network_ops(SHAMapHash::new(prev_ledger.id()), |_| {});
             let _ = self.app_root.apply_network_ops_pending_to_open_ledger();
             RclConsensusOpenLedgerSource::current_open_transactions(&self.open_ledger)
         };
@@ -874,6 +901,8 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 close_time,
                 close_resolution: close_resolution_secs,
                 correct_close_time: close_time_correct,
+                consensus_hash: result.txns.id(),
+                have_correct_lcl: mode != ConsensusMode::WrongLedger,
                 base_fee_drops: base_fee,
                 txns,
                 validation: pending_validation,
@@ -938,8 +967,44 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
         consensus::algorithm::timing::round_close_time(raw, resolution)
     }
 
-    fn validators_count(&self) -> usize {
-        self.validators.unl_size()
+    fn valid_ledger_seq(&self) -> u32 {
+        self.ledger_master_runtime
+            .ledger_master()
+            .valid_ledger_seq()
+    }
+
+    fn quorum_keys(&self) -> (usize, HashSet<PublicKey>) {
+        let (quorum, keys) = self.validators.get_quorum_keys();
+        (quorum, keys.into_iter().collect())
+    }
+
+    fn laggards(&self, seq: u32, trusted_keys: &mut HashSet<PublicKey>) -> usize {
+        // The generic consensus layer deliberately uses its hardened HashSet,
+        // while the existing validation tracker predates that boundary and
+        // owns a standard HashSet. Preserve rippled's mutating contract by
+        // moving all keys into the tracker, then restoring only its remaining
+        // (offline) keys to the generic set.
+        let mut validation_keys: StdHashSet<_> = trusted_keys.drain().collect();
+        let laggards = self
+            .validations
+            .validations()
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .laggards(seq, &mut validation_keys);
+        trusted_keys.extend(validation_keys);
+        laggards
+    }
+
+    fn validator(&self) -> bool {
+        self.is_validator()
+    }
+
+    fn have_validated(&self) -> bool {
+        self.ledger_master_runtime.ledger_master().have_validated()
+    }
+
+    fn update_operating_mode(&self, positions: usize) {
+        update_operating_mode_after_accept(&self.network_ops_mode_owner, positions);
     }
 }
 
@@ -1057,6 +1122,15 @@ impl AppConsensus {
             work.txns,
         ) {
             Ok(outcome) => {
+                // This is the live `doAccept` handoff. Run the exact
+                // LedgerMaster::consensusBuilt lifecycle once, after the
+                // ledger exists and before open-ledger or next-round work.
+                // The helper clears building state, records built-history
+                // metadata, checks this ledger, then scans alternate trusted
+                // candidates.
+                if let Some(closed) = root.closed_ledger() {
+                    root.record_consensus_built_ledger(Arc::clone(&closed), work.consensus_hash);
+                }
                 if let Some(closed) = root.closed_ledger() {
                     RclConsensusOpenLedgerSource::accept_consensus_ledger(
                         &self.adaptor.open_ledger,
@@ -1080,25 +1154,11 @@ impl AppConsensus {
                 // Broadcast StatusChange (neACCEPTED_LEDGER) and sign/publish validation.
                 if let Some(closed) = root.closed_ledger() {
                     let hdr = closed.header();
-                    if let Some(overlay_rt) = root.overlay_runtime() {
-                        use overlay::Overlay;
-                        let status =
-                            overlay::ProtocolMessage::new(overlay::ProtocolPayload::StatusChange(
-                                overlay::message::wire::TmStatusChange {
-                                    new_status: None,
-                                    new_event: Some(2), // neACCEPTED_LEDGER
-                                    ledger_seq: Some(hdr.seq),
-                                    ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
-                                    ledger_hash_previous: Some(
-                                        hdr.parent_hash.as_uint256().data().to_vec(),
-                                    ),
-                                    network_time: None,
-                                    first_seq: Some(0),
-                                    last_seq: Some(0),
-                                },
-                            ));
-                        overlay_rt.overlay().broadcast(&status);
-                    }
+                    root.broadcast_consensus_status_change(
+                        closed.as_ref(),
+                        2, // neACCEPTED_LEDGER
+                        work.have_correct_lcl,
+                    );
 
                     if let Some(pending) = work.validation {
                         tracing::info!(target: "consensus", closed_seq, proposing = pending.proposing, "execute_accept: signing validation");
@@ -1258,11 +1318,25 @@ impl AppConsensus {
                             "synchronous accept: peers prefer different chain"
                         );
                         if let Some(lm_rt) = root.ledger_master_runtime() {
-                            if let Some(network_ledger) = lm_rt.ledger_master().get_ledger_by_hash(
-                                basics::sha_map_hash::SHAMapHash::new(network_closed),
-                            ) {
-                                root.on_closed_ledger(Arc::clone(&network_ledger));
-                                Some(network_ledger)
+                            if lm_rt
+                                .ledger_master()
+                                .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(
+                                    network_closed,
+                                ))
+                                .is_some()
+                            {
+                                // Cached and acquired preferred LCLs must take
+                                // the same strand-owned switchLastClosedLedger
+                                // path. Do not partially install a cached LCL
+                                // here and skip open-ledger/TxQ/trust/status
+                                // work that an acquired LCL receives.
+                                root.set_need_network_ledger(true);
+                                self.adaptor
+                                    .network_ops_mode_owner
+                                    .set_operating_mode_direct(
+                                    crate::network::network_ops::NetworkOpsOperatingMode::Connected,
+                                );
+                                None
                             } else {
                                 // Network ledger not locally available — acquire from peers.
                                 // Set need_network_ledger so the strand's switchLastClosedLedger
@@ -1302,23 +1376,7 @@ impl AppConsensus {
                         let prev_id = *round_ledger.header().hash.as_uint256();
                         let prev_cx = crate::consensus_ledger_from_ledger(&round_ledger);
 
-                        if self.adaptor.validators.count() > 0
-                            && self.adaptor.validators.unl_size() == 0
-                        {
-                            self.adaptor.network_ops_mode_owner.set_unl_blocked(true);
-                        } else {
-                            self.adaptor.network_ops_mode_owner.set_unl_blocked(false);
-                        }
-
-                        let now_untrusted = self.compute_now_untrusted();
-                        self.state.start_round(
-                            &self.adaptor,
-                            now,
-                            prev_id,
-                            prev_cx,
-                            &now_untrusted,
-                            proposing,
-                        );
+                        self.start_round(now, prev_id, prev_cx, proposing);
                         tracing::info!(
                             target: "consensus",
                             closed_seq,
@@ -1348,15 +1406,7 @@ impl AppConsensus {
                         // happen). Start round on our ledger as a fallback.
                         let prev_id = *closed.header().hash.as_uint256();
                         let prev_cx = crate::consensus_ledger_from_ledger(&closed);
-                        let now_untrusted = self.compute_now_untrusted();
-                        self.state.start_round(
-                            &self.adaptor,
-                            now,
-                            prev_id,
-                            prev_cx,
-                            &now_untrusted,
-                            false,
-                        );
+                        self.start_round(now, prev_id, prev_cx, false);
                         tracing::warn!(
                             target: "consensus",
                             closed_seq,
@@ -1376,15 +1426,7 @@ impl AppConsensus {
                 if let Some(closed) = root.closed_ledger() {
                     let prev_id = *closed.header().hash.as_uint256();
                     let prev_cx = crate::consensus_ledger_from_ledger(&closed);
-                    let now_untrusted = self.compute_now_untrusted();
-                    self.state.start_round(
-                        &self.adaptor,
-                        now,
-                        prev_id,
-                        prev_cx,
-                        &now_untrusted,
-                        false,
-                    );
+                    self.start_round(now, prev_id, prev_cx, false);
                     tracing::warn!(
                         target: "consensus",
                         closed_seq,
@@ -1402,10 +1444,16 @@ mod tests {
     use super::{
         AppRclConsensusOptions, decode_consensus_accept_transactions,
         pseudo_transaction_voting_enabled, trusted_validation_quorum_reached,
+        update_operating_mode_after_accept,
+    };
+    use crate::network::network_ops::{
+        AppNetworkOpsModeOwner, NetworkOpsOperatingMode, SharedNetworkOpsState,
     };
     use basics::base_uint::Uint256;
     use consensus::algorithm::types::ConsensusMode;
     use protocol::{AccountID, STAmount, STTx, TxType, get_field_by_symbol};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn consensus_pseudo_transaction_voting_requires_proposing_or_standalone_and_quorum() {
@@ -1426,6 +1474,16 @@ mod tests {
         ));
         assert!(trusted_validation_quorum_reached(3, 3));
         assert!(!trusted_validation_quorum_reached(2, 3));
+    }
+
+    #[test]
+    fn consensus_accept_with_no_positions_downgrades_full_operating_mode() {
+        let state = Arc::new(SharedNetworkOpsState::new(NetworkOpsOperatingMode::Full));
+        let owner = AppNetworkOpsModeOwner::new(Arc::clone(&state), Arc::new(|| Duration::ZERO));
+
+        update_operating_mode_after_accept(&owner, 0);
+
+        assert_eq!(state.operating_mode(), NetworkOpsOperatingMode::Connected);
     }
 
     #[test]
@@ -1506,6 +1564,36 @@ impl ConsensusRunner for AppConsensus {
         prev_ledger: RclCxLedger,
         proposing: bool,
     ) {
+        // Every AppConsensus start path, including initial, external, and
+        // accepted-phase recovery starts, must run the beginConsensus trust
+        // prelude against the LCL actually selected for this round. Rippled
+        // refuses beginConsensus when that LCL cannot be loaded, rather than
+        // starting a round with stale NegativeUNL/trusted state.
+        let lcl = self
+            .adaptor
+            .ledger_master_runtime
+            .ledger_master()
+            .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(prev_ledger_id))
+            .or_else(|| {
+                self.adaptor
+                    .app_root
+                    .closed_ledger()
+                    .filter(|ledger| *ledger.header().hash.as_uint256() == prev_ledger_id)
+            });
+        let Some(lcl) = lcl else {
+            self.adaptor
+                .network_ops_mode_owner
+                .set_operating_mode_direct(
+                    crate::network::network_ops::NetworkOpsOperatingMode::Connected,
+                );
+            tracing::warn!(target: "consensus", %prev_ledger_id,
+                "refusing consensus round because selected LCL is unavailable");
+            return;
+        };
+        self.adaptor
+            .app_root
+            .refresh_validator_trust_for_consensus(lcl.as_ref());
+
         if self.adaptor.validators.count() > 0 && self.adaptor.validators.unl_size() == 0 {
             self.adaptor.network_ops_mode_owner.set_unl_blocked(true);
         } else {

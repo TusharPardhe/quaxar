@@ -16,7 +16,7 @@ mod registry;
 mod worker_pool;
 
 pub use self::acquisition::{AcquisitionState, stash_stale_packet};
-pub use self::registry::{AcquireReason, InboundLedgers};
+pub use self::registry::{AcquireReason, CompletedInboundLedger, InboundLedgers};
 pub use self::worker_pool::WorkerPool;
 
 // ─── Backward-compatible stub ────────────────────────────────────────────────

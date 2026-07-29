@@ -24,7 +24,8 @@ use tokio::time::timeout;
 use super::{
     OverlayHandoff, OverlayImpl, OverlayInboundRouter, PEERFINDER_LIVE_CACHE_TTL,
     PEERFINDER_MAX_ACCEPTED_ENDPOINTS, PEERFINDER_MAX_HOPS, PEERFINDER_REDIRECT_ENDPOINT_COUNT,
-    PeerReservation, PeerReservationSource, PeerReservationTable, is_valid_peer_endpoint,
+    PeerReservation, PeerReservationSource, PeerReservationTable, RelayKind,
+    is_valid_peer_endpoint,
 };
 use crate::message::{
     Message, ProtocolMessage, ProtocolPayload, TmEndpoints, TmGetLedger, TmGetObjectByHash,
@@ -293,17 +294,81 @@ fn proposal_relay_updates_slot_and_sends_squelch_control() {
         ..Default::default()
     };
 
-    for uid in 1..=25 {
+    let sources = [&a, &b, &c, &d];
+    for uid in 1..=88 {
+        let source = sources[(uid as usize - 1) % sources.len()];
+        assert!(overlay.register_relay_source(
+            RelayKind::Proposal,
+            Uint256::from_u64(uid),
+            source.id(),
+        ));
         overlay.relay_proposal(proposal.clone(), Uint256::from_u64(uid), validator);
     }
 
     assert_eq!(overlay.slot_state(validator), Some(SlotState::Selected));
-    let squelch_messages = d
-        .queued_messages()
+    let squelch_messages = [&a, &b, &c, &d]
         .into_iter()
+        .flat_map(|peer| peer.queued_messages())
         .filter(|message| matches!(message.protocol().payload, ProtocolPayload::Squelch(_)))
         .count();
     assert!(squelch_messages > 0);
+}
+
+#[test]
+fn recent_duplicate_ingress_updates_source_peer_slot() {
+    let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(Duration::from_secs(0)));
+    let overlay =
+        OverlayImpl::with_clock(test_setup(), Arc::new(TestHandoff), clock).expect("overlay");
+    let first = peer(1, 11);
+    let duplicate = peer(2, 12);
+    overlay.activate(first.clone());
+    overlay.activate(duplicate.clone());
+
+    let validator = validator(99);
+    let uid = Uint256::from_u64(99);
+    let proposal = TmProposeSet {
+        propose_seq: 1,
+        current_tx_hash: vec![1; 32],
+        node_pub_key: validator.as_bytes().to_vec(),
+        close_time: 2,
+        signature: vec![3; 64],
+        previousledger: vec![4; 32],
+        ..Default::default()
+    };
+
+    assert!(overlay.register_relay_source(RelayKind::Proposal, uid, first.id()));
+    overlay.relay_proposal(proposal, uid, validator);
+    assert!(!overlay.register_relay_source(RelayKind::Proposal, uid, duplicate.id()));
+    overlay.update_slot_for_recent_duplicate(
+        RelayKind::Proposal,
+        uid,
+        validator,
+        duplicate.id(),
+        crate::message::ProtocolMessageType::MtProposeLedger,
+    );
+
+    assert!(overlay.slot_peers(validator).contains_key(&duplicate.id()));
+}
+
+#[test]
+fn local_validation_suppression_deduplicates_echo_without_marking_relayed() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let source = peer(1, 31);
+    let recipient = peer(2, 32);
+    overlay.activate(source.clone());
+    overlay.activate(recipient.clone());
+
+    let uid = Uint256::from_u64(101);
+    let signer = validator(100);
+    overlay.suppress_validation(uid);
+    assert!(!overlay.admit_validation_source(uid, signer, source.id()));
+
+    // A suppression-only entry has no relay timestamp: the local broadcast
+    // stays independent, while a later echo remains excluded as its source.
+    let relayed = overlay.relay_validation(TmValidation::default(), uid, signer);
+    assert_eq!(relayed, BTreeSet::from([source.id()]));
+    assert!(source.queued_messages().is_empty());
+    assert_eq!(recipient.queued_messages().len(), 1);
 }
 
 #[test]
@@ -1039,6 +1104,9 @@ async fn inbound_session_queues_remaining_heavy_families() {
 
     peer.record_ledger(Uint256::from_u64(900), 900);
     peer.check_tracking(900);
+    // This fixture uses a synthetic legacy proposal signature. Rippled
+    // bypasses proposal signature verification for trusted cluster peers.
+    peer.set_clustered(true);
 
     // Kept for compatibility with the legacy overlay wire fixtures; these
     // deprecated fields still exist on the protobuf surface we ingest.

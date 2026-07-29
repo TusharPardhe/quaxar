@@ -40,7 +40,8 @@ use crate::state::app_registry::{
     AppAcceptedLedgerCache, AppConfig, AppInboundLedgers, AppInboundTransactions, AppLogs,
     AppOpenLedgerTxRecord, AppOpenLedgerView, AppPlaceholder, AppQueueApplyTxSource,
     AppServerHandler, AppTxQAccount, AppTxQJournalTag, AppTxQLock, AppTxQParentBatchId,
-    AppTxQTransaction, ApplicationRegistryOwners, SharedAppOpenLedger, SharedAppTxQ,
+    AppTxQTransaction, ApplicationRegistryOwners, RelayUntrustedPolicy, SharedAppOpenLedger,
+    SharedAppTxQ,
 };
 use crate::state::basic_app::BasicApp;
 use crate::state::collector_manager::{CollectorManager, CollectorParams};
@@ -71,10 +72,11 @@ use overlay::Cluster;
 use overlay::{OverlayHandoff, OverlayImpl, PeerReservationSource};
 use perflog::PerfLogImp;
 use protocol::{
-    AccountID, BatchTransactionFlags, JsonOptions, JsonValue, NotTec, PublicKey, Rules, STAmount,
-    STLedgerEntry, STObject, STTx, SecretKey, SeqProxy, Serializer, Ter, TxType, XRPAmount,
-    account_keylet, calc_account_id, calc_node_id, feature_xrp_fees, get_field_by_symbol,
-    is_tec_claim, is_tef_failure, is_tem_malformed, is_tes_success, lsfDisableMaster,
+    AccountID, BatchTransactionFlags, JsonOptions, JsonValue, NodeID, NotTec, PublicKey, Rules,
+    STAmount, STLedgerEntry, STObject, STTx, SecretKey, SeqProxy, Serializer, Ter, TxType,
+    XRPAmount, account_keylet, calc_account_id, calc_node_id, feature_xrp_fees,
+    get_field_by_symbol, is_tec_claim, is_tef_failure, is_tem_malformed, is_tes_success,
+    lsfDisableMaster,
 };
 use shamap::family::{NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
 use shamap::tree_node_cache::TreeNodeCache;
@@ -98,6 +100,10 @@ fn to_nodestore_type(object_type: LedgerNodeObjectType) -> nodestore::NodeObject
         LedgerNodeObjectType::AccountNode => nodestore::NodeObjectType::AccountNode,
         LedgerNodeObjectType::TransactionNode => nodestore::NodeObjectType::TransactionNode,
     }
+}
+
+fn consensus_status_event(event: i32, have_correct_lcl: bool) -> i32 {
+    if have_correct_lcl { event } else { 4 } // neLOST_SYNC
 }
 
 fn full_sync_debug_enabled() -> bool {
@@ -2306,20 +2312,11 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                         // every round).
                         if let Some(closed) = root.closed_ledger() {
                             let hdr = closed.header();
-                            if let Some(overlay_rt) = root.overlay_runtime() {
-                                use overlay::Overlay;
-                                let status = overlay::ProtocolMessage::new(overlay::ProtocolPayload::StatusChange(overlay::message::wire::TmStatusChange {
-                                    new_status: None,
-                                    new_event: Some(2), // neACCEPTED_LEDGER
-                                    ledger_seq: Some(hdr.seq),
-                                    ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
-                                    ledger_hash_previous: Some(hdr.parent_hash.as_uint256().data().to_vec()),
-                                    network_time: None,
-                                    first_seq: Some(0),
-                                    last_seq: Some(0),
-                                }));
-                                overlay_rt.overlay().broadcast(&status);
-                            }
+                            root.broadcast_consensus_status_change(
+                                closed.as_ref(),
+                                2, // neACCEPTED_LEDGER
+                                true,
+                            );
 
                             if let Some(pending) = validation {
                                 let ledger_hash = *hdr.hash.as_uint256();
@@ -2391,17 +2388,27 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                                             "checkLastClosedLedger: peers prefer different chain"
                                         );
                                         if let Some(lm_rt) = root.ledger_master_runtime() {
-                                            if let Some(network_ledger) = lm_rt.ledger_master().get_ledger_by_hash(
-                                                basics::sha_map_hash::SHAMapHash::new(network_closed)
-                                            ) {
-                                                // switchLastClosedLedger: adopt the network's chain
-                                                tracing::info!(
-                                                    target: "consensus",
-                                                    seq = network_ledger.header().seq,
-                                                    "checkLastClosedLedger: switching to network chain"
+                                            if lm_rt
+                                                .ledger_master()
+                                                .get_ledger_by_hash(
+                                                    basics::sha_map_hash::SHAMapHash::new(
+                                                        network_closed,
+                                                    ),
+                                                )
+                                                .is_some()
+                                            {
+                                                // The strand owns the complete
+                                                // switchLastClosedLedger flow.
+                                                // Cached LCLs must wait for it
+                                                // just like acquired LCLs so
+                                                // neither path skips TxQ,
+                                                // open-ledger, trust, status,
+                                                // or peer-cycle work.
+                                                root.set_need_network_ledger(true);
+                                                let _ = root.set_network_ops_operating_mode(
+                                                    crate::state::application_root::NetworkOpsOperatingMode::Connected,
                                                 );
-                                                root.on_closed_ledger(Arc::clone(&network_ledger));
-                                                network_ledger
+                                                return;
                                             } else {
                                                 // Ledger not in local cache — acquire it from peers
                                                 // (matching rippled NetworkOPs.cpp:1974).
@@ -2501,20 +2508,23 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
         // use, which is what lets `Validations::getPreferred` later compare
         // this node's own validated branch against what its peers report.
         let mut owned = (*validation).clone();
+        let serialized = owned.get_serialized();
+        let suppression = protocol::sha512_half(&serialized);
+        if let Some(overlay_rt) = self.root.overlay_runtime() {
+            overlay_rt.overlay().suppress_validation(suppression);
+        }
         let _ = self
             .root
             .receive_validation_to_network_ops_with_accept(&mut owned, "local", &self.root);
 
         if let Some(overlay_rt) = self.root.overlay_runtime() {
-            use overlay::Overlay;
-            let serialized = owned.get_serialized();
-            let message = overlay::ProtocolMessage::new(overlay::ProtocolPayload::Validation(
+            overlay_rt.overlay().broadcast_validation(
                 overlay::TmValidation {
                     validation: serialized,
                     ..Default::default()
                 },
-            ));
-            overlay_rt.overlay().broadcast(&message);
+                *owned.get_signer_public(),
+            );
         }
     }
 
@@ -3054,8 +3064,37 @@ impl ApplicationRoot {
             .unwrap_or_default()
     }
 
-    pub fn on_consensus_built_ledger(&self, ledger: Arc<Ledger>) {
+    /// Execute the ledger-master portion of `consensusBuilt` exactly once for
+    /// a locally built ledger. The live AppConsensus path calls this after
+    /// construction and before any next-round decision; alternate acceptors
+    /// reuse it through `on_consensus_built_ledger`.
+    pub(crate) fn record_consensus_built_ledger(
+        &self,
+        ledger: Arc<Ledger>,
+        consensus_hash: Uint256,
+    ) -> Arc<Ledger> {
+        if let Some(lm_rt) = self.ledger_master_runtime() {
+            // A completed build is no longer protected from checkAccept.
+            lm_rt.set_building_ledger(0);
+        }
         let ledger = self.ledger_with_node_fetcher(ledger);
+        if let Some(runtime) = self.ledger_master_runtime()
+            && ledger.header().hash.is_non_zero()
+        {
+            let ledger_master = runtime.ledger_master();
+            let history = ledger_master.ledger_history();
+            history.insert(Arc::clone(&ledger), false);
+            history.built_ledger(Arc::clone(&ledger), consensus_hash, JsonValue::Null);
+        }
+        // `consensusBuilt` must check the built ledger and then scan the
+        // current trusted validations before any next-round semantics.
+        self.consensus_built_check_accept(&ledger);
+        ledger
+    }
+
+    pub fn on_consensus_built_ledger(&self, ledger: Arc<Ledger>) {
+        let consensus_hash = *ledger.header().tx_hash.as_uint256();
+        let ledger = self.record_consensus_built_ledger(ledger, consensus_hash);
         let _ = self.process_closed_ledger_txq(ledger.as_ref(), false);
 
         // Sweep local_txs: remove any TX already included in the built ledger
@@ -3071,18 +3110,9 @@ impl ApplicationRoot {
         );
 
         if let Some(runtime) = self.ledger_master_runtime() {
-            // rounds can look up the parent via get_ledger_by_hash.
-            runtime
-                .ledger_master()
-                .ledger_history()
-                .insert(Arc::clone(&ledger), false);
-            // `LedgerMaster::get_ledger_by_hash` falls back to this
-            // `closed_ledger` slot when `ledger_history`'s cache doesn't
-            // (yet) have the entry, so this is kept as a second, redundant
-            // path -- it is NOT the bootstrap loop's source of truth for
-            // "the closed ledger" (that is `root.closed_ledger()`,
-            // `ApplicationRoot`'s own tracker, updated by `on_closed_ledger`
-            // below); nothing in the bootstrap loop reads this slot.
+            // `record_consensus_built_ledger` already inserted this built
+            // ledger into history. Keep only LedgerMaster's closed slot here
+            // for the alternate wrapper's legacy lookup behavior.
             runtime
                 .ledger_master()
                 .set_closed_ledger(Arc::clone(&ledger));
@@ -3094,20 +3124,8 @@ impl ApplicationRoot {
         self.set_status_rpc_current_ledger_index(Some(next_open_index));
         self.set_status_rpc_queue_report(Some(self.tx_q_rpc_report()));
 
-        // ── rippled parity: LedgerMaster::consensusBuilt ──────────────────
-        // After building a ledger, check if it (or any other ledger with
-        // sufficient validations) can advance the validated ledger. This is
-        // critical for nodes that build a different hash than the network
-        // (e.g., due to empty tx set or different close time when behind):
-        // without this scan, the node never discovers the network's validated
-        // ledger and remains on a permanent fork.
-        //
-        // Matches rippled LedgerMaster.cpp:1090-1185:
-        //   1. checkAccept(built_ledger)
-        //   2. If that didn't advance, scan all current trusted validations
-        //   3. Find the highest-seq ledger hash with quorum validations
-        //   4. checkAccept(maxLedger, maxSeq) to advance to the network's chain
-        self.consensus_built_check_accept(&ledger);
+        // `record_consensus_built_ledger` above is the sole owner of
+        // LedgerHistory's built-ledger bookkeeping and its checkAccept scan.
     }
 
     /// Matches rippled's `LedgerMaster::consensusBuilt` validation scan.
@@ -3143,34 +3161,34 @@ impl ApplicationRoot {
             return;
         }
 
-        let validations_guard = self
-            .validations()
-            .validations()
-            .lock()
-            .expect("validations mutex must not be poisoned");
-        let current_trusted = validations_guard.current_trusted();
-        drop(validations_guard);
+        let current_trusted = {
+            let validations_guard = self
+                .validations()
+                .validations()
+                .lock()
+                .expect("validations mutex must not be poisoned");
+            validations_guard.current_trusted()
+        };
 
-        // Count validations by ledger hash, tracking sequence.
-        let mut counts: std::collections::HashMap<Uint256, (usize, u32)> =
-            std::collections::HashMap::new();
-        for val in &current_trusted {
-            let hash = val.get_ledger_hash();
-            let seq = val.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence"));
-            let entry = counts.entry(hash).or_insert((0, seq));
-            entry.0 += 1;
-            if seq != 0 && entry.1 == 0 {
-                entry.1 = seq;
-            }
-        }
+        // `current_trusted()` is deliberately generic and does not know the
+        // app's negative UNL. Re-check each candidate through the same exact
+        // sequence, nUNL-filtered count used by checkAccept.
+        let candidates: std::collections::HashSet<(Uint256, u32)> = current_trusted
+            .iter()
+            .map(|validation| {
+                (
+                    validation.get_ledger_hash(),
+                    validation.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence")),
+                )
+            })
+            .collect();
 
-        // Find the ledger with the highest sequence that exceeds quorum.
         let mut max_seq = valid_seq;
         let mut max_hash = built_hash;
-        for (hash, (count, seq)) in &counts {
-            if *count >= quorum && *seq > max_seq {
-                max_seq = *seq;
-                max_hash = *hash;
+        for (hash, seq) in candidates {
+            if seq > max_seq && self.trusted_validation_count_for_ledger(hash, seq) >= quorum {
+                max_seq = seq;
+                max_hash = hash;
             }
         }
 
@@ -3275,7 +3293,25 @@ impl ApplicationRoot {
     }
 
     pub fn relay_untrusted_validations(&self) -> bool {
+        self.registry
+            .config
+            .relay_untrusted_validations
+            .should_relay()
+    }
+
+    pub fn relay_untrusted_validations_policy(&self) -> RelayUntrustedPolicy {
         self.registry.config.relay_untrusted_validations
+    }
+
+    pub fn relay_untrusted_proposals(&self) -> bool {
+        self.registry
+            .config
+            .relay_untrusted_proposals
+            .should_relay()
+    }
+
+    pub fn relay_untrusted_proposals_policy(&self) -> RelayUntrustedPolicy {
+        self.registry.config.relay_untrusted_proposals
     }
 
     pub fn path_search_old(&self) -> u32 {
@@ -3306,14 +3342,45 @@ impl ApplicationRoot {
     }
 
     pub fn set_relay_untrusted_validations(&mut self, relay_untrusted_validations: bool) -> bool {
+        self.set_relay_untrusted_validations_policy(if relay_untrusted_validations {
+            RelayUntrustedPolicy::All
+        } else {
+            RelayUntrustedPolicy::Trusted
+        })
+        .should_relay()
+    }
+
+    pub fn set_relay_untrusted_validations_policy(
+        &mut self,
+        relay_untrusted_validations: RelayUntrustedPolicy,
+    ) -> RelayUntrustedPolicy {
         let previous = std::mem::replace(
             &mut self.registry.config.relay_untrusted_validations,
             relay_untrusted_validations,
         );
         if let Some(runtime) = self.network_ops_validation_runtime.as_ref() {
-            let _ = runtime.set_relay_untrusted_validations(relay_untrusted_validations);
+            let _ = runtime.set_relay_untrusted_validations_policy(relay_untrusted_validations);
         }
         previous
+    }
+
+    pub fn set_relay_untrusted_proposals(&mut self, relay_untrusted_proposals: bool) -> bool {
+        self.set_relay_untrusted_proposals_policy(if relay_untrusted_proposals {
+            RelayUntrustedPolicy::All
+        } else {
+            RelayUntrustedPolicy::Trusted
+        })
+        .should_relay()
+    }
+
+    pub fn set_relay_untrusted_proposals_policy(
+        &mut self,
+        relay_untrusted_proposals: RelayUntrustedPolicy,
+    ) -> RelayUntrustedPolicy {
+        std::mem::replace(
+            &mut self.registry.config.relay_untrusted_proposals,
+            relay_untrusted_proposals,
+        )
     }
 
     pub fn node_store(&self) -> &Option<crate::shamap::shamap_store_backend::SHAMapStoreNodeStore> {
@@ -4019,7 +4086,7 @@ impl ApplicationRoot {
         runtime.set_runner(runner);
 
         // to the consensus thread, which calls got_tx_set (event-driven, not polling).
-        let (map_complete_tx, map_complete_rx) = std::sync::mpsc::channel();
+        let (map_complete_tx, map_complete_rx) = std::sync::mpsc::sync_channel(1_024);
         self.registry
             .inbound_transactions
             .lock()
@@ -4102,6 +4169,51 @@ impl ApplicationRoot {
         self.network_ops_runtime.as_ref().map(|runtime| {
             runtime.apply_held_transactions_to_queue(next_open_ledger_parent_hash, run_sync_batch)
         })
+    }
+
+    /// Broadcast a consensus StatusChange with the same event downgrade and
+    /// range/time payload that rippled's RCLConsensus::Adaptor::notify uses.
+    pub(crate) fn broadcast_consensus_status_change(
+        &self,
+        ledger: &Ledger,
+        event: i32,
+        have_correct_lcl: bool,
+    ) {
+        let Some(overlay_rt) = self.overlay_runtime() else {
+            return;
+        };
+
+        use overlay::Overlay;
+        let (first_seq, last_seq) = self
+            .ledger_master_runtime()
+            .and_then(|runtime| runtime.ledger_master().full_validated_range())
+            .map(|(first, last)| {
+                // The current model exposes an online-deletion floor when
+                // available. Until a distinct fetch-depth setting is wired,
+                // this is the strongest servability bound we can prove.
+                (
+                    self.minimum_online_seq()
+                        .map_or(first, |floor| first.max(floor)),
+                    last,
+                )
+            })
+            .unwrap_or((0, 0));
+        let header = ledger.header();
+        let status = overlay::ProtocolMessage::new(overlay::ProtocolPayload::StatusChange(
+            overlay::message::wire::TmStatusChange {
+                new_status: None,
+                // rippled sends LOST_SYNC, rather than the requested event,
+                // whenever consensus was operating on the wrong LCL.
+                new_event: Some(consensus_status_event(event, have_correct_lcl)),
+                ledger_seq: Some(header.seq),
+                ledger_hash: Some(header.hash.as_uint256().data().to_vec()),
+                ledger_hash_previous: Some(header.parent_hash.as_uint256().data().to_vec()),
+                network_time: Some(self.shared_time_keeper().now().as_seconds() as u64),
+                first_seq: Some(first_seq),
+                last_seq: Some(last_seq),
+            },
+        ));
+        overlay_rt.overlay().broadcast(&status);
     }
 
     pub fn apply_network_ops_pending_with<RelaySkip>(
@@ -4453,6 +4565,62 @@ impl ApplicationRoot {
         Arc::clone(&self.validators)
     }
 
+    /// Refresh NegativeUNL and trusted-validator state before every consensus
+    /// round. This is the shared `NetworkOPs::beginConsensus` prelude: the
+    /// selected LCL supplies both its NegativeUNL and its close time.
+    pub(crate) fn refresh_validator_trust_for_consensus(&self, lcl: &Ledger) {
+        let negative_unl = lcl
+            .negative_unl()
+            .into_iter()
+            .map(PublicKey::from_bytes)
+            .collect();
+        self.validators.set_negative_unl(negative_unl);
+
+        let current_node_ids = self
+            .validations
+            .validations()
+            .lock()
+            .expect("validations mutex must not be poisoned")
+            .get_current_node_ids();
+        let seen_validators = current_node_ids
+            .iter()
+            .map(|node_id| {
+                AccountID::from_slice(node_id.data())
+                    .expect("NodeID and AccountID have equal width")
+            })
+            .collect();
+        let trust_changes = self
+            .validators
+            .update_trusted(&seen_validators, lcl.header().close_time);
+        if trust_changes.added.is_empty() && trust_changes.removed.is_empty() {
+            return;
+        }
+
+        let added = trust_changes
+            .added
+            .iter()
+            .map(|account_id| {
+                NodeID::from_slice(account_id.data())
+                    .expect("AccountID and NodeID have equal width")
+            })
+            .collect();
+        let removed = trust_changes
+            .removed
+            .iter()
+            .map(|account_id| {
+                NodeID::from_slice(account_id.data())
+                    .expect("AccountID and NodeID have equal width")
+            })
+            .collect();
+        self.validations
+            .validations()
+            .lock()
+            .expect("validations mutex must not be poisoned")
+            .trust_changed(&added, &removed);
+        self.amendment_status
+            .set_trusted_validators(self.validators.get_quorum_keys().1);
+    }
+
     pub fn manifest_cache(&self) -> &Arc<ManifestCache> {
         &self.registry.manifest_cache
     }
@@ -4462,6 +4630,9 @@ impl ApplicationRoot {
         validation: &mut protocol::STValidation,
         source: &str,
     ) -> Option<AppNetworkOpsValidationReceiveReport> {
+        if validation.get_seen_time() == 0 {
+            validation.set_seen(self.shared_time_keeper().close_time().as_seconds());
+        }
         self.network_ops_validation_runtime
             .as_ref()
             .map(|runtime| runtime.receive_validation(validation, source))
@@ -4473,6 +4644,9 @@ impl ApplicationRoot {
         source: &str,
         accept_sink: &dyn crate::RclValidationAcceptanceSink,
     ) -> Option<AppNetworkOpsValidationReceiveReport> {
+        if validation.get_seen_time() == 0 {
+            validation.set_seen(self.shared_time_keeper().close_time().as_seconds());
+        }
         self.network_ops_validation_runtime.as_ref().map(|runtime| {
             runtime.receive_validation_with_accept(validation, source, Some(accept_sink))
         })
@@ -4681,7 +4855,7 @@ impl ApplicationRoot {
 
     pub fn set_completed_ledgers_rx(
         &self,
-        rx: std::sync::mpsc::Receiver<std::sync::Arc<ledger::Ledger>>,
+        rx: std::sync::mpsc::Receiver<crate::ledger::inbound_ledgers::CompletedInboundLedger>,
     ) {
         if let Some(lm_rt) = self.ledger_master_runtime() {
             *lm_rt
@@ -5144,16 +5318,22 @@ impl ApplicationRoot {
             })
     }
 
-    /// Returns the minimum ledger sequence that must remain online, matching
-    /// rippled's `app_.getSHAMapStore().minimumOnline()`.
+    /// Returns the earliest persisted ledger sequence available through the
+    /// configured node store, matching rippled's SHAMapStore online floor.
     ///
-    /// Returns `None` when SHAMapStore online deletion is not configured or
-    /// not yet fully ported.
+    /// `None` means no node store is configured, so callers retain the full
+    /// validated range without imposing an unsupported floor.
     pub fn minimum_online_seq(&self) -> Option<u32> {
-        // TODO: Wire through to SHAMapStore.minimum_online() once online
-        // deletion rotation is fully ported. For now return None (no lower
-        // bound enforced).
-        None
+        self.node_store()
+            .as_ref()
+            .map(|node_store| match node_store {
+                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(database) => {
+                    database.earliest_ledger_seq()
+                }
+                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(database) => {
+                    database.earliest_ledger_seq()
+                }
+            })
     }
 
     pub fn is_caught_up(&self) -> LedgerMasterCaughtUp {
@@ -5353,6 +5533,20 @@ impl ApplicationRoot {
         true
     }
 
+    /// Count trusted, full validations for this exact ledger sequence after
+    /// excluding validators in the current negative UNL. `ValidatorList`
+    /// already calculates `quorum()` from the effective UNL, so callers must
+    /// filter the votes but must not reduce the quorum again.
+    pub fn trusted_validation_count_for_ledger(&self, hash: Uint256, seq: u32) -> usize {
+        self.validators()
+            .negative_unl_filter_validations(
+                self.validations()
+                    .store()
+                    .trusted_for_ledger_by_sequence(hash, seq),
+            )
+            .len()
+    }
+
     /// Matches rippled's `LedgerMaster::checkAccept(hash, seq)`
     /// (LedgerMaster.cpp:886-931): called synchronously whenever a new
     /// validation is received (`handleNewValidation` -> `checkAccept`).
@@ -5373,21 +5567,27 @@ impl ApplicationRoot {
             if seq < lm.valid_ledger_seq() {
                 return;
             }
+            let val_count = self.trusted_validation_count_for_ledger(hash, seq);
             let quorum = self.validators().quorum();
-            // Rippled-parity: reduce effective quorum by half the negative UNL
-            // size, matching the nUNL filter applied during consensus.
-            let nunl_size = self.validators().get_negative_unl().len();
-            let effective_quorum = quorum.saturating_sub(nunl_size / 2);
-            let val_count = self.validations().num_trusted_for_ledger(hash);
-            // (rippled tracks lastValidLedger_ here even before acquiring;
-            // we don't have an equivalent field yet, so this is a no-op
-            // placeholder for that bookkeeping — the important side effect
-            // below, active acquisition, still applies.)
-            if val_count < effective_quorum {
-                return;
+            if val_count >= quorum {
+                // Keep the quorum-backed hash/sequence even if its ledger is
+                // not cached yet. `is_compatible` must reject a conflicting
+                // preferred LCL after the asynchronous acquisition completes.
+                lm.note_last_valid_ledger(hash, seq);
+                tracing::debug!(
+                    target: "consensus",
+                    seq,
+                    %hash,
+                    val_count,
+                    quorum,
+                    "check_accept_hash_seq observed a quorum-backed candidate"
+                );
             }
-
-            if seq == lm.valid_ledger_seq() {
+            if seq == lm.valid_ledger_seq()
+                || lm_rt
+                    .building_ledger()
+                    .is_some_and(|building| building == seq)
+            {
                 return;
             }
         }
@@ -5407,7 +5607,7 @@ impl ApplicationRoot {
                         shared.acquire_async(
                             hash,
                             seq,
-                            crate::ledger::inbound_ledgers::AcquireReason::Consensus,
+                            crate::ledger::inbound_ledgers::AcquireReason::Generic,
                         );
                     }
                 }
@@ -5416,9 +5616,10 @@ impl ApplicationRoot {
         };
 
         if let Some(ledger) = ledger {
-            let val_count = self
-                .validations()
-                .num_trusted_for_ledger(*ledger.header().hash.as_uint256());
+            let val_count = self.trusted_validation_count_for_ledger(
+                *ledger.header().hash.as_uint256(),
+                ledger.header().seq,
+            );
             let quorum = self.validators().quorum();
             tracing::debug!(target: "consensus",
                 seq = ledger.header().seq, val_count, quorum,
@@ -5442,14 +5643,16 @@ impl ApplicationRoot {
         }
 
         let quorum = self.validators().quorum();
-        // Rippled-parity: reduce effective quorum by half the negative UNL
-        // size, matching the nUNL filter applied during consensus.
-        let nunl_size = self.validators().get_negative_unl().len();
-        let effective_quorum = quorum.saturating_sub(nunl_size / 2);
-        let val_count = self
-            .validations()
-            .num_trusted_for_ledger(*ledger.header().hash.as_uint256());
-        if val_count < effective_quorum {
+        let val_count = self.trusted_validation_count_for_ledger(
+            *ledger.header().hash.as_uint256(),
+            ledger.header().seq,
+        );
+        if !lm.check_accept_ledger(
+            ledger.as_ref(),
+            val_count,
+            quorum,
+            self.current_close_time_seconds(),
+        ) {
             return;
         }
 
@@ -5516,7 +5719,7 @@ impl ApplicationRoot {
 
         tracing::info!(
             target: "consensus",
-            seq = validated.header().seq, val_count, quorum, effective_quorum, nunl_size,
+            seq = validated.header().seq, val_count, quorum,
             "check_accept: validated ledger advanced (synchronous, on validation receipt)"
         );
 
@@ -6281,16 +6484,9 @@ impl ApplicationRoot {
 
         // Register the built ledger in ledger_history so that
         // get_cached_ledger_by_hash / get_cached_ledger_by_seq can find it.
-        // Without this, the inline accept path (do_accept_and_start_next_round
-        // → accept_ledger_with_txns) produces a ledger that is invisible to
-        // by-hash/by-seq lookups, causing acquire_ledger to fall through to
-        // async and tryAdvance to break at the gap.
-        if let Some(runtime) = self.ledger_master_runtime() {
-            runtime
-                .ledger_master()
-                .ledger_history()
-                .insert(Arc::clone(&closed), false);
-        }
+        // The live consensus owner calls `record_consensus_built_ledger`
+        // immediately after construction, where the insert and built-ledger
+        // bookkeeping occur atomically with the required checkAccept scan.
 
         self.on_closed_ledger(Arc::clone(&closed));
         self.on_published_ledger(Arc::clone(&closed));

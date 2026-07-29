@@ -106,6 +106,46 @@ fn inbound_transactions_acquires_and_caches_transaction_sets() {
 }
 
 #[test]
+fn inbound_transactions_admit_sets_until_round_window_expiry() {
+    let mut inbound = InboundTransactions::new(Arc::new(SimplePeerSetBuilder::new(Vec::new())));
+    for value in 1..=1_024u64 {
+        assert!(inbound.get_set(Uint256::from_u64(value), true).is_none());
+    }
+    assert_eq!(inbound.len(), 1_025);
+    inbound.new_round(4);
+    assert_eq!(inbound.len(), 1);
+}
+
+#[test]
+fn inbound_transactions_retain_completion_when_channel_is_full() {
+    let mut inbound = InboundTransactions::new(Arc::new(SimplePeerSetBuilder::new(Vec::new())));
+    let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+    tx.send((
+        Uint256::zero(),
+        Arc::new(SyncTree::new_with_type(
+            shamap::sync::SHAMapType::Transaction,
+            true,
+            0,
+        )),
+    ))
+    .expect("test channel should accept filler");
+    inbound.set_map_complete_sender(tx);
+
+    let hash = Uint256::from_array([0x44; 32]);
+    let set = Arc::new(SyncTree::new_with_type(
+        shamap::sync::SHAMapType::Transaction,
+        true,
+        0,
+    ));
+    assert!(inbound.give_set(hash, set, true));
+
+    let pending = inbound.take_pending_map_completions(1);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, hash);
+    assert!(inbound.take_pending_map_completions(1).is_empty());
+}
+
+#[test]
 fn inbound_transactions_stop_clears_active_acquires_shutdown() {
     let hash = Uint256::from_array([0x33; 32]);
     let peer = test_peer(9);

@@ -88,6 +88,10 @@ pub struct LedgerMaster<C = MonotonicClock, S = HardenedHashBuilder> {
     pub_ledger_close: AtomicU32,
     valid_ledger_sign: AtomicU32,
     valid_ledger_seq: AtomicU32,
+    /// Highest quorum-backed ledger observed by `checkAccept(hash, seq)`.
+    /// This is intentionally retained even while the ledger is being
+    /// acquired, matching rippled's `lastValidLedger_` safety anchor.
+    last_valid_ledger: Mutex<Option<(Uint256, u32)>>,
 }
 
 impl<C> LedgerMaster<C, HardenedHashBuilder>
@@ -144,6 +148,7 @@ where
             pub_ledger_close: AtomicU32::new(0),
             valid_ledger_sign: AtomicU32::new(0),
             valid_ledger_seq: AtomicU32::new(0),
+            last_valid_ledger: Mutex::new(None),
         }
     }
 
@@ -280,6 +285,62 @@ where
 
     pub fn have_validated(&self) -> bool {
         !self.valid_ledger.empty()
+    }
+
+    /// Record the highest sequence for which trusted validations reached
+    /// quorum. This must happen before acquisition: an unavailable but
+    /// quorum-backed ledger is still the compatibility anchor for later LCL
+    /// switches.
+    pub fn note_last_valid_ledger(&self, hash: Uint256, seq: u32) {
+        if seq == 0 {
+            return;
+        }
+        let mut last = self
+            .last_valid_ledger
+            .lock()
+            .expect("last-valid-ledger mutex must not be poisoned");
+        if last.is_none_or(|(_, last_seq)| seq > last_seq) {
+            *last = Some((hash, seq));
+        }
+    }
+
+    pub fn last_valid_ledger(&self) -> Option<(Uint256, u32)> {
+        *self
+            .last_valid_ledger
+            .lock()
+            .expect("last-valid-ledger mutex must not be poisoned")
+    }
+
+    /// Equivalent to LedgerMaster::isCompatible. A candidate must remain on
+    /// both the validated chain and the highest quorum-backed chain observed
+    /// before acquisition.
+    pub fn is_compatible(&self, ledger: &Ledger) -> bool {
+        let matches_anchor = |hash: Uint256, seq: u32| {
+            if ledger.header().seq < seq {
+                return false;
+            }
+            if ledger.header().seq == seq {
+                return *ledger.header().hash.as_uint256() == hash;
+            }
+            if ledger.header().seq == seq.saturating_add(1) {
+                return *ledger.header().parent_hash.as_uint256() == hash;
+            }
+            ledger
+                .hash_of_seq(seq, &NullLedgerJournal)
+                .is_some_and(|ancestor| *ancestor.as_uint256() == hash)
+        };
+
+        if let Some(validated) = self.validated_ledger()
+            && !matches_anchor(
+                *validated.header().hash.as_uint256(),
+                validated.header().seq,
+            )
+        {
+            return false;
+        }
+
+        self.last_valid_ledger()
+            .is_none_or(|(hash, seq)| matches_anchor(hash, seq))
     }
 
     /// too far from network close time, or too far ahead of the valid ledger.
@@ -546,7 +607,11 @@ where
             .complete_ledgers
             .lock()
             .expect("complete-ledgers mutex must not be poisoned");
-        let max = complete_ledgers.last()?;
+        // Match rippled's `getFullValidatedRange`: the advertised upper
+        // bound is the published ledger, not the highest fully acquired
+        // ledger. Completed inbound candidates may be unvalidated forks and
+        // therefore must never extend peer-visible validated/servable range.
+        let max = self.published_ledger()?.header().seq;
         if max == 0 {
             return None;
         }
@@ -981,6 +1046,19 @@ mod tests {
         assert!(!master.got_fetch_pack(false, 10));
         master.finish_got_fetch_pack();
         assert!(master.got_fetch_pack(false, 10));
+    }
+
+    #[test]
+    fn full_validated_range_stops_at_published_ledger_not_acquired_fork() {
+        let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
+        let published = immutable_ledger(100, 0x10);
+        let acquired_unvalidated = immutable_ledger(101, 0x20);
+
+        master.set_pub_ledger(Arc::clone(&published));
+        master.mark_ledger_complete(published.header().seq);
+        master.mark_ledger_complete(acquired_unvalidated.header().seq);
+
+        assert_eq!(master.full_validated_range(), Some((100, 100)));
     }
 
     #[test]

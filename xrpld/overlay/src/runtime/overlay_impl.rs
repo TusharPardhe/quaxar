@@ -15,8 +15,8 @@ use basics::base64::base64_encode;
 use http::{Request, Response};
 use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use protocol::{
-    JsonValue, KeyType, PublicKey, STTx, STValidation, SecretKey, SerialIter, Serializer,
-    derive_public_key, sha512_half as protocol_sha512_half, sign_digest,
+    JsonValue, KeyType, PublicKey, STTx, SecretKey, SerialIter, Serializer, derive_public_key,
+    sha512_half as protocol_sha512_half, sign_digest,
 };
 use rand::seq::SliceRandom;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,7 +41,8 @@ use crate::inbound::{
     QueuedValidation,
 };
 use crate::message::{
-    Message, ProtocolMessage, ProtocolPayload, TmProposeSet, TmSquelch, TmTransaction, TmValidation,
+    Message, ProtocolMessage, ProtocolMessageType, ProtocolPayload, TmProposeSet, TmSquelch,
+    TmTransaction, TmValidation,
 };
 use crate::overlay::{Handoff, Overlay, Setup, stats_to_json};
 use crate::peer::status_change::{build_peer_status_event, lost_sync_event};
@@ -56,7 +57,11 @@ use crate::transport::handshake::is_public_ip;
 use crate::tx_metrics::TxMetrics;
 use crate::{HARD_MAX_REPLY_NODES, ProtocolFeature, ProtocolVersion, parse_protocol_versions};
 
-const PEER_LIMIT_REJECTION_REASON: &str = "slots full";
+const PEER_LIMIT_REJECTION_REASON: &str = "peer limit reached for unreserved peer";
+/// rippled `HashRouter::Setup` defaults. Entries expire after the hold window,
+/// while a message may be relayed again after the shorter relay window.
+const RELAY_HISTORY_HOLD_TIME: Duration = Duration::from_secs(300);
+const RELAY_HISTORY_RELAY_TIME: Duration = Duration::from_secs(30);
 const PEERFINDER_MAX_HOPS: u32 = 6;
 const PEERFINDER_MAX_ACCEPTED_ENDPOINTS: usize = 64;
 const PEERFINDER_REDIRECT_ENDPOINT_COUNT: usize = 10;
@@ -252,6 +257,17 @@ enum RelayKind {
 struct RelayKey {
     kind: RelayKind,
     uid: Uint256,
+}
+
+/// The behavioral subset of rippled's `HashRouter::Entry` needed for
+/// validator proposal and validation relay. The peer set is reset whenever
+/// the relay interval permits a new relay, and entries are retained only for
+/// the reference hold interval.
+#[derive(Debug, Default)]
+struct RelayHistoryEntry {
+    peers: BTreeSet<PeerId>,
+    relayed_at: Option<Instant>,
+    last_touched: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -735,6 +751,9 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         let Ok(public_key) = PublicKey::from_slice(&message.node_pub_key) else {
             return crate::router::RouteAction::Continue;
         };
+        if public_key.key_type() != Some(KeyType::Secp256k1) {
+            return crate::router::RouteAction::Continue;
+        }
         let Some(current_tx_hash) = Uint256::from_slice(&message.current_tx_hash) else {
             return crate::router::RouteAction::Continue;
         };
@@ -749,10 +768,6 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             public_key,
             &message.signature,
         );
-        // Build the PeerPos so we can verify its signature before accepting.
-        // rippled's PeerImp::checkPropose calls peerPos.checkSign() and drops
-        // the message if it fails (unless the sender is a cluster peer, which
-        // is implicitly trusted within the private cluster network).
         let peer_pos = QueuedProposal {
             peer_id: self.peer.id(),
             suppression,
@@ -761,14 +776,6 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             previous_ledger,
             message: message.clone(),
         };
-        if !self.peer.cluster() && !peer_pos.check_sign() {
-            tracing::warn!(
-                target: "overlay",
-                peer_id = %self.peer.id(),
-                "Proposal fails signature check — dropping",
-            );
-            return crate::router::RouteAction::Continue;
-        }
         self.overlay
             .inbound_handler
             .on_propose_ledger(self.peer, peer_pos);
@@ -848,33 +855,14 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Validation too short, ignoring");
             return crate::router::RouteAction::Continue;
         }
-        let mut serial = SerialIter::new(&message.validation);
-        let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            STValidation::from_serial_iter_default_node_id(&mut serial, false)
-        }))
-        .ok()
-        .and_then(Result::ok);
-        let Some(parsed) = parsed else {
-            tracing::warn!(target: "overlay", peer_id = %self.peer.id(), len = message.validation.len(), "on_validation: PARSE FAILED — dropping validation");
-            return crate::router::RouteAction::Continue;
-        };
-        // Verify the cryptographic signature of the validation before accepting
-        // it, matching rippled's PeerImp::checkValidation which calls
-        // val->isValid() and drops the message if the check fails.
-        if !parsed.is_valid() {
-            tracing::warn!(
-                target: "overlay",
-                peer_id = %self.peer.id(),
-                "Validation fails signature check — dropping",
-            );
-            return crate::router::RouteAction::Continue;
-        }
+        let suppression = sha512_half(&message.validation);
         self.overlay.inbound_handler.on_validation(
             self.peer,
             QueuedValidation {
                 peer_id: self.peer.id(),
-                suppression: sha512_half(&message.validation),
+                suppression,
                 message: message.clone(),
+                validation: None,
             },
         );
         crate::router::RouteAction::Continue
@@ -1112,7 +1100,7 @@ pub struct OverlayImpl {
     stopping: Arc<AtomicBool>,
     traffic: Arc<TrafficCount>,
     tx_metrics: Arc<TxMetrics>,
-    relay_history: Arc<Mutex<HashMap<RelayKey, BTreeSet<PeerId>>>>,
+    relay_history: Arc<Mutex<HashMap<RelayKey, RelayHistoryEntry>>>,
     local_reservations: Arc<PeerReservationTable>,
     reservation_source: Arc<RwLock<Arc<dyn PeerReservationSource>>>,
     local_cluster: Arc<Cluster>,
@@ -1647,9 +1635,9 @@ impl OverlayImpl {
             self.relay_history
                 .lock()
                 .expect("relay history lock")
-                .retain(|_, seen| {
-                    seen.remove(&id);
-                    !seen.is_empty()
+                .values_mut()
+                .for_each(|entry| {
+                    entry.peers.remove(&id);
                 });
             self.slots
                 .lock()
@@ -1805,7 +1793,7 @@ impl OverlayImpl {
     /// network thread, matching reference InboundLedgers::gotLedgerData.
     pub fn set_ledger_data_channel(
         &self,
-        tx: std::sync::mpsc::Sender<crate::PeerMessage<crate::TmLedgerData>>,
+        tx: std::sync::mpsc::SyncSender<crate::PeerMessage<crate::TmLedgerData>>,
     ) {
         self.queued_inbound.set_ledger_data_channel(tx);
     }
@@ -1840,6 +1828,69 @@ impl OverlayImpl {
 
     pub fn take_get_objects(&self) -> Vec<crate::PeerMessage<crate::TmGetObjectByHash>> {
         self.queued_inbound.take_get_objects()
+    }
+
+    pub fn admit_proposal_source(
+        &self,
+        uid: Uint256,
+        validator: PublicKey,
+        peer_id: PeerId,
+    ) -> bool {
+        let added = self.register_relay_source(RelayKind::Proposal, uid, peer_id);
+        if !added {
+            self.update_slot_for_recent_duplicate(
+                RelayKind::Proposal,
+                uid,
+                validator,
+                peer_id,
+                ProtocolMessageType::MtProposeLedger,
+            );
+        }
+        added
+    }
+
+    pub fn admit_validation_source(
+        &self,
+        uid: Uint256,
+        validator: PublicKey,
+        peer_id: PeerId,
+    ) -> bool {
+        let added = self.register_relay_source(RelayKind::Validation, uid, peer_id);
+        if !added {
+            self.update_slot_for_recent_duplicate(
+                RelayKind::Validation,
+                uid,
+                validator,
+                peer_id,
+                ProtocolMessageType::MtValidation,
+            );
+        }
+        added
+    }
+
+    pub fn peer_is_diverged(&self, peer_id: PeerId) -> bool {
+        self.active_peers
+            .read()
+            .expect("overlay peers lock")
+            .get(&peer_id)
+            .is_some_and(|peer| peer.tracking() == crate::peer_imp::Tracking::Diverged)
+    }
+
+    pub fn suppress_validation(&self, uid: Uint256) {
+        let now = Instant::now();
+        let mut history = self.relay_history.lock().expect("relay history lock");
+        history.retain(|_, entry| {
+            entry
+                .last_touched
+                .is_some_and(|touched| now.duration_since(touched) < RELAY_HISTORY_HOLD_TIME)
+        });
+        history
+            .entry(RelayKey {
+                kind: RelayKind::Validation,
+                uid,
+            })
+            .or_default()
+            .last_touched = Some(now);
     }
 
     pub fn relay_proposal(
@@ -1995,6 +2046,59 @@ impl OverlayImpl {
             .get_peers(validator)
     }
 
+    fn register_relay_source(&self, kind: RelayKind, uid: Uint256, peer_id: PeerId) -> bool {
+        let now = Instant::now();
+        let mut history = self.relay_history.lock().expect("relay history lock");
+        history.retain(|_, entry| {
+            entry
+                .last_touched
+                .is_some_and(|touched| now.duration_since(touched) < RELAY_HISTORY_HOLD_TIME)
+        });
+        match history.entry(RelayKey { kind, uid }) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let mut state = RelayHistoryEntry {
+                    last_touched: Some(now),
+                    ..RelayHistoryEntry::default()
+                };
+                state.peers.insert(peer_id);
+                entry.insert(state);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                state.last_touched = Some(now);
+                state.peers.insert(peer_id);
+                false
+            }
+        }
+    }
+
+    fn update_slot_for_recent_duplicate(
+        &self,
+        kind: RelayKind,
+        uid: Uint256,
+        validator: PublicKey,
+        peer_id: PeerId,
+        message_type: ProtocolMessageType,
+    ) {
+        let now = Instant::now();
+        let recently_relayed = self
+            .relay_history
+            .lock()
+            .expect("relay history lock")
+            .get(&RelayKey { kind, uid })
+            .and_then(|entry| entry.relayed_at)
+            .is_some_and(|relayed_at| now.duration_since(relayed_at) < crate::slot::IDLED);
+        if !recently_relayed {
+            return;
+        }
+
+        let mut slots = self.slots.lock().expect("overlay slots lock");
+        if slots.base_squelch_ready() {
+            slots.update_slot_and_squelch(uid, validator, peer_id, message_type, || {});
+        }
+    }
+
     fn relay_validator_message(
         &self,
         kind: RelayKind,
@@ -2006,14 +2110,32 @@ impl OverlayImpl {
         let message_type = protocol.message_type;
         let message = Message::new(protocol, Some(validator));
         let peers = self.active_peers_snapshot();
-        let mut already_seen = BTreeSet::new();
         let mut relayed = BTreeSet::new();
+        let now = Instant::now();
         let mut history = self.relay_history.lock().expect("relay history lock");
-        let seen = history.entry(relay_key).or_default();
+        // `HashRouter::emplace` expires aged entries before admitting a new
+        // key. This is time-based retention, not arbitrary eviction.
+        history.retain(|_, entry| {
+            entry
+                .last_touched
+                .is_some_and(|touched| now.duration_since(touched) < RELAY_HISTORY_HOLD_TIME)
+        });
+        let entry = history.entry(relay_key).or_default();
+        entry.last_touched = Some(now);
+        let relay_due = entry
+            .relayed_at
+            .is_none_or(|relayed_at| now.duration_since(relayed_at) >= RELAY_HISTORY_RELAY_TIME);
+        if !relay_due {
+            return entry.peers.clone();
+        }
+        // `HashRouter::shouldRelay` admits the new relay and
+        // `releasePeerSet` returns (and clears) every ingress source so we do
+        // not relay a proposal or validation back to its sender.
+        entry.relayed_at = Some(now);
+        let already_seen = std::mem::take(&mut entry.peers);
 
         for peer in peers {
-            if seen.contains(&peer.id()) {
-                already_seen.insert(peer.id());
+            if already_seen.contains(&peer.id()) {
                 continue;
             }
             if self.send_runtime_message(&peer, message.clone(), false) {
@@ -2021,7 +2143,6 @@ impl OverlayImpl {
             }
         }
 
-        seen.extend(relayed.iter().copied());
         drop(history);
 
         tracing::trace!(
@@ -2041,7 +2162,7 @@ impl OverlayImpl {
             self.slots.lock().expect("overlay slots lock").update_many(
                 uid,
                 validator,
-                relayed.iter().copied(),
+                already_seen.iter().copied(),
                 message_type,
             );
         }
@@ -2617,41 +2738,42 @@ impl Overlay for OverlayImpl {
         self.tx_metrics.json()
     }
 
-    fn sweep_relay_history(&self, max_entries: u64) {
-        // Remove entries whose peer IDs are no longer in the active set,
-        // then enforce a hard size cap to prevent unbounded growth.
-        // relay_history entries grow monotonically — each unique relayed message
-        // creates an entry — and without periodic sweep the HashMap grows forever
-        // on long-lived nodes.
-        let active_peer_ids: std::collections::HashSet<PeerId> = self
-            .active_peers_snapshot()
-            .iter()
-            .map(|p| p.id())
-            .collect();
+    fn admit_proposal_source(&self, uid: Uint256, validator: PublicKey, peer_id: PeerId) -> bool {
+        OverlayImpl::admit_proposal_source(self, uid, validator, peer_id)
+    }
+
+    fn admit_validation_source(&self, uid: Uint256, validator: PublicKey, peer_id: PeerId) -> bool {
+        OverlayImpl::admit_validation_source(self, uid, validator, peer_id)
+    }
+
+    fn peer_is_diverged(&self, peer_id: PeerId) -> bool {
+        OverlayImpl::peer_is_diverged(self, peer_id)
+    }
+
+    fn suppress_validation(&self, uid: Uint256) {
+        OverlayImpl::suppress_validation(self, uid)
+    }
+
+    fn sweep_relay_history(&self, _max_entries: u64) {
+        // Match HashRouter's aged-container expiry. Its setup has no fixed
+        // entry-count admission cap: entries live for holdTime (300 seconds)
+        // after their last use, and can relay again after relayTime (30
+        // seconds). The argument is retained for the public trait surface.
+        let now = Instant::now();
         let mut history = self.relay_history.lock().expect("relay history lock");
         let before = history.len();
-        // remove entries for fully-disconnected peers
-        history.retain(|_key, peers| {
-            peers.retain(|id| active_peer_ids.contains(id));
-            !peers.is_empty()
+        history.retain(|_, entry| {
+            entry
+                .last_touched
+                .is_some_and(|touched| now.duration_since(touched) < RELAY_HISTORY_HOLD_TIME)
         });
-        // enforce size cap — if still over limit, drain oldest entries
-        // (HashMap iteration order is non-deterministic, but this prevents OOM)
-        let cap = max_entries as usize;
-        if history.len() > cap {
-            let excess = history.len() - cap;
-            let keys_to_remove: Vec<_> = history.keys().take(excess).cloned().collect();
-            for key in keys_to_remove {
-                history.remove(&key);
-            }
-        }
         let after = history.len();
         if before != after {
             tracing::debug!(
                 target: "overlay",
                 before, after,
                 freed = before.saturating_sub(after),
-                "relay_history sweep (disconnected cleanup + size cap)"
+                "relay_history sweep (HashRouter hold-time expiry)"
             );
         }
     }

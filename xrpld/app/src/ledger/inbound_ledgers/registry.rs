@@ -12,9 +12,10 @@ use ledger::{FetchPackCache, InboundLedgerPacket, Ledger};
 use overlay::Peer;
 use shamap::family::{FullBelowCache, FullBelowCacheImpl};
 use shamap::tree_node_cache::TreeNodeCache;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -53,6 +54,15 @@ pub enum AcquireReason {
     History,
 }
 
+/// A completed acquisition retains its origin until LedgerMaster consumes it.
+/// This distinguishes rippled's non-validating `storeLedger` paths from its
+/// history-only `setFullLedger` path.
+#[derive(Debug, Clone)]
+pub struct CompletedInboundLedger {
+    pub ledger: Arc<Ledger>,
+    pub reason: AcquireReason,
+}
+
 // ─── Entry ───────────────────────────────────────────────────────────────────
 
 struct Entry {
@@ -70,8 +80,12 @@ struct Entry {
 // ─── RegistryInner ───────────────────────────────────────────────────────────
 
 struct RegistryInner {
-    entries: HashMap<Uint256, Entry>,
+    entries: BTreeMap<Uint256, Entry>,
     recent_failures: HashMap<Uint256, Instant>,
+    /// Last key consumed by bounded result polling. Ordered traversal from
+    /// this cursor keeps recovery fair while inspecting only one turn's
+    /// budget, even when channel notification was lost.
+    poll_cursor: Option<Uint256>,
 }
 
 // ─── InboundLedgers ──────────────────────────────────────────────────────────
@@ -89,7 +103,7 @@ pub struct InboundLedgers {
     full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
     fetch_pack: Arc<FetchPackCache>,
     overlay_rt: Arc<RwLock<Option<Arc<AppOverlayRuntime>>>>,
-    completed_ledgers_tx: Sender<Arc<Ledger>>,
+    completed_ledgers_tx: SyncSender<CompletedInboundLedger>,
     stopping: AtomicBool,
     need_network_ledger: Arc<AtomicBool>,
     pending_acquires: Arc<Mutex<HashSet<Uint256>>>,
@@ -101,13 +115,14 @@ impl InboundLedgers {
         tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
         full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
         fetch_pack: Arc<FetchPackCache>,
-        completed_ledgers_tx: Sender<Arc<Ledger>>,
+        completed_ledgers_tx: SyncSender<CompletedInboundLedger>,
         need_network_ledger: Arc<AtomicBool>,
     ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
-                entries: HashMap::new(),
+                entries: BTreeMap::new(),
                 recent_failures: HashMap::new(),
+                poll_cursor: None,
             })),
             worker_pool: Arc::new(WorkerPool::new(WORKER_COUNT)),
             node_store: Arc::new(RwLock::new(None)),
@@ -196,6 +211,11 @@ impl InboundLedgers {
             }
             return entry.completed_ledger.clone();
         }
+
+        // rippled admits one InboundLedger per hash and bounds retention by
+        // progress/failure lifecycle plus the five-minute idle sweep below.
+        // Do not reject a distinct acquisition merely because other active
+        // hashes are present.
 
         // Validate required resources
         let ns = {
@@ -327,6 +347,9 @@ impl InboundLedgers {
 
         {
             let mut buf = state.data_buffer.lock().expect("data_buffer push lock");
+            // `InboundLedger::gotData` retains received packets until its
+            // dispatched worker drains them. Preserve this lifecycle rather
+            // than dropping a valid packet at a fixed local count.
             buf.push((peer_id, packet));
         }
         state.submit_data_job();
@@ -504,7 +527,8 @@ impl InboundLedgers {
         self.stopping.store(true, Ordering::Release);
 
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        for (_, entry) in inner.entries.drain() {
+        let entries = std::mem::take(&mut inner.entries);
+        for (_, entry) in entries {
             entry.state.stopped.store(true, Ordering::Release);
         }
         inner.recent_failures.clear();
@@ -515,47 +539,88 @@ impl InboundLedgers {
 
     // ─── Catchup loop compatibility API ──────────────────────────────────
 
-    /// Poll for completed acquisitions. Returns `(hash, ledger, skip_state)` tuples
-    /// for all entries whose underlying acquisition has finished. Removes those
-    /// entries from the registry.
-    ///
-    /// This is the catchup loop's primary mechanism for consuming results.
-    pub fn poll_results(&self) -> Vec<(Uint256, Ledger, bool)> {
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+    /// Poll all completed acquisitions. Prefer `poll_results_bounded` from
+    /// timer-driven consensus paths so a completion flood cannot starve the
+    /// heartbeat.
+    pub fn poll_results(&self) -> Vec<(Uint256, Ledger, AcquireReason)> {
+        self.poll_results_bounded(usize::MAX)
+    }
+
+    /// Poll at most `budget` acquisition entries. Entries beyond the budget
+    /// remain in the registry for a later turn; no completed result is lost.
+    pub fn poll_results_bounded(&self, budget: usize) -> Vec<(Uint256, Ledger, AcquireReason)> {
+        // Snapshot under the registry mutex, then inspect each acquisition
+        // after releasing it. Completion can race with a long map walk, so
+        // never hold the registry lock while taking `state.mutable`.
+        let entries: Vec<(
+            Uint256,
+            Arc<AcquisitionState>,
+            Option<Arc<Ledger>>,
+            bool,
+            AcquireReason,
+        )> = {
+            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let mut entries = Vec::with_capacity(budget);
+            if budget != 0 {
+                let mut record = |hash: &Uint256, entry: &Entry| {
+                    entries.push((
+                        *hash,
+                        Arc::clone(&entry.state),
+                        entry.completed_ledger.clone(),
+                        entry.failed,
+                        entry.reason,
+                    ));
+                };
+                match inner.poll_cursor {
+                    Some(cursor) => {
+                        for (hash, entry) in inner
+                            .entries
+                            .range((Excluded(cursor), Unbounded))
+                            .chain(inner.entries.range(..=cursor))
+                            .take(budget)
+                        {
+                            record(hash, entry);
+                        }
+                    }
+                    None => {
+                        for (hash, entry) in inner.entries.iter().take(budget) {
+                            record(hash, entry);
+                        }
+                    }
+                }
+                inner.poll_cursor = entries.last().map(|(hash, _, _, _, _)| *hash);
+            }
+            entries
+        };
+
         let mut completed = Vec::new();
         let mut failed_hashes = Vec::new();
         let mut done_hashes = Vec::new();
-
-        for (hash, entry) in inner.entries.iter_mut() {
-            if entry.completed_ledger.is_some() {
-                // Already extracted — skip
+        for (hash, state, externally_completed, failed, reason) in entries {
+            if failed {
                 continue;
             }
-            if entry.failed {
-                continue;
-            }
-            if entry.state.completed.load(Ordering::Acquire) {
-                // Acquisition finished — extract ledger from mutable state
-                let mutable = entry.state.mutable.lock().expect("acq mutable lock (poll)");
-                if let Some(ledger) = mutable.inbound.ledger().cloned() {
-                    completed.push((*hash, ledger, false));
-                    done_hashes.push(*hash);
+            if let Some(ledger) = externally_completed {
+                completed.push((hash, (*ledger).clone(), reason));
+                done_hashes.push(hash);
+            } else if state.completed.load(Ordering::Acquire) {
+                if let Some(ledger) = state.completed_ledger() {
+                    completed.push((hash, (*ledger).clone(), reason));
+                    done_hashes.push(hash);
                 } else {
-                    failed_hashes.push(*hash);
+                    failed_hashes.push(hash);
                 }
-            } else if entry.state.stopped.load(Ordering::Acquire) {
-                failed_hashes.push(*hash);
+            } else if state.stopped.load(Ordering::Acquire) {
+                failed_hashes.push(hash);
             }
         }
 
-        // Remove completed entries
+        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
         for hash in &done_hashes {
             if let Some(entry) = inner.entries.remove(hash) {
                 entry.state.stopped.store(true, Ordering::Release);
             }
         }
-
-        // Mark failed entries
         for hash in &failed_hashes {
             inner.recent_failures.insert(*hash, Instant::now());
             if let Some(entry) = inner.entries.remove(hash) {

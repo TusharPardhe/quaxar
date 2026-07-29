@@ -99,7 +99,7 @@ pub trait ConsensusTxSet: Clone {
 /// Matches the reference's implicit `Ledger` concept.
 pub trait ConsensusLedger: Clone + Default {
     type Id: Eq + std::hash::Hash + Clone + ToString + Default;
-    type Seq: Copy + Ord + Default + std::ops::Add<u32, Output = Self::Seq> + ToString;
+    type Seq: Copy + Ord + Default + std::ops::Add<u32, Output = Self::Seq> + Into<u64> + ToString;
 
     fn id(&self) -> Self::Id;
     fn seq(&self) -> Self::Seq;
@@ -221,13 +221,48 @@ pub trait ConsensusAdaptor {
     /// same rationale as `next_ledger_time_resolution`.
     fn round_close_time(&self, raw: NetClockTimePoint, resolution: Duration) -> NetClockTimePoint;
 
-    /// Total number of trusted validators in the UNL. Used by
-    /// `should_pause` to determine the fraction of laggards. Defaults to
-    /// `0`, which disables the pause logic in the generic algorithm. The
-    /// RCL adaptor overrides this with the live UNL size.
-    fn validators_count(&self) -> usize {
+    /// Sequence of the most recently locally validated ledger. Used by
+    /// `should_pause` to determine how far ahead this working ledger is.
+    /// Defaults to the ledger sequence's default value, which disables the
+    /// pause logic for adaptors that do not track validation state.
+    fn valid_ledger_seq(&self) -> <Self::Ledger as ConsensusLedger>::Seq {
+        Default::default()
+    }
+
+    /// Return the validation quorum and the currently trusted validator keys.
+    /// `laggards` removes keys it has observed online from this set, leaving
+    /// offline validators behind, exactly as rippled's adaptor contract does.
+    fn quorum_keys(&self) -> (usize, HashSet<Self::NodeId>) {
+        (0, HashSet::default())
+    }
+
+    /// Count trusted validators whose live validation is behind `seq`, while
+    /// removing every currently online trusted validator from `trusted_keys`.
+    /// The remaining keys are treated as offline by `should_pause`.
+    fn laggards(
+        &self,
+        _seq: <Self::Ledger as ConsensusLedger>::Seq,
+        _trusted_keys: &mut HashSet<Self::NodeId>,
+    ) -> usize {
         0
     }
+
+    /// Whether this node has validator credentials. Matches rippled's
+    /// `Adaptor::validator` predicate used by `shouldPause`.
+    fn validator(&self) -> bool {
+        false
+    }
+
+    /// Whether the local node has ever completed a validation. Matches
+    /// rippled's `Adaptor::haveValidated` predicate used by `shouldPause`.
+    fn have_validated(&self) -> bool {
+        false
+    }
+
+    /// Update application operating mode after a consensus acceptance.
+    /// Rippled uses the number of current peer positions to downgrade a full
+    /// node with no consensus participants back to connected.
+    fn update_operating_mode(&self, _positions: usize) {}
 }
 
 /// Shorthand for the concrete [`ConsensusResult`] type produced by an
@@ -568,17 +603,6 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         self.now = now;
         self.check_ledger(adaptor);
 
-        // If check_ledger determined we're on the wrong chain, do NOT proceed
-        // with phase advancement. The node must acquire the network's preferred
-        // ledger before participating in consensus. Continuing to close on a
-        // stale ledger risks applying transactions that fail (e.g., amount
-        // overflow panics) and can leave the consensus driver unable to advance.
-        // rippled handles this implicitly through exception-resilient C++ tx
-        // application; Quaxar hardens explicitly by suppressing the close.
-        if self.mode.get() == ConsensusMode::WrongLedger {
-            return;
-        }
-
         match self.phase {
             ConsensusPhase::Open => self.phase_open(adaptor),
             ConsensusPhase::Establish => self.phase_establish(adaptor),
@@ -760,25 +784,10 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
         );
 
         self.phase = ConsensusPhase::Establish;
-        // When recovering from a ledger switch, prefer the peer-reported
-        // close time over our local clock. Our local "now" may be several
-        // seconds past peers' actual close moment due to acquisition delay.
-        // This ensures our close_time matches what peers used, producing
-        // the same ledger hash after effective_close_time rounding.
-        if self.mode.get() == ConsensusMode::SwitchedLedger
-            && !self.raw_close_times.peers.is_empty()
-        {
-            let best_peer_time = self
-                .raw_close_times
-                .peers
-                .iter()
-                .max_by_key(|(_, count)| *count)
-                .map(|(time, _)| *time)
-                .unwrap_or(self.now);
-            self.raw_close_times.self_ = best_peer_time;
-        } else {
-            self.raw_close_times.self_ = self.now;
-        }
+        // The raw self close time is always the current network-adjusted
+        // time. Rippled does not substitute a peer time after switching
+        // ledgers; peer close times remain independent votes for adjustment.
+        self.raw_close_times.self_ = self.now;
         self.peer_unchanged_counter = 0;
         self.establish_counter = 0;
 
@@ -848,16 +857,9 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             return;
         }
 
+        adaptor.update_operating_mode(self.curr_peer_positions.len());
         self.prev_proposers = self.curr_peer_positions.len();
-        // Cap prev_round_time to prevent cascading slowdowns. If one round
-        // takes 22s due to disputes, without a cap the NEXT round must stay
-        // open for 11s (prev_round_time/2 guard in shouldCloseLedger).
-        // Rippled never hits this because it gets 0 disputes, but a cap at
-        // 10s (producing a 5s minimum open time) prevents permanent divergence
-        // if a single slow round occurs. The av_min_consensus_time (5s) is the
-        // natural floor — there's no benefit to prev_round_time exceeding 2x that.
-        let raw_round_time = self.result.as_ref().expect("result set").round_time.read();
-        self.prev_round_time = raw_round_time.min(Duration::from_secs(10));
+        self.prev_round_time = self.result.as_ref().expect("result set").round_time.read();
         self.phase = ConsensusPhase::Accepted;
 
         let result = self.result.take().expect("result set");
@@ -872,31 +874,50 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
     }
 
     /// Evaluate whether pausing increases the likelihood of validation.
-    /// Matches rippled's `shouldPause`: if we are a validator (Proposing
-    /// mode) and more than 20% of trusted validators have not yet validated
-    /// the previous ledger, pause to let them catch up. This prevents fast
-    /// validators from advancing too quickly and leaving slow validators
-    /// unable to participate in consensus.
+    ///
+    /// Faithful port of rippled's `shouldPause`: a node that is ahead of its
+    /// locally validated ledger cycles through five increasingly strict
+    /// thresholds for online, non-lagging validators. `laggards` removes
+    /// online validators from the trusted-key set, leaving offline validators
+    /// behind for the same calculation as the reference implementation.
     fn should_pause(&self, adaptor: &A) -> bool {
-        // Only validators (Proposing mode) should ever pause.
-        if self.mode.get() != ConsensusMode::Proposing {
+        const MAX_PAUSE_PHASE: usize = 4;
+
+        let working_seq = self.previous_ledger.seq();
+        let ahead = Into::<u64>::into(working_seq)
+            .saturating_sub(Into::<u64>::into(adaptor.valid_ledger_seq()));
+        let (quorum, mut trusted_keys) = adaptor.quorum_keys();
+        let total_validators = trusted_keys.len();
+        let laggards = adaptor.laggards(working_seq, &mut trusted_keys);
+        let offline = trusted_keys.len();
+        let round_time = self.result.as_ref().expect("result set").round_time.read();
+
+        if ahead == 0
+            || laggards == 0
+            || total_validators == 0
+            || !adaptor.validator()
+            || !adaptor.have_validated()
+            || round_time > adaptor.parms().ledger_max_consensus
+        {
             return false;
         }
 
-        let total = adaptor.validators_count();
-        // If we don't know the UNL size, can't compute laggard fraction.
-        if total == 0 {
-            return false;
+        let phase = ((ahead - 1) as usize) % (MAX_PAUSE_PHASE + 1);
+        let unavailable = laggards.saturating_add(offline);
+
+        match phase {
+            0 => unavailable > total_validators.saturating_sub(quorum),
+            MAX_PAUSE_PHASE => true,
+            _ => {
+                let non_laggards = total_validators.saturating_sub(unavailable) as f32;
+                let total = total_validators as f32;
+                let quorum_ratio = quorum as f32 / total;
+                let allowed_dissent = 1.0 - quorum_ratio;
+                let phase_factor = phase as f32 / MAX_PAUSE_PHASE as f32;
+
+                non_laggards / total < quorum_ratio + (allowed_dissent * phase_factor)
+            }
         }
-
-        // Count validators who have validated the parent ledger.
-        let validated_parent = adaptor.proposers_validated(&self.prev_ledger_id);
-
-        // Laggards = validators who haven't validated the parent yet.
-        let laggards = total.saturating_sub(validated_parent);
-
-        // Pause if more than 20% of validators are lagging.
-        laggards > total / 5
     }
 
     /// Adjust our position to try to agree with other validators. Matches
@@ -1389,6 +1410,14 @@ mod tests {
         mode_changes: Vec<(ConsensusMode, ConsensusMode)>,
         proposers_validated: usize,
         proposers_finished: usize,
+        valid_ledger_seq: u32,
+        quorum: usize,
+        trusted_keys: HashSet<NodeId>,
+        laggards: usize,
+        online_validators: usize,
+        validator: bool,
+        have_validated: bool,
+        operating_mode_updates: Vec<usize>,
         has_open_transactions: bool,
         ledgers: BTreeMap<LedgerId, MockLedger>,
         tx_sets: BTreeMap<TxSetId, MockTxSet>,
@@ -1509,6 +1538,40 @@ mod tests {
             _resolution: Duration,
         ) -> NetClockTimePoint {
             raw
+        }
+
+        fn valid_ledger_seq(&self) -> u32 {
+            self.state.borrow().valid_ledger_seq
+        }
+
+        fn quorum_keys(&self) -> (usize, HashSet<NodeId>) {
+            let state = self.state.borrow();
+            (state.quorum, state.trusted_keys.clone())
+        }
+
+        fn laggards(&self, _seq: u32, trusted_keys: &mut HashSet<NodeId>) -> usize {
+            let state = self.state.borrow();
+            let online = state.online_validators.min(trusted_keys.len());
+            let online_keys: Vec<_> = trusted_keys.iter().copied().take(online).collect();
+            for key in online_keys {
+                trusted_keys.remove(&key);
+            }
+            state.laggards
+        }
+
+        fn validator(&self) -> bool {
+            self.state.borrow().validator
+        }
+
+        fn have_validated(&self) -> bool {
+            self.state.borrow().have_validated
+        }
+
+        fn update_operating_mode(&self, positions: usize) {
+            self.state
+                .borrow_mut()
+                .operating_mode_updates
+                .push(positions);
         }
     }
 
@@ -1703,6 +1766,97 @@ mod tests {
 
         assert_eq!(c.phase(), ConsensusPhase::Accepted);
         assert_eq!(adaptor.state.borrow().accepted.len(), 1);
+        assert_eq!(c.prev_round_time, max_consensus + Duration::from_secs(1));
+        assert_eq!(adaptor.state.borrow().operating_mode_updates, vec![0]);
+    }
+
+    #[test]
+    fn wrong_ledger_timer_entry_still_advances_open_phase() {
+        let adaptor = MockAdaptor::new();
+        let mut c: Consensus<MockAdaptor> = Consensus::new();
+        let start = NetClockTimePoint::new(1000);
+        c.start_round(
+            &adaptor,
+            start,
+            99,
+            genesis_ledger(),
+            &HashSet::default(),
+            true,
+        );
+        assert_eq!(c.mode(), ConsensusMode::WrongLedger);
+
+        let idle = adaptor
+            .parms
+            .ledger_idle_interval
+            .max(Duration::from_secs(10) * 2);
+        let now = start + time::Duration::seconds(idle.as_secs() as i64 + 1);
+        c.timer_entry(&adaptor, now);
+
+        assert_eq!(c.phase(), ConsensusPhase::Establish);
+        assert_eq!(c.raw_close_times.self_, now);
+    }
+
+    #[test]
+    fn switched_ledger_uses_current_time_as_raw_self_close_time() {
+        let adaptor = MockAdaptor::new();
+        let mut c: Consensus<MockAdaptor> = Consensus::new();
+        let start = NetClockTimePoint::new(1000);
+        c.start_round(
+            &adaptor,
+            start,
+            0,
+            genesis_ledger(),
+            &HashSet::default(),
+            true,
+        );
+        c.mode.set(ConsensusMode::SwitchedLedger, &adaptor);
+        c.raw_close_times
+            .peers
+            .insert(NetClockTimePoint::new(900), 10);
+
+        let idle = adaptor
+            .parms
+            .ledger_idle_interval
+            .max(Duration::from_secs(10) * 2);
+        let now = start + time::Duration::seconds(idle.as_secs() as i64 + 1);
+        c.timer_entry(&adaptor, now);
+
+        assert_eq!(c.raw_close_times.self_, now);
+    }
+
+    #[test]
+    fn should_pause_matches_rippled_laggard_thresholds() {
+        let adaptor = MockAdaptor::new();
+        {
+            let mut state = adaptor.state.borrow_mut();
+            state.valid_ledger_seq = 9;
+            state.quorum = 4;
+            state.trusted_keys = (1..=5).collect();
+            state.laggards = 1;
+            state.online_validators = 1;
+            state.validator = true;
+            state.have_validated = true;
+        }
+        let mut c: Consensus<MockAdaptor> = Consensus::new();
+        let mut ledger = genesis_ledger();
+        ledger.seq = 10;
+        c.start_round(
+            &adaptor,
+            NetClockTimePoint::new(1000),
+            0,
+            ledger,
+            &HashSet::default(),
+            true,
+        );
+        c.close_ledger(&adaptor);
+
+        assert!(c.should_pause(&adaptor));
+
+        let mut state = adaptor.state.borrow_mut();
+        state.laggards = 0;
+        state.online_validators = 5;
+        drop(state);
+        assert!(!c.should_pause(&adaptor));
     }
 
     #[test]

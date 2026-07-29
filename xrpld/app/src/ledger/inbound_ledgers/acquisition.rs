@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 
-use super::registry::AcquireReason;
+use super::registry::{AcquireReason, CompletedInboundLedger};
 use super::worker_pool::WorkerPool;
 
 const PEER_COUNT_START: usize = 5;
@@ -250,6 +250,9 @@ impl ReceivedDataState {
     }
 }
 
+/// Peer packets retained until the acquisition's dispatched worker drains them,
+/// matching rippled `InboundLedger::receivedData_`.
+
 /// Per-ledger state owned by the registry.
 pub struct AcquisitionState {
     pub data_buffer: Mutex<Vec<(u64, InboundLedgerPacket)>>,
@@ -262,9 +265,10 @@ pub struct AcquisitionState {
     pub worker_full_below: FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>,
     pub node_store: SHAMapStoreNodeStore,
     pub shared_tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
-    pub store_tx: std::sync::mpsc::Sender<Arc<Ledger>>,
+    pub store_tx: std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     pub stopped: AtomicBool,
     pub completed: AtomicBool,
+    completed_ledger: Mutex<Option<Arc<Ledger>>>,
     pub failed: AtomicBool,
     pub fetch_pack_ready: AtomicBool,
     data_job_queued: AtomicBool,
@@ -410,6 +414,14 @@ impl AcquisitionState {
     }
 
     pub(crate) fn completed_ledger(&self) -> Option<Arc<Ledger>> {
+        if let Some(ledger) = self
+            .completed_ledger
+            .lock()
+            .expect("acquisition completed ledger lock")
+            .clone()
+        {
+            return Some(ledger);
+        }
         self.mutable
             .lock()
             .expect("acquisition mutable lock")
@@ -427,7 +439,7 @@ pub struct AcquisitionBuilder {
     pub node_store: SHAMapStoreNodeStore,
     pub tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
     pub fetch_pack: Arc<FetchPackCache>,
-    pub store_tx: std::sync::mpsc::Sender<Arc<Ledger>>,
+    pub store_tx: std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     pub full_below_generation: u32,
     pub worker_pool: Arc<WorkerPool>,
     pub initial_peers: Vec<Arc<dyn Peer>>,
@@ -467,6 +479,7 @@ impl AcquisitionBuilder {
             store_tx: self.store_tx,
             stopped: AtomicBool::new(false),
             completed: AtomicBool::new(false),
+            completed_ledger: Mutex::new(None),
             failed: AtomicBool::new(false),
             fetch_pack_ready: AtomicBool::new(false),
             data_job_queued: AtomicBool::new(false),
@@ -804,6 +817,32 @@ fn process_timeout_job(state: &Arc<AcquisitionState>) {
     state.arm_timer();
 }
 
+fn record_completed_ledger(
+    completed: &AtomicBool,
+    completed_ledger: &Mutex<Option<Arc<Ledger>>>,
+    store_tx: &std::sync::mpsc::SyncSender<CompletedInboundLedger>,
+    reason: AcquireReason,
+    ledger: Arc<Ledger>,
+) -> bool {
+    // Record first: the registry's polling path is the authoritative
+    // recovery path when the notification receiver is disconnected or late.
+    // Holding this small cache lock closes the completed=true/cache-empty
+    // window for concurrent acquire/poll callers.
+    let mut cached = completed_ledger
+        .lock()
+        .expect("acquisition completed ledger lock");
+    if completed.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    *cached = Some(Arc::clone(&ledger));
+    drop(cached);
+
+    // This channel only wakes a consumer; failure must not revoke a completed
+    // acquisition or make the ledger unrecoverable through the registry.
+    let _ = store_tx.try_send(CompletedInboundLedger { ledger, reason });
+    true
+}
+
 fn finalize_acquisition(state: &Arc<AcquisitionState>) {
     if state.is_done() {
         return;
@@ -861,11 +900,58 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
         shamap::nodes::tree_node::SHAMapTreeNode::make_from_prefix(object.data(), hash).ok()
     }));
 
-    if state.completed.swap(true, Ordering::AcqRel) {
+    let ledger = Arc::new(ledger);
+    let ledger_seq = ledger.header().seq;
+    // Do not hold the acquisition state lock while publishing completion.
+    // The registry/promotion path may immediately re-enter this state.
+    drop(mutable);
+    if !record_completed_ledger(
+        &state.completed,
+        &state.completed_ledger,
+        &state.store_tx,
+        state.reason,
+        ledger,
+    ) {
         return;
     }
-    tracing::info!(target: "inbound_ledger", seq = ledger.header().seq, "LEDGER ACQUIRED");
-    let _ = state.store_tx.send(Arc::new(ledger));
+    tracing::info!(target: "inbound_ledger", seq = ledger_seq, "LEDGER ACQUIRED");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::registry::AcquireReason;
+    use super::record_completed_ledger;
+    use ledger::Ledger;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+
+    #[test]
+    fn completed_ledger_remains_recoverable_when_notification_channel_is_closed() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(rx);
+        let completed = AtomicBool::new(false);
+        let cache = Mutex::new(None);
+        let ledger = Arc::new(Ledger::from_ledger_seq_and_close_time(1, 100, false));
+
+        assert!(record_completed_ledger(
+            &completed,
+            &cache,
+            &tx,
+            AcquireReason::Consensus,
+            Arc::clone(&ledger)
+        ));
+        assert!(completed.load(Ordering::Acquire));
+        assert_eq!(
+            cache
+                .lock()
+                .expect("completion cache lock")
+                .as_ref()
+                .expect("completion must be cached")
+                .header()
+                .hash,
+            ledger.header().hash
+        );
+    }
 }
 
 /// Stash state nodes from an unroutable response in the fetch pack, matching

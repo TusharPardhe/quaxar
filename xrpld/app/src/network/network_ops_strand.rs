@@ -15,17 +15,21 @@
 //! this thread touches it.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use basics::base_uint::Uint256;
 use consensus::algorithm::ConsensusPhase;
-use protocol::PublicKey;
 
 use crate::ApplicationRoot;
-use crate::consensus::rcl_consensus::{ConsensusRunner, RclConsensusValidationSource};
+use crate::consensus::rcl_consensus::{
+    ConsensusRunner, PendingAcceptWork, RclConsensusValidationSource,
+};
 use crate::consensus::rcl_validation::RclValidatedLedger;
+use crate::job::job_queue::JobQueue;
+use crate::job::job_types::JobType;
 use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers};
 use crate::network::network_ops::NetworkOpsOperatingMode;
 use crate::runtime::component_runtime::{AppConsensusRuntime, ConsensusCommand};
@@ -36,6 +40,171 @@ use overlay::inbound::QueuedProposal;
 // ledger. InboundLedgers deduplicates by hash/sequence, as rippled does.
 const HISTORY_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
+// A polling turn must always return to the heartbeat scheduler. The overlay
+// channels can be continuously non-empty under peer load; draining either one
+// without a budget would otherwise defer the next JtNetopTimer forever.
+// A command burst should not defer a heartbeat indefinitely either.
+const MAX_COMMANDS_PER_TURN: usize = 64;
+const MAX_PROPOSALS_PER_TURN: usize = 64;
+const MAX_TXSET_COMPLETIONS_PER_TURN: usize = 64;
+const MAX_MAP_COMPLETIONS_PER_TURN: usize = 64;
+const MAX_LEDGER_COMPLETIONS_PER_TURN: usize = 64;
+const MAX_STRAND_INGRESS_QUEUE: usize = 1_024;
+const MAX_STRAND_COMMAND_QUEUE: usize = 128;
+
+/// Typed JobQueue handoff for work that must ultimately mutate consensus.
+///
+/// Rippled schedules heartbeats as `JtNetopTimer` and accepted-ledger work as
+/// `JtAccept`. Quaxar's runner is deliberately owned only by the strand, so
+/// the queued closure cannot call it directly. Instead each typed job sends a
+/// command to that sole owner. This retains the queue's existing priority and
+/// limit policy without adding a second scheduler or permitting concurrent
+/// `timer_tick`/`execute_accept` calls.
+#[derive(Clone)]
+struct ConsensusJobScheduler {
+    job_queue: JobQueue,
+    command_tx: std::sync::mpsc::SyncSender<ConsensusCommand>,
+    heartbeat_queued: Arc<AtomicBool>,
+    accept_queued: Arc<AtomicBool>,
+    /// Accepted-ledger work remains here until a JtAccept worker has
+    /// successfully handed it to the strand command queue. A full bounded
+    /// queue must delay, never discard, the `doAccept` transition.
+    pending_accept: Arc<Mutex<Option<PendingAcceptWork>>>,
+}
+
+impl ConsensusJobScheduler {
+    fn new(job_queue: JobQueue, command_tx: std::sync::mpsc::SyncSender<ConsensusCommand>) -> Self {
+        Self {
+            job_queue,
+            command_tx,
+            heartbeat_queued: Arc::new(AtomicBool::new(false)),
+            accept_queued: Arc::new(AtomicBool::new(false)),
+            pending_accept: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Queue at most one outstanding heartbeat. The flag remains set until
+    /// the command is consumed by the strand, which prevents timer-job pileup
+    /// when workers are temporarily saturated.
+    fn schedule_heartbeat(&self) -> bool {
+        if self
+            .heartbeat_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+
+        let command_tx = self.command_tx.clone();
+        let heartbeat_queued = Arc::clone(&self.heartbeat_queued);
+        if self
+            .job_queue
+            .add_job(JobType::JtNetopTimer, "NetHeart", move || {
+                if command_tx.try_send(ConsensusCommand::Heartbeat).is_err() {
+                    heartbeat_queued.store(false, Ordering::Release);
+                }
+            })
+        {
+            true
+        } else {
+            self.heartbeat_queued.store(false, Ordering::Release);
+            false
+        }
+    }
+
+    /// Queue at most one accepted-ledger handoff. `execute_accept` stays on
+    /// the strand so its full `doAccept → endConsensus → startRound` ordering
+    /// is serialized with timer, proposal, and tx-set mutations.
+    fn schedule_accept(&self, work: PendingAcceptWork) -> bool {
+        let mut pending = self.pending_accept.lock().expect("pending accept lock");
+        if pending.is_some() {
+            return false;
+        }
+        *pending = Some(work);
+        drop(pending);
+        self.schedule_pending_accept()
+    }
+
+    /// Retry an accept handoff retained because the bounded command queue or
+    /// the JobQueue was saturated. The work is removed only after `try_send`
+    /// succeeds, so accepted-phase recovery cannot race ahead of it.
+    fn schedule_pending_accept(&self) -> bool {
+        if self
+            .accept_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+
+        let command_tx = self.command_tx.clone();
+        let accept_queued = Arc::clone(&self.accept_queued);
+        let pending_accept = Arc::clone(&self.pending_accept);
+        if self
+            .job_queue
+            .add_job(JobType::JtAccept, "AcceptLedger", move || {
+                let work = pending_accept.lock().expect("pending accept lock").take();
+                let Some(work) = work else {
+                    accept_queued.store(false, Ordering::Release);
+                    return;
+                };
+                match command_tx.try_send(ConsensusCommand::Accept(work)) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::TrySendError::Full(ConsensusCommand::Accept(work)))
+                    | Err(std::sync::mpsc::TrySendError::Disconnected(ConsensusCommand::Accept(
+                        work,
+                    ))) => {
+                        *pending_accept.lock().expect("pending accept lock") = Some(work);
+                        accept_queued.store(false, Ordering::Release);
+                    }
+                    Err(_) => unreachable!("only Accept commands are sent here"),
+                }
+            })
+        {
+            true
+        } else {
+            self.accept_queued.store(false, Ordering::Release);
+            false
+        }
+    }
+
+    fn has_pending_accept(&self) -> bool {
+        self.pending_accept
+            .lock()
+            .expect("pending accept lock")
+            .is_some()
+    }
+
+    fn heartbeat_consumed(&self) {
+        self.heartbeat_queued.store(false, Ordering::Release);
+    }
+
+    fn accept_consumed(&self) {
+        self.accept_queued.store(false, Ordering::Release);
+    }
+
+    fn accept_is_queued(&self) -> bool {
+        self.accept_queued.load(Ordering::Acquire)
+    }
+}
+
+/// Drain at most `budget` messages so a saturated ingress channel cannot
+/// monopolize the consensus owner.
+fn drain_bounded<T>(
+    receiver: &std::sync::mpsc::Receiver<T>,
+    budget: usize,
+    mut handle: impl FnMut(T),
+) {
+    for _ in 0..budget {
+        match receiver.try_recv() {
+            Ok(value) => handle(value),
+            Err(
+                std::sync::mpsc::TryRecvError::Empty | std::sync::mpsc::TryRecvError::Disconnected,
+            ) => break,
+        }
+    }
+}
+
 /// Dependencies the strand needs (passed at construction).
 pub struct NetworkOpsStrandDeps {
     pub root: ApplicationRoot,
@@ -43,9 +212,10 @@ pub struct NetworkOpsStrandDeps {
     pub shared_inbound: Arc<InboundLedgers>,
     pub configured_ledger_history: u32,
     /// Consensus event channel sender for LedgerDone events from storeLedger drain.
-    pub event_tx: Option<std::sync::mpsc::Sender<crate::consensus::driver::ConsensusEvent>>,
+    pub event_tx: Option<std::sync::mpsc::SyncSender<crate::consensus::driver::ConsensusEvent>>,
     /// Receiver for completed ledgers from shared_inbound acquisition.
-    pub shared_completed_rx: Option<std::sync::mpsc::Receiver<Arc<ledger::Ledger>>>,
+    pub shared_completed_rx:
+        Option<std::sync::mpsc::Receiver<crate::ledger::inbound_ledgers::CompletedInboundLedger>>,
 }
 
 /// External handle to the running strand. Drop to stop.
@@ -53,31 +223,43 @@ pub struct NetworkOpsStrand {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     /// Send proposals from the overlay to the strand.
-    pub proposal_tx: std::sync::mpsc::Sender<QueuedProposal>,
+    pub proposal_tx: std::sync::mpsc::SyncSender<QueuedProposal>,
     /// Send tx-set completions to the strand.
-    pub txset_tx: std::sync::mpsc::Sender<(Uint256, Arc<shamap::sync::SyncTree>)>,
+    pub txset_tx: std::sync::mpsc::SyncSender<(Uint256, Arc<shamap::sync::SyncTree>)>,
     /// Send commands (StartRound, Stop) to the strand.
-    pub command_tx: std::sync::mpsc::Sender<ConsensusCommand>,
+    pub command_tx: std::sync::mpsc::SyncSender<ConsensusCommand>,
 }
 
 impl NetworkOpsStrand {
     /// Spawn the strand thread. Takes ownership of the consensus runner.
     pub fn spawn(deps: NetworkOpsStrandDeps) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let (proposal_tx, proposal_rx) = std::sync::mpsc::channel::<QueuedProposal>();
-        let (txset_tx, txset_rx) =
-            std::sync::mpsc::channel::<(Uint256, Arc<shamap::sync::SyncTree>)>();
-        let (command_tx, command_rx) = std::sync::mpsc::channel::<ConsensusCommand>();
+        let (proposal_tx, proposal_rx) =
+            std::sync::mpsc::sync_channel::<QueuedProposal>(MAX_STRAND_INGRESS_QUEUE);
+        let (txset_tx, txset_rx) = std::sync::mpsc::sync_channel::<(
+            Uint256,
+            Arc<shamap::sync::SyncTree>,
+        )>(MAX_STRAND_INGRESS_QUEUE);
+        let (command_tx, command_rx) =
+            std::sync::mpsc::sync_channel::<ConsensusCommand>(MAX_STRAND_COMMAND_QUEUE);
 
         // Wire the command sender to the consensus runtime so external code
         // (e.g. validation event loop) can issue StartRound commands.
         deps.consensus_rt.set_cmd_sender(command_tx.clone());
 
         let stop_clone = Arc::clone(&stop);
+        let strand_command_tx = command_tx.clone();
         let thread = thread::Builder::new()
             .name("networkops-strand".into())
             .spawn(move || {
-                strand_loop(deps, stop_clone, proposal_rx, txset_rx, command_rx);
+                strand_loop(
+                    deps,
+                    stop_clone,
+                    proposal_rx,
+                    txset_rx,
+                    command_rx,
+                    strand_command_tx,
+                );
             })
             .expect("failed to spawn networkops-strand thread");
 
@@ -93,7 +275,7 @@ impl NetworkOpsStrand {
     /// Signal the strand to stop and wait for the thread to exit.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        let _ = self.command_tx.send(ConsensusCommand::Stop);
+        let _ = self.command_tx.try_send(ConsensusCommand::Stop);
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -103,7 +285,7 @@ impl NetworkOpsStrand {
 impl Drop for NetworkOpsStrand {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        let _ = self.command_tx.send(ConsensusCommand::Stop);
+        let _ = self.command_tx.try_send(ConsensusCommand::Stop);
         // Don't join on drop — just signal.
     }
 }
@@ -116,6 +298,7 @@ fn strand_loop(
     proposal_rx: std::sync::mpsc::Receiver<QueuedProposal>,
     txset_rx: std::sync::mpsc::Receiver<(Uint256, Arc<shamap::sync::SyncTree>)>,
     command_rx: std::sync::mpsc::Receiver<ConsensusCommand>,
+    command_tx: std::sync::mpsc::SyncSender<ConsensusCommand>,
 ) {
     // Elevate thread priority — consensus must never be starved by RPC load.
     #[cfg(unix)]
@@ -146,6 +329,7 @@ fn strand_loop(
     // Take the map-complete receiver for tx-set acquisitions.
     let map_complete_rx = consensus_rt.take_map_complete_receiver();
 
+    let scheduler = ConsensusJobScheduler::new(root.job_queue().clone(), command_tx);
     let mut consensus_started = false;
     let mut last_timer_tick = Instant::now();
     let mut last_round_ledger_id: Option<Uint256> = None;
@@ -175,9 +359,47 @@ fn strand_loop(
     // MAIN STRAND LOOP — matches rippled's NetworkOPs::heartbeatTimer
     // ═══════════════════════════════════════════════════════════════════════
     while !stop.load(Ordering::Acquire) {
-        // ─── 1. Process external commands ─────────────────────────────────
-        while let Ok(cmd) = command_rx.try_recv() {
+        // Retry retained accept work before doing any fallback that could
+        // start a new round. A full command queue delays acceptance but never
+        // permits the accepted-phase recovery path to bypass it.
+        if scheduler.has_pending_accept() && !scheduler.accept_is_queued() {
+            let _ = scheduler.schedule_pending_accept();
+        }
+
+        // ─── 1. Process serialized commands ──────────────────────────────
+        // Worker jobs and external callers can enqueue commands, but only this
+        // thread owns `runner`, so timer, accept, proposal, and round changes
+        // cannot mutate consensus concurrently.
+        for _ in 0..MAX_COMMANDS_PER_TURN {
+            let Ok(cmd) = command_rx.try_recv() else {
+                break;
+            };
             match cmd {
+                ConsensusCommand::Heartbeat => {
+                    scheduler.heartbeat_consumed();
+                    let now = root.shared_time_keeper().close_time();
+                    if let Some(work) = runner.timer_tick(now)
+                        && !scheduler.schedule_accept(work)
+                    {
+                        // A second accept result cannot normally occur before
+                        // the first is consumed: timer_entry remains in
+                        // Accepted. Never execute it inline on this path.
+                        tracing::error!(target: "consensus", "failed to queue JtAccept handoff");
+                    }
+                    consensus_rt.update_phase(runner.phase());
+                    consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
+                    last_timer_tick = Instant::now();
+                }
+                ConsensusCommand::Accept(work) => {
+                    // This command was emitted by a JtAccept job. Execute the
+                    // whole accept/end/start transition on the one owner.
+                    let now = root.shared_time_keeper().close_time();
+                    runner.execute_accept(now, work);
+                    scheduler.accept_consumed();
+                    consensus_rt.update_phase(runner.phase());
+                    consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
+                    last_round_ledger_id = Some(runner.prev_ledger_id());
+                }
                 ConsensusCommand::StartRound {
                     now,
                     prev_ledger_id,
@@ -227,8 +449,15 @@ fn strand_loop(
             }
         }
 
-        // ─── 2. Drain proposals → peer_proposal() ────────────────────────
-        while let Ok(proposal) = proposal_rx.try_recv() {
+        // ─── 2. Schedule the 1s heartbeat before processing peer ingress ──
+        // `JtNetopTimer` has the reference priority/limit. The job only
+        // hands off a command; `timer_tick` remains serialized on this strand.
+        if last_timer_tick.elapsed() >= Duration::from_secs(1) {
+            let _ = scheduler.schedule_heartbeat();
+        }
+
+        // ─── 3. Drain a bounded proposal slice → peer_proposal() ─────────
+        drain_bounded(&proposal_rx, MAX_PROPOSALS_PER_TURN, |proposal| {
             let now = root.shared_time_keeper().close_time();
             let peer_close_time =
                 basics::chrono::NetClockTimePoint::new(proposal.message.close_time);
@@ -247,12 +476,12 @@ fn strand_loop(
                 prop,
             );
             runner.peer_proposal(now, &peer_pos);
-        }
+        });
         consensus_rt.update_phase(runner.phase());
         consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
 
-        // ─── 3. Drain tx-set completions → got_tx_set() ──────────────────
-        while let Ok((hash, set)) = txset_rx.try_recv() {
+        // ─── 4. Drain a bounded tx-set completion slice → got_tx_set() ───
+        drain_bounded(&txset_rx, MAX_TXSET_COMPLETIONS_PER_TURN, |(hash, set)| {
             let now = root.shared_time_keeper().close_time();
             let tx_set = consensus::RclTxSet::from_parts(
                 set.root(),
@@ -263,11 +492,11 @@ fn strand_loop(
             runner.got_tx_set(now, tx_set);
             consensus_rt.update_phase(runner.phase());
             tracing::debug!(target: "consensus", %hash, "strand: got_tx_set processed");
-        }
+        });
 
-        // Also drain from the map_complete receiver if available
+        // Also drain a bounded slice from the map-complete receiver.
         if let Some(ref rx) = map_complete_rx {
-            while let Ok((hash, set)) = rx.try_recv() {
+            drain_bounded(rx, MAX_MAP_COMPLETIONS_PER_TURN, |(hash, set)| {
                 let now = root.shared_time_keeper().close_time();
                 let tx_set = consensus::RclTxSet::from_parts(
                     set.root(),
@@ -278,19 +507,29 @@ fn strand_loop(
                 runner.got_tx_set(now, tx_set);
                 consensus_rt.update_phase(runner.phase());
                 tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (map_complete)");
-            }
+            });
         }
 
-        // ─── 4. Timer tick every 1s → timer_entry + execute_accept ────────
-        if last_timer_tick.elapsed() >= Duration::from_secs(1) {
+        // Durable recovery for completion notifications that could not enter
+        // the bounded map-complete channel. These are coalesced by tx-set hash
+        // in InboundTransactions and drained every strand turn.
+        let pending_map_completions = root
+            .inbound_transactions()
+            .lock()
+            .ok()
+            .map(|mut inbound| inbound.take_pending_map_completions(MAX_MAP_COMPLETIONS_PER_TURN))
+            .unwrap_or_default();
+        for (hash, set) in pending_map_completions {
             let now = root.shared_time_keeper().close_time();
-            if let Some(work) = runner.timer_tick(now) {
-                runner.execute_accept(now, work);
-                last_round_ledger_id = Some(runner.prev_ledger_id());
-            }
+            let tx_set = consensus::RclTxSet::from_parts(
+                set.root(),
+                Arc::clone(runner.adaptor.tx_set_cache()),
+                set.backed(),
+                0,
+            );
+            runner.got_tx_set(now, tx_set);
             consensus_rt.update_phase(runner.phase());
-            consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-            last_timer_tick = Instant::now();
+            tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (durable map completion)");
         }
 
         // ─── 5. Handle Accepted phase → detect new closed and start_round ─
@@ -299,7 +538,11 @@ fn strand_loop(
         // ledger and must NOT start new consensus rounds on our local (wrong)
         // ledger. The switchLastClosedLedger block in step 6 handles starting
         // a round on the correct chain once the acquisition completes.
-        if runner.phase() == ConsensusPhase::Accepted && !root.need_network_ledger() {
+        if runner.phase() == ConsensusPhase::Accepted
+            && !scheduler.accept_is_queued()
+            && !scheduler.has_pending_accept()
+            && !root.need_network_ledger()
+        {
             if let Some(closed) = root.closed_ledger() {
                 let closed_id = *closed.header().hash.as_uint256();
                 if last_round_ledger_id != Some(closed_id) {
@@ -315,6 +558,29 @@ fn strand_loop(
                     last_timer_tick = Instant::now();
                     tracing::info!(target: "consensus", seq = closed.header().seq,
                         "Consensus started next round on newly accepted ledger");
+                }
+            }
+        }
+
+        // ─── 6a. completion recovery — registry is authoritative ────────
+        // The sender is only a wakeup optimization. If it is disconnected or
+        // not yet drained, completed acquisition state remains recoverable
+        // here and follows the same storeLedger -> checkAccept path.
+        if let Some(lm_rt) = root.ledger_master_runtime() {
+            let lm = lm_rt.ledger_master();
+            for (_, ledger, reason) in
+                shared_inbound.poll_results_bounded(MAX_LEDGER_COMPLETIONS_PER_TURN)
+            {
+                let ledger = Arc::new(ledger);
+                let inserted = persist_completed_inbound_ledger(&root, &lm, &ledger, reason);
+                root.check_accept_hash_seq(*ledger.header().hash.as_uint256(), ledger.header().seq);
+                if inserted {
+                    root.validations().register_ledger(&ledger);
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.try_send(crate::consensus::driver::ConsensusEvent::LedgerDone(
+                            Arc::clone(&ledger),
+                        ));
+                    }
                 }
             }
         }
@@ -340,36 +606,43 @@ fn strand_loop(
                 .lock()
                 .expect("completed_ledgers_rx");
             if let Some(rx) = rx_guard.as_ref() {
-                while let Ok(ledger) = rx.try_recv() {
-                    // The application-owned registry sends every completed
-                    // inbound ledger here, including History acquisitions.
-                    // `setFullLedger` in rippled makes this ledger part of
-                    // completeLedgers before doAdvance chooses the next gap.
+                drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |completion| {
+                    let ledger = completion.ledger;
                     let lm = lm_rt.ledger_master();
-                    let inserted = persist_completed_inbound_ledger(&root, &lm, &ledger);
+                    let inserted =
+                        persist_completed_inbound_ledger(&root, &lm, &ledger, completion.reason);
+                    root.check_accept_hash_seq(
+                        *ledger.header().hash.as_uint256(),
+                        ledger.header().seq,
+                    );
                     if inserted {
+                        root.validations().register_ledger(&ledger);
                         if let Some(ref tx) = event_tx {
-                            let _ = tx.send(crate::consensus::driver::ConsensusEvent::LedgerDone(
-                                Arc::clone(&ledger),
-                            ));
+                            let _ =
+                                tx.try_send(crate::consensus::driver::ConsensusEvent::LedgerDone(
+                                    Arc::clone(&ledger),
+                                ));
                         }
                     }
-                }
+                });
             }
         }
         if let Some(ref rx) = shared_completed_rx {
-            while let Ok(ledger) = rx.try_recv() {
-                let persisted = root.ledger_master_runtime().is_some_and(|lm_rt| {
+            drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |completion| {
+                let ledger = completion.ledger;
+                let inserted = root.ledger_master_runtime().is_some_and(|lm_rt| {
                     let lm = lm_rt.ledger_master();
-                    persist_completed_inbound_ledger(&root, &lm, &ledger)
+                    persist_completed_inbound_ledger(&root, &lm, &ledger, completion.reason)
                 });
-                if persisted {
+                root.check_accept_hash_seq(*ledger.header().hash.as_uint256(), ledger.header().seq);
+                if inserted {
+                    root.validations().register_ledger(&ledger);
                     if let Some(ref tx) = event_tx {
-                        let _ =
-                            tx.send(crate::consensus::driver::ConsensusEvent::LedgerDone(ledger));
+                        let _ = tx
+                            .try_send(crate::consensus::driver::ConsensusEvent::LedgerDone(ledger));
                     }
                 }
-            }
+            });
         }
 
         // ─── 6c. pending_consensus_ledger → acquire_async ────────────────
@@ -404,7 +677,6 @@ fn check_accept_and_advance(
         return;
     };
     let lm = lm_rt.ledger_master();
-    let quorum = root.validators().quorum();
 
     // ── switchLastClosedLedger for joining nodes ──────────────────────────
     if root.need_network_ledger()
@@ -477,51 +749,42 @@ fn check_accept_and_advance(
                     || !network_ledger.tx_map().is_synching();
                 let can_be_current =
                     lm.can_be_current(network_ledger.as_ref(), root.current_close_time_seconds());
-                if state_complete && tx_complete && can_be_current {
+                let compatible = lm.is_compatible(network_ledger.as_ref());
+                if state_complete && tx_complete && can_be_current && compatible {
                     let new_seq = network_ledger.header().seq;
                     let new_hash = *network_ledger.header().hash.as_uint256();
 
-                    // H4: Reject switch to a ledger at or below the current validated
-                    // sequence.  Matches rippled's isCompatible guard which prevents
-                    // re-processing already-validated ledger heights.
-                    if new_seq > lm.valid_ledger_seq() {
-                        let trusted_validation_quorum =
-                            root.validations().num_trusted_for_ledger(new_hash) >= quorum;
-
-                        if trusted_validation_quorum {
-                            let mut ledger = (*network_ledger).clone();
-                            ledger.set_validated();
-                            let validated = Arc::new(ledger);
-                            lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
-                            lm.mark_ledger_complete(validated.header().seq);
-                            root.note_validated_ledger_for_sync(Arc::clone(&validated));
-                            root.on_closed_ledger(Arc::clone(&validated));
-                            root.try_advance_publication();
-                            root.promote_operating_mode_after_accepted_ledger(&validated);
-                        } else {
-                            // This is a peer-LCL fallback, not a claim that the
-                            // ledger is validated. Install it as the closed ledger
-                            // so consensus can resume; later trusted validations
-                            // still flow through checkAccept before advancing the
-                            // validated-ledger slot.
-                            //
-                            // We must also advance `valid_ledger_seq` here.  If we
-                            // leave it at its old value (e.g. after a DB-restart
-                            // catch-up), `get_preferred` can return ledgers far
-                            // ahead of what we've actually closed, causing every
-                            // subsequent consensus round to be killed by
-                            // `check_ledger` before it can advance the validated
-                            // ledger -- an infinite restart deadlock.  Updating
-                            // `valid_ledger_seq` bounds `min_valid_seq` so that
-                            // `get_preferred` only returns ledgers we've actually
-                            // closed, preventing the deadlock.
-                            lm.set_valid_ledger_no_sweep(Arc::clone(&network_ledger), None, None);
-                            lm.mark_ledger_complete(network_ledger.header().seq);
+                    // `isCompatible` already establishes that an equal-height
+                    // candidate is on the validated chain. rippled permits
+                    // switching that compatible LCL; only older candidates
+                    // are rejected here.
+                    if new_seq >= lm.valid_ledger_seq() {
+                        // Switching the local closed ledger and accepting a
+                        // fully validated ledger are separate operations.
+                        // Let the common checkAccept path decide whether this
+                        // candidate has exact-sequence, nUNL-filtered quorum.
+                        let trusted_validation_quorum = root
+                            .trusted_validation_count_for_ledger(new_hash, new_seq)
+                            >= root.validators().quorum();
+                        root.check_accept_hash_seq(new_hash, new_seq);
+                        let accepted = lm.validated_ledger().is_some_and(|validated| {
+                            validated.header().hash == network_ledger.header().hash
+                        });
+                        if !accepted {
+                            // This is a peer-LCL fallback only. It must not
+                            // mutate LedgerMaster's validated/published slots
+                            // or mark the ledger validated: peer agreement is
+                            // not trusted-validation evidence.
                             root.on_closed_ledger(Arc::clone(&network_ledger));
-                            root.promote_operating_mode_after_accepted_ledger(&network_ledger);
                         }
 
                         root.set_need_network_ledger(false);
+
+                        // TxQ must observe the new closed ledger before the
+                        // re-parented open ledger accepts its queued work.
+                        // This is rippled's `processClosedLedger(..., true)`
+                        // backstep call in switchLastClosedLedger.
+                        root.process_closed_ledger_txq(network_ledger.as_ref(), true);
 
                         // Rippled parity: rebuild open ledger on the new chain so
                         // local transactions and TxQ state are re-evaluated against
@@ -533,58 +796,26 @@ fn check_accept_and_advance(
                             new_hash,
                         );
 
-                        // Rippled parity: broadcast neSWITCHED_LEDGER to all peers
-                        // so they know we jumped to the network chain.
-                        if let Some(overlay_rt) = root.overlay_runtime() {
-                            use overlay::Overlay;
-                            let hdr = network_ledger.header();
-                            let status = overlay::ProtocolMessage::new(
-                                overlay::ProtocolPayload::StatusChange(
-                                    overlay::message::wire::TmStatusChange {
-                                        new_status: None,
-                                        new_event: Some(3), // neSWITCHED_LEDGER
-                                        ledger_seq: Some(hdr.seq),
-                                        ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
-                                        ledger_hash_previous: Some(
-                                            hdr.parent_hash.as_uint256().data().to_vec(),
-                                        ),
-                                        network_time: None,
-                                        first_seq: Some(0),
-                                        last_seq: Some(0),
-                                    },
-                                ),
-                            );
-                            overlay_rt.overlay().broadcast(&status);
-                        }
-
-                        // H5: TxQ::processClosedLedger on chain jump.  Matches
-                        // rippled's switchLastClosedLedger which calls
-                        // TxQ::processClosedLedger with backStep=true after
-                        // re-parenting the open ledger.
-                        root.process_closed_ledger_txq(network_ledger.as_ref(), false);
-
-                        // H6: Update NegativeUNL and trust set before starting the
-                        // next consensus round.  Matches rippled's
-                        // switchLastClosedLedger which calls
-                        // updateTrie(validations, ledger) and
-                        // validators.setNegativeUNL() before beginConsensus.
-                        {
-                            let nunl_bytes = network_ledger.negative_unl();
-                            let nunl: std::collections::HashSet<PublicKey> =
-                                nunl_bytes.into_iter().map(PublicKey::from_bytes).collect();
-                            root.validators().set_negative_unl(nunl);
-                        }
-                        root.validators().update_trusted(
-                            &std::collections::HashSet::new(),
-                            root.current_close_time_seconds(),
+                        // The shared notifier supplies rippled-compatible
+                        // network time and the actual advertised ledger range.
+                        root.broadcast_consensus_status_change(
+                            network_ledger.as_ref(),
+                            3, // neSWITCHED_LEDGER
+                            true,
                         );
 
+                        // endConsensus promotes the operating mode before
+                        // beginConsensus, so a caught-up validator can propose
+                        // in this new round rather than first observing it.
+                        root.promote_operating_mode_after_accepted_ledger(network_ledger.as_ref());
+                        let proposing =
+                            root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full;
                         let now = root.shared_time_keeper().close_time();
                         let prev_cx = crate::consensus_ledger_from_ledger(&network_ledger);
                         if let Some(inbound_tx) = root.inbound_transactions().lock().ok().as_mut() {
                             inbound_tx.new_round(network_ledger.header().seq);
                         }
-                        runner.start_round(now, new_hash, prev_cx, true);
+                        runner.start_round(now, new_hash, prev_cx, proposing);
 
                         // M16: Cycle peer status after chain jump.  Matches rippled's
                         // endConsensus which calls cycleStatus() on peers that still
@@ -615,63 +846,29 @@ fn check_accept_and_advance(
                             target: "consensus",
                             new_seq,
                             valid_seq = lm.valid_ledger_seq(),
-                            "Rejected switch to ledger at or below validated sequence"
+                            "Rejected switch to ledger below validated sequence"
                         );
                     }
-                } else if !can_be_current {
+                } else if !can_be_current || !compatible {
                     tracing::warn!(
                         target: "consensus",
                         seq = network_ledger.header().seq,
                         hash = %preferred_hash,
-                        "Rejected preferred peer LCL that cannot be current"
+                        can_be_current,
+                        compatible,
+                        "Rejected preferred peer LCL that conflicts with validated or quorum-backed history"
                     );
                 }
             }
         }
     }
 
-    // ── checkAccept: promote closed ledger if quorum validations ──────────
+    // ── checkAccept: the closed ledger may now have reached quorum ───────
     if let Some(closed) = root.closed_ledger() {
-        let closed_seq = closed.header().seq;
-        if closed_seq > lm.valid_ledger_seq() {
-            let closed_hash = *closed.header().hash.as_uint256();
-            let val_count = root.validations().num_trusted_for_ledger(closed_hash);
-            if val_count >= quorum {
-                let mut l = (*closed).clone();
-                l.set_validated();
-                let validated = Arc::new(l);
-                lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
-                root.note_validated_ledger_for_sync(Arc::clone(&validated));
-                lm.mark_ledger_complete(validated.header().seq);
-                root.set_need_network_ledger(false);
-
-                // Rippled parity: propagate median fee from trusted validations.
-                // Matches LedgerMaster::checkAccept lines 986-1014.
-                let load_base = root.load_fee_track().load_base();
-                let mut fees =
-                    root.validations()
-                        .fees_for_ledger(closed_hash, closed_seq, load_base);
-                {
-                    let parent_hash = *closed.header().parent_hash.as_uint256();
-                    let mut fees2 = root.validations().fees_for_ledger(
-                        parent_hash,
-                        closed_seq.saturating_sub(1),
-                        load_base,
-                    );
-                    fees.append(&mut fees2);
-                }
-                let fee = if fees.is_empty() {
-                    load_base
-                } else {
-                    fees.sort_unstable();
-                    fees[fees.len() / 2]
-                };
-                root.load_fee_track().set_remote_fee(fee);
-            }
-        }
+        root.check_accept_hash_seq(*closed.header().hash.as_uint256(), closed.header().seq);
     }
 
-    // ── tryAdvance: burst through consecutive validated ledgers ───────────
+    // ── tryAdvance: burst through consecutive quorum-backed ledgers ───────
     let mut advanced = 0u32;
     loop {
         let next_seq = lm.valid_ledger_seq() + 1;
@@ -679,17 +876,10 @@ fn check_accept_and_advance(
             break;
         };
         let candidate_hash = *candidate.header().hash.as_uint256();
-        let val_count = root.validations().num_trusted_for_ledger(candidate_hash);
-        if val_count < quorum {
+        root.check_accept_hash_seq(candidate_hash, next_seq);
+        if lm.valid_ledger_seq() < next_seq {
             break;
         }
-        let mut l = (*candidate).clone();
-        l.set_validated();
-        let validated = Arc::new(l);
-        lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
-        root.note_validated_ledger_for_sync(Arc::clone(&validated));
-        lm.mark_ledger_complete(validated.header().seq);
-        root.set_need_network_ledger(false);
         advanced += 1;
     }
     if advanced > 0 {
@@ -866,78 +1056,41 @@ fn persist_completed_inbound_ledger(
     root: &ApplicationRoot,
     lm: &ledger::LedgerMaster,
     ledger: &Arc<ledger::Ledger>,
+    reason: AcquireReason,
 ) -> bool {
-    // rippled's `LedgerMaster::setFullLedger` is the ownership boundary for
-    // a completed inbound ledger.  It validates and marks the complete map,
-    // but critically also schedules `pendSaveValidated`, which records the
-    // header and accepted TransactionMd entries for restart-safe RPC lookup.
-    //
-    // The old Rust path only populated the TaggedCache/RangeSet.  Raw SHAMap
-    // nodes then survived in NuDB, while headers, transaction rows and the
-    // transaction-master committed state were never persisted.
     let normalized = root.ledger_with_node_fetcher(Arc::clone(ledger));
-    let was_complete = lm.have_ledger(normalized.header().seq);
-    let persistence =
-        ledger::LedgerPersistence::new(Arc::new(root.build_ledger_persistence_runtime()));
-    let saved = match lm.set_full_ledger(
-        &persistence,
-        Arc::clone(&normalized),
-        true,
-        false,
-        None,
-        None,
-    ) {
-        Ok(saved) => saved,
-        Err(error) => {
-            tracing::warn!(
-                target: "ledger",
-                seq = normalized.header().seq,
-                hash = %normalized.header().hash,
-                ?error,
-                "completed inbound ledger was not persisted"
-            );
-            false
+    match reason {
+        // `InboundLedger::done` calls `storeLedger` for generic and consensus
+        // acquisitions. It preserves the header's existing validated state
+        // and never inserts an unvalidated fork by sequence or into
+        // `completeLedgers`.
+        AcquireReason::Consensus | AcquireReason::Generic => {
+            !lm.ledger_history().insert(normalized, false)
         }
-    };
-
-    if !saved {
-        // `set_full_ledger` marks the range before its persistence result is
-        // returned.  Do not expose a ledger as retained history when its
-        // metadata/transaction records failed to save.
-        if !was_complete {
-            lm.clear_ledger(normalized.header().seq);
+        // History is consumed by LedgerMaster's fetch-for-history path. That
+        // path always calls `setFullLedger(..., false, false)`: even an
+        // already-complete sequence may be a competing hash whose lifecycle
+        // effects must be considered before the result is de-duplicated.
+        AcquireReason::History => {
+            let was_complete = lm.have_ledger(normalized.header().seq);
+            let persistence =
+                ledger::LedgerPersistence::new(Arc::new(root.build_ledger_persistence_runtime()));
+            if let Err(error) =
+                lm.set_full_ledger(&persistence, normalized, false, false, None, None)
+            {
+                tracing::warn!(target: "ledger", ?error, "failed to promote completed history ledger");
+                return false;
+            }
+            !was_complete
         }
-        return false;
     }
-
-    // `set_full_ledger` may advance LedgerMaster's validated ledger directly.
-    // Mirror its authoritative result into ApplicationRoot before exposing the
-    // completed ledger to RPC consumers. Without this, server_info and
-    // snapshot export can observe no validated ledger even though LedgerMaster
-    // has already logged and retained one.
-    if let Some(validated) = lm.validated_ledger() {
-        root.note_validated_ledger_for_sync(validated);
-    }
-
-    let _ = record_completed_inbound_ledger(lm, &normalized);
-    !was_complete
 }
 
 fn record_completed_inbound_ledger(
     lm: &ledger::LedgerMaster,
     ledger: &Arc<ledger::Ledger>,
 ) -> bool {
-    // `LedgerMaster::setFullLedger` in rippled publishes the acquired object
-    // into both its history cache and completeLedgers. Both are required:
-    // cache lookup supplies the predecessor hash, while completeLedgers lets
-    // doAdvance select the next lower missing sequence.
-    let ledger_seq = ledger.header().seq;
-    let was_complete = ledger_seq > 0 && lm.have_ledger(ledger_seq);
-    let _ = lm.ledger_history().insert(Arc::clone(ledger), true);
-    if ledger_seq > 0 {
-        lm.mark_ledger_complete(ledger_seq);
-    }
-    !was_complete
+    !lm.ledger_history().insert(Arc::clone(ledger), false)
 }
 
 /// Matches rippled's static `shouldAcquire()` helper in LedgerMaster.cpp.
@@ -974,13 +1127,23 @@ fn should_acquire_history(
 
 #[cfg(test)]
 mod tests {
-    use super::{persist_completed_inbound_ledger, record_completed_inbound_ledger};
+    use super::{
+        ConsensusJobScheduler, MAX_LEDGER_COMPLETIONS_PER_TURN, MAX_PROPOSALS_PER_TURN,
+        drain_bounded, persist_completed_inbound_ledger, record_completed_inbound_ledger,
+    };
     use crate::ApplicationRoot;
+    use crate::consensus::rcl_consensus::PendingAcceptWork;
+    use crate::job::job_queue::JobQueue;
+    use crate::job::job_types::JobType;
+    use crate::ledger::inbound_ledgers::AcquireReason;
+    use crate::runtime::component_runtime::ConsensusCommand;
     use basics::base_uint::Uint256;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::MonotonicClock;
     use ledger::{Ledger, LedgerHeader, LedgerMaster, LedgerMasterConfig, calculate_ledger_hash};
     use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn immutable_ledger(seq: u32, parent_fill: u8) -> Arc<Ledger> {
         let mut header = LedgerHeader {
@@ -1021,24 +1184,191 @@ mod tests {
     }
 
     #[test]
-    fn completed_inbound_current_ledger_publishes_application_validated_slot() {
+    fn heartbeat_job_runs_under_ingress_flood_and_ingress_drain_is_bounded() {
+        let queue = JobQueue::new(1);
+        let (command_tx, command_rx) = mpsc::sync_channel(128);
+        let scheduler = ConsensusJobScheduler::new(queue.clone(), command_tx);
+        let (gate_started_tx, gate_started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        // Hold the only worker so the full flood and the timer job are queued
+        // together. JtNetopTimer must then win over JtTransaction work.
+        assert!(queue.add_job(JobType::JtAdmin, "test-gate", move || {
+            gate_started_tx.send(()).expect("gate start receiver");
+            release_rx.recv().expect("gate release sender");
+        }));
+        gate_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("gate should occupy the worker");
+
+        for _ in 0..MAX_PROPOSALS_PER_TURN * 4 {
+            assert!(queue.add_job(JobType::JtTransaction, "ingress", || {}));
+        }
+        assert!(scheduler.schedule_heartbeat());
+        assert_eq!(queue.job_count(JobType::JtNetopTimer), 1);
+
+        release_tx.send(()).expect("release gate");
+        assert!(matches!(
+            command_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("JtNetopTimer must run before ingress flood"),
+            ConsensusCommand::Heartbeat
+        ));
+
+        let (ingress_tx, ingress_rx) = mpsc::channel();
+        for value in 0..=MAX_PROPOSALS_PER_TURN {
+            ingress_tx.send(value).expect("ingress receiver");
+        }
+        let mut processed = Vec::new();
+        drain_bounded(&ingress_rx, MAX_PROPOSALS_PER_TURN, |value| {
+            processed.push(value);
+        });
+        assert_eq!(processed.len(), MAX_PROPOSALS_PER_TURN);
+        assert_eq!(ingress_rx.try_recv(), Ok(MAX_PROPOSALS_PER_TURN));
+
+        let (completion_tx, completion_rx) = mpsc::channel();
+        for value in 0..=MAX_LEDGER_COMPLETIONS_PER_TURN {
+            completion_tx.send(value).expect("completion receiver");
+        }
+        let mut completions = Vec::new();
+        drain_bounded(&completion_rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |value| {
+            completions.push(value);
+        });
+        assert_eq!(completions.len(), MAX_LEDGER_COMPLETIONS_PER_TURN);
+        assert_eq!(
+            completion_rx.try_recv(),
+            Ok(MAX_LEDGER_COMPLETIONS_PER_TURN)
+        );
+
+        queue.rendezvous();
+        queue.stop();
+    }
+
+    #[test]
+    fn accept_handoff_is_jtaccept_and_coalesces_before_strand_mutation() {
+        let queue = JobQueue::new(1);
+        let (command_tx, command_rx) = mpsc::sync_channel(128);
+        let scheduler = ConsensusJobScheduler::new(queue.clone(), command_tx);
+        let (gate_started_tx, gate_started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        assert!(queue.add_job(JobType::JtAdmin, "test-gate", move || {
+            gate_started_tx.send(()).expect("gate start receiver");
+            release_rx.recv().expect("gate release sender");
+        }));
+        gate_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("gate should occupy the worker");
+
+        let work = PendingAcceptWork {
+            closed_seq: 7,
+            close_time: 700,
+            close_resolution: 30,
+            correct_close_time: true,
+            consensus_hash: Uint256::from_u64(70),
+            have_correct_lcl: true,
+            base_fee_drops: 10,
+            txns: Vec::new(),
+            validation: None,
+        };
+        assert!(scheduler.schedule_accept(work));
+        assert!(scheduler.accept_is_queued());
+        assert_eq!(queue.job_count(JobType::JtAccept), 1);
+
+        // An accepted consensus phase cannot queue a second mutable accept
+        // transition before the first JtAccept command reaches the strand.
+        assert!(!scheduler.schedule_accept(PendingAcceptWork {
+            closed_seq: 8,
+            close_time: 800,
+            close_resolution: 30,
+            correct_close_time: true,
+            consensus_hash: Uint256::from_u64(80),
+            have_correct_lcl: true,
+            base_fee_drops: 10,
+            txns: Vec::new(),
+            validation: None,
+        }));
+        assert_eq!(queue.job_count(JobType::JtAccept), 1);
+
+        release_tx.send(()).expect("release gate");
+        match command_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("JtAccept command should reach the strand")
+        {
+            ConsensusCommand::Accept(work) => assert_eq!(work.closed_seq, 7),
+            _ => panic!("expected JtAccept handoff"),
+        }
+        // The strand clears this only after it serially executes the complete
+        // accept/endConsensus/startRound transition.
+        scheduler.accept_consumed();
+        assert!(!scheduler.accept_is_queued());
+
+        queue.rendezvous();
+        queue.stop();
+    }
+
+    #[test]
+    fn accept_handoff_retries_after_full_command_queue_without_losing_work() {
+        let queue = JobQueue::new(1);
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        command_tx
+            .send(ConsensusCommand::Heartbeat)
+            .expect("test command queue should accept filler");
+        let scheduler = ConsensusJobScheduler::new(queue.clone(), command_tx);
+        let work = PendingAcceptWork {
+            closed_seq: 9,
+            close_time: 900,
+            close_resolution: 30,
+            correct_close_time: true,
+            consensus_hash: Uint256::from_u64(90),
+            have_correct_lcl: true,
+            base_fee_drops: 10,
+            txns: Vec::new(),
+            validation: None,
+        };
+
+        assert!(scheduler.schedule_accept(work));
+        queue.rendezvous();
+        assert!(scheduler.has_pending_accept());
+        assert!(!scheduler.accept_is_queued());
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(ConsensusCommand::Heartbeat)
+        ));
+
+        assert!(scheduler.schedule_pending_accept());
+        match command_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("retained accept must reach the strand after capacity returns")
+        {
+            ConsensusCommand::Accept(work) => assert_eq!(work.closed_seq, 9),
+            _ => panic!("expected retained JtAccept handoff"),
+        }
+        assert!(!scheduler.has_pending_accept());
+        scheduler.accept_consumed();
+        queue.stop();
+    }
+
+    #[test]
+    fn completed_inbound_ledger_is_cached_without_promoting_unvalidated_state() {
         let root = ApplicationRoot::new(0).expect("root should build");
         let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
         let current = immutable_ledger(101, 0xA1);
 
         assert!(root.validated_ledger().is_none());
-        assert!(persist_completed_inbound_ledger(&root, &master, &current));
+        assert!(persist_completed_inbound_ledger(
+            &root,
+            &master,
+            &current,
+            AcquireReason::Consensus,
+        ));
+        assert!(master.validated_ledger().is_none());
+        assert!(root.validated_ledger().is_none());
         assert_eq!(
             master
-                .validated_ledger()
-                .expect("LedgerMaster should retain the completed ledger")
-                .header()
-                .seq,
-            101
-        );
-        assert_eq!(
-            root.validated_ledger()
-                .expect("ApplicationRoot must mirror LedgerMaster validation for RPC")
+                .ledger_history()
+                .get_cached_ledger_by_hash(current.header().hash)
+                .expect("completed ledger should be available to checkAccept")
                 .header()
                 .seq,
             101
@@ -1046,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_inbound_history_ledger_is_cached_and_marked_complete() {
+    fn completed_inbound_ledgers_are_cached_without_marking_complete() {
         let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
         let newer = immutable_ledger(101, 0xA1);
         let older = immutable_ledger(100, 0xA0);
@@ -1054,18 +1384,12 @@ mod tests {
         assert!(record_completed_inbound_ledger(&master, &newer));
         assert!(record_completed_inbound_ledger(&master, &older));
 
-        let complete = master.complete_ledgers();
-        assert!(complete.contains(100));
-        assert!(complete.contains(101));
-        assert_eq!(complete.to_string(), "100-101");
-        assert_eq!(
+        assert!(master.complete_ledgers().empty());
+        assert!(
             master
                 .ledger_history()
-                .get_cached_ledger_by_seq(100)
-                .expect("completed history ledger must be cached")
-                .header()
-                .hash,
-            older.header().hash
+                .get_cached_ledger_by_hash(older.header().hash)
+                .is_some_and(|ledger| ledger.header().hash == older.header().hash)
         );
     }
 }
