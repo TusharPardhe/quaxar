@@ -587,6 +587,15 @@ fn trigger(
     // mutable dropped here — lock released.
 }
 
+fn peer_has_acquisition_target(peer: &Arc<dyn Peer>, hash: Uint256, seq: u32) -> bool {
+    peer.has_ledger(hash, seq)
+        // A StatusChange advertisement for a peer's current closed ledger may
+        // omit the sequence. It updates closed_ledger_hash without populating
+        // the historical known-ledger cache, but is still direct evidence that
+        // this peer can serve a hash-only recovery request.
+        || (seq == 0 && peer.closed_ledger_hash() == hash)
+}
+
 fn add_peers(state: &AcquisitionState) -> Vec<Arc<dyn Peer>> {
     let limit = if state.peer_set.peer_count() == 0 {
         PEER_COUNT_START
@@ -597,7 +606,7 @@ fn add_peers(state: &AcquisitionState) -> Vec<Arc<dyn Peer>> {
     let mut added = Vec::new();
     state.peer_set.add_peers(
         limit,
-        &mut |peer| peer.has_ledger(hash, state.seq),
+        &mut |peer| peer_has_acquisition_target(peer, hash, state.seq),
         &mut |peer| added.push(Arc::clone(peer)),
     );
     added
@@ -920,10 +929,36 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
 #[cfg(test)]
 mod tests {
     use super::super::registry::AcquireReason;
-    use super::record_completed_ledger;
+    use super::{peer_has_acquisition_target, record_completed_ledger};
+    use basics::base_uint::Uint256;
     use ledger::Ledger;
+    use overlay::{Peer, PeerImp};
+    use protocol::PublicKey;
+    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
+
+    #[test]
+    fn hash_only_acquisition_targets_peer_advertising_current_closed_hash() {
+        let hash = Uint256::from_array([0xA5; 32]);
+        let peer = PeerImp::new(
+            42,
+            SocketAddr::from(([127, 0, 0, 1], 51235)),
+            PublicKey::from_bytes([0x02; 33]),
+            "status-only-peer",
+        );
+        peer.set_closed_ledger_hash(hash);
+        let peer: Arc<dyn Peer> = peer;
+
+        // A sequence-less StatusChange does not populate known_ledgers.
+        assert!(!peer.has_ledger(hash, 0));
+        assert!(peer_has_acquisition_target(&peer, hash, 0));
+        assert!(!peer_has_acquisition_target(
+            &peer,
+            Uint256::from_array([0xA6; 32]),
+            0,
+        ));
+    }
 
     #[test]
     fn completed_ledger_remains_recoverable_when_notification_channel_is_closed() {
