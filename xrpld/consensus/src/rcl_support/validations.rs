@@ -67,6 +67,47 @@ impl Default for ValidationParms {
     }
 }
 
+/// The state that supplied `getPreferred`'s working-ledger candidate.
+/// This is diagnostic-only and does not affect rippled-compatible selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreferredLclWorkingSource {
+    Trie,
+    AcquiringFallback,
+    NoPreference,
+}
+
+/// The final `getPreferredLCL` disposition after applying `minSeq` and peer
+/// fallback. This is diagnostic-only and does not affect selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreferredLclSelectionSource {
+    WorkingPreferred,
+    LocalBelowMinSeq,
+    PeerFallback,
+    LocalNoPreference,
+}
+
+/// A snapshot of the inputs and decision made by `getPreferredLCL`.
+///
+/// It exposes the distinction between trie support, the no-trie acquiring
+/// fallback, and the peer-count fallback without changing consensus policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreferredLclDiagnostic<Seq, Id> {
+    pub trie_preferred: Option<(Seq, Id)>,
+    pub acquiring_preferred: Option<(Seq, Id)>,
+    pub working_preferred: Option<(Seq, Id)>,
+    pub working_source: PreferredLclWorkingSource,
+    pub selection_source: PreferredLclSelectionSource,
+    pub selected: Id,
+    pub peer_preferred: Option<(Id, u32)>,
+    pub peer_lcl_entry_count: usize,
+    pub current_validation_count: usize,
+    pub current_trusted_count: usize,
+    pub current_trusted_full_count: usize,
+    pub trie_ledger_count: usize,
+    pub acquiring_entry_count: usize,
+    pub acquiring_waiter_count: usize,
+}
+
 /// Enforces that a validation must be larger than all unexpired validation
 /// sequence numbers previously issued by the validator this tracks.
 /// Matches `SeqEnforcer<Seq>`.
@@ -739,15 +780,88 @@ impl<A: ValidationsAdaptor> Validations<A> {
         min_seq: SeqOf<A>,
         peer_counts: &BTreeMap<LedgerIdOf<A>, u32>,
     ) -> LedgerIdOf<A> {
-        if let Some((seq, id)) = self.get_preferred(lcl) {
-            return if seq >= min_seq { id } else { lcl.id() };
-        }
+        self.get_preferred_lcl_diagnostic(lcl, min_seq, peer_counts)
+            .selected
+    }
 
-        peer_counts
+    /// Return the rippled-compatible preferred LCL together with a bounded
+    /// snapshot of the source and disposition of that decision. The snapshot
+    /// is intended for sampled runtime diagnostics; it has no policy effect.
+    pub fn get_preferred_lcl_diagnostic(
+        &self,
+        lcl: &A::Ledger,
+        min_seq: SeqOf<A>,
+        peer_counts: &BTreeMap<LedgerIdOf<A>, u32>,
+    ) -> PreferredLclDiagnostic<SeqOf<A>, LedgerIdOf<A>> {
+        let mut inner = self.inner.lock();
+        let largest = inner.local_seq_enforcer.largest();
+        let trie_preferred: Option<SpanTip<A::Ledger>> =
+            inner.with_trie(&self.adaptor, &self.parms, |trie| {
+                trie.get_preferred(largest)
+            });
+        let trie_preferred_info = trie_preferred
+            .as_ref()
+            .map(|preferred| (preferred.seq, preferred.id));
+        let acquiring_preferred = inner
+            .acquiring
+            .iter()
+            .max_by(|a, b| (a.1.len(), &a.0.1).cmp(&(b.1.len(), &b.0.1)))
+            .map(|(key, _)| *key);
+
+        let (working_preferred, working_source) = if let Some(preferred) = trie_preferred {
+            let selected =
+                if preferred.seq == lcl.seq() + 1 && preferred.ancestor(lcl.seq()) == lcl.id() {
+                    (lcl.seq(), lcl.id())
+                } else if preferred.seq > lcl.seq() || lcl.ancestor(preferred.seq) != preferred.id {
+                    (preferred.seq, preferred.id)
+                } else {
+                    (lcl.seq(), lcl.id())
+                };
+            (Some(selected), PreferredLclWorkingSource::Trie)
+        } else if let Some(preferred) = acquiring_preferred {
+            (
+                Some(preferred),
+                PreferredLclWorkingSource::AcquiringFallback,
+            )
+        } else {
+            (None, PreferredLclWorkingSource::NoPreference)
+        };
+
+        let peer_preferred = peer_counts
             .iter()
             .max_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)))
-            .map(|(id, _)| *id)
-            .unwrap_or_else(|| lcl.id())
+            .map(|(id, count)| (*id, *count));
+        let (selected, selection_source) = match working_preferred {
+            Some((seq, id)) if seq >= min_seq => {
+                (id, PreferredLclSelectionSource::WorkingPreferred)
+            }
+            Some(_) => (lcl.id(), PreferredLclSelectionSource::LocalBelowMinSeq),
+            None => match peer_preferred {
+                Some((id, _)) => (id, PreferredLclSelectionSource::PeerFallback),
+                None => (lcl.id(), PreferredLclSelectionSource::LocalNoPreference),
+            },
+        };
+
+        PreferredLclDiagnostic {
+            trie_preferred: trie_preferred_info,
+            acquiring_preferred,
+            working_preferred,
+            working_source,
+            selection_source,
+            selected,
+            peer_preferred,
+            peer_lcl_entry_count: peer_counts.len(),
+            current_validation_count: inner.current.len(),
+            current_trusted_count: inner.current.values().filter(|v| v.trusted()).count(),
+            current_trusted_full_count: inner
+                .current
+                .values()
+                .filter(|v| v.trusted() && v.full())
+                .count(),
+            trie_ledger_count: inner.last_ledger.len(),
+            acquiring_entry_count: inner.acquiring.len(),
+            acquiring_waiter_count: inner.acquiring.values().map(HashSet::len).sum(),
+        }
     }
 
     /// The number of current trusted validators working on a descendant of
@@ -1047,6 +1161,40 @@ mod tests {
             full: true,
             cookie: 0,
         }
+    }
+
+    #[test]
+    fn preferred_lcl_diagnostic_exposes_acquiring_fallback_below_min_seq() {
+        let adaptor = MockAdaptor::new(1000);
+        let genesis = MockLedger::genesis_();
+        adaptor.register_ledger(genesis.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        // The trusted validation is current, but its ledger is intentionally
+        // unavailable, so it remains in `acquiring` rather than the trie.
+        assert_eq!(
+            validations.add(1, val(42, 1, 1000, 1, 100)),
+            ValStatus::Current
+        );
+        let peer_counts = BTreeMap::from([(99, 3)]);
+        let diagnostic = validations.get_preferred_lcl_diagnostic(&genesis, 2, &peer_counts);
+
+        assert_eq!(diagnostic.trie_preferred, None);
+        assert_eq!(diagnostic.acquiring_preferred, Some((1, 42)));
+        assert_eq!(diagnostic.working_preferred, Some((1, 42)));
+        assert_eq!(
+            diagnostic.working_source,
+            PreferredLclWorkingSource::AcquiringFallback
+        );
+        assert_eq!(
+            diagnostic.selection_source,
+            PreferredLclSelectionSource::LocalBelowMinSeq
+        );
+        assert_eq!(diagnostic.selected, genesis.id());
+        assert_eq!(diagnostic.peer_preferred, Some((99, 3)));
+        assert_eq!(diagnostic.current_trusted_full_count, 1);
+        assert_eq!(diagnostic.trie_ledger_count, 0);
+        assert_eq!(diagnostic.acquiring_entry_count, 1);
     }
 
     #[test]

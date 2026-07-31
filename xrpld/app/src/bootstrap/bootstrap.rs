@@ -1109,28 +1109,15 @@ fn run_start_mode_consensus_loop(
                 .overlay()
                 .queued_inbound()
                 .set_validation_router(Box::new(move |mut queued| {
-                    // Match PeerImp::onMessage(TMValidation): parse with
-                    // manifest-aware node-ID resolution, then apply time and
-                    // trust before source retention or crypto.
+                    // Match PeerImp::onMessage(TMValidation): parse only far
+                    // enough to establish time and trust, then apply the
+                    // drop_untrusted policy before source retention or crypto.
                     let mut serial = protocol::SerialIter::new(&queued.message.validation);
-                    let manifest_cache = validation_root.manifest_cache();
-                    let mut validation =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            protocol::STValidation::from_serial_iter(
-                                &mut serial,
-                                |pk: &protocol::PublicKey| {
-                                    // Resolve ephemeral signing key → master key
-                                    // through the validator manifest cache, then
-                                    // compute NodeId. Matches rippled:
-                                    // calcNodeID(app_.getValidatorManifests().getMasterKey(pk))
-                                    let master = manifest_cache.get_master_key(pk);
-                                    protocol::calc_node_id(&master)
-                                },
-                                false,
-                            )
-                        }))
-                        .ok()
-                        .and_then(Result::ok);
+                    let mut validation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        protocol::STValidation::from_serial_iter_default_node_id(&mut serial, false)
+                    }))
+                    .ok()
+                    .and_then(Result::ok);
                     let Some(ref mut parsed_validation) = validation else {
                         return;
                     };
@@ -1185,15 +1172,14 @@ fn run_start_mode_consensus_loop(
                         job_type,
                         "checkValidation",
                         move || {
-                            // Non-blocking delivery to the consensus event loop.
-                            // Rippled's checkValidation runs inline on the
-                            // JobQueue worker; saturation drops rather than
-                            // blocking other workers.
-                            let _ = event_tx.try_send(
-                                crate::consensus::driver::ConsensusEvent::Validation(queued),
-                            );
+                            // The event-loop parser performs the signature
+                            // check after scheduling, matching checkValidation.
+                            let _ = event_tx
+                                .send(crate::consensus::driver::ConsensusEvent::Validation(queued));
                         },
-                    ) {}
+                    ) {
+                        tracing::debug!(target: "consensus", "validation job rejected during shutdown");
+                    }
                 }));
         }
         std::thread::Builder::new()
@@ -1210,11 +1196,12 @@ fn run_start_mode_consensus_loop(
                     };
                     let validations = overlay_rt.overlay().take_validations();
                     for queued in validations {
-                        // Non-blocking: drop under saturation rather than
-                        // parking the forwarder thread (rippled equivalent
-                        // would be JobQueue admission rejection).
-                        let _ = fwd_event_tx
-                            .try_send(crate::consensus::driver::ConsensusEvent::Validation(queued));
+                        match fwd_event_tx
+                            .send(crate::consensus::driver::ConsensusEvent::Validation(queued))
+                        {
+                            Ok(()) => {}
+                            Err(_) => return,
+                        }
                     }
                 }
             })
@@ -1279,6 +1266,7 @@ fn run_start_mode_consensus_loop(
 
                 // Request-cookie relay (matching rippled PeerImp::onMessage TMLedgerData)
                 if let Some(cookie) = message.request_cookie {
+                    router_shared_inbound.note_wire_ledger_data_relayed();
                     // Forward to the peer that originally requested this data
                     if let Some(requesting_peer) = router_overlay.find_peer_by_short_id(cookie) {
                         let mut fwd = message.clone();
@@ -1292,6 +1280,7 @@ fn run_start_mode_consensus_loop(
                 }
 
                 let Some(hash) = Uint256::from_slice(&message.ledger_hash) else {
+                    router_shared_inbound.note_wire_ledger_data_invalid_hash();
                     return;
                 };
                 match message.r#type {
@@ -1325,6 +1314,7 @@ fn run_start_mode_consensus_loop(
                                 )
                             })
                             .collect();
+                        router_shared_inbound.note_wire_ledger_data(nodes.len());
                         let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
                         let stale_packet = (packet.packet_type
                             == ledger::InboundLedgerDataType::StateNode)
@@ -1337,7 +1327,8 @@ fn run_start_mode_consensus_loop(
                         );
                         if !routed {
                             if let Some(packet) = stale_packet {
-                                let _ = router_shared_inbound.stash_stale_packet(&packet);
+                                let stored = router_shared_inbound.stash_stale_packet(&packet);
+                                router_shared_inbound.note_stale_packet_result(stored);
                             }
                             // Peer sent unsolicited ledger data — charge them
                             if let Some(peer) = router_overlay.find_peer_by_short_id(peer_id) {
@@ -1451,7 +1442,9 @@ fn run_start_mode_consensus_loop(
                             }
                         }
                     })
-                {}
+                {
+                    tracing::debug!(target: "consensus", "proposal job rejected during shutdown");
+                }
             }));
     }
 
@@ -1501,26 +1494,41 @@ fn run_start_mode_consensus_loop(
                 let msg_envelope = overlay::PeerMessage { peer_id, message };
                 let msg = &msg_envelope.message;
                 if !msg.query {
-                    // Response: fetch pack data to store
-                    if msg.r#type != 6 {
-                        return;
+                    // Non-query TMGetObjectByHash messages are content-addressed
+                    // NodeStore/fetch-pack blobs, not TMLedgerData packets. As in
+                    // PeerImp, cache every structurally valid reply regardless of
+                    // its object type; consumers validate the hash against data.
+                    let mut stored = 0;
+                    let ledger_master = router_root
+                        .ledger_master_runtime()
+                        .map(|runtime| runtime.ledger_master());
+
+                    for obj in &msg.objects {
+                        let (Some(hash_bytes), Some(data)) = (&obj.hash, &obj.data) else {
+                            continue;
+                        };
+                        let Some(hash) = Uint256::from_slice(hash_bytes) else {
+                            continue;
+                        };
+
+                        // Preserve both established cache owners used by the
+                        // shared acquisition lifecycle.
+                        if let Some(ledger_master) = ledger_master.as_ref() {
+                            ledger_master.add_fetch_pack(hash, data.clone());
+                        }
+                        router_shared_inbound.store_fetch_pack(hash, data.clone());
+                        stored += 1;
                     }
-                    if let Some(lm_rt) = router_root.ledger_master_runtime() {
-                        let lm = lm_rt.ledger_master();
-                        let mut stored = 0;
-                        for obj in &msg.objects {
-                            if let (Some(hash_bytes), Some(data)) = (&obj.hash, &obj.data) {
-                                if let Some(hash) = Uint256::from_slice(hash_bytes) {
-                                    lm.fetch_pack_cache().add_fetch_pack(hash, data.clone());
-                                    router_shared_inbound.store_fetch_pack(hash, data.clone());
-                                    stored += 1;
-                                }
-                            }
-                        }
-                        if stored > 0 {
-                            router_root.signal_fetch_pack_ready();
-                            router_shared_inbound.notify_fetch_pack_ready();
-                        }
+
+                    // PeerImp's completion notification is specific to replies
+                    // tagged as fetch packs; ordinary object replies only cache.
+                    if msg.r#type
+                        == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack
+                            as i32
+                        && stored > 0
+                    {
+                        router_root.signal_fetch_pack_ready();
+                        router_shared_inbound.notify_fetch_pack_ready();
                     }
                 } else if msg.r#type
                     == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32

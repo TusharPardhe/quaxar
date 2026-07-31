@@ -169,9 +169,12 @@ pub enum ConsensusCommand {
     /// and its `endConsensus → startRound` tail on the owner strand prevents a
     /// JobQueue worker from racing a timer or peer-proposal mutation.
     Accept(crate::consensus::rcl_consensus::PendingAcceptWork),
+    /// Begin consensus with `network_closed` as the target hash and
+    /// `prev_ledger` as the locally loaded previous ledger. These can differ
+    /// during rippled-compatible WrongLedger recovery.
     StartRound {
         now: basics::chrono::NetClockTimePoint,
-        prev_ledger_id: basics::base_uint::Uint256,
+        network_closed: basics::base_uint::Uint256,
         prev_ledger: consensus::RclCxLedger,
     },
     Stop,
@@ -251,17 +254,19 @@ impl AppConsensusRuntime {
         *self.cmd_tx.lock().expect("cmd_tx mutex") = Some(tx);
     }
 
-    /// Send a start-round command to the strand thread.
+    /// Send a start-round command to the strand thread. `network_closed` may
+    /// differ from `prev_ledger.id()` while generic consensus acquires the
+    /// preferred network LCL.
     pub fn send_start_round(
         &self,
         now: basics::chrono::NetClockTimePoint,
-        prev_ledger_id: basics::base_uint::Uint256,
+        network_closed: basics::base_uint::Uint256,
         prev_ledger: consensus::RclCxLedger,
     ) {
         if let Some(tx) = self.cmd_tx.lock().expect("cmd_tx mutex").as_ref() {
             let _ = tx.try_send(ConsensusCommand::StartRound {
                 now,
-                prev_ledger_id,
+                network_closed,
                 prev_ledger,
             });
         }

@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use basics::base_uint::Uint256;
 use consensus::rcl_support::Validations;
+use consensus::rcl_support::validations::PreferredLclDiagnostic;
 use protocol::{PublicKey, STValidation, calc_node_id};
 
 use crate::consensus::rcl_validation::{RclValidatedLedger, RclValidation, RclValidationsAdaptor};
@@ -249,6 +250,22 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
             .register_ledger(ledger);
     }
 
+    /// Return the preferred-LCL decision together with sampled diagnostic
+    /// state identifying whether it came from the validation trie, pending
+    /// acquisition fallback, or peer fallback. This preserves the selection
+    /// behavior of `Validations::getPreferredLCL`.
+    pub fn preferred_lcl_diagnostic(
+        &self,
+        lcl: &RclValidatedLedger,
+        min_seq: u32,
+        peer_counts: &std::collections::BTreeMap<Uint256, u32>,
+    ) -> PreferredLclDiagnostic<u32, Uint256> {
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .get_preferred_lcl_diagnostic(lcl, min_seq, peer_counts)
+    }
+
     /// Number of trusted, full validations tracked for `ledger_hash`.
     /// Matches `Validations::numTrustedForLedger`, exposed directly since
     /// `bootstrap.rs`'s catch-up loop calls this without needing the full
@@ -304,6 +321,16 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
             .expect("shared app validations mutex must not be poisoned")
             .adaptor()
             .set_overlay(overlay);
+    }
+
+    /// Provide the application job queue for reference-equivalent deferred
+    /// consensus-ledger cache-miss acquisition work.
+    pub fn set_job_queue(&self, job_queue: Option<Arc<crate::job::job_queue::JobQueue>>) {
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .adaptor()
+            .set_job_queue(job_queue);
     }
 }
 

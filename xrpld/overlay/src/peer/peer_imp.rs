@@ -364,6 +364,11 @@ impl PeerImp {
             .clear();
     }
 
+    /// Returns a snapshot of resource charges applied through `Peer::charge`.
+    pub fn charges(&self) -> Vec<(Charge, String)> {
+        self.charges.lock().expect("peer charges lock").clone()
+    }
+
     pub fn attach_session(
         &self,
         session_tx: mpsc::UnboundedSender<Message>,

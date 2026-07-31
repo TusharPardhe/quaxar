@@ -405,12 +405,26 @@ fn last_valid_ledger_rejects_conflicting_cached_and_acquired_lcl_candidates() {
         master.last_valid_ledger(),
         Some((*quorum_backed.header().hash.as_uint256(), 40))
     );
+    let compatible_audit = master.compatibility_audit(compatible.as_ref());
+    assert!(compatible_audit.compatible());
+    assert!(
+        compatible_audit
+            .last_valid_anchor
+            .is_some_and(|anchor| anchor.matches)
+    );
     assert!(master.is_compatible(compatible.as_ref()));
     assert!(
         master
             .ledger_history()
             .get_cached_ledger_by_hash(cached_conflict.header().hash)
             .is_some()
+    );
+    let cached_conflict_audit = master.compatibility_audit(cached_conflict.as_ref());
+    assert!(!cached_conflict_audit.compatible());
+    assert!(
+        cached_conflict_audit
+            .last_valid_anchor
+            .is_some_and(|anchor| !anchor.matches)
     );
     assert!(!master.is_compatible(cached_conflict.as_ref()));
     // Acquired candidates take the identical guard after they enter the

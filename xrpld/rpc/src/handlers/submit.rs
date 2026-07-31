@@ -2686,6 +2686,10 @@ pub(crate) fn submit_sttx<Env, Runtime: RpcRuntime>(
         || false,
         || {
             if let Some(app) = ctx.runtime.app() {
+                // Keep the global ordering consistent with consensus and batch
+                // paths: a preferred-LCL transition gate always precedes the
+                // close gate used for direct open-ledger application.
+                let _lcl_transition_guard = app.lcl_transition_gate().lock();
                 let _close_guard = app
                     .close_gate()
                     .lock()

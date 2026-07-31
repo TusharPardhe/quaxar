@@ -9,6 +9,8 @@ use consensus::rcl_support::{ValidationT, ValidationsLedger};
 use ledger::{Ledger, LedgerJournal, NullLedgerJournal};
 use protocol::{NodeID, PublicKey, STValidation, get_field_by_symbol};
 
+use crate::job::{job_queue::JobQueue, job_types::JobType};
+
 #[derive(Clone)]
 pub struct RclValidation {
     val: Arc<STValidation>,
@@ -200,6 +202,7 @@ pub struct RclValidationsAdaptor {
         Option<Arc<crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime>>,
     >,
     overlay: parking_lot::Mutex<Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>>,
+    job_queue: parking_lot::Mutex<Option<Arc<JobQueue>>>,
 }
 
 impl RclValidationsAdaptor {
@@ -214,6 +217,7 @@ impl RclValidationsAdaptor {
             now: Arc::new(now),
             ledger_master_runtime: parking_lot::Mutex::new(None),
             overlay: parking_lot::Mutex::new(None),
+            job_queue: parking_lot::Mutex::new(None),
         }
     }
 
@@ -238,6 +242,12 @@ impl RclValidationsAdaptor {
     /// sequence number from peers when the local cache does not have it.
     pub fn set_overlay(&self, overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>) {
         *self.overlay.lock() = overlay;
+    }
+
+    /// Attach the application job queue used for rippled-equivalent
+    /// `GetConsL2` cache-miss acquisition jobs.
+    pub fn set_job_queue(&self, job_queue: Option<Arc<JobQueue>>) {
+        *self.job_queue.lock() = job_queue;
     }
 }
 
@@ -285,16 +295,32 @@ impl consensus::rcl_support::ValidationsAdaptor for RclValidationsAdaptor {
             return Some(RclValidatedLedger::from_ledger(&ledger));
         }
 
-        if let Some(guard) = runtime.inbound_ledgers.lock().ok()
-            && let Some(shared) = guard.as_ref()
-        {
-            // This path has only a ledger hash. A peer's history range is
-            // not an authoritative hash-to-sequence binding, so acquire by
-            // hash and learn the sequence from the response header.
-            shared.acquire_closed_ledger_async(
-                *ledger_id,
-                crate::ledger::inbound_ledgers::AcquireReason::Consensus,
-            );
+        let requested_hash = *ledger_id;
+        let acquire = move || {
+            if let Some(guard) = runtime.inbound_ledgers.lock().ok()
+                && let Some(shared) = guard.as_ref()
+            {
+                // This path has only a ledger hash. A peer's history range is
+                // not an authoritative hash-to-sequence binding, so acquire by
+                // hash and learn the sequence from the response header.
+                shared.acquire_closed_ledger_async(
+                    requested_hash,
+                    crate::ledger::inbound_ledgers::AcquireReason::Consensus,
+                );
+            }
+        };
+        if let Some(job_queue) = self.job_queue.lock().clone() {
+            // Match rippled RCLValidationsAdaptor::acquire: cache-miss
+            // recovery runs as a JtAdvance "GetConsL2" job, not inline in
+            // validation trie maintenance.
+            if !job_queue.add_job(JobType::JtAdvance, "GetConsL2", acquire) {
+                tracing::debug!(target: "consensus", %ledger_id, "GetConsL2 rejected because job queue is stopping");
+            }
+        } else {
+            // The queue is attached during application runtime wiring. Keep
+            // the adaptor useful in isolated construction/tests before that
+            // wiring has occurred.
+            acquire();
         }
         None
     }

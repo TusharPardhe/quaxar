@@ -1281,9 +1281,20 @@ impl SyncTree {
                 continue;
             }
 
+            let mut completions_by_hash = BTreeMap::new();
+            for request in &pending {
+                completions_by_hash
+                    .entry(request.hash())
+                    .or_insert_with(|| self.load_node_with_owner_family(request.hash(), family));
+            }
             let completions = pending
-                .into_iter()
-                .map(|request| self.load_node_with_owner_family(request.hash(), family))
+                .iter()
+                .map(|request| {
+                    completions_by_hash
+                        .get(&request.hash())
+                        .expect("every deferred request hash must have a completion")
+                        .clone()
+                })
                 .collect::<Vec<_>>();
             scan.complete_pending_reads(completions);
         }
@@ -1327,9 +1338,20 @@ impl SyncTree {
                 continue;
             }
 
+            let mut completions_by_hash = BTreeMap::new();
+            for request in &pending {
+                completions_by_hash
+                    .entry(request.hash())
+                    .or_insert_with(|| self.load_node_with_owner_family(request.hash(), family));
+            }
             let completions = pending
-                .into_iter()
-                .map(|request| self.load_node_with_owner_family(request.hash(), family))
+                .iter()
+                .map(|request| {
+                    completions_by_hash
+                        .get(&request.hash())
+                        .expect("every deferred request hash must have a completion")
+                        .clone()
+                })
                 .collect::<Vec<_>>();
             scan.complete_pending_reads(completions);
         }
@@ -1417,7 +1439,32 @@ impl SyncTree {
                 continue;
             }
 
-            let completions = complete_async_fetches(pending);
+            let mut unique_hashes = BTreeSet::new();
+            let unique_pending = pending
+                .iter()
+                .copied()
+                .filter(|request| unique_hashes.insert(request.hash()))
+                .collect::<Vec<_>>();
+            let unique_completions = complete_async_fetches(unique_pending.clone());
+            assert_eq!(
+                unique_pending.len(),
+                unique_completions.len(),
+                "complete_async_fetches requires one completion per unique deferred hash"
+            );
+            let completions_by_hash = unique_pending
+                .into_iter()
+                .zip(unique_completions)
+                .map(|(request, completion)| (request.hash(), completion))
+                .collect::<BTreeMap<_, _>>();
+            let completions = pending
+                .iter()
+                .map(|request| {
+                    completions_by_hash
+                        .get(&request.hash())
+                        .expect("every deferred request hash must have a completion")
+                        .clone()
+                })
+                .collect::<Vec<_>>();
             scan.complete_pending_reads(completions);
         }
 
@@ -2212,55 +2259,46 @@ impl SyncTree {
 }
 
 #[derive(Debug, Clone)]
-/// Scan state for getMissingNodes — uses raw pointer matching reference stack.
-/// Safety: parent node on the stack holds SharedIntrusive to children,
-/// keeping them alive for the scan duration. Single-threaded access.
+/// Scan state for getMissingNodes. The strong owner keeps a scan node alive
+/// even when a concurrent backed-tree eviction detaches it from its parent.
 struct MissingNodeScanState {
-    node: *const SHAMapTreeNode,
+    node: SharedIntrusive<SHAMapTreeNode>,
     node_id: SHAMapNodeId,
     first_child: usize,
     current_child: usize,
     full_below: bool,
 }
 
-unsafe impl Send for MissingNodeScanState {}
-
 impl MissingNodeScanState {
     #[inline(always)]
     fn node(&self) -> &SHAMapTreeNode {
-        unsafe { &*self.node }
+        &self.node
     }
 }
 
 #[derive(Debug, Clone)]
 struct DeferredSyncRead {
-    parent: *const SHAMapTreeNode,
+    parent: SharedIntrusive<SHAMapTreeNode>,
     parent_id: SHAMapNodeId,
     branch: usize,
     node: Option<SharedIntrusive<SHAMapTreeNode>>,
 }
 
-unsafe impl Send for DeferredSyncRead {}
-
 #[derive(Debug, Clone)]
 struct DeferredResume {
-    node: *const SHAMapTreeNode,
+    node: SharedIntrusive<SHAMapTreeNode>,
     node_id: SHAMapNodeId,
 }
 
-unsafe impl Send for DeferredResume {}
-
 #[derive(Debug, Clone)]
-/// Deferred fetch state — uses raw pointer for parent (parent is on scan stack).
+/// Deferred fetch state retains the parent while peer/NodeStore I/O is pending.
 struct PendingDeferredFetch {
-    parent: *const SHAMapTreeNode,
+    parent: SharedIntrusive<SHAMapTreeNode>,
     parent_id: SHAMapNodeId,
     branch: usize,
     hash: SHAMapHash,
     ledger_seq: u32,
 }
-
-unsafe impl Send for PendingDeferredFetch {}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeferredMissingNodeScanStats {
@@ -2272,6 +2310,7 @@ pub struct DeferredMissingNodeScanStats {
     pub inner_children: u64,
     pub full_below_inner_children: u64,
     pub pending_reads: u64,
+    pub max_pending_reads: u64,
     pub completed_pending_reads: u64,
     pub completed_pending_misses: u64,
     pub missing_recorded: u64,
@@ -2305,6 +2344,7 @@ pub struct DeferredMissingNodeScan {
     missing_nodes: Vec<(SHAMapNodeId, Uint256)>,
     stack: Vec<MissingNodeScanState>,
     pending_reads: Vec<PendingDeferredFetch>,
+    pending_hashes: BTreeSet<SHAMapHash>,
     deferred_resumes: BTreeMap<usize, DeferredResume>,
     stats: DeferredMissingNodeScanStats,
 }
@@ -2351,6 +2391,7 @@ impl DeferredMissingNodeScan {
             missing_nodes: Vec::with_capacity(max as usize),
             stack,
             pending_reads: Vec::new(),
+            pending_hashes: BTreeSet::new(),
             deferred_resumes: BTreeMap::new(),
             stats: DeferredMissingNodeScanStats::default(),
         }
@@ -2453,16 +2494,22 @@ impl DeferredMissingNodeScan {
                 continue;
             }
 
-            match crate::fetch::descend_async_raw_nocopy(
-                state.node(),
+            let request_already_pending = self.pending_hashes.contains(&child_hash);
+            let mut request_once = |hash, ledger_seq| {
+                if !request_already_pending {
+                    request_async_fetch(hash, ledger_seq);
+                }
+            };
+            match crate::fetch::descend_async_with_family(
+                &state.node,
                 branch,
                 self.backed,
                 self.ledger_seq,
                 family,
                 filter,
-                request_async_fetch,
+                &mut request_once,
             ) {
-                crate::fetch::AsyncDescendResultRaw::Ready(None) => {
+                crate::fetch::AsyncDescendResult::Ready(None) => {
                     state.full_below = false;
                     let exhausted = record_missing_child(
                         &mut self.missing_hashes,
@@ -2477,9 +2524,8 @@ impl DeferredMissingNodeScan {
                         break;
                     }
                 }
-                crate::fetch::AsyncDescendResultRaw::Ready(Some(child_ptr)) => {
+                crate::fetch::AsyncDescendResult::Ready(Some(child)) => {
                     self.stats.loaded_or_cached_children += 1;
-                    let child = unsafe { &*child_ptr };
                     if child.is_inner() {
                         self.stats.inner_children += 1;
                         if child.is_full_below(self.generation) {
@@ -2489,27 +2535,27 @@ impl DeferredMissingNodeScan {
                                 .node_id
                                 .get_child_node_id(branch)
                                 .expect("branch selection must stay within SHAMap depth bounds");
-                            push_scan_state_raw(
-                                &mut self.stack,
-                                child_ptr,
-                                child_id,
-                                next_first_child,
-                            );
+                            push_scan_state(&mut self.stack, child, child_id, next_first_child);
                         }
                     } else {
                         self.stats.leaf_children += 1;
                     }
                 }
-                crate::fetch::AsyncDescendResultRaw::Pending(hash) => {
+                crate::fetch::AsyncDescendResult::Pending(hash) => {
                     state.full_below = false;
+                    self.pending_hashes.insert(hash);
                     self.stats.pending_reads += 1;
                     self.pending_reads.push(PendingDeferredFetch {
-                        parent: state.node,
+                        parent: state.node.clone(),
                         parent_id: state.node_id,
                         branch,
                         hash,
                         ledger_seq: self.ledger_seq,
                     });
+                    self.stats.max_pending_reads = self
+                        .stats
+                        .max_pending_reads
+                        .max(self.pending_reads.len() as u64);
                 }
             }
         }
@@ -2521,6 +2567,7 @@ impl DeferredMissingNodeScan {
     {
         let completions: Vec<_> = completions.into_iter().collect();
         let pending_reads = std::mem::take(&mut self.pending_reads);
+        self.pending_hashes.clear();
         assert_eq!(
             pending_reads.len(),
             completions.len(),
@@ -2567,24 +2614,6 @@ fn push_scan_state<R>(
 ) where
     R: FnMut() -> u8,
 {
-    let ptr: *const SHAMapTreeNode = &*node;
-    stack.push(MissingNodeScanState {
-        node: ptr,
-        node_id,
-        first_child: next_first_child() as usize,
-        current_child: 0,
-        full_below: true,
-    });
-}
-
-fn push_scan_state_raw<R>(
-    stack: &mut Vec<MissingNodeScanState>,
-    node: *const SHAMapTreeNode,
-    node_id: SHAMapNodeId,
-    next_first_child: &mut R,
-) where
-    R: FnMut() -> u8,
-{
     stack.push(MissingNodeScanState {
         node,
         node_id,
@@ -2625,7 +2654,7 @@ fn process_deferred_sync_reads(
     let mut resumes = BTreeMap::<usize, DeferredResume>::new();
 
     for deferred in deferred_reads {
-        let parent = unsafe { &*deferred.parent };
+        let parent = &*deferred.parent;
         assert!(
             parent.is_inner(),
             "process_deferred_sync_reads requires inner parent nodes"
@@ -2635,7 +2664,7 @@ fn process_deferred_sync_reads(
         if let Some(node) = deferred.node {
             parent.canonicalize_child(deferred.branch, node);
             stats.completed_pending_reads += 1;
-            let parent_key = deferred.parent as usize;
+            let parent_key = parent as *const SHAMapTreeNode as usize;
             resumes.insert(
                 parent_key,
                 DeferredResume {
@@ -2672,8 +2701,8 @@ fn enqueue_deferred_resumes<R>(
     R: FnMut() -> u8,
 {
     for resume in resumes {
-        if !unsafe { &*resume.node }.is_full_below(generation) {
-            push_scan_state_raw(stack, resume.node, resume.node_id, next_first_child);
+        if !resume.node.is_full_below(generation) {
+            push_scan_state(stack, resume.node, resume.node_id, next_first_child);
         }
     }
 }
@@ -3514,13 +3543,14 @@ fn clone_sync_subtree_as_shareable(
 #[cfg(test)]
 mod tests {
     use super::{
-        DeferredSyncRead, MissingNodeRef, SHAMapAddNode, SHAMapMissingNode, SHAMapSyncFilter,
-        SHAMapType, SyncState, SyncTree, enqueue_deferred_resumes, get_missing_nodes, get_node_fat,
-        process_deferred_sync_reads, walk_map, walk_map_parallel,
+        DeferredMissingNodeScan, DeferredSyncRead, MissingNodeRef, SHAMapAddNode,
+        SHAMapMissingNode, SHAMapSyncFilter, SHAMapType, SyncState, SyncTree,
+        enqueue_deferred_resumes, get_missing_nodes, get_node_fat, process_deferred_sync_reads,
+        walk_map, walk_map_parallel,
     };
     use crate::family::{
         FullBelowCache, MissingNodeReporter, NullFullBelowCache, NullMissingNodeReporter,
-        NullNodeFetcher, SHAMapFamily,
+        NullNodeFetcher, SHAMapFamily, SHAMapNodeFetcher,
     };
     use crate::item::SHAMapItem;
     use crate::node_id::SHAMapNodeId;
@@ -3534,6 +3564,7 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use time::Duration;
 
     fn sample_uint256(fill: u8) -> Uint256 {
@@ -3623,6 +3654,28 @@ mod tests {
         }
 
         fn missing_node_acquire_by_hash(&self, _ref_hash: Uint256, _ref_num: u32) {}
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingMissingNodeFetcher {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingMissingNodeFetcher {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl SHAMapNodeFetcher for CountingMissingNodeFetcher {
+        fn fetch_node_object(
+            &self,
+            _hash: SHAMapHash,
+            _ledger_seq: u32,
+        ) -> Option<crate::node_object::NodeObject> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            None
+        }
     }
 
     #[test]
@@ -4102,6 +4155,42 @@ mod tests {
     }
 
     #[test]
+    fn backed_deferred_scan_probes_node_store_once_per_unresolved_child() {
+        let child_hash = sample_hash(0x6C);
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(3, child_hash);
+        root.update_hash();
+
+        let fetcher = CountingMissingNodeFetcher::default();
+        let family = SHAMapFamily::new(
+            Arc::new(TreeNodeCache::new(
+                "family-single-deferred-probe",
+                8,
+                Duration::seconds(1),
+                ManualClock::new(0),
+            )),
+            NullFullBelowCache::new(24),
+            fetcher.clone(),
+            NullMissingNodeReporter,
+        );
+        let mut tree = SyncTree::from_root(root, true, 55, SyncState::Synching);
+        let mut no_filter: Option<&mut dyn SHAMapSyncFilter> = None;
+
+        let missing = tree.get_missing_nodes_with_family(8, &mut no_filter, &family, &mut || 0);
+
+        assert_eq!(
+            missing,
+            vec![(
+                SHAMapNodeId::default()
+                    .get_child_node_id(3)
+                    .expect("child node id should exist"),
+                *child_hash.as_uint256(),
+            )]
+        );
+        assert_eq!(fetcher.calls(), 1);
+    }
+
+    #[test]
     fn add_known_node_prefers_backed_fetch_before_filter_descend() {
         let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
             SHAMapNodeType::AccountState,
@@ -4523,13 +4612,13 @@ mod tests {
         let resumes = process_deferred_sync_reads(
             [
                 DeferredSyncRead {
-                    parent: &*parent as *const SHAMapTreeNode,
+                    parent: parent.clone(),
                     parent_id: SHAMapNodeId::default(),
                     branch: 1,
                     node: Some(left_child.clone()),
                 },
                 DeferredSyncRead {
-                    parent: &*parent as *const SHAMapTreeNode,
+                    parent: parent.clone(),
                     parent_id: SHAMapNodeId::default(),
                     branch: 2,
                     node: Some(right_child.clone()),
@@ -4553,7 +4642,7 @@ mod tests {
             .values()
             .next()
             .expect("one deferred resume should be recorded");
-        assert!(std::ptr::eq(unsafe { &*resume.node }, &*parent));
+        assert!(std::ptr::eq(&*resume.node, &*parent));
         assert_eq!(resume.node_id, SHAMapNodeId::default());
     }
 
@@ -4571,13 +4660,13 @@ mod tests {
         let resumes = process_deferred_sync_reads(
             [
                 DeferredSyncRead {
-                    parent: &*parent as *const SHAMapTreeNode,
+                    parent: parent.clone(),
                     parent_id: SHAMapNodeId::default(),
                     branch: 3,
                     node: None,
                 },
                 DeferredSyncRead {
-                    parent: &*parent as *const SHAMapTreeNode,
+                    parent: parent.clone(),
                     parent_id: SHAMapNodeId::default(),
                     branch: 4,
                     node: None,
@@ -4616,11 +4705,11 @@ mod tests {
             &mut stack,
             vec![
                 super::DeferredResume {
-                    node: &*queued_parent as *const SHAMapTreeNode,
+                    node: queued_parent.clone(),
                     node_id: SHAMapNodeId::default(),
                 },
                 super::DeferredResume {
-                    node: &*skipped_parent as *const SHAMapTreeNode,
+                    node: skipped_parent.clone(),
                     node_id: SHAMapNodeId::default()
                         .get_child_node_id(1)
                         .expect("child id should exist"),
@@ -4635,11 +4724,73 @@ mod tests {
         );
 
         assert_eq!(stack.len(), 1);
-        assert!(std::ptr::eq(unsafe { &*stack[0].node }, &*queued_parent));
+        assert!(std::ptr::eq(&*stack[0].node, &*queued_parent));
         assert_eq!(stack[0].node_id, SHAMapNodeId::default());
         assert_eq!(stack[0].first_child, 5);
         assert_eq!(stack[0].current_child, 0);
         assert!(stack[0].full_below);
+    }
+
+    #[test]
+    fn deferred_missing_node_scan_keeps_nested_parent_alive_across_eviction() {
+        let missing_leaf_hash = sample_hash(0x73);
+        let fetched_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf_with_hash(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(sample_uint256(0x73), vec![3; 12]),
+            0,
+            missing_leaf_hash,
+        ));
+        let nested = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        nested.set_child_hash(7, missing_leaf_hash);
+        nested.update_hash();
+
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(3, nested.get_hash());
+        root.share_child(3, &nested);
+        root.update_hash_deep();
+
+        let family = SHAMapFamily::new(
+            Arc::new(TreeNodeCache::new(
+                "deferred-scan-eviction",
+                8,
+                Duration::seconds(1),
+                ManualClock::new(0),
+            )),
+            NullFullBelowCache::new(13),
+            NullNodeFetcher,
+            NullMissingNodeReporter,
+        );
+        let full_below = NullFullBelowCache::new(13);
+        let mut scan = DeferredMissingNodeScan::new(&root, 8, true, 55, &full_below, &mut || 0);
+        let mut no_filter: Option<&mut dyn SHAMapSyncFilter> = None;
+        let mut requests = Vec::new();
+
+        scan.run_with_family(
+            &family,
+            &mut no_filter,
+            8,
+            &mut || 0,
+            &mut |hash, ledger_seq| requests.push((hash, ledger_seq)),
+        );
+        assert_eq!(requests, vec![(missing_leaf_hash, 55)]);
+
+        // The active scan and its deferred fetch retain `nested`. After this
+        // release and drop, the root no longer owns that node at branch 3.
+        root.release_loaded_children();
+        drop(nested);
+        assert!(root.get_child(3).is_none());
+
+        scan.complete_pending_reads(vec![Some(fetched_leaf)]);
+        scan.run_with_family(
+            &family,
+            &mut no_filter,
+            8,
+            &mut || 0,
+            &mut |hash, ledger_seq| requests.push((hash, ledger_seq)),
+        );
+
+        assert!(scan.is_complete());
+        assert!(scan.missing_nodes().is_empty());
     }
 
     #[test]
@@ -4747,17 +4898,18 @@ mod tests {
             missing_hashes: BTreeSet::new(),
             missing_nodes: Vec::new(),
             stack: vec![super::MissingNodeScanState {
-                node: &*active_parent as *const SHAMapTreeNode,
+                node: active_parent.clone(),
                 node_id: SHAMapNodeId::default(),
                 first_child: 0,
                 current_child: 0,
                 full_below: true,
             }],
             pending_reads: Vec::new(),
+            pending_hashes: BTreeSet::new(),
             deferred_resumes: BTreeMap::from([(
                 (&*resumed_parent as *const SHAMapTreeNode) as usize,
                 super::DeferredResume {
-                    node: &*resumed_parent as *const SHAMapTreeNode,
+                    node: resumed_parent.clone(),
                     node_id: SHAMapNodeId::default()
                         .get_child_node_id(2)
                         .expect("child id should exist"),

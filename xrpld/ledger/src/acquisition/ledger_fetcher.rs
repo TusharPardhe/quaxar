@@ -318,6 +318,11 @@ pub struct InboundLedgerPeerScore {
 pub struct InboundLedgerRunDataResult {
     pub triggered_peer_ids: Vec<u64>,
     pub processed_packets: usize,
+    pub useful_packets: usize,
+    pub useful_nodes: u64,
+    pub state_packets: usize,
+    pub state_useful_nodes: u64,
+    pub state_duplicate_nodes: u64,
     pub max_useful_count: i32,
     pub packet_stats: Vec<InboundLedgerPacketDebugStats>,
     /// Packets that rippled charges as malformed, with their source peer.
@@ -478,6 +483,9 @@ pub struct TriggerSetup {
     pub state_scan: Option<StateScanParams>,
     pub tx_scan: Option<TxScanParams>,
     pub messages_to_send: Vec<ProtocolMessage>,
+    /// True when setup already emitted a state-root or by-hash request and
+    /// rippled would return before considering transaction work.
+    pub state_request_pending: bool,
     pub complete: bool,
 }
 
@@ -585,6 +593,11 @@ impl InboundLedgerLocal {
 
     pub fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    /// Current no-progress timeout count, for bounded acquisition diagnostics.
+    pub fn timeout_count(&self) -> u32 {
+        self.timeouts
     }
 
     pub fn set_complete(&mut self) {
@@ -1113,6 +1126,17 @@ impl InboundLedgerLocal {
                     result.malformed_packets.push((peer_id, packet_type, error));
                 }
                 let count = san.map(|san| san.get_good()).unwrap_or(-1);
+                if count > 0 {
+                    result.useful_packets += 1;
+                    result.useful_nodes += count as u64;
+                }
+                if packet_type == InboundLedgerDataType::StateNode {
+                    result.state_packets += 1;
+                    result.state_useful_nodes += count.max(0) as u64;
+                    result.state_duplicate_nodes += san
+                        .map(|stats| stats.get_duplicate().max(0) as u64)
+                        .unwrap_or(0);
+                }
                 {
                     let peer_id = entry.peer_id.unwrap_or(0);
                     let nodes_received = count.max(0) as u32;
@@ -1312,6 +1336,17 @@ impl InboundLedgerLocal {
                     result.malformed_packets.push((peer_id, packet_type, error));
                 }
                 let count = san.map(|san| san.get_good()).unwrap_or(-1);
+                if count > 0 {
+                    result.useful_packets += 1;
+                    result.useful_nodes += count as u64;
+                }
+                if packet_type == InboundLedgerDataType::StateNode {
+                    result.state_packets += 1;
+                    result.state_useful_nodes += count.max(0) as u64;
+                    result.state_duplicate_nodes += san
+                        .map(|stats| stats.get_duplicate().max(0) as u64)
+                        .unwrap_or(0);
+                }
                 {
                     let peer_id = entry.peer_id.unwrap_or(0);
                     let nodes_received = count.max(0) as u32;
@@ -2657,6 +2692,7 @@ impl InboundLedgerLocal {
                 state_scan: None,
                 tx_scan: None,
                 messages_to_send: Vec::new(),
+                state_request_pending: false,
                 complete: false,
             };
         }
@@ -2669,6 +2705,7 @@ impl InboundLedgerLocal {
                     state_scan: None,
                     tx_scan: None,
                     messages_to_send: Vec::new(),
+                    state_request_pending: false,
                     complete: false,
                 };
             }
@@ -2693,6 +2730,7 @@ impl InboundLedgerLocal {
                     state_scan: None,
                     tx_scan: None,
                     messages_to_send,
+                    state_request_pending: false,
                     complete: false,
                 };
             } else {
@@ -2723,6 +2761,7 @@ impl InboundLedgerLocal {
                 state_scan: None,
                 tx_scan: None,
                 messages_to_send,
+                state_request_pending: false,
                 complete: false,
             };
         }
@@ -2740,6 +2779,7 @@ impl InboundLedgerLocal {
                             state_scan: None,
                             tx_scan: None,
                             messages_to_send,
+                            state_request_pending: false,
                             complete: false,
                         };
                     }
@@ -2765,7 +2805,13 @@ impl InboundLedgerLocal {
                         query_depth,
                         query_type,
                     ));
-                    None
+                    return TriggerSetup {
+                        state_scan: None,
+                        tx_scan: None,
+                        messages_to_send,
+                        state_request_pending: true,
+                        complete: false,
+                    };
                 } else {
                     Some(StateScanParams {
                         missing_limit: MISSING_NODES_FIND,
@@ -2783,8 +2829,13 @@ impl InboundLedgerLocal {
             None
         };
 
-        // Compute tx scan parameters and handle root node request
-        let tx_scan = if !self.planner_state.have_transactions && !self.failed {
+        // Rippled prioritizes the account-state tree and only considers
+        // transaction work after state completes. Do not pre-queue TX root or
+        // node requests while state remains incomplete.
+        let tx_scan = if self.planner_state.have_state
+            && !self.planner_state.have_transactions
+            && !self.failed
+        {
             if let Some(ledger) = self.ledger.as_mut() {
                 let map_hash = ledger.tx_map_mut().hash();
                 let tx_hash = ledger.header().tx_hash;
@@ -2840,8 +2891,156 @@ impl InboundLedgerLocal {
             state_scan,
             tx_scan,
             messages_to_send,
+            state_request_pending: false,
             complete,
         }
+    }
+
+    /// Prepare the transaction half of `trigger` after a state scan produced
+    /// no outbound state request. rippled falls through in this case even when
+    /// state is still incomplete because all current state candidates were
+    /// filtered as recent; keeping this separate prevents concurrent state and
+    /// transaction requests during the ordinary state-first path.
+    pub fn prepare_tx_after_state_scan(
+        &mut self,
+        reason: InboundLedgerRequestTrigger,
+    ) -> TriggerSetup {
+        if self.is_done() || !self.planner_state.have_header || self.failed {
+            return TriggerSetup {
+                state_scan: None,
+                tx_scan: None,
+                messages_to_send: Vec::new(),
+                state_request_pending: false,
+                complete: false,
+            };
+        }
+
+        let query_depth = match reason {
+            InboundLedgerRequestTrigger::Timeout
+            | InboundLedgerRequestTrigger::Added
+            | InboundLedgerRequestTrigger::Blind => 0,
+            InboundLedgerRequestTrigger::Reply => 1,
+            InboundLedgerRequestTrigger::ReplyHighLatency => 2,
+        };
+        let query_type = (self.timeouts > 0).then_some(TM_QUERY_INDIRECT);
+        let mut messages_to_send = Vec::new();
+        let tx_scan = if !self.planner_state.have_transactions {
+            if let Some(ledger) = self.ledger.as_mut() {
+                let map_hash = ledger.tx_map_mut().hash();
+                let tx_hash = ledger.header().tx_hash;
+                if tx_hash.is_zero() {
+                    self.planner_state.have_transactions = true;
+                    None
+                } else if map_hash.is_zero() {
+                    let node_ids = [shamap::node_id::SHAMapNodeId::default()];
+                    log_acq_request_nodes(
+                        self.seq,
+                        "tx",
+                        tx_hash,
+                        1,
+                        1,
+                        1,
+                        reason,
+                        self.recent_nodes.len(),
+                        query_depth,
+                        query_type,
+                        &node_ids,
+                    );
+                    messages_to_send.push(make_get_ledger_with_node_ids(
+                        self.hash,
+                        self.seq,
+                        TM_GET_LEDGER_TX_NODE,
+                        &node_ids,
+                        query_depth,
+                        query_type,
+                    ));
+                    None
+                } else {
+                    Some(TxScanParams {
+                        missing_limit: MISSING_NODES_FIND,
+                        map_hash,
+                        reason,
+                        query_depth,
+                        query_type,
+                        have_transactions: self.planner_state.have_transactions,
+                    })
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        TriggerSetup {
+            state_scan: None,
+            tx_scan,
+            messages_to_send,
+            state_request_pending: false,
+            complete: self.planner_state.have_header
+                && self.planner_state.have_state
+                && self.planner_state.have_transactions,
+        }
+    }
+
+    /// Move the assembled ledger into an exclusive state-scan lease. While
+    /// leased, callers must buffer incoming packets rather than mutate either
+    /// SHAMap. The app restores the exact ledger before applying the scan
+    /// result, which gives the same unlock/recheck boundary as rippled without
+    /// sharing mutable `SyncTree` state across threads.
+    pub fn take_ledger_for_state_scan(&mut self, params: &StateScanParams) -> Option<Ledger> {
+        if params.have_state || self.failed || self.complete {
+            return None;
+        }
+        self.ledger.take()
+    }
+
+    /// Restore a ledger previously taken by `take_ledger_for_state_scan`.
+    /// A detached scan has exclusive ownership, so replacing an existing ledger
+    /// would indicate an invalid concurrent mutation rather than a recoverable
+    /// acquisition state.
+    pub fn restore_ledger_after_state_scan(&mut self, ledger: Ledger) {
+        assert!(
+            self.ledger.is_none(),
+            "state scan lease must restore into an empty inbound ledger slot"
+        );
+        self.ledger = Some(ledger);
+    }
+
+    /// Perform a state-map scan against an exclusively leased ledger.
+    pub fn do_state_map_scan_for_ledger<CLOCK, S, C, F, MR, NS, DB, FP>(
+        ledger: &mut Ledger,
+        params: &StateScanParams,
+        store: &mut DB,
+        fetch_pack: &mut FP,
+        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
+    ) -> (
+        Vec<(shamap::node_id::SHAMapNodeId, Uint256)>,
+        shamap::sync::DeferredMissingNodeScanStats,
+    )
+    where
+        CLOCK: basics::tagged_cache::CacheClock,
+        S: std::hash::BuildHasher + Clone,
+        C: shamap::family::FullBelowCache,
+        F: shamap::family::SHAMapNodeFetcher,
+        MR: shamap::family::MissingNodeReporter,
+        DB: InboundLedgerStore,
+        FP: FetchPackContainer,
+    {
+        if params.have_state || params.map_hash.is_zero() {
+            return (Vec::new(), Default::default());
+        }
+
+        let mut filter = AccountStateSF::new(InboundLedgerSyncStore(&mut *store), &mut *fetch_pack);
+        let mut filter_ref: Option<&mut dyn shamap::fetch::SHAMapSyncFilter> = Some(&mut filter);
+        ledger
+            .state_map_mut()
+            .get_missing_nodes_with_family_diagnostics(
+                params.missing_limit,
+                &mut filter_ref,
+                family,
+                &mut next_missing_scan_first_child,
+            )
     }
 
     /// Perform the expensive state map walk.
@@ -2858,7 +3057,10 @@ impl InboundLedgerLocal {
         store: &mut DB,
         fetch_pack: &mut FP,
         family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-    ) -> Vec<(shamap::node_id::SHAMapNodeId, Uint256)>
+    ) -> (
+        Vec<(shamap::node_id::SHAMapNodeId, Uint256)>,
+        shamap::sync::DeferredMissingNodeScanStats,
+    )
     where
         CLOCK: basics::tagged_cache::CacheClock,
         S: std::hash::BuildHasher + Clone,
@@ -2869,23 +3071,12 @@ impl InboundLedgerLocal {
         FP: FetchPackContainer,
     {
         let Some(ledger) = self.ledger.as_mut() else {
-            return Vec::new();
+            return (Vec::new(), Default::default());
         };
-        if params.have_state || self.failed {
-            return Vec::new();
+        if self.failed {
+            return (Vec::new(), Default::default());
         }
-        if params.map_hash.is_zero() {
-            return Vec::new();
-        }
-
-        let mut filter = AccountStateSF::new(InboundLedgerSyncStore(&mut *store), &mut *fetch_pack);
-        let mut filter_ref: Option<&mut dyn shamap::fetch::SHAMapSyncFilter> = Some(&mut filter);
-        ledger.state_map_mut().get_missing_nodes_with_family(
-            params.missing_limit,
-            &mut filter_ref,
-            family,
-            &mut next_missing_scan_first_child,
-        )
+        Self::do_state_map_scan_for_ledger(ledger, params, store, fetch_pack, family)
     }
 
     /// Apply state-map scan results and build the corresponding peer requests.
@@ -2898,7 +3089,8 @@ impl InboundLedgerLocal {
         params: &StateScanParams,
         _family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
         send_fn: &mut dyn FnMut(ProtocolMessage),
-    ) where
+    ) -> bool
+    where
         CLOCK: basics::tagged_cache::CacheClock,
         S: std::hash::BuildHasher + Clone,
         C: shamap::family::FullBelowCache,
@@ -2906,16 +3098,16 @@ impl InboundLedgerLocal {
         MR: shamap::family::MissingNodeReporter,
     {
         let Some(ledger) = self.ledger.as_mut() else {
-            return;
+            return false;
         };
         if params.have_state || self.failed {
-            return;
+            return false;
         }
 
         if missing.is_empty() {
             if !ledger.state_map().is_valid() {
                 self.failed = true;
-                return;
+                return false;
             }
             if ledger.state_map().is_valid() {
                 self.planner_state.have_state = true;
@@ -2980,8 +3172,10 @@ impl InboundLedgerLocal {
                     params.query_type,
                 );
                 send_fn(request);
+                return true;
             }
         }
+        false
     }
 
     /// Perform the expensive transaction map walk.

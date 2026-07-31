@@ -184,7 +184,12 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
         if is_sell {
             // reference: saTakerPays = multiply(saTakerGets, rate, saTakerPays.asset())
-            taker_pays = taker_gets.multiply(&rate_amount, taker_pays.asset());
+            taker_pays = match amount_or_exception(
+                taker_gets.try_multiply(&rate_amount, taker_pays.asset()),
+            ) {
+                Ok(amount) => amount,
+                Err(ter) => return ter,
+            };
         } else {
             // rippled invokes divide here; its zero-rate exception is mapped by
             // doApply to tefEXCEPTION. Preserve that result without emitting a
@@ -193,7 +198,12 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                 return Ter::TEF_EXCEPTION;
             }
             // reference: saTakerGets = divide(saTakerPays, rate, saTakerGets.asset())
-            taker_gets = taker_pays.divide(&rate_amount, taker_gets.asset());
+            taker_gets = match amount_or_exception(
+                taker_pays.try_divide(&rate_amount, taker_gets.asset()),
+            ) {
+                Ok(amount) => amount,
+                Err(ter) => return ter,
+            };
         }
         if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
             return Ter::TES_SUCCESS; // Rounded to zero
@@ -430,16 +440,17 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                 1_000_000_000u32
             };
             let non_gateway_in = if gateway_rate != 1_000_000_000 {
-                actual_in.divide(
-                    &STAmount::new_with_asset(
-                        sf("sfAmount"),
-                        protocol::Asset::Issue(protocol::Issue::default()),
-                        gateway_rate as u64,
-                        -9,
-                        false,
-                    ),
-                    taker_pays.asset(),
-                )
+                let rate = STAmount::new_with_asset(
+                    sf("sfAmount"),
+                    protocol::Asset::Issue(protocol::Issue::default()),
+                    gateway_rate as u64,
+                    -9,
+                    false,
+                );
+                match amount_or_exception(actual_in.try_divide(&rate, taker_pays.asset())) {
+                    Ok(amount) => amount,
+                    Err(ter) => return ter,
+                }
             } else {
                 actual_in
             };
@@ -450,9 +461,16 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             let rem_gets = if rem_pays.signum() <= 0 {
                 taker_gets.zeroed()
             } else {
-                rem_pays
-                    .multiply(&taker_gets, taker_gets.asset())
-                    .divide(&taker_pays, taker_gets.asset())
+                let product = match amount_or_exception(
+                    rem_pays.try_multiply(&taker_gets, taker_gets.asset()),
+                ) {
+                    Ok(amount) => amount,
+                    Err(ter) => return ter,
+                };
+                match amount_or_exception(product.try_divide(&taker_pays, taker_gets.asset())) {
+                    Ok(amount) => amount,
+                    Err(ter) => return ter,
+                }
             };
             (rem_gets, rem_pays)
         } else {
@@ -464,9 +482,16 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             let rem_pays = if rem_gets.signum() <= 0 {
                 taker_pays.zeroed()
             } else {
-                rem_gets
-                    .multiply(&taker_pays, taker_pays.asset())
-                    .divide(&taker_gets, taker_pays.asset())
+                let product = match amount_or_exception(
+                    rem_gets.try_multiply(&taker_pays, taker_pays.asset()),
+                ) {
+                    Ok(amount) => amount,
+                    Err(ter) => return ter,
+                };
+                match amount_or_exception(product.try_divide(&taker_gets, taker_pays.asset())) {
+                    Ok(amount) => amount,
+                    Err(ter) => return ter,
+                }
             };
             (rem_gets, rem_pays)
         };
@@ -822,6 +847,15 @@ fn offer_delete<V: ledger::ApplyView>(
     ledger::offer_helpers::offer_delete(view, offer_sle).unwrap_or(Ter::TEF_BAD_LEDGER)
 }
 
+fn amount_or_exception(
+    result: Result<STAmount, protocol::st_amount::AmountError>,
+) -> Result<STAmount, Ter> {
+    result.map_err(|error| {
+        tracing::debug!(target: "tx", %error, "OfferCreate amount calculation rejected");
+        Ter::TEF_EXCEPTION
+    })
+}
+
 /// Returns the exchange rate encoded as u64: top 8 bits = exponent+100, lower 56 bits = mantissa.
 /// reference: getRate(offerOut=taker_gets, offerIn=taker_pays) = divide(taker_pays, taker_gets) encoded.
 fn get_rate(taker_gets: &STAmount, taker_pays: &STAmount) -> u64 {
@@ -830,7 +864,9 @@ fn get_rate(taker_gets: &STAmount, taker_pays: &STAmount) -> u64 {
     }
     // STAmount r = divide(offerIn, offerOut, noIssue())
     let no_issue = protocol::no_issue();
-    let r = taker_pays.divide(taker_gets, no_issue);
+    let Ok(r) = taker_pays.try_divide(taker_gets, no_issue) else {
+        return 0;
+    };
     if r.signum() <= 0 {
         return 0;
     }
@@ -944,6 +980,14 @@ fn quality_to_rate_amount(quality: u64, _pays: &STAmount, _gets: &STAmount) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offer_create_amount_error_maps_to_tef_exception_without_unwinding() {
+        assert_eq!(
+            amount_or_exception(Err(protocol::st_amount::AmountError::NativeOutOfRange)),
+            Err(Ter::TEF_EXCEPTION)
+        );
+    }
 
     #[test]
     fn quality_to_rate_amount_underflow_is_zero() {

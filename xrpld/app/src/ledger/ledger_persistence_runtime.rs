@@ -166,13 +166,21 @@ impl LedgerPersistenceRuntime for AppLedgerPersistenceRuntime {
     fn save_validated_ledger(&self, ledger: Arc<Ledger>, _is_current: bool) -> bool {
         // Write header to SQLite Ledgers table (compatibility: the reference source kADD_LEDGER).
         // This is the primary bootstrap source on restart — mirrors reference getLastFullLedger().
-        if let Some(db) = self.ledger_db.as_ref() {
-            if let Err(e) = db.insert_ledger(&ledger.header()) {
-                tracing::info!(target: "ledger",
-                    "[ledger_persistence] rdb insert failed seq={} error={e}",
-                    ledger.header().seq
-                );
-            }
+        if let Some(db) = self.ledger_db.as_ref()
+            && let Err(error) = db.insert_ledger(&ledger.header())
+        {
+            self.saved_hashes
+                .lock()
+                .expect("saved_hashes mutex must not be poisoned")
+                .remove(&ledger.header().hash);
+            tracing::warn!(
+                target: "ledger",
+                seq = ledger.header().seq,
+                hash = %ledger.header().hash,
+                %error,
+                "required ledger-header persistence failed"
+            );
+            return false;
         }
 
         let Some(relational) = self.relational_database.as_ref() else {

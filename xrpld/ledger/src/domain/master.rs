@@ -65,6 +65,34 @@ pub enum LedgerMasterPathWork {
     OrderBookDb,
 }
 
+/// Exact result of comparing one candidate ledger to one compatibility anchor.
+/// Kept structured so recovery logs can identify the failing anchor instead of
+/// emitting only the final `is_compatible` boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerCompatibilityAnchorAudit {
+    pub hash: Uint256,
+    pub seq: u32,
+    pub candidate_ancestor: Option<Uint256>,
+    pub matches: bool,
+}
+
+/// Compatibility evidence for a candidate considered by preferred-LCL recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerCompatibilityAudit {
+    pub candidate_hash: Uint256,
+    pub candidate_seq: u32,
+    pub candidate_parent_hash: Uint256,
+    pub validated_anchor: Option<LedgerCompatibilityAnchorAudit>,
+    pub last_valid_anchor: Option<LedgerCompatibilityAnchorAudit>,
+}
+
+impl LedgerCompatibilityAudit {
+    pub fn compatible(&self) -> bool {
+        self.validated_anchor.is_none_or(|anchor| anchor.matches)
+            && self.last_valid_anchor.is_none_or(|anchor| anchor.matches)
+    }
+}
+
 #[derive(Debug, Default)]
 struct PathState {
     path_ledger: Option<Arc<Ledger>>,
@@ -311,36 +339,58 @@ where
             .expect("last-valid-ledger mutex must not be poisoned")
     }
 
+    fn compatibility_anchor_audit(
+        ledger: &Ledger,
+        hash: Uint256,
+        seq: u32,
+    ) -> LedgerCompatibilityAnchorAudit {
+        let candidate_ancestor = if ledger.header().seq < seq {
+            None
+        } else if ledger.header().seq == seq {
+            Some(*ledger.header().hash.as_uint256())
+        } else if ledger.header().seq == seq.saturating_add(1) {
+            Some(*ledger.header().parent_hash.as_uint256())
+        } else {
+            ledger
+                .hash_of_seq(seq, &NullLedgerJournal)
+                .map(|ancestor| *ancestor.as_uint256())
+        };
+        let matches = candidate_ancestor == Some(hash);
+        LedgerCompatibilityAnchorAudit {
+            hash,
+            seq,
+            candidate_ancestor,
+            matches,
+        }
+    }
+
+    /// Return the exact validated and quorum-anchor comparisons that determine
+    /// whether a preferred-LCL candidate may replace the local closed ledger.
+    pub fn compatibility_audit(&self, ledger: &Ledger) -> LedgerCompatibilityAudit {
+        let validated_anchor = self.validated_ledger().map(|validated| {
+            Self::compatibility_anchor_audit(
+                ledger,
+                *validated.header().hash.as_uint256(),
+                validated.header().seq,
+            )
+        });
+        let last_valid_anchor = self
+            .last_valid_ledger()
+            .map(|(hash, seq)| Self::compatibility_anchor_audit(ledger, hash, seq));
+        LedgerCompatibilityAudit {
+            candidate_hash: *ledger.header().hash.as_uint256(),
+            candidate_seq: ledger.header().seq,
+            candidate_parent_hash: *ledger.header().parent_hash.as_uint256(),
+            validated_anchor,
+            last_valid_anchor,
+        }
+    }
+
     /// Equivalent to LedgerMaster::isCompatible. A candidate must remain on
     /// both the validated chain and the highest quorum-backed chain observed
     /// before acquisition.
     pub fn is_compatible(&self, ledger: &Ledger) -> bool {
-        let matches_anchor = |hash: Uint256, seq: u32| {
-            if ledger.header().seq < seq {
-                return false;
-            }
-            if ledger.header().seq == seq {
-                return *ledger.header().hash.as_uint256() == hash;
-            }
-            if ledger.header().seq == seq.saturating_add(1) {
-                return *ledger.header().parent_hash.as_uint256() == hash;
-            }
-            ledger
-                .hash_of_seq(seq, &NullLedgerJournal)
-                .is_some_and(|ancestor| *ancestor.as_uint256() == hash)
-        };
-
-        if let Some(validated) = self.validated_ledger()
-            && !matches_anchor(
-                *validated.header().hash.as_uint256(),
-                validated.header().seq,
-            )
-        {
-            return false;
-        }
-
-        self.last_valid_ledger()
-            .is_none_or(|(hash, seq)| matches_anchor(hash, seq))
+        self.compatibility_audit(ledger).compatible()
     }
 
     /// too far from network close time, or too far ahead of the valid ledger.

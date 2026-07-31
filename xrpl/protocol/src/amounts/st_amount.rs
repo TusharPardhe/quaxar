@@ -2,6 +2,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Sub, SubAssign};
 
 use basics::number::NumberParts as RuntimeNumber;
@@ -21,6 +22,33 @@ use crate::{
 };
 
 const IOU_ZERO_OFFSET: i32 = -100;
+
+/// A numeric result that cannot be represented by the XRPL amount wire format.
+/// Callers performing transaction arithmetic should propagate this as a normal
+/// engine result rather than unwind from a consensus or network worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmountError {
+    NativeOutOfRange,
+    MptOutOfRange,
+    IssuedOutOfRange,
+    DivisionByZero,
+    ArithmeticOverflow,
+}
+
+impl fmt::Display for AmountError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::NativeOutOfRange => "Native currency amount out of range",
+            Self::MptOutOfRange => "MPT amount out of range",
+            Self::IssuedOutOfRange => "Issued currency amount out of range",
+            Self::DivisionByZero => "division by zero",
+            Self::ArithmeticOverflow => "amount arithmetic overflow",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for AmountError {}
 
 #[derive(Debug, Clone)]
 pub struct STAmount {
@@ -133,6 +161,17 @@ impl STAmount {
         exponent: i32,
         negative: bool,
     ) -> Self {
+        Self::try_new_with_asset(field, asset, mantissa, exponent, negative)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_new_with_asset(
+        field: &'static SField,
+        asset: impl Into<Asset>,
+        mantissa: u64,
+        exponent: i32,
+        negative: bool,
+    ) -> Result<Self, AmountError> {
         let mut amount = Self {
             core: StBaseCore::with_field(field),
             asset: asset.into(),
@@ -140,8 +179,8 @@ impl STAmount {
             offset: exponent,
             is_negative: negative,
         };
-        amount.canonicalize();
-        amount
+        amount.try_canonicalize()?;
+        Ok(amount)
     }
 
     pub fn from_xrp_amount(amount: XRPAmount) -> Self {
@@ -313,6 +352,11 @@ impl STAmount {
     }
 
     fn canonicalize(&mut self) {
+        self.try_canonicalize()
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    fn try_canonicalize(&mut self) -> Result<(), AmountError> {
         if self.integral() {
             // Match rippled STAmount::canonicalize. XRP and MPT are integral
             // values, but arithmetic can temporarily represent them using an
@@ -324,45 +368,45 @@ impl STAmount {
                 self.value = 0;
                 self.offset = 0;
                 self.is_negative = false;
-                return;
+                return Ok(());
             }
 
             if self.native() && self.offset > 17 {
-                panic!("Native currency amount out of range");
+                return Err(AmountError::NativeOutOfRange);
             }
             if self.holds_mpt_issue() && self.offset > 18 {
-                panic!("MPT amount out of range");
+                return Err(AmountError::MptOutOfRange);
             }
 
             let number = RuntimeNumber::unchecked(self.is_negative, self.value, self.offset);
             if self.native() {
-                let amount = XRPAmount::from_number(number)
-                    .unwrap_or_else(|_| panic!("Native currency amount out of range"));
+                let amount =
+                    XRPAmount::from_number(number).map_err(|_| AmountError::NativeOutOfRange)?;
                 self.is_negative = amount.drops() < 0;
                 self.value = amount.drops().unsigned_abs();
                 self.offset = 0;
                 if self.value > ST_AMOUNT_MAX_NATIVE_NETWORK {
-                    panic!("Native currency amount out of range");
+                    return Err(AmountError::NativeOutOfRange);
                 }
             } else if self.holds_mpt_issue() {
-                let amount = MPTAmount::from_number(number)
-                    .unwrap_or_else(|_| panic!("MPT amount out of range"));
+                let amount =
+                    MPTAmount::from_number(number).map_err(|_| AmountError::MptOutOfRange)?;
                 self.is_negative = amount.value() < 0;
                 self.value = amount.value().unsigned_abs();
                 self.offset = 0;
                 if self.value > crate::MAX_MP_TOKEN_AMOUNT as u64 {
-                    panic!("MPT amount out of range");
+                    return Err(AmountError::MptOutOfRange);
                 }
             } else {
                 unreachable!("integral STAmount must hold XRP or MPT");
             }
-            return;
+            return Ok(());
         }
 
         if self.value == 0 {
             self.offset = IOU_ZERO_OFFSET;
             self.is_negative = false;
-            return;
+            return Ok(());
         }
 
         while self.value < ST_AMOUNT_MIN_MANTISSA && self.offset > ST_AMOUNT_MIN_OFFSET {
@@ -372,7 +416,7 @@ impl STAmount {
 
         while self.value > ST_AMOUNT_MAX_MANTISSA {
             if self.offset >= ST_AMOUNT_MAX_OFFSET {
-                panic!("value overflow");
+                return Err(AmountError::IssuedOutOfRange);
             }
             self.value /= 10;
             self.offset += 1;
@@ -382,12 +426,13 @@ impl STAmount {
             self.value = 0;
             self.is_negative = false;
             self.offset = IOU_ZERO_OFFSET;
-            return;
+            return Ok(());
         }
 
         if self.offset > ST_AMOUNT_MAX_OFFSET {
-            panic!("value overflow");
+            return Err(AmountError::IssuedOutOfRange);
         }
+        Ok(())
     }
 
     fn are_comparable(&self, other: &Self) -> bool {
@@ -465,6 +510,14 @@ impl STAmount {
             };
         }
         Ordering::Equal
+    }
+
+    pub fn try_multiply(&self, other: &Self, asset: impl Into<Asset>) -> Result<Self, AmountError> {
+        crate::quality::try_multiply(self, other, asset)
+    }
+
+    pub fn try_divide(&self, other: &Self, asset: impl Into<Asset>) -> Result<Self, AmountError> {
+        crate::quality::try_divide(self, other, asset)
     }
 
     pub fn multiply(&self, other: &Self, asset: impl Into<Asset>) -> Self {
@@ -884,7 +937,10 @@ impl StBase for STAmount {
 
 #[cfg(test)]
 mod tests {
-    use super::{ST_AMOUNT_MAX_NATIVE_NETWORK, STAmount, ValidationError, has_invalid_amount};
+    use super::{
+        AmountError, ST_AMOUNT_MAX_NATIVE_NETWORK, ST_AMOUNT_MIN_MANTISSA, STAmount,
+        ValidationError, has_invalid_amount,
+    };
     use crate::sf_generic;
     use crate::stbase::StBase;
     use crate::{AccountID, MPTAmount, MPTIssue, STArray, STObject, get_field_by_symbol};
@@ -942,6 +998,27 @@ mod tests {
         let result = native + iou;
         // Result should be the native amount unchanged (no-op on incompatible)
         assert!(result.native());
+    }
+
+    #[test]
+    fn fallible_native_canonicalization_rejects_overflow_without_unwinding() {
+        let result = STAmount::try_new_with_asset(sf_generic(), crate::xrp_issue(), 1, 18, false);
+        assert_eq!(result, Err(AmountError::NativeOutOfRange));
+    }
+
+    #[test]
+    fn fallible_native_multiplication_rejects_overflow_without_unwinding() {
+        let native = STAmount::new_native(ST_AMOUNT_MAX_NATIVE_NETWORK, false);
+        let mut issue = crate::no_issue();
+        issue.currency = crate::currency_from_string("USD");
+        issue.account =
+            crate::parse_base58_account_id("rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh").unwrap();
+        let rate = STAmount::new_with_asset(sf_generic(), issue, ST_AMOUNT_MIN_MANTISSA, 3, false);
+
+        assert_eq!(
+            native.try_multiply(&rate, native.asset()),
+            Err(AmountError::NativeOutOfRange)
+        );
     }
 
     #[test]

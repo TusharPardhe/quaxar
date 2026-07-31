@@ -2798,9 +2798,24 @@ impl<V: AppServerInfoView> crate::state::feature::FeatureSource for ApplicationS
 impl<V: AppServerInfoView> crate::commands::fetch_info::FetchInfoSource
     for ApplicationServerInfo<V>
 {
-    fn clear_ledger_fetch(&self) {}
+    fn clear_ledger_fetch(&self) {
+        if let Some(inbound) = self
+            .view
+            .app()
+            .and_then(|app| app.ledger_master_runtime())
+            .and_then(|runtime| runtime.inbound_ledgers.lock().ok()?.clone())
+        {
+            inbound.clear_failures();
+        }
+    }
+
     fn get_ledger_fetch_info(&self) -> JsonValue {
-        JsonValue::Object(BTreeMap::new())
+        self.view
+            .app()
+            .and_then(|app| app.ledger_master_runtime())
+            .and_then(|runtime| runtime.inbound_ledgers.lock().ok()?.clone())
+            .map(|inbound| inbound.fetch_info_bounded(16))
+            .unwrap_or_else(|| JsonValue::Object(BTreeMap::new()))
     }
 }
 

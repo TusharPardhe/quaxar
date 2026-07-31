@@ -194,16 +194,10 @@ where
         return AsyncDescendResultRaw::Ready(None);
     }
 
-    // NuDB read — matching rippled's fetchNodeNT which reads from DB before
-    // falling through to peer request. Without this, nodes released by
-    // release_deep_children() would be re-downloaded from peers instead of
-    // re-read from the local NuDB store where they were already persisted.
-    if let Some(found) = family.fetch_cached_node_or_acquire_by_seq(hash, ledger_seq) {
-        let canonical = parent.canonicalize_child(branch, found);
-        let ptr: *const SHAMapTreeNode = &*canonical;
-        return AsyncDescendResultRaw::Ready(Some(ptr));
-    }
-
+    // Match rippled `descendAsync`: after cache/filter misses, defer exactly
+    // one backing-store resolution to the scan completion boundary. Doing a
+    // synchronous read here and another during completion probes NuDB twice
+    // for the same unresolved child.
     request_async_fetch(hash, ledger_seq);
     AsyncDescendResultRaw::Pending(hash)
 }
@@ -252,13 +246,10 @@ where
         return AsyncDescendResult::Ready(None);
     }
 
-    // NuDB read — matching rippled's fetchNodeNT chain: cache → DB → filter → peers.
-    // Without this, nodes released by release_deep_children() are re-downloaded
-    // from peers instead of re-read from NuDB where they already exist.
-    if let Some(found) = family.fetch_cached_node_or_acquire_by_seq(hash, ledger_seq) {
-        return AsyncDescendResult::Ready(Some(parent.canonicalize_child(branch, found)));
-    }
-
+    // Match rippled `descendAsync`: after cache/filter misses, defer exactly
+    // one backing-store resolution to the scan completion boundary. Doing a
+    // synchronous read here and another during completion probes NuDB twice
+    // for the same unresolved child.
     request_async_fetch(hash, ledger_seq);
     AsyncDescendResult::Pending(hash)
 }

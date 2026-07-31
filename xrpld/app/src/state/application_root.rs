@@ -1,8 +1,7 @@
 //! Honest application-root owner for the migrated runtime shell.
 
 use crate::amendments::amendment_status::{AmendmentStatus, UnsupportedMajorityWarningDetails};
-use crate::consensus::rcl_consensus::{RclConsensusOpenLedgerSource, RclConsensusValidationSource};
-use crate::consensus::rcl_validation::RclValidatedLedger;
+use crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource;
 use crate::consensus::rcl_validations::SharedAppValidations;
 use crate::job::job_queue::JobQueue;
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
@@ -103,18 +102,21 @@ fn to_nodestore_type(object_type: LedgerNodeObjectType) -> nodestore::NodeObject
     }
 }
 
-/// Matches rippled `checkLastClosedLedger`: a peer/validation preference for
-/// our immediate parent is not an abnormal LCL switch, but every other hash is.
-fn preferred_lcl_matches_local_or_parent(
-    local_hash: Uint256,
-    local_parent_hash: Uint256,
-    preferred_hash: Uint256,
-) -> bool {
-    preferred_hash.is_zero() || preferred_hash == local_hash || preferred_hash == local_parent_hash
-}
-
 fn consensus_status_event(event: i32, have_correct_lcl: bool) -> i32 {
     if have_correct_lcl { event } else { 4 } // neLOST_SYNC
+}
+
+/// A preferred LCL equal to the local closed ledger or its immediate parent
+/// cannot justify an abnormal jump. This test-only predicate keeps the mode
+/// promotion regression assertion explicit without introducing another
+/// production LCL policy owner.
+#[cfg(test)]
+fn preferred_lcl_matches_local_or_parent(
+    local_hash: Uint256,
+    parent_hash: Uint256,
+    preferred_hash: Uint256,
+) -> bool {
+    preferred_hash == local_hash || preferred_hash == parent_hash
 }
 
 fn full_sync_debug_enabled() -> bool {
@@ -2348,154 +2350,11 @@ impl LedgerAcceptor for ConsensusLedgerAcceptor {
                                 }
                             }
                         }
-                        // Matches rippled's doAccept → endConsensus →
-                        // beginConsensus: start the next consensus round
-                        // ATOMICALLY from within the same JtAccept job.
-                        // This eliminates the timing window where peer
-                        // proposals arrive while we're still in Accepted
-                        // phase (the root cause of the post-stress stall).
-                        let started_next = {
-                            let consensus_rt = root.shared_consensus_rt.read().ok().and_then(|g| g.clone());
-                            let network_ops_rt = root.shared_network_ops_rt.read().ok().and_then(|g| g.clone());
-                            if let (Some(crt), Some(nrt)) = (consensus_rt, network_ops_rt) {
-                                // checkLastClosedLedger: determine if peers
-                                // prefer a different closed ledger.
-                                let closed = root.closed_ledger();
-                                if let Some(closed) = closed {
-                                    let closed_id = *closed.header().hash.as_uint256();
-                                    let network_closed = if let Some(ort) = root.overlay_runtime() {
-                                        use overlay::Overlay;
-                                        let peers = ort.overlay().active_peers();
-                                        if peers.len() >= 3 {
-                                            let mut counts = std::collections::HashMap::<basics::base_uint::Uint256, u32>::new();
-                                            *counts.entry(closed_id).or_insert(0) += 1;
-                                            for peer in &peers {
-                                                let h = peer.closed_ledger_hash();
-                                                if !h.is_zero() {
-                                                    *counts.entry(h).or_insert(0) += 1;
-                                                }
-                                            }
-                                            let preferred = counts.iter()
-                                                .max_by_key(|(_, c)| *c)
-                                                .map(|(h, _)| *h)
-                                                .unwrap_or(closed_id);
-                                            if preferred != closed_id
-                                                && preferred != *closed.header().parent_hash.as_uint256()
-                                            {
-                                                preferred
-                                            } else {
-                                                closed_id
-                                            }
-                                        } else {
-                                            closed_id
-                                        }
-                                    } else {
-                                        closed_id
-                                    };
-
-                                    let round_ledger = if network_closed != closed_id {
-                                        tracing::info!(
-                                            target: "consensus",
-                                            %closed_id, %network_closed,
-                                            "checkLastClosedLedger: peers prefer different chain"
-                                        );
-                                        if let Some(lm_rt) = root.ledger_master_runtime() {
-                                            if lm_rt
-                                                .ledger_master()
-                                                .get_ledger_by_hash(
-                                                    basics::sha_map_hash::SHAMapHash::new(
-                                                        network_closed,
-                                                    ),
-                                                )
-                                                .is_some()
-                                            {
-                                                // The strand owns the complete
-                                                // switchLastClosedLedger flow.
-                                                // Cached LCLs must wait for it
-                                                // just like acquired LCLs so
-                                                // neither path skips TxQ,
-                                                // open-ledger, trust, status,
-                                                // or peer-cycle work.
-                                                root.set_need_network_ledger(true);
-                                                let _ = root.set_network_ops_operating_mode(
-                                                    crate::state::application_root::NetworkOpsOperatingMode::Connected,
-                                                );
-                                                return;
-                                            } else {
-                                                // Ledger not in local cache — acquire it from peers
-                                                // (matching rippled NetworkOPs.cpp:1974).
-                                                // Do NOT start the next round on our own (wrong)
-                                                // ledger — that would produce another divergent
-                                                // close and perpetuate the fork. Instead, wait for
-                                                // the acquisition to complete: storeLedger drain →
-                                                // LedgerDone → check_accept → on_closed_ledger →
-                                                // next on_accept finds matching chain → starts round.
-                                                if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
-                                                    if let Some(shared) = guard.as_ref() {
-                                                        // A peer's current closed-ledger hash is
-                                                        // not sequence-bound to its separately
-                                                        // advertised history range.
-                                                        tracing::warn!(
-                                                            target: "consensus",
-                                                            %network_closed,
-                                                            "checkLastClosedLedger: acquiring network ledger by hash"
-                                                        );
-                                                        shared.acquire_closed_ledger_async(
-                                                            network_closed,
-                                                            crate::ledger::inbound_ledgers::AcquireReason::Consensus,
-                                                        );
-                                                        tracing::info!(
-                                                            target: "consensus",
-                                                            %network_closed,
-                                                            "checkLastClosedLedger: acquire_async returned, suppressing round start"
-                                                        );
-                                                    } else {
-                                                        tracing::error!(
-                                                            target: "consensus",
-                                                            "checkLastClosedLedger: inbound_ledgers is None (not initialized)"
-                                                        );
-                                                    }
-                                                } else {
-                                                    tracing::error!(
-                                                        target: "consensus",
-                                                        "checkLastClosedLedger: inbound_ledgers lock POISONED"
-                                                    );
-                                                }
-                                                // Downgrade operating mode (matching rippled line 1993)
-                                                let _ = root.set_network_ops_operating_mode(
-                                                    crate::state::application_root::NetworkOpsOperatingMode::Connected
-                                                );
-                                                // Re-enable switchLastClosedLedger in bootstrap
-                                                // so it handles the acquired ledger when it arrives
-                                                root.set_need_network_ledger(true);
-                                                // Return without starting next round
-                                                return;
-                                            }
-                                        } else {
-                                            Arc::clone(&closed)
-                                        }
-                                    } else {
-                                        Arc::clone(&closed)
-                                    };
-
-                                    let now = root.shared_time_keeper().close_time();
-                                    let prev_id = *round_ledger.header().hash.as_uint256();
-                                    let prev_cx = crate::consensus_ledger_from_ledger(&round_ledger);
-                                    crt.send_start_round(now, prev_id, prev_cx);
-                                    true
-                                } else {
-                                    false
-                                }
-                            } else {
-                                false
-                            }
-                        };
-                        // Fallback: if we couldn't start the next round
-                        // (runtimes not yet attached), wake the bootstrap
-                        // loop to handle it via polling.
-                        if !started_next {
-                            let _ = root.schedule_network_ops_transaction_batch();
-                        }
+                        // Preferred-LCL policy and the next-round handoff
+                        // are exclusively owned by NetworkOpsStrand. This
+                        // legacy acceptor remains a publication/validation
+                        // service and only wakes that serialized owner.
+                        root.notify_consensus_event();
                     }
                     Err(err) => {
                         tracing::error!(target: "consensus", closed_seq, %err, "ConsensusLedgerAcceptor: inner accept_ledger job failed");
@@ -2843,6 +2702,10 @@ impl ApplicationRoot {
     /// JobQueue worker. This is intentionally not a consensus-strand task.
     pub fn run_network_ops_transaction_batch(&self) {
         while self.network_ops_pending_transaction_count().unwrap_or(0) != 0 {
+            // Preferred-LCL reconciliation holds this gate across the whole
+            // TxQ/open-ledger/LCL transition. Take it before close_gate so a
+            // batch never applies transactions against a mixed old/new parent.
+            let _lcl_transition_guard = self.lcl_transition_gate().lock();
             let _close_guard = self
                 .close_gate()
                 .lock()
@@ -3929,6 +3792,7 @@ impl ApplicationRoot {
         if let Some(runtime) = self.network_ops_runtime.as_ref() {
             let _ = runtime.set_ledger_master_runtime(Arc::clone(&ledger_master_runtime));
         }
+        self.validations.set_job_queue(Some(self.job_queue.clone()));
         let _ = self
             .validations
             .set_ledger_master_runtime(Some(Arc::clone(&ledger_master_runtime)));
@@ -4326,6 +4190,11 @@ impl ApplicationRoot {
     }
 
     pub fn apply_network_ops_pending_to_open_ledger(&self) -> Option<AppNetworkOpsApplyReport> {
+        // This method reads the closed-LCL-derived base and applies into the
+        // open ledger. Hold the outer gate for both phases so it cannot capture
+        // the old parent, wait through a jump, and then apply to the new view.
+        // The mutex is re-entrant because close/batch callers already hold it.
+        let _lcl_transition_guard = self.lcl_transition_gate().lock();
         let pending = self.network_ops_pending_transaction_count().unwrap_or(0);
         if pending > 0 {}
         let base_ledger = match self.closed_ledger().or_else(|| self.validated_ledger()) {
@@ -4861,6 +4730,42 @@ impl ApplicationRoot {
         let new_mode = self.network_ops_state.operating_mode();
         if previous != new_mode {
             tracing::info!(target: "app", from = %previous.as_str(), to = %new_mode.as_str(), "Operating mode changed");
+            let fee_track = self.load_fee_track();
+            let base_fee = self
+                .closed_ledger()
+                .or_else(|| self.validated_ledger())
+                .map(|ledger| ledger.fees().base)
+                .unwrap_or_default();
+            let payload = JsonValue::Object(std::collections::BTreeMap::from([
+                (
+                    "type".to_owned(),
+                    JsonValue::String("serverStatus".to_owned()),
+                ),
+                (
+                    "server_status".to_owned(),
+                    JsonValue::String(new_mode.as_str().to_owned()),
+                ),
+                (
+                    "load_base".to_owned(),
+                    JsonValue::Unsigned(u64::from(fee_track.load_base())),
+                ),
+                (
+                    "load_factor".to_owned(),
+                    JsonValue::Unsigned(u64::from(std::cmp::max(
+                        fee_track.local_fee(),
+                        fee_track.cluster_fee(),
+                    ))),
+                ),
+                (
+                    "base_fee".to_owned(),
+                    JsonValue::Unsigned(u64::from(base_fee)),
+                ),
+            ]));
+            if let Ok(guard) = self.shared_subscription_manager.read()
+                && let Some(publisher) = guard.as_ref()
+            {
+                publisher("server", payload);
+            }
         }
         previous
     }
@@ -5318,7 +5223,17 @@ impl ApplicationRoot {
         let Some(lm_rt) = self.ledger_master_runtime() else {
             return;
         };
-        let report = lm_rt.plan_advance_publication();
+        let mut report = lm_rt.plan_advance_publication();
+        if let Some(missing) = report.missing
+            && self
+                .resolve_ledger_by_hash(SHAMapHash::new(missing.hash))
+                .is_some()
+        {
+            // The provider load canonicalized the exact hash into LedgerHistory.
+            // Re-plan so publication remains contiguous and never treats a
+            // provider result as validated by itself.
+            report = lm_rt.plan_advance_publication();
+        }
 
         use crate::ledger::ledger_master_runtime::AppLedgerMasterPublishAdvance;
         match report.decision {
@@ -5332,7 +5247,6 @@ impl ApplicationRoot {
                     );
                     self.on_published_ledger(Arc::clone(ledger));
                     lm_rt.ledger_master().set_pub_ledger(Arc::clone(ledger));
-                    self.set_need_network_ledger(false);
                 }
             }
             AppLedgerMasterPublishAdvance::GapTooLarge => {
@@ -5344,7 +5258,6 @@ impl ApplicationRoot {
                     );
                     self.on_published_ledger(Arc::clone(ledger));
                     lm_rt.ledger_master().set_pub_ledger(Arc::clone(ledger));
-                    self.set_need_network_ledger(false);
                 }
             }
             AppLedgerMasterPublishAdvance::Sequential => {
@@ -5357,9 +5270,7 @@ impl ApplicationRoot {
                     self.on_published_ledger(Arc::clone(ledger));
                     lm_rt.ledger_master().set_pub_ledger(Arc::clone(ledger));
                 }
-                if !report.published.is_empty() {
-                    self.set_need_network_ledger(false);
-                }
+                if !report.published.is_empty() {}
                 // If there's a missing ledger, trigger acquisition.
                 if let Some(missing) = report.missing {
                     if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
@@ -5578,6 +5489,22 @@ impl ApplicationRoot {
             .map(|service| service.operating_mode())
     }
 
+    /// Resolve an immutable ledger by its exact hash through the same
+    /// cache-then-provider path used by ledger serving. A provider result is
+    /// canonicalized as a nonvalidated history cache entry; callers must still
+    /// apply compatibility, quorum, and publication policy themselves.
+    pub(crate) fn resolve_ledger_by_hash(&self, hash: SHAMapHash) -> Option<Arc<Ledger>> {
+        let loaded = crate::ledger::loaded_ledger_runtime::AppLoadedLedgerRuntime::from_root(self)?;
+        match loaded.get_history_ledger_by_hash(hash) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                tracing::warn!(target: "ledger", %hash, ?error,
+                    "provider-backed exact-hash ledger lookup failed");
+                None
+            }
+        }
+    }
+
     pub fn on_validated_ledger(&self, ledger: Arc<Ledger>) -> bool {
         let ledger = self.ledger_with_node_fetcher(ledger);
         self.ledger_master_state
@@ -5653,29 +5580,70 @@ impl ApplicationRoot {
         let lm = lm_rt.ledger_master();
 
         if seq != 0 {
-            if seq < lm.valid_ledger_seq() {
+            let current_valid_seq = lm.valid_ledger_seq();
+            let validated_anchor = lm
+                .validated_ledger()
+                .map(|current| (*current.header().hash.as_uint256(), current.header().seq));
+            let last_valid_before = lm.last_valid_ledger();
+            if seq < current_valid_seq {
+                tracing::debug!(
+                    target: "lcl_audit",
+                    observed_hash = %hash,
+                    observed_seq = seq,
+                    current_valid_seq,
+                    ?validated_anchor,
+                    ?last_valid_before,
+                    "LCL_AUDIT validation ignored below current validated sequence"
+                );
                 return;
             }
             let val_count = self.trusted_validation_count_for_ledger(hash, seq);
             let quorum = self.validators().quorum();
+            tracing::debug!(
+                target: "lcl_audit",
+                observed_hash = %hash,
+                observed_seq = seq,
+                current_valid_seq,
+                val_count,
+                quorum,
+                quorum_reached = val_count >= quorum,
+                ?validated_anchor,
+                ?last_valid_before,
+                "LCL_AUDIT validation observed"
+            );
             if val_count >= quorum {
                 // Keep the quorum-backed hash/sequence even if its ledger is
                 // not cached yet. `is_compatible` must reject a conflicting
                 // preferred LCL after the asynchronous acquisition completes.
                 lm.note_last_valid_ledger(hash, seq);
+                tracing::debug!(
+                    target: "lcl_audit",
+                    observed_hash = %hash,
+                    observed_seq = seq,
+                    val_count,
+                    quorum,
+                    last_valid_after = ?lm.last_valid_ledger(),
+                    "LCL_AUDIT quorum compatibility anchor recorded"
+                );
             }
-            if seq == lm.valid_ledger_seq()
-                || lm_rt
-                    .building_ledger()
-                    .is_some_and(|building| building == seq)
-            {
+            let already_validated = seq == current_valid_seq;
+            let building_same_seq = lm_rt
+                .building_ledger()
+                .is_some_and(|building| building == seq);
+            if already_validated || building_same_seq {
+                tracing::debug!(
+                    target: "lcl_audit",
+                    observed_hash = %hash,
+                    observed_seq = seq,
+                    already_validated,
+                    building_same_seq,
+                    "LCL_AUDIT validation promotion deferred"
+                );
                 return;
             }
         }
 
-        let ledger = lm
-            .ledger_history()
-            .get_cached_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(hash));
+        let ledger = self.resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(hash));
 
         let ledger = match ledger {
             Some(l) => Some(l),
@@ -5683,6 +5651,7 @@ impl ApplicationRoot {
                 // Matches rippled's `app_.getInboundLedgers().acquire(hash,
                 // seq, InboundLedger::Reason::GENERIC)`: actively fetch the
                 // ledger we don't have from peers rather than waiting.
+                let mut acquisition_dispatched = false;
                 if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                     if let Some(shared) = guard.as_ref() {
                         shared.acquire_async(
@@ -5690,8 +5659,16 @@ impl ApplicationRoot {
                             seq,
                             crate::ledger::inbound_ledgers::AcquireReason::Generic,
                         );
+                        acquisition_dispatched = true;
                     }
                 }
+                tracing::debug!(
+                    target: "lcl_audit",
+                    requested_hash = %hash,
+                    requested_seq = seq,
+                    acquisition_dispatched,
+                    "LCL_AUDIT quorum-backed validation ledger unavailable locally"
+                );
                 None
             }
         };
@@ -5702,9 +5679,13 @@ impl ApplicationRoot {
                 ledger.header().seq,
             );
             let quorum = self.validators().quorum();
-            tracing::debug!(target: "consensus",
-                seq = ledger.header().seq, val_count, quorum,
-                "check_accept_hash_seq: ledger found in history, checking quorum"
+            tracing::debug!(target: "lcl_audit",
+                candidate_hash = %ledger.header().hash,
+                candidate_seq = ledger.header().seq,
+                candidate_parent_hash = %ledger.header().parent_hash,
+                val_count,
+                quorum,
+                "LCL_AUDIT quorum-backed validation ledger resolved locally"
             );
             self.check_accept_ledger(ledger);
         }
@@ -5719,7 +5700,15 @@ impl ApplicationRoot {
         };
         let lm = lm_rt.ledger_master();
 
-        if ledger.header().seq <= lm.valid_ledger_seq() {
+        let current_valid_seq = lm.valid_ledger_seq();
+        if ledger.header().seq <= current_valid_seq {
+            tracing::debug!(
+                target: "lcl_audit",
+                candidate_hash = %ledger.header().hash,
+                candidate_seq = ledger.header().seq,
+                current_valid_seq,
+                "LCL_AUDIT validation promotion skipped for non-advancing candidate"
+            );
             return;
         }
 
@@ -5728,31 +5717,48 @@ impl ApplicationRoot {
             *ledger.header().hash.as_uint256(),
             ledger.header().seq,
         );
-        if !lm.check_accept_ledger(
+        let can_be_current = lm.can_be_current(ledger.as_ref(), self.current_close_time_seconds());
+        let accepted = lm.check_accept_ledger(
             ledger.as_ref(),
             val_count,
             quorum,
             self.current_close_time_seconds(),
-        ) {
+        );
+        if !accepted {
+            tracing::debug!(
+                target: "lcl_audit",
+                candidate_hash = %ledger.header().hash,
+                candidate_seq = ledger.header().seq,
+                current_valid_seq,
+                val_count,
+                quorum,
+                can_be_current,
+                sequence_advances = ledger.header().seq > current_valid_seq,
+                quorum_reached = val_count >= quorum,
+                "LCL_AUDIT validation promotion rejected"
+            );
             return;
         }
+        tracing::info!(
+            target: "lcl_audit",
+            candidate_hash = %ledger.header().hash,
+            candidate_seq = ledger.header().seq,
+            val_count,
+            quorum,
+            can_be_current,
+            "LCL_AUDIT validation promotion admitted"
+        );
 
         let mut l = (*ledger).clone();
         l.set_validated();
+        l.set_full();
         let validated = Arc::new(l);
-        lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
-        // `setFullLedger` in rippled indexes validated ledgers in
-        // LedgerHistory. The history scheduler needs this by-sequence entry
-        // to retrieve the parent hash for its first predecessor request.
-        lm.ledger_history().insert(Arc::clone(&validated), true);
-        lm.mark_ledger_complete(validated.header().seq);
-        self.note_validated_ledger_for_sync(Arc::clone(&validated));
 
-        // Persist transaction and ledger indexes only after trusted
-        // validations promoted this exact network ledger. Persisting the
-        // locally closed candidate from `accept_ledger_with_txns` can index a
-        // transaction in the next local round when its actual network ledger
-        // has not yet been validated.
+        // A successful quorum check is necessary but not sufficient for a
+        // visible validated transition: persistence must acknowledge the
+        // exact immutable ledger before it enters the validated/complete or
+        // application-facing slots. Otherwise a metadata failure leaves a
+        // false validated head that blocks retry and publication.
         use ledger::LedgerPersistenceRuntime;
         if !self
             .build_ledger_persistence_runtime()
@@ -5762,9 +5768,22 @@ impl ApplicationRoot {
                 target: "ledger",
                 seq = validated.header().seq,
                 hash = %validated.header().hash,
-                "failed to persist trusted validated ledger"
+                "failed to persist trusted validated ledger; visible promotion deferred"
             );
+            return;
         }
+
+        lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
+        // `setFullLedger` in rippled indexes validated ledgers in
+        // LedgerHistory. The history scheduler needs this by-sequence entry
+        // to retrieve the parent hash for its first predecessor request.
+        lm.ledger_history().insert(Arc::clone(&validated), true);
+        lm.mark_ledger_complete(validated.header().seq);
+        self.note_validated_ledger_for_sync(Arc::clone(&validated));
+
+        // Persistence completed above, before this ledger became visible as
+        // validated. The remaining work updates in-memory indexes and runtime
+        // mirrors only.
 
         // Rippled parity: after promoting a validated ledger, update the fee
         // tracker with the ledger's base fee so the fee escalation algorithm
@@ -5803,45 +5822,19 @@ impl ApplicationRoot {
             seq = validated.header().seq, val_count, quorum,
             "check_accept: validated ledger advanced (synchronous, on validation receipt)"
         );
+        tracing::info!(
+            target: "lcl_audit",
+            validated_hash = %validated.header().hash,
+            validated_seq = validated.header().seq,
+            last_valid_anchor = ?lm.last_valid_ledger(),
+            "LCL_AUDIT validation promotion committed"
+        );
 
-        // Promote as the closed ledger so the consensus state machine
-        // transitions to proposing and on_closed_ledger's steady-state
-        // sweep can bound the shared tree cache. Without this, the node
-        // validates the acquired ledger but stays at "connected" indefinitely
-        // because the closed-ledger slot never advances past genesis.
-        self.on_closed_ledger(Arc::clone(&validated));
-
-        // tryAdvance (rippled LedgerMaster.cpp:946 step 3): publish the
-        // validated ledger so that is_caught_up() returns true and the
-        // operating mode can advance to FULL. Without this, the node
-        // validates but never publishes, keeping it in TRACKING forever.
+        // `checkAccept` advances only validated/publication state. It must not
+        // install this ledger as the closed LCL, rebuild the open ledger,
+        // change operating mode, or emit a switched-ledger StatusChange;
+        // NetworkOpsStrand owns those actions after preferred-LCL selection.
         self.try_advance_publication();
-
-        self.promote_operating_mode_after_accepted_ledger(&validated);
-
-        // Broadcast our validated ledger to peers via TMStatusChange so they
-        // know we're on the same chain and continue relaying validations.
-        // Without this, after consensus_started=true the pre-consensus
-        // StatusChange broadcast stops, and our on_accept produces wrong
-        // hashes (close_time divergence) — peers see us as diverged and
-        // stop relaying validations, permanently stalling advancement.
-        if let Some(overlay_rt) = self.overlay_runtime() {
-            use overlay::Overlay;
-            let hdr = validated.header();
-            let status = overlay::ProtocolMessage::new(overlay::ProtocolPayload::StatusChange(
-                overlay::message::wire::TmStatusChange {
-                    new_status: Some(1),
-                    new_event: Some(1),
-                    ledger_seq: Some(hdr.seq),
-                    ledger_hash: Some(hdr.hash.as_uint256().data().to_vec()),
-                    ledger_hash_previous: Some(hdr.parent_hash.as_uint256().data().to_vec()),
-                    network_time: None,
-                    first_seq: Some(1),
-                    last_seq: Some(hdr.seq),
-                },
-            ));
-            overlay_rt.overlay().broadcast(&status);
-        }
 
         // Consensus advancement after validating a new ledger.
         //
@@ -5891,52 +5884,10 @@ impl ApplicationRoot {
             .note_validated_ledger(self.ledger_with_node_fetcher(ledger));
     }
 
-    /// Returns whether this local LCL agrees with the network's preferred LCL.
-    ///
-    /// This is the read-only `checkLastClosedLedger` precondition for mode
-    /// promotion. The authoritative consensus path owns switching, acquisition,
-    /// and `need_network_ledger`; a promotion preflight must not make that flag
-    /// sticky when the later compatibility check keeps the local ledger.
-    pub(crate) fn preferred_lcl_allows_mode_promotion(&self, ledger: &Ledger) -> bool {
-        let local_hash = *ledger.header().hash.as_uint256();
-        let local_parent_hash = *ledger.header().parent_hash.as_uint256();
-        let current_mode = self.network_ops_operating_mode();
-        let mut peer_counts = std::collections::BTreeMap::<Uint256, u32>::new();
-
-        // Match rippled: count our own LCL only once we are already tracking.
-        if current_mode >= NetworkOpsOperatingMode::Tracking {
-            *peer_counts.entry(local_hash).or_default() += 1;
-        }
-        if let Some(overlay_rt) = self.overlay_runtime() {
-            use overlay::Overlay;
-            for peer in overlay_rt.overlay().active_peers() {
-                let peer_hash = peer.closed_ledger_hash();
-                if !peer_hash.is_zero() {
-                    *peer_counts.entry(peer_hash).or_default() += 1;
-                }
-            }
-        }
-
-        let min_valid_seq = self
-            .ledger_master_runtime()
-            .map_or(ledger.header().seq, |runtime| {
-                runtime.ledger_master().valid_ledger_seq()
-            });
-        let preferred_hash = self.validations().preferred_lcl(
-            &RclValidatedLedger::from_ledger(ledger),
-            min_valid_seq,
-            &peer_counts,
-        );
-        let matches =
-            preferred_lcl_matches_local_or_parent(local_hash, local_parent_hash, preferred_hash);
-
-        matches
-    }
-
-    /// Promotes `NetworkOpsOperatingMode` only after the exact accepted LCL
-    /// has been published and reconciled with the network-preferred LCL. This
-    /// mirrors rippled's endConsensus ordering and prevents a fresh but
-    /// unvalidated peer-LCL fallback from reporting FULL.
+    /// Promotes `NetworkOpsOperatingMode` only after the caller's
+    /// NetworkOps-strand reconciliation has committed the accepted LCL. This
+    /// method consumes the strand-owned recovery visibility bit; it does not
+    /// independently evaluate a preferred-LCL policy.
     pub fn promote_operating_mode_after_accepted_ledger(&self, ledger: &Ledger) {
         let Some(published) = self.published_ledger() else {
             return;
@@ -5944,10 +5895,6 @@ impl ApplicationRoot {
         if published.header().hash != ledger.header().hash {
             return;
         }
-        if !self.preferred_lcl_allows_mode_promotion(ledger) {
-            return;
-        }
-
         let current_mode = self.network_ops_operating_mode();
         let need_network_ledger = self.need_network_ledger();
 
@@ -6310,18 +6257,9 @@ impl ApplicationRoot {
         // discarded child into partially committed local state.
         let _lcl_transition_guard = self.lcl_transition_gate.lock();
         let Some(expected_current) = self.closed_ledger() else {
-            // Accept cancelled — clear the build marker so
-            // check_accept_hash_seq does not suppress this sequence.
-            if let Some(lm_rt) = self.ledger_master_runtime() {
-                lm_rt.set_building_ledger(0);
-            }
             return Err("stale consensus parent: no current closed ledger".to_owned());
         };
         if expected_current.header().hash != parent_ledger.header().hash {
-            // Accept cancelled — clear the build marker.
-            if let Some(lm_rt) = self.ledger_master_runtime() {
-                lm_rt.set_building_ledger(0);
-            }
             return Err(format!(
                 "stale consensus parent: captured={} current={}",
                 parent_ledger.header().hash,

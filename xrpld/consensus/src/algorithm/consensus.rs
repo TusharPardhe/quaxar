@@ -1419,6 +1419,7 @@ mod tests {
         have_validated: bool,
         operating_mode_updates: Vec<usize>,
         has_open_transactions: bool,
+        preferred_ledger: Option<LedgerId>,
         ledgers: BTreeMap<LedgerId, MockLedger>,
         tx_sets: BTreeMap<TxSetId, MockTxSet>,
     }
@@ -1473,9 +1474,10 @@ mod tests {
             _prev_ledger: &MockLedger,
             _mode: ConsensusMode,
         ) -> LedgerId {
-            // Mock always agrees with our own view unless a test overrides
-            // via direct field mutation (not exercised in these tests).
-            *prev_ledger_id
+            self.state
+                .borrow()
+                .preferred_ledger
+                .unwrap_or(*prev_ledger_id)
         }
 
         fn on_mode_change(&self, before: ConsensusMode, after: ConsensusMode) {
@@ -1620,7 +1622,61 @@ mod tests {
             true,
         );
 
+        assert_eq!(c.phase(), ConsensusPhase::Open);
         assert_eq!(c.mode(), ConsensusMode::WrongLedger);
+        assert_eq!(*c.prev_ledger_id(), 99);
+    }
+
+    #[test]
+    fn wrong_ledger_retargets_to_available_current_preference_after_target_advances() {
+        let adaptor = MockAdaptor::new();
+        let mut c: Consensus<MockAdaptor> = Consensus::new();
+        let start = NetClockTimePoint::new(1000);
+
+        // NetworkOps starts WrongLedger recovery for target 10 while the
+        // actual local LCL remains genesis (id 0).
+        c.start_round(
+            &adaptor,
+            start,
+            10,
+            genesis_ledger(),
+            &HashSet::default(),
+            false,
+        );
+        assert_eq!(c.mode(), ConsensusMode::WrongLedger);
+        assert_eq!(*c.prev_ledger_id(), 10);
+
+        let mut old_target = genesis_ledger();
+        old_target.id = 10;
+        old_target.seq = 10;
+        let mut current_target = old_target.clone();
+        current_target.id = 11;
+        current_target.seq = 11;
+        {
+            let mut state = adaptor.state.borrow_mut();
+            // The first request completes after trusted evidence has already
+            // advanced to 11. It is cache history, not an exact-target token
+            // that can force an obsolete jump.
+            state.ledgers.insert(10, old_target);
+            state.preferred_ledger = Some(11);
+        }
+
+        c.timer_entry(&adaptor, start + time::Duration::seconds(1));
+        assert_eq!(c.mode(), ConsensusMode::WrongLedger);
+        assert_eq!(*c.prev_ledger_id(), 11);
+        assert_eq!(c.previous_ledger.id(), 0);
+
+        // When the current preferred target arrives, generic WrongLedger
+        // recovery consumes the cache hit and leaves the stale local parent.
+        adaptor
+            .state
+            .borrow_mut()
+            .ledgers
+            .insert(11, current_target);
+        c.timer_entry(&adaptor, start + time::Duration::seconds(2));
+        assert_eq!(c.mode(), ConsensusMode::SwitchedLedger);
+        assert_eq!(*c.prev_ledger_id(), 11);
+        assert_eq!(c.previous_ledger.id(), 11);
     }
 
     #[test]

@@ -10,11 +10,12 @@ use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::MonotonicClock;
 use ledger::{FetchPackCache, InboundLedgerPacket, Ledger};
 use overlay::Peer;
+use protocol::JsonValue;
 use shamap::family::{FullBelowCache, FullBelowCacheImpl};
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound::{Excluded, Unbounded};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -22,7 +23,10 @@ use std::time::{Duration, Instant};
 use crate::runtime::overlay_runtime::AppOverlayRuntime;
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 
-use super::acquisition::{AcquisitionBuilder, AcquisitionState};
+use super::acquisition::{
+    AcquisitionBuilder, AcquisitionFailureRecorder, AcquisitionPeerProvider, AcquisitionSnapshot,
+    AcquisitionState,
+};
 use super::worker_pool::WorkerPool;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -30,19 +34,132 @@ use super::worker_pool::WorkerPool;
 /// How long a failed hash stays in recent_failures (prevents retry storms).
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 
-/// Entries idle longer than this are swept.
-const SWEEP_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Entries idle longer than this are swept. rippled removes an inbound ledger
+/// once its last action is more than one minute old; its separate failure cache
+/// retains failed hashes for five minutes.
+const SWEEP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `fetch_info` must remain diagnostic-only and bounded even during a recovery
+/// flood. Operators can use the aggregate fields to see work beyond this set.
+const FETCH_INFO_MAX_ACQUISITIONS: usize = 16;
 
 fn response_sequence_matches_request(expected_seq: u32, response_seq: u32) -> bool {
     expected_seq == 0 || response_seq == 0 || expected_seq == response_seq
 }
 
-/// While joining a different network chain, peer closed-ledger advertisements
-/// move every close. Admit one hash-only consensus acquisition at a time so a
-/// changing preferred hash cannot consume the shared worker pool before any
 /// Rust worker count for the `JtLedgerData`-equivalent queue. This does not
 /// limit the number of tracked acquisitions.
 const WORKER_COUNT: usize = 64;
+
+/// Cumulative, process-lifetime counters covering every inbound-ledger
+/// lifecycle boundary. They are sampled by NetworkOPs at most once every five
+/// seconds, avoiding per-packet journal traffic during recovery pressure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AcquisitionLifecycleSnapshot {
+    pub acquisition_starts: u64,
+    pub acquisition_existing: u64,
+    pub wire_ledger_data: u64,
+    pub wire_relayed: u64,
+    pub wire_invalid_hash: u64,
+    pub wire_nodes: u64,
+    pub route_attempts: u64,
+    pub route_accepted: u64,
+    pub route_misses: u64,
+    pub route_terminal: u64,
+    pub route_sequence_mismatch: u64,
+    pub stale_packet_attempts: u64,
+    pub stale_packets_stored: u64,
+    pub initialization_jobs: u64,
+    pub request_triggers: u64,
+    pub request_messages: u64,
+    pub peers_added: u64,
+    pub data_jobs_submitted: u64,
+    pub data_jobs_coalesced: u64,
+    pub data_jobs_started: u64,
+    pub packet_steps: u64,
+    pub packet_step_errors: u64,
+    pub packet_steps_completed: u64,
+    pub timeout_jobs: u64,
+    pub timeout_no_progress: u64,
+    pub timeout_retries: u64,
+    pub timeout_queue_rejected: u64,
+    pub terminal_completed: u64,
+    pub terminal_failed: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct AcquisitionLifecycleCounters {
+    pub acquisition_starts: AtomicU64,
+    pub acquisition_existing: AtomicU64,
+    pub wire_ledger_data: AtomicU64,
+    pub wire_relayed: AtomicU64,
+    pub wire_invalid_hash: AtomicU64,
+    pub wire_nodes: AtomicU64,
+    pub route_attempts: AtomicU64,
+    pub route_accepted: AtomicU64,
+    pub route_misses: AtomicU64,
+    pub route_terminal: AtomicU64,
+    pub route_sequence_mismatch: AtomicU64,
+    pub stale_packet_attempts: AtomicU64,
+    pub stale_packets_stored: AtomicU64,
+    pub initialization_jobs: AtomicU64,
+    pub request_triggers: AtomicU64,
+    pub request_messages: AtomicU64,
+    pub peers_added: AtomicU64,
+    pub data_jobs_submitted: AtomicU64,
+    pub data_jobs_coalesced: AtomicU64,
+    pub data_jobs_started: AtomicU64,
+    pub packet_steps: AtomicU64,
+    pub packet_step_errors: AtomicU64,
+    pub packet_steps_completed: AtomicU64,
+    pub timeout_jobs: AtomicU64,
+    pub timeout_no_progress: AtomicU64,
+    pub timeout_retries: AtomicU64,
+    pub timeout_queue_rejected: AtomicU64,
+    pub terminal_completed: AtomicU64,
+    pub terminal_failed: AtomicU64,
+}
+
+impl AcquisitionLifecycleCounters {
+    fn snapshot(&self) -> AcquisitionLifecycleSnapshot {
+        macro_rules! load {
+            ($field:ident) => {
+                self.$field.load(Ordering::Relaxed)
+            };
+        }
+        AcquisitionLifecycleSnapshot {
+            acquisition_starts: load!(acquisition_starts),
+            acquisition_existing: load!(acquisition_existing),
+            wire_ledger_data: load!(wire_ledger_data),
+            wire_relayed: load!(wire_relayed),
+            wire_invalid_hash: load!(wire_invalid_hash),
+            wire_nodes: load!(wire_nodes),
+            route_attempts: load!(route_attempts),
+            route_accepted: load!(route_accepted),
+            route_misses: load!(route_misses),
+            route_terminal: load!(route_terminal),
+            route_sequence_mismatch: load!(route_sequence_mismatch),
+            stale_packet_attempts: load!(stale_packet_attempts),
+            stale_packets_stored: load!(stale_packets_stored),
+            initialization_jobs: load!(initialization_jobs),
+            request_triggers: load!(request_triggers),
+            request_messages: load!(request_messages),
+            peers_added: load!(peers_added),
+            data_jobs_submitted: load!(data_jobs_submitted),
+            data_jobs_coalesced: load!(data_jobs_coalesced),
+            data_jobs_started: load!(data_jobs_started),
+            packet_steps: load!(packet_steps),
+            packet_step_errors: load!(packet_step_errors),
+            packet_steps_completed: load!(packet_steps_completed),
+            timeout_jobs: load!(timeout_jobs),
+            timeout_no_progress: load!(timeout_no_progress),
+            timeout_retries: load!(timeout_retries),
+            timeout_queue_rejected: load!(timeout_queue_rejected),
+            terminal_completed: load!(terminal_completed),
+            terminal_failed: load!(terminal_failed),
+        }
+    }
+}
 
 // ─── Reason enum ─────────────────────────────────────────────────────────────
 
@@ -69,6 +186,10 @@ pub struct CompletedInboundLedger {
 // ─── Entry ───────────────────────────────────────────────────────────────────
 
 struct Entry {
+    id: u64,
+    /// Requested sequence constraint. Zero means the hash is the only
+    /// pre-completion identity; a completed ledger header supplies its
+    /// authoritative sequence to the strand.
     seq: u32,
     #[allow(dead_code)]
     reason: AcquireReason,
@@ -91,7 +212,303 @@ struct RegistryInner {
     poll_cursor: Option<Uint256>,
 }
 
-// ─── InboundLedgers ──────────────────────────────────────────────────────────
+fn failure_matches_entry(acquisition_id: Option<u64>, entry_id: u64) -> bool {
+    acquisition_id.is_none_or(|id| entry_id == id)
+}
+
+fn record_recent_failure_at(
+    inner: &mut RegistryInner,
+    hash: Uint256,
+    acquisition_id: Option<u64>,
+    now: Instant,
+) {
+    // A worker callback belongs to the acquisition that installed it. It must
+    // not create a hash-wide cooldown after that acquisition has been swept or
+    // replaced. Administrative hash-only callers intentionally retain the
+    // broad rippled `logFailure` behavior.
+    if let Some(acquisition_id) = acquisition_id
+        && inner
+            .entries
+            .get(&hash)
+            .is_none_or(|entry| entry.id != acquisition_id)
+    {
+        return;
+    }
+
+    inner.recent_failures.entry(hash).or_insert(now);
+    if let Some(entry) = inner.entries.get_mut(&hash)
+        && failure_matches_entry(acquisition_id, entry.id)
+        && !entry.failed
+    {
+        // `InboundLedger::done` touches the acquisition before dispatching
+        // InboundLedgers::logFailure. Touch exactly once on the first failure
+        // transition. Subsequent poll passes must not extend either this
+        // one-minute idle retention or the five-minute failure cooldown.
+        entry.failed = true;
+        entry.last_touched = now;
+    }
+}
+
+fn record_recent_failure(inner: &mut RegistryInner, hash: Uint256, acquisition_id: Option<u64>) {
+    record_recent_failure_at(inner, hash, acquisition_id, Instant::now());
+}
+
+#[derive(Clone)]
+struct RecoveryLclDecision {
+    recorded_at: Instant,
+    preferred_hash: Uint256,
+    candidate_hash: Option<Uint256>,
+    candidate_seq: Option<u32>,
+    source: String,
+    decision: String,
+}
+
+fn acquire_reason_name(reason: AcquireReason) -> &'static str {
+    match reason {
+        AcquireReason::Consensus => "consensus",
+        AcquireReason::Generic => "generic",
+        AcquireReason::History => "history",
+    }
+}
+
+fn acquisition_snapshot_json(
+    hash: Uint256,
+    requested_seq: u32,
+    reason: AcquireReason,
+    idle_ms: u64,
+    complete: bool,
+    failed: bool,
+    snapshot: AcquisitionSnapshot,
+) -> JsonValue {
+    let lookup_total = snapshot
+        .node_store_fetch_hits
+        .saturating_add(snapshot.node_store_fetch_misses);
+    let lookup_hit_rate_ppm = (lookup_total != 0).then(|| {
+        snapshot
+            .node_store_fetch_hits
+            .saturating_mul(1_000_000)
+            .saturating_div(lookup_total)
+    });
+    let average_worker_queue_wait_us = (snapshot.worker_jobs != 0).then(|| {
+        snapshot
+            .worker_queue_wait_us
+            .saturating_div(snapshot.worker_jobs)
+    });
+    let mut values = BTreeMap::from([
+        ("hash".to_owned(), JsonValue::String(hash.to_string())),
+        (
+            "requested_seq".to_owned(),
+            JsonValue::Unsigned(requested_seq as u64),
+        ),
+        ("seq".to_owned(), JsonValue::Unsigned(snapshot.seq as u64)),
+        (
+            "reason".to_owned(),
+            JsonValue::String(acquire_reason_name(reason).to_owned()),
+        ),
+        ("age_ms".to_owned(), JsonValue::Unsigned(snapshot.age_ms)),
+        ("idle_ms".to_owned(), JsonValue::Unsigned(idle_ms)),
+        ("complete".to_owned(), JsonValue::Bool(complete)),
+        ("failed".to_owned(), JsonValue::Bool(failed)),
+        (
+            "have_header".to_owned(),
+            JsonValue::Bool(snapshot.have_header),
+        ),
+        (
+            "have_state".to_owned(),
+            JsonValue::Bool(snapshot.have_state),
+        ),
+        (
+            "have_transactions".to_owned(),
+            JsonValue::Bool(snapshot.have_transactions),
+        ),
+        (
+            "timeouts".to_owned(),
+            JsonValue::Unsigned(snapshot.timeouts as u64),
+        ),
+        ("packets".to_owned(), JsonValue::Unsigned(snapshot.packets)),
+        (
+            "useful_packets".to_owned(),
+            JsonValue::Unsigned(snapshot.useful_packets),
+        ),
+        (
+            "useful_nodes".to_owned(),
+            JsonValue::Unsigned(snapshot.useful_nodes),
+        ),
+        (
+            "state_packets".to_owned(),
+            JsonValue::Unsigned(snapshot.state_packets),
+        ),
+        (
+            "state_useful_nodes".to_owned(),
+            JsonValue::Unsigned(snapshot.state_useful_nodes),
+        ),
+        (
+            "state_duplicate_nodes".to_owned(),
+            JsonValue::Unsigned(snapshot.state_duplicate_nodes),
+        ),
+        (
+            "malformed_packets".to_owned(),
+            JsonValue::Unsigned(snapshot.malformed_packets),
+        ),
+        (
+            "state_scan_runs".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_runs),
+        ),
+        (
+            "state_missing_nodes".to_owned(),
+            JsonValue::Unsigned(snapshot.state_missing_nodes),
+        ),
+        (
+            "tx_missing_nodes".to_owned(),
+            JsonValue::Unsigned(snapshot.tx_missing_nodes),
+        ),
+        (
+            "state_scan_us".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_us),
+        ),
+        (
+            "state_scan_branches_seen".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_branches_seen),
+        ),
+        (
+            "state_scan_duplicate_missing_hashes".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_duplicate_missing_hashes),
+        ),
+        (
+            "state_scan_full_below_hits".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_full_below_hits),
+        ),
+        (
+            "state_scan_loaded_or_cached_children".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_loaded_or_cached_children),
+        ),
+        (
+            "state_scan_pending_reads".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_pending_reads),
+        ),
+        (
+            "state_scan_max_pending_reads".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_max_pending_reads),
+        ),
+        (
+            "state_scan_pending_hits".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_pending_hits),
+        ),
+        (
+            "state_scan_pending_misses".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_pending_misses),
+        ),
+        (
+            "state_scan_deferred_resumes".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_deferred_resumes),
+        ),
+        (
+            "state_scan_max_buffered_packets".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_max_buffered_packets),
+        ),
+        (
+            "data_drain_runs".to_owned(),
+            JsonValue::Unsigned(snapshot.data_drain_runs),
+        ),
+        (
+            "data_drain_us".to_owned(),
+            JsonValue::Unsigned(snapshot.data_drain_us),
+        ),
+        (
+            "data_drain_max_us".to_owned(),
+            JsonValue::Unsigned(snapshot.data_drain_max_us),
+        ),
+        (
+            "data_drain_max_packets".to_owned(),
+            JsonValue::Unsigned(snapshot.data_drain_max_packets),
+        ),
+        (
+            "tx_scan_us".to_owned(),
+            JsonValue::Unsigned(snapshot.tx_scan_us),
+        ),
+        (
+            "worker_jobs".to_owned(),
+            JsonValue::Unsigned(snapshot.worker_jobs),
+        ),
+        (
+            "worker_queue_wait_us".to_owned(),
+            JsonValue::Unsigned(snapshot.worker_queue_wait_us),
+        ),
+        (
+            "node_store_lookup_hits".to_owned(),
+            JsonValue::Unsigned(snapshot.node_store_fetch_hits),
+        ),
+        (
+            "node_store_lookup_misses".to_owned(),
+            JsonValue::Unsigned(snapshot.node_store_fetch_misses),
+        ),
+        (
+            "tracked_peers".to_owned(),
+            JsonValue::Unsigned(snapshot.tracked_peers as u64),
+        ),
+        (
+            "buffered_packets".to_owned(),
+            JsonValue::Unsigned(snapshot.buffered_packets as u64),
+        ),
+        (
+            "has_active_packet".to_owned(),
+            JsonValue::Bool(snapshot.has_active_packet),
+        ),
+    ]);
+    values.insert(
+        "header_after_ms".to_owned(),
+        snapshot
+            .header_after_ms
+            .map(JsonValue::Unsigned)
+            .unwrap_or(JsonValue::Null),
+    );
+    values.insert(
+        "node_store_lookup_hit_rate_ppm".to_owned(),
+        lookup_hit_rate_ppm
+            .map(JsonValue::Unsigned)
+            .unwrap_or(JsonValue::Null),
+    );
+    values.insert(
+        "average_worker_queue_wait_us".to_owned(),
+        average_worker_queue_wait_us
+            .map(JsonValue::Unsigned)
+            .unwrap_or(JsonValue::Null),
+    );
+    JsonValue::Object(values)
+}
+
+fn recovery_lcl_decision_json(decision: Option<RecoveryLclDecision>) -> JsonValue {
+    let Some(decision) = decision else {
+        return JsonValue::Null;
+    };
+    let mut value = BTreeMap::from([
+        (
+            "age_ms".to_owned(),
+            JsonValue::Unsigned(decision.recorded_at.elapsed().as_millis() as u64),
+        ),
+        (
+            "preferred_hash".to_owned(),
+            JsonValue::String(decision.preferred_hash.to_string()),
+        ),
+        ("source".to_owned(), JsonValue::String(decision.source)),
+        ("decision".to_owned(), JsonValue::String(decision.decision)),
+    ]);
+    value.insert(
+        "candidate_hash".to_owned(),
+        decision
+            .candidate_hash
+            .map(|hash| JsonValue::String(hash.to_string()))
+            .unwrap_or(JsonValue::Null),
+    );
+    value.insert(
+        "candidate_seq".to_owned(),
+        decision
+            .candidate_seq
+            .map(|seq| JsonValue::Unsigned(seq as u64))
+            .unwrap_or(JsonValue::Null),
+    );
+    JsonValue::Object(value)
+}
 
 /// Thread-safe global service for inbound ledger acquisition.
 ///
@@ -110,6 +527,13 @@ pub struct InboundLedgers {
     stopping: AtomicBool,
     need_network_ledger: Arc<AtomicBool>,
     pending_acquires: Arc<Mutex<HashSet<Uint256>>>,
+    next_acquisition_id: AtomicU64,
+    /// Last preferred-LCL selection outcome, retained solely for bounded
+    /// operator diagnostics.
+    recovery_lcl_decision: Mutex<Option<RecoveryLclDecision>>,
+    /// Shared lifecycle counters incremented at request, wire, worker, retry,
+    /// and terminal boundaries. The sampled snapshot never mutates state.
+    lifecycle: Arc<AcquisitionLifecycleCounters>,
 }
 
 impl InboundLedgers {
@@ -121,13 +545,34 @@ impl InboundLedgers {
         completed_ledgers_tx: SyncSender<CompletedInboundLedger>,
         need_network_ledger: Arc<AtomicBool>,
     ) -> Self {
+        Self::with_worker_pool(
+            tree_cache,
+            full_below,
+            fetch_pack,
+            completed_ledgers_tx,
+            need_network_ledger,
+            Arc::new(WorkerPool::new(WORKER_COUNT)),
+        )
+    }
+
+    /// Construct the registry around its worker queue. Production always uses
+    /// the fixed-size pool above; tests provide a zero-worker pool so they can
+    /// prove real ingress scheduling and draining without timing races.
+    fn with_worker_pool(
+        tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
+        full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
+        fetch_pack: Arc<FetchPackCache>,
+        completed_ledgers_tx: SyncSender<CompletedInboundLedger>,
+        need_network_ledger: Arc<AtomicBool>,
+        worker_pool: Arc<WorkerPool>,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
                 entries: BTreeMap::new(),
                 recent_failures: HashMap::new(),
                 poll_cursor: None,
             })),
-            worker_pool: Arc::new(WorkerPool::new(WORKER_COUNT)),
+            worker_pool,
             node_store: Arc::new(RwLock::new(None)),
             tree_cache,
             full_below,
@@ -137,6 +582,9 @@ impl InboundLedgers {
             stopping: AtomicBool::new(false),
             need_network_ledger,
             pending_acquires: Arc::new(Mutex::new(HashSet::new())),
+            next_acquisition_id: AtomicU64::new(1),
+            recovery_lcl_decision: Mutex::new(None),
+            lifecycle: Arc::new(AcquisitionLifecycleCounters::default()),
         }
     }
 
@@ -157,6 +605,48 @@ impl InboundLedgers {
     pub fn set_node_store(&self, ns: SHAMapStoreNodeStore) {
         let mut guard = self.node_store.write().expect("node_store write");
         *guard = Some(ns);
+    }
+
+    /// Return a read-only, cumulative trace of inbound ledger work across all
+    /// active and completed acquisitions. This is intentionally aggregate and
+    /// is emitted only through sampled diagnostics or explicit fetch_info.
+    pub(crate) fn lifecycle_snapshot(&self) -> AcquisitionLifecycleSnapshot {
+        self.lifecycle.snapshot()
+    }
+
+    /// Record a parsed wire-level ledger-data packet before registry routing.
+    pub fn note_wire_ledger_data(&self, node_count: usize) {
+        self.lifecycle
+            .wire_ledger_data
+            .fetch_add(1, Ordering::Relaxed);
+        self.lifecycle
+            .wire_nodes
+            .fetch_add(node_count as u64, Ordering::Relaxed);
+    }
+
+    /// Record a ledger-data relay that is intentionally not processed locally.
+    pub fn note_wire_ledger_data_relayed(&self) {
+        self.lifecycle.wire_relayed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a malformed ledger-data message whose hash could not be parsed.
+    pub fn note_wire_ledger_data_invalid_hash(&self) {
+        self.lifecycle
+            .wire_invalid_hash
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record whether an unroutable state packet was saved for later fetch-pack
+    /// use. The call does not change routing or peer charging behavior.
+    pub fn note_stale_packet_result(&self, stored: bool) {
+        self.lifecycle
+            .stale_packet_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        if stored {
+            self.lifecycle
+                .stale_packets_stored
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     // ─── Core API ────────────────────────────────────────────────────────
@@ -197,23 +687,45 @@ impl InboundLedgers {
             .recent_failures
             .retain(|_, t| t.elapsed() < FAILURE_COOLDOWN);
 
-        // Existing acquisition: update an unknown sequence, retain it for the
-        // sweep window, and return the ledger once it is complete.
+        // Existing acquisition: a failed one returns immediately, exactly as
+        // rippled checks `InboundLedger::isFailed()` before `update()`. Do
+        // not touch it or refresh recent_failures: its first failure owns the
+        // one-minute sweep age and five-minute cooldown. A live acquisition
+        // can update an unknown sequence and is retained for the sweep window.
         if let Some(entry) = inner.entries.get_mut(&hash) {
-            entry.last_touched = Instant::now();
-            if entry.seq == 0 && seq != 0 {
-                entry.seq = seq;
-                entry.state.update_seq(seq);
-            }
+            self.lifecycle
+                .acquisition_existing
+                .fetch_add(1, Ordering::Relaxed);
             if entry.failed || entry.state.failed.load(Ordering::Acquire) {
-                inner.recent_failures.insert(hash, Instant::now());
                 return None;
             }
-            if entry.state.completed.load(Ordering::Acquire) {
-                return entry.state.completed_ledger();
+            entry.last_touched = Instant::now();
+            let update_seq = (entry.seq == 0 && seq != 0).then_some(seq);
+            if let Some(update_seq) = update_seq {
+                entry.seq = update_seq;
             }
-            return entry.completed_ledger.clone();
+            let is_completed = entry.state.completed.load(Ordering::Acquire);
+            let completed_ledger = entry.completed_ledger.clone();
+            let state = Arc::clone(&entry.state);
+
+            // Do not call into AcquisitionState while holding the registry
+            // mutex: worker failure reporting can arrive from acquisition
+            // state and then lock this registry.
+            drop(inner);
+            if let Some(update_seq) = update_seq {
+                state.update_seq(update_seq);
+            }
+            return if is_completed {
+                completed_ledger.or_else(|| state.completed_ledger())
+            } else {
+                completed_ledger
+            };
         }
+
+        // Match rippled InboundLedgers::acquire: retain one acquisition per
+        // hash and let the normal per-hash lifecycle, failure cooldown, and
+        // idle sweep bound work. Do not globally serialize hash-only
+        // consensus requests while the preferred LCL advances.
 
         // Validate required resources
         let ns = {
@@ -226,15 +738,29 @@ impl InboundLedgers {
                 }
             }
         };
-        // Get initial peers from overlay
-        let initial_peers: Vec<Arc<dyn Peer>> = {
-            let guard = self.overlay_rt.read().expect("overlay_rt read");
-            if let Some(overlay_rt) = guard.as_ref() {
+        // The reference PeerSet consults the live overlay on each addPeers
+        // turn. Keep a cheap provider in the acquisition rather than freezing
+        // a construction-time snapshot of peer sessions.
+        let peer_provider: AcquisitionPeerProvider = {
+            let overlay_rt = Arc::clone(&self.overlay_rt);
+            Arc::new(move || {
                 use overlay::Overlay as _;
-                overlay_rt.overlay().active_peers()
-            } else {
-                Vec::new()
-            }
+                overlay_rt
+                    .read()
+                    .expect("inbound overlay_rt read")
+                    .as_ref()
+                    .map(|runtime| runtime.overlay().active_peers())
+                    .unwrap_or_default()
+            })
+        };
+        let initial_peers = peer_provider();
+        let acquisition_id = self.next_acquisition_id.fetch_add(1, Ordering::Relaxed);
+        let failure_recorder: AcquisitionFailureRecorder = {
+            let inner = Arc::clone(&self.inner);
+            Arc::new(move |failed_hash| {
+                let mut inner = inner.lock().expect("inbound_ledgers failure recorder lock");
+                record_recent_failure(&mut inner, failed_hash, Some(acquisition_id));
+            })
         };
 
         let full_below_gen = self.full_below.generation().wrapping_add(1);
@@ -247,9 +773,12 @@ impl InboundLedgers {
             tree_cache: Arc::clone(&self.tree_cache),
             fetch_pack: Arc::clone(&self.fetch_pack),
             store_tx: self.completed_ledgers_tx.clone(),
+            failure_recorder,
             full_below_generation: full_below_gen,
             worker_pool: Arc::clone(&self.worker_pool),
             initial_peers,
+            peer_provider,
+            lifecycle: Arc::clone(&self.lifecycle),
         }
         .build();
 
@@ -257,6 +786,7 @@ impl InboundLedgers {
         inner.entries.insert(
             hash,
             Entry {
+                id: acquisition_id,
                 seq,
                 reason,
                 state: Arc::clone(&acq_state),
@@ -269,6 +799,9 @@ impl InboundLedgers {
         drop(inner);
 
         tracing::info!(target: "inbound_ledger", seq, %hash, "Acquisition started");
+        self.lifecycle
+            .acquisition_starts
+            .fetch_add(1, Ordering::Relaxed);
         acq_state.start();
         None
     }
@@ -317,15 +850,32 @@ impl InboundLedgers {
         response_seq: Option<u32>,
         packet: InboundLedgerPacket,
     ) -> bool {
+        self.lifecycle
+            .route_attempts
+            .fetch_add(1, Ordering::Relaxed);
         let state = {
             let mut inner = self.inner.lock().expect("inbound_ledgers lock");
             let Some(entry) = inner.entries.get_mut(hash) else {
+                self.lifecycle.route_misses.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: registry miss");
                 return false;
             };
+            if entry.failed
+                || entry.state.failed.load(Ordering::Acquire)
+                || entry.state.stopped.load(Ordering::Acquire)
+            {
+                self.lifecycle
+                    .route_terminal
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: ignored terminal acquisition");
+                return false;
+            }
             if let Some(response_seq) = response_seq
                 && !response_sequence_matches_request(entry.seq, response_seq)
             {
+                self.lifecycle
+                    .route_sequence_mismatch
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     target: "inbound_ledger",
                     %hash,
@@ -351,35 +901,181 @@ impl InboundLedgers {
             buf.push((peer_id, packet));
         }
         state.submit_data_job();
+        self.lifecycle
+            .route_accepted
+            .fetch_add(1, Ordering::Relaxed);
         tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: registry hit");
         true
     }
 
-    /// Remove entries idle for more than 5 minutes, matching
-    /// `InboundLedgersImp::sweep` (5-minute idle timeout).
+    /// Remove entries idle for more than one minute, matching
+    /// `InboundLedgersImp::sweep`. Failed hashes separately remain in the
+    /// five-minute recent-failure cache.
     pub fn sweep(&self) {
         let now = Instant::now();
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
         let mut to_remove = Vec::new();
 
         for (hash, entry) in &inner.entries {
-            let failed = entry.failed || entry.state.failed.load(Ordering::Acquire);
-            if failed || now.duration_since(entry.last_touched) > SWEEP_IDLE_TIMEOUT {
-                to_remove.push((*hash, failed));
+            if now.duration_since(entry.last_touched) > SWEEP_IDLE_TIMEOUT {
+                to_remove.push(*hash);
             }
         }
 
-        for (hash, failed) in to_remove {
+        for hash in to_remove {
             if let Some(entry) = inner.entries.remove(&hash) {
                 entry.state.stopped.store(true, Ordering::Release);
-            }
-            if failed && !inner.recent_failures.contains_key(&hash) {
-                inner.recent_failures.insert(hash, now);
             }
         }
         inner
             .recent_failures
             .retain(|_, when| when.elapsed() < FAILURE_COOLDOWN);
+    }
+
+    /// Record a preferred-LCL request, selection, installation, or rejection
+    /// without mutating acquisition or consensus state. `fetch_info` exposes
+    /// only this most recent decision so normal recovery does not allocate an
+    /// unbounded event history.
+    pub fn record_recovery_lcl_decision(
+        &self,
+        preferred_hash: Uint256,
+        candidate: Option<&Ledger>,
+        source: &str,
+        decision: &str,
+    ) {
+        let (candidate_hash, candidate_seq) = candidate
+            .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq))
+            .unzip();
+        *self
+            .recovery_lcl_decision
+            .lock()
+            .expect("recovery_lcl_decision lock") = Some(RecoveryLclDecision {
+            recorded_at: Instant::now(),
+            preferred_hash,
+            candidate_hash,
+            candidate_seq,
+            source: source.to_owned(),
+            decision: decision.to_owned(),
+        });
+    }
+
+    /// Return a bounded, read-only acquisition snapshot for `fetch_info`.
+    /// It does not execute a SHAMap walk, read NodeStore, add peers, or alter
+    /// selection state.
+    pub fn fetch_info_bounded(&self, limit: usize) -> JsonValue {
+        let limit = limit.min(FETCH_INFO_MAX_ACQUISITIONS);
+        let (entries, active, completed, failed, recent_failures, decision) = {
+            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            let mut active = 0u64;
+            let mut completed = 0u64;
+            let mut failed = 0u64;
+            for entry in inner.entries.values() {
+                if entry.failed || entry.state.failed.load(Ordering::Acquire) {
+                    failed += 1;
+                } else if entry.completed_ledger.is_some()
+                    || entry.state.completed.load(Ordering::Acquire)
+                {
+                    completed += 1;
+                } else {
+                    active += 1;
+                }
+            }
+            let entries = inner
+                .entries
+                .iter()
+                .take(limit)
+                .map(|(hash, entry)| {
+                    (
+                        *hash,
+                        entry.seq,
+                        entry.reason,
+                        entry.last_touched.elapsed().as_millis() as u64,
+                        entry.completed_ledger.is_some()
+                            || entry.state.completed.load(Ordering::Acquire),
+                        entry.failed || entry.state.failed.load(Ordering::Acquire),
+                        Arc::clone(&entry.state),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (
+                entries,
+                active,
+                completed,
+                failed,
+                inner.recent_failures.len() as u64,
+                self.recovery_lcl_decision
+                    .lock()
+                    .expect("recovery_lcl_decision lock")
+                    .clone(),
+            )
+        };
+
+        let acquisitions = entries
+            .into_iter()
+            .map(
+                |(hash, requested_seq, reason, idle_ms, complete, failed, state)| {
+                    acquisition_snapshot_json(
+                        hash,
+                        requested_seq,
+                        reason,
+                        idle_ms,
+                        complete,
+                        failed,
+                        state.diagnostics(),
+                    )
+                },
+            )
+            .collect();
+        let worker = self.worker_pool.snapshot();
+        let lifecycle = self.lifecycle_snapshot();
+        let mut result = BTreeMap::from([
+            ("active".to_owned(), JsonValue::Unsigned(active)),
+            ("completed".to_owned(), JsonValue::Unsigned(completed)),
+            ("failed".to_owned(), JsonValue::Unsigned(failed)),
+            (
+                "recent_failures".to_owned(),
+                JsonValue::Unsigned(recent_failures),
+            ),
+            ("acquisitions".to_owned(), JsonValue::Array(acquisitions)),
+            (
+                "worker_pool".to_owned(),
+                JsonValue::Object(BTreeMap::from([
+                    (
+                        "queued_jobs".to_owned(),
+                        JsonValue::Unsigned(worker.queued_jobs as u64),
+                    ),
+                    (
+                        "outstanding_ledger_data_jobs".to_owned(),
+                        JsonValue::Unsigned(worker.outstanding_ledger_data_jobs as u64),
+                    ),
+                    (
+                        "worker_count".to_owned(),
+                        JsonValue::Unsigned(worker.worker_count as u64),
+                    ),
+                    (
+                        "ledger_data_job_limit".to_owned(),
+                        JsonValue::Unsigned(worker.ledger_data_job_limit as u64),
+                    ),
+                    (
+                        "timeout_submission_attempts".to_owned(),
+                        JsonValue::Unsigned(worker.timeout_submission_attempts),
+                    ),
+                    (
+                        "timeout_submission_rejected".to_owned(),
+                        JsonValue::Unsigned(worker.timeout_submission_rejected),
+                    ),
+                ])),
+            ),
+        ]);
+        result.insert(
+            "lifecycle".to_owned(),
+            JsonValue::String(format!("{lifecycle:?}")),
+        );
+        result.insert(
+            "last_recovery_lcl_decision".to_owned(),
+            recovery_lcl_decision_json(decision),
+        );
+        JsonValue::Object(result)
     }
 
     /// Check if tracking a hash.
@@ -410,9 +1106,8 @@ impl InboundLedgers {
     /// Notify that a ledger acquisition failed.
     pub fn on_failed(&self, hash: Uint256) {
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        inner.recent_failures.insert(hash, Instant::now());
-        if let Some(entry) = inner.entries.get_mut(&hash) {
-            entry.failed = true;
+        record_recent_failure(&mut inner, hash, None);
+        if let Some(entry) = inner.entries.get(&hash) {
             entry.state.stopped.store(true, Ordering::Release);
         }
     }
@@ -420,7 +1115,7 @@ impl InboundLedgers {
     /// Log a failure for the given hash/seq (matches rippled's `logFailure`).
     pub fn log_failure(&self, hash: Uint256, _seq: u32) {
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        inner.recent_failures.insert(hash, Instant::now());
+        record_recent_failure(&mut inner, hash, None);
     }
 
     /// Check whether a hash is recorded as a recent failure (matches rippled's
@@ -439,8 +1134,15 @@ impl InboundLedgers {
     /// Clear both `recent_failures` and `ledgers_` (matches rippled's
     /// `clearFailures`).
     pub fn clear_failures(&self) {
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        inner.recent_failures.clear();
+        let entries = {
+            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            inner.recent_failures.clear();
+            inner.poll_cursor = None;
+            std::mem::take(&mut inner.entries)
+        };
+        for entry in entries.into_values() {
+            entry.state.stopped.store(true, Ordering::Release);
+        }
     }
 
     /// Send current peers to all active acquisition workers.
@@ -545,13 +1247,17 @@ impl InboundLedgers {
     }
 
     /// Poll at most `budget` acquisition entries. Entries beyond the budget
-    /// remain in the registry for a later turn; no completed result is lost.
+    /// remain in the registry for a later turn; completed entries remain until
+    /// the consumer calls `acknowledge_completed` after its cache/persistence
+    /// work succeeds. This makes completion a two-phase handoff instead of
+    /// treating an in-memory result as a durable ledger transition.
     pub fn poll_results_bounded(&self, budget: usize) -> Vec<(Uint256, Ledger, AcquireReason)> {
         // Snapshot under the registry mutex, then inspect each acquisition
         // after releasing it. Completion can race with a long map walk, so
         // never hold the registry lock while taking `state.mutable`.
         let entries: Vec<(
             Uint256,
+            u64,
             Arc<AcquisitionState>,
             Option<Arc<Ledger>>,
             bool,
@@ -563,6 +1269,7 @@ impl InboundLedgers {
                 let mut record = |hash: &Uint256, entry: &Entry| {
                     entries.push((
                         *hash,
+                        entry.id,
                         Arc::clone(&entry.state),
                         entry.completed_ledger.clone(),
                         entry.failed,
@@ -586,47 +1293,53 @@ impl InboundLedgers {
                         }
                     }
                 }
-                inner.poll_cursor = entries.last().map(|(hash, _, _, _, _)| *hash);
+                inner.poll_cursor = entries.last().map(|(hash, _, _, _, _, _)| *hash);
             }
             entries
         };
 
         let mut completed = Vec::new();
-        let mut failed_hashes = Vec::new();
-        let mut done_hashes = Vec::new();
-        for (hash, state, externally_completed, failed, reason) in entries {
-            if failed {
+        let mut failed_entries = Vec::new();
+        for (hash, acquisition_id, state, externally_completed, failed, reason) in entries {
+            if failed || state.failed.load(Ordering::Acquire) {
+                failed_entries.push((hash, acquisition_id));
                 continue;
             }
             if let Some(ledger) = externally_completed {
                 completed.push((hash, (*ledger).clone(), reason));
-                done_hashes.push(hash);
             } else if state.completed.load(Ordering::Acquire) {
                 if let Some(ledger) = state.completed_ledger() {
                     completed.push((hash, (*ledger).clone(), reason));
-                    done_hashes.push(hash);
                 } else {
-                    failed_hashes.push(hash);
+                    failed_entries.push((hash, acquisition_id));
                 }
-            } else if state.stopped.load(Ordering::Acquire) {
-                failed_hashes.push(hash);
             }
         }
 
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        for hash in &done_hashes {
-            if let Some(entry) = inner.entries.remove(hash) {
-                entry.state.stopped.store(true, Ordering::Release);
-            }
-        }
-        for hash in &failed_hashes {
-            inner.recent_failures.insert(*hash, Instant::now());
-            if let Some(entry) = inner.entries.remove(hash) {
-                entry.state.stopped.store(true, Ordering::Release);
-            }
+        for (hash, acquisition_id) in &failed_entries {
+            // Do not remove a failed entry here. Rippled leaves it until its
+            // one-minute idle sweep; recent_failures separately blocks retry.
+            record_recent_failure(&mut inner, *hash, Some(*acquisition_id));
         }
 
         completed
+    }
+
+    /// Acknowledge that a consumer has durably handled this completed result.
+    /// A failed persistence attempt must not call this: the completed state is
+    /// retained so the owner can retry on a later bounded poll.
+    pub fn acknowledge_completed(&self, hash: &Uint256) {
+        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+        let completed = inner.entries.get(hash).is_some_and(|entry| {
+            !entry.failed
+                && !entry.state.failed.load(Ordering::Acquire)
+                && (entry.completed_ledger.is_some()
+                    || entry.state.completed.load(Ordering::Acquire))
+        });
+        if completed && let Some(entry) = inner.entries.remove(hash) {
+            entry.state.stopped.store(true, Ordering::Release);
+        }
     }
 
     /// Check if a specific hash is currently in-progress (not completed, not failed).
@@ -713,8 +1426,8 @@ impl InboundLedgers {
     }
 
     /// Check whether an in-progress acquisition has the given sequence or hash.
-    /// Completed entries remain in the registry until its sweep but are already
-    /// represented in LedgerHistory, so they must not block the next history
+    /// Completed entries remain until their consumer acknowledges successful
+    /// cache/persistence handling, so they must not block the next history
     /// predecessor request.
     pub fn has_entry_for_seq_or_hash(&self, seq: u32, hash: &Uint256) -> bool {
         let inner = self.inner.lock().expect("inbound_ledgers lock");
@@ -757,46 +1470,49 @@ impl InboundLedgers {
         &self,
         target_seq: u32,
     ) -> Option<basics::sha_map_hash::SHAMapHash> {
-        let inner = self.inner.lock().expect("inbound_ledgers lock");
-        // Find completed entries with seq >= target_seq
+        // Snapshot candidates before consulting the acquisition's mutable
+        // state. Workers can report failure while holding acquisition state,
+        // so taking `inner` and then `state.mutable` would invert the
+        // registry's worker callback lock order. The requested sequence may
+        // be zero for preferred-LCL recovery; rank by the actual completed
+        // ledger header rather than the original request sequence.
+        let candidates: Vec<_> = {
+            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            inner
+                .entries
+                .values()
+                .filter(|entry| {
+                    !entry.failed
+                        && !entry.state.failed.load(Ordering::Acquire)
+                        && (entry.completed_ledger.is_some()
+                            || entry.state.completed.load(Ordering::Acquire))
+                })
+                .map(|entry| (entry.completed_ledger.clone(), Arc::clone(&entry.state)))
+                .collect()
+        };
+
         let mut best: Option<(u32, basics::sha_map_hash::SHAMapHash)> = None;
-        for entry in inner.entries.values() {
-            if entry.failed {
-                continue;
-            }
-            let is_complete =
-                entry.completed_ledger.is_some() || entry.state.completed.load(Ordering::Acquire);
-            if !is_complete || entry.seq < target_seq {
-                continue;
-            }
-            // Try to get hash from the entry's ledger
-            if let Some(ledger) = &entry.completed_ledger {
+        for (completed_ledger, state) in candidates {
+            let mut consider = |ledger: &ledger::Ledger| {
+                let ledger_seq = ledger.header().seq;
+                if ledger_seq < target_seq {
+                    return;
+                }
                 if let Some(hash) = ledger
                     .hash_of_seq(target_seq, &ledger::NullLedgerJournal)
-                    .filter(|h| !h.is_zero())
+                    .filter(|hash| !hash.is_zero())
+                    && best.is_none_or(|(best_seq, _)| ledger_seq < best_seq)
                 {
-                    if best.is_none() || entry.seq < best.unwrap().0 {
-                        best = Some((entry.seq, hash));
-                    }
+                    best = Some((ledger_seq, hash));
                 }
+            };
+
+            if let Some(ledger) = completed_ledger {
+                consider(&ledger);
             } else {
-                // Try from mutable state
-                let mutable = entry
-                    .state
-                    .mutable
-                    .lock()
-                    .expect("acq mutable (hash lookup)");
+                let mutable = state.mutable.lock().expect("acq mutable (hash lookup)");
                 if let Some(ledger) = mutable.inbound.ledger() {
-                    if ledger.header().seq >= target_seq {
-                        if let Some(hash) = ledger
-                            .hash_of_seq(target_seq, &ledger::NullLedgerJournal)
-                            .filter(|h| !h.is_zero())
-                        {
-                            if best.is_none() || entry.seq < best.unwrap().0 {
-                                best = Some((entry.seq, hash));
-                            }
-                        }
-                    }
+                    consider(ledger);
                 }
             }
         }
@@ -809,48 +1525,57 @@ impl InboundLedgers {
         &self,
         target_seq: u32,
     ) -> Option<(u32, basics::sha_map_hash::SHAMapHash)> {
-        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        // Use candidate_ledger_for_seq logic inline: round up to next 256 boundary.
+        let candidate_seq = target_seq.saturating_add(255) & !255;
+        if candidate_seq <= target_seq {
+            return None;
+        }
+
+        // As above, snapshot under the registry mutex and inspect acquisition
+        // mutable state only after releasing it. Rank by an acquisition's
+        // learned ledger header so completed hash-only recovery candidates
+        // participate even though their initial request sequence was zero.
+        let candidates: Vec<_> = {
+            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            inner
+                .entries
+                .values()
+                .filter(|entry| {
+                    !entry.failed
+                        && !entry.state.failed.load(Ordering::Acquire)
+                        && (entry.completed_ledger.is_some()
+                            || entry.state.completed.load(Ordering::Acquire))
+                })
+                .map(|entry| (entry.completed_ledger.clone(), Arc::clone(&entry.state)))
+                .collect()
+        };
+
         let mut best: Option<(u32, basics::sha_map_hash::SHAMapHash)> = None;
-        for entry in inner.entries.values() {
-            if entry.failed {
-                continue;
-            }
-            let is_complete =
-                entry.completed_ledger.is_some() || entry.state.completed.load(Ordering::Acquire);
-            if !is_complete || entry.seq < target_seq {
-                continue;
-            }
-            // Use candidate_ledger_for_seq logic inline: round up to next 256 boundary
-            let candidate_seq = target_seq.saturating_add(255) & !255;
-            if candidate_seq <= target_seq {
-                continue;
-            }
-            if let Some(ledger) = &entry.completed_ledger {
+        for (completed_ledger, state) in candidates {
+            let mut consider = |ledger: &ledger::Ledger| {
+                let ledger_seq = ledger.header().seq;
+                if ledger_seq < target_seq {
+                    return;
+                }
                 if let Some(hash) = ledger
                     .hash_of_seq(candidate_seq, &ledger::NullLedgerJournal)
-                    .filter(|h| !h.is_zero())
+                    .filter(|hash| !hash.is_zero())
+                    && best.is_none_or(|(best_seq, _)| ledger_seq < best_seq)
                 {
-                    if best.is_none() || entry.seq < best.unwrap().0 {
-                        best = Some((candidate_seq, hash));
-                    }
+                    best = Some((ledger_seq, hash));
                 }
+            };
+
+            if let Some(ledger) = completed_ledger {
+                consider(&ledger);
             } else {
-                let mutable = entry.state.mutable.lock().expect("acq mutable (candidate)");
+                let mutable = state.mutable.lock().expect("acq mutable (candidate)");
                 if let Some(ledger) = mutable.inbound.ledger() {
-                    if ledger.header().seq >= target_seq {
-                        if let Some(hash) = ledger
-                            .hash_of_seq(candidate_seq, &ledger::NullLedgerJournal)
-                            .filter(|h| !h.is_zero())
-                        {
-                            if best.is_none() || entry.seq < best.unwrap().0 {
-                                best = Some((candidate_seq, hash));
-                            }
-                        }
-                    }
+                    consider(ledger);
                 }
             }
         }
-        best
+        best.map(|(_, hash)| (candidate_seq, hash))
     }
 }
 
@@ -862,7 +1587,198 @@ impl std::fmt::Debug for InboundLedgers {
 
 #[cfg(test)]
 mod tests {
-    use super::{AcquireReason, response_sequence_matches_request};
+    use super::super::acquisition::AcquisitionSnapshot;
+    use super::super::worker_pool::WorkerPool;
+    use super::{
+        AcquireReason, AcquisitionLifecycleCounters, AcquisitionLifecycleSnapshot, InboundLedgers,
+        RecoveryLclDecision, RegistryInner, SWEEP_IDLE_TIMEOUT, acquisition_snapshot_json,
+        failure_matches_entry, record_recent_failure, record_recent_failure_at,
+        recovery_lcl_decision_json, response_sequence_matches_request,
+    };
+    use basics::base_uint::Uint256;
+    use basics::basic_config::BasicConfig;
+    use basics::hardened_hash::HardenedHashBuilder;
+    use basics::tagged_cache::MonotonicClock;
+    use ledger::{FetchPackCache, InboundLedgerDataType, InboundLedgerPacket};
+    use nodestore::{DummyScheduler, ManagerImp, NullJournal, Scheduler};
+    use overlay::{Peer, PeerImp, PeerSet as _};
+    use protocol::{JsonValue, PublicKey};
+    use shamap::family::FullBelowCacheImpl;
+    use shamap::tree_node_cache::TreeNodeCache;
+    use std::collections::{BTreeMap, HashMap};
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    /// Build the same real in-memory node store used by the acquisition
+    /// integration fixtures. `acquire` performs a local-store check before
+    /// processing ingress, so a genuine store keeps this route test on the
+    /// production path.
+    fn test_node_store() -> (TempDir, crate::SHAMapStoreNodeStore) {
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = BasicConfig::new();
+        config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
+        let node_db = config.section_mut("node_db");
+        node_db.set("type", "Memory");
+        node_db.set("path", dir.path().join("node").to_string_lossy());
+
+        let bootstrap = crate::bootstrap_shamap_store(
+            &config,
+            false,
+            128,
+            1,
+            8,
+            64,
+            2,
+            &ManagerImp::new(),
+            Arc::new(DummyScheduler) as Arc<dyn Scheduler>,
+            Arc::new(NullJournal),
+        )
+        .expect("bootstrap");
+        (dir, bootstrap.node_store)
+    }
+
+    fn registry_with_manual_worker_pool(worker_pool: Arc<WorkerPool>) -> (TempDir, InboundLedgers) {
+        let (dir, node_store) = test_node_store();
+        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+        let registry = InboundLedgers::with_worker_pool(
+            Arc::new(TreeNodeCache::new(
+                "registry-ingress-test",
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            Arc::new(FullBelowCacheImpl::new(
+                1,
+                MonotonicClock::default(),
+                HardenedHashBuilder::default(),
+                8,
+            )),
+            Arc::new(FetchPackCache::new(
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            completed_tx,
+            Arc::new(AtomicBool::new(false)),
+            worker_pool,
+        );
+        registry.set_node_store(node_store);
+        (dir, registry)
+    }
+
+    #[test]
+    fn registry_ingress_coalesces_and_charges_selected_peer_malformed_packets() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(Arc::clone(&worker_pool));
+        let hash = Uint256::from_array([0xC7; 32]);
+        let peer = PeerImp::new(
+            77,
+            SocketAddr::from(([127, 0, 0, 1], 51235)),
+            PublicKey::from_bytes([0x03; 33]),
+            "registry-ingress-parity-peer",
+        );
+        peer.record_ledger(hash, 1);
+
+        assert!(
+            registry.acquire(hash, 1, AcquireReason::Generic).is_none(),
+            "production registry creates the active acquisition"
+        );
+        let state = {
+            let inner = registry.inner.lock().expect("registry lock");
+            Arc::clone(
+                &inner
+                    .entries
+                    .get(&hash)
+                    .expect("active acquisition entry")
+                    .state,
+            )
+        };
+        let queued_before_ingress = worker_pool.snapshot().queued_jobs;
+        assert_eq!(
+            queued_before_ingress, 1,
+            "acquire queues its real initialization job"
+        );
+
+        let malformed = || InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new());
+        assert!(registry.route_response_with_seq(&hash, 77, Some(1), malformed()));
+        assert!(registry.route_response_with_seq(&hash, 77, Some(1), malformed()));
+        assert_eq!(
+            worker_pool.snapshot().queued_jobs,
+            queued_before_ingress + 1,
+            "two production registry routes queue one coalesced packet worker"
+        );
+        let routed = registry.lifecycle_snapshot();
+        assert_eq!(routed.route_attempts, 2);
+        assert_eq!(routed.route_accepted, 2);
+        assert_eq!(routed.data_jobs_submitted, 1);
+        assert_eq!(routed.data_jobs_coalesced, 1);
+
+        // Initialization refreshes from the absent overlay runtime. Install the
+        // selected live peer after that production setup turn, before the one
+        // queued data drain runs.
+        assert!(worker_pool.run_next_job_for_test());
+        state
+            .peer_set
+            .refresh_peers(vec![Arc::clone(&peer) as Arc<dyn Peer>]);
+        state.peer_set.add_peers(1, &mut |_| true, &mut |_| {});
+        assert!(worker_pool.run_next_job_for_test());
+
+        let charges = peer.charges();
+        assert_eq!(
+            charges.len(),
+            2,
+            "one worker drain processes both routed packets"
+        );
+        for (fee, context) in charges {
+            assert_eq!(fee, (*resource::FEE_MALFORMED_REQUEST).clone());
+            assert_eq!(context, "ledger_data empty header");
+        }
+        let drained = registry.lifecycle_snapshot();
+        assert_eq!(drained.data_jobs_started, 1);
+        assert_eq!(drained.packet_steps, 2);
+        assert_eq!(drained.packet_steps_completed, 2);
+        assert_eq!(drained.packet_step_errors, 2);
+        registry.stop();
+    }
+
+    #[test]
+    fn acquisition_lifecycle_snapshot_exposes_route_and_worker_boundaries() {
+        let counters = AcquisitionLifecycleCounters::default();
+        assert_eq!(counters.snapshot(), AcquisitionLifecycleSnapshot::default());
+
+        counters.acquisition_starts.fetch_add(1, Ordering::Relaxed);
+        counters.wire_ledger_data.fetch_add(2, Ordering::Relaxed);
+        counters.route_attempts.fetch_add(3, Ordering::Relaxed);
+        counters.route_accepted.fetch_add(1, Ordering::Relaxed);
+        counters.route_misses.fetch_add(1, Ordering::Relaxed);
+        counters
+            .route_sequence_mismatch
+            .fetch_add(1, Ordering::Relaxed);
+        counters.data_jobs_submitted.fetch_add(1, Ordering::Relaxed);
+        counters.data_jobs_started.fetch_add(1, Ordering::Relaxed);
+        counters.packet_steps.fetch_add(4, Ordering::Relaxed);
+        counters.terminal_completed.fetch_add(1, Ordering::Relaxed);
+
+        assert_eq!(
+            counters.snapshot(),
+            AcquisitionLifecycleSnapshot {
+                acquisition_starts: 1,
+                wire_ledger_data: 2,
+                route_attempts: 3,
+                route_accepted: 1,
+                route_misses: 1,
+                route_sequence_mismatch: 1,
+                data_jobs_submitted: 1,
+                data_jobs_started: 1,
+                packet_steps: 4,
+                terminal_completed: 1,
+                ..AcquisitionLifecycleSnapshot::default()
+            }
+        );
+    }
 
     #[test]
     fn unknown_closed_ledger_sequence_accepts_authoritative_response_sequence() {
@@ -870,5 +1786,181 @@ mod tests {
         assert!(response_sequence_matches_request(105_847_104, 0));
         assert!(response_sequence_matches_request(105_847_104, 105_847_104));
         assert!(!response_sequence_matches_request(105_847_103, 105_847_104));
+    }
+
+    #[test]
+    fn stale_inbound_acquisitions_match_rippleds_one_minute_sweep() {
+        assert_eq!(SWEEP_IDLE_TIMEOUT, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn recovery_lcl_diagnostic_reports_selected_candidate() {
+        let preferred = Uint256::from_array([0xA5; 32]);
+        let candidate = Uint256::from_array([0xB6; 32]);
+        let JsonValue::Object(value) = recovery_lcl_decision_json(Some(RecoveryLclDecision {
+            recorded_at: Instant::now(),
+            preferred_hash: preferred,
+            candidate_hash: Some(candidate),
+            candidate_seq: Some(123),
+            source: "completed_recovery".to_owned(),
+            decision: "installed".to_owned(),
+        })) else {
+            panic!("recovery diagnostic must be an object");
+        };
+
+        assert_eq!(
+            value.get("preferred_hash"),
+            Some(&JsonValue::String(preferred.to_string()))
+        );
+        assert_eq!(
+            value.get("candidate_hash"),
+            Some(&JsonValue::String(candidate.to_string()))
+        );
+        assert_eq!(value.get("candidate_seq"), Some(&JsonValue::Unsigned(123)));
+        assert_eq!(
+            value.get("decision"),
+            Some(&JsonValue::String("installed".to_owned()))
+        );
+    }
+
+    #[test]
+    fn failed_acquisition_enters_cooldown_without_waiting_for_sweep() {
+        let hash = Uint256::from_array([0xF1; 32]);
+        let mut inner = RegistryInner {
+            entries: BTreeMap::new(),
+            recent_failures: HashMap::new(),
+            poll_cursor: None,
+        };
+
+        record_recent_failure(&mut inner, hash, None);
+
+        assert!(
+            inner
+                .recent_failures
+                .get(&hash)
+                .is_some_and(|recorded_at| recorded_at.elapsed() < Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn repeated_failure_records_preserve_the_original_cooldown_time() {
+        let hash = Uint256::from_array([0xF2; 32]);
+        let first_failure = Instant::now() - Duration::from_secs(240);
+        let mut inner = RegistryInner {
+            entries: BTreeMap::new(),
+            recent_failures: HashMap::new(),
+            poll_cursor: None,
+        };
+
+        record_recent_failure_at(&mut inner, hash, None, first_failure);
+        record_recent_failure_at(&mut inner, hash, None, Instant::now());
+
+        assert_eq!(inner.recent_failures.get(&hash), Some(&first_failure));
+    }
+
+    #[test]
+    fn delayed_failure_cannot_match_a_replacement_acquisition() {
+        assert!(failure_matches_entry(None, 2));
+        assert!(failure_matches_entry(Some(2), 2));
+        assert!(!failure_matches_entry(Some(1), 2));
+    }
+
+    #[test]
+    fn delayed_failure_from_a_swept_acquisition_cannot_restart_cooldown() {
+        let hash = Uint256::from_array([0xF3; 32]);
+        let mut inner = RegistryInner {
+            entries: BTreeMap::new(),
+            recent_failures: HashMap::new(),
+            poll_cursor: None,
+        };
+
+        record_recent_failure_at(&mut inner, hash, Some(17), Instant::now());
+
+        assert!(
+            !inner.recent_failures.contains_key(&hash),
+            "a callback whose acquisition no longer exists must not create a new cooldown"
+        );
+    }
+
+    #[test]
+    fn fetch_info_handles_zero_lookup_and_worker_counts_without_panicking() {
+        let snapshot = AcquisitionSnapshot {
+            age_ms: 1,
+            header_after_ms: None,
+            seq: 0,
+            have_header: false,
+            have_state: false,
+            have_transactions: false,
+            timeouts: 0,
+            packets: 0,
+            useful_packets: 0,
+            useful_nodes: 0,
+            state_packets: 0,
+            state_useful_nodes: 0,
+            state_duplicate_nodes: 0,
+            malformed_packets: 0,
+            state_scan_runs: 0,
+            state_missing_nodes: 0,
+            tx_missing_nodes: 0,
+            state_scan_us: 0,
+            state_scan_branches_seen: 0,
+            state_scan_duplicate_missing_hashes: 0,
+            state_scan_full_below_hits: 0,
+            state_scan_loaded_or_cached_children: 0,
+            state_scan_pending_reads: 0,
+            state_scan_max_pending_reads: 0,
+            state_scan_pending_hits: 0,
+            state_scan_pending_misses: 0,
+            state_scan_deferred_resumes: 0,
+            state_scan_max_buffered_packets: 0,
+            data_drain_runs: 0,
+            data_drain_us: 0,
+            data_drain_max_us: 0,
+            data_drain_max_packets: 0,
+            tx_scan_us: 0,
+            worker_jobs: 0,
+            worker_queue_wait_us: 7,
+            node_store_fetch_hits: 0,
+            node_store_fetch_misses: 0,
+            tracked_peers: 0,
+            buffered_packets: 0,
+            has_active_packet: false,
+        };
+
+        let JsonValue::Object(values) = acquisition_snapshot_json(
+            Uint256::from_u64(1),
+            0,
+            AcquireReason::Consensus,
+            0,
+            false,
+            false,
+            snapshot,
+        ) else {
+            panic!("acquisition diagnostics must be an object");
+        };
+
+        assert_eq!(values.get("state_packets"), Some(&JsonValue::Unsigned(0)));
+        assert_eq!(
+            values.get("state_useful_nodes"),
+            Some(&JsonValue::Unsigned(0))
+        );
+        assert_eq!(
+            values.get("state_duplicate_nodes"),
+            Some(&JsonValue::Unsigned(0))
+        );
+        assert_eq!(values.get("state_scan_runs"), Some(&JsonValue::Unsigned(0)));
+        assert_eq!(
+            values.get("state_scan_pending_reads"),
+            Some(&JsonValue::Unsigned(0))
+        );
+        assert_eq!(values.get("data_drain_runs"), Some(&JsonValue::Unsigned(0)));
+        assert_eq!(
+            values.get("node_store_lookup_hit_rate_ppm"),
+            Some(&JsonValue::Null)
+        );
+        assert_eq!(
+            values.get("average_worker_queue_wait_us"),
+            Some(&JsonValue::Null)
+        );
     }
 }
