@@ -1598,7 +1598,7 @@ impl ConsensusRunner for AppConsensus {
         let accepted = self.state.peer_proposal(&self.adaptor, now, peer_pos);
         self.publish_consensus_mode();
         if !accepted && our_prev != their_prev {
-            tracing::info!(target: "consensus",
+            tracing::debug!(target: "consensus",
                 %our_prev, %their_prev,
                 phase = ?self.state.phase(),
                 "peer_proposal REJECTED: prev_ledger mismatch"
