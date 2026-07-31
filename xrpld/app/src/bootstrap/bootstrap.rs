@@ -1109,14 +1109,23 @@ fn run_start_mode_consensus_loop(
                 .overlay()
                 .queued_inbound()
                 .set_validation_router(Box::new(move |mut queued| {
-                    // Match PeerImp::onMessage(TMValidation): parse only far
-                    // enough to establish time and trust, then apply the
-                    // drop_untrusted policy before source retention or crypto.
+                    // Match PeerImp::onMessage(TMValidation): parse with
+                    // manifest-aware node-ID resolution, then apply time and
+                    // trust before source retention or crypto.
                     let mut serial = protocol::SerialIter::new(&queued.message.validation);
+                    let manifest_cache = validation_root.manifest_cache();
                     let mut validation =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            protocol::STValidation::from_serial_iter_default_node_id(
+                            protocol::STValidation::from_serial_iter(
                                 &mut serial,
+                                |pk: &protocol::PublicKey| {
+                                    // Resolve ephemeral signing key → master key
+                                    // through the validator manifest cache, then
+                                    // compute NodeId. Matches rippled:
+                                    // calcNodeID(app_.getValidatorManifests().getMasterKey(pk))
+                                    let master = manifest_cache.get_master_key(pk);
+                                    protocol::calc_node_id(&master)
+                                },
                                 false,
                             )
                         }))

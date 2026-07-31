@@ -211,9 +211,12 @@ fn drain_bounded<T>(
 /// compatibility checks before installation.
 fn select_recovery_lcl(
     cached_preferred: Option<Arc<ledger::Ledger>>,
-    completed_consensus_recovery_ledger: &mut Option<Arc<ledger::Ledger>>,
+    _completed_consensus_recovery_ledger: &mut Option<Arc<ledger::Ledger>>,
 ) -> Option<Arc<ledger::Ledger>> {
-    cached_preferred.or_else(|| completed_consensus_recovery_ledger.take())
+    // Rippled's checkLastClosedLedger only uses the currently-preferred hash
+    // (either from cache or via InboundLedgers::acquire). It never falls back
+    // to a prior completed candidate.
+    cached_preferred
 }
 
 /// Dependencies the strand needs (passed at construction).
@@ -506,7 +509,18 @@ fn strand_loop(
                 proposal.suppression,
                 prop,
             );
-            runner.peer_proposal(now, &peer_pos);
+            let relay = runner.peer_proposal(now, &peer_pos);
+            // Match rippled PeerImp::checkPropose: relay trusted proposals
+            // to all peers (minus the suppression set from HashRouter).
+            if relay {
+                if let Some(overlay_runtime) = root.overlay_runtime() {
+                    overlay_runtime.overlay().relay_proposal(
+                        proposal.message,
+                        proposal.suppression,
+                        proposal.public_key,
+                    );
+                }
+            }
         });
         consensus_rt.update_phase(runner.phase());
         consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
@@ -947,45 +961,43 @@ fn check_accept_and_advance(
     }
 
     // ── Operating mode promotion ─────────────────────────────────────────
-    // Use the same preferred-LCL precondition as accepted-ledger promotion;
-    // otherwise a strand tick can report FULL before consensus observes that
-    // peers and trusted validations prefer a different chain.
-    if let Some(promotion_lcl) = root.published_ledger().or_else(|| root.closed_ledger()) {
-        if root.preferred_lcl_allows_mode_promotion(promotion_lcl.as_ref()) {
-            let current_mode = root.network_ops_state().operating_mode();
-            let need_network = root.need_network_ledger();
-            let mut next_mode = current_mode;
+    // Match rippled endConsensus (NetworkOPs.cpp:2219-2232):
+    // - CONNECTED/SYNCING + !needNetworkLedger → TRACKING
+    // - CONNECTED/TRACKING + current ledger fresh → FULL
+    {
+        let current_mode = root.network_ops_state().operating_mode();
+        let need_network = root.need_network_ledger();
+        let mut next_mode = current_mode;
 
-            // Connected/Syncing → Tracking
-            if matches!(
-                next_mode,
-                NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Syncing
-            ) && !need_network
-            {
-                next_mode = NetworkOpsOperatingMode::Tracking;
-            }
+        // Connected/Syncing → Tracking
+        if matches!(
+            next_mode,
+            NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Syncing
+        ) && !need_network
+        {
+            next_mode = NetworkOpsOperatingMode::Tracking;
+        }
 
-            // Connected/Tracking → Full when published ledger is fresh
-            if matches!(
-                next_mode,
-                NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Tracking
-            ) && !need_network
-            {
-                let fresh = root.published_ledger().map_or(false, |pub_ledger| {
-                    let now_close = root.current_close_time_seconds();
-                    let pub_close = pub_ledger.header().close_time;
-                    let resolution = u32::from(pub_ledger.header().close_time_resolution);
-                    now_close < pub_close.saturating_add(resolution.saturating_mul(2))
-                });
-                if fresh {
-                    next_mode = NetworkOpsOperatingMode::Full;
-                }
+        // Connected/Tracking → Full when current ledger is fresh
+        if matches!(
+            next_mode,
+            NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Tracking
+        ) && !need_network
+        {
+            let fresh = root.closed_ledger().map_or(false, |current| {
+                let now_close = root.current_close_time_seconds();
+                let parent_close = current.header().close_time;
+                let resolution = u32::from(current.header().close_time_resolution);
+                now_close < parent_close.saturating_add(resolution.saturating_mul(2))
+            });
+            if fresh {
+                next_mode = NetworkOpsOperatingMode::Full;
             }
+        }
 
-            if next_mode != current_mode {
-                tracing::info!(target: "app", ?current_mode, ?next_mode, "strand: operating mode promoted");
-                root.set_network_ops_operating_mode(next_mode);
-            }
+        if next_mode != current_mode {
+            tracing::info!(target: "app", ?current_mode, ?next_mode, "strand: operating mode promoted");
+            root.set_network_ops_operating_mode(next_mode);
         }
     }
 
@@ -1114,11 +1126,11 @@ fn persist_completed_inbound_ledger(
     let normalized = root.ledger_with_node_fetcher(Arc::clone(ledger));
     match reason {
         // `InboundLedger::done` calls `storeLedger` for generic and consensus
-        // acquisitions. It preserves the header's existing validated state
-        // and never inserts an unvalidated fork by sequence or into
-        // `completeLedgers`.
+        // acquisitions. rippled's `storeLedger` passes
+        // `ledger->header().validated` to ledgerHistory_.insert.
         AcquireReason::Consensus | AcquireReason::Generic => {
-            !lm.ledger_history().insert(normalized, false)
+            let validated = normalized.header().validated;
+            !lm.ledger_history().insert(normalized, validated)
         }
         // History is consumed by LedgerMaster's fetch-for-history path. That
         // path always calls `setFullLedger(..., false, false)`: even an
@@ -1407,25 +1419,23 @@ mod tests {
     }
 
     #[test]
-    fn completed_recovery_candidate_is_selected_when_peer_preference_advances() {
+    fn select_recovery_lcl_uses_only_cached_preferred_hash() {
         let completed = immutable_ledger(101, 0xA1);
         let mut pending = Some(Arc::clone(&completed));
 
-        // The peer has advanced to a new hash that is not cached yet. Use the
-        // completed candidate rather than serially chasing the new advert.
-        let selected = select_recovery_lcl(None, &mut pending)
-            .expect("completed recovery candidate should remain eligible");
-        assert_eq!(selected.header().hash, completed.header().hash);
-        assert!(pending.is_none());
+        // When the preferred hash is not cached, no fallback to a previously
+        // completed candidate occurs — matching rippled's checkLastClosedLedger
+        // which only acquires/uses the currently-preferred hash.
+        assert!(select_recovery_lcl(None, &mut pending).is_none());
+        assert!(pending.is_some(), "stale candidate must not be consumed");
 
-        // If the newer peer LCL has already arrived, it remains preferred and
-        // the older completion is not consumed for this decision.
+        // When the preferred hash IS cached, it is returned directly.
         let newer = immutable_ledger(102, 0xA2);
         let mut pending = Some(completed);
         let selected = select_recovery_lcl(Some(Arc::clone(&newer)), &mut pending)
-            .expect("cached preferred LCL should win");
+            .expect("cached preferred LCL should be returned");
         assert_eq!(selected.header().hash, newer.header().hash);
-        assert!(pending.is_some());
+        assert!(pending.is_some(), "stale candidate must not be consumed");
     }
 
     #[test]
