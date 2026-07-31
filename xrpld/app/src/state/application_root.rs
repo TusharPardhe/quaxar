@@ -5806,16 +5806,14 @@ impl ApplicationRoot {
             }
         }
 
-        // Release in-memory tree nodes on the ORIGINAL ledger (the one held in
-        // the closed_ledger slot and potentially in ledger_history/validations
-        // caches). Since release_maps_to_disk takes &self, it operates in-place
-        // via interior mutability on ALL Arc<Ledger> holders simultaneously —
-        // no slot-swapping or cloning needed. After this, the ~33GB+ state tree
-        // is freed; future reads fetch from NuDB on demand.
-        ledger.release_maps_to_disk();
-        // Also release on the validated clone (which shares no nodes with the
-        // original since it was cloned before release).
-        validated.release_maps_to_disk();
+        // Rippled does NOT release ledger maps in checkAccept. The ledger
+        // stays in memory with its full SHAMap so that:
+        // 1. The validation trie adaptor can build ancestor chains via
+        //    hash_of_seq (which walks the state map skip-list)
+        // 2. getPreferredLCL can advance past minSeq once the trie is
+        //    populated with the new validated ledger
+        // Memory is reclaimed by the normal TreeNodeCache/LedgerHistory
+        // sweep cycle, matching rippled's nodeFamily_.sweep() cadence.
 
         tracing::info!(
             target: "consensus",
