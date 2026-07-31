@@ -1117,6 +1117,7 @@ fn check_accept_and_advance(
     // strand-owned reconciliation before this maintenance pass. Keep the
     // existing transition gate for validation/publication consistency only.
     let _lcl_transition_guard = root.lcl_transition_gate().lock();
+    let published_before = root.published_ledger_seq();
 
     // ── checkAccept: the closed ledger may now have reached quorum ───────
     if let Some(closed) = root.closed_ledger() {
@@ -1143,6 +1144,15 @@ fn check_accept_and_advance(
 
     // ── tryAdvance publication ────────────────────────────────────────────
     root.try_advance_publication();
+    // doAdvance clears this only after a validated ledger has actually been
+    // published. Do not clear it for a no-op publication pass.
+    if root.published_ledger_seq() != published_before
+        && root
+            .published_ledger()
+            .is_some_and(|ledger| ledger.header().seq <= lm.valid_ledger_seq())
+    {
+        root.set_need_network_ledger(false);
+    }
 
     // ── Update complete_ledgers display ──────────────────────────────────
     let complete_range = lm.complete_ledgers();
@@ -1249,9 +1259,12 @@ fn check_accept_and_advance(
         *last_history_tick = Instant::now();
 
         let complete = lm.complete_ledgers();
+        // Do not fetch below the configured NodeStore retention floor.
+        // This matches nodeStore().earliestLedgerSeq(), falling back to the
+        // historical genesis+1 guard only when no node store is attached.
+        let earliest_seq = root.minimum_online_seq().unwrap_or(2);
         // Find the first missing ledger scanning backward from valid_seq
         let mut missing_seq = None;
-        let earliest_seq = 2u32; // don't go below genesis+1
         for seq in (earliest_seq..valid_seq).rev() {
             if !complete.contains(seq) {
                 missing_seq = Some(seq);

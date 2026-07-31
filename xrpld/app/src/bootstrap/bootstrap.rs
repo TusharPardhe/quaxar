@@ -29,7 +29,7 @@ use protocol::{
 };
 use rusqlite::{OptionalExtension, params};
 use shamap::family::{
-    NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
+    FullBelowCache, NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -1431,7 +1431,9 @@ fn run_start_mode_consensus_loop(
                             return;
                         }
                         if trusted {
-                            let _ = proposal_tx.send(proposal);
+                            // The consensus strand owns a bounded ingress queue;
+                            // never let an overlay job block waiting for it.
+                            let _ = proposal_tx.try_send(proposal);
                         } else if policy.should_relay() || cluster {
                             if let Some(overlay_runtime) = job_root.overlay_runtime() {
                                 overlay_runtime.overlay().relay_proposal(
@@ -1605,6 +1607,7 @@ fn run_start_mode_consensus_loop(
         let hk_stop = Arc::clone(&stop);
         let hk_runtime = Arc::clone(&runtime);
         let hk_shared_inbound = Arc::clone(&shared_inbound);
+        let hk_full_below_cache = Arc::clone(shared_inbound.full_below_cache());
         let hk_tree_cache = Arc::clone(&app_tree_cache);
         let hk_sweep_interval = node_size_profile.sweep_interval_seconds;
         std::thread::Builder::new()
@@ -1646,6 +1649,10 @@ fn run_start_mode_consensus_loop(
                                 "TreeNodeCache sweep (matching rippled doSweep)"
                             );
                         }
+
+                        // `nodeFamily_.sweep()` also expires FullBelow entries.
+                        // Keep the shared acquisition cache on the same cadence.
+                        hk_full_below_cache.sweep();
 
                         // TransactionMaster sweep — matching rippled's doSweep which
                         // sweeps the MasterTransaction TaggedCache (65,536 entries, 30min TTL).
@@ -1715,6 +1722,50 @@ fn run_start_mode_consensus_loop(
                             }
                             overlay_rt.overlay().delete_idle_peers();
                             tracing::debug!(target: "overlay", peer_count = peers.len(), "Ping sent to all peers");
+                        }
+                    }
+
+                    // Drain accepted manifest updates, install them in the shared
+                    // validator ManifestCache, and relay only newly accepted blobs.
+                    // This is OverlayImpl::onManifests parity; do not echo a
+                    // peer's accepted manifests back to that peer.
+                    let manifests = overlay_rt.overlay().take_manifests();
+                    for inbound in manifests {
+                        let mut relay_list = Vec::new();
+                        for wire_manifest in inbound.message.list {
+                            let Some(manifest) = crate::state::manifest::deserialize_manifest(
+                                &wire_manifest.stobject,
+                            ) else {
+                                tracing::debug!(
+                                    target: "overlay",
+                                    peer_id = inbound.peer_id,
+                                    "discarding malformed manifest"
+                                );
+                                continue;
+                            };
+
+                            if root.manifest_cache().apply_manifest(manifest)
+                                == crate::state::manifest::ManifestDisposition::Accepted
+                            {
+                                relay_list.push(wire_manifest);
+                            }
+                        }
+
+                        if !relay_list.is_empty() {
+                            let message = overlay::Message::new(
+                                overlay::ProtocolMessage::new(
+                                    overlay::ProtocolPayload::Manifests(overlay::TmManifests {
+                                        list: relay_list,
+                                        ..Default::default()
+                                    }),
+                                ),
+                                None,
+                            );
+                            for peer in overlay_rt.overlay().active_peers() {
+                                if peer.id() != inbound.peer_id {
+                                    peer.send(message.clone());
+                                }
+                            }
                         }
                     }
 
@@ -2847,7 +2898,7 @@ fn hydrate_loaded_ledger(
     let ledger = root.ledger_with_node_fetcher(ledger);
     ledger_master.set_closed_ledger(Arc::clone(&ledger));
     ledger_master
-        .set_full_ledger(&persistence, Arc::clone(&ledger), true, true, None, None)
+        .set_full_ledger(&persistence, Arc::clone(&ledger), true, false, None, None)
         .map_err(|error| format!("ledger master bootstrap failed: {error:?}"))?;
     ledger_master.set_pub_ledger(Arc::clone(&ledger));
     let _ = ledger_master.set_valid_ledger(Arc::clone(&ledger), None, None);

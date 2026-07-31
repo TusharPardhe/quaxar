@@ -460,8 +460,21 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         &mut self,
         message: &crate::message::TmManifests,
     ) -> crate::router::RouteAction {
+        // Match PeerImp::onMessage(TMManifests): an empty batch is useless
+        // data, while batches over 100 entries impose a moderate burden but
+        // are still delivered for normal manifest processing.
         if message.list.is_empty() {
+            self.peer.charge(
+                (*resource::FEE_USELESS_DATA).clone(),
+                "empty manifests".to_owned(),
+            );
             return crate::router::RouteAction::Continue;
+        }
+        if message.list.len() > 100 {
+            self.peer.charge(
+                (*resource::FEE_MODERATE_BURDEN_PEER).clone(),
+                "oversized manifests".to_owned(),
+            );
         }
         tracing::debug!(
             target: "overlay",
