@@ -400,7 +400,9 @@ fn dispatch_available(
                 Ok(Some(consumed))
             }
         }
-        Err(ProtocolMessageError::InvalidHeader) => {
+        Err(ProtocolMessageError::InvalidHeader)
+        | Err(ProtocolMessageError::UnsupportedCompression)
+        | Err(ProtocolMessageError::CompressionDisabled) => {
             // Match rippled: parseMessageHeader returning no_message/nullopt
             // does NOT disconnect the peer. The caller returns 0 consumed and
             // the read loop waits for more data. Skip one byte to attempt
