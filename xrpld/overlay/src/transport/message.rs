@@ -418,16 +418,33 @@ pub fn parse_message_header(bytes: &[u8]) -> Result<Option<MessageHeader>, Proto
             return Err(ProtocolMessageError::InvalidHeader);
         }
 
+        // Parse the full header regardless of whether we support the
+        // compression algorithm. This allows the caller to skip the entire
+        // message frame rather than losing framing synchronization.
         let algorithm = CompressionAlgorithm::from_header_bits(first & 0xF0)
-            .ok_or(ProtocolMessageError::UnsupportedCompression)?;
-        if algorithm != CompressionAlgorithm::Lz4 {
-            return Err(ProtocolMessageError::UnsupportedCompression);
-        }
+            .unwrap_or(CompressionAlgorithm::Lz4); // placeholder for unknown
 
         let payload_wire_size =
             u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) & 0x0FFF_FFFF;
         let message_type = u16::from_be_bytes([bytes[4], bytes[5]]);
         let uncompressed_size = u32::from_be_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
+
+        // Now validate the algorithm — but return a full header so the
+        // caller knows how many bytes to skip.
+        let actual_algorithm = CompressionAlgorithm::from_header_bits(first & 0xF0);
+        if actual_algorithm.is_none() || actual_algorithm != Some(CompressionAlgorithm::Lz4) {
+            // Return the header with the wire size so decode_protocol_message
+            // can skip the whole frame. Use a sentinel to signal unsupported.
+            return Ok(Some(MessageHeader {
+                total_wire_size: HEADER_BYTES_COMPRESSED as u32 + payload_wire_size,
+                header_size: HEADER_BYTES_COMPRESSED as u32,
+                payload_wire_size,
+                uncompressed_size,
+                message_type,
+                algorithm: CompressionAlgorithm::None, // marker: not actually None, but unsupported
+            }));
+        }
+
         return Ok(Some(MessageHeader {
             total_wire_size: HEADER_BYTES_COMPRESSED as u32 + payload_wire_size,
             header_size: HEADER_BYTES_COMPRESSED as u32,
@@ -481,7 +498,48 @@ pub fn decode_protocol_message(
     if header.payload_wire_size as usize > MAXIMUM_MESSAGE_SIZE
         || header.uncompressed_size as usize > MAXIMUM_MESSAGE_SIZE
     {
-        return Err(ProtocolMessageError::MessageTooLarge);
+        // Skip the oversized message to maintain framing synchronization.
+        // Wait for full frame if not yet buffered.
+        if header.total_wire_size as usize > bytes.len() {
+            return Ok(DecodedProtocolMessage {
+                header,
+                message: None,
+                consumed: 0,
+                hint: header.total_wire_size as usize - bytes.len(),
+            });
+        }
+        return Ok(DecodedProtocolMessage {
+            header,
+            message: None,
+            consumed: header.total_wire_size as usize,
+            hint: 0,
+        });
+    }
+
+    // If the header indicates a compressed message (uncompressed_size differs
+    // from payload_wire_size) but the algorithm was not recognized by
+    // parse_message_header, skip the entire frame to maintain framing sync.
+    // This matches rippled which returns nullopt and the read loop just
+    // continues without disconnecting.
+    if header.uncompressed_size != header.payload_wire_size
+        && header.algorithm == CompressionAlgorithm::None
+    {
+        // Wait for the full frame if not yet available
+        if header.total_wire_size as usize > bytes.len() {
+            return Ok(DecodedProtocolMessage {
+                header,
+                message: None,
+                consumed: 0,
+                hint: header.total_wire_size as usize - bytes.len(),
+            });
+        }
+        // Skip the entire unsupported message
+        return Ok(DecodedProtocolMessage {
+            header,
+            message: None,
+            consumed: header.total_wire_size as usize,
+            hint: 0,
+        });
     }
 
     if !compression_enabled && header.algorithm != CompressionAlgorithm::None {
@@ -783,10 +841,18 @@ mod tests {
         buf[6..10].copy_from_slice(&uncompressed_size.to_be_bytes());
 
         let result = decode_protocol_message(&buf, true);
+        // Oversized messages are skipped (consumed with message=None) to
+        // maintain framing synchronization, matching rippled behavior.
+        let decoded = result.expect("oversized message should be skipped, not error");
         assert!(
-            matches!(result, Err(ProtocolMessageError::MessageTooLarge)),
-            "expected MessageTooLarge, got: {:?}",
-            result
+            decoded.message.is_none(),
+            "oversized message should not decode"
+        );
+        // If the buffer is large enough the frame is fully consumed;
+        // otherwise consumed=0 (waiting for more bytes).
+        assert!(
+            decoded.consumed == 0 || decoded.consumed == decoded.header.total_wire_size as usize,
+            "should either wait or skip entire frame"
         );
     }
 
