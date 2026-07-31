@@ -375,6 +375,10 @@ fn strand_loop(
     let mut last_round_ledger_id: Option<Uint256> = None;
     let mut last_history_tick = Instant::now();
     let mut history_fetch_pack: Option<(u32, Instant)> = None;
+    // Match rippled's `acquiringLedger_`: only issue ONE acquireAsync per
+    // unique preferred-LCL hash. Prevents flooding peers with parallel
+    // acquisition requests as the network tip advances every 3-4 seconds.
+    let mut acquiring_ledger: Uint256 = Uint256::zero();
     // Sample repeating LCL diagnostics while leaving recovery decisions and
     // state-transition logs complete.
     let mut lcl_audit_sampler = LclAuditSampler::new();
@@ -708,6 +712,7 @@ fn strand_loop(
             &consensus_rt,
             &mut last_round_ledger_id,
             &mut lcl_audit_sampler,
+            &mut acquiring_ledger,
         );
 
         // `checkAccept`/publication/history do not select, acquire, install,
@@ -819,6 +824,7 @@ fn reconcile_preferred_lcl(
     consensus_rt: &AppConsensusRuntime,
     last_round_ledger_id: &mut Option<Uint256>,
     audit_sampler: &mut LclAuditSampler,
+    acquiring_ledger: &mut Uint256,
 ) -> PreferredLclReconciliation {
     if !should_reconcile_preferred_lcl(runner.phase()) {
         return PreferredLclReconciliation::NoChange;
@@ -924,18 +930,17 @@ fn reconcile_preferred_lcl(
     let candidate =
         root.resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash));
     let Some(candidate) = candidate else {
-        // This is a best-effort NetworkOPs acquisition, matching rippled's
-        // checkLastClosedLedger. Generic Consensus independently coalesces
-        // GetConsL1 misses and can consume any completed cache entry.
-        let acquisition_requested = !shared_inbound.contains(&preferred_hash);
-        if acquisition_requested {
+        // Match rippled acquiringLedger_: only issue ONE acquireAsync per
+        // unique hash. If we already requested this hash, skip.
+        if preferred_hash != *acquiring_ledger {
+            *acquiring_ledger = preferred_hash;
+            shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
             shared_inbound.record_recovery_lcl_decision(
                 preferred_hash,
                 None,
                 "check_last_closed_ledger",
                 "requested",
             );
-            shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
         }
         if emit_audit {
             tracing::info!(
@@ -943,7 +948,7 @@ fn reconcile_preferred_lcl(
                 local_lcl_hash = %our_hash,
                 local_lcl_seq = our_closed.header().seq,
                 preferred_lcl_hash = %preferred_hash,
-                acquisition_requested,
+                acquiring_ledger = %acquiring_ledger,
                 "LCL_AUDIT preferred-LCL candidate is not cached"
             );
         }
