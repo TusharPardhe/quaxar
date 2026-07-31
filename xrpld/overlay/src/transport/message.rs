@@ -664,7 +664,12 @@ fn set_header(
     compression: CompressionAlgorithm,
     uncompressed_bytes: u32,
 ) {
-    let mut payload_header = payload_bytes.to_be_bytes();
+    // The wire format uses 26 bits for payload size. Mask to prevent high
+    // bits from leaking into the algorithm/reserved bit positions.
+    // Matches rippled Message.cpp setHeader which masks with & 0x0F on
+    // the top byte (keeping only 4 bits of payload from byte 0).
+    let masked_payload = payload_bytes & 0x03FF_FFFF; // 26-bit max
+    let mut payload_header = masked_payload.to_be_bytes();
     if compression != CompressionAlgorithm::None {
         payload_header[0] |= compression as u8;
     }
