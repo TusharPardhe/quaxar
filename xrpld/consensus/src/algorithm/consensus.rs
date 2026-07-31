@@ -989,12 +989,7 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
             }
 
             if dispute_count > 0 || vote_changes > 0 {
-                let vote_detail: Vec<(bool, i32, i32)> = result
-                    .disputes
-                    .values()
-                    .map(|d| (d.get_our_vote(), d.yays(), d.nays()))
-                    .collect();
-                tracing::info!(target: "consensus", dispute_count, vote_changes, proposing, converge_pct = self.converge_percent, votes = ?vote_detail, "update_our_positions: dispute status");
+                tracing::info!(target: "consensus", dispute_count, vote_changes, proposing, converge_pct = self.converge_percent, "update_our_positions: dispute status");
             }
 
             our_new_set = mutable_set;

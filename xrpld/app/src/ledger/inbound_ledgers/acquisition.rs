@@ -1028,7 +1028,14 @@ fn trigger(
                 .lifecycle
                 .request_messages
                 .fetch_add(1, Ordering::Relaxed);
-            state.peer_set.send_request(&message, peer.as_ref());
+            // rippled broadcasts TMGetObjectByHash to ALL tracked peers
+            // (InboundLedger.cpp:542-548) regardless of trigger source.
+            let target = if matches!(message.payload, overlay::ProtocolPayload::GetObjects(_)) {
+                None
+            } else {
+                peer.as_ref()
+            };
+            state.peer_set.send_request(&message, target);
         };
         let state_request_sent =
             mutable
@@ -1100,7 +1107,12 @@ fn trigger(
                     .lifecycle
                     .request_messages
                     .fetch_add(1, Ordering::Relaxed);
-                state.peer_set.send_request(&message, peer.as_ref());
+                let target = if matches!(message.payload, overlay::ProtocolPayload::GetObjects(_)) {
+                    None
+                } else {
+                    peer.as_ref()
+                };
+                state.peer_set.send_request(&message, target);
             };
             inbound.apply_tx_scan_results(tx_missing, params, &family, &mut send_fn);
         }

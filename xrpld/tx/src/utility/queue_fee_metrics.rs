@@ -218,7 +218,7 @@ pub fn scale_fee_level(
     )
     .unwrap_or(FeeLevel64::MAX);
 
-    tracing::info!(target: "tx", fee_level, open_ledger_count = open_ledger_tx_count, target = snapshot.txns_expected, "Fee escalation active");
+    tracing::debug!(target: "tx", fee_level, open_ledger_count = open_ledger_tx_count, target = snapshot.txns_expected, "Fee escalation active");
 
     fee_level
 }
