@@ -392,19 +392,37 @@ fn dispatch_available(
     handler: &mut PeerSessionDispatch,
 ) -> Result<Option<usize>, OverlayError> {
     let mut hint = 0usize;
-    let consumed = invoke_protocol_message(buffer, handler, &mut hint).map_err(|e| {
-        tracing::warn!(
-            target: "overlay",
-            peer_id = %handler.peer.id(),
-            error = %e,
-            "Bad data from peer"
-        );
-        session_error(e)
-    })?;
-    if consumed == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(consumed))
+    match invoke_protocol_message(buffer, handler, &mut hint) {
+        Ok(consumed) => {
+            if consumed == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(consumed))
+            }
+        }
+        Err(ProtocolMessageError::InvalidHeader) => {
+            // Match rippled: parseMessageHeader returning no_message/nullopt
+            // does NOT disconnect the peer. The caller returns 0 consumed and
+            // the read loop waits for more data. Skip one byte to attempt
+            // resynchronization rather than blocking on a permanently
+            // unparseable prefix.
+            tracing::debug!(
+                target: "overlay",
+                peer_id = %handler.peer.id(),
+                first_byte = format!("0x{:02X}", buffer.first().copied().unwrap_or(0)),
+                "skipping unparseable message header byte"
+            );
+            Ok(Some(1))
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "overlay",
+                peer_id = %handler.peer.id(),
+                error = %e,
+                "Bad data from peer"
+            );
+            Err(session_error(e))
+        }
     }
 }
 
