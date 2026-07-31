@@ -258,13 +258,6 @@ impl InboundLedgers {
                 reason,
                 active_hash_only_consensus_recovery_acquisitions,
             ) {
-                tracing::debug!(
-                    target: "inbound_ledger",
-                    %hash,
-                    seq,
-                    active_hash_only_consensus_recovery_acquisitions,
-                    "acquire: deferred while preferred LCL recovery is in progress"
-                );
                 return None;
             }
         }

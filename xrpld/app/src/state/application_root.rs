@@ -5663,14 +5663,6 @@ impl ApplicationRoot {
                 // not cached yet. `is_compatible` must reject a conflicting
                 // preferred LCL after the asynchronous acquisition completes.
                 lm.note_last_valid_ledger(hash, seq);
-                tracing::debug!(
-                    target: "consensus",
-                    seq,
-                    %hash,
-                    val_count,
-                    quorum,
-                    "check_accept_hash_seq observed a quorum-backed candidate"
-                );
             }
             if seq == lm.valid_ledger_seq()
                 || lm_rt
@@ -5938,14 +5930,6 @@ impl ApplicationRoot {
         let matches =
             preferred_lcl_matches_local_or_parent(local_hash, local_parent_hash, preferred_hash);
 
-        if !matches {
-            tracing::debug!(
-                target: "consensus",
-                %local_hash,
-                %preferred_hash,
-                "mode promotion deferred: network prefers a different closed ledger"
-            );
-        }
         matches
     }
 

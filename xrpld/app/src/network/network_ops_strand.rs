@@ -522,7 +522,6 @@ fn strand_loop(
             );
             runner.got_tx_set(now, tx_set);
             consensus_rt.update_phase(runner.phase());
-            tracing::debug!(target: "consensus", %hash, "strand: got_tx_set processed");
         });
 
         // Also drain a bounded slice from the map-complete receiver.
@@ -537,7 +536,6 @@ fn strand_loop(
                 );
                 runner.got_tx_set(now, tx_set);
                 consensus_rt.update_phase(runner.phase());
-                tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (map_complete)");
             });
         }
 
@@ -560,7 +558,6 @@ fn strand_loop(
             );
             runner.got_tx_set(now, tx_set);
             consensus_rt.update_phase(runner.phase());
-            tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (durable map completion)");
         }
 
         // ─── 5. Handle Accepted phase → detect new closed and start_round ─

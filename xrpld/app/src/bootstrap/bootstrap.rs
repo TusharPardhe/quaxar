@@ -1113,11 +1113,15 @@ fn run_start_mode_consensus_loop(
                     // enough to establish time and trust, then apply the
                     // drop_untrusted policy before source retention or crypto.
                     let mut serial = protocol::SerialIter::new(&queued.message.validation);
-                    let mut validation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        protocol::STValidation::from_serial_iter_default_node_id(&mut serial, false)
-                    }))
-                    .ok()
-                    .and_then(Result::ok);
+                    let mut validation =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            protocol::STValidation::from_serial_iter_default_node_id(
+                                &mut serial,
+                                false,
+                            )
+                        }))
+                        .ok()
+                        .and_then(Result::ok);
                     let Some(ref mut parsed_validation) = validation else {
                         return;
                     };
@@ -1177,9 +1181,7 @@ fn run_start_mode_consensus_loop(
                             let _ = event_tx
                                 .send(crate::consensus::driver::ConsensusEvent::Validation(queued));
                         },
-                    ) {
-                        tracing::debug!(target: "consensus", "validation job rejected during shutdown");
-                    }
+                    ) {}
                 }));
         }
         std::thread::Builder::new()
@@ -1438,9 +1440,7 @@ fn run_start_mode_consensus_loop(
                             }
                         }
                     })
-                {
-                    tracing::debug!(target: "consensus", "proposal job rejected during shutdown");
-                }
+                {}
             }));
     }
 
