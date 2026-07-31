@@ -146,11 +146,13 @@ impl InboundTransactions {
         if is_new {
             inbound.set = Some(Arc::clone(&set));
         }
-        let was_acquiring = inbound.acquire.is_some();
+        let _was_acquiring = inbound.acquire.is_some();
         inbound.acquire = None;
 
-        let notify_completion = is_new && (from_acquire || was_acquiring);
-        if notify_completion && !self.notify_map_complete(hash, Arc::clone(&set)) {
+        // Match rippled giveSet: notify on every new set regardless of
+        // from_acquire or was_acquiring. rippled's condition is simply
+        // `if (isNew) gotSet_(set, fromAcquire)`.
+        if is_new && !self.notify_map_complete(hash, Arc::clone(&set)) {
             if let Some(inbound) = self.sets.get_mut(&hash) {
                 inbound.completion_pending = true;
             }

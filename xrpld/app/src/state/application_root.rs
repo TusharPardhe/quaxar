@@ -6310,9 +6310,18 @@ impl ApplicationRoot {
         // discarded child into partially committed local state.
         let _lcl_transition_guard = self.lcl_transition_gate.lock();
         let Some(expected_current) = self.closed_ledger() else {
+            // Accept cancelled — clear the build marker so
+            // check_accept_hash_seq does not suppress this sequence.
+            if let Some(lm_rt) = self.ledger_master_runtime() {
+                lm_rt.set_building_ledger(0);
+            }
             return Err("stale consensus parent: no current closed ledger".to_owned());
         };
         if expected_current.header().hash != parent_ledger.header().hash {
+            // Accept cancelled — clear the build marker.
+            if let Some(lm_rt) = self.ledger_master_runtime() {
+                lm_rt.set_building_ledger(0);
+            }
             return Err(format!(
                 "stale consensus parent: captured={} current={}",
                 parent_ledger.header().hash,

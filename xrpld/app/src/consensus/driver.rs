@@ -95,6 +95,17 @@ pub fn spawn_event_loop(
                             continue;
                         };
                         if !validation.is_valid() {
+                            // Match rippled PeerImp::checkValidation:
+                            // charge(Resource::kFeeInvalidSignature, desc)
+                            if let Some(overlay_rt) = app.overlay_runtime() {
+                                use overlay::Overlay;
+                                if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(queued.peer_id) {
+                                    peer.charge(
+                                        (*resource::FEE_INVALID_SIGNATURE).clone(),
+                                        "validation invalid signature".to_owned(),
+                                    );
+                                }
+                            }
                             tracing::warn!(target: "consensus", peer = ?queued.peer_id, "dropped invalid validation signature");
                             continue;
                         }

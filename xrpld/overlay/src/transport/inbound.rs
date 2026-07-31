@@ -12,17 +12,24 @@ use crate::message::{
 use crate::peer::{Peer, PeerId, ProtocolFeature};
 use crate::peer_imp::PeerImp;
 
+/// Maximum entries retained in the pre-router fallback queue per message
+/// family. Rippled dispatches directly from the network thread to handlers
+/// or JobQueue; this queue only accumulates during the brief window between
+/// overlay construction and router installation at startup. The cap prevents
+/// unbounded memory growth if a router is never installed or is cleared.
+const FALLBACK_QUEUE_CAP: usize = 10_000;
+
 fn push_bounded<T>(queue: &mut Vec<T>, message: T, _family: &'static str) -> bool {
-    // These queues model direct rippled dispatch during the short period
-    // before a Rust runtime router is wired. Retain work rather than dropping
-    // a protocol message solely because an implementation-local snapshot has
-    // reached an arbitrary size.
+    if queue.len() >= FALLBACK_QUEUE_CAP {
+        return false;
+    }
     queue.push(message);
     true
 }
 
 fn extend_bounded<T>(queue: &mut Vec<T>, messages: Vec<T>, _family: &'static str) {
-    queue.extend(messages);
+    let remaining = FALLBACK_QUEUE_CAP.saturating_sub(queue.len());
+    queue.extend(messages.into_iter().take(remaining));
 }
 
 #[derive(Debug, Clone, PartialEq)]

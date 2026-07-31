@@ -1185,10 +1185,13 @@ fn run_start_mode_consensus_loop(
                         job_type,
                         "checkValidation",
                         move || {
-                            // The event-loop parser performs the signature
-                            // check after scheduling, matching checkValidation.
-                            let _ = event_tx
-                                .send(crate::consensus::driver::ConsensusEvent::Validation(queued));
+                            // Non-blocking delivery to the consensus event loop.
+                            // Rippled's checkValidation runs inline on the
+                            // JobQueue worker; saturation drops rather than
+                            // blocking other workers.
+                            let _ = event_tx.try_send(
+                                crate::consensus::driver::ConsensusEvent::Validation(queued),
+                            );
                         },
                     ) {}
                 }));
@@ -1207,12 +1210,11 @@ fn run_start_mode_consensus_loop(
                     };
                     let validations = overlay_rt.overlay().take_validations();
                     for queued in validations {
-                        match fwd_event_tx
-                            .send(crate::consensus::driver::ConsensusEvent::Validation(queued))
-                        {
-                            Ok(()) => {}
-                            Err(_) => return,
-                        }
+                        // Non-blocking: drop under saturation rather than
+                        // parking the forwarder thread (rippled equivalent
+                        // would be JobQueue admission rejection).
+                        let _ = fwd_event_tx
+                            .try_send(crate::consensus::driver::ConsensusEvent::Validation(queued));
                     }
                 }
             })
