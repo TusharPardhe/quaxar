@@ -344,18 +344,40 @@ where
         hash: Uint256,
         seq: u32,
     ) -> LedgerCompatibilityAnchorAudit {
-        let candidate_ancestor = if ledger.header().seq < seq {
-            None
+        // Matches rippled's areCompatible (View.cpp:134-192):
+        // When validLedger.seq > testLedger.seq, rippled calls
+        //   hashOfSeq(validLedger, testLedger.seq)
+        // i.e. it looks DOWN from the HIGHER ledger to check ancestry.
+        // We only have the candidate (lower) ledger here, so:
+        // - candidate.seq < anchor.seq: can't look up, treat as compatible
+        //   (rippled: "if (hash && ..." — only fails on positive mismatch)
+        // - candidate.seq == anchor.seq: compare hashes directly
+        // - candidate.seq > anchor.seq: look down via skip-list
+        let (candidate_ancestor, matches) = if ledger.header().seq < seq {
+            // Cannot verify from candidate's perspective — the anchor is AHEAD.
+            // Rippled would ask the anchor to look down, and if it can't resolve
+            // (hashOfSeq returns nullopt), it returns compatible (true).
+            // We don't have the anchor ledger object here, so we cannot disprove
+            // compatibility. Match rippled: assume compatible.
+            (None, true)
         } else if ledger.header().seq == seq {
-            Some(*ledger.header().hash.as_uint256())
+            let ancestor = Some(*ledger.header().hash.as_uint256());
+            (ancestor, ancestor == Some(hash))
         } else if ledger.header().seq == seq.saturating_add(1) {
-            Some(*ledger.header().parent_hash.as_uint256())
+            let ancestor = Some(*ledger.header().parent_hash.as_uint256());
+            (ancestor, ancestor == Some(hash))
         } else {
-            ledger
+            let ancestor = ledger
                 .hash_of_seq(seq, &NullLedgerJournal)
-                .map(|ancestor| *ancestor.as_uint256())
+                .map(|a| *a.as_uint256());
+            // Rippled: only incompatible if hash IS resolved AND doesn't match.
+            // If hash_of_seq returns None (skip-list gap), assume compatible.
+            let m = match ancestor {
+                Some(a) => a == hash,
+                None => true, // can't disprove → compatible
+            };
+            (ancestor, m)
         };
-        let matches = candidate_ancestor == Some(hash);
         LedgerCompatibilityAnchorAudit {
             hash,
             seq,
