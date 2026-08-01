@@ -5994,6 +5994,12 @@ impl ApplicationRoot {
         // LedgerHistory. The history scheduler needs this by-sequence entry
         // to retrieve the parent hash for its first predecessor request.
         lm.ledger_history().insert(Arc::clone(&validated), true);
+        // Rippled's getLedgerByHash has a closed-ledger fallback that Quaxar
+        // lacks. Without registering here, the exact validator-backed hash
+        // becomes invisible to check_acquired once ledger_history sweeps it.
+        // This ensures the validation trie can always resolve quorum-backed
+        // ledgers via the adaptor's local HashMap (never swept).
+        self.validations().register_ledger(&validated);
         lm.mark_ledger_complete(validated.header().seq);
         self.note_validated_ledger_for_sync(Arc::clone(&validated));
 
