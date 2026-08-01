@@ -3155,6 +3155,13 @@ impl ApplicationRoot {
             history.insert(Arc::clone(&ledger), false);
             history.built_ledger(Arc::clone(&ledger), consensus_hash, JsonValue::Null);
         }
+        // Matches rippled: the built ledger must be immediately findable by
+        // Validations::updateTrie → acquire() so the trie advances on the same
+        // consensus round. Without this, acquire() must fall back to the
+        // ledger_history TaggedCache which may have swept the entry under heavy
+        // load, causing the trie to stall.
+        self.validations().register_ledger(&ledger);
+
         // `consensusBuilt` must check the built ledger and then scan the
         // current trusted validations before any next-round semantics.
         self.consensus_built_check_accept(&ledger);
