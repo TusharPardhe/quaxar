@@ -689,12 +689,13 @@ where
         K: Borrow<Q>,
         Q: Eq + Hash + PartitionKey + ?Sized,
     {
-        // Fast path: lock-free DashMap lookup
-        if let Some(entry) = self.fast_map.get(key) {
-            self.fast_hits.fetch_add(1, Ordering::Relaxed);
-            return Some(entry.value().clone());
-        }
-        // Slow path: fall through to locked state
+        // rippled's TaggedCache::initialFetch always refreshes lastAccess on
+        // every hit (TaggedCache.ipp:724). The lock-free fast_map path was
+        // skipping this refresh, causing actively-used nodes to be swept
+        // after their original insertion TTL expired. This broke cross-
+        // acquisition cache reuse during ledger sync.
+        //
+        // Always take the slow path which properly touches last_access.
         let mut state = self
             .state
             .lock()
@@ -707,18 +708,14 @@ where
     }
 
     pub fn fetch_with(&self, key: &K, handler: impl FnOnce() -> Option<SP>) -> Option<SP> {
-        // Fast path: lock-free DashMap lookup
-        if let Some(entry) = self.fast_map.get(key) {
-            self.fast_hits.fetch_add(1, Ordering::Relaxed);
-            return Some(entry.value().clone());
-        }
+        // Same fix as fetch(): always go through the slow path that refreshes
+        // last_access, matching rippled TaggedCache behavior.
         {
             let mut state = self
                 .state
                 .lock()
                 .expect("TaggedCache mutex must not be poisoned");
             if let Some(found) = state.initial_fetch(key, self.clock.now()) {
-                self.fast_map.insert(key.clone(), found.clone());
                 return Some(found);
             }
         }
