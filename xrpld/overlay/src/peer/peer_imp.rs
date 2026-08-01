@@ -19,6 +19,8 @@ use crate::squelch::Squelch;
 use crate::tuning::{CONVERGED_LEDGER_LIMIT, DIVERGED_LEDGER_LIMIT};
 
 const RECENT_PEER_KNOWLEDGE_CAPACITY: usize = 128;
+/// Matches rippled's `Tuning::kDropSendQueue`.
+pub(crate) const SEND_QUEUE_CAPACITY: usize = 192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tracking {
@@ -84,6 +86,9 @@ pub struct PeerImp {
     listener_check: Mutex<ListenerCheckState>,
     charges: Mutex<Vec<(Charge, String)>>,
     squelch: Mutex<Squelch>,
+    /// Set when a non-droppable message cannot enter the bounded send queue.
+    /// The session stop signal then tears down the non-reading peer.
+    disconnect_requested: AtomicBool,
     created_at: Instant,
 }
 
@@ -103,7 +108,7 @@ struct ListenerCheckState {
 #[derive(Default)]
 struct PeerOutboundState {
     queued_messages: Vec<Message>,
-    session_tx: Option<mpsc::UnboundedSender<Message>>,
+    session_tx: Option<mpsc::Sender<Message>>,
     session_stop: Option<watch::Sender<bool>>,
 }
 
@@ -171,6 +176,7 @@ impl PeerImp {
             }),
             charges: Mutex::new(Vec::new()),
             squelch: Mutex::new(Squelch::new(Arc::new(SystemClock))),
+            disconnect_requested: AtomicBool::new(false),
             created_at: Instant::now(),
         })
     }
@@ -371,7 +377,7 @@ impl PeerImp {
 
     pub fn attach_session(
         &self,
-        session_tx: mpsc::UnboundedSender<Message>,
+        session_tx: mpsc::Sender<Message>,
         session_stop: watch::Sender<bool>,
     ) -> Vec<Message> {
         let mut outbound_state = self.outbound_state.lock().expect("peer outbound lock");
@@ -538,17 +544,68 @@ impl PeerImp {
     }
 }
 
+impl PeerImp {
+    fn is_droppable_send(&self, message: &Message) -> bool {
+        match &message.protocol().payload {
+            ProtocolPayload::LedgerData(_) => true,
+            ProtocolPayload::GetObjects(reply) => !reply.query,
+            _ => false,
+        }
+    }
+
+    fn request_disconnect(&self) {
+        if self.disconnect_requested.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let session_stop = self
+            .outbound_state
+            .lock()
+            .expect("peer outbound lock")
+            .session_stop
+            .clone();
+        if let Some(session_stop) = session_stop {
+            let _ = session_stop.send(true);
+        }
+    }
+}
+
 impl Peer for PeerImp {
     fn send(&self, message: Message) {
+        if self.disconnect_requested.load(Ordering::Acquire) {
+            return;
+        }
+
+        let droppable = self.is_droppable_send(&message);
         let session_tx = {
             let mut outbound_state = self.outbound_state.lock().expect("peer outbound lock");
-            if outbound_state.session_tx.is_none() {
-                outbound_state.queued_messages.push(message.clone());
-            }
-            outbound_state.session_tx.clone()
+            let Some(session_tx) = outbound_state.session_tx.clone() else {
+                if outbound_state.queued_messages.len() < SEND_QUEUE_CAPACITY {
+                    outbound_state.queued_messages.push(message);
+                    return;
+                }
+                if droppable {
+                    return;
+                }
+                drop(outbound_state);
+                self.request_disconnect();
+                return;
+            };
+            session_tx
         };
-        if let Some(session_tx) = session_tx {
-            let _ = session_tx.send(message);
+
+        match session_tx.try_send(message) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) if droppable => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    target: "overlay",
+                    peer_id = %self.id,
+                    capacity = SEND_QUEUE_CAPACITY,
+                    "Send queue full for non-droppable message; disconnecting peer"
+                );
+                self.request_disconnect();
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => self.request_disconnect(),
         }
     }
 

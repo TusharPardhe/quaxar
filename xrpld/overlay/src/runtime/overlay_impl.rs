@@ -32,8 +32,9 @@ use crate::connect_attempt::{
     ConnectAttempt, ConnectAttemptConfig, ConnectAttemptError, ConnectAttemptResult, ConnectionStep,
 };
 use crate::handshake::{
-    FEATURE_COMPR, FEATURE_LEDGER_REPLAY, FEATURE_TXRR, HandshakeContext, feature_enabled,
-    is_feature_value, make_response, parse_http_request, serialize_response,
+    FEATURE_COMPR, FEATURE_LEDGER_REPLAY, FEATURE_TXRR, HandshakeContext,
+    HandshakeVerificationContext, feature_enabled, is_feature_value, make_response,
+    parse_http_request, serialize_response, verify_handshake,
 };
 use crate::inbound::{
     OverlayInboundHandler, OverlayInboundSnapshot, QueuedEndpoint, QueuedEndpoints,
@@ -1124,6 +1125,9 @@ pub struct OverlayImpl {
     redirect_endpoints: Arc<Mutex<HashMap<SocketAddr, RedirectEndpoint>>>,
     pending_outbound_ips: Arc<Mutex<HashSet<IpAddr>>>,
     peer_status_publisher: Arc<RwLock<Option<PeerStatusPublisher>>>,
+    /// Hashes from the current local closed ledger and its parent, included in
+    /// every outbound HTTP upgrade request like rippled's makeHandshake.
+    handshake_ledgers: Arc<RwLock<Option<(Uint256, Uint256)>>>,
     session_runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -1212,6 +1216,7 @@ impl OverlayImpl {
             redirect_endpoints: Arc::new(Mutex::new(HashMap::new())),
             pending_outbound_ips: Arc::new(Mutex::new(HashSet::new())),
             peer_status_publisher: Arc::new(RwLock::new(None)),
+            handshake_ledgers: Arc::new(RwLock::new(None)),
             session_runtime,
         })
     }
@@ -1418,8 +1423,16 @@ impl OverlayImpl {
             .values()
             .filter(|p| p.remote_address().ip() == remote_ip)
             .count();
-        if active_count >= 5 {
-            tracing::warn!(target: "overlay", ip = %remote_ip, "Resource limit reached: too many active connections from IP");
+        // rippled's PeerFinder tuning defaults an unspecified ip_limit to two
+        // inbound connections per IP. Honor an explicit configured limit here
+        // rather than retaining the former hard-coded cap of five.
+        let ip_limit = if self.setup.ip_limit == 0 {
+            2
+        } else {
+            self.setup.ip_limit
+        };
+        if active_count >= ip_limit {
+            tracing::warn!(target: "overlay", ip = %remote_ip, ip_limit, "Resource limit reached: too many active connections from IP");
             let response = Response::builder()
                 .status(503)
                 .body(())
@@ -1631,6 +1644,7 @@ impl OverlayImpl {
             redirect_endpoints: Arc::clone(&self.redirect_endpoints),
             pending_outbound_ips: Arc::clone(&self.pending_outbound_ips),
             peer_status_publisher: Arc::clone(&self.peer_status_publisher),
+            handshake_ledgers: Arc::clone(&self.handshake_ledgers),
             session_runtime: Arc::clone(&self.session_runtime),
         }
     }
@@ -1718,9 +1732,25 @@ impl OverlayImpl {
         let _ = self.stop_requested.send(true);
     }
 
+    /// Update the ledger hashes advertised on future outbound handshakes.
+    pub fn set_handshake_ledgers(&self, closed_ledger: Uint256, previous_ledger: Uint256) {
+        *self
+            .handshake_ledgers
+            .write()
+            .expect("overlay handshake ledger lock") = Some((closed_ledger, previous_ledger));
+    }
+
     fn handshake_context(&self) -> HandshakeContext {
         let mut context = self.identity.context();
         context.network_id = self.setup.network_id;
+        if let Some((closed_ledger, previous_ledger)) = *self
+            .handshake_ledgers
+            .read()
+            .expect("overlay handshake ledger lock")
+        {
+            context.closed_ledger = Some(closed_ledger.to_string());
+            context.previous_ledger = Some(previous_ledger.to_string());
+        }
         context
     }
 
@@ -2607,6 +2637,7 @@ impl Overlay for OverlayImpl {
         let connector = self.connector.clone();
         let config = ConnectAttemptConfig {
             server_name: address.ip().to_string(),
+            compr_enabled: true,
             tx_reduce_relay_enabled: self.setup.tx_reduce_relay_enabled,
             vp_reduce_relay_enabled: self.setup.vp_reduce_relay_base_squelch_enabled,
             ..ConnectAttemptConfig::default()
@@ -2620,29 +2651,31 @@ impl Overlay for OverlayImpl {
                 .map_err(ConnectAttemptError::Protocol)
         });
         let local_public_key = self.identity.public_key();
-        let verify_response = Arc::new(move |response: &Response<()>, remote: SocketAddr| {
-            let public_key = response
-                .headers()
-                .get("Public-Key")
-                .and_then(|value| value.to_str().ok())
-                .and_then(protocol::parse_base58_node_public)
-                .and_then(|bytes| PublicKey::from_slice(&bytes).ok())
-                .ok_or_else(|| {
-                    ConnectAttemptError::Protocol("missing peer public key".to_owned())
-                })?;
-            if public_key == local_public_key {
-                return Err(ConnectAttemptError::Protocol(
-                    "self connection detected".to_owned(),
-                ));
-            }
-            Ok(PeerImp::new_with_inbound(
-                peer_id,
-                remote,
-                false,
-                public_key,
-                remote.to_string(),
-            ))
-        });
+        let network_id = self.setup.network_id;
+        let public_ip = self.setup.public_ip;
+        let verify_response = Arc::new(
+            move |response: &Response<()>, remote: SocketAddr, shared_value: &Uint256| {
+                let handshake_peer = verify_handshake(
+                    response.headers(),
+                    &HandshakeVerificationContext {
+                        shared_value: *shared_value,
+                        network_id,
+                        local_public_key: Some(local_public_key),
+                        public_ip,
+                        remote_ip: remote.ip(),
+                        clock_tolerance: Duration::from_secs(20),
+                    },
+                )
+                .map_err(ConnectAttemptError::Protocol)?;
+                Ok(PeerImp::new_with_inbound(
+                    peer_id,
+                    remote,
+                    false,
+                    handshake_peer.public_key,
+                    remote.to_string(),
+                ))
+            },
+        );
         let attempt = ConnectAttempt::new(
             address,
             config,

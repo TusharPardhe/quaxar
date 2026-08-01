@@ -73,10 +73,8 @@ fn bootstrap_needs_bootcache_dial(
 fn bootstrap_can_dial_bootcache(
     active_outbound_peers: usize,
     target_outbound_peers: usize,
-    pending_outbound_attempts: usize,
 ) -> bool {
-    pending_outbound_attempts == 0
-        && bootstrap_needs_bootcache_dial(active_outbound_peers, target_outbound_peers)
+    bootstrap_needs_bootcache_dial(active_outbound_peers, target_outbound_peers)
 }
 
 fn fixed_retry_delay(failures: usize) -> Duration {
@@ -380,7 +378,6 @@ impl ManagedComponent for AppOverlayRuntime {
 
                     let mut connected_this_cycle = false;
                     let now = Instant::now();
-                    let mut eligible_fixed = false;
                     if !fixed_endpoints.is_empty() {
                         for endpoint in &fixed_endpoints {
                             let Ok(addrs) = tokio::net::lookup_host(endpoint).await else {
@@ -401,7 +398,6 @@ impl ManagedComponent for AppOverlayRuntime {
                                 if retry_state.1 > now {
                                     continue;
                                 }
-                                eligible_fixed = true;
                                 match overlay.connect(address).await {
                                     Ok(mut result) => {
                                         fixed_retry_state.remove(&address);
@@ -441,13 +437,6 @@ impl ManagedComponent for AppOverlayRuntime {
                                 }
                             }
                         }
-
-                        if overlay.active_fixed_peers_count() < overlay.fixed_peer_slot_count()
-                            && (eligible_fixed || overlay.pending_fixed_outbound_attempts() > 0)
-                        {
-                            tokio::time::sleep(Duration::from_secs(10)).await;
-                            continue;
-                        }
                     }
 
                     for endpoint in &endpoints {
@@ -466,11 +455,7 @@ impl ManagedComponent for AppOverlayRuntime {
                     }
 
                     let active_outbound_peers = overlay.active_outbound_peers_count();
-                    if !bootstrap_can_dial_bootcache(
-                        active_outbound_peers,
-                        target_outbound_peers,
-                        overlay.pending_outbound_attempts(),
-                    ) {
+                    if !bootstrap_can_dial_bootcache(active_outbound_peers, target_outbound_peers) {
                         tokio::time::sleep(Duration::from_secs(10)).await;
                         continue;
                     }
@@ -484,6 +469,7 @@ impl ManagedComponent for AppOverlayRuntime {
                     let attempt_budget = PEERFINDER_MAX_CONNECT_ATTEMPTS
                         .saturating_sub(overlay.pending_outbound_attempts())
                         .min(target_outbound_peers.saturating_sub(active_outbound_peers));
+                    let mut attempts = Vec::new();
                     for address in select_bootcache_endpoints(
                         &connected_ips,
                         &bootcache,
@@ -496,8 +482,15 @@ impl ManagedComponent for AppOverlayRuntime {
                         }
                         recent_bootcache_attempts
                             .insert(address.ip(), now + PEERFINDER_RECENT_ATTEMPT_DURATION);
-                        match overlay.connect(address).await {
-                            Ok(mut result) => {
+                        let overlay = std::sync::Arc::clone(&overlay);
+                        attempts.push(tokio::spawn(async move {
+                            (address, overlay.connect(address).await)
+                        }));
+                    }
+
+                    for attempt in attempts {
+                        match attempt.await {
+                            Ok((address, Ok(mut result))) => {
                                 bootcache_on_success(&mut bootcache, address);
                                 if let Some(session) = result.session.take() {
                                     overlay.spawn_peer_session(
@@ -517,7 +510,7 @@ impl ManagedComponent for AppOverlayRuntime {
                                     network_ops_mode_owner.as_ref(),
                                 );
                             }
-                            Err(overlay::ConnectAttemptError::Redirect(peers)) => {
+                            Ok((address, Err(overlay::ConnectAttemptError::Redirect(peers)))) => {
                                 bootcache_on_failure(&mut bootcache, address);
                                 tracing::info!(target: "overlay",
                                     "overlay bootstrap: {} redirected us to {} peer(s)",
@@ -526,16 +519,18 @@ impl ManagedComponent for AppOverlayRuntime {
                                 );
                                 remember_bootcache_endpoints(&mut bootcache, peers, false);
                             }
-                            Err(error) => {
+                            Ok((address, Err(error))) => {
                                 bootcache_on_failure(&mut bootcache, address);
                                 tracing::info!(target: "overlay",
                                     "overlay bootstrap: connect to {} failed: {}",
                                     address, error
                                 );
                             }
-                        }
-                        if overlay.active_outbound_peers_count() >= target_outbound_peers {
-                            break;
+                            Err(error) => {
+                                tracing::warn!(target: "overlay", %error,
+                                    "overlay bootstrap: connect attempt task failed"
+                                );
+                            }
                         }
                     }
 
@@ -1382,10 +1377,9 @@ tx_min_peers = 9
     }
 
     #[test]
-    fn bootstrap_bootcache_stage_waits_on_pending_attempts_counts() {
-        assert!(bootstrap_can_dial_bootcache(5, 10, 0));
-        assert!(!bootstrap_can_dial_bootcache(5, 10, 1));
-        assert!(!bootstrap_can_dial_bootcache(10, 10, 0));
+    fn bootstrap_bootcache_stage_allows_parallel_pending_attempts() {
+        assert!(bootstrap_can_dial_bootcache(5, 10));
+        assert!(!bootstrap_can_dial_bootcache(10, 10));
     }
 
     #[test]

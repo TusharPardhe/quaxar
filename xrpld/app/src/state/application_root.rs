@@ -3587,6 +3587,12 @@ impl ApplicationRoot {
     ) -> Option<Arc<AppOverlayRuntime>> {
         let overlay = overlay_runtime.overlay();
         self.wire_overlay_membership_sources(overlay.as_ref());
+        if let Some(closed_ledger) = self.closed_ledger() {
+            overlay.set_handshake_ledgers(
+                *closed_ledger.header().hash.as_uint256(),
+                *closed_ledger.header().parent_hash.as_uint256(),
+            );
+        }
         let overlay_status: Arc<dyn OverlayStatusSource> = overlay;
         self.overlay_status = Some(overlay_status);
         self.runtime_bindings.overlay = Some(overlay_runtime.clone());
@@ -5037,6 +5043,13 @@ impl ApplicationRoot {
             }
             self.ledger_master_state
                 .note_closed_ledger(Arc::clone(&normalized));
+        }
+
+        if let Some(overlay_runtime) = self.overlay_runtime() {
+            overlay_runtime.overlay().set_handshake_ledgers(
+                *normalized.header().hash.as_uint256(),
+                *normalized.header().parent_hash.as_uint256(),
+            );
         }
 
         // Release in-memory tree nodes IMMEDIATELY after promotion.

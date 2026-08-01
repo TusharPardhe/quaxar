@@ -13,7 +13,7 @@ use crate::message::{
 };
 use crate::overlay_impl::OverlayError;
 use crate::peer::{Peer, PeerId};
-use crate::peer_imp::PeerImp;
+use crate::peer_imp::{PeerImp, SEND_QUEUE_CAPACITY};
 
 pub trait PeerSessionStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -81,7 +81,7 @@ impl PeerSessionStarter {
         let stream = self.stream.take().expect("peer session stream must exist");
         let stop_requested = self.stop_requested.clone();
         let (session_stop_tx, session_stop_rx) = watch::channel(false);
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(SEND_QUEUE_CAPACITY);
         let pending = peer.attach_session(sender.clone(), session_stop_tx);
         tracing::debug!(
             target: "overlay",
@@ -108,7 +108,7 @@ impl PeerSessionStarter {
 struct PeerSession {
     peer: Arc<PeerImp>,
     stream: Option<BoxPeerSessionStream>,
-    outbound: mpsc::UnboundedReceiver<Message>,
+    outbound: mpsc::Receiver<Message>,
     pending_outbound: Vec<Message>,
     stop_requested: watch::Receiver<bool>,
     session_stop: watch::Receiver<bool>,
@@ -164,7 +164,7 @@ impl PeerSession {
     fn new(
         peer: Arc<PeerImp>,
         stream: BoxPeerSessionStream,
-        outbound: mpsc::UnboundedReceiver<Message>,
+        outbound: mpsc::Receiver<Message>,
         pending_outbound: Vec<Message>,
         stop_requested: watch::Receiver<bool>,
         session_stop: watch::Receiver<bool>,
@@ -247,7 +247,7 @@ impl PeerSession {
         // messages, both running concurrently on the tokio runtime.
         let mut outbound_rx = std::mem::replace(
             &mut self.outbound,
-            mpsc::unbounded_channel().1, // placeholder — won't be used
+            mpsc::channel(1).1, // placeholder — won't be used
         );
         let mut writer_stop = self.stop_requested.clone();
         let mut writer_session_stop = self.session_stop.clone();
@@ -399,21 +399,6 @@ fn dispatch_available(
             } else {
                 Ok(Some(consumed))
             }
-        }
-        Err(ProtocolMessageError::InvalidHeader)
-        | Err(ProtocolMessageError::UnsupportedCompression)
-        | Err(ProtocolMessageError::CompressionDisabled) => {
-            // Match rippled: parseMessageHeader returning nullopt with 0 consumed.
-            // The read loop waits for more data. If this is a permanently
-            // unparseable stream, the peer will eventually be dropped by
-            // timeout or resource logic.
-            tracing::debug!(
-                target: "overlay",
-                peer_id = %handler.peer.id(),
-                first_byte = format!("0x{:02X}", buffer.first().copied().unwrap_or(0)),
-                "unparseable message header — waiting for more data"
-            );
-            Ok(None)
         }
         Err(e) => {
             tracing::warn!(

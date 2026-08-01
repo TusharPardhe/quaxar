@@ -1693,12 +1693,64 @@ fn run_start_mode_consensus_loop(
                             overlay_rt.overlay().sweep_relay_history(5000);
                         }
 
-                        // Ping every 60 seconds
-                        static LAST_PING_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        // OverlayImpl::sendEndpoints runs every second in rippled. Broadcast
+                        // from the live bootstrap timer at a less chatty 15-second cadence,
+                        // including this listener and currently discovered peers.
+                        static LAST_ENDPOINTS_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                         let now_secs = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
+                        let last_endpoints = LAST_ENDPOINTS_SECS.load(std::sync::atomic::Ordering::Relaxed);
+                        if now_secs.saturating_sub(last_endpoints) >= 15 {
+                            LAST_ENDPOINTS_SECS.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                            let peers = overlay_rt.overlay().active_peers();
+                            let listener_endpoint = overlay_rt
+                                .listener_setup()
+                                .map(|setup| format!("{}:{}", setup.ip, setup.port));
+                            let discovered_endpoints = peers
+                                .iter()
+                                .map(|peer| peer.remote_address())
+                                .collect::<std::collections::BTreeSet<_>>();
+
+                            for peer in &peers {
+                                let mut endpoints_v2 = Vec::with_capacity(
+                                    1 + discovered_endpoints.len().min(9),
+                                );
+                                if let Some(endpoint) = &listener_endpoint {
+                                    endpoints_v2.push(overlay::message::wire::tm_endpoints::TmEndpointv2 {
+                                        endpoint: endpoint.clone(),
+                                        hops: 0,
+                                    });
+                                }
+                                for endpoint in &discovered_endpoints {
+                                    if endpoint.ip() == peer.remote_address().ip()
+                                        || endpoints_v2.len() >= 10
+                                    {
+                                        continue;
+                                    }
+                                    endpoints_v2.push(overlay::message::wire::tm_endpoints::TmEndpointv2 {
+                                        endpoint: endpoint.to_string(),
+                                        hops: 1,
+                                    });
+                                }
+                                if !endpoints_v2.is_empty() {
+                                    let message = overlay::Message::new(
+                                        overlay::ProtocolMessage::new(
+                                            overlay::ProtocolPayload::Endpoints(overlay::TmEndpoints {
+                                                version: 2,
+                                                endpoints_v2,
+                                            }),
+                                        ),
+                                        None,
+                                    );
+                                    peer.send(message);
+                                }
+                            }
+                        }
+
+                        // Ping every 60 seconds
+                        static LAST_PING_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                         let last_ping = LAST_PING_SECS.load(std::sync::atomic::Ordering::Relaxed);
                         if now_secs.saturating_sub(last_ping) >= 60 {
                             LAST_PING_SECS.store(now_secs, std::sync::atomic::Ordering::Relaxed);

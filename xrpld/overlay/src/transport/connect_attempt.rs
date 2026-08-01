@@ -119,7 +119,7 @@ pub struct ConnectAttemptResult {
 }
 
 type VerifyResponse = Arc<
-    dyn Fn(&http::Response<()>, SocketAddr) -> Result<Arc<PeerImp>, ConnectAttemptError>
+    dyn Fn(&http::Response<()>, SocketAddr, &Uint256) -> Result<Arc<PeerImp>, ConnectAttemptError>
         + Send
         + Sync,
 >;
@@ -304,7 +304,7 @@ impl ConnectAttempt {
                 response.status().as_u16()
             )));
         }
-        let peer = (self.verify_response)(&response, self.remote_endpoint)?;
+        let peer = (self.verify_response)(&response, self.remote_endpoint, &shared_value)?;
 
         tracing::info!(
             target: "overlay",
