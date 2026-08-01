@@ -1144,9 +1144,12 @@ fn check_accept_and_advance(
 
     // ── tryAdvance publication ────────────────────────────────────────────
     root.try_advance_publication();
-    // doAdvance clears this only after a validated ledger has actually been
-    // published. Do not clear it for a no-op publication pass.
-    if root.published_ledger_seq() != published_before
+    // rippled LedgerMaster::doAdvance clears needNetworkLedger_ unconditionally
+    // after finding/publishing new validated ledgers (LedgerMaster.cpp:1945-1966).
+    // Clear whenever we have a validated published ledger, not only when this
+    // specific strand pass observed a publication delta (eliminates race with
+    // external validation paths publishing before the strand snapshots).
+    if root.need_network_ledger()
         && root
             .published_ledger()
             .is_some_and(|ledger| ledger.header().seq <= lm.valid_ledger_seq())
@@ -1186,11 +1189,11 @@ fn check_accept_and_advance(
         }
 
         // Connected/Tracking → Full when published ledger is fresh
+        // rippled (NetworkOPs.cpp:2219-2230) does NOT gate this on needNetworkLedger.
         if matches!(
             next_mode,
             NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Tracking
-        ) && !need_network
-        {
+        ) {
             // rippled (NetworkOPs.cpp:2226-2230): uses the current open ledger's
             // parentCloseTime (= LCL close time) and closeTimeResolution.
             // auto current = ledgerMaster_.getCurrentLedger();

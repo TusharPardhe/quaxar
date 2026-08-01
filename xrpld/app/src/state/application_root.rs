@@ -5768,22 +5768,20 @@ impl ApplicationRoot {
         let validated = Arc::new(l);
 
         // A successful quorum check is necessary but not sufficient for a
-        // visible validated transition: persistence must acknowledge the
-        // exact immutable ledger before it enters the validated/complete or
-        // application-facing slots. Otherwise a metadata failure leaves a
-        // false validated head that blocks retry and publication.
+        // rippled (LedgerMaster.cpp:973-984) marks the ledger validated/full
+        // and sets validated state immediately, then schedules persistence
+        // asynchronously. Failed saving is handled later by failedSave.
+        // Do not block visible promotion on persistence acknowledgement.
         use ledger::LedgerPersistenceRuntime;
-        if !self
-            .build_ledger_persistence_runtime()
-            .save_validated_ledger(Arc::clone(&validated), true)
-        {
+        let persistence_rt = self.build_ledger_persistence_runtime();
+        if !persistence_rt.save_validated_ledger(Arc::clone(&validated), true) {
             tracing::warn!(
                 target: "ledger",
                 seq = validated.header().seq,
                 hash = %validated.header().hash,
-                "failed to persist trusted validated ledger; visible promotion deferred"
+                "failed to persist validated ledger (will retry on next advance)"
             );
-            return;
+            // Continue with visible promotion regardless — matching rippled
         }
 
         lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);

@@ -2072,10 +2072,17 @@ fn serve_one_get_ledger_request(
             } else {
                 ledger.state_map()
             };
-            let fat_leaves = itype == 1; // fat for TX, not for AS
-            let depth = req.message.query_depth.unwrap_or(1);
+            let fat_leaves = true; // rippled: fatLeaves{true} for both liTX_NODE and liAS_NODE
+            let depth = req.message.query_depth.map(|d| d.min(3)).unwrap_or(1); // rippled: kMaxQueryDepth=3
+
+            // rippled kSoftMaxReplyNodes = 8192: stop processing requested
+            // node IDs once we've accumulated this many output nodes.
+            const SOFT_MAX_REPLY_NODES: usize = 8192;
 
             for node_id_bytes in &req.message.node_i_ds {
+                if nodes.len() >= SOFT_MAX_REPLY_NODES {
+                    break;
+                }
                 let Some(node_id) =
                     shamap::nodes::node_id::deserialize_shamap_node_id(node_id_bytes)
                 else {
