@@ -295,6 +295,16 @@ impl consensus::rcl_support::ValidationsAdaptor for RclValidationsAdaptor {
             return Some(RclValidatedLedger::from_ledger(&ledger));
         }
 
+        // Rippled's LedgerMaster::getLedgerByHash (LedgerMaster.cpp:1722-1724)
+        // also checks the actual closed-ledger slot as a fallback when the
+        // history cache misses. This handles the case where the ledger was
+        // swept from the TaggedCache but is still the node's current LCL.
+        if let Some(closed) = runtime.ledger_master().closed_ledger() {
+            if closed.header().hash.as_uint256() == ledger_id {
+                return Some(RclValidatedLedger::from_ledger(&closed));
+            }
+        }
+
         let requested_hash = *ledger_id;
         let acquire = move || {
             if let Some(guard) = runtime.inbound_ledgers.lock().ok()

@@ -617,8 +617,12 @@ fn strand_loop(
                 if persisted.acknowledged {
                     shared_inbound.acknowledge_completed(ledger.header().hash.as_uint256());
                 }
+                // Always register with the validations adaptor regardless of
+                // whether LedgerHistory already had this ledger. A ledger can
+                // be in LedgerHistory but absent from the adaptor's local map,
+                // which would leave check_acquired unable to resolve it.
+                root.validations().register_ledger(&ledger);
                 if persisted.inserted {
-                    root.validations().register_ledger(&ledger);
                     if let Some(ref tx) = event_tx {
                         let _ = tx.try_send(crate::consensus::driver::ConsensusEvent::LedgerDone(
                             Arc::clone(&ledger),
@@ -650,8 +654,8 @@ fn strand_loop(
                     if persisted.acknowledged {
                         shared_inbound.acknowledge_completed(ledger.header().hash.as_uint256());
                     }
+                    root.validations().register_ledger(&ledger);
                     if persisted.inserted {
-                        root.validations().register_ledger(&ledger);
                         if let Some(ref tx) = event_tx {
                             let _ =
                                 tx.try_send(crate::consensus::driver::ConsensusEvent::LedgerDone(
@@ -673,8 +677,8 @@ fn strand_loop(
                 if persisted.is_some_and(|result| result.acknowledged) {
                     shared_inbound.acknowledge_completed(ledger.header().hash.as_uint256());
                 }
+                root.validations().register_ledger(&ledger);
                 if persisted.is_some_and(|result| result.inserted) {
-                    root.validations().register_ledger(&ledger);
                     if let Some(ref tx) = event_tx {
                         let _ = tx
                             .try_send(crate::consensus::driver::ConsensusEvent::LedgerDone(ledger));
