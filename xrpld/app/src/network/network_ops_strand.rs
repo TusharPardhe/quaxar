@@ -845,13 +845,13 @@ fn reconcile_preferred_lcl(
     let _lcl_transition_guard = root.lcl_transition_gate().lock();
     let our_hash = *our_closed.header().hash.as_uint256();
     let parent_hash = *our_closed.header().parent_hash.as_uint256();
-    if !parent_hash.is_zero()
-        && root
-            .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(parent_hash))
-            .is_none()
-    {
-        return PreferredLclReconciliation::NoChange;
-    }
+    // NOTE: Rippled's checkLastClosedLedger (NetworkOPs.cpp:1902-2005) has NO
+    // local-parent-residency precondition. It always computes preferredLCL and
+    // attempts recovery regardless of whether the parent is locally cached.
+    // A previous gate here returned NoChange when the parent couldn't be
+    // resolved, which permanently blocked preferred-LCL recovery whenever
+    // the parent was swept from ledger_history (the common case during
+    // catch-up). Removed to match rippled.
 
     use overlay::Overlay;
     let peers = root
