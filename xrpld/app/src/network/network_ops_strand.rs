@@ -927,10 +927,10 @@ fn reconcile_preferred_lcl(
         root.resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash));
     let Some(candidate) = candidate else {
         // Rippled re-invokes InboundLedgers::acquire(hash, 0, CONSENSUS) on
-        // every endConsensus pass (NetworkOPs.cpp:1979-1981). The registry's
-        // by-hash deduplication handles idempotency. We must NOT gate here
-        // because a transient rejection (failure cooldown, attach ordering)
-        // self-heals on the next pass.
+        // every endConsensus pass (NetworkOPs.cpp:1979-1981) unconditionally.
+        // Deduplication happens INSIDE acquire(): ledgers_.find(hash) returns
+        // the existing entry without creating a new one. Our registry does
+        // the same via entries.get_mut(&hash). Match rippled exactly.
         shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
         shared_inbound.record_recovery_lcl_decision(
             preferred_hash,
