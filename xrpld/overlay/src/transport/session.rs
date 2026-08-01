@@ -83,7 +83,10 @@ impl PeerSessionStarter {
         let stream = self.stream.take().expect("peer session stream must exist");
         let stop_requested = self.stop_requested.clone();
         let (session_stop_tx, session_stop_rx) = watch::channel(false);
-        let (sender, receiver) = mpsc::channel(SEND_QUEUE_CAPACITY);
+        // rippled's sendQueue_ is unbounded (PeerImp.cpp:322 always pushes).
+        // Disconnection for sustained large queues is handled by the per-peer
+        // 60s timer (largeSendq_ over 4 ticks), not by refusing messages.
+        let (sender, receiver) = mpsc::unbounded_channel();
         let pending = peer.attach_session(sender.clone(), session_stop_tx);
         tracing::debug!(
             target: "overlay",
@@ -110,7 +113,7 @@ impl PeerSessionStarter {
 struct PeerSession {
     peer: Arc<PeerImp>,
     stream: Option<BoxPeerSessionStream>,
-    outbound: mpsc::Receiver<Message>,
+    outbound: mpsc::UnboundedReceiver<Message>,
     pending_outbound: Vec<Message>,
     stop_requested: watch::Receiver<bool>,
     session_stop: watch::Receiver<bool>,
@@ -166,7 +169,7 @@ impl PeerSession {
     fn new(
         peer: Arc<PeerImp>,
         stream: BoxPeerSessionStream,
-        outbound: mpsc::Receiver<Message>,
+        outbound: mpsc::UnboundedReceiver<Message>,
         pending_outbound: Vec<Message>,
         stop_requested: watch::Receiver<bool>,
         session_stop: watch::Receiver<bool>,
@@ -249,7 +252,7 @@ impl PeerSession {
         // messages, both running concurrently on the tokio runtime.
         let mut outbound_rx = std::mem::replace(
             &mut self.outbound,
-            mpsc::channel(1).1, // placeholder — won't be used
+            mpsc::unbounded_channel().1, // placeholder — won't be used
         );
         let mut writer_stop = self.stop_requested.clone();
         let mut writer_session_stop = self.session_stop.clone();

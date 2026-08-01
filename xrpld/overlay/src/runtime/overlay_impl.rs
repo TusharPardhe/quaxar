@@ -469,9 +469,10 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         &mut self,
         message: &crate::message::TmManifests,
     ) -> crate::router::RouteAction {
-        // Match PeerImp::onMessage(TMManifests): an empty batch is useless
-        // data, while batches over 100 entries impose a moderate burden but
-        // are still delivered for normal manifest processing.
+        // rippled 3.2.1: kMaxManifestsPerMessage = 200.
+        // Drop oversized TMManifests without penalty (unpatched peer tolerance).
+        const MAX_MANIFESTS_PER_MESSAGE: usize = 200;
+
         if message.list.is_empty() {
             self.peer.charge(
                 (*resource::FEE_USELESS_DATA).clone(),
@@ -479,11 +480,16 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             );
             return crate::router::RouteAction::Continue;
         }
-        if message.list.len() > 100 {
-            self.peer.charge(
-                (*resource::FEE_MODERATE_BURDEN_PEER).clone(),
-                "oversized manifests".to_owned(),
+        if message.list.len() > MAX_MANIFESTS_PER_MESSAGE {
+            // rippled 3.2.1: oversized messages dropped without penalty
+            tracing::debug!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                count = message.list.len(),
+                max = MAX_MANIFESTS_PER_MESSAGE,
+                "Dropping oversized TMManifests message"
             );
+            return crate::router::RouteAction::Continue;
         }
         tracing::debug!(
             target: "overlay",

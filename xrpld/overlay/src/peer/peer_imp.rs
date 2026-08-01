@@ -146,7 +146,7 @@ struct ListenerCheckState {
 #[derive(Default)]
 struct PeerOutboundState {
     queued_messages: Vec<Message>,
-    session_tx: Option<mpsc::Sender<Message>>,
+    session_tx: Option<mpsc::UnboundedSender<Message>>,
     session_stop: Option<watch::Sender<bool>>,
 }
 
@@ -314,10 +314,15 @@ impl PeerImp {
     }
 
     fn send_queue_size(&self) -> usize {
+        // With an unbounded send channel (matching rippled's unbounded sendQueue_),
+        // the queue size is not directly observable from the sender. The pre-session
+        // queue length is returned when no session is attached. The per-peer timer
+        // uses large_sendq counter (incremented when this returns >= TARGET) for
+        // sustained pressure detection, matching rippled's onTimer behavior.
         let outbound = self.outbound_state.lock().expect("peer outbound lock");
         outbound.session_tx.as_ref().map_or_else(
             || outbound.queued_messages.len(),
-            |sender| SEND_QUEUE_CAPACITY.saturating_sub(sender.capacity()),
+            |_sender| 0, // unbounded channel — pressure tracked by timer
         )
     }
 
@@ -577,7 +582,7 @@ impl PeerImp {
 
     pub fn attach_session(
         &self,
-        session_tx: mpsc::Sender<Message>,
+        session_tx: mpsc::UnboundedSender<Message>,
         session_stop: watch::Sender<bool>,
     ) -> Vec<Message> {
         let mut outbound_state = self.outbound_state.lock().expect("peer outbound lock");
@@ -805,26 +810,17 @@ impl Peer for PeerImp {
             session_tx
         };
 
-        match session_tx.try_send(message) {
+        // rippled's send() always pushes to the unbounded queue (PeerImp.cpp:322).
+        // Queue pressure is handled by the per-peer 60s timer (largeSendq_),
+        // not by refusing messages. Only closed channels cause disconnect.
+        match session_tx.send(message) {
             Ok(()) => {
                 // rippled resets largeSendq_ when sendq < kTargetSendQueue
-                // (PeerImp.cpp:304-311). Check remaining capacity.
-                let queued = SEND_QUEUE_CAPACITY - session_tx.capacity();
-                if queued < TARGET_SEND_QUEUE {
+                if self.send_queue_size() < TARGET_SEND_QUEUE {
                     self.large_sendq.store(0, Ordering::Release);
                 }
             }
-            Err(mpsc::error::TrySendError::Full(_)) if droppable => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!(
-                    target: "overlay",
-                    peer_id = %self.id,
-                    capacity = SEND_QUEUE_CAPACITY,
-                    "Send queue full for non-droppable message; disconnecting peer"
-                );
-                self.request_disconnect();
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => self.request_disconnect(),
+            Err(_) => self.request_disconnect(),
         }
     }
 

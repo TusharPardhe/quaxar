@@ -3761,9 +3761,16 @@ impl ApplicationRoot {
         let overlay = overlay_runtime.overlay();
         let manifests = Arc::clone(&self.registry.manifest_cache);
         overlay.set_manifests_message_provider(move || {
+            // rippled 3.2.1: kMaxManifestsPerMessage = 200, kMaxManifestBytes = 358.
+            // Cap outgoing manifest messages to prevent oversized TMManifests
+            // that updated peers would drop (manifest cache poisoning mitigation).
+            const MAX_MANIFESTS_PER_MESSAGE: usize = 200;
+            const MAX_MANIFEST_BYTES: usize = 358;
             let list = manifests
                 .serialized_manifests()
                 .into_iter()
+                .filter(|m| m.len() <= MAX_MANIFEST_BYTES)
+                .take(MAX_MANIFESTS_PER_MESSAGE)
                 .map(|stobject| overlay::message::wire::TmManifest { stobject })
                 .collect::<Vec<_>>();
             (!list.is_empty()).then(|| {
