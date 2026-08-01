@@ -2593,13 +2593,19 @@ fn configured_node_size_from_config(config: &BasicConfig) -> Option<String> {
 fn attach_bootstrap_node_family(root: &mut ApplicationRoot, node_size: Option<&str>) {
     if let Some(node_store) = root.node_store().clone() {
         let profile = crate::NodeSizeResourceProfile::for_node_size(node_size);
+        // rippled has ONE TreeNodeCache shared between NodeFamily and all
+        // InboundLedger acquisitions (Application.cpp:236, InboundLedger.cpp:236,
+        // SHAMap.cpp:1156,1168). Create it here and publish as shared_tree_cache
+        // so acquisitions reuse the same instance.
+        let tree_cache = Arc::new(TreeNodeCache::new(
+            "tree-node-cache",
+            profile.tree_cache_size,
+            time::Duration::seconds(profile.tree_cache_age_seconds),
+            MonotonicClock::default(),
+        ));
+        let _ = root.attach_shared_tree_cache(Arc::clone(&tree_cache));
         let family = crate::NodeFamily::new(SHAMapFamily::new(
-            Arc::new(TreeNodeCache::new(
-                "app-bootstrap-node-family",
-                profile.tree_cache_size,
-                time::Duration::seconds(profile.tree_cache_age_seconds),
-                MonotonicClock::default(),
-            )),
+            tree_cache,
             NullFullBelowCache::new(0),
             BootstrapNodeStoreFetcher::new(node_store),
             NullMissingNodeReporter,

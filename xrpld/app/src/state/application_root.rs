@@ -5315,9 +5315,11 @@ impl ApplicationRoot {
             // Sweep stale entries to bound RAM — without this, every closed
             // ledger accumulates indefinitely in the cache (~240KB each).
             runtime.ledger_master().ledger_history().sweep();
-            if let Some(node_family) = self.node_family() {
-                node_family.sweep();
-            }
+            // NOTE: rippled does NOT sweep NodeFamily on every closed ledger.
+            // NodeFamily::sweep() is called only from ApplicationImp::doSweep()
+            // which runs on the configured SweepInterval (60s for medium).
+            // See Application.cpp:982. Sweeping here caused premature eviction
+            // of tree nodes during initial sync (every 3-4s vs correct 60s).
             // Matches rippled's Validations::onLedger: pre-populate the
             // validations adaptor's local cache so `updateTrie` →
             // `acquire` doesn't need the slower ledger_history fallback.
