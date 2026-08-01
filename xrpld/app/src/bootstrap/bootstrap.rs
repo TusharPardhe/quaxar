@@ -1628,7 +1628,10 @@ fn run_start_mode_consensus_loop(
 
                     // Tick pending tx-set acquisitions (every ~1s now instead of 500ms)
                     if last_acquire_tick.elapsed() >= Duration::from_millis(500) {
-                        let mut guard = root.inbound_transactions().lock().expect("inbound_transactions mutex");
+                        let mut guard = root
+                            .inbound_transactions()
+                            .lock()
+                            .expect("inbound_transactions mutex");
                         guard.tick_pending_acquires();
                         last_acquire_tick = std::time::Instant::now();
                         hk_shared_inbound.sweep();
@@ -1668,13 +1671,15 @@ fn run_start_mode_consensus_loop(
                         use overlay::Overlay;
 
                         // check_tracking every tick (1s) — updates peer convergence state
-                        let valid_seq = root.ledger_master_runtime()
+                        let valid_seq = root
+                            .ledger_master_runtime()
                             .map(|lm_rt| lm_rt.ledger_master().valid_ledger_seq())
                             .unwrap_or(0);
                         overlay_rt.overlay().check_tracking(valid_seq);
 
                         // delete_idle_peers every 4 ticks (matching CHECK_IDLE_PEERS = 4)
-                        static IDLE_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        static IDLE_TICK: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
                         let tick = IDLE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if tick % 4 == 0 {
                             overlay_rt.overlay().delete_idle_peers();
@@ -1682,12 +1687,14 @@ fn run_start_mode_consensus_loop(
 
                         // relay_history sweep every 60s — prunes entries for disconnected peers
                         // preventing unbounded memory growth on long-lived nodes.
-                        static LAST_RELAY_SWEEP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        static LAST_RELAY_SWEEP: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
                         let now_secs = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        let last_sweep = LAST_RELAY_SWEEP.load(std::sync::atomic::Ordering::Relaxed);
+                        let last_sweep =
+                            LAST_RELAY_SWEEP.load(std::sync::atomic::Ordering::Relaxed);
                         if now_secs.saturating_sub(last_sweep) >= 60 {
                             LAST_RELAY_SWEEP.store(now_secs, std::sync::atomic::Ordering::Relaxed);
                             overlay_rt.overlay().sweep_relay_history(5000);
@@ -1696,14 +1703,17 @@ fn run_start_mode_consensus_loop(
                         // OverlayImpl::sendEndpoints runs every second in rippled. Broadcast
                         // from the live bootstrap timer at a less chatty 15-second cadence,
                         // including this listener and currently discovered peers.
-                        static LAST_ENDPOINTS_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        static LAST_ENDPOINTS_SECS: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
                         let now_secs = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        let last_endpoints = LAST_ENDPOINTS_SECS.load(std::sync::atomic::Ordering::Relaxed);
+                        let last_endpoints =
+                            LAST_ENDPOINTS_SECS.load(std::sync::atomic::Ordering::Relaxed);
                         if now_secs.saturating_sub(last_endpoints) >= 15 {
-                            LAST_ENDPOINTS_SECS.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                            LAST_ENDPOINTS_SECS
+                                .store(now_secs, std::sync::atomic::Ordering::Relaxed);
                             let peers = overlay_rt.overlay().active_peers();
                             let listener_endpoint = overlay_rt
                                 .listener_setup()
@@ -1714,14 +1724,15 @@ fn run_start_mode_consensus_loop(
                                 .collect::<std::collections::BTreeSet<_>>();
 
                             for peer in &peers {
-                                let mut endpoints_v2 = Vec::with_capacity(
-                                    1 + discovered_endpoints.len().min(9),
-                                );
+                                let mut endpoints_v2 =
+                                    Vec::with_capacity(1 + discovered_endpoints.len().min(9));
                                 if let Some(endpoint) = &listener_endpoint {
-                                    endpoints_v2.push(overlay::message::wire::tm_endpoints::TmEndpointv2 {
-                                        endpoint: endpoint.clone(),
-                                        hops: 0,
-                                    });
+                                    endpoints_v2.push(
+                                        overlay::message::wire::tm_endpoints::TmEndpointv2 {
+                                            endpoint: endpoint.clone(),
+                                            hops: 0,
+                                        },
+                                    );
                                 }
                                 for endpoint in &discovered_endpoints {
                                     if endpoint.ip() == peer.remote_address().ip()
@@ -1729,18 +1740,22 @@ fn run_start_mode_consensus_loop(
                                     {
                                         continue;
                                     }
-                                    endpoints_v2.push(overlay::message::wire::tm_endpoints::TmEndpointv2 {
-                                        endpoint: endpoint.to_string(),
-                                        hops: 1,
-                                    });
+                                    endpoints_v2.push(
+                                        overlay::message::wire::tm_endpoints::TmEndpointv2 {
+                                            endpoint: endpoint.to_string(),
+                                            hops: 1,
+                                        },
+                                    );
                                 }
                                 if !endpoints_v2.is_empty() {
                                     let message = overlay::Message::new(
                                         overlay::ProtocolMessage::new(
-                                            overlay::ProtocolPayload::Endpoints(overlay::TmEndpoints {
-                                                version: 2,
-                                                endpoints_v2,
-                                            }),
+                                            overlay::ProtocolPayload::Endpoints(
+                                                overlay::TmEndpoints {
+                                                    version: 2,
+                                                    endpoints_v2,
+                                                },
+                                            ),
                                         ),
                                         None,
                                     );
@@ -1749,32 +1764,9 @@ fn run_start_mode_consensus_loop(
                             }
                         }
 
-                        // Ping every 60 seconds
-                        static LAST_PING_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                        let last_ping = LAST_PING_SECS.load(std::sync::atomic::Ordering::Relaxed);
-                        if now_secs.saturating_sub(last_ping) >= 60 {
-                            LAST_PING_SECS.store(now_secs, std::sync::atomic::Ordering::Relaxed);
-                            let peers = overlay_rt.overlay().active_peers();
-                            let ping_msg = overlay::ProtocolMessage::new(
-                                overlay::ProtocolPayload::Ping(overlay::message::wire::TmPing {
-                                    r#type: 0,
-                                    seq: Some(basics::random::rand_int_to(u32::MAX)),
-                                    ping_time: Some(
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_millis() as u64,
-                                    ),
-                                    net_time: None,
-                                }),
-                            );
-                            let wire = overlay::Message::new(ping_msg, None);
-                            for p in &peers {
-                                p.send(wire.clone());
-                            }
-                            overlay_rt.overlay().delete_idle_peers();
-                            tracing::debug!(target: "overlay", peer_count = peers.len(), "Ping sent to all peers");
-                        }
+                        // Per-peer PeerImp timers send cookie-bound pings and
+                        // enforce the matching timeout. Do not duplicate that
+                        // lifecycle in this global housekeeping loop.
                     }
 
                     // Drain accepted manifest updates, install them in the shared
@@ -1805,12 +1797,12 @@ fn run_start_mode_consensus_loop(
 
                         if !relay_list.is_empty() {
                             let message = overlay::Message::new(
-                                overlay::ProtocolMessage::new(
-                                    overlay::ProtocolPayload::Manifests(overlay::TmManifests {
+                                overlay::ProtocolMessage::new(overlay::ProtocolPayload::Manifests(
+                                    overlay::TmManifests {
                                         list: relay_list,
                                         ..Default::default()
-                                    }),
-                                ),
+                                    },
+                                )),
                                 None,
                             );
                             for peer in overlay_rt.overlay().active_peers() {
@@ -2274,9 +2266,6 @@ const COST_BAND_MEDIUM: u32 = 100;
 /// Surcharge for large requests (>1024 objects).
 const COST_BAND_LARGE: u32 = 1000;
 
-/// If the computed cost exceeds this threshold, charge and warn about the peer.
-const DROP_THRESHOLD: u32 = 25_000;
-
 /// Serve a generic GetObjectByHash query from a peer (matching rippled processGetObjectByHash).
 ///
 /// Looks up each requested hash in the node store, tracks hits/misses, applies
@@ -2300,6 +2289,12 @@ fn serve_get_object_by_hash_request(
             limit = HARD_MAX_REPLY_NODES,
             "GetObjectByHash: oversized request rejected"
         );
+        if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
+            peer.charge(
+                (*resource::FEE_MALFORMED_REQUEST).clone(),
+                "GetObjectByHash oversized request".to_owned(),
+            );
+        }
         return;
     }
 
@@ -2362,14 +2357,14 @@ fn serve_get_object_by_hash_request(
     let cost =
         billable_hits * COST_PER_LOOKUP_HIT + billable_misses * COST_PER_LOOKUP_MISS + size_band;
 
-    if cost > DROP_THRESHOLD {
+    if cost > resource::DROP_THRESHOLD as u32 {
         tracing::warn!(target: "overlay",
             peer_id = req.peer_id,
             requested,
             hits,
             misses,
             cost,
-            threshold = DROP_THRESHOLD,
+            threshold = resource::DROP_THRESHOLD,
             "GetObjectByHash: cost exceeds drop threshold, charging peer"
         );
         if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
@@ -2377,7 +2372,6 @@ fn serve_get_object_by_hash_request(
                 resource::Charge::new(cost as i32, "GetObjectByHash excessive cost"),
                 "GetObjectByHash cost exceeded drop threshold".to_owned(),
             );
-            overlay_rt.overlay().inc_peer_disconnect_charges();
         }
         return;
     }

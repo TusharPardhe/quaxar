@@ -15,6 +15,7 @@ use protocol::{
     AccountID, JsonValue, KeyType, PublicKey, STAmount, STTx, STValidation, SecretKey,
     VF_FULL_VALIDATION, calc_node_id, derive_public_key, get_field_by_symbol,
 };
+use resource::Charge;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
@@ -143,6 +144,79 @@ fn peer(id: u32, seed: u8) -> Arc<PeerImp> {
         validator(seed),
         format!("peer-{id}"),
     )
+}
+
+fn inbound_peer(id: u32, seed: u8) -> Arc<PeerImp> {
+    PeerImp::new_with_inbound(
+        id,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51235 + id as u16),
+        true,
+        validator(seed),
+        format!("inbound-peer-{id}"),
+    )
+}
+
+fn directional_default_setup() -> Setup {
+    Setup {
+        peer_limit: 21,
+        want_incoming: true,
+        ..test_setup()
+    }
+}
+
+#[test]
+fn default_rippled_budget_inbound_exhaustion_does_not_block_outbound() {
+    let overlay =
+        OverlayImpl::new(directional_default_setup(), Arc::new(TestHandoff)).expect("overlay");
+    assert_eq!(
+        overlay.peer_limits(),
+        crate::overlay::PeerLimits {
+            max_peers: 21,
+            inbound_max: 11,
+            outbound_max: 10,
+        }
+    );
+
+    let inbound = (0..11)
+        .map(|index| inbound_peer(100 + index, 100 + index as u8))
+        .collect::<Vec<_>>();
+    for peer in &inbound {
+        assert!(overlay.activate(Arc::clone(peer)));
+    }
+    assert!(!overlay.activate(inbound_peer(111, 111)));
+    assert_eq!(overlay.active_inbound_peers_count(), 11);
+    assert_eq!(overlay.active_outbound_peers_count(), 0);
+
+    // `Counts::canActivate` compares only outActive/outMax for an outbound
+    // slot, so an exhausted inbound budget cannot block this peer.
+    assert!(overlay.activate(peer(200, 200)));
+    assert_eq!(overlay.active_outbound_peers_count(), 1);
+
+    // Deactivation removes the direction-specific slot and immediately frees
+    // one inbound admission, matching Counts::remove(Active).
+    overlay.on_peer_deactivate(inbound[0].id());
+    assert_eq!(overlay.active_inbound_peers_count(), 10);
+    assert!(overlay.activate(inbound_peer(112, 112)));
+    assert_eq!(overlay.active_inbound_peers_count(), 11);
+}
+
+#[test]
+fn default_rippled_budget_outbound_exhaustion_does_not_block_inbound() {
+    let overlay =
+        OverlayImpl::new(directional_default_setup(), Arc::new(TestHandoff)).expect("overlay");
+    assert_eq!(overlay.peer_limits().outbound_max, 10);
+    assert_eq!(overlay.peer_limits().inbound_max, 11);
+
+    for index in 0..10 {
+        assert!(overlay.activate(peer(220 + index, 120 + index as u8)));
+    }
+    assert!(!overlay.activate(peer(230, 130)));
+    assert_eq!(overlay.active_outbound_peers_count(), 10);
+    assert_eq!(overlay.active_inbound_peers_count(), 0);
+
+    // `Counts::canActivate` compares only inActive/inMax for an inbound slot.
+    assert!(overlay.activate(inbound_peer(240, 140)));
+    assert_eq!(overlay.active_inbound_peers_count(), 1);
 }
 
 /// Drop an overlay safely from within an async test context.
@@ -484,6 +558,8 @@ fn activate_enforces_peer_limit_for_unreserved_peers_only() {
         Setup {
             ip_limit: 99,
             peer_limit: 1,
+            peer_limit_in: Some(0),
+            peer_limit_out: Some(1),
             ..test_setup()
         },
         Arc::new(TestHandoff),
@@ -509,7 +585,8 @@ fn activate_enforces_peer_limit_for_unreserved_peers_only() {
 
     assert!(overlay.activate(Arc::clone(&reserved)));
     assert!(overlay.activate(Arc::clone(&clustered)));
-    assert_eq!(overlay.limit(), 1);
+    // rippled: config.maxPeers = 0 when explicit in/out limits are set
+    assert_eq!(overlay.limit(), 0);
     assert_eq!(overlay.size(), 3);
     assert!(reserved.reserved());
     assert!(clustered.cluster());
@@ -562,6 +639,8 @@ fn activate_enforces_peer_limit_for_fixed_peers_slots() {
     let overlay = OverlayImpl::new(
         Setup {
             peer_limit: 1,
+            peer_limit_in: Some(0),
+            peer_limit_out: Some(1),
             fixed_peer_ips: HashSet::from([IpAddr::V4(Ipv4Addr::new(127, 0, 0, 99))]),
             ..test_setup()
         },
@@ -579,9 +658,10 @@ fn activate_enforces_peer_limit_for_fixed_peers_slots() {
     assert!(overlay.activate(Arc::clone(&counted)));
     assert!(overlay.activate(Arc::clone(&fixed)));
     assert!(fixed.fixed());
-    assert_eq!(overlay.limit(), 1);
+    // rippled: config.maxPeers = 0 when explicit in/out limits are set
+    assert_eq!(overlay.limit(), 0);
     assert_eq!(overlay.size(), 2);
-    assert_eq!(overlay.counted_active_peers_count(), 1);
+    assert_eq!(overlay.active_outbound_peers_count(), 1);
 }
 
 #[test]
@@ -625,6 +705,8 @@ fn refresh_membership_state_drops_excess_peers_after_reservation_loss() {
     let overlay = OverlayImpl::new(
         Setup {
             peer_limit: 1,
+            peer_limit_in: Some(0),
+            peer_limit_out: Some(1),
             ..test_setup()
         },
         Arc::new(TestHandoff),
@@ -649,6 +731,29 @@ fn refresh_membership_state_drops_excess_peers_after_reservation_loss() {
     assert!(!reserved.reserved());
     assert!(overlay.find_peer_by_short_id(first.id()).is_some());
     assert!(overlay.find_peer_by_short_id(reserved.id()).is_none());
+}
+
+#[test]
+fn resource_drop_charge_disconnects_and_deactivates_peer() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    let charged = peer(40, 80);
+
+    assert!(overlay.activate(Arc::clone(&charged)));
+    assert!(charged.lifecycle_timer_active());
+    charged.charge(
+        Charge::new(800_001, "resource drop test"),
+        "sustained abusive peer load".to_owned(),
+    );
+
+    assert!(charged.disconnect_requested());
+    assert_eq!(overlay.peer_disconnect_charges(), 1);
+    assert_eq!(
+        overlay.size(),
+        0,
+        "disconnect request must prune active peer"
+    );
+    assert!(!charged.lifecycle_timer_active());
+    assert_eq!(overlay.peer_disconnect(), 1);
 }
 
 #[test]
@@ -696,6 +801,8 @@ fn finalize_connected_peer_rejects_unreserved_peer_when_limit_is_full() {
     let overlay = OverlayImpl::new(
         Setup {
             peer_limit: 1,
+            peer_limit_in: Some(0),
+            peer_limit_out: Some(1),
             ..test_setup()
         },
         Arc::new(TestHandoff),

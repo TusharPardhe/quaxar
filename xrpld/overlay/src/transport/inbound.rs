@@ -515,6 +515,11 @@ impl QueuedOverlayInboundHandler {
         )
     }
 
+    /// Drain only accepted endpoint messages for PeerFinder's livecache.
+    pub fn take_endpoints(&self) -> Vec<QueuedEndpoints> {
+        std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").endpoints)
+    }
+
     pub fn take_transactions(&self) -> Vec<QueuedTransaction> {
         std::mem::take(
             &mut self

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use crate::Compressed;
 use crate::message::{
@@ -14,6 +15,7 @@ use crate::message::{
 use crate::overlay_impl::OverlayError;
 use crate::peer::{Peer, PeerId};
 use crate::peer_imp::{PeerImp, SEND_QUEUE_CAPACITY};
+use crate::tuning::{READ_ACTIVITY_DEADLINE, WRITE_DEADLINE};
 
 pub trait PeerSessionStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -238,7 +240,7 @@ impl PeerSession {
 
         // Send any pending outbound messages before splitting
         for message in self.pending_outbound.drain(..) {
-            write_message(&mut writer, &message, compression).await?;
+            write_message_with_deadline(&mut writer, &message, compression).await?;
         }
 
         // Spawn a dedicated writer task — runs independently from the reader.
@@ -265,12 +267,12 @@ impl PeerSession {
                         break;
                     }
                     Some(message) = outbound_rx.recv() => {
-                        if write_message(&mut writer, &message, compression).await.is_err() {
+                        if write_message_with_deadline(&mut writer, &message, compression).await.is_err() {
                             break;
                         }
                         // Drain remaining outbound in one batch
                         while let Ok(message) = outbound_rx.try_recv() {
-                            if write_message(&mut writer, &message, compression).await.is_err() {
+                            if write_message_with_deadline(&mut writer, &message, compression).await.is_err() {
                                 // Signal reader that writer is dead
                                 let _ = writer_dead_tx.send(true);
                                 return;
@@ -296,7 +298,7 @@ impl PeerSession {
                 }
 
                 tokio::select! {
-                    result = read_message(&mut reader, &mut buffer) => {
+                    result = read_message_with_deadline(&mut reader, &mut buffer) => {
                         match result? {
                             ReadOutcome::EndOfStream => break,
                             ReadOutcome::Progress => {}
@@ -448,6 +450,36 @@ where
     writer.write_all(bytes).await.map_err(OverlayError::Io)?;
     writer.flush().await.map_err(OverlayError::Io)?;
     Ok(())
+}
+
+async fn write_message_with_deadline<W>(
+    writer: &mut W,
+    message: &Message,
+    compression_enabled: bool,
+) -> Result<(), OverlayError>
+where
+    W: AsyncWrite + Unpin,
+{
+    timeout(
+        WRITE_DEADLINE,
+        write_message(writer, message, compression_enabled),
+    )
+    .await
+    .map_err(|_| OverlayError::InvalidRequest("session write deadline exceeded".to_owned()))?
+}
+
+async fn read_message_with_deadline<R>(
+    reader: &mut R,
+    buffer: &mut Vec<u8>,
+) -> Result<ReadOutcome, OverlayError>
+where
+    R: AsyncRead + Unpin,
+{
+    timeout(READ_ACTIVITY_DEADLINE, read_message(reader, buffer))
+        .await
+        .map_err(|_| {
+            OverlayError::InvalidRequest("session read activity deadline exceeded".to_owned())
+        })?
 }
 
 fn session_error(error: ProtocolMessageError) -> OverlayError {

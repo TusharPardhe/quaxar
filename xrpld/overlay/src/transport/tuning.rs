@@ -1,5 +1,18 @@
 //! Overlay tuning constants mirrored from `detail/Tuning.h`.
 
+use std::time::Duration;
+
+/// `PeerImp.cpp` schedules each active peer's timer at this cadence.
+pub const PEER_TIMER_INTERVAL: Duration = Duration::from_secs(60);
+/// Outbound peers may not remain in the Not Useful diverged state indefinitely.
+pub const MAX_DIVERGED_TIME: Duration = Duration::from_secs(300);
+/// Outbound peers that never establish useful tracking are eventually dropped.
+pub const MAX_UNKNOWN_TIME: Duration = Duration::from_secs(600);
+/// A write must not permanently pin a session task. This is one peer timer interval.
+pub const WRITE_DEADLINE: Duration = PEER_TIMER_INTERVAL;
+/// Reads permit a full ping request/response interval before considering the session idle.
+pub const READ_ACTIVITY_DEADLINE: Duration = Duration::from_secs(120);
+
 pub const CONVERGED_LEDGER_LIMIT: usize = 24;
 pub const DIVERGED_LEDGER_LIMIT: usize = 128;
 pub const SOFT_MAX_REPLY_NODES: usize = 8192;

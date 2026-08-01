@@ -4,7 +4,7 @@ use resource::{
     FEE_INVALID_DATA, FEE_INVALID_SIGNATURE, FEE_LOG_AS_DEBUG, FEE_LOG_AS_INFO, FEE_LOG_AS_WARN,
     FEE_MALFORMED_REQUEST, FEE_MALFORMED_RPC, FEE_MEDIUM_BURDEN_RPC, FEE_MODERATE_BURDEN_PEER,
     FEE_REFERENCE_RPC, FEE_REQUEST_NO_REPLY, FEE_TRIVIAL_PEER, FEE_USELESS_DATA, FEE_WARNING,
-    Gossip, GossipItem, JournalLevel, NullCollector, ResourceJournal, ResourceManager,
+    Gossip, GossipItem, JournalLevel, NullCollector, NullJournal, ResourceJournal, ResourceManager,
     make_manager,
 };
 use std::sync::{Arc, Mutex};
@@ -111,6 +111,29 @@ fn charge_log_cutoffs_match_cpp_logic() {
         JournalLevel::Warn,
         "Charging IP Address: 127.0.0.1:0 for warn ($3000) (warn ctx)"
     ));
+}
+
+#[test]
+fn charge_decay_recovers_before_a_later_drop() {
+    let start = Instant::now();
+    let clock = Arc::new(ManualStopwatch::new(start));
+    let manager = new_manager_with_clock(clock.clone(), Arc::new(NullJournal));
+    let consumer =
+        manager.new_inbound_endpoint("127.0.0.1:51234".parse().expect("endpoint should parse"));
+
+    assert_eq!(
+        consumer.charge(Charge::new(160_000, "temporary burst")),
+        Disposition::Warn
+    );
+    clock.advance(Duration::from_secs(200));
+    assert_eq!(consumer.disposition(), Disposition::Ok);
+    assert_eq!(consumer.balance(), 0);
+
+    assert_eq!(
+        consumer.charge(Charge::new(800_001, "sustained abuse")),
+        Disposition::Drop
+    );
+    assert!(consumer.disconnect_with_manager_journal());
 }
 
 #[test]

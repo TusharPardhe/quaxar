@@ -18,9 +18,9 @@ use basics::make_ssl_context::{
 use overlay::{Handoff, Overlay, OverlayHandoff, OverlayImpl, Peer, Setup};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use std::collections::BTreeSet;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -32,13 +32,16 @@ pub const CRAWL_OPTION_SERVER_COUNTS: u32 = 1 << 2;
 pub const CRAWL_OPTION_UNL: u32 = 1 << 3;
 
 const DEFAULT_REDUCE_RELAY_WAIT: Duration = Duration::from_secs(600);
-const PEERFINDER_OUT_PERCENT: usize = 15;
-const PEERFINDER_MIN_OUTBOUND: usize = 10;
 const PEERFINDER_MAX_CONNECT_ATTEMPTS: usize = 20;
+const PEERFINDER_MAX_REDIRECTS: usize = 30;
+const PEERFINDER_MAX_HOPS: u32 = 6;
+const PEERFINDER_BOOTCACHE_SIZE: usize = 1_000;
+const PEERFINDER_BOOTCACHE_PRUNE_PERCENT: usize = 10;
+const PEERFINDER_BOOTCACHE_UPDATE_COOLDOWN: Duration = Duration::from_secs(60);
+const PEERFINDER_LIVECACHE_TTL: Duration = Duration::from_secs(30);
 const PEERFINDER_RECENT_ATTEMPT_DURATION: Duration = Duration::from_secs(60);
 const BOOTCACHE_STATIC_VALENCE: i32 = 32;
 const DEFAULT_PEER_PORT: u16 = 51235;
-const DEFAULT_PEER_LIMIT: usize = 21;
 const FIXED_CONNECTION_BACKOFF_MINUTES: [u64; 10] = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55];
 const DEFAULT_BOOTSTRAP_PEER_ENDPOINTS: [&str; 4] = [
     "r.ripple.com:51235",
@@ -47,20 +50,263 @@ const DEFAULT_BOOTSTRAP_PEER_ENDPOINTS: [&str; 4] = [
     "hub.xrpl-commons.org:51235",
 ];
 
+#[cfg(test)]
 fn peerfinder_outbound_target(peer_limit: usize, want_incoming: bool) -> usize {
-    if peer_limit == 0 {
-        return 0;
+    Setup {
+        peer_limit,
+        want_incoming,
+        ..Setup::default()
     }
-    if !want_incoming {
-        return peer_limit;
-    }
-    let computed = ((peer_limit * PEERFINDER_OUT_PERCENT) + 50) / 100;
-    peer_limit.min(computed.max(PEERFINDER_MIN_OUTBOUND))
+    .peer_limits()
+    .outbound_max
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BootcacheEntry {
     valence: i32,
+}
+
+/// The non-persistent half of rippled's `Livecache`: endpoint advertisements
+/// are retained for `kLiveCacheSecondsToLive`, with a lower hop count replacing
+/// a higher hop count and higher-hop duplicates left untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LivecacheEntry {
+    hops: u32,
+    seen_at: Instant,
+}
+
+/// The active PeerFinder cache owner. This is intentionally local to the
+/// overlay task: SQLite work receives immutable snapshots via `spawn_blocking`,
+/// so neither peer transport nor cache mutation waits on database I/O.
+#[derive(Debug)]
+struct PeerfinderCaches {
+    bootcache: HashMap<SocketAddr, BootcacheEntry>,
+    livecache: HashMap<SocketAddr, LivecacheEntry>,
+    needs_update: bool,
+    when_update: Instant,
+}
+
+impl PeerfinderCaches {
+    fn loaded(entries: Vec<rdb::PeerFinderBootcacheEntry>, now: Instant) -> Self {
+        let mut cache = Self {
+            bootcache: HashMap::new(),
+            livecache: HashMap::new(),
+            // `Bootcache::load` calls `clear`, which flags the cache. The
+            // following one-second periodic activity canonicalizes even an
+            // unchanged store, exactly as rippled does.
+            needs_update: true,
+            when_update: now,
+        };
+        for entry in entries {
+            if let Ok(endpoint) = entry.address.parse::<SocketAddr>()
+                && !endpoint.ip().is_unspecified()
+            {
+                cache.bootcache.insert(
+                    endpoint,
+                    BootcacheEntry {
+                        valence: entry.valence,
+                    },
+                );
+            }
+        }
+        cache.prune_bootcache();
+        cache
+    }
+
+    fn entries(&self) -> Vec<rdb::PeerFinderBootcacheEntry> {
+        let mut entries = self
+            .bootcache
+            .iter()
+            .map(|(endpoint, entry)| rdb::PeerFinderBootcacheEntry {
+                address: endpoint.to_string(),
+                valence: entry.valence,
+            })
+            .collect::<Vec<_>>();
+        // Storage does not define a read order; a stable snapshot makes the
+        // SQLite rewrite and regression tests deterministic without changing
+        // PeerFinder's valence-based connection ordering.
+        entries.sort_by(|left, right| left.address.cmp(&right.address));
+        entries
+    }
+
+    fn prune_bootcache(&mut self) {
+        if self.bootcache.len() <= PEERFINDER_BOOTCACHE_SIZE {
+            return;
+        }
+        let prune_count = (self.bootcache.len() * PEERFINDER_BOOTCACHE_PRUNE_PERCENT) / 100;
+        let mut worst = self
+            .bootcache
+            .iter()
+            .map(|(endpoint, entry)| (*endpoint, entry.valence))
+            .collect::<Vec<_>>();
+        // `Bootcache`'s bimap is ordered by descending valence and erases
+        // backward from end; therefore remove the lowest valences first.
+        worst.sort_by(|(left_endpoint, left), (right_endpoint, right)| {
+            left.cmp(right)
+                .then_with(|| left_endpoint.cmp(right_endpoint))
+        });
+        for (endpoint, _) in worst.into_iter().take(prune_count) {
+            self.bootcache.remove(&endpoint);
+        }
+    }
+
+    fn insert_bootcache(&mut self, endpoint: SocketAddr) -> bool {
+        let inserted = match self.bootcache.entry(endpoint) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(BootcacheEntry { valence: 0 });
+                true
+            }
+        };
+        if inserted {
+            self.prune_bootcache();
+            self.flag_for_update();
+        }
+        inserted
+    }
+
+    fn insert_static_bootcache(&mut self, endpoint: SocketAddr) -> bool {
+        match self.bootcache.get_mut(&endpoint) {
+            Some(entry) if entry.valence >= BOOTCACHE_STATIC_VALENCE => false,
+            Some(entry) => {
+                entry.valence = BOOTCACHE_STATIC_VALENCE;
+                self.flag_for_update();
+                true
+            }
+            None => {
+                self.bootcache.insert(
+                    endpoint,
+                    BootcacheEntry {
+                        valence: BOOTCACHE_STATIC_VALENCE,
+                    },
+                );
+                self.prune_bootcache();
+                self.flag_for_update();
+                true
+            }
+        }
+    }
+
+    fn on_success(&mut self, endpoint: SocketAddr) {
+        match self.bootcache.entry(endpoint) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(BootcacheEntry { valence: 1 });
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let valence = entry.get().valence;
+                entry.get_mut().valence = valence.max(0).saturating_add(1);
+            }
+        }
+        self.prune_bootcache();
+        self.flag_for_update();
+    }
+
+    fn on_failure(&mut self, endpoint: SocketAddr) {
+        match self.bootcache.entry(endpoint) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(BootcacheEntry { valence: -1 });
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let valence = entry.get().valence;
+                entry.get_mut().valence = valence.min(0).saturating_sub(1);
+            }
+        }
+        self.prune_bootcache();
+        self.flag_for_update();
+    }
+
+    fn on_redirects<I>(&mut self, endpoints: I)
+    where
+        I: IntoIterator<Item = SocketAddr>,
+    {
+        for endpoint in endpoints.into_iter().take(PEERFINDER_MAX_REDIRECTS) {
+            self.insert_bootcache(endpoint);
+        }
+    }
+
+    fn on_learned_endpoint(&mut self, endpoint: SocketAddr, hops: u32, now: Instant) {
+        if hops > PEERFINDER_MAX_HOPS + 1 {
+            return;
+        }
+        match self.livecache.get_mut(&endpoint) {
+            Some(existing) if hops > existing.hops => return,
+            Some(existing) => {
+                existing.hops = hops.min(existing.hops);
+                existing.seen_at = now;
+            }
+            None => {
+                self.livecache
+                    .insert(endpoint, LivecacheEntry { hops, seen_at: now });
+            }
+        }
+        self.insert_bootcache(endpoint);
+    }
+
+    fn expire_livecache(&mut self, now: Instant) {
+        self.livecache.retain(|_, entry| {
+            now.saturating_duration_since(entry.seen_at) <= PEERFINDER_LIVECACHE_TTL
+        });
+    }
+
+    fn select_livecache(
+        &self,
+        connected_ips: &BTreeSet<IpAddr>,
+        recent_attempts: &HashMap<IpAddr, Instant>,
+        now: Instant,
+        max_attempts: usize,
+    ) -> Vec<SocketAddr> {
+        let mut candidates = self
+            .livecache
+            .iter()
+            .filter_map(|(endpoint, entry)| {
+                (!connected_ips.contains(&endpoint.ip())
+                    && recent_attempts
+                        .get(&endpoint.ip())
+                        .is_none_or(|until| *until <= now))
+                .then_some((*endpoint, *entry))
+            })
+            .collect::<Vec<_>>();
+        // `Logic::autoconnect` hands out the reverse hop histogram, so the
+        // max-hop bucket is tried before nearer buckets within a batch.
+        candidates.sort_by(|(left_endpoint, left), (right_endpoint, right)| {
+            right
+                .hops
+                .cmp(&left.hops)
+                .then_with(|| left_endpoint.cmp(right_endpoint))
+        });
+
+        let mut selected = Vec::new();
+        let mut seen_ips = connected_ips.clone();
+        for (endpoint, _) in candidates {
+            if seen_ips.insert(endpoint.ip()) {
+                selected.push(endpoint);
+            }
+            if selected.len() >= max_attempts {
+                break;
+            }
+        }
+        selected
+    }
+
+    fn flag_for_update(&mut self) {
+        self.needs_update = true;
+    }
+
+    fn take_update_if_due(
+        &mut self,
+        now: Instant,
+        force: bool,
+    ) -> Option<Vec<rdb::PeerFinderBootcacheEntry>> {
+        // rippled: whenUpdate_ < now (strict; update only when deadline is
+        // strictly in the past). Block when when_update >= now.
+        if !self.needs_update || (!force && self.when_update >= now) {
+            return None;
+        }
+        let entries = self.entries();
+        self.needs_update = false;
+        self.when_update = now + PEERFINDER_BOOTCACHE_UPDATE_COOLDOWN;
+        Some(entries)
+    }
 }
 
 fn bootstrap_needs_bootcache_dial(
@@ -242,6 +488,7 @@ pub struct AppOverlayRuntime {
     listener_setup: Option<ServerPortOverlaySetup>,
     fixed_peer_endpoints: Vec<String>,
     bootstrap_peer_endpoints: Vec<String>,
+    peerfinder_bootcache_path: Option<PathBuf>,
     network_ops_mode_owner: Option<AppNetworkOpsModeOwner>,
     status_rpc_state: Option<Arc<StatusRpcState>>,
     listener_task: Mutex<Option<tokio::task::JoinHandle<Result<(), overlay::OverlayError>>>>,
@@ -257,6 +504,7 @@ impl std::fmt::Debug for AppOverlayRuntime {
             .field("listener_setup", &self.listener_setup)
             .field("fixed_peer_endpoints", &self.fixed_peer_endpoints)
             .field("bootstrap_peer_endpoints", &self.bootstrap_peer_endpoints)
+            .field("peerfinder_bootcache_path", &self.peerfinder_bootcache_path)
             .field("started", &self.started())
             .field("stopped", &self.stopped())
             .finish()
@@ -269,6 +517,7 @@ impl AppOverlayRuntime {
         listener_setup: Option<ServerPortOverlaySetup>,
         fixed_peer_endpoints: Vec<String>,
         bootstrap_peer_endpoints: Vec<String>,
+        peerfinder_bootcache_path: Option<PathBuf>,
         network_ops_mode_owner: Option<AppNetworkOpsModeOwner>,
         status_rpc_state: Option<Arc<StatusRpcState>>,
     ) -> Self {
@@ -277,6 +526,7 @@ impl AppOverlayRuntime {
             listener_setup,
             fixed_peer_endpoints,
             bootstrap_peer_endpoints,
+            peerfinder_bootcache_path,
             network_ops_mode_owner,
             status_rpc_state,
             listener_task: Mutex::new(None),
@@ -353,201 +603,22 @@ impl ManagedComponent for AppOverlayRuntime {
                 .expect("overlay listener task mutex must not be poisoned") = Some(task);
         }
 
-        if !self.bootstrap_peer_endpoints.is_empty() || !self.fixed_peer_endpoints.is_empty() {
-            let overlay = Arc::clone(&self.overlay);
-            let fixed_endpoints = self.fixed_peer_endpoints.clone();
-            let endpoints = self.bootstrap_peer_endpoints.clone();
-            let network_ops_mode_owner = self.network_ops_mode_owner.clone();
-            let status_rpc_state = self.status_rpc_state.clone();
-            let target_outbound_peers =
-                peerfinder_outbound_target(overlay.limit(), self.listener_setup.is_some());
-            runtime_handle.spawn(async move {
-                let mut bootcache = HashMap::<SocketAddr, BootcacheEntry>::new();
-                let mut recent_bootcache_attempts = HashMap::<IpAddr, Instant>::new();
-                let mut fixed_retry_state = HashMap::<SocketAddr, (usize, Instant)>::new();
-                loop {
-                    if overlay.is_stopping() {
-                        return;
-                    }
-
-                    refresh_peer_count_and_operating_mode(
-                        overlay.as_ref(),
-                        status_rpc_state.as_ref(),
-                        network_ops_mode_owner.as_ref(),
-                    );
-
-                    let mut connected_this_cycle = false;
-                    let now = Instant::now();
-                    if !fixed_endpoints.is_empty() {
-                        for endpoint in &fixed_endpoints {
-                            let Ok(addrs) = tokio::net::lookup_host(endpoint).await else {
-                                tracing::info!(target: "overlay",
-                                    "overlay bootstrap: failed to resolve fixed peer endpoint {}",
-                                    endpoint
-                                );
-                                continue;
-                            };
-                            let resolved = addrs.collect::<Vec<_>>();
-                            overlay.remember_fixed_peer_endpoints(resolved.iter().copied());
-                            for address in resolved {
-                                if overlay.is_stopping() {
-                                    return;
-                                }
-                                let retry_state =
-                                    fixed_retry_state_or_due(&fixed_retry_state, address, now);
-                                if retry_state.1 > now {
-                                    continue;
-                                }
-                                match overlay.connect(address).await {
-                                    Ok(mut result) => {
-                                        fixed_retry_state.remove(&address);
-                                        // Start the peer session read/write loop
-                                        if let Some(session) = result.session.take() {
-                                            overlay.spawn_peer_session(
-                                                std::sync::Arc::clone(&result.peer),
-                                                session,
-                                            );
-                                        }
-                                        tracing::info!(target: "overlay",
-                                            "overlay bootstrap: connected to fixed {} as peer {}",
-                                            address,
-                                            result.peer.id()
-                                        );
-                                        connected_this_cycle = true;
-                                        refresh_peer_count_and_operating_mode(
-                                            overlay.as_ref(),
-                                            status_rpc_state.as_ref(),
-                                            network_ops_mode_owner.as_ref(),
-                                        );
-                                    }
-                                    Err(error) => {
-                                        let failures = fixed_retry_state
-                                            .get(&address)
-                                            .map(|(failures, _)| failures.saturating_add(1))
-                                            .unwrap_or(1);
-                                        fixed_retry_state.insert(
-                                            address,
-                                            (failures, now + fixed_retry_delay(failures)),
-                                        );
-                                        tracing::info!(target: "overlay",
-                                            "overlay bootstrap: connect to fixed {} failed: {}",
-                                            address, error
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    for endpoint in &endpoints {
-                        let Ok(addrs) = tokio::net::lookup_host(endpoint).await else {
-                            tracing::info!(target: "overlay",
-                                "overlay bootstrap: failed to resolve peer endpoint {}",
-                                endpoint
-                            );
-                            continue;
-                        };
-                        remember_bootcache_endpoints(
-                            &mut bootcache,
-                            addrs.collect::<Vec<_>>(),
-                            true,
-                        );
-                    }
-
-                    let active_outbound_peers = overlay.active_outbound_peers_count();
-                    if !bootstrap_can_dial_bootcache(active_outbound_peers, target_outbound_peers) {
-                        tokio::time::sleep(Duration::from_secs(10)).await;
-                        continue;
-                    }
-
-                    let connected_ips = overlay
-                        .active_peers()
-                        .into_iter()
-                        .map(|peer| peer.remote_address().ip())
-                        .collect::<BTreeSet<_>>();
-                    prune_recent_bootcache_attempts(&mut recent_bootcache_attempts, now);
-                    let attempt_budget = PEERFINDER_MAX_CONNECT_ATTEMPTS
-                        .saturating_sub(overlay.pending_outbound_attempts())
-                        .min(target_outbound_peers.saturating_sub(active_outbound_peers));
-                    let mut attempts = Vec::new();
-                    for address in select_bootcache_endpoints(
-                        &connected_ips,
-                        &bootcache,
-                        &recent_bootcache_attempts,
-                        now,
-                        attempt_budget,
-                    ) {
-                        if overlay.is_stopping() {
-                            return;
-                        }
-                        recent_bootcache_attempts
-                            .insert(address.ip(), now + PEERFINDER_RECENT_ATTEMPT_DURATION);
-                        let overlay = std::sync::Arc::clone(&overlay);
-                        attempts.push(tokio::spawn(async move {
-                            (address, overlay.connect(address).await)
-                        }));
-                    }
-
-                    for attempt in attempts {
-                        match attempt.await {
-                            Ok((address, Ok(mut result))) => {
-                                bootcache_on_success(&mut bootcache, address);
-                                if let Some(session) = result.session.take() {
-                                    overlay.spawn_peer_session(
-                                        std::sync::Arc::clone(&result.peer),
-                                        session,
-                                    );
-                                }
-                                tracing::info!(target: "overlay",
-                                    "overlay bootstrap: connected to {} as peer {}",
-                                    address,
-                                    result.peer.id()
-                                );
-                                connected_this_cycle = true;
-                                refresh_peer_count_and_operating_mode(
-                                    overlay.as_ref(),
-                                    status_rpc_state.as_ref(),
-                                    network_ops_mode_owner.as_ref(),
-                                );
-                            }
-                            Ok((address, Err(overlay::ConnectAttemptError::Redirect(peers)))) => {
-                                bootcache_on_failure(&mut bootcache, address);
-                                tracing::info!(target: "overlay",
-                                    "overlay bootstrap: {} redirected us to {} peer(s)",
-                                    address,
-                                    peers.len()
-                                );
-                                remember_bootcache_endpoints(&mut bootcache, peers, false);
-                            }
-                            Ok((address, Err(error))) => {
-                                bootcache_on_failure(&mut bootcache, address);
-                                tracing::info!(target: "overlay",
-                                    "overlay bootstrap: connect to {} failed: {}",
-                                    address, error
-                                );
-                            }
-                            Err(error) => {
-                                tracing::warn!(target: "overlay", %error,
-                                    "overlay bootstrap: connect attempt task failed"
-                                );
-                            }
-                        }
-                    }
-
-                    refresh_peer_count_and_operating_mode(
-                        overlay.as_ref(),
-                        status_rpc_state.as_ref(),
-                        network_ops_mode_owner.as_ref(),
-                    );
-
-                    if connected_this_cycle {
-                        tokio::time::sleep(Duration::from_secs(4)).await;
-                    } else {
-                        tokio::time::sleep(Duration::from_secs(10)).await;
-                    }
-                }
-            });
-        }
+        let overlay = Arc::clone(&self.overlay);
+        let fixed_endpoints = self.fixed_peer_endpoints.clone();
+        let endpoints = self.bootstrap_peer_endpoints.clone();
+        let peerfinder_bootcache_path = self.peerfinder_bootcache_path.clone();
+        let network_ops_mode_owner = self.network_ops_mode_owner.clone();
+        let status_rpc_state = self.status_rpc_state.clone();
+        let target_outbound_peers = overlay.peer_limits().outbound_max;
+        runtime_handle.spawn(run_live_peerfinder(
+            overlay,
+            fixed_endpoints,
+            endpoints,
+            peerfinder_bootcache_path,
+            target_outbound_peers,
+            network_ops_mode_owner,
+            status_rpc_state,
+        ));
 
         Ok(())
     }
@@ -576,6 +647,278 @@ impl AppOverlayRuntime {
     fn rollback_started(&self, error: String) -> String {
         self.started.store(false, Ordering::Release);
         error
+    }
+}
+
+enum PeerfinderConnectionEvent {
+    Success {
+        address: SocketAddr,
+        fixed: bool,
+    },
+    Failure {
+        address: SocketAddr,
+        fixed: bool,
+    },
+    Redirect {
+        address: SocketAddr,
+        fixed: bool,
+        peers: Vec<SocketAddr>,
+    },
+}
+
+async fn load_peerfinder_caches(path: Option<PathBuf>) -> PeerfinderCaches {
+    let now = Instant::now();
+    let Some(path) = path else {
+        return PeerfinderCaches::loaded(Vec::new(), now);
+    };
+    let display_path = path.display().to_string();
+    let loaded = tokio::task::spawn_blocking(move || {
+        rdb::PeerFinderDb::open(&path).and_then(|db| db.load_bootcache())
+    })
+    .await;
+    match loaded {
+        Ok(Ok(entries)) => {
+            tracing::info!(target: "peerfinder", count = entries.len(), path = %display_path,
+                "Bootcache loaded into live overlay runtime");
+            PeerfinderCaches::loaded(entries, now)
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(target: "peerfinder", path = %display_path, %error,
+                "Bootcache load failed; continuing with an empty cache");
+            PeerfinderCaches::loaded(Vec::new(), now)
+        }
+        Err(error) => {
+            tracing::warn!(target: "peerfinder", path = %display_path, %error,
+                "Bootcache load worker failed; continuing with an empty cache");
+            PeerfinderCaches::loaded(Vec::new(), now)
+        }
+    }
+}
+
+async fn persist_peerfinder_bootcache(
+    path: Option<PathBuf>,
+    entries: Vec<rdb::PeerFinderBootcacheEntry>,
+) -> bool {
+    let Some(path) = path else {
+        return true;
+    };
+    let display_path = path.display().to_string();
+    match tokio::task::spawn_blocking(move || {
+        rdb::PeerFinderDb::open(&path).and_then(|db| db.save_bootcache(&entries))
+    })
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "peerfinder", path = %display_path, %error,
+                "Bootcache save failed");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(target: "peerfinder", path = %display_path, %error,
+                "Bootcache save worker failed");
+            false
+        }
+    }
+}
+
+fn spawn_peerfinder_connect(
+    overlay: Arc<OverlayImpl>,
+    address: SocketAddr,
+    fixed: bool,
+    results: tokio::sync::mpsc::UnboundedSender<PeerfinderConnectionEvent>,
+) {
+    tokio::spawn(async move {
+        match overlay.connect(address).await {
+            Ok(mut result) => {
+                if let Some(session) = result.session.take() {
+                    overlay.spawn_peer_session(Arc::clone(&result.peer), session);
+                }
+                tracing::info!(target: "overlay", %address, peer_id = result.peer.id(), fixed,
+                    "PeerFinder connected");
+                let _ = results.send(PeerfinderConnectionEvent::Success { address, fixed });
+            }
+            Err(overlay::ConnectAttemptError::Redirect(peers)) => {
+                tracing::info!(target: "overlay", %address, redirect_count = peers.len(), fixed,
+                    "PeerFinder connection redirected");
+                let _ = results.send(PeerfinderConnectionEvent::Redirect {
+                    address,
+                    fixed,
+                    peers,
+                });
+            }
+            Err(error) => {
+                tracing::info!(target: "overlay", %address, fixed, %error,
+                    "PeerFinder connection failed");
+                let _ = results.send(PeerfinderConnectionEvent::Failure { address, fixed });
+            }
+        }
+    });
+}
+
+async fn run_live_peerfinder(
+    overlay: Arc<OverlayImpl>,
+    fixed_endpoints: Vec<String>,
+    bootstrap_endpoints: Vec<String>,
+    bootcache_path: Option<PathBuf>,
+    target_outbound_peers: usize,
+    network_ops_mode_owner: Option<AppNetworkOpsModeOwner>,
+    status_rpc_state: Option<Arc<StatusRpcState>>,
+) {
+    let mut caches = load_peerfinder_caches(bootcache_path.clone()).await;
+    let mut recent_attempts = HashMap::<IpAddr, Instant>::new();
+    let mut fixed_retry_state = HashMap::<SocketAddr, (usize, Instant)>::new();
+    let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut next_connect = Instant::now();
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // rippled arms its first periodic callback 1 second after setup
+    // (OverlayImpl.cpp:131-161). tokio::time::interval fires immediately;
+    // consume the first instant tick to match rippled's initial delay.
+    ticker.tick().await;
+
+    while !overlay.is_stopping() {
+        ticker.tick().await;
+        let now = Instant::now();
+        refresh_peer_count_and_operating_mode(
+            overlay.as_ref(),
+            status_rpc_state.as_ref(),
+            network_ops_mode_owner.as_ref(),
+        );
+
+        // `Logic::oncePerSecond`: expire live data, retry squelches, and
+        // check the bootcache persistence cooldown on every timer tick.
+        caches.expire_livecache(now);
+        prune_recent_bootcache_attempts(&mut recent_attempts, now);
+        for endpoints in overlay.take_endpoints() {
+            for endpoint in endpoints.endpoints {
+                caches.on_learned_endpoint(endpoint.endpoint, endpoint.hops, now);
+            }
+        }
+        while let Ok(event) = result_rx.try_recv() {
+            match event {
+                PeerfinderConnectionEvent::Success { address, fixed } => {
+                    caches.on_success(address);
+                    if fixed {
+                        fixed_retry_state.remove(&address);
+                    }
+                }
+                PeerfinderConnectionEvent::Failure { address, fixed } => {
+                    caches.on_failure(address);
+                    if fixed {
+                        let failures = fixed_retry_state
+                            .get(&address)
+                            .map(|(failures, _)| failures.saturating_add(1))
+                            .unwrap_or(1);
+                        fixed_retry_state
+                            .insert(address, (failures, now + fixed_retry_delay(failures)));
+                    }
+                }
+                PeerfinderConnectionEvent::Redirect {
+                    address,
+                    fixed,
+                    peers,
+                } => {
+                    // A redirect supplies referrals through `onRedirects`,
+                    // while this outbound attempt itself did not complete the
+                    // handshake and therefore reaches `onFailure` when its
+                    // connect slot closes in rippled.
+                    caches.on_failure(address);
+                    caches.on_redirects(peers);
+                    if fixed {
+                        let failures = fixed_retry_state
+                            .get(&address)
+                            .map(|(failures, _)| failures.saturating_add(1))
+                            .unwrap_or(1);
+                        fixed_retry_state
+                            .insert(address, (failures, now + fixed_retry_delay(failures)));
+                    }
+                }
+            }
+        }
+
+        if now >= next_connect {
+            for endpoint in &fixed_endpoints {
+                let Ok(addresses) = tokio::net::lookup_host(endpoint).await else {
+                    tracing::info!(target: "overlay", %endpoint,
+                        "PeerFinder failed to resolve fixed endpoint");
+                    continue;
+                };
+                let addresses = addresses.collect::<Vec<_>>();
+                overlay.remember_fixed_peer_endpoints(addresses.iter().copied());
+                for address in addresses {
+                    if fixed_retry_state_or_due(&fixed_retry_state, address, now).1 > now {
+                        continue;
+                    }
+                    spawn_peerfinder_connect(
+                        Arc::clone(&overlay),
+                        address,
+                        true,
+                        result_tx.clone(),
+                    );
+                }
+            }
+
+            for endpoint in &bootstrap_endpoints {
+                let Ok(addresses) = tokio::net::lookup_host(endpoint).await else {
+                    tracing::info!(target: "overlay", %endpoint,
+                        "PeerFinder failed to resolve bootstrap endpoint");
+                    continue;
+                };
+                for address in addresses {
+                    caches.insert_static_bootcache(address);
+                }
+            }
+
+            let active_outbound = overlay.active_outbound_peers_count();
+            if bootstrap_can_dial_bootcache(active_outbound, target_outbound_peers) {
+                let connected_ips = overlay
+                    .active_peers()
+                    .into_iter()
+                    .map(|peer| peer.remote_address().ip())
+                    .collect::<BTreeSet<_>>();
+                let attempt_budget = PEERFINDER_MAX_CONNECT_ATTEMPTS
+                    .saturating_sub(overlay.pending_outbound_attempts())
+                    .min(target_outbound_peers.saturating_sub(active_outbound));
+                let selected =
+                    caches.select_livecache(&connected_ips, &recent_attempts, now, attempt_budget);
+                let selected = if selected.is_empty() {
+                    select_bootcache_endpoints(
+                        &connected_ips,
+                        &caches.bootcache,
+                        &recent_attempts,
+                        now,
+                        attempt_budget,
+                    )
+                } else {
+                    selected
+                };
+                for address in selected {
+                    recent_attempts.insert(address.ip(), now + PEERFINDER_RECENT_ATTEMPT_DURATION);
+                    spawn_peerfinder_connect(
+                        Arc::clone(&overlay),
+                        address,
+                        false,
+                        result_tx.clone(),
+                    );
+                }
+            }
+            next_connect = now + Duration::from_secs(10);
+        }
+
+        if let Some(entries) = caches.take_update_if_due(now, false)
+            && !persist_peerfinder_bootcache(bootcache_path.clone(), entries).await
+        {
+            // Preserve the update request so a transient SQLite fault is not
+            // converted into a silently volatile cache.
+            caches.flag_for_update();
+        }
+    }
+
+    // `Bootcache::~Bootcache` calls `update()` without consulting the
+    // cooldown. Mirror that final durable flush on orderly overlay shutdown.
+    if let Some(entries) = caches.take_update_if_due(Instant::now(), true) {
+        let _ = persist_peerfinder_bootcache(bootcache_path, entries).await;
     }
 }
 
@@ -612,6 +955,9 @@ pub fn build_overlay_setup(config: &BasicConfig) -> Result<Setup, String> {
         fixed_peer_ips: std::collections::HashSet::new(),
         ip_limit: 0,
         peer_limit: 0,
+        peer_limit_in: None,
+        peer_limit_out: None,
+        want_incoming: true,
         verify_endpoints: true,
         crawl_options: CRAWL_OPTION_OVERLAY | CRAWL_OPTION_SERVER_INFO | CRAWL_OPTION_UNL,
         network_id: None,
@@ -624,6 +970,7 @@ pub fn build_overlay_setup(config: &BasicConfig) -> Result<Setup, String> {
         reduce_relay_wait: DEFAULT_REDUCE_RELAY_WAIT,
     };
 
+    parse_peer_limit_sections(config, &mut setup)?;
     parse_overlay_section(config.section("overlay"), &mut setup)?;
     parse_crawl_section(config.section("crawl"), &mut setup)?;
     parse_vl_section(config.section("vl"), &mut setup)?;
@@ -643,15 +990,22 @@ pub fn build_overlay_runtime(
     let mut setup = build_overlay_setup(config)?;
     let fixed_peer_endpoints = parse_peer_endpoints(config, "ips_fixed")?;
     let bootstrap_peer_endpoints = parse_bootstrap_peer_endpoints(config, &fixed_peer_endpoints)?;
+    let peerfinder_bootcache_path = config
+        .legacy("database_path")
+        .ok()
+        .map(|path| PathBuf::from(path).join("peerfinder.db"));
     let listener_setup = server_ports_setup.and_then(|setup| setup.overlay.clone());
+    let peer_limit_sections_configured = config.exists("peers_max")
+        || config.exists("peers_in_max")
+        || config.exists("peers_out_max");
     if let Some(listener) = listener_setup.as_ref() {
-        setup.peer_limit = listener.limit as usize;
+        if !peer_limit_sections_configured {
+            setup.peer_limit = listener.limit as usize;
+        }
         setup.server_config = build_overlay_server_config(listener)?;
         setup.server_ssl_acceptor = build_overlay_ssl_acceptor(listener)?;
     }
-    if setup.peer_limit == 0 {
-        setup.peer_limit = DEFAULT_PEER_LIMIT.max(PEERFINDER_MIN_OUTBOUND);
-    }
+    setup.want_incoming = listener_setup.is_some() && !parse_peer_private(config)?;
     setup.fixed_peer_ips = parse_fixed_peer_ips(&fixed_peer_endpoints);
     let overlay = Arc::new(OverlayImpl::new(setup, handoff).map_err(|error| error.to_string())?);
     Ok(Arc::new(AppOverlayRuntime::new(
@@ -659,6 +1013,7 @@ pub fn build_overlay_runtime(
         listener_setup,
         fixed_peer_endpoints,
         bootstrap_peer_endpoints,
+        peerfinder_bootcache_path,
         network_ops_mode_owner,
         status_rpc_state,
     )))
@@ -859,6 +1214,62 @@ pub(crate) fn overlay_server_config(
 pub(crate) fn test_default_overlay_client_config() -> Result<Arc<rustls::ClientConfig>, String> {
     install_tls_provider();
     default_overlay_client_config()
+}
+
+fn parse_peer_limit_sections(config: &BasicConfig, setup: &mut Setup) -> Result<(), String> {
+    let max_peers = parse_single_section_usize(config, "peers_max")?;
+    let inbound_max = parse_single_section_usize(config, "peers_in_max")?;
+    let outbound_max = parse_single_section_usize(config, "peers_out_max")?;
+
+    if max_peers.is_some() {
+        // rippled gives legacy [peers_max] precedence over paired directional
+        // sections, including when its value is zero (the default then applies).
+        setup.peer_limit = max_peers.expect("checked is_some");
+        setup.peer_limit_in = None;
+        setup.peer_limit_out = None;
+        return Ok(());
+    }
+
+    match (inbound_max, outbound_max) {
+        (None, None) => Ok(()),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("Both [peers_in_max] and [peers_out_max] must be configured".to_owned())
+        }
+        (Some(inbound_max), Some(outbound_max)) => {
+            if inbound_max > 1_000 {
+                return Err("Inbound peer limit must be less than or equal to 1000".to_owned());
+            }
+            if !(10..=1_000).contains(&outbound_max) {
+                return Err("Outbound peer limit must be in the range 10-1000".to_owned());
+            }
+            setup.peer_limit_in = Some(inbound_max);
+            setup.peer_limit_out = Some(outbound_max);
+            Ok(())
+        }
+    }
+}
+
+fn parse_single_section_usize(config: &BasicConfig, name: &str) -> Result<Option<usize>, String> {
+    let values = config.section(name).values();
+    match values {
+        [] => Ok(None),
+        [value] => value
+            .trim()
+            .parse::<usize>()
+            .map(Some)
+            .map_err(|_| format!("Configured [{name}] section is invalid")),
+        _ => Err(format!("Configured [{name}] section has too many values")),
+    }
+}
+
+fn parse_peer_private(config: &BasicConfig) -> Result<bool, String> {
+    let values = config.section("peer_private").values();
+    match values {
+        [] => Ok(false),
+        [value] => parse_bool(value.clone())
+            .map_err(|_| "Configured [peer_private] section is invalid".to_owned()),
+        _ => Err("Configured [peer_private] section has too many values".to_owned()),
+    }
 }
 
 fn parse_overlay_section(section: &Section, setup: &mut Setup) -> Result<(), String> {
@@ -1082,12 +1493,12 @@ mod tests {
     use super::{
         BOOTCACHE_STATIC_VALENCE, BootcacheEntry, BootstrapOverlayHandoff, CRAWL_OPTION_DISABLED,
         CRAWL_OPTION_OVERLAY, CRAWL_OPTION_SERVER_COUNTS, CRAWL_OPTION_SERVER_INFO,
-        CRAWL_OPTION_UNL, bootcache_on_failure, bootcache_on_success, bootstrap_can_dial_bootcache,
-        bootstrap_needs_bootcache_dial, build_overlay_runtime, build_overlay_setup,
-        default_overlay_client_config, fixed_retry_state_or_due, is_public_ip,
-        overlay_server_config, parse_bootstrap_peer_endpoints, parse_fixed_peer_ips,
-        parse_peer_endpoints, peerfinder_outbound_target, remember_bootcache_endpoint,
-        select_bootcache_endpoints,
+        CRAWL_OPTION_UNL, PeerfinderCaches, bootcache_on_failure, bootcache_on_success,
+        bootstrap_can_dial_bootcache, bootstrap_needs_bootcache_dial, build_overlay_runtime,
+        build_overlay_setup, default_overlay_client_config, fixed_retry_state_or_due, is_public_ip,
+        load_peerfinder_caches, overlay_server_config, parse_bootstrap_peer_endpoints,
+        parse_fixed_peer_ips, parse_peer_endpoints, peerfinder_outbound_target,
+        persist_peerfinder_bootcache, remember_bootcache_endpoint, select_bootcache_endpoints,
     };
     use crate::runtime::main_runtime::ManagedComponent;
     use basics::basic_config::BasicConfig;
@@ -1360,11 +1771,46 @@ tx_min_peers = 9
     }
 
     #[test]
+    fn peer_limit_configuration_matches_rippled_legacy_and_directional_rules() {
+        let defaulted = build_overlay_setup(&config("")).expect("default setup");
+        assert_eq!(defaulted.peer_limits().max_peers, 21);
+        assert_eq!(defaulted.peer_limits().inbound_max, 11);
+        assert_eq!(defaulted.peer_limits().outbound_max, 10);
+
+        // rippled raises a legacy max below kMinOutCount to ten before
+        // deriving in/out maxima.
+        let legacy = build_overlay_setup(&config("[peers_max]\n8\n")).expect("legacy setup");
+        assert_eq!(legacy.peer_limits().max_peers, 10);
+        assert_eq!(legacy.peer_limits().inbound_max, 0);
+        assert_eq!(legacy.peer_limits().outbound_max, 10);
+
+        let explicit = build_overlay_setup(&config("[peers_in_max]\n7\n[peers_out_max]\n10\n"))
+            .expect("explicit setup");
+        // rippled Config.cpp:112: config.maxPeers = 0 when explicit in/out set
+        assert_eq!(explicit.peer_limits().max_peers, 0);
+        assert_eq!(explicit.peer_limits().inbound_max, 7);
+        assert_eq!(explicit.peer_limits().outbound_max, 10);
+
+        assert_eq!(
+            build_overlay_setup(&config("[peers_in_max]\n7\n"))
+                .err()
+                .expect("incomplete directional limits must fail"),
+            "Both [peers_in_max] and [peers_out_max] must be configured"
+        );
+        assert_eq!(
+            build_overlay_setup(&config("[peers_in_max]\n7\n[peers_out_max]\n9\n"))
+                .err()
+                .expect("outbound limit below ten must fail"),
+            "Outbound peer limit must be in the range 10-1000"
+        );
+    }
+
+    #[test]
     fn peerfinder_outbound_target_percent_and_minimum_shape() {
         assert_eq!(peerfinder_outbound_target(21, true), 10);
         assert_eq!(peerfinder_outbound_target(64, true), 10);
         assert_eq!(peerfinder_outbound_target(100, true), 15);
-        assert_eq!(peerfinder_outbound_target(8, true), 8);
+        assert_eq!(peerfinder_outbound_target(8, true), 10);
         assert_eq!(peerfinder_outbound_target(21, false), 21);
     }
 
@@ -1460,6 +1906,59 @@ tx_min_peers = 9
 
         bootcache_on_failure(&mut bootcache, endpoint);
         assert_eq!(bootcache.get(&endpoint).expect("failure entry").valence, -1);
+    }
+
+    #[test]
+    fn persistent_live_bootcache_reloads_and_ranks_failed_endpoints_last() {
+        let dir = tempfile::TempDir::new().expect("peerfinder cache dir");
+        let path = dir.path().join("peerfinder.db");
+        let preferred: std::net::SocketAddr = "8.8.8.8:51235".parse().expect("preferred");
+        let fresh: std::net::SocketAddr = "1.1.1.1:51235".parse().expect("fresh");
+        let failed: std::net::SocketAddr = "9.9.9.9:51235".parse().expect("failed");
+        let now = Instant::now();
+        let mut initial = PeerfinderCaches::loaded(Vec::new(), now);
+        initial.on_success(preferred);
+        initial.on_success(preferred);
+        initial.insert_bootcache(fresh);
+        initial.on_success(failed);
+        initial.on_failure(failed);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        assert!(runtime.block_on(persist_peerfinder_bootcache(
+            Some(path.clone()),
+            initial.entries(),
+        )));
+
+        // Recreate the live cache owner exactly as AppOverlayRuntime does at
+        // startup, rather than reusing the in-memory map from the prior run.
+        let recreated = runtime.block_on(load_peerfinder_caches(Some(path)));
+        assert_eq!(
+            recreated.bootcache.get(&preferred),
+            Some(&BootcacheEntry { valence: 2 })
+        );
+        assert_eq!(
+            recreated.bootcache.get(&fresh),
+            Some(&BootcacheEntry { valence: 0 })
+        );
+        assert_eq!(
+            recreated.bootcache.get(&failed),
+            Some(&BootcacheEntry { valence: -1 })
+        );
+
+        // `Bootcache::onFailure` resets a formerly successful endpoint to
+        // -1; bootcache iteration is decreasing valence, so it follows zero
+        // and positive entries unless a recent-attempt squelch excludes it.
+        let selected = select_bootcache_endpoints(
+            &BTreeSet::new(),
+            &recreated.bootcache,
+            &HashMap::new(),
+            Instant::now(),
+            3,
+        );
+        assert_eq!(selected, vec![preferred, fresh, failed]);
     }
 
     #[test]

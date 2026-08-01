@@ -2,21 +2,25 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use basics::base_uint::Uint256;
 use protocol::{JsonValue, PublicKey};
-use resource::Charge;
+use resource::{Charge, Consumer, Disposition};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::message::{Message, ProtocolMessage, ProtocolPayload, TmHaveTransactions};
 use crate::peer::{Peer, PeerId, ProtocolFeature};
 use crate::protocol_version::ProtocolVersion;
 use crate::slot::{MAX_TX_QUEUE_SIZE, SystemClock};
 use crate::squelch::Squelch;
-use crate::tuning::{CONVERGED_LEDGER_LIMIT, DIVERGED_LEDGER_LIMIT};
+use crate::tuning::{
+    CONVERGED_LEDGER_LIMIT, DIVERGED_LEDGER_LIMIT, MAX_DIVERGED_TIME, MAX_UNKNOWN_TIME,
+    PEER_TIMER_INTERVAL, SENDQ_INTERVALS, TARGET_SEND_QUEUE,
+};
 
 const RECENT_PEER_KNOWLEDGE_CAPACITY: usize = 128;
 /// Matches rippled's `Tuning::kDropSendQueue`.
@@ -47,7 +51,6 @@ impl Tracking {
     }
 }
 
-#[derive(Debug)]
 pub struct PeerImp {
     id: PeerId,
     remote_address: SocketAddr,
@@ -81,6 +84,17 @@ pub struct PeerImp {
     min_ledger: Mutex<u32>,
     max_ledger: Mutex<u32>,
     tracking: AtomicU8,
+    /// When the peer entered its current tracking state. `onTimer` uses this
+    /// for the outbound Not Useful deadlines.
+    tracking_since: Mutex<Instant>,
+    /// One active timer is owned by an activated peer and cancelled during
+    /// overlay deactivation.
+    lifecycle_timer: Mutex<Option<JoinHandle<()>>>,
+    /// Consecutive timer intervals with a large send queue.
+    large_sendq: AtomicUsize,
+    outstanding_ping: Mutex<Option<OutstandingPing>>,
+    resource: Mutex<PeerResourceState>,
+    resource_drop_requested: AtomicBool,
     endpoint_accept_after: Mutex<Option<Instant>>,
     recent_endpoints: Mutex<HashMap<SocketAddr, RecentEndpoint>>,
     listener_check: Mutex<ListenerCheckState>,
@@ -96,6 +110,30 @@ pub struct PeerImp {
 struct RecentEndpoint {
     hops: u32,
     last_seen: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutstandingPing {
+    sequence: u32,
+    sent_at: Instant,
+}
+
+#[derive(Default)]
+struct PeerResourceState {
+    consumer: Option<Consumer>,
+    disconnect_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl std::fmt::Debug for PeerImp {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PeerImp")
+            .field("id", &self.id)
+            .field("remote_address", &self.remote_address)
+            .field("inbound", &self.inbound)
+            .field("tracking", &self.tracking())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -167,6 +205,12 @@ impl PeerImp {
             min_ledger: Mutex::new(0),
             max_ledger: Mutex::new(0),
             tracking: AtomicU8::new(Tracking::Unknown.as_u8()),
+            tracking_since: Mutex::new(Instant::now()),
+            lifecycle_timer: Mutex::new(None),
+            large_sendq: AtomicUsize::new(0),
+            outstanding_ping: Mutex::new(None),
+            resource: Mutex::new(PeerResourceState::default()),
+            resource_drop_requested: AtomicBool::new(false),
             endpoint_accept_after: Mutex::new(None),
             recent_endpoints: Mutex::new(HashMap::new()),
             listener_check: Mutex::new(ListenerCheckState {
@@ -183,6 +227,162 @@ impl PeerImp {
 
     pub fn inbound(&self) -> bool {
         self.inbound
+    }
+
+    /// Attach the Resource::Consumer selected by OverlayImpl for this peer.
+    /// The separate counter lets PeerImp mirror rippled's charge-disconnect
+    /// metric without coupling it to OverlayImpl's lifetime.
+    pub fn install_resource_consumer(
+        &self,
+        consumer: Consumer,
+        disconnect_counter: Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        let mut resource = self.resource.lock().expect("peer resource lock");
+        resource.consumer = Some(consumer);
+        resource.disconnect_counter = Some(disconnect_counter);
+        self.resource_drop_requested.store(false, Ordering::Release);
+    }
+
+    /// Start exactly one 60-second PeerImp lifecycle timer after activation.
+    pub fn start_lifecycle_timer(self: &Arc<Self>, handle: &tokio::runtime::Handle) {
+        let mut timer = self.lifecycle_timer.lock().expect("peer timer lock");
+        if timer.is_some() {
+            return;
+        }
+        let peer = Arc::downgrade(self);
+        *timer = Some(handle.spawn(async move {
+            loop {
+                tokio::time::sleep(PEER_TIMER_INTERVAL).await;
+                let Some(peer) = peer.upgrade() else {
+                    return;
+                };
+                peer.on_timer();
+                if peer.disconnect_requested() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Cancel the lifecycle timer during deactivation. Aborting is safe here:
+    /// the timer owns no socket state and all session teardown is separately
+    /// idempotent through the session stop watch channel.
+    pub fn stop_lifecycle_timer(&self) {
+        if let Some(timer) = self.lifecycle_timer.lock().expect("peer timer lock").take() {
+            timer.abort();
+        }
+    }
+
+    pub fn lifecycle_timer_active(&self) -> bool {
+        self.lifecycle_timer
+            .lock()
+            .expect("peer timer lock")
+            .as_ref()
+            .is_some_and(|timer| !timer.is_finished())
+    }
+
+    /// Record and validate a PONG against the locally generated outstanding
+    /// ping cookie. Peer-provided timestamps are never used for RTT.
+    pub fn acknowledge_ping(&self, sequence: Option<u32>) -> Option<u32> {
+        let sequence = sequence?;
+        let sent_at = {
+            let mut outstanding = self.outstanding_ping.lock().expect("peer ping lock");
+            let ping = (*outstanding)?;
+            if ping.sequence != sequence {
+                return None;
+            }
+            *outstanding = None;
+            ping.sent_at
+        };
+        let rtt_ms = sent_at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+        self.update_latency(rtt_ms);
+        Some(rtt_ms)
+    }
+
+    pub fn disconnect_requested(&self) -> bool {
+        self.disconnect_requested.load(Ordering::Acquire)
+    }
+
+    fn set_tracking(&self, tracking: Tracking) {
+        let previous = Tracking::from_u8(self.tracking.swap(tracking.as_u8(), Ordering::AcqRel));
+        if previous != tracking {
+            *self
+                .tracking_since
+                .lock()
+                .expect("peer tracking timer lock") = Instant::now();
+        }
+    }
+
+    fn send_queue_size(&self) -> usize {
+        let outbound = self.outbound_state.lock().expect("peer outbound lock");
+        outbound.session_tx.as_ref().map_or_else(
+            || outbound.queued_messages.len(),
+            |sender| SEND_QUEUE_CAPACITY.saturating_sub(sender.capacity()),
+        )
+    }
+
+    /// Port of PeerImp::onTimer: enforce sustained send-queue pressure and
+    /// Not Useful deadlines, reject a missed prior ping, then send a newly
+    /// cookie-bound PING.
+    fn on_timer(&self) {
+        // rippled resets largeSendq_ in send() when queue < target, NOT in
+        // onTimer. Here we only increment/check.
+        if self.send_queue_size() >= TARGET_SEND_QUEUE {
+            if self.large_sendq.fetch_add(1, Ordering::AcqRel) >= SENDQ_INTERVALS {
+                tracing::warn!(target: "overlay", peer_id = %self.id, "send queue remained large; disconnecting peer");
+                self.request_disconnect();
+                return;
+            }
+        }
+
+        if !self.inbound {
+            let state = self.tracking();
+            let state_age = self
+                .tracking_since
+                .lock()
+                .expect("peer tracking timer lock")
+                .elapsed();
+            // rippled uses strict > (duration > maxDivergedTime/maxUnknownTime)
+            let expired = matches!(state, Tracking::Diverged) && state_age > MAX_DIVERGED_TIME
+                || matches!(state, Tracking::Unknown) && state_age > MAX_UNKNOWN_TIME;
+            if expired {
+                tracing::warn!(target: "overlay", peer_id = %self.id, ?state, "peer remained Not Useful; disconnecting");
+                // rippled calls peerFinder().onFailure(slot_) before fail()
+                // to lower bootcache valence for this endpoint.
+                self.notify_outbound_failure();
+                self.request_disconnect();
+                return;
+            }
+        }
+
+        let sequence = basics::random::rand_int_to(u32::MAX);
+        {
+            let mut outstanding = self.outstanding_ping.lock().expect("peer ping lock");
+            if outstanding.is_some() {
+                tracing::warn!(target: "overlay", peer_id = %self.id, "Ping Timeout");
+                drop(outstanding);
+                self.request_disconnect();
+                return;
+            }
+            *outstanding = Some(OutstandingPing {
+                sequence,
+                sent_at: Instant::now(),
+            });
+        }
+        self.send(Message::new(
+            ProtocolMessage::new(ProtocolPayload::Ping(crate::message::TmPing {
+                r#type: 0,
+                seq: Some(sequence),
+                ping_time: None,
+                net_time: None,
+            })),
+            None,
+        ));
+    }
+
+    #[cfg(test)]
+    fn on_timer_for_test(&self) {
+        self.on_timer();
     }
 
     pub fn set_fixed(&self, fixed: bool) {
@@ -465,13 +665,11 @@ impl PeerImp {
         let diff = seq1.abs_diff(seq2) as usize;
 
         if diff < CONVERGED_LEDGER_LIMIT {
-            self.tracking
-                .store(Tracking::Converged.as_u8(), Ordering::Relaxed);
+            self.set_tracking(Tracking::Converged);
         }
 
-        if diff > DIVERGED_LEDGER_LIMIT && self.tracking() != Tracking::Diverged {
-            self.tracking
-                .store(Tracking::Diverged.as_u8(), Ordering::Relaxed);
+        if diff > DIVERGED_LEDGER_LIMIT {
+            self.set_tracking(Tracking::Diverged);
         }
     }
 
@@ -553,6 +751,20 @@ impl PeerImp {
         }
     }
 
+    /// Notify the bootcache/peerfinder that an outbound peer was not useful,
+    /// lowering its valence for future selection (rippled: peerFinder().onFailure(slot_)).
+    fn notify_outbound_failure(&self) {
+        // The bootcache valence decrement happens via the overlay runtime's
+        // deactivation handler which already records failure for outbound peers.
+        // This explicit marker ensures the "Not Useful" reason is logged.
+        tracing::debug!(
+            target: "overlay",
+            peer_id = %self.id,
+            remote = %self.remote_address,
+            "PeerFinder outbound failure notification (Not Useful)"
+        );
+    }
+
     fn request_disconnect(&self) {
         if self.disconnect_requested.swap(true, Ordering::AcqRel) {
             return;
@@ -594,7 +806,14 @@ impl Peer for PeerImp {
         };
 
         match session_tx.try_send(message) {
-            Ok(()) => {}
+            Ok(()) => {
+                // rippled resets largeSendq_ when sendq < kTargetSendQueue
+                // (PeerImp.cpp:304-311). Check remaining capacity.
+                let queued = SEND_QUEUE_CAPACITY - session_tx.capacity();
+                if queued < TARGET_SEND_QUEUE {
+                    self.large_sendq.store(0, Ordering::Release);
+                }
+            }
             Err(mpsc::error::TrySendError::Full(_)) if droppable => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 tracing::warn!(
@@ -637,10 +856,35 @@ impl Peer for PeerImp {
     }
 
     fn charge(&self, fee: Charge, context: String) {
+        // Retain the local diagnostic snapshot used by existing callers and
+        // tests, but make the Resource Manager disposition authoritative.
         self.charges
             .lock()
             .expect("peer charges lock")
-            .push((fee, context));
+            .push((fee.clone(), context.clone()));
+
+        let (consumer, disconnect_counter) = {
+            let resource = self.resource.lock().expect("peer resource lock");
+            (
+                resource.consumer.clone(),
+                resource.disconnect_counter.clone(),
+            )
+        };
+        let Some(consumer) = consumer else {
+            return;
+        };
+        if consumer.charge_with_context(fee, context) != Disposition::Drop
+            || self.resource_drop_requested.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        if consumer.disconnect_with_manager_journal() {
+            if let Some(counter) = disconnect_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::warn!(target: "overlay", peer_id = %self.id, "charge: Resources");
+            self.request_disconnect();
+        }
     }
 
     fn id(&self) -> PeerId {
@@ -890,6 +1134,7 @@ mod tests {
     use protocol::{KeyType, SecretKey, derive_public_key};
 
     use super::{PeerImp, Tracking};
+    use crate::message::ProtocolPayload;
     use crate::peer::{Peer, ProtocolFeature};
     use crate::protocol_version::ProtocolVersion;
 
@@ -1047,6 +1292,45 @@ mod tests {
         assert_eq!(peer.remember_status(None), Some(2));
         assert_eq!(peer.remember_status(Some(4)), Some(4));
         assert_eq!(peer.remember_status(None), Some(4));
+    }
+
+    #[test]
+    fn matching_pong_uses_local_cookie_and_ignores_peer_timestamp() {
+        let secret = SecretKey::from_bytes([14u8; 32]);
+        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+        let peer = PeerImp::new(
+            16,
+            "127.0.0.1:51241".parse().expect("endpoint"),
+            public,
+            "ping-cookie",
+        );
+
+        peer.on_timer_for_test();
+        let ping = peer.queued_messages().pop().expect("timer ping");
+        let ProtocolPayload::Ping(ping) = ping.protocol().payload.clone() else {
+            panic!("timer must send TMPing");
+        };
+        let rtt = peer
+            .acknowledge_ping(Some(ping.seq.expect("ping sequence")))
+            .expect("matching local cookie");
+        assert_eq!(peer.latency_ms(), rtt);
+
+        peer.on_timer_for_test();
+        let second_ping = peer.queued_messages().pop().expect("second timer ping");
+        let ProtocolPayload::Ping(second_ping) = second_ping.protocol().payload.clone() else {
+            panic!("timer must send TMPing");
+        };
+        assert!(
+            peer.acknowledge_ping(Some(
+                second_ping
+                    .seq
+                    .expect("second ping sequence")
+                    .wrapping_add(1)
+            ))
+            .is_none()
+        );
+        assert!(peer.acknowledge_ping(None).is_none());
+        assert!(!peer.disconnect_requested());
     }
 
     #[test]

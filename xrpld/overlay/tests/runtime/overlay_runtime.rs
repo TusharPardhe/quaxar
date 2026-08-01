@@ -247,6 +247,8 @@ fn activation_enforces_peer_limit_but_allows_reserved_or_cluster_bypass() {
         Setup {
             ip_limit: 32,
             peer_limit: 1,
+            peer_limit_in: Some(0),
+            peer_limit_out: Some(1),
             ..setup()
         },
         Arc::new(TestHandoff),
@@ -284,6 +286,8 @@ fn refresh_membership_state_evicts_excess_unreserved_peers_after_owner_source_ch
     let overlay = OverlayImpl::new(
         Setup {
             peer_limit: 1,
+            peer_limit_in: Some(0),
+            peer_limit_out: Some(1),
             ..setup()
         },
         Arc::new(TestHandoff),
@@ -551,7 +555,9 @@ async fn outbound_connect_reports_service_unavailable_when_listener_peer_limit_i
     let listener_overlay = OverlayImpl::new(
         Setup {
             server_config: Some(server_config()),
-            peer_limit: 1,
+            peer_limit: 2,
+            peer_limit_in: Some(1),
+            peer_limit_out: Some(1),
             ..setup()
         },
         Arc::new(TestHandoff),
@@ -559,7 +565,13 @@ async fn outbound_connect_reports_service_unavailable_when_listener_peer_limit_i
     .expect("listener overlay");
     let client_overlay = OverlayImpl::new(setup(), Arc::new(TestHandoff)).expect("client overlay");
 
-    assert!(listener_overlay.activate(peer(17, 50)));
+    assert!(listener_overlay.activate(PeerImp::new_with_inbound(
+        17,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5017),
+        true,
+        public_key(50),
+        "inbound-peer-17",
+    )));
     // Register a known redirect endpoint so the 503 response includes peer-ips
     listener_overlay.remember_redirect_endpoint(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)), 5017),

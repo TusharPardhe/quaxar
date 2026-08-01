@@ -19,12 +19,12 @@ use protocol::{
     sha512_half as protocol_sha512_half, sign_digest,
 };
 use rand::seq::SliceRandom;
+use resource::{NullCollector, NullJournal, ResourceManager, make_manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tokio_openssl::SslStream;
 use xrpl_core::PeerReservationTable as CorePeerReservationTable;
 
 use crate::cluster::Cluster;
@@ -427,6 +427,14 @@ impl OverlayInboundRouter<'_> {
         }
     }
 
+    fn reject_malformed(&self, context: &'static str) -> crate::router::RouteAction {
+        self.peer.charge(
+            (*resource::FEE_MALFORMED_REQUEST).clone(),
+            context.to_owned(),
+        );
+        crate::router::RouteAction::Continue
+    }
+
     fn parse_transaction(&self, message: &crate::message::TmTransaction) -> Option<Uint256> {
         if self.peer.tracking() == crate::peer_imp::Tracking::Diverged {
             return None;
@@ -491,6 +499,12 @@ impl MessageRouter for OverlayInboundRouter<'_> {
 
     fn on_ping(&mut self, message: &crate::message::TmPing) -> crate::router::RouteAction {
         if message.r#type == 0 {
+            // TMPing PING costs moderate peer work before replying, exactly as
+            // PeerImp::onMessage(TMPing) does.
+            self.peer.charge(
+                (*resource::FEE_MODERATE_BURDEN_PEER).clone(),
+                "ping request".to_owned(),
+            );
             // Ping request — reply with pong
             let _ = self.overlay.send_runtime_message(
                 self.peer,
@@ -506,23 +520,15 @@ impl MessageRouter for OverlayInboundRouter<'_> {
                 false,
             );
         } else if message.r#type == 1 {
-            // Pong response — compute RTT and update peer latency
-            // reference: latency_ = latency_ ? (*latency_ * 7 + rtt) / 8 : rtt
-            if let Some(ping_time) = message.ping_time {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                if now_ms > ping_time {
-                    let rtt_ms = (now_ms - ping_time) as u32;
-                    self.peer.update_latency(rtt_ms);
-                    tracing::debug!(
-                        target: "overlay",
-                        peer_id = %self.peer.id(),
-                        latency_ms = rtt_ms,
-                        "Peer latency measured"
-                    );
-                }
+            // A PONG is valid only for the exact outstanding local cookie.
+            // Never derive RTT from the peer-provided timestamp.
+            if let Some(rtt_ms) = self.peer.acknowledge_ping(message.seq) {
+                tracing::debug!(
+                    target: "overlay",
+                    peer_id = %self.peer.id(),
+                    latency_ms = rtt_ms,
+                    "Peer latency measured"
+                );
             }
         }
         crate::router::RouteAction::Continue
@@ -569,6 +575,10 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             return crate::router::RouteAction::Continue;
         }
         if message.endpoints_v2.len() >= 1024 {
+            self.peer.charge(
+                (*resource::FEE_MODERATE_BURDEN_PEER).clone(),
+                "oversized endpoints".to_owned(),
+            );
             return crate::router::RouteAction::Continue;
         }
         let now_instant = Instant::now();
@@ -686,7 +696,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
     ) -> crate::router::RouteAction {
         if !(0..=3).contains(&message.itype) {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid get_ledger itype");
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("invalid get_ledger type");
         }
         if message.itype == 3 {
             if message
@@ -695,26 +705,26 @@ impl MessageRouter for OverlayInboundRouter<'_> {
                 .and_then(Uint256::from_slice)
                 .is_none()
             {
-                return crate::router::RouteAction::Continue;
+                return self.reject_malformed("get_ledger candidate without hash");
             }
         } else if message.ledger_hash.is_none()
             && message.ledger_seq.is_none()
             && message.ltype != Some(2)
         {
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("get_ledger without ledger selector");
         }
         if message
             .ledger_hash
             .as_deref()
             .is_some_and(|hash| Uint256::from_slice(hash).is_none())
         {
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("get_ledger malformed ledger hash");
         }
         if message.itype != 0
             && (message.node_i_ds.is_empty()
                 || message.node_i_ds.iter().any(|node_id| node_id.is_empty()))
         {
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("get_ledger invalid node ids");
         }
 
         self.overlay
@@ -728,18 +738,18 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         message: &crate::message::TmLedgerData,
     ) -> crate::router::RouteAction {
         if Uint256::from_slice(&message.ledger_hash).is_none() {
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("ledger_data malformed ledger hash");
         }
         if !(0..=3).contains(&message.r#type) {
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("ledger_data invalid type");
         }
         if let Some(error) = message.error
             && !(1..=3).contains(&error)
         {
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("ledger_data invalid error code");
         }
         if message.nodes.is_empty() || message.nodes.len() > HARD_MAX_REPLY_NODES {
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("ledger_data invalid node count");
         }
 
         self.overlay
@@ -760,19 +770,19 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         );
         if !(64..=72).contains(&message.signature.len()) {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid proposal signature length");
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("proposal invalid signature length");
         }
         let Ok(public_key) = PublicKey::from_slice(&message.node_pub_key) else {
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("proposal invalid public key");
         };
         if public_key.key_type() != Some(KeyType::Secp256k1) {
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("proposal unsupported public key");
         }
         let Some(current_tx_hash) = Uint256::from_slice(&message.current_tx_hash) else {
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("proposal malformed transaction hash");
         };
         let Some(previous_ledger) = Uint256::from_slice(&message.previousledger) else {
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("proposal malformed previous ledger");
         };
         let suppression = proposal_unique_id(
             current_tx_hash,
@@ -867,7 +877,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         tracing::trace!(target: "overlay", peer_id = %self.peer.id(), len = message.validation.len(), "on_validation: received TMValidation from peer");
         if message.validation.len() < 50 {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Validation too short, ignoring");
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("validation too short");
         }
         let suppression = sha512_half(&message.validation);
         self.overlay.inbound_handler.on_validation(
@@ -894,7 +904,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         }
         if message.manifest.is_empty() || message.blob.is_empty() || message.signature.is_empty() {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid validator list message");
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("validator list missing payload");
         }
         tracing::debug!(target: "overlay", peer_id = %self.peer.id(), "Validator list received");
         self.overlay
@@ -910,11 +920,11 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         if !self
             .peer
             .supports_feature(ProtocolFeature::ValidatorList2Propagation)
-            || message.version < 2
-            || message.manifest.is_empty()
-            || message.blobs.is_empty()
         {
             return crate::router::RouteAction::Continue;
+        }
+        if message.version < 2 || message.manifest.is_empty() || message.blobs.is_empty() {
+            return self.reject_malformed("validator list collection malformed");
         }
         tracing::debug!(target: "overlay", peer_id = %self.peer.id(), "Validator list collection received");
         self.overlay
@@ -933,7 +943,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             .is_some_and(|hash| Uint256::from_slice(hash).is_none())
         {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid get_objects ledger hash");
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("get_objects malformed ledger hash");
         }
         if message.r#type == 7 && !self.peer.tx_reduce_relay_enabled() {
             return crate::router::RouteAction::Continue;
@@ -959,7 +969,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             .collect::<Option<Vec<_>>>();
         let Some(hashes) = hashes else {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid have_transactions hash");
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("have_transactions malformed hash");
         };
 
         tracing::trace!(
@@ -1004,7 +1014,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
     fn on_squelch(&mut self, message: &crate::message::TmSquelch) -> crate::router::RouteAction {
         let Ok(validator) = PublicKey::from_slice(&message.validator_pub_key) else {
             tracing::debug!(target: "overlay", peer_id = %self.peer.id(), "Invalid squelch public key");
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("squelch malformed public key");
         };
 
         if !message.squelch {
@@ -1033,7 +1043,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             || !(1..=2).contains(&message.r#type)
         {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid proof path request");
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("proof path request malformed");
         }
         tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Proof path request received");
         self.overlay
@@ -1051,7 +1061,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             || !(1..=2).contains(&message.r#type)
         {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid proof path response");
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("proof path response malformed");
         }
         tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Proof path response received");
         self.overlay
@@ -1066,7 +1076,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
     ) -> crate::router::RouteAction {
         if Uint256::from_slice(&message.ledger_hash).is_none() {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid replay delta request hash");
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("replay delta request malformed hash");
         }
         tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Replay delta request received");
         self.overlay
@@ -1081,7 +1091,7 @@ impl MessageRouter for OverlayInboundRouter<'_> {
     ) -> crate::router::RouteAction {
         if Uint256::from_slice(&message.ledger_hash).is_none() {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid replay delta response hash");
-            return crate::router::RouteAction::Continue;
+            return self.reject_malformed("replay delta response malformed hash");
         }
         tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Replay delta response received");
         self.overlay
@@ -1108,6 +1118,7 @@ pub struct OverlayImpl {
     jq_trans_overflow: Arc<AtomicU64>,
     peer_disconnects: Arc<AtomicU64>,
     peer_disconnect_charges: Arc<AtomicU64>,
+    resource_manager: Arc<ResourceManager>,
     identity: OverlayIdentity,
     stop_requested: watch::Sender<bool>,
     stopping: Arc<AtomicBool>,
@@ -1188,6 +1199,8 @@ impl OverlayImpl {
                 .build()
                 .map_err(OverlayError::Io)?,
         );
+        let resource_manager =
+            Arc::new(make_manager(Arc::new(NullCollector), Arc::new(NullJournal)));
 
         Ok(Self {
             setup,
@@ -1199,6 +1212,7 @@ impl OverlayImpl {
             jq_trans_overflow: Arc::new(AtomicU64::new(0)),
             peer_disconnects: Arc::new(AtomicU64::new(0)),
             peer_disconnect_charges: Arc::new(AtomicU64::new(0)),
+            resource_manager,
             identity,
             stop_requested,
             stopping: Arc::new(AtomicBool::new(false)),
@@ -1627,6 +1641,7 @@ impl OverlayImpl {
             jq_trans_overflow: Arc::clone(&self.jq_trans_overflow),
             peer_disconnects: Arc::clone(&self.peer_disconnects),
             peer_disconnect_charges: Arc::clone(&self.peer_disconnect_charges),
+            resource_manager: Arc::clone(&self.resource_manager),
             identity: self.identity.clone(),
             stop_requested: self.stop_requested.clone(),
             stopping: Arc::clone(&self.stopping),
@@ -1651,21 +1666,39 @@ impl OverlayImpl {
 
     pub fn activate(&self, peer: Arc<PeerImp>) -> bool {
         self.apply_membership_state(&peer);
+        let limits = self.setup.peer_limits();
         let mut active_peers = self.active_peers.write().expect("overlay peers lock");
-        if self.limit() != 0
-            && self.counted_active_peers_count_locked(&active_peers) >= self.limit()
-            && self.peer_counts_toward_limit(&peer)
-        {
+        let active_in_direction =
+            self.directional_active_peers_count_locked(&active_peers, peer.inbound());
+        let direction_limit = if peer.inbound() {
+            limits.inbound_max
+        } else {
+            limits.outbound_max
+        };
+        if self.peer_counts_toward_limit(&peer) && active_in_direction >= direction_limit {
             tracing::warn!(
                 target: "overlay",
                 peer_id = %peer.id(),
-                "Peer resource limit exceeded"
+                inbound = peer.inbound(),
+                active_in_direction,
+                direction_limit,
+                "Peer directional resource limit exceeded"
             );
             return false;
         }
         active_peers.insert(peer.id(), Arc::clone(&peer));
         let total = active_peers.len();
         drop(active_peers);
+
+        let consumer = if peer.inbound() {
+            self.resource_manager
+                .new_inbound_endpoint(peer.remote_address())
+        } else {
+            self.resource_manager
+                .new_outbound_endpoint(peer.remote_address())
+        };
+        peer.install_resource_consumer(consumer, Arc::clone(&self.peer_disconnect_charges));
+        peer.start_lifecycle_timer(self.session_runtime.handle());
 
         self.by_public_key
             .write()
@@ -1702,6 +1735,7 @@ impl OverlayImpl {
                 .write()
                 .expect("overlay public-key lock")
                 .remove(&peer.node_public());
+            peer.stop_lifecycle_timer();
             peer.detach_session();
             peer.clear_queued_messages();
             peer.clear_tx_queue();
@@ -1885,6 +1919,11 @@ impl OverlayImpl {
         tx: std::sync::mpsc::SyncSender<crate::PeerMessage<crate::TmLedgerData>>,
     ) {
         self.queued_inbound.set_ledger_data_channel(tx);
+    }
+
+    /// Drain accepted endpoint advertisements for the live PeerFinder cache.
+    pub fn take_endpoints(&self) -> Vec<crate::QueuedEndpoints> {
+        self.queued_inbound.take_endpoints()
     }
 
     pub fn take_validations(&self) -> Vec<crate::QueuedValidation> {
@@ -2352,7 +2391,7 @@ impl OverlayImpl {
             .read()
             .expect("overlay peers lock")
             .values()
-            .filter(|peer| peer.has_dead_session_channel())
+            .filter(|peer| peer.disconnect_requested() || peer.has_dead_session_channel())
             .map(|peer| peer.id())
             .collect::<Vec<_>>();
 
@@ -2425,55 +2464,70 @@ impl OverlayImpl {
         (reserved, clustered)
     }
 
+    /// Mirrors rippled `Counts::adjust(Active)`: fixed, reserved, and cluster
+    /// peers remain active but do not consume a public directional slot.
     fn peer_counts_toward_limit(&self, peer: &PeerImp) -> bool {
         !peer.fixed() && !peer.reserved() && !peer.cluster()
     }
 
-    fn counted_active_peers_count_locked(
+    fn directional_active_peers_count_locked(
         &self,
         active_peers: &HashMap<PeerId, Arc<PeerImp>>,
+        inbound: bool,
     ) -> usize {
         active_peers
             .values()
-            .filter(|peer| self.peer_counts_toward_limit(peer))
+            .filter(|peer| peer.inbound() == inbound && self.peer_counts_toward_limit(peer))
             .count()
     }
 
-    fn counted_active_peers_count(&self) -> usize {
-        self.counted_active_peers_count_locked(
+    pub fn active_inbound_peers_count(&self) -> usize {
+        self.prune_disconnected_peers();
+        self.directional_active_peers_count_locked(
             &self.active_peers.read().expect("overlay peers lock"),
+            true,
         )
     }
 
     fn can_activate_peer(&self, peer: &PeerImp) -> bool {
-        let limit = self.limit();
-        limit == 0
-            || self.counted_active_peers_count() < limit
-            || !self.peer_counts_toward_limit(peer)
+        if !self.peer_counts_toward_limit(peer) {
+            return true;
+        }
+        let limits = self.setup.peer_limits();
+        let active_peers = self.active_peers.read().expect("overlay peers lock");
+        let (active_in_direction, direction_limit) = if peer.inbound() {
+            (
+                self.directional_active_peers_count_locked(&active_peers, true),
+                limits.inbound_max,
+            )
+        } else {
+            (
+                self.directional_active_peers_count_locked(&active_peers, false),
+                limits.outbound_max,
+            )
+        };
+        active_in_direction < direction_limit
     }
 
     fn enforce_peer_limit(&self, peers: &[Arc<PeerImp>]) {
-        let limit = self.limit();
-        if limit == 0 {
-            return;
-        }
-
-        let active_count = self.counted_active_peers_count();
-        if active_count <= limit {
-            return;
-        }
-
-        let mut remaining = active_count;
+        let limits = self.setup.peer_limits();
+        let mut remaining_inbound = self.active_inbound_peers_count();
+        let mut remaining_outbound = self.active_outbound_peers_count();
         let mut to_deactivate = Vec::new();
+
         for peer in peers.iter().rev() {
-            if remaining <= limit {
-                break;
-            }
             if !self.peer_counts_toward_limit(peer) {
                 continue;
             }
-            to_deactivate.push(peer.id());
-            remaining -= 1;
+            let (remaining, limit) = if peer.inbound() {
+                (&mut remaining_inbound, limits.inbound_max)
+            } else {
+                (&mut remaining_outbound, limits.outbound_max)
+            };
+            if *remaining > limit {
+                to_deactivate.push(peer.id());
+                *remaining -= 1;
+            }
         }
 
         for id in to_deactivate {
@@ -2568,12 +2622,14 @@ impl OverlayImpl {
 
     pub fn active_outbound_peers_count(&self) -> usize {
         self.prune_disconnected_peers();
-        self.active_peers
-            .read()
-            .expect("overlay peers lock")
-            .values()
-            .filter(|peer| !peer.inbound() && self.peer_counts_toward_limit(peer))
-            .count()
+        self.directional_active_peers_count_locked(
+            &self.active_peers.read().expect("overlay peers lock"),
+            false,
+        )
+    }
+
+    pub fn peer_limits(&self) -> crate::overlay::PeerLimits {
+        self.setup.peer_limits()
     }
 
     fn finalize_connect_result(
@@ -2709,7 +2765,7 @@ impl Overlay for OverlayImpl {
     }
 
     fn limit(&self) -> usize {
-        self.setup.peer_limit
+        self.setup.peer_limits().max_peers
     }
 
     fn size(&self) -> usize {
