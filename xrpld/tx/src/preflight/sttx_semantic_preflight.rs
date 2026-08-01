@@ -10,7 +10,7 @@ use protocol::{NotTec, Permission, Rules, STTx, Ter, TxType, get_field_by_symbol
 /// Runs the common, amendment-aware, stateless preflight portion for a
 /// canonical transaction. Signature validation and ledger-dependent preclaim
 /// remain the responsibility of the caller's normal transaction pipeline.
-pub fn validate_sttx_semantic_preflight_with_rules(tx: &STTx, rules: &Rules) -> NotTec {
+pub fn validate_sttx_transaction_preflight_with_rules(tx: &STTx, rules: &Rules) -> NotTec {
     if protocol::passes_local_checks(tx).is_err() {
         return Ter::TEM_INVALID;
     }
@@ -24,6 +24,11 @@ pub fn validate_sttx_semantic_preflight_with_rules(tx: &STTx, rules: &Rules) -> 
     let common = validate_sttx_common_transactor_preflight(tx);
     if !is_tes_success(common) {
         return common;
+    }
+
+    let sponsor = validate_sttx_sponsor_preflight(tx, rules);
+    if !is_tes_success(sponsor) {
+        return sponsor;
     }
 
     let typed_preflight = crate::run_with_txn_type_key(rules, tx.get_txn_type(), |txn_type| {
@@ -49,6 +54,49 @@ pub fn validate_sttx_semantic_preflight_with_rules(tx: &STTx, rules: &Rules) -> 
         return Ter::TEM_BAD_SIGNER;
     }
 
+    Ter::TES_SUCCESS
+}
+
+/// Backward-compatible name for the standalone transaction semantic dispatcher.
+pub fn validate_sttx_semantic_preflight_with_rules(tx: &STTx, rules: &Rules) -> NotTec {
+    validate_sttx_transaction_preflight_with_rules(tx, rules)
+}
+
+fn validate_sttx_sponsor_preflight(tx: &STTx, rules: &Rules) -> NotTec {
+    let sponsor = get_field_by_symbol("sfSponsor");
+    let sponsor_flags = get_field_by_symbol("sfSponsorFlags");
+    let sponsor_signature = get_field_by_symbol("sfSponsorSignature");
+    let has_sponsor = tx.is_field_present(sponsor);
+    let has_sponsor_flags = tx.is_field_present(sponsor_flags);
+    let has_sponsor_signature = tx.is_field_present(sponsor_signature);
+
+    if (has_sponsor || has_sponsor_flags || has_sponsor_signature)
+        && !rules.enabled(&protocol::feature_sponsor())
+    {
+        return Ter::TEM_DISABLED;
+    }
+    if has_sponsor != has_sponsor_flags {
+        return Ter::TEM_INVALID_FLAG;
+    }
+    if has_sponsor_signature && (!has_sponsor || !has_sponsor_flags) {
+        return Ter::TEM_MALFORMED;
+    }
+    if has_sponsor_flags {
+        let flags = tx.get_field_u32(sponsor_flags);
+        if flags == 0 || (flags & ledger::SPF_SPONSOR_FLAG_MASK) != 0 {
+            return Ter::TEM_INVALID_FLAG;
+        }
+        if ledger::is_reserve_sponsored(flags)
+            && !ledger::is_reserve_sponsor_allowed(tx.get_txn_type())
+        {
+            return Ter::TEM_INVALID_FLAG;
+        }
+    }
+    if has_sponsor
+        && tx.get_account_id(sponsor) == tx.get_account_id(get_field_by_symbol("sfAccount"))
+    {
+        return Ter::TEM_MALFORMED;
+    }
     Ter::TES_SUCCESS
 }
 
@@ -83,14 +131,19 @@ fn validate_sttx_typed_semantic_preflight(tx: &STTx, rules: &Rules, txn_type: Tx
         TxType::PAYCHAN_CREATE => validate_payment_channel_create_preflight(tx),
         TxType::PAYCHAN_FUND => validate_payment_channel_fund_preflight(tx),
         TxType::CHECK_CREATE => validate_check_create_preflight(tx),
+        TxType::CHECK_CASH => validate_check_cash_preflight(tx),
+        TxType::REGULAR_KEY_SET => validate_set_regular_key_preflight(tx),
         TxType::ESCROW_CREATE => validate_escrow_create_preflight(tx, rules),
         TxType::ACCOUNT_SET => validate_account_set_preflight(tx),
-        // Every dispatchable transaction reaches this shared semantic boundary.
-        // Types whose stateless rules currently live entirely in the common
-        // transactor shell receive that shell's result rather than bypassing
-        // preflight through a Batch-local success fallback.
-        _ => Ter::TES_SUCCESS,
+        // Types with no additional stateless rule still traverse the standalone
+        // dispatcher explicitly; unknown types never silently succeed.
+        _ if txn_type.is_dispatchable() => validate_sttx_noop_preflight(txn_type),
+        _ => Ter::TEM_UNKNOWN,
     }
+}
+
+fn validate_sttx_noop_preflight(_txn_type: TxType) -> NotTec {
+    Ter::TES_SUCCESS
 }
 
 fn validate_payment_preflight(tx: &STTx) -> NotTec {
@@ -195,6 +248,41 @@ fn validate_check_create_preflight(tx: &STTx) -> NotTec {
             .is_field_present(expiration)
             .then(|| tx.get_field_u32(expiration)),
     })
+}
+
+fn validate_check_cash_preflight(tx: &STTx) -> NotTec {
+    let amount_field = get_field_by_symbol("sfAmount");
+    let deliver_min_field = get_field_by_symbol("sfDeliverMin");
+    let amount_present = tx.is_field_present(amount_field);
+    let deliver_min_present = tx.is_field_present(deliver_min_field);
+    let value = amount_present
+        .then(|| tx.get_field_amount(amount_field))
+        .or_else(|| deliver_min_present.then(|| tx.get_field_amount(deliver_min_field)));
+    let (value_signum_positive, value_currency_is_bad) = value
+        .map(|value| {
+            (
+                value.signum() > 0,
+                !value.native() && value.issue().currency.is_zero(),
+            )
+        })
+        .unwrap_or((true, false));
+
+    crate::run_check_cash_preflight(crate::CheckCashPreflightFacts {
+        amount_present,
+        deliver_min_present,
+        value_is_legal: true,
+        value_signum_positive,
+        value_currency_is_bad,
+    })
+}
+
+fn validate_set_regular_key_preflight(tx: &STTx) -> NotTec {
+    let account = tx.get_account_id(get_field_by_symbol("sfAccount"));
+    let regular_key_field = get_field_by_symbol("sfRegularKey");
+    if tx.is_field_present(regular_key_field) && tx.get_account_id(regular_key_field) == account {
+        return Ter::TEM_BAD_REGKEY;
+    }
+    Ter::TES_SUCCESS
 }
 
 fn validate_escrow_create_preflight(tx: &STTx, rules: &Rules) -> NotTec {

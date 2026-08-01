@@ -1,4 +1,4 @@
-use crate::{Backend, Factory, NodeObject, NodeStoreJournal, Scheduler, Status};
+use crate::{Backend, Factory, JournalLevel, NodeObject, NodeStoreJournal, Scheduler, Status};
 use basics::{base_uint::Uint256, basic_config::Section};
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -193,9 +193,16 @@ impl Backend for MemoryBackend {
         (results, Status::Ok)
     }
 
-    fn store(&self, object: Arc<NodeObject>) {
-        let db = self.open_database();
-        let mut table = db
+    fn store(&self, object: Arc<NodeObject>) -> Result<(), String> {
+        let database = self
+            .database
+            .lock()
+            .expect("memory backend database mutex must not be poisoned")
+            .clone()
+            .ok_or_else(|| {
+                "xrpl::NodeStore::MemoryBackend::store : database is not open".to_owned()
+            })?;
+        let mut table = database
             .table
             .lock()
             .expect("memory database table mutex must not be poisoned");
@@ -205,11 +212,15 @@ impl Backend for MemoryBackend {
             }
             Entry::Occupied(_) => {}
         }
+        Ok(())
     }
 
     fn store_batch(&self, batch: &crate::Batch) {
         for object in batch {
-            self.store(Arc::clone(object));
+            if let Err(error) = self.store(Arc::clone(object)) {
+                self.journal.log(JournalLevel::Error, &error);
+                return;
+            }
         }
     }
 
@@ -311,7 +322,9 @@ mod tests {
         }
 
         let first = sample_object(0x11, &[1, 2, 3]);
-        backend_a.store(Arc::clone(&first));
+        backend_a
+            .store(Arc::clone(&first))
+            .expect("first store should succeed");
         backend_a.close().expect("close should succeed");
 
         backend_b
@@ -319,7 +332,9 @@ mod tests {
             .expect("reopen should succeed after close");
         let replacement =
             NodeObject::create_object(NodeObjectType::Ledger, vec![9, 9, 9], *first.hash());
-        backend_b.store(replacement);
+        backend_b
+            .store(replacement)
+            .expect("replacement store should succeed");
 
         let (fetched, status) = backend_b.fetch(first.hash());
         assert_eq!(status, crate::Status::Ok);
@@ -374,7 +389,9 @@ mod tests {
         backend.open(true).expect("open should succeed");
 
         let present = sample_object(0x21, &[4, 5, 6]);
-        backend.store(Arc::clone(&present));
+        backend
+            .store(Arc::clone(&present))
+            .expect("present store should succeed");
 
         let missing = Uint256::from_array([0x22; 32]);
         let (results, status) = backend.fetch_batch(&[*present.hash(), missing]);
@@ -401,9 +418,15 @@ mod tests {
         let second = sample_object(0x22, &[2]);
         let duplicate = NodeObject::create_object(NodeObjectType::Ledger, vec![9], *first.hash());
 
-        backend.store(Arc::clone(&second));
-        backend.store(Arc::clone(&first));
-        backend.store(duplicate);
+        backend
+            .store(Arc::clone(&second))
+            .expect("second store should succeed");
+        backend
+            .store(Arc::clone(&first))
+            .expect("first store should succeed");
+        backend
+            .store(duplicate)
+            .expect("duplicate store should succeed");
 
         let mut seen = Vec::new();
         backend.for_each(&mut |object| {

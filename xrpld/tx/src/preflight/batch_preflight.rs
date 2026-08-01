@@ -350,10 +350,11 @@ fn validate_sttx_batch_preflight_with_inner_preflight(
     }
 }
 
-/// Delegates Batch inner validation to the shared, amendment-aware, stateless
-/// transaction semantic-preflight dispatcher.
+/// Delegates Batch inner validation to the same shared dispatcher used for
+/// standalone transaction admission. This prevents Batch from bypassing a
+/// transaction type's semantic preflight.
 pub fn validate_sttx_inner_batch_preflight_with_rules(inner: &STTx, rules: &Rules) -> NotTec {
-    crate::validate_sttx_semantic_preflight_with_rules(inner, rules)
+    crate::validate_sttx_transaction_preflight_with_rules(inner, rules)
 }
 
 fn st_object_signature_facts(object: &STObject) -> BatchSignatureFacts {

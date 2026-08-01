@@ -317,10 +317,14 @@ fn bootstrap_needs_bootcache_dial(
 }
 
 fn bootstrap_can_dial_bootcache(
+    auto_connect: bool,
     active_outbound_peers: usize,
     target_outbound_peers: usize,
 ) -> bool {
-    bootstrap_needs_bootcache_dial(active_outbound_peers, target_outbound_peers)
+    // rippled PeerFinder::Config: autoConnect = !standalone && !peerPrivate.
+    // Fixed peers remain independently retried below; this controls only
+    // autonomous livecache/bootcache acquisition.
+    auto_connect && bootstrap_needs_bootcache_dial(active_outbound_peers, target_outbound_peers)
 }
 
 fn fixed_retry_delay(failures: usize) -> Duration {
@@ -486,8 +490,13 @@ impl OverlayHandoff for BootstrapOverlayHandoff {
 pub struct AppOverlayRuntime {
     overlay: Arc<OverlayImpl>,
     listener_setup: Option<ServerPortOverlaySetup>,
+    /// A mixed peer+HTTP/WS port is bound by the server runtime exactly once.
+    /// The overlay retains its TLS/handshake configuration but must not bind it.
+    server_owns_listener: bool,
     fixed_peer_endpoints: Vec<String>,
     bootstrap_peer_endpoints: Vec<String>,
+    /// `false` for `[peer_private]`, matching rippled's `autoConnect`.
+    bootstrap_can_dial_bootcache: bool,
     peerfinder_bootcache_path: Option<PathBuf>,
     network_ops_mode_owner: Option<AppNetworkOpsModeOwner>,
     status_rpc_state: Option<Arc<StatusRpcState>>,
@@ -502,8 +511,13 @@ impl std::fmt::Debug for AppOverlayRuntime {
             .debug_struct("AppOverlayRuntime")
             .field("network_id", &self.network_id())
             .field("listener_setup", &self.listener_setup)
+            .field("server_owns_listener", &self.server_owns_listener)
             .field("fixed_peer_endpoints", &self.fixed_peer_endpoints)
             .field("bootstrap_peer_endpoints", &self.bootstrap_peer_endpoints)
+            .field(
+                "bootstrap_can_dial_bootcache",
+                &self.bootstrap_can_dial_bootcache,
+            )
             .field("peerfinder_bootcache_path", &self.peerfinder_bootcache_path)
             .field("started", &self.started())
             .field("stopped", &self.stopped())
@@ -515,8 +529,10 @@ impl AppOverlayRuntime {
     pub fn new(
         overlay: Arc<OverlayImpl>,
         listener_setup: Option<ServerPortOverlaySetup>,
+        server_owns_listener: bool,
         fixed_peer_endpoints: Vec<String>,
         bootstrap_peer_endpoints: Vec<String>,
+        bootstrap_can_dial_bootcache: bool,
         peerfinder_bootcache_path: Option<PathBuf>,
         network_ops_mode_owner: Option<AppNetworkOpsModeOwner>,
         status_rpc_state: Option<Arc<StatusRpcState>>,
@@ -524,8 +540,10 @@ impl AppOverlayRuntime {
         Self {
             overlay,
             listener_setup,
+            server_owns_listener,
             fixed_peer_endpoints,
             bootstrap_peer_endpoints,
+            bootstrap_can_dial_bootcache,
             peerfinder_bootcache_path,
             network_ops_mode_owner,
             status_rpc_state,
@@ -541,6 +559,14 @@ impl AppOverlayRuntime {
 
     pub fn listener_setup(&self) -> Option<ServerPortOverlaySetup> {
         self.listener_setup.clone()
+    }
+
+    pub fn server_owns_listener(&self) -> bool {
+        self.server_owns_listener
+    }
+
+    pub fn bootstrap_can_dial_bootcache(&self) -> bool {
+        self.bootstrap_can_dial_bootcache
     }
 
     pub fn network_id(&self) -> Option<u32> {
@@ -576,7 +602,9 @@ impl ManagedComponent for AppOverlayRuntime {
             "overlay runtime requires an active tokio runtime before start".to_owned()
         })?;
 
-        if let Some(listener_setup) = self.listener_setup.as_ref() {
+        if let Some(listener_setup) = self.listener_setup.as_ref()
+            && !self.server_owns_listener
+        {
             let address = format!("{}:{}", listener_setup.ip, listener_setup.port)
                 .parse::<SocketAddr>()
                 .map_err(|error| {
@@ -615,6 +643,7 @@ impl ManagedComponent for AppOverlayRuntime {
             fixed_endpoints,
             endpoints,
             peerfinder_bootcache_path,
+            self.bootstrap_can_dial_bootcache,
             target_outbound_peers,
             network_ops_mode_owner,
             status_rpc_state,
@@ -637,9 +666,13 @@ impl ManagedComponent for AppOverlayRuntime {
     }
 
     fn fd_required(&self) -> usize {
-        self.listener_setup
-            .as_ref()
-            .map_or(0, ServerPortOverlaySetup::fd_required)
+        if self.server_owns_listener {
+            0
+        } else {
+            self.listener_setup
+                .as_ref()
+                .map_or(0, ServerPortOverlaySetup::fd_required)
+        }
     }
 }
 
@@ -761,6 +794,7 @@ async fn run_live_peerfinder(
     fixed_endpoints: Vec<String>,
     bootstrap_endpoints: Vec<String>,
     bootcache_path: Option<PathBuf>,
+    auto_connect: bool,
     target_outbound_peers: usize,
     network_ops_mode_owner: Option<AppNetworkOpsModeOwner>,
     status_rpc_state: Option<Arc<StatusRpcState>>,
@@ -859,19 +893,21 @@ async fn run_live_peerfinder(
                 }
             }
 
-            for endpoint in &bootstrap_endpoints {
-                let Ok(addresses) = tokio::net::lookup_host(endpoint).await else {
-                    tracing::info!(target: "overlay", %endpoint,
-                        "PeerFinder failed to resolve bootstrap endpoint");
-                    continue;
-                };
-                for address in addresses {
-                    caches.insert_static_bootcache(address);
+            if auto_connect {
+                for endpoint in &bootstrap_endpoints {
+                    let Ok(addresses) = tokio::net::lookup_host(endpoint).await else {
+                        tracing::info!(target: "overlay", %endpoint,
+                            "PeerFinder failed to resolve bootstrap endpoint");
+                        continue;
+                    };
+                    for address in addresses {
+                        caches.insert_static_bootcache(address);
+                    }
                 }
             }
 
             let active_outbound = overlay.active_outbound_peers_count();
-            if bootstrap_can_dial_bootcache(active_outbound, target_outbound_peers) {
+            if bootstrap_can_dial_bootcache(auto_connect, active_outbound, target_outbound_peers) {
                 let connected_ips = overlay
                     .active_peers()
                     .into_iter()
@@ -988,6 +1024,7 @@ pub fn build_overlay_runtime(
     status_rpc_state: Option<Arc<StatusRpcState>>,
 ) -> Result<Arc<AppOverlayRuntime>, String> {
     let mut setup = build_overlay_setup(config)?;
+    let peer_private = parse_peer_private(config)?;
     let fixed_peer_endpoints = parse_peer_endpoints(config, "ips_fixed")?;
     let bootstrap_peer_endpoints = parse_bootstrap_peer_endpoints(config, &fixed_peer_endpoints)?;
     let peerfinder_bootcache_path = config
@@ -995,6 +1032,15 @@ pub fn build_overlay_runtime(
         .ok()
         .map(|path| PathBuf::from(path).join("peerfinder.db"));
     let listener_setup = server_ports_setup.and_then(|setup| setup.overlay.clone());
+    let server_owns_listener = server_ports_setup.is_some_and(|setup| {
+        setup.ports.iter().any(|port| {
+            port.allows_peer()
+                && (port.allows_http() || port.allows_websocket())
+                && listener_setup
+                    .as_ref()
+                    .is_some_and(|listener| port.ip == listener.ip && port.port == listener.port)
+        })
+    });
     let peer_limit_sections_configured = config.exists("peers_max")
         || config.exists("peers_in_max")
         || config.exists("peers_out_max");
@@ -1005,14 +1051,16 @@ pub fn build_overlay_runtime(
         setup.server_config = build_overlay_server_config(listener)?;
         setup.server_ssl_acceptor = build_overlay_ssl_acceptor(listener)?;
     }
-    setup.want_incoming = listener_setup.is_some() && !parse_peer_private(config)?;
+    setup.want_incoming = listener_setup.is_some() && !peer_private;
     setup.fixed_peer_ips = parse_fixed_peer_ips(&fixed_peer_endpoints);
     let overlay = Arc::new(OverlayImpl::new(setup, handoff).map_err(|error| error.to_string())?);
     Ok(Arc::new(AppOverlayRuntime::new(
         overlay,
         listener_setup,
+        server_owns_listener,
         fixed_peer_endpoints,
         bootstrap_peer_endpoints,
+        !peer_private,
         peerfinder_bootcache_path,
         network_ops_mode_owner,
         status_rpc_state,
@@ -1824,8 +1872,56 @@ tx_min_peers = 9
 
     #[test]
     fn bootstrap_bootcache_stage_allows_parallel_pending_attempts() {
-        assert!(bootstrap_can_dial_bootcache(5, 10));
-        assert!(!bootstrap_can_dial_bootcache(10, 10));
+        assert!(bootstrap_can_dial_bootcache(true, 5, 10));
+        assert!(!bootstrap_can_dial_bootcache(true, 10, 10));
+        assert!(!bootstrap_can_dial_bootcache(false, 0, 10));
+    }
+
+    #[test]
+    fn peer_private_disables_automatic_bootcache_dials_but_keeps_fixed_peers() {
+        let configured = config(
+            "[peer_private]\n1\n[ips_fixed]\nfixed.example.com 51236\n[ips]\nbootstrap.example.com 51235\n",
+        );
+        let runtime = build_overlay_runtime(
+            &configured,
+            None,
+            Arc::new(BootstrapOverlayHandoff),
+            None,
+            None,
+        )
+        .expect("runtime");
+
+        // rippled PeerFinder::Config.cpp: autoConnect = !standalone && !peerPrivate.
+        assert!(!runtime.bootstrap_can_dial_bootcache());
+        assert_eq!(
+            runtime.fixed_peer_endpoints,
+            vec!["fixed.example.com:51236".to_owned()]
+        );
+    }
+
+    #[test]
+    fn mixed_peer_http_ws_port_is_owned_by_server_runtime_once() {
+        let configured = config(
+            "[server]\nport_mixed\n\n[port_mixed]\nip = 127.0.0.1\nport = 51235\nprotocol = peer,http,ws\nlimit = 64\n",
+        );
+        let ports = crate::ServerPortsSetup::from_config(&configured, false).expect("server ports");
+        let runtime = build_overlay_runtime(
+            &configured,
+            Some(&ports),
+            Arc::new(BootstrapOverlayHandoff),
+            None,
+            None,
+        )
+        .expect("runtime");
+
+        assert!(runtime.server_owns_listener());
+        assert_eq!(runtime.fd_required(), 0);
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        tokio_runtime.block_on(async { runtime.start().expect("start") });
+        runtime.stop();
     }
 
     #[test]

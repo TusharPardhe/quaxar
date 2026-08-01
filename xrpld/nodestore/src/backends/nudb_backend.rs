@@ -2260,26 +2260,20 @@ impl Backend for NuDbBackend {
         (results, overall)
     }
 
-    fn store(&self, object: Arc<NodeObject>) {
+    fn store(&self, object: Arc<NodeObject>) -> Result<(), String> {
         // Pre-compute the encoded+compressed record outside the lock. The
         // bucket lookup below remains under the lock so duplicate detection and
         // insertion are one serialized operation.
         let encoded = EncodedBlob::new(&object);
-        let compressed = match nodeobject_compress(encoded.get_data()) {
-            Ok(c) => c,
-            Err(error) => {
-                tracing::error!(target: "nodestore", error = %error, "Node store write failed");
-                self.journal.log(JournalLevel::Error, &error);
-                return;
-            }
-        };
-        let hash_prefix = match self.key_hash_prefix(encoded.get_key()) {
-            Ok(p) => p,
-            Err(error) => {
-                self.journal.log(JournalLevel::Error, &error);
-                return;
-            }
-        };
+        let compressed = nodeobject_compress(encoded.get_data()).map_err(|error| {
+            tracing::error!(target: "nodestore", error = %error, "Node store write failed");
+            self.journal.log(JournalLevel::Error, &error);
+            error
+        })?;
+        let hash_prefix = self.key_hash_prefix(encoded.get_key()).map_err(|error| {
+            self.journal.log(JournalLevel::Error, &error);
+            error
+        })?;
 
         let lock_started = Instant::now();
         let _store_guard = self
@@ -2299,24 +2293,24 @@ impl Backend for NuDbBackend {
                 .lock()
                 .expect("nudb backend runtime mutex must not be poisoned");
             if !runtime.open_state.is_open() {
-                self.journal
-                    .log(JournalLevel::Error, "NuDB backend is not open");
-                return;
-            }
-            if let Err(error) = self.ensure_primary_bucket(&mut runtime) {
+                let error = "NuDB backend is not open".to_owned();
                 self.journal.log(JournalLevel::Error, &error);
-                return;
+                return Err(error);
             }
+            self.ensure_primary_bucket(&mut runtime).map_err(|error| {
+                self.journal.log(JournalLevel::Error, &error);
+                error
+            })?;
             runtime
                 .key_header
                 .expect("nudb runtime header must exist after ensure_primary_bucket")
         };
         match self.find_bucket_entry(encoded.get_key()) {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
             Err(error) => {
                 self.journal.log(JournalLevel::Error, &error);
-                return;
+                return Err(error);
             }
         }
         let key_header = if bulk_importing {
@@ -2329,43 +2323,43 @@ impl Backend for NuDbBackend {
             runtime.split_fraction = runtime.split_fraction.saturating_add(65_536);
             if runtime.split_fraction >= runtime.split_threshold {
                 runtime.split_fraction -= runtime.split_threshold;
-                if let Err(error) = self.split_one_bucket(&mut runtime) {
+                self.split_one_bucket(&mut runtime).map_err(|error| {
                     self.journal.log(JournalLevel::Error, &error);
-                    return;
-                }
+                    error
+                })?;
             }
             runtime
                 .key_header
                 .expect("nudb runtime header must exist after split")
         };
-        if !bulk_importing && let Err(error) = self.begin_burst_checkpoint_if_needed(&key_header) {
-            self.journal.log(JournalLevel::Error, &error);
-            return;
+        if !bulk_importing {
+            self.begin_burst_checkpoint_if_needed(&key_header)
+                .map_err(|error| {
+                    self.journal.log(JournalLevel::Error, &error);
+                    error
+                })?;
         }
         // Use pre-computed compressed data — no re-encoding under the lock.
         let key_size = usize::from(key_header.key_size);
         if encoded.get_key().len() != key_size {
-            self.journal
-                .log(JournalLevel::Error, "NuDB record key size mismatch");
-            return;
+            let error = "NuDB record key size mismatch".to_owned();
+            self.journal.log(JournalLevel::Error, &error);
+            return Err(error);
         }
         let size_val = u64::try_from(compressed.len()).expect("record size must fit u64");
         let mut record = Vec::with_capacity(6 + key_size + compressed.len());
         record.resize(6, 0);
         let mut off = 0usize;
-        if let Err(error) = write_u48_be(&mut record, &mut off, size_val) {
+        write_u48_be(&mut record, &mut off, size_val).map_err(|error| {
             self.journal.log(JournalLevel::Error, &error);
-            return;
-        }
+            error
+        })?;
         record.extend_from_slice(encoded.get_key());
         record.extend_from_slice(&compressed);
-        let offset = match self.append_data(&record) {
-            Ok(o) => o,
-            Err(error) => {
-                self.journal.log(JournalLevel::Error, &error);
-                return;
-            }
-        };
+        let offset = self.append_data(&record).map_err(|error| {
+            self.journal.log(JournalLevel::Error, &error);
+            error
+        })?;
         let entry = NuDbBucketEntry {
             offset,
             size: size_val,
@@ -2373,77 +2367,59 @@ impl Backend for NuDbBackend {
         };
         let bucket_index =
             nudb_bucket_index(entry.hash_prefix, key_header.buckets, key_header.modulus);
-        if let Err(error) = self.insert_bucket_entry(bucket_index, entry) {
-            tracing::error!(target: "nodestore", error = %error, "Node store write failed");
-            self.journal.log(JournalLevel::Error, &error);
-            return;
-        }
+        self.insert_bucket_entry(bucket_index, entry)
+            .map_err(|error| {
+                tracing::error!(target: "nodestore", error = %error, "Node store write failed");
+                self.journal.log(JournalLevel::Error, &error);
+                error
+            })?;
         let size_bytes = compressed.len();
         tracing::debug!(target: "nodestore", hash = %object.hash(), size_bytes, "Node object stored");
-        if !bulk_importing && let Err(error) = self.finish_burst_write() {
-            self.journal.log(JournalLevel::Error, &error);
+        if !bulk_importing {
+            self.finish_burst_write().map_err(|error| {
+                self.journal.log(JournalLevel::Error, &error);
+                error
+            })?;
         }
+        Ok(())
     }
 
     fn store_batch(&self, batch: &Batch) {
-        let mut batch_size_bytes: usize = 0;
+        let mut batch_size_bytes = 0usize;
+        let mut seen_batch_keys = BTreeSet::new();
         let mut to_write = Vec::with_capacity(batch.len());
         let bulk_importing = self.bulk_importing.load(Ordering::Acquire);
 
         for object in batch {
             batch_size_bytes += object.data().len();
-            // NOTE: find_bucket_entry pre-check removed — same reason as store().
             let encoded = EncodedBlob::new(object);
+            let key = encoded.get_key().to_vec();
+            // NuDB's insert treats key_exists as a no-op. Avoid creating an
+            // orphan record for repeats within the same batch as well.
+            if !seen_batch_keys.insert(key.clone()) {
+                continue;
+            }
             let compressed = match nodeobject_compress(encoded.get_data()) {
-                Ok(c) => c,
+                Ok(compressed) => compressed,
                 Err(error) => {
                     tracing::error!(target: "nodestore", error = %error, "Node store write failed");
                     self.journal.log(JournalLevel::Error, &error);
                     continue;
                 }
             };
-            let hash_prefix = match self.key_hash_prefix(encoded.get_key()) {
-                Ok(p) => p,
+            let hash_prefix = match self.key_hash_prefix(&key) {
+                Ok(hash_prefix) => hash_prefix,
                 Err(error) => {
                     self.journal.log(JournalLevel::Error, &error);
                     continue;
                 }
             };
-            let key_size = encoded.get_key().len() as u16;
-            to_write.push((hash_prefix, key_size, encoded, compressed));
+            to_write.push((key, hash_prefix, compressed));
         }
 
         if to_write.is_empty() {
             return;
         }
-
-        let mut coalesced_buffer = Vec::new();
-        let mut total_bytes = 0;
-        for (_, key_size, _, compressed) in &to_write {
-            total_bytes += 6 + *key_size as usize + compressed.len();
-        }
-        coalesced_buffer.reserve_exact(total_bytes);
-
-        let mut entries = Vec::with_capacity(to_write.len());
-        let mut current_offset = 0;
-
-        for (hash_prefix, key_size, encoded, compressed) in to_write {
-            let record_size = compressed.len() as u64;
-            let mut header = [0u8; 6];
-            let mut off = 0usize;
-            write_u48_be(&mut header, &mut off, record_size).unwrap();
-
-            coalesced_buffer.extend_from_slice(&header);
-            coalesced_buffer.extend_from_slice(encoded.get_key());
-            coalesced_buffer.extend_from_slice(&compressed);
-
-            entries.push((hash_prefix, record_size, current_offset as u64));
-            current_offset += 6 + key_size as usize + compressed.len();
-        }
-
-        self.metrics
-            .store_batch_coalesced_bytes
-            .fetch_add(coalesced_buffer.len(), Ordering::Relaxed);
 
         let lock_started = Instant::now();
         let _store_guard = self
@@ -2455,15 +2431,7 @@ impl Backend for NuDbBackend {
             .fetch_add(lock_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let _store_timing = StoreLockTiming::new(self.metrics.as_ref());
 
-        let base_offset = match self.append_data(&coalesced_buffer) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::error!(target: "nodestore", error = %e, "Batch data append failed");
-                return;
-            }
-        };
-
-        let key_header = {
+        let initial_key_header = {
             let mut runtime = self
                 .runtime
                 .lock()
@@ -2477,26 +2445,110 @@ impl Backend for NuDbBackend {
                 self.journal.log(JournalLevel::Error, &error);
                 return;
             }
-            if !bulk_importing {
-                runtime.split_fraction = runtime
-                    .split_fraction
-                    .saturating_add(65_536 * entries.len() as u64);
-                while runtime.split_fraction >= runtime.split_threshold {
-                    runtime.split_fraction -= runtime.split_threshold;
-                    if let Err(error) = self.split_one_bucket(&mut runtime) {
-                        self.journal.log(JournalLevel::Error, &error);
-                    }
+            runtime.key_header.expect("header must be present")
+        };
+
+        // Check the persisted index while holding the store lock. Existing
+        // keys are no-ops, precisely matching NuDBFactory::doInsert's
+        // key_exists handling, and are excluded before any data append.
+        let mut pending = Vec::with_capacity(to_write.len());
+        for (key, hash_prefix, compressed) in to_write {
+            match self.find_bucket_entry(&key) {
+                Ok(Some(_)) => continue,
+                Ok(None) => pending.push((key, hash_prefix, compressed)),
+                Err(error) => {
+                    self.journal.log(JournalLevel::Error, &error);
+                    return;
+                }
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+
+        // NuDB saves the pre-write key/data sizes before it can append data.
+        // Recovery restores this checkpoint if a later append or index update
+        // is interrupted.
+        if !bulk_importing
+            && let Err(error) = self.begin_burst_checkpoint_if_needed(&initial_key_header)
+        {
+            self.journal.log(JournalLevel::Error, &error);
+            return;
+        }
+
+        let key_header = if bulk_importing {
+            initial_key_header
+        } else {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .expect("nudb backend runtime mutex must not be poisoned");
+            runtime.split_fraction = runtime
+                .split_fraction
+                .saturating_add(65_536 * pending.len() as u64);
+            while runtime.split_fraction >= runtime.split_threshold {
+                runtime.split_fraction -= runtime.split_threshold;
+                if let Err(error) = self.split_one_bucket(&mut runtime) {
+                    self.journal.log(JournalLevel::Error, &error);
+                    return;
                 }
             }
             runtime.key_header.expect("header must be present")
         };
 
-        if !bulk_importing && let Err(error) = self.begin_burst_checkpoint_if_needed(&key_header) {
-            self.journal.log(JournalLevel::Error, &error);
-            return;
+        let mut coalesced_buffer = Vec::new();
+        let total_bytes = pending
+            .iter()
+            .map(|(key, _, compressed)| 6 + key.len() + compressed.len())
+            .sum();
+        coalesced_buffer.reserve_exact(total_bytes);
+        let mut entries = Vec::with_capacity(pending.len());
+        let mut relative_offset = 0u64;
+        for (key, hash_prefix, compressed) in pending {
+            if key.len() != usize::from(key_header.key_size) {
+                self.journal
+                    .log(JournalLevel::Error, "NuDB record key size mismatch");
+                return;
+            }
+            let record_size = match u64::try_from(compressed.len()) {
+                Ok(record_size) if record_size <= NUDB_U48_MAX => record_size,
+                _ => {
+                    self.journal.log(
+                        JournalLevel::Error,
+                        "NuDB data record exceeds 48-bit size field",
+                    );
+                    return;
+                }
+            };
+            let mut record_header = [0u8; 6];
+            let mut record_header_offset = 0usize;
+            if let Err(error) =
+                write_u48_be(&mut record_header, &mut record_header_offset, record_size)
+            {
+                self.journal.log(JournalLevel::Error, &error);
+                return;
+            }
+            coalesced_buffer.extend_from_slice(&record_header);
+            coalesced_buffer.extend_from_slice(&key);
+            coalesced_buffer.extend_from_slice(&compressed);
+            entries.push((hash_prefix, record_size, relative_offset));
+            relative_offset += u64::try_from(6 + key.len() + compressed.len())
+                .expect("NuDB record length must fit u64");
         }
 
-        for (hash_prefix, size, relative_offset) in entries {
+        let base_offset = match self.append_data(&coalesced_buffer) {
+            Ok(offset) => offset,
+            Err(error) => {
+                tracing::error!(target: "nodestore", error = %error, "Batch data append failed");
+                self.journal.log(JournalLevel::Error, &error);
+                return;
+            }
+        };
+        self.metrics
+            .store_batch_coalesced_bytes
+            .fetch_add(coalesced_buffer.len(), Ordering::Relaxed);
+
+        for (hash_prefix, size, relative_offset) in entries.iter().copied() {
             let entry = NuDbBucketEntry {
                 offset: base_offset + relative_offset,
                 size,
@@ -2506,10 +2558,15 @@ impl Backend for NuDbBackend {
             if let Err(error) = self.insert_bucket_entry(bucket_index, entry) {
                 tracing::error!(target: "nodestore", error = %error, "Node store write failed (key)");
                 self.journal.log(JournalLevel::Error, &error);
+                return;
             }
         }
 
-        let objects_written = batch.len();
+        if !bulk_importing && let Err(error) = self.finish_burst_write() {
+            self.journal.log(JournalLevel::Error, &error);
+            return;
+        }
+        let objects_written = entries.len();
         tracing::info!(target: "nodestore", objects_written, batch_size_bytes, "Batch flush complete");
     }
 
@@ -3028,6 +3085,9 @@ pub fn read_nudb_key_file_header(path: &Path) -> Result<NuDbKeyFileHeader, Strin
         modulus,
     };
     header.validate_basic()?;
+    if header.buckets == 0 {
+        return Err("NuDB key file contains no buckets".to_owned());
+    }
     Ok(header)
 }
 
@@ -3474,9 +3534,9 @@ mod tests {
             config.metadata_header(NuDbOpenArgs::deterministic(NUDB_APPNUM, 55, 66)),
         )
         .expect("disk header");
-        config
-            .write_key_file_header_for_tests(&disk_header)
-            .expect("write key header");
+        let mut key_file = encode_nudb_key_file_header(&disk_header).expect("encode key header");
+        key_file.extend_from_slice(&vec![0u8; usize::from(disk_header.block_size)]);
+        fs::write(&config.layout.key_path, key_file).expect("write key header and bucket");
 
         let read = read_nudb_key_file_header(&config.layout.key_path).expect("read key header");
         assert_eq!(read.version, NUDB_CURRENT_VERSION);
@@ -3488,6 +3548,32 @@ mod tests {
         assert_eq!(read.block_size, 4096);
         assert_eq!(read.capacity, nudb_bucket_capacity(4096));
         assert_eq!(nudb_decode_load_factor(read.load_factor), 0.5);
+    }
+
+    #[test]
+    fn nudb_key_header_rejects_zero_bucket_count() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("nudb.key");
+        let header = NuDbKeyFileHeader {
+            version: NUDB_CURRENT_VERSION,
+            uid: 1,
+            appnum: NUDB_APPNUM,
+            key_size: 32,
+            salt: 2,
+            pepper: nudb_pepper(2),
+            block_size: 4096,
+            load_factor: nudb_encode_load_factor(0.5).expect("load factor"),
+            capacity: nudb_bucket_capacity(4096),
+            buckets: 0,
+            modulus: 1,
+        };
+        fs::write(&path, encode_nudb_key_file_header(&header).expect("encode"))
+            .expect("write zero-bucket header");
+
+        assert_eq!(
+            read_nudb_key_file_header(&path).expect_err("zero buckets must be rejected"),
+            "NuDB key file contains no buckets"
+        );
     }
 
     #[test]

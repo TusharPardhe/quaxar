@@ -3,6 +3,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::service::TowerToHyperService;
+use tower::Service;
+
 use app::{ApplicationRoot, ManagedComponent};
 use rpc::{ApplicationServerInfo, OwnedApplicationServerInfo};
 use tokio::sync::Notify;
@@ -164,6 +168,10 @@ pub struct ServerRuntime<D> {
     /// Shared subscription manager across ALL ports. Ensures that a
     /// publish from the HTTP handler reaches WS subscribers.
     shared_subscriptions: Arc<crate::SubscriptionManager>,
+    /// Present only for a mixed peer+HTTP/WS port. The server accepts the TCP
+    /// connection once and hands TLS peer streams to this overlay.
+    peer_handoff: Option<Arc<overlay::OverlayImpl>>,
+    peer_handoff_listener: Option<SocketAddr>,
 }
 
 pub struct ServerRuntimeBuildReport<D> {
@@ -247,6 +255,8 @@ where
             state: Arc::new(ServerRuntimeState::default()),
             deferred_protocols: Vec::new(),
             shared_subscriptions: Arc::new(crate::SubscriptionManager::default()),
+            peer_handoff: None,
+            peer_handoff_listener: None,
         }
     }
 
@@ -275,6 +285,7 @@ where
         &self,
         policy: RpcServerPortPolicy,
         listener: StdTcpListener,
+        peer_handoff: Option<Arc<overlay::OverlayImpl>>,
     ) -> Result<(), String> {
         let listener_name = policy.name.clone();
         let server = RpcServer::with_auth_and_subscriptions(
@@ -324,6 +335,62 @@ where
                     let router = server
                         .router()
                         .into_make_service_with_connect_info::<SocketAddr>();
+
+                    // rippled ServerHandler owns a mixed port once. For the
+                    // Rust plain HTTP/WS listener, TLS records are XRPL peer
+                    // upgrades; hand their stream to OverlayImpl so its
+                    // existing handshake invokes OverlayHandoff::on_handoff.
+                    if let Some(overlay) = peer_handoff.filter(|_| rustls_config.is_none()) {
+                        let bound_listener = tokio::net::TcpListener::from_std(listener)
+                            .expect("failed to adopt shared server listener");
+                        loop {
+                            let accepted = tokio::select! {
+                                _ = Arc::clone(&shutdown).wait_for_shutdown() => break,
+                                result = bound_listener.accept() => match result {
+                                    Ok(accepted) => accepted,
+                                    Err(error) => {
+                                        tracing::warn!(target: "server", "shared listener accept failed: {error}");
+                                        continue;
+                                    }
+                                },
+                            };
+                            let (stream, remote_address) = accepted;
+                            let mut make_service = router.clone();
+                            let overlay = Arc::clone(&overlay);
+                            tokio::spawn(async move {
+                                let mut first_byte = [0_u8; 1];
+                                let is_peer_tls = stream
+                                    .peek(&mut first_byte)
+                                    .await
+                                    .map(|read| read > 0 && first_byte[0] == 0x16)
+                                    .unwrap_or(false);
+                                if is_peer_tls {
+                                    match overlay.spawn_handoff(stream, remote_address).await {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(error)) => tracing::debug!(target: "server", %remote_address, %error, "overlay peer handoff ended"),
+                                        Err(error) => tracing::warn!(target: "server", %remote_address, %error, "overlay peer handoff task failed"),
+                                    }
+                                    return;
+                                }
+
+                                let service = match make_service.call(remote_address).await {
+                                    Ok(service) => service,
+                                    Err(error) => match error {},
+                                };
+                                let builder = hyper_util::server::conn::auto::Builder::new(
+                                    TokioExecutor::new(),
+                                );
+                                let connection = builder.serve_connection(
+                                    TokioIo::new(stream),
+                                    TowerToHyperService::new(service),
+                                );
+                                if let Err(error) = connection.await {
+                                    tracing::debug!(target: "server", %remote_address, "shared HTTP/WS connection ended: {error}");
+                                }
+                            });
+                        }
+                        return;
+                    }
 
                     if let Some(config) = rustls_config {
                         let handle = axum_server::Handle::new();
@@ -458,6 +525,14 @@ impl ServerRuntime<BuiltinDispatcher<ApplicationServerInfo<OwnedApplicationServe
         );
         runtime.shared_subscriptions = shared_subs;
         runtime.deferred_protocols = deferred_protocols.clone();
+        if let Some(overlay_runtime) = app.overlay_runtime()
+            && overlay_runtime.server_owns_listener()
+        {
+            runtime.peer_handoff_listener = overlay_runtime
+                .listener_setup()
+                .and_then(|listener| format!("{}:{}", listener.ip, listener.port).parse().ok());
+            runtime.peer_handoff = Some(overlay_runtime.overlay());
+        }
         Ok(ServerRuntimeBuildReport {
             runtime,
             deferred_protocols,
@@ -519,7 +594,14 @@ where
             } else {
                 "http"
             };
-            if let Err(error) = self.spawn_listener(policy, listener) {
+            if let Err(error) = self.spawn_listener(
+                policy.clone(),
+                listener,
+                self.peer_handoff_listener
+                    .is_some_and(|address| address == policy.socket_addr)
+                    .then(|| self.peer_handoff.clone())
+                    .flatten(),
+            ) {
                 self.rollback_start(started_servers);
                 return Err(error);
             }

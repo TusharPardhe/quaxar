@@ -600,7 +600,9 @@ mod tests {
             (Vec::new(), nodestore::Status::NotFound)
         }
 
-        fn store(&self, _object: Arc<nodestore::NodeObject>) {}
+        fn store(&self, _object: Arc<nodestore::NodeObject>) -> Result<(), String> {
+            Ok(())
+        }
 
         fn store_batch(&self, _batch: &nodestore::Batch) {}
 

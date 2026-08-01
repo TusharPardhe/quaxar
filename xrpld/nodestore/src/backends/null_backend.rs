@@ -30,7 +30,9 @@ impl Backend for NullBackend {
         (Vec::new(), Status::Ok)
     }
 
-    fn store(&self, _object: Arc<NodeObject>) {}
+    fn store(&self, _object: Arc<NodeObject>) -> Result<(), String> {
+        Ok(())
+    }
 
     fn store_batch(&self, _batch: &crate::Batch) {}
 

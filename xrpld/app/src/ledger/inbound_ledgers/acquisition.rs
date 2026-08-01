@@ -403,9 +403,12 @@ impl WorkerStore {
         hash: Uint256,
         seq: u32,
     ) {
-        match &self.node_store {
+        let result = match &self.node_store {
             SHAMapStoreNodeStore::Single(db) => db.store(object_type, data, hash, seq),
             SHAMapStoreNodeStore::Rotating(db) => db.store(object_type, data, hash, seq),
+        };
+        if let Err(error) = result {
+            tracing::error!(target: "nodestore", %error, "Failed to persist acquired SHAMap node");
         }
     }
 }

@@ -51,18 +51,21 @@ impl DatabaseDelegate for DatabaseNodeImpCore {
         match status {
             Status::Ok | Status::NotFound => {}
             Status::DataCorrupt => {
-                journal.log(
-                    JournalLevel::Fatal,
-                    &format!("fetchNodeObject {hash_hex}: nodestore data is corrupted"),
-                );
+                let message = format!("fetchNodeObject {hash_hex}: nodestore data is corrupted");
+                tracing::error!(target: "nodestore", %message);
+                journal.log(JournalLevel::Error, &message);
+                // rippled logs its fatal backend-read failure and rethrows.
+                // This Rust surface has status values instead of exceptions,
+                // so propagate every non-miss status as a panic rather than
+                // converting corruption into an ordinary cache miss.
+                panic!("{message}");
             }
             other => {
-                journal.log(
-                    JournalLevel::Warn,
-                    &format!(
-                        "fetchNodeObject {hash_hex}: backend returns unknown result {other:?}"
-                    ),
-                );
+                let message =
+                    format!("fetchNodeObject {hash_hex}: backend returned error status {other:?}");
+                tracing::error!(target: "nodestore", %message);
+                journal.log(JournalLevel::Error, &message);
+                panic!("{message}");
             }
         }
 
@@ -117,11 +120,23 @@ impl DatabaseNodeImp {
         self.database.import_internal(self.backend.as_ref(), source);
     }
 
-    pub fn store(&self, object_type: NodeObjectType, data: Blob, hash: Uint256, _ledger_seq: u32) {
+    pub fn store(
+        &self,
+        object_type: NodeObjectType,
+        data: Blob,
+        hash: Uint256,
+        _ledger_seq: u32,
+    ) -> Result<(), String> {
         let object = NodeObject::create_object(object_type, data, hash);
-        self.backend.store(Arc::clone(&object));
+        self.backend.store(Arc::clone(&object)).map_err(|error| {
+            tracing::error!(target: "nodestore", %error, hash = %object.hash(), "NodeStore backend write failed");
+            error
+        })?;
+        // Match rippled's post-store canonicalization ordering: neither
+        // counters nor cache state can imply a write that the backend rejected.
         self.database.store_stats(1, object.data().len() as u64);
         self.database.promote_node_object(object);
+        Ok(())
     }
 
     pub fn is_same_db(&self, _first: u32, _second: u32) -> bool {
@@ -240,8 +255,14 @@ impl DatabaseTrait for DatabaseNodeImp {
         DatabaseNodeImp::get_write_load(self)
     }
 
-    fn store(&self, object_type: NodeObjectType, data: Blob, hash: Uint256, ledger_seq: u32) {
-        DatabaseNodeImp::store(self, object_type, data, hash, ledger_seq);
+    fn store(
+        &self,
+        object_type: NodeObjectType,
+        data: Blob,
+        hash: Uint256,
+        ledger_seq: u32,
+    ) -> Result<(), String> {
+        DatabaseNodeImp::store(self, object_type, data, hash, ledger_seq)
     }
 
     fn is_same_db(&self, first: u32, second: u32) -> bool {

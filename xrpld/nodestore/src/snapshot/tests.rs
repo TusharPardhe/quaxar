@@ -123,8 +123,10 @@ fn post_import_verifies_account_and_transaction_shamap_roots() {
         SHAMapNodeType::TransactionMd,
         0x82,
     );
-    src.store(account_node);
-    src.store(transaction_node);
+    src.store(account_node)
+        .expect("account-node store must succeed");
+    src.store(transaction_node)
+        .expect("transaction-node store must succeed");
 
     let mut manifest = test_manifest();
     manifest.account_hash = account_hash;
@@ -149,7 +151,7 @@ fn post_import_rejects_manifest_root_missing_from_snapshot() {
         0x91,
     );
     let (root_node, root_hash) = shamap_inner_with_child(child_hash);
-    src.store(root_node);
+    src.store(root_node).expect("root-node store must succeed");
 
     let mut manifest = test_manifest();
     manifest.account_hash = root_hash;
@@ -181,7 +183,8 @@ fn post_import_rejects_shamap_body_under_forged_content_key() {
         NodeObjectType::AccountNode,
         valid_node.data().to_vec(),
         forged_hash,
-    )));
+    )))
+    .expect("forged-node store must succeed");
 
     let mut manifest = test_manifest();
     manifest.account_hash = *forged_hash.data();
@@ -208,7 +211,8 @@ fn post_import_rejects_transaction_leaf_as_account_state_root() {
         SHAMapNodeType::TransactionMd,
         0xA2,
     );
-    src.store(transaction_node);
+    src.store(transaction_node)
+        .expect("transaction-node store must succeed");
 
     let mut manifest = test_manifest();
     manifest.account_hash = tx_hash;
@@ -273,17 +277,20 @@ fn round_trip_export_load() {
         NodeObjectType::Ledger,
         vec![1, 2, 3, 4],
         Uint256::from_array([0x11; 32]),
-    )));
+    )))
+    .expect("ledger store must succeed");
     src.store(Arc::new(NodeObject::new(
         NodeObjectType::AccountNode,
         vec![5, 6, 7],
         Uint256::from_array([0x22; 32]),
-    )));
+    )))
+    .expect("account-node store must succeed");
     src.store(Arc::new(NodeObject::new(
         NodeObjectType::TransactionNode,
         vec![8, 9],
         Uint256::from_array([0x33; 32]),
-    )));
+    )))
+    .expect("transaction-node store must succeed");
 
     // Export
     let manifest = test_manifest();
@@ -323,7 +330,8 @@ fn corrupt_chunk_hash_detected() {
         NodeObjectType::Ledger,
         vec![1, 2, 3],
         Uint256::from_array([0x44; 32]),
-    )));
+    )))
+    .expect("ledger store must succeed");
 
     export_snapshot(src.as_ref(), &test_manifest(), &snap_path).expect("export must succeed");
 
@@ -353,7 +361,8 @@ fn bad_magic_detected() {
         NodeObjectType::Ledger,
         vec![1],
         Uint256::from_array([0x55; 32]),
-    )));
+    )))
+    .expect("ledger store must succeed");
 
     export_snapshot(src.as_ref(), &test_manifest(), &snap_path).expect("export must succeed");
 

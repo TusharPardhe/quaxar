@@ -32,7 +32,9 @@ pub trait Backend: Send + Sync + 'static {
 
     fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status);
 
-    fn store(&self, object: Arc<NodeObject>);
+    /// Stores one object, reporting backend failures to the caller so it does
+    /// not treat an unpersisted object as cacheable.
+    fn store(&self, object: Arc<NodeObject>) -> Result<(), String>;
 
     fn store_batch(&self, batch: &Batch);
 

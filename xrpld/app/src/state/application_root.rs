@@ -76,7 +76,7 @@ use protocol::{
     STAmount, STLedgerEntry, STObject, STTx, SecretKey, SeqProxy, Serializer, Ter, TxType,
     XRPAmount, account_keylet, calc_account_id, calc_node_id, feature_xrp_fees,
     get_field_by_symbol, is_tec_claim, is_tef_failure, is_tem_malformed, is_tes_success,
-    lsfDisableMaster,
+    lsfDisableMaster, tfInnerBatchTxn,
 };
 use shamap::family::{NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
 use shamap::tree_node_cache::TreeNodeCache;
@@ -1555,6 +1555,13 @@ pub fn apply_submit_transactor_shell_with_delivered_amount<V: ledger::ApplyView>
     tx: &STTx,
     txn_type: TxType,
 ) -> (Ter, Option<STAmount>) {
+    // An inner Batch transaction is valid only while its parent Batch applies
+    // it through apply_submit_batch_followup. Never allow one through the
+    // standalone transaction entry point.
+    if txn_type != TxType::BATCH && tx.is_flag(tfInnerBatchTxn) {
+        return (Ter::TEM_INVALID_INNER_BATCH, None);
+    }
+
     let rules = view.rules();
     // Accepted-ledger replay and BuildLedger call this public shell directly,
     // bypassing the open-ledger TxQ gates. Validate an outer Batch before
@@ -1673,8 +1680,12 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
 
     let sequence_field = get_field_by_symbol("sfSequence");
     let balance_field = get_field_by_symbol("sfBalance");
+    let sponsor_field = get_field_by_symbol("sfSponsor");
+    let sponsor_flags_field = get_field_by_symbol("sfSponsorFlags");
+    let sponsor_signature_field = get_field_by_symbol("sfSponsorSignature");
+    let sponsor_fee_amount_field = get_field_by_symbol("sfFeeAmount");
+    let sponsor_max_fee_field = get_field_by_symbol("sfMaxFee");
     let account = tx.get_account_id(account_field);
-    let fee_payer = tx.get_initiator();
     let account_uint160 =
         Uint160::from_slice(account.data()).expect("account width should match Uint160");
     let account_key = account_keylet(account_uint160);
@@ -1682,6 +1693,27 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
     let Some(account_root) = view.peek(account_key).ok().flatten() else {
         return Ter::TER_NO_ACCOUNT;
     };
+
+    // Match Transactor::checkPriorTxAndLastLedger: all ordering and replay
+    // guards run against the unmodified view, before fee or sequence handling.
+    if tx.is_field_present(account_txn_id_field) {
+        let prior = account_root
+            .is_field_present(account_txn_id_field)
+            .then(|| account_root.get_field_h256(account_txn_id_field))
+            .unwrap_or_else(Uint256::zero);
+        if prior != tx.get_field_h256(account_txn_id_field) {
+            return Ter::TEF_WRONG_PRIOR;
+        }
+    }
+    let last_ledger_sequence_field = get_field_by_symbol("sfLastLedgerSequence");
+    if tx.is_field_present(last_ledger_sequence_field)
+        && view.seq() > tx.get_field_u32(last_ledger_sequence_field)
+    {
+        return Ter::TEF_MAX_LEDGER;
+    }
+    if view.tx_exists(tx.get_transaction_id()).unwrap_or(false) {
+        return Ter::TEF_ALREADY;
+    }
 
     let oracle_preclaim = if txn_type == TxType::ORACLE_SET {
         run_oracle_set_preclaim_with_view(view, tx)
@@ -1691,6 +1723,74 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
     if !is_tes_success(oracle_preclaim) && !is_tec_claim(oracle_preclaim) {
         return oracle_preclaim;
     }
+
+    // Match Transactor::checkSponsor/getFeePayer. Fee-sponsored transactions
+    // prefer a prefunded Sponsorship entry; absent that entry, a valid sponsor
+    // signature authorizes payment from the sponsor account above its reserve.
+    // The transaction account still owns sequence/ticket consumption.
+    let fee_sponsored = tx.is_field_present(sponsor_field)
+        && tx.is_field_present(sponsor_flags_field)
+        && ledger::is_fee_sponsored(tx.get_field_u32(sponsor_flags_field));
+    let mut prefunded_sponsorship = None;
+    let fee_payer = if tx.is_field_present(sponsor_field) {
+        let sponsor = tx.get_account_id(sponsor_field);
+        if sponsor == account {
+            return Ter::TEM_MALFORMED;
+        }
+        if !tx.is_field_present(sponsor_flags_field) {
+            return Ter::TEM_INVALID_FLAG;
+        }
+        let sponsor_flags = tx.get_field_u32(sponsor_flags_field);
+        if sponsor_flags == 0 || (sponsor_flags & ledger::SPF_SPONSOR_FLAG_MASK) != 0 {
+            return Ter::TEM_INVALID_FLAG;
+        }
+        if tx.is_field_present(get_field_by_symbol("sfDelegate"))
+            && ledger::is_reserve_sponsored(sponsor_flags)
+        {
+            return Ter::TEM_INVALID;
+        }
+        if view
+            .read(account_keylet(Uint160::from_void(sponsor.data())))
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            return Ter::TER_NO_ACCOUNT;
+        }
+
+        let sponsorship_keylet = protocol::sponsorship_keylet(
+            Uint160::from_void(sponsor.data()),
+            Uint160::from_void(tx.get_initiator().data()),
+        );
+        let sponsorship = view.read(sponsorship_keylet.clone()).ok().flatten();
+        if !tx.is_field_present(sponsor_signature_field) {
+            let Some(sponsorship) = sponsorship.as_ref() else {
+                return Ter::TEC_NO_PERMISSION;
+            };
+            let sponsor_flags = sponsorship.get_field_u32(get_field_by_symbol("sfFlags"));
+            if fee_sponsored
+                && (sponsor_flags & protocol::LSF_SPONSORSHIP_REQUIRE_SIGN_FOR_FEE) != 0
+            {
+                return Ter::TEC_NO_PERMISSION;
+            }
+            if tx.is_field_present(sponsor_flags_field)
+                && ledger::is_reserve_sponsored(tx.get_field_u32(sponsor_flags_field))
+                && (sponsor_flags & protocol::LSF_SPONSORSHIP_REQUIRE_SIGN_FOR_RESERVE) != 0
+            {
+                return Ter::TEC_NO_PERMISSION;
+            }
+        }
+        if fee_sponsored {
+            if sponsorship.is_some() {
+                prefunded_sponsorship = Some(sponsorship_keylet);
+            }
+            sponsor
+        } else {
+            tx.get_initiator()
+        }
+    } else {
+        tx.get_initiator()
+    };
 
     let mut updated =
         STLedgerEntry::from_stobject(account_root.clone_as_object(), *account_root.key());
@@ -1736,6 +1836,49 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
                 STAmount::from_xrp_amount(XRPAmount::from_drops(balance_drops - fee_drops)),
             );
         }
+    } else if let Some(sponsorship_keylet) = prefunded_sponsorship {
+        let Some(sponsorship_sle) = view.peek(sponsorship_keylet).ok().flatten() else {
+            return Ter::TEF_INTERNAL;
+        };
+        let balance_drops = sponsorship_sle
+            .is_field_present(sponsor_fee_amount_field)
+            .then(|| {
+                sponsorship_sle
+                    .get_field_amount(sponsor_fee_amount_field)
+                    .xrp()
+                    .drops()
+            })
+            .unwrap_or(0);
+        let max_fee_drops = sponsorship_sle
+            .is_field_present(sponsor_max_fee_field)
+            .then(|| {
+                sponsorship_sle
+                    .get_field_amount(sponsor_max_fee_field)
+                    .xrp()
+                    .drops()
+            })
+            .unwrap_or(i64::MAX);
+        let fee_drops = tx.get_field_amount(fee_field).xrp().drops();
+        let spendable = balance_drops.min(max_fee_drops);
+        if spendable < fee_drops {
+            return if spendable > 0 && !view.open() {
+                Ter::TEC_INSUFF_FEE
+            } else {
+                Ter::TER_INSUF_FEE_B
+            };
+        }
+        let mut updated_sponsorship =
+            STLedgerEntry::from_stobject(sponsorship_sle.clone_as_object(), *sponsorship_sle.key());
+        let remaining = balance_drops - fee_drops;
+        if remaining == 0 {
+            updated_sponsorship.make_field_absent(sponsor_fee_amount_field);
+        } else {
+            updated_sponsorship.set_field_amount(
+                sponsor_fee_amount_field,
+                STAmount::from_xrp_amount(XRPAmount::from_drops(remaining)),
+            );
+        }
+        let _ = view.update(Arc::new(updated_sponsorship));
     } else {
         let fee_payer_uint160 =
             Uint160::from_slice(fee_payer.data()).expect("fee payer width should match Uint160");
@@ -1743,16 +1886,30 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
         else {
             return Ter::TEF_INTERNAL;
         };
+        let balance_drops = fee_payer_sle.get_field_amount(balance_field).xrp().drops();
+        let fee_drops = tx.get_field_amount(fee_field).xrp().drops();
+        // A co-signed sponsor may not pay into its account reserve. Ordinary
+        // delegates retain the standard account-fee behavior.
+        let spendable = if fee_sponsored {
+            let reserve = view.fees().account_reserve(
+                fee_payer_sle.get_field_u32(get_field_by_symbol("sfOwnerCount")) as usize,
+            ) as i64;
+            (balance_drops - reserve).max(0)
+        } else {
+            balance_drops
+        };
+        if fee_sponsored && spendable < fee_drops {
+            return if spendable > 0 && !view.open() {
+                Ter::TEC_INSUFF_FEE
+            } else {
+                Ter::TER_INSUF_FEE_B
+            };
+        }
         let mut updated_fee_payer =
             STLedgerEntry::from_stobject(fee_payer_sle.clone_as_object(), *fee_payer_sle.key());
-        let new_balance = updated_fee_payer
-            .get_field_amount(balance_field)
-            .xrp()
-            .drops()
-            - tx.get_field_amount(fee_field).xrp().drops();
         updated_fee_payer.set_field_amount(
             balance_field,
-            STAmount::from_xrp_amount(XRPAmount::from_drops(new_balance)),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(balance_drops - fee_drops)),
         );
         let _ = view.update(Arc::new(updated_fee_payer));
     }
@@ -1807,7 +1964,12 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
         let do_nf_token_offers = result == Ter::TEC_EXPIRED;
         let do_credentials = result == Ter::TEC_EXPIRED;
 
-        if !do_offers && !do_lines_or_mpts && !do_nf_token_offers && !do_credentials {
+        if result == Ter::TEC_INVARIANT_FAILED {
+            // Transactor::reset(fee) discards all doApply mutations and leaves
+            // only the fee and sequence/ticket work in the outer transaction
+            // view. Those mutations were applied before this inner sandbox.
+            drop(inner);
+        } else if !do_offers && !do_lines_or_mpts && !do_nf_token_offers && !do_credentials {
             if result != Ter::TEC_KILLED {
                 // Apply inner sandbox changes to outer view (normal path)
                 let _ = inner.apply();
@@ -2089,9 +2251,15 @@ impl
                 }
             }
         } else {
-            match sttx.check_sign(&ctx.rules) {
-                Ok(()) => Ter::TES_SUCCESS,
-                Err(_) => Ter::TEM_BAD_SIGNATURE,
+            let semantic_preflight =
+                tx::validate_sttx_transaction_preflight_with_rules(&sttx, &ctx.rules);
+            if !is_tes_success(semantic_preflight) {
+                semantic_preflight
+            } else {
+                match sttx.check_sign(&ctx.rules) {
+                    Ok(()) => Ter::TES_SUCCESS,
+                    Err(_) => Ter::TEM_BAD_SIGNATURE,
+                }
             }
         };
 
@@ -3384,12 +3552,17 @@ impl ApplicationRoot {
                 .and_then(|guard| guard.clone())
         })?;
         Some(std::sync::Arc::new(
-            move |object_type, hash, data, ledger_seq| match &ns {
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => {
-                    db.store(to_nodestore_type(object_type), data, hash, ledger_seq);
-                }
-                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => {
-                    db.store(to_nodestore_type(object_type), data, hash, ledger_seq);
+            move |object_type, hash, data, ledger_seq| {
+                let result = match &ns {
+                    crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => {
+                        db.store(to_nodestore_type(object_type), data, hash, ledger_seq)
+                    }
+                    crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => {
+                        db.store(to_nodestore_type(object_type), data, hash, ledger_seq)
+                    }
+                };
+                if let Err(error) = result {
+                    tracing::error!(target: "nodestore", %error, "Failed to persist SHAMap node");
                 }
             },
         ))

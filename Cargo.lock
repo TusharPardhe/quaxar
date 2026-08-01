@@ -3089,6 +3089,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "ledger",
+ "overlay",
  "protocol",
  "rpc",
  "rustls",

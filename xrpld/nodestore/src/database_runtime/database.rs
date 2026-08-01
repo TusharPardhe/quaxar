@@ -33,7 +33,13 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
 
     fn get_write_load(&self) -> i32;
 
-    fn store(&self, object_type: NodeObjectType, data: Blob, hash: Uint256, ledger_seq: u32);
+    fn store(
+        &self,
+        object_type: NodeObjectType,
+        data: Blob,
+        hash: Uint256,
+        ledger_seq: u32,
+    ) -> Result<(), String>;
 
     fn is_same_db(&self, first: u32, second: u32) -> bool;
 
@@ -1020,11 +1026,12 @@ mod tests {
                 (Vec::new(), Status::Ok)
             }
 
-            fn store(&self, object: Arc<NodeObject>) {
+            fn store(&self, object: Arc<NodeObject>) -> Result<(), String> {
                 self.imported
                     .lock()
                     .expect("recording backend mutex must not be poisoned")
                     .push(object);
+                Ok(())
             }
 
             fn store_batch(&self, batch: &crate::Batch) {

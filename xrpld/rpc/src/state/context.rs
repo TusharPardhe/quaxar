@@ -379,13 +379,16 @@ impl RpcInboundLedgerStore {
         hash: Uint256,
         ledger_seq: u32,
     ) {
-        match &self.node_store {
+        let result = match &self.node_store {
             app::SHAMapStoreNodeStore::Single(database) => {
                 database.store(object_type, data, hash, ledger_seq)
             }
             app::SHAMapStoreNodeStore::Rotating(database) => {
                 database.store(object_type, data, hash, ledger_seq)
             }
+        };
+        if let Err(error) = result {
+            tracing::error!(target: "nodestore", %error, "Failed to persist RPC inbound-ledger node");
         }
     }
 }

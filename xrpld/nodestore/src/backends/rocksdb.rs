@@ -1055,8 +1055,9 @@ impl Backend for RocksDbBackend {
         (results, Status::Ok)
     }
 
-    fn store(&self, object: Arc<NodeObject>) {
+    fn store(&self, object: Arc<NodeObject>) -> Result<(), String> {
         self.batch_writer.store(object);
+        Ok(())
     }
 
     fn store_batch(&self, batch: &crate::Batch) {

@@ -102,7 +102,11 @@ impl DatabaseDelegate for DatabaseRotatingCore {
                 drop(state);
 
                 if duplicate {
-                    writable.store(Arc::clone(node_object_ref));
+                    if let Err(error) = writable.store(Arc::clone(node_object_ref)) {
+                        tracing::error!(target: "nodestore", %error, hash = %hash, "Failed to copy archive node into writable backend");
+                        journal.log(JournalLevel::Error, &error);
+                        panic!("failed to copy archive node into writable backend: {error}");
+                    }
                 }
                 // While rotation is in flight, copy archive-served reads
                 // forward into the writable backend. The archive is about
@@ -114,7 +118,11 @@ impl DatabaseDelegate for DatabaseRotatingCore {
                         .rotation_in_flight
                         .load(std::sync::atomic::Ordering::Acquire)
                 {
-                    writable.store(Arc::clone(node_object_ref));
+                    if let Err(error) = writable.store(Arc::clone(node_object_ref)) {
+                        tracing::error!(target: "nodestore", %error, hash = %hash, "Failed to copy archive node into writable backend");
+                        journal.log(JournalLevel::Error, &error);
+                        panic!("failed to copy archive node into writable backend: {error}");
+                    }
                     self.copy_forward_count
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -285,7 +293,13 @@ impl DatabaseRotatingImp {
         state.writable_backend.sync();
     }
 
-    pub fn store(&self, object_type: NodeObjectType, data: Blob, hash: Uint256, _ledger_seq: u32) {
+    pub fn store(
+        &self,
+        object_type: NodeObjectType,
+        data: Blob,
+        hash: Uint256,
+        _ledger_seq: u32,
+    ) -> Result<(), String> {
         let node_object = NodeObject::create_object(object_type, data, hash);
         let backend = {
             let state = self
@@ -295,10 +309,14 @@ impl DatabaseRotatingImp {
             Arc::clone(&state.writable_backend)
         };
 
-        backend.store(Arc::clone(&node_object));
+        backend.store(Arc::clone(&node_object)).map_err(|error| {
+            tracing::error!(target: "nodestore", %error, hash = %node_object.hash(), "Rotating NodeStore backend write failed");
+            error
+        })?;
         self.database
             .store_stats(1, node_object.data().len() as u64);
         self.database.promote_node_object(node_object);
+        Ok(())
     }
 
     pub fn fetch_node_object(
@@ -409,8 +427,14 @@ impl DatabaseTrait for DatabaseRotatingImp {
         DatabaseRotatingImp::get_write_load(self)
     }
 
-    fn store(&self, object_type: NodeObjectType, data: Blob, hash: Uint256, ledger_seq: u32) {
-        DatabaseRotatingImp::store(self, object_type, data, hash, ledger_seq);
+    fn store(
+        &self,
+        object_type: NodeObjectType,
+        data: Blob,
+        hash: Uint256,
+        ledger_seq: u32,
+    ) -> Result<(), String> {
+        DatabaseRotatingImp::store(self, object_type, data, hash, ledger_seq)
     }
 
     fn is_same_db(&self, first: u32, second: u32) -> bool {
@@ -576,17 +600,19 @@ mod tests {
             )
         }
 
-        fn store(&self, object: Arc<NodeObject>) {
+        fn store(&self, object: Arc<NodeObject>) -> Result<(), String> {
             self.store_count.fetch_add(1, Ordering::Relaxed);
             self.objects
                 .lock()
                 .expect("objects mutex")
                 .insert(*object.hash(), object);
+            Ok(())
         }
 
         fn store_batch(&self, batch: &crate::Batch) {
             for object in batch {
-                self.store(Arc::clone(object));
+                self.store(Arc::clone(object))
+                    .expect("test backend store must succeed");
             }
         }
 
@@ -638,7 +664,9 @@ mod tests {
         let writable = Arc::new(TestBackend::new("writable"));
         let archive = Arc::new(TestBackend::new("archive"));
         let object = sample_object(0x44);
-        archive.store(Arc::clone(&object));
+        archive
+            .store(Arc::clone(&object))
+            .expect("archive store should succeed");
 
         let database = DatabaseRotatingImp::new(
             Arc::new(DummyScheduler),
@@ -673,7 +701,9 @@ mod tests {
         let writable = Arc::new(TestBackend::new("writable"));
         let archive = Arc::new(TestBackend::new("archive"));
         let object = sample_object(0x45);
-        archive.store(Arc::clone(&object));
+        archive
+            .store(Arc::clone(&object))
+            .expect("archive store should succeed");
 
         let database = DatabaseRotatingImp::new(
             Arc::new(DummyScheduler),
@@ -710,7 +740,9 @@ mod tests {
         let writable = Arc::new(TestBackend::new("writable"));
         let archive = Arc::new(TestBackend::new("archive"));
         let object = sample_object(0x46);
-        archive.store(Arc::clone(&object));
+        archive
+            .store(Arc::clone(&object))
+            .expect("archive store should succeed");
 
         let database = DatabaseRotatingImp::new(
             Arc::new(DummyScheduler),

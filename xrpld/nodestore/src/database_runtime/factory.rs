@@ -123,7 +123,9 @@ mod tests {
             (Vec::new(), crate::Status::Ok)
         }
 
-        fn store(&self, _object: Arc<crate::NodeObject>) {}
+        fn store(&self, _object: Arc<crate::NodeObject>) -> Result<(), String> {
+            Ok(())
+        }
 
         fn store_batch(&self, _batch: &crate::Batch) {}
 

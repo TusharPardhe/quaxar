@@ -586,6 +586,56 @@ fn apply_submit_tx_for_test(
 }
 
 #[test]
+fn direct_shell_rejects_standalone_inner_batch_and_preclaim_ordering_guards() {
+    let source = account("ABABABABABABABABABABABABABABABABABABABAB");
+    let destination = account("CDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCD");
+
+    let mut inner = (*payment_tx(source, destination, 1, None, 10)).clone();
+    inner.set_field_u32(get_field_by_symbol("sfFlags"), INNER_BATCH_TRANSACTION_FLAG);
+    let base = Arc::new(ledger_view(10, source, 1, &[]));
+    let mut view = Sandbox::new(Arc::clone(&base), ApplyFlags::NONE);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &inner, TxType::PAYMENT),
+        Ter::TEM_INVALID_INNER_BATCH
+    );
+
+    let mut wrong_prior = (*payment_tx(source, destination, 1, None, 10)).clone();
+    wrong_prior.set_field_h256(get_field_by_symbol("sfAccountTxnID"), Uint256::from_u64(2));
+    let mut view = Sandbox::new(
+        Arc::new(ledger_view_with_account_txn_id(
+            10,
+            source,
+            1,
+            Uint256::from_u64(1),
+            &[],
+        )),
+        ApplyFlags::NONE,
+    );
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &wrong_prior, TxType::PAYMENT),
+        Ter::TEF_WRONG_PRIOR
+    );
+
+    let mut expired = (*payment_tx(source, destination, 1, None, 10)).clone();
+    expired.set_field_u32(get_field_by_symbol("sfLastLedgerSequence"), 9);
+    let mut view = Sandbox::new(Arc::new(ledger_view(10, source, 1, &[])), ApplyFlags::NONE);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &expired, TxType::PAYMENT),
+        Ter::TEF_MAX_LEDGER
+    );
+
+    let replay = (*payment_tx(source, destination, 1, None, 10)).clone();
+    let mut view = Sandbox::new(
+        Arc::new(ledger_view(10, source, 1, &[replay.get_transaction_id()])),
+        ApplyFlags::NONE,
+    );
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &replay, TxType::PAYMENT),
+        Ter::TEF_ALREADY
+    );
+}
+
+#[test]
 fn closed_ledger_transition_rebases_persistent_submit_state() {
     fn immutable_ledger(seq: u32, parent: u8) -> Arc<Ledger> {
         let mut header = LedgerHeader {

@@ -1388,10 +1388,49 @@ impl OverlayImpl {
             result = acceptor.listener.accept() => result?,
         };
 
+        self.handle_inbound_stream(
+            tcp_stream,
+            remote_address,
+            stop_requested,
+            Arc::clone(&acceptor.acceptor),
+        )
+        .await
+    }
+
+    /// Continue an accepted TLS peer connection from a shared server listener.
+    /// The server owns the socket only until it identifies a peer TLS ClientHello;
+    /// this method then follows the same OverlayImpl::onHandoff path as a
+    /// dedicated peer listener.
+    pub fn spawn_handoff(
+        &self,
+        tcp_stream: TcpStream,
+        remote_address: SocketAddr,
+    ) -> JoinHandle<Result<(), OverlayError>> {
+        let this = self.clone_for_tasks();
+        let stop_requested = this.stop_requested.subscribe();
+        let acceptor = this
+            .setup
+            .server_ssl_acceptor
+            .clone()
+            .ok_or_else(|| OverlayError::Tls("missing server TLS acceptor".to_owned()));
+        tokio::spawn(async move {
+            let acceptor = acceptor?;
+            this.handle_inbound_stream(tcp_stream, remote_address, stop_requested, acceptor)
+                .await
+        })
+    }
+
+    async fn handle_inbound_stream(
+        &self,
+        tcp_stream: TcpStream,
+        remote_address: SocketAddr,
+        mut stop_requested: watch::Receiver<bool>,
+        acceptor: Arc<openssl::ssl::SslAcceptor>,
+    ) -> Result<(), OverlayError> {
         tracing::debug!(target: "overlay", ip = %remote_address, "Inbound connection accepted");
         // Disable Nagle's algorithm for low-latency request-response pipelining.
         let _ = tcp_stream.set_nodelay(true);
-        let ssl = openssl::ssl::Ssl::new(acceptor.acceptor.context())
+        let ssl = openssl::ssl::Ssl::new(acceptor.context())
             .map_err(|error| OverlayError::Tls(error.to_string()))?;
         let mut tls_stream = tokio_openssl::SslStream::new(ssl, tcp_stream)
             .map_err(|error| OverlayError::Tls(error.to_string()))?;
