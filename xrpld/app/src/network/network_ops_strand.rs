@@ -526,13 +526,17 @@ fn strand_loop(
             let now = root.shared_time_keeper().close_time();
             let peer_close_time =
                 basics::chrono::NetClockTimePoint::new(proposal.message.close_time);
+            // Match PeerImp::onMessage: the consensus position is keyed by
+            // the validator's master key, while `RclCxPeerPos::public_key`
+            // retains the signing key used to verify and relay the proposal.
+            let master_key = root.manifest_cache().get_master_key(&proposal.public_key);
             let prop = consensus::ConsensusProposal::new(
                 proposal.previous_ledger,
                 proposal.message.propose_seq,
                 proposal.current_tx_hash,
                 peer_close_time,
                 now,
-                proposal.public_key,
+                master_key,
             );
             let peer_pos = crate::consensus::rcl_cx_peer_pos::RclCxPeerPos::new(
                 proposal.public_key,

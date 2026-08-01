@@ -44,9 +44,6 @@ const LEDGER_NAMESPACE_VAULT: u16 = b'V' as u16;
 const LEDGER_NAMESPACE_LOAN_BROKER: u16 = b'l' as u16;
 const LEDGER_NAMESPACE_LOAN: u16 = b'L' as u16;
 const LEDGER_NAMESPACE_SPONSORSHIP: u16 = b'>' as u16;
-const BOOK_BASE_ISSUE_MPT_TAG: [u8; 1] = [0x01];
-const BOOK_BASE_MPT_ISSUE_TAG: [u8; 1] = [0x02];
-const BOOK_BASE_MPT_MPT_TAG: [u8; 1] = [0x03];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u16)]
@@ -603,7 +600,6 @@ pub fn get_book_base(book: Book) -> Uint256 {
         (Asset::Issue(input), Asset::MPTIssue(output), Some(domain)) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
             &[
-                &BOOK_BASE_ISSUE_MPT_TAG,
                 input.currency.data(),
                 output.mpt_id().data(),
                 input.account.data(),
@@ -613,7 +609,6 @@ pub fn get_book_base(book: Book) -> Uint256 {
         (Asset::Issue(input), Asset::MPTIssue(output), None) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
             &[
-                &BOOK_BASE_ISSUE_MPT_TAG,
                 input.currency.data(),
                 output.mpt_id().data(),
                 input.account.data(),
@@ -622,7 +617,6 @@ pub fn get_book_base(book: Book) -> Uint256 {
         (Asset::MPTIssue(input), Asset::Issue(output), Some(domain)) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
             &[
-                &BOOK_BASE_MPT_ISSUE_TAG,
                 input.mpt_id().data(),
                 output.currency.data(),
                 output.account.data(),
@@ -632,7 +626,6 @@ pub fn get_book_base(book: Book) -> Uint256 {
         (Asset::MPTIssue(input), Asset::Issue(output), None) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
             &[
-                &BOOK_BASE_MPT_ISSUE_TAG,
                 input.mpt_id().data(),
                 output.currency.data(),
                 output.account.data(),
@@ -640,20 +633,11 @@ pub fn get_book_base(book: Book) -> Uint256 {
         ),
         (Asset::MPTIssue(input), Asset::MPTIssue(output), Some(domain)) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
-            &[
-                &BOOK_BASE_MPT_MPT_TAG,
-                input.mpt_id().data(),
-                output.mpt_id().data(),
-                domain.data(),
-            ],
+            &[input.mpt_id().data(), output.mpt_id().data(), domain.data()],
         ),
         (Asset::MPTIssue(input), Asset::MPTIssue(output), None) => index_hash_with_slices(
             LEDGER_NAMESPACE_BOOK_DIR,
-            &[
-                &BOOK_BASE_MPT_MPT_TAG,
-                input.mpt_id().data(),
-                output.mpt_id().data(),
-            ],
+            &[input.mpt_id().data(), output.mpt_id().data()],
         ),
     };
 

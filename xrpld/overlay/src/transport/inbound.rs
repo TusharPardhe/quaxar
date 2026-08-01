@@ -95,7 +95,7 @@ impl QueuedProposal {
         data.extend_from_slice(self.previous_ledger.data());
         data.extend_from_slice(self.current_tx_hash.data());
         let hash = sha512_half(&data);
-        verify_digest(&self.public_key, hash, &self.message.signature, true)
+        verify_digest(&self.public_key, hash, &self.message.signature, false)
     }
 }
 

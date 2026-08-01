@@ -417,7 +417,6 @@ pub fn encode_constructor_fee_settings_entry(entry: ConstructorFeeSettingsEntry)
         }
     }
 
-    bytes.push(OBJECT_END);
     bytes
 }
 
@@ -1550,7 +1549,7 @@ mod tests {
     fn legacy_fee_settings_entry_matches_current_field_layout() {
         assert_eq!(
             bytes_to_hex(&encode_fee_settings_entry(10, 20, 30, false)),
-            "11007335000000000000000A201E0000000A201F0000001420200000001EE1"
+            "11007335000000000000000A201E0000000A201F0000001420200000001E"
         );
     }
 
@@ -1558,7 +1557,7 @@ mod tests {
     fn xrp_fee_settings_entry_matches_current_field_layout() {
         assert_eq!(
             bytes_to_hex(&encode_fee_settings_entry(11, 22, 33, true)),
-            "1100736016400000000000000B6017400000000000001660184000000000000021E1"
+            "1100736016400000000000000B6017400000000000001660184000000000000021"
         );
     }
 
@@ -1988,10 +1987,9 @@ mod tests {
                 reserve_base: Some(20),
                 reserve_increment: Some(30),
             });
-        // Remove trailing OBJECT_END, insert XRP field, then re-add OBJECT_END
-        bytes.pop(); // remove 0xE1
+        // Constructor-time FeeSettings is a top-level object, so append the
+        // XRP field directly without an OBJECT_END marker.
         bytes.extend_from_slice(&encode_native_amount(22, 11));
-        bytes.push(0xE1); // re-add OBJECT_END
 
         let error = decode_constructor_fee_settings_entry(&bytes)
             .expect_err("mixed constructor fee settings should fail");
