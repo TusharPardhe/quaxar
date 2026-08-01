@@ -22,6 +22,7 @@ libc = "0.2"
 ipnet = "2"
 ledger = { path = "../ledger" }
 nodestore = { path = "../nodestore" }
+openssl = { version = "0.10", features = ["vendored"] }
 rdb = { path = "../rdb" }
 overlay = { path = "../overlay" }
 perflog = { path = "../perflog" }

@@ -609,12 +609,29 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             min_valid_seq,
         );
         if mode != ConsensusMode::WrongLedger && preferred != *prev_ledger_id {
-            tracing::info!(
-                target: "consensus",
-                requested = %prev_ledger_id,
-                preferred = %preferred,
-                "Consensus view change — preferred ledger differs from current"
-            );
+            // rippled RCLConsensus.cpp:313-316: consensusViewChange() demotes
+            // FULL/TRACKING→CONNECTED when the preferred ledger diverges.
+            let current_mode = self.app_root.network_ops_operating_mode();
+            if current_mode == crate::NetworkOpsOperatingMode::Full
+                || current_mode == crate::NetworkOpsOperatingMode::Tracking
+            {
+                tracing::info!(
+                    target: "consensus",
+                    ?current_mode,
+                    requested = %prev_ledger_id,
+                    preferred = %preferred,
+                    "consensusViewChange: demoting to Connected (preferred ledger differs)"
+                );
+                self.app_root
+                    .set_network_ops_operating_mode(crate::NetworkOpsOperatingMode::Connected);
+            } else {
+                tracing::info!(
+                    target: "consensus",
+                    requested = %prev_ledger_id,
+                    preferred = %preferred,
+                    "Consensus view change — preferred ledger differs from current"
+                );
+            }
         }
         preferred
     }

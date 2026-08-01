@@ -95,6 +95,7 @@ pub(super) fn overlay_setup(network_id: Option<u32>) -> Setup {
                 .with_no_client_auth(),
         )),
         server_config: None,
+        server_ssl_acceptor: None,
         fixed_peer_ips: HashSet::new(),
         public_ip: None,
         ip_limit: 0,

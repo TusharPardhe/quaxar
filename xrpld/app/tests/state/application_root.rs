@@ -271,6 +271,7 @@ fn overlay_setup(network_id: Option<u32>) -> Setup {
                 .with_no_client_auth(),
         )),
         server_config: None,
+        server_ssl_acceptor: None,
         public_ip: None,
         ip_limit: 0,
         peer_limit: 0,

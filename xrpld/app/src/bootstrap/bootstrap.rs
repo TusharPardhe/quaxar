@@ -1820,10 +1820,32 @@ fn serve_one_get_ledger_request(
 ) {
     use overlay::Overlay;
 
-    let Some(hash_bytes) = req.message.ledger_hash.as_deref() else {
-        return;
-    };
-    let Some(hash) = Uint256::from_slice(hash_bytes) else {
+    // rippled serves seq-only requests via getLedgerBySeq (PeerImp.cpp:3319+).
+    // If hash is missing but seq is present, resolve the hash from LedgerMaster.
+    let hash = if let Some(hash_bytes) = req.message.ledger_hash.as_deref() {
+        match Uint256::from_slice(hash_bytes) {
+            Some(h) => h,
+            None => return,
+        }
+    } else if let Some(seq) = req.message.ledger_seq {
+        // Seq-only request: look up hash from validated range.
+        // rippled rejects sequences below getEarliestFetch() (PeerImp.cpp:3336).
+        if let Some(lm_rt) = root.ledger_master_runtime() {
+            let lm = lm_rt.ledger_master();
+            // Reject requests below our validated range floor
+            if let Some((earliest, _)) = lm.full_validated_range() {
+                if seq < earliest {
+                    return;
+                }
+            }
+            match lm.get_ledger_by_seq(seq, &ledger::NullLedgerJournal) {
+                Some(ledger) if ledger.header().seq == seq => *ledger.header().hash.as_uint256(),
+                _ => return,
+            }
+        } else {
+            return;
+        }
+    } else {
         return;
     };
 
@@ -1903,7 +1925,7 @@ fn serve_one_get_ledger_request(
                     nodeid: Some(nid.get_raw_string()),
                     nodedata: ndata.clone(),
                 });
-                if nodes.len() >= 2048 {
+                if nodes.len() >= 12_288 {
                     break;
                 }
             }
@@ -1924,12 +1946,12 @@ fn serve_one_get_ledger_request(
                             nodeid: Some(nid.get_raw_string()),
                             nodedata: ndata.clone(),
                         });
-                        if nodes.len() >= 256 {
+                        if nodes.len() >= HARD_MAX_REPLY_NODES {
                             break;
                         }
                     }
                 }
-                if nodes.len() >= 256 {
+                if nodes.len() >= HARD_MAX_REPLY_NODES {
                     break;
                 }
             }
@@ -2030,12 +2052,12 @@ fn serve_one_get_ledger_request(
                             nodeid: Some(nid.get_raw_string()),
                             nodedata: ndata.clone(),
                         });
-                        if nodes.len() >= 256 {
+                        if nodes.len() >= HARD_MAX_REPLY_NODES {
                             break;
                         }
                     }
                 }
-                if nodes.len() >= 256 {
+                if nodes.len() >= HARD_MAX_REPLY_NODES {
                     break;
                 }
             }

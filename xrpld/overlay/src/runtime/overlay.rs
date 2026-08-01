@@ -27,6 +27,9 @@ pub enum Promote {
 pub struct Setup {
     pub client_config: Option<Arc<ClientConfig>>,
     pub server_config: Option<Arc<ServerConfig>>,
+    /// OpenSSL-based server acceptor for inbound TLS connections.
+    /// Required for TLS Finished message extraction (Session-Signature derivation).
+    pub server_ssl_acceptor: Option<Arc<openssl::ssl::SslAcceptor>>,
     pub public_ip: Option<IpAddr>,
     pub fixed_peer_ips: HashSet<IpAddr>,
     pub ip_limit: usize,
@@ -48,6 +51,7 @@ impl Default for Setup {
         Self {
             client_config: None,
             server_config: None,
+            server_ssl_acceptor: None,
             public_ip: None,
             fixed_peer_ips: HashSet::new(),
             ip_limit: 0,

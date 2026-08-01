@@ -24,7 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tokio_rustls::TlsAcceptor;
+use tokio_openssl::SslStream;
 use xrpl_core::PeerReservationTable as CorePeerReservationTable;
 
 use crate::cluster::Cluster;
@@ -118,7 +118,7 @@ impl From<std::io::Error> for OverlayError {
 #[derive(Clone)]
 pub struct OverlayAcceptor {
     pub listener: Arc<TcpListener>,
-    pub acceptor: TlsAcceptor,
+    pub acceptor: Arc<openssl::ssl::SslAcceptor>,
 }
 
 #[derive(Debug, Clone)]
@@ -1101,7 +1101,6 @@ pub struct OverlayImpl {
     setup: Setup,
     handoff: Arc<dyn OverlayHandoff>,
     connector: Arc<SslConnector>,
-    acceptor: Option<TlsAcceptor>,
     active_peers: Arc<RwLock<HashMap<PeerId, Arc<PeerImp>>>>,
     by_public_key: Arc<RwLock<HashMap<PublicKey, Arc<PeerImp>>>>,
     next_id: Arc<AtomicU32>,
@@ -1134,7 +1133,7 @@ impl OverlayImpl {
     }
 
     pub fn has_tls_acceptor(&self) -> bool {
-        self.acceptor.is_some()
+        self.setup.server_ssl_acceptor.is_some()
     }
 
     pub fn with_clock(
@@ -1160,7 +1159,6 @@ impl OverlayImpl {
             .map_err(|error| OverlayError::Tls(error.to_string()))?;
         connector_builder.set_verify(SslVerifyMode::NONE);
         let connector = Arc::new(connector_builder.build());
-        let acceptor = setup.server_config.clone().map(TlsAcceptor::from);
         let active_peers = Arc::new(RwLock::new(HashMap::new()));
         let traffic = Arc::new(TrafficCount::default());
         let (stop_requested, _) = watch::channel(false);
@@ -1191,7 +1189,6 @@ impl OverlayImpl {
             setup,
             handoff,
             connector,
-            acceptor,
             active_peers,
             by_public_key: Arc::new(RwLock::new(HashMap::new())),
             next_id: Arc::new(AtomicU32::new(1)),
@@ -1323,9 +1320,10 @@ impl OverlayImpl {
 
     pub fn bind(&self, listener: TcpListener) -> Result<OverlayAcceptor, OverlayError> {
         let acceptor = self
-            .acceptor
+            .setup
+            .server_ssl_acceptor
             .clone()
-            .ok_or_else(|| OverlayError::Tls("missing server tls config".to_owned()))?;
+            .ok_or_else(|| OverlayError::Tls("missing server openssl acceptor".to_owned()))?;
         Ok(OverlayAcceptor {
             listener: Arc::new(listener),
             acceptor,
@@ -1374,20 +1372,40 @@ impl OverlayImpl {
         tracing::debug!(target: "overlay", ip = %remote_address, "Inbound connection accepted");
         // Disable Nagle's algorithm for low-latency request-response pipelining.
         let _ = tcp_stream.set_nodelay(true);
-        let mut tls_stream = tokio::select! {
+        let ssl = openssl::ssl::Ssl::new(acceptor.acceptor.context())
+            .map_err(|error| OverlayError::Tls(error.to_string()))?;
+        let mut tls_stream = tokio_openssl::SslStream::new(ssl, tcp_stream)
+            .map_err(|error| OverlayError::Tls(error.to_string()))?;
+        let accept_result = tokio::select! {
             biased;
             changed = stop_requested.changed() => {
                 let _ = changed;
                 return Ok(());
             }
-            result = acceptor.acceptor.accept(tcp_stream) => {
-                result.map_err(|error| OverlayError::Tls(error.to_string()))?
-            }
+            result = std::pin::Pin::new(&mut tls_stream).accept() => result,
         };
+        if let Err(error) = accept_result {
+            tracing::debug!(target: "overlay", ip = %remote_address, %error, "TLS accept failed");
+            return Ok(());
+        }
 
         let request = match read_http_request(&mut tls_stream, stop_requested.clone()).await? {
             Some(request) => request,
             None => return Ok(()),
+        };
+
+        // Derive TLS shared value from Finished messages (rippled: makeSharedValue).
+        // This is used for Session-Signature signing and peer verification.
+        let inbound_shared_value = {
+            let ssl = tls_stream.ssl();
+            let mut local_finished = [0u8; 64];
+            let mut peer_finished = [0u8; 64];
+            let local_len = ssl.finished(&mut local_finished);
+            let peer_len = ssl.peer_finished(&mut peer_finished);
+            crate::transport::handshake::make_shared_value_from_finished_messages(
+                &local_finished[..local_len],
+                &peer_finished[..peer_len],
+            )
         };
 
         // Basic Resource Management (IP Throttling)
@@ -1457,21 +1475,39 @@ impl OverlayImpl {
                     );
                     self.make_redirect_response(&request, remote_address)?
                 } else {
+                    // Derive shared value must succeed — rippled rejects at
+                    // OverlayImpl.cpp:282-292 when makeSharedValue fails.
+                    let shared_value = match inbound_shared_value {
+                        Some(sv) => sv,
+                        None => {
+                            tracing::warn!(
+                                target: "overlay",
+                                ip = %remote_address,
+                                "Inbound shared value derivation failed — disconnecting"
+                            );
+                            return Ok(());
+                        }
+                    };
                     // Verify the peer's handshake (compatibility: validatePeerHandshake)
                     let verify_ctx = crate::transport::handshake::HandshakeVerificationContext {
-                        shared_value: basics::base_uint::Uint256::default(),
+                        shared_value,
                         network_id: self.handshake_context().network_id,
                         local_public_key: None,
                         public_ip: self.handshake_context().local_ip,
                         remote_ip: remote_address.ip(),
                         clock_tolerance: std::time::Duration::from_secs(20),
                     };
-                    if let Err(_reason) = crate::transport::handshake::verify_handshake(
+                    if let Err(reason) = crate::transport::handshake::verify_handshake(
                         request.headers(),
                         &verify_ctx,
                     ) {
-                        // Handshake verification failed — log but don't reject
-                        // during migration to maintain connectivity.
+                        tracing::warn!(
+                            target: "overlay",
+                            ip = %remote_address,
+                            %reason,
+                            "Inbound handshake verification failed — disconnecting"
+                        );
+                        return Ok(());
                     }
 
                     let offered = request
@@ -1483,15 +1519,26 @@ impl OverlayImpl {
                         crate::protocol_version::parse_protocol_versions(offered),
                     )
                     .unwrap_or(crate::protocol_version::ProtocolVersion::new(2, 2));
+                    // Build handshake context with real TLS Session-Signature.
+                    let mut handshake_ctx = self.handshake_context();
+                    if let Some(sv) = inbound_shared_value {
+                        match self.identity.sign_session(&sv) {
+                            Ok(sig) => handshake_ctx.session_signature = sig,
+                            Err(err) => {
+                                tracing::warn!(target: "overlay", %err, "Failed to sign inbound session");
+                                return Ok(());
+                            }
+                        }
+                    }
                     let response = make_response(
                         true,
                         &request,
-                        &self.handshake_context(),
+                        &handshake_ctx,
                         protocol,
-                        false,
-                        false,
-                        false,
-                        false,
+                        true,  // compr — we support LZ4
+                        false, // ledger_replay — not implemented
+                        true,  // txrr — tx reduce relay
+                        true,  // vprr — validation/proposal reduce relay
                     );
                     accepted_peer = Some((peer, request.headers().clone()));
                     let response_wire = serialize_response(&response);
@@ -1561,7 +1608,6 @@ impl OverlayImpl {
             setup: self.setup.clone(),
             handoff: Arc::clone(&self.handoff),
             connector: self.connector.clone(),
-            acceptor: self.acceptor.clone(),
             active_peers: Arc::clone(&self.active_peers),
             by_public_key: Arc::clone(&self.by_public_key),
             next_id: Arc::clone(&self.next_id),

@@ -107,6 +107,7 @@ dependencies = [
  "ledger",
  "libc",
  "nodestore",
+ "openssl",
  "overlay",
  "parking_lot",
  "perflog",

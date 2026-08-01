@@ -403,18 +403,17 @@ fn dispatch_available(
         Err(ProtocolMessageError::InvalidHeader)
         | Err(ProtocolMessageError::UnsupportedCompression)
         | Err(ProtocolMessageError::CompressionDisabled) => {
-            // Match rippled: parseMessageHeader returning no_message/nullopt
-            // does NOT disconnect the peer. The caller returns 0 consumed and
-            // the read loop waits for more data. Skip one byte to attempt
-            // resynchronization rather than blocking on a permanently
-            // unparseable prefix.
+            // Match rippled: parseMessageHeader returning nullopt with 0 consumed.
+            // The read loop waits for more data. If this is a permanently
+            // unparseable stream, the peer will eventually be dropped by
+            // timeout or resource logic.
             tracing::debug!(
                 target: "overlay",
                 peer_id = %handler.peer.id(),
                 first_byte = format!("0x{:02X}", buffer.first().copied().unwrap_or(0)),
-                "skipping unparseable message header byte"
+                "unparseable message header — waiting for more data"
             );
-            Ok(Some(1))
+            Ok(None)
         }
         Err(e) => {
             tracing::warn!(

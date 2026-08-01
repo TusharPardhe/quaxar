@@ -612,6 +612,7 @@ pub fn build_overlay_setup(config: &BasicConfig) -> Result<Setup, String> {
     let mut setup = Setup {
         client_config: Some(default_overlay_client_config()?),
         server_config: None,
+        server_ssl_acceptor: None,
         public_ip: None,
         fixed_peer_ips: std::collections::HashSet::new(),
         ip_limit: 0,
@@ -651,6 +652,7 @@ pub fn build_overlay_runtime(
     if let Some(listener) = listener_setup.as_ref() {
         setup.peer_limit = listener.limit as usize;
         setup.server_config = build_overlay_server_config(listener)?;
+        setup.server_ssl_acceptor = build_overlay_ssl_acceptor(listener)?;
     }
     if setup.peer_limit == 0 {
         setup.peer_limit = DEFAULT_PEER_LIMIT.max(PEERFINDER_MIN_OUTBOUND);
@@ -794,6 +796,59 @@ fn rustls_private_key(identity: &TlsIdentityDer) -> PrivateKeyDer<'static> {
     PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
         identity.private_key_pkcs8_der().to_vec(),
     ))
+}
+
+/// Build an OpenSSL `SslAcceptor` for inbound peer connections.
+///
+/// This is required because the XRPL peer protocol derives a Session-Signature
+/// from raw TLS Finished messages (`SSL_get_finished` / `SSL_get_peer_finished`),
+/// which rustls does not expose. The openssl crate provides direct access.
+fn build_overlay_ssl_acceptor(
+    listener: &ServerPortOverlaySetup,
+) -> Result<Option<Arc<openssl::ssl::SslAcceptor>>, String> {
+    use openssl::pkey::PKey;
+    use openssl::ssl::{SslAcceptor, SslMethod, SslVerifyMode};
+    use openssl::x509::X509;
+
+    let identity = if listener.ssl_key.is_empty()
+        && listener.ssl_cert.is_empty()
+        && listener.ssl_chain.is_empty()
+    {
+        anonymous_tls_identity_der()
+    } else {
+        authenticated_tls_identity_der(&listener.ssl_key, &listener.ssl_cert, &listener.ssl_chain)
+    }
+    .map_err(|error| error.to_string())?;
+
+    let mut builder =
+        SslAcceptor::mozilla_intermediate(SslMethod::tls()).map_err(|e| e.to_string())?;
+
+    // Set certificate
+    let cert_der = identity
+        .certificate_chain_der()
+        .first()
+        .ok_or_else(|| "no certificate in identity".to_owned())?
+        .clone();
+    let cert = X509::from_der(&cert_der).map_err(|e| e.to_string())?;
+    builder.set_certificate(&cert).map_err(|e| e.to_string())?;
+
+    // Set additional chain certs
+    for chain_cert_der in identity.certificate_chain_der().iter().skip(1) {
+        let chain_cert = X509::from_der(chain_cert_der).map_err(|e| e.to_string())?;
+        builder
+            .add_extra_chain_cert(chain_cert)
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Set private key
+    let key = PKey::private_key_from_pkcs8(identity.private_key_pkcs8_der())
+        .map_err(|e| e.to_string())?;
+    builder.set_private_key(&key).map_err(|e| e.to_string())?;
+
+    // No client auth (matching rippled)
+    builder.set_verify(SslVerifyMode::NONE);
+
+    Ok(Some(Arc::new(builder.build())))
 }
 
 #[cfg(test)]
