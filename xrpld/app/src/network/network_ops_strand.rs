@@ -702,6 +702,12 @@ fn strand_loop(
         // replacement round. This is the sole endConsensus cadence token for
         // peer-status cycling, mode promotion, and the ordinary next round.
         let end_consensus_pass = should_reconcile_preferred_lcl(runner.phase());
+        // Rippled guarantees doAccept() runs BEFORE endConsensus/checkLastClosedLedger
+        // (RCLConsensus.cpp:438-450). Don't run reconciliation while accept work
+        // is still pending — it would restart the round before the accepted ledger
+        // is built, discarding locally-built progress.
+        let end_consensus_pass =
+            end_consensus_pass && !scheduler.accept_is_queued() && !scheduler.has_pending_accept();
         if end_consensus_pass {
             // endConsensus invalidates obsolete peer status before evaluating
             // the preferred LCL, whether or not this pass later performs a jump.
