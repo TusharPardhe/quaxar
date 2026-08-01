@@ -227,28 +227,83 @@ flowchart TD
     IL_RETRY --> IL_SCAN
 
     %% ════════════════════════════════════════════════════════════════
-    %% PHASE 11: VALIDATION → VALIDATED LEDGER
+    %% PHASE 11: VALIDATION RECEIPT → TRIE UPDATE → VALIDATED LEDGER
     %% ════════════════════════════════════════════════════════════════
     
-    IL_DONE --> VAL_PATH["Validations accumulate for this ledger"]
-    VAL_PATH --> VAL_QUORUM{"trusted count >= quorum?<br/>(ceil(UNL * 0.8))"}
-    VAL_QUORUM -->|No| VAL_WAIT["Wait for more validations"]
-    VAL_QUORUM -->|Yes| CHECK_ACCEPT["LedgerMaster::checkAccept(hash, seq)"]
+    IL_DONE --> VAL_WIRE["TMValidation arrives<br/>PeerImp.cpp:2347"]
+    VAL_WIRE --> VAL_SIZE{"payload >= 50 bytes?"}
+    VAL_SIZE -->|No| VAL_DROP1["Reject: too small"]
+    VAL_SIZE -->|Yes| VAL_DESER["Deserialize STValidation<br/>setSeen(closeTime)<br/>PeerImp.cpp:2362-2371"]
+    VAL_DESER --> VAL_CUR{"isCurrent(parms,<br/>closeTime, signTime,<br/>seenTime)?"}
+    VAL_CUR -->|No| VAL_DROP2["Reject stale"]
+    VAL_CUR -->|Yes| VAL_TRUSTED{"getValidators()<br/>.trusted(signerPublic)?"}
+    VAL_TRUSTED -->|"No + relay==-1"| VAL_DROP3["Drop untrusted"]
+    VAL_TRUSTED -->|Pass| VAL_HASH["sha512Half suppression<br/>via HashRouter"]
+    VAL_HASH --> VAL_DUP{"duplicate?"}
+    VAL_DUP -->|Yes| VAL_DROP4["Suppress"]
+    VAL_DUP -->|No| VAL_SIG["checkValidation:<br/>val->isValid() signature"]
+    VAL_SIG -->|Invalid| VAL_DROP5["charge kFeeInvalidSignature"]
+    VAL_SIG -->|Valid| VAL_HANDLE["handleNewValidation<br/>RCLValidations.cpp:150"]
+    VAL_HANDLE --> VAL_MARK["getTrustedKey → setTrusted if found"]
+    VAL_MARK --> VAL_ADD_CALL["*** validations.add(nodeID, val) ***<br/>Validations.h:591"]
+
+    %% ═══ Validations::add internals ═══
+    VAL_ADD_CALL --> ADD_CUR{"isCurrent?"}
+    ADD_CUR -->|No| ADD_STALE["return Stale"]
+    ADD_CUR -->|Yes| ADD_SEQ["seqEnforcers_[nodeID]<br/>monotonic advance"]
+    ADD_SEQ --> ADD_OK{"advancing?"}
+    ADD_OK -->|No| ADD_BAD["return BadSeq/Conflicting"]
+    ADD_OK -->|Yes| ADD_CUR_MAP{"current_.emplace<br/>(nodeID, val)?"}
+    ADD_CUR_MAP -->|"New + trusted"| UT_NEW["updateTrie(lock, nodeID,<br/>val, nullopt) :669"]
+    ADD_CUR_MAP -->|"Existing + newer + trusted"| UT_REPL["updateTrie(lock, nodeID,<br/>val, old_key) :660"]
+    ADD_CUR_MAP -->|"Not trusted or stale"| ADD_DONE["return Current"]
+
+    %% ═══ updateTrie: the trie insertion gate ═══
+    UT_NEW --> UT_BODY["Clear prior from acquiring_<br/>checkAcquired: flush pending"]
+    UT_REPL --> UT_BODY
+    UT_BODY --> UT_ACQ["*** adaptor_.acquire(ledgerID) ***<br/>RCLValidations.cpp:118"]
+    UT_ACQ --> ACQ_LBH["getLedgerByHash(hash)<br/>LedgerMaster.cpp:1717<br/>(LedgerHistory cache + closed slot)"]
+    ACQ_LBH --> ACQ_HIT{"found locally?"}
+    ACQ_HIT -->|Yes| TRIE_INS["*** trie_.insert(ledger) ***<br/>TRIE ADVANCES ✓"]
+    ACQ_HIT -->|No| ACQ_DEFER["acquiring_[valPair].insert(nodeID)<br/>Async JtAdvance GetConsL2<br/>acquireAsync(hash, 0, CONSENSUS)"]
+
+    %% ═══ Why caught-up node always finds it ═══
+    ON_ACCEPT -.->|"consensusBuilt:<br/>ledgerHistory_.insert(ledger)<br/>LedgerMaster.cpp:1094"| ACQ_HIT
+
+    %% ═══ getPreferred: trie → preferred LCL (called from Phase 6) ═══
+    TRIE_INS -.->|"Trie now current"| GET_PREV
+    GET_PREV --> GP_TRIE["trie.getPreferred(largestSeq)<br/>Validations.h:814"]
+    GP_TRIE --> GP_HAVE{"trie has preferred?"}
+    GP_HAVE -->|No| GP_FALL["Fall back to acquiring_ majority"]
+    GP_HAVE -->|Yes| GP_PARENT{"preferred.seq == curr.seq+1<br/>AND ancestor(curr.seq)==curr.id?<br/>(line 837)"}
+    GP_PARENT -->|"Yes: we are parent<br/>of next tip"| GP_STAY["return (curr.seq, curr.id)<br/>→ preferred == LCL<br/>→ NO DEMOTION ✓"]
+    GP_PARENT -->|No| GP_AHEAD{"preferred.seq > curr.seq?"}
+    GP_AHEAD -->|Yes| GP_SWITCH["return preferred → switch"]
+    GP_AHEAD -->|No| GP_CHAIN{"different chain?"}
+    GP_CHAIN -->|Yes| GP_SWITCH
+    GP_CHAIN -->|No| GP_STAY
+    GP_STAY -.-> PREF_DIFF
+    GP_SWITCH -.-> PREF_DIFF
+    GP_FALL -.-> PREF_DIFF
+
+    %% ═══ checkAccept → promote to validated ═══
+    UT_NEW --> ADD_DONE
+    UT_REPL --> ADD_DONE
+    ADD_DONE --> VAL_OUTCOME{"Current + trusted?"}
+    VAL_OUTCOME -->|Yes| CHECK_ACCEPT["checkAccept(hash, seq)<br/>LedgerMaster.cpp:884"]
+    VAL_OUTCOME -->|No| VAL_RELAY["Log/relay"]
     CHECK_ACCEPT --> CA_STALE{"seq <= validatedSeq?"}
-    CA_STALE -->|Yes| CA_SKIP["Skip (stale)"]
+    CA_STALE -->|Yes| CA_SKIP["Skip"]
     CA_STALE -->|No| CA_GET["getLedgerByHash(hash)"]
-    CA_GET --> CA_HAVE{"found?"}
+    CA_GET --> CA_HAVE{"found + quorum met?"}
     CA_HAVE -->|No| CA_ACQ["acquire(hash, seq, GENERIC)"]
-    CA_HAVE -->|Yes| CA_CUR{"canBeCurrent?<br/>quorum still met?"}
-    CA_CUR -->|No| CA_SKIP
-    CA_CUR -->|Yes| PROMOTE_VAL["═══ PROMOTE TO VALIDATED ═══<br/>ledger.setValidated()<br/>setFullLedger(ledger)<br/>setValidLedger(ledger)<br/>mark complete_ledgers"]
+    CA_HAVE -->|Yes| PROMOTE_VAL["═══ PROMOTE VALIDATED ═══<br/>setValidated + setFullLedger<br/>setValidLedger + complete_ledgers"]
     
-    PROMOTE_VAL --> DO_ADVANCE["doAdvance() → find publishable"]
+    PROMOTE_VAL --> DO_ADVANCE["doAdvance() → publishable?"]
     DO_ADVANCE --> PUB_FOUND{"publishable?"}
-    PUB_FOUND -->|Yes| PUBLISH["setFullLedger + setPubLedger + pubLedger"]
-    PUBLISH --> CLEAR_NNL2["▶ clearNeedNetworkLedger()<br/>LedgerMaster.cpp:1966"]
+    PUB_FOUND -->|Yes| PUBLISH["publish + clearNeedNetworkLedger"]
     PUB_FOUND -->|No| HISTORY["History fetch if needed"]
-    CLEAR_NNL2 -.-> PROMO_TRACK
+    PUBLISH -.-> PROMO_TRACK
 
     %% ════════════════════════════════════════════════════════════════
     %% PHASE 12: SERVING REQUESTS TO OTHER PEERS
@@ -924,179 +979,7 @@ has completed. Resource accounting should therefore be described by handler
 outcome, rather than assuming all work is charged synchronously in
 `onMessageEnd`.
 
-## 13. Validation Trie: Receipt → updateTrie → acquire → getPreferred
-
-This section covers the complete chain that keeps the validation trie advancing
-and enables `getPreferred()` to return the correct preferred ledger. A stalled
-trie causes mode oscillation (Full → Connected every consensus round).
-
-### 13.1 TMValidation Receipt Chain
-
-```mermaid
-flowchart TD
-    WIRE["TMValidation arrives on wire"] --> SIZE{"payload >= 50 bytes?"}
-    SIZE -->|no| DROP1["Reject: too small\ncharge kFeeMalformedRequest"]
-    SIZE -->|yes| DESER["Deserialize STValidation\nPeerImp.cpp:2362-2371\nsetSeen(closeTime)"]
-    DESER --> CURRENT{"isCurrent(\nparms, closeTime,\nsignTime, seenTime)?"}
-    CURRENT -->|no| DROP2["Reject: stale\ncharge kFeeUselessData"]
-    CURRENT -->|yes| TRUSTED{"app.getValidators()\n.trusted(signerPublic)?"}
-    TRUSTED -->|no| UNTRUST_FILTER{"relayUntrustedValidations == -1\nOR fee track loaded locally?"}
-    UNTRUST_FILTER -->|drop| DROP3["Drop untrusted"]
-    UNTRUST_FILTER -->|pass| HASH_CHECK
-    TRUSTED -->|yes| HASH_CHECK["key = sha512Half(payload)"]
-    HASH_CHECK --> SUPPRESS{"HashRouter.addSuppression\n(key, peerID)\nalready seen?"}
-    SUPPRESS -->|yes| DROP4["Duplicate\nupdate squelch slot counts"]
-    SUPPRESS -->|no| DIVERGED{"untrusted AND\npeer Diverged?"}
-    DIVERGED -->|yes| DROP5["Drop from diverged peer"]
-    DIVERGED -->|no| JOB["Post job:\nJtValidationT or JtValidationUt\n→ checkValidation()"]
-    JOB --> SIGCHECK{"val->isValid()\n(signature check)?"}
-    SIGCHECK -->|no| DROP6["charge kFeeInvalidSignature"]
-    SIGCHECK -->|yes| RECV_VAL["app.getOPs().recvValidation(val)\nNetworkOPs.cpp:2567"]
-    RECV_VAL --> HANDLE["handleNewValidation(app, val, source)\nRCLValidations.cpp:150"]
-    HANDLE --> MARK_TRUST{"getTrustedKey(signingKey)\nreturns masterKey?"}
-    MARK_TRUST -->|yes, not marked| SET_TRUST["val.setTrusted()"]
-    MARK_TRUST -->|already trusted| ADD_CALL
-    SET_TRUST --> ADD_CALL
-    MARK_TRUST -->|untrusted| LISTED["getListedKey(signingKey)\n(for nodeID derivation)"]
-    LISTED --> ADD_CALL["*** validations.add(nodeID, val) ***\nValidations.h:591"]
-    ADD_CALL --> STATUS{"outcome?"}
-    STATUS -->|Current + trusted| CHECK_ACCEPT["checkAccept(hash, seq)\nLedgerMaster.cpp:884\n(called from RCLValidations.cpp:191)"]
-    STATUS -->|Current + untrusted| RELAY_MAYBE["Maybe relay to peers"]
-    STATUS -->|Stale/BadSeq| LOG_DROP["Log and drop"]
-    STATUS -->|Conflicting/Multiple| BYZANTINE["Log Byzantine behavior\nstill relay for peer visibility"]
-```
-
-### 13.2 Validations::add → updateTrie Decision
-
-```mermaid
-flowchart TD
-    ADD["Validations::add(nodeID, val)\nValidations.h:591"] --> IS_CUR{"isCurrent(\nparms, now,\nsignTime, seenTime)?"}
-    IS_CUR -->|no| RET_STALE["return Stale"]
-    IS_CUR -->|yes| LOCK["scoped_lock(mutex_)"]
-    LOCK --> SEQ_ENF["seqEnforcers_[nodeID]\ntry advance seq"]
-    SEQ_ENF --> ENF_OK{"monotonically advancing?"}
-    ENF_OK -->|no| BYZANTINE_CHECK["Check for Conflicting/Multiple\nreturn BadSeq/Conflicting/Multiple"]
-    ENF_OK -->|yes| BY_LEDGER["byLedger_[ledgerID]\n.insert_or_assign(nodeID, val)"]
-    BY_LEDGER --> CURRENT_MAP{"current_.emplace(nodeID, val)\ninserted?"}
-    CURRENT_MAP -->|"yes (new node)"| NEW_NODE{"val.trusted()?"}
-    NEW_NODE -->|yes| UPDATE_NEW["*** updateTrie(lock, nodeID, val, nullopt) ***\nValidations.h:667-669"]
-    NEW_NODE -->|no| INSERT_DONE["current_.insert done"]
-    CURRENT_MAP -->|"no (existing)"| NEWER{"val.signTime >\noldVal.signTime?"}
-    NEWER -->|no| RET_STALE2["return Stale"]
-    NEWER -->|yes| REPLACE["old_key = (oldVal.seq, oldVal.id)\nit->second = val"]
-    REPLACE --> TRUST_CHECK{"val.trusted()?"}
-    TRUST_CHECK -->|yes| UPDATE_REPLACE["*** updateTrie(lock, nodeID, val, old_key) ***\nValidations.h:658-660"]
-    TRUST_CHECK -->|no| RET_CURRENT
-    UPDATE_NEW --> RET_CURRENT["return Current"]
-    UPDATE_REPLACE --> RET_CURRENT
-    INSERT_DONE --> RET_CURRENT
-```
-
-### 13.3 updateTrie: The Trie Insertion Gate
-
-```mermaid
-flowchart TD
-    UT["updateTrie(lock, nodeID, val, prior)\nValidations.h:405"] --> CLEAR_PRIOR{"prior is Some?"}
-    CLEAR_PRIOR -->|yes| RM_ACQ["acquiring_[prior].erase(nodeID)\nif empty: erase key"]
-    CLEAR_PRIOR -->|no| CHECK_ACQ
-    RM_ACQ --> CHECK_ACQ["*** checkAcquired(lock) ***\n(flush pending entries)"]
-    CHECK_ACQ --> FLUSH_LOOP["For each (seq,id) in acquiring_:\nacquire(id) → if found:\n  updateTrie(lock, nodeID, ledger)\n  erase from acquiring_"]
-    FLUSH_LOOP --> VAL_KEY["valPair = (val.seq, val.ledgerID)"]
-    VAL_KEY --> EXISTING_ACQ{"acquiring_.contains(valPair)?"}
-    EXISTING_ACQ -->|yes| ADD_NODE["acquiring_[valPair].insert(nodeID)\n(another validator waiting for same ledger)"]
-    EXISTING_ACQ -->|no| TRY_ACQUIRE["*** ledger = adaptor_.acquire(val.ledgerID()) ***\nRCLValidations.cpp:118"]
-    TRY_ACQUIRE --> FOUND{"ledger found locally?"}
-    FOUND -->|yes| TRIE_INSERT["*** updateTrie(lock, nodeID, ledger) ***\nValidations.h:380\n→ trie_.remove(old) + trie_.insert(ledger)"]
-    FOUND -->|no| DEFER["acquiring_[valPair].insert(nodeID)\n(deferred until ledger becomes available)"]
-    ADD_NODE --> DONE["Done — trie NOT updated yet"]
-    TRIE_INSERT --> DONE2["Done — trie ADVANCED ✓"]
-    DEFER --> ASYNC_FETCH["*** Async: JtAdvance GetConsL2 ***\nacquireAsync(hash, 0, CONSENSUS)\nwill eventually fetch the ledger"]
-```
-
-### 13.4 adaptor_.acquire(): What Makes a Ledger Findable
-
-```mermaid
-flowchart TD
-    ACQ["RCLValidationsAdaptor::acquire(hash)\nRCLValidations.cpp:118"] --> LBH["ledger = getLedgerByHash(hash)\n(searches LedgerHistory TaggedCache)"]
-    LBH --> FOUND{"ledger found?"}
-    FOUND -->|yes| VALIDATE["Assert: !open, immutable, hash matches"]
-    VALIDATE --> WRAP["return RCLValidatedLedger(ledger)"]
-    FOUND -->|no| LOG["Log: Need validated ledger for preferred analysis"]
-    LOG --> JOB["Post JtAdvance GetConsL2:\nacquireAsync(hash, 0, CONSENSUS)"]
-    JOB --> NONE["return nullopt\n(validation goes to acquiring_ map)"]
-    
-    subgraph sources["getLedgerByHash (LedgerMaster.cpp:1717)"]
-        S1["1. LedgerHistory TaggedCache\n   (inserted by storeLedger/LedgerHistory::insert)"]
-        S2["2. Closed-ledger slot (LedgerMaster.cpp:1722-1724)"]
-        S3["Note: does NOT invoke InboundLedgers.\n   Inbound fetch is done by adaptor at :133-136"]
-    end
-```
-
-**KEY INSIGHT:** `getLedgerByHash` succeeds for consensus-built ledgers because
-`consensusBuilt()` calls `ledgerHistory_.insert(ledger, false)` (at line 1094)
-which stores the ledger in the TaggedCache. (`builtLedger` at line 1095 only
-records consensus metadata, not the ledger itself.) A caught-up node always has
-its own LCL in the history cache, so `acquire()` succeeds immediately and the
-trie advances every round.
-
-### 13.5 getPreferred(): Trie → Preferred LCL
-
-```mermaid
-flowchart TD
-    GP["getPreferred(curr)\nValidations.h:810"] --> WITH_TRIE["withTrie(lock, ...):\nflush checkAcquired first"]
-    WITH_TRIE --> TRIE_PREF["preferred = trie.getPreferred(largestSeq)"]
-    TRIE_PREF --> HAVE_PREF{"preferred is Some?"}
-    HAVE_PREF -->|no| FALLBACK["Fall back to acquiring_ map:\nmax by validator count, break ties by ID"]
-    FALLBACK --> FB_FOUND{"any acquiring entry?"}
-    FB_FOUND -->|no| RET_NONE["return None\n(outer caller falls back to peer counts)"]
-    FB_FOUND -->|yes| RET_ACQ["return (seq, id) of majority acquiring"]
-    HAVE_PREF -->|yes| PARENT_CHECK{"preferred.seq == curr.seq() + 1\nAND preferred.ancestor(curr.seq) == curr.id?"}
-    PARENT_CHECK -->|yes| STAY_CURRENT["*** return (curr.seq, curr.id) ***\n'we might be about to generate it'\n→ THIS PREVENTS OSCILLATION"]
-    PARENT_CHECK -->|no| AHEAD{"preferred.seq > curr.seq?"}
-    AHEAD -->|yes| RET_AHEAD["return (preferred.seq, preferred.id)\n(preferred is ahead, switch to it)"]
-    AHEAD -->|no| DIFF_CHAIN{"curr[preferred.seq] != preferred.id?\n(different chain at same/earlier seq)"}
-    DIFF_CHAIN -->|yes| RET_DIFF["return (preferred.seq, preferred.id)\n(different chain, switch)"]
-    DIFF_CHAIN -->|no| STAY["return (curr.seq, curr.id)\n(same chain, stick with current)"]
-```
-
-**CRITICAL FOR STABILITY:** When a caught-up node's trie has the NEXT ledger as
-preferred (because validators are validating N+1 while we're still on N), the
-`PARENT_CHECK` at line 836-837 returns OUR CURRENT LCL. This means
-`preferred == LCL` in `get_prev_ledger` → NO `consensusViewChange` → stays at Full.
-
-If the trie is STALE (stuck at old seq), `getPreferred` returns that old seq
-which differs from our current LCL → demotion every round.
-
-### 13.6 Steady-State Trie Advancement
-
-For a caught-up node building ledger N via consensus:
-
-```
-1. doAccept → consensusBuilt → ledgerHistory_.insert(N, false) [line 1094]
-   → Ledger N is in LedgerHistory TaggedCache
-   (builtLedger at line 1095 records metadata only, not the ledger itself)
-
-2. Trusted validation for N arrives from network
-   → handleNewValidation → validations.add(nodeID, val)
-   → val.trusted() → updateTrie(lock, nodeID, val, prior)
-   → checkAcquired (flush any pending)
-   → acquire(N.hash) → getLedgerByHash → FOUND (from step 1)
-   → trie_.insert(N) — TRIE ADVANCES TO N
-
-3. Next consensus round: get_prev_ledger
-   → getPreferred(curr=N)
-   → trie returns N+1 as preferred (next tip, IF trusted support exists)
-   → PARENT_CHECK: N+1 == N.seq+1 AND ancestor(N)==N.id → TRUE
-   → return (N.seq, N.id) = our LCL
-   → preferred == LCL → NO DEMOTION → STAYS AT FULL ✓
-
-Note: If trie preferred is at an earlier/same seq ON THE SAME CHAIN,
-getPreferred also returns curr (lines 845-851). Demotion only occurs
-when preferred is on a DIFFERENT chain or strictly ahead without being
-our immediate child.
-```
-
-## 14. The Application Sweep Timer (`doSweep`)
+## 13. The Application Sweep Timer (`doSweep`)
 
 `ApplicationImp::setSweepTimer` schedules a wait for the configured
 `sweepInterval` (or its node-size default). On success it enqueues a `JtSweep`
@@ -1121,7 +1004,7 @@ recently active acquisitions are touched instead. This maintenance is separate
 from the one-second Overlay timer (endpoint exchange/autoconnect/idle reduction)
 and from the 60-second per-peer timer (send queue, usefulness, and ping checks).
 
-## 15. Compression: Negotiation, Eligibility, and Framing
+## 14. Compression: Negotiation, Eligibility, and Framing
 
 Compression is negotiated through the peer feature headers. `PeerImp` enables
 compression only when both the negotiated peer feature `compr=lz4` and local
@@ -1153,7 +1036,7 @@ size. The parser rejects invalid algorithms, malformed sizes, oversized
 uncompressed messages, and compressed frames received when compression was not
 negotiated.
 
-## 16. Peer Deactivation and Cleanup
+## 15. Peer Deactivation and Cleanup
 
 `PeerImp::close` is idempotent on its strand: it marks the deprecated detaching
 flag, cancels the peer timer, closes the socket, increments peer-disconnect
