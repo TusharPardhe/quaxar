@@ -1776,7 +1776,18 @@ fn run_start_mode_consensus_loop(
                     let manifests = overlay_rt.overlay().take_manifests();
                     for inbound in manifests {
                         let mut relay_list = Vec::new();
+                        // rippled 3.2.1: kMaxManifestBytes=358, kMaxManifestsPerMessage=200.
+                        // Only relay manifests that are within size bounds and were accepted.
+                        // rippled relays accepted gossip only if trusted or already known
+                        // (OverlayImpl.cpp:705-736).
+                        const MAX_MANIFEST_BYTES: usize = 358;
+                        const MAX_MANIFESTS_PER_MESSAGE: usize = 200;
+
                         for wire_manifest in inbound.message.list {
+                            // Reject oversized manifests before decoding (3.2.1 fix)
+                            if wire_manifest.stobject.len() > MAX_MANIFEST_BYTES {
+                                continue;
+                            }
                             let Some(manifest) = crate::state::manifest::deserialize_manifest(
                                 &wire_manifest.stobject,
                             ) else {
@@ -1792,6 +1803,10 @@ fn run_start_mode_consensus_loop(
                                 == crate::state::manifest::ManifestDisposition::Accepted
                             {
                                 relay_list.push(wire_manifest);
+                            }
+                            // Cap relay list to prevent oversized outgoing messages
+                            if relay_list.len() >= MAX_MANIFESTS_PER_MESSAGE {
+                                break;
                             }
                         }
 

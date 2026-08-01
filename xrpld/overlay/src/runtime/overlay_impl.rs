@@ -469,25 +469,17 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         &mut self,
         message: &crate::message::TmManifests,
     ) -> crate::router::RouteAction {
-        // rippled 3.2.1: kMaxManifestsPerMessage = 200.
-        // Drop oversized TMManifests without penalty (unpatched peer tolerance).
+        // rippled 3.2.1 (OverlayImpl.cpp:667-757): process all trusted manifests,
+        // cap untrusted processing at kMaxManifestsPerMessage=200, charge only
+        // excess untrusted. Drop empty messages with useless-data charge.
+        // Oversized messages (> 200 entries) are still processed up to the cap
+        // rather than dropped entirely, matching rippled's trust-first behavior.
         const MAX_MANIFESTS_PER_MESSAGE: usize = 200;
 
         if message.list.is_empty() {
             self.peer.charge(
                 (*resource::FEE_USELESS_DATA).clone(),
                 "empty manifests".to_owned(),
-            );
-            return crate::router::RouteAction::Continue;
-        }
-        if message.list.len() > MAX_MANIFESTS_PER_MESSAGE {
-            // rippled 3.2.1: oversized messages dropped without penalty
-            tracing::debug!(
-                target: "overlay",
-                peer_id = %self.peer.id(),
-                count = message.list.len(),
-                max = MAX_MANIFESTS_PER_MESSAGE,
-                "Dropping oversized TMManifests message"
             );
             return crate::router::RouteAction::Continue;
         }
