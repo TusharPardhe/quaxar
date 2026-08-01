@@ -3759,6 +3759,22 @@ impl ApplicationRoot {
         overlay_runtime: Arc<AppOverlayRuntime>,
     ) -> Option<Arc<AppOverlayRuntime>> {
         let overlay = overlay_runtime.overlay();
+        let manifests = Arc::clone(&self.registry.manifest_cache);
+        overlay.set_manifests_message_provider(move || {
+            let list = manifests
+                .serialized_manifests()
+                .into_iter()
+                .map(|stobject| overlay::message::wire::TmManifest { stobject })
+                .collect::<Vec<_>>();
+            (!list.is_empty()).then(|| {
+                overlay::ProtocolMessage::new(overlay::ProtocolPayload::Manifests(
+                    overlay::TmManifests {
+                        list,
+                        ..Default::default()
+                    },
+                ))
+            })
+        });
         self.wire_overlay_membership_sources(overlay.as_ref());
         if let Some(closed_ledger) = self.closed_ledger() {
             overlay.set_handshake_ledgers(

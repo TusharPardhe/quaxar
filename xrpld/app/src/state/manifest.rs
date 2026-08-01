@@ -202,6 +202,18 @@ impl ManifestCache {
             .map(|manifest| manifest.serialized.clone())
     }
 
+    /// Snapshot every current manifest, including revocations. Rippled sends
+    /// the cache's complete current manifest set at protocol start.
+    pub fn serialized_manifests(&self) -> Vec<Vec<u8>> {
+        self.state
+            .read()
+            .expect("manifest cache read lock")
+            .manifests
+            .values()
+            .map(|manifest| manifest.serialized.clone())
+            .collect()
+    }
+
     pub fn revoked(&self, master_key: &PublicKey) -> bool {
         let state = self.state.read().expect("manifest cache read lock");
         state

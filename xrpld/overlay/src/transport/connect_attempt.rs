@@ -45,10 +45,6 @@ pub struct ConnectAttemptConfig {
     pub tx_reduce_relay_enabled: bool,
     pub vp_reduce_relay_enabled: bool,
     pub connect_timeout: Duration,
-    pub tcp_connect_timeout: Duration,
-    pub tls_handshake_timeout: Duration,
-    pub http_write_timeout: Duration,
-    pub http_read_timeout: Duration,
 }
 
 impl Default for ConnectAttemptConfig {
@@ -57,14 +53,10 @@ impl Default for ConnectAttemptConfig {
             server_name: "localhost".to_owned(),
             crawl_public: false,
             compr_enabled: false,
-            ledger_replay_enabled: false,
+            ledger_replay_enabled: true,
             tx_reduce_relay_enabled: false,
             vp_reduce_relay_enabled: false,
-            connect_timeout: Duration::from_secs(25),
-            tcp_connect_timeout: Duration::from_secs(8),
-            tls_handshake_timeout: Duration::from_secs(8),
-            http_write_timeout: Duration::from_secs(3),
-            http_read_timeout: Duration::from_secs(3),
+            connect_timeout: Duration::from_secs(15),
         }
     }
 }
@@ -185,12 +177,8 @@ impl ConnectAttempt {
                 let _ = changed;
                 return Err(Self::shutdown_started_error());
             }
-            result = timeout(
-                self.config.tcp_connect_timeout,
-                TcpStream::connect(self.remote_endpoint),
-            ) => {
-                result.map_err(|_| ConnectAttemptError::Timeout(ConnectionStep::TcpConnect))?
-                    .map_err(ConnectAttemptError::Io)?
+            result = TcpStream::connect(self.remote_endpoint) => {
+                result.map_err(ConnectAttemptError::Io)?
             }
         };
 
@@ -210,12 +198,8 @@ impl ConnectAttempt {
                 let _ = changed;
                 return Err(Self::shutdown_started_error());
             }
-            result = timeout(
-                self.config.tls_handshake_timeout,
-                std::pin::Pin::new(&mut tls_stream).connect(),
-            ) => {
-                result.map_err(|_| ConnectAttemptError::Timeout(ConnectionStep::TlsHandshake))?
-                    .map_err(|error| ConnectAttemptError::Protocol(error.to_string()))?
+            result = std::pin::Pin::new(&mut tls_stream).connect() => {
+                result.map_err(|error| ConnectAttemptError::Protocol(error.to_string()))?
             }
         };
 
@@ -244,12 +228,8 @@ impl ConnectAttempt {
                 let _ = changed;
                 return Err(Self::shutdown_started_error());
             }
-            result = timeout(
-                self.config.http_write_timeout,
-                tls_stream.write_all(&wire_request),
-            ) => {
-                result.map_err(|_| ConnectAttemptError::Timeout(ConnectionStep::HttpWrite))?
-                    .map_err(ConnectAttemptError::Io)?
+            result = tls_stream.write_all(&wire_request) => {
+                result.map_err(ConnectAttemptError::Io)?
             }
         };
         self.ensure_not_stopping(&stop_requested)?;
@@ -259,9 +239,8 @@ impl ConnectAttempt {
                 let _ = changed;
                 return Err(Self::shutdown_started_error());
             }
-            result = timeout(self.config.http_write_timeout, tls_stream.flush()) => {
-                result.map_err(|_| ConnectAttemptError::Timeout(ConnectionStep::HttpWrite))?
-                    .map_err(ConnectAttemptError::Io)?
+            result = tls_stream.flush() => {
+                result.map_err(ConnectAttemptError::Io)?
             }
         };
 
@@ -272,11 +251,8 @@ impl ConnectAttempt {
                 let _ = changed;
                 return Err(Self::shutdown_started_error());
             }
-            result = timeout(
-                self.config.http_read_timeout,
-                read_http_response(&mut tls_stream),
-            ) => {
-                result.map_err(|_| ConnectAttemptError::Timeout(ConnectionStep::HttpRead))??
+            result = read_http_response(&mut tls_stream) => {
+                result?
             }
         };
         let response =

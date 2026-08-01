@@ -2,10 +2,15 @@
 
 use crate::{
     InboundLedgerReason, Ledger, LedgerDeltaAcquire, LedgerDeltaBuildError, SkipListAcquire,
+    timeout_counter::{
+        TimeoutCounter, TimeoutCounterJobConfig, TimeoutCounterJournal, TimeoutCounterRuntime,
+    },
 };
 use basics::base_uint::Uint256;
 use std::sync::{Arc, Mutex};
+use time::Duration;
 
+pub const REPLAY_TASK_TIMEOUT: Duration = Duration::milliseconds(500);
 pub const REPLAY_TASK_MAX_TIMEOUTS_MULTIPLIER: u32 = 2;
 pub const REPLAY_TASK_MAX_TIMEOUTS_MINIMUM: u32 = 10;
 
@@ -96,6 +101,8 @@ pub struct LedgerReplayTask {
     stopping: bool,
     progress: bool,
     timeouts: u32,
+    timer_interval: Duration,
+    timeout_counter: Option<TimeoutCounter>,
 }
 
 impl LedgerReplayTask {
@@ -120,6 +127,8 @@ impl LedgerReplayTask {
             stopping: false,
             progress: false,
             timeouts: 0,
+            timer_interval: REPLAY_TASK_TIMEOUT,
+            timeout_counter: None,
         }
     }
 
@@ -141,6 +150,31 @@ impl LedgerReplayTask {
 
     pub fn is_stopped(&self) -> bool {
         self.stopping
+    }
+
+    pub fn timer_interval(&self) -> Duration {
+        self.timer_interval
+    }
+
+    /// Construct and retain the 500 ms TimeoutCounter used to drive this
+    /// parent replay task.
+    pub fn create_timeout_counter(
+        &mut self,
+        runtime: Arc<dyn TimeoutCounterRuntime>,
+        journal: Arc<dyn TimeoutCounterJournal>,
+        job: TimeoutCounterJobConfig,
+        on_timer: impl Fn(bool, TimeoutCounter) + Send + Sync + 'static,
+    ) -> TimeoutCounter {
+        let counter = TimeoutCounter::new(
+            runtime,
+            journal,
+            self.parameter.finish_hash,
+            self.timer_interval,
+            job,
+            on_timer,
+        );
+        self.timeout_counter = Some(counter.clone());
+        counter
     }
 
     pub fn add_delta(&mut self, delta: Arc<Mutex<LedgerDeltaAcquire>>) {

@@ -1,12 +1,20 @@
 //! `SkipListAcquire` owner port above the landed ledger and overlay seams.
 
-use crate::{InboundLedgerReason, Ledger};
+use crate::{
+    InboundLedgerReason, Ledger,
+    timeout_counter::{
+        TimeoutCounter, TimeoutCounterJobConfig, TimeoutCounterJournal, TimeoutCounterRuntime,
+    },
+};
 use basics::base_uint::Uint256;
 use overlay::{PeerSet, ProtocolFeature, ProtocolMessage, ProtocolPayload, TmProofPathRequest};
 use protocol::{decode_ledger_hashes_entry, keylet};
 use shamap::item::SHAMapItem;
 use std::sync::Arc;
+use time::Duration;
 
+pub const REPLAY_SUB_TASK_TIMEOUT: Duration = Duration::milliseconds(250);
+pub const REPLAY_SUB_TASK_FALLBACK_TIMEOUT: Duration = Duration::milliseconds(1000);
 pub const REPLAY_SUB_TASK_MAX_TIMEOUTS: i32 = 10;
 pub const REPLAY_MAX_NO_FEATURE_PEER_COUNT: u32 = 2;
 
@@ -27,6 +35,8 @@ pub struct SkipListAcquire {
     stopping: bool,
     progress: bool,
     timeouts: i32,
+    timer_interval: Duration,
+    timeout_counter: Option<TimeoutCounter>,
 }
 
 impl SkipListAcquire {
@@ -42,6 +52,8 @@ impl SkipListAcquire {
             stopping: false,
             progress: false,
             timeouts: 0,
+            timer_interval: REPLAY_SUB_TASK_TIMEOUT,
+            timeout_counter: None,
         }
     }
 
@@ -75,6 +87,32 @@ impl SkipListAcquire {
 
     pub fn is_fallback(&self) -> bool {
         self.fall_back
+    }
+
+    pub fn timer_interval(&self) -> Duration {
+        self.timer_interval
+    }
+
+    /// Construct and retain the TimeoutCounter that drives this replay
+    /// subtask. The interval starts at rippled's 250 ms and is updated to one
+    /// second if featureless peers require normal acquisition fallback.
+    pub fn create_timeout_counter(
+        &mut self,
+        runtime: Arc<dyn TimeoutCounterRuntime>,
+        journal: Arc<dyn TimeoutCounterJournal>,
+        job: TimeoutCounterJobConfig,
+        on_timer: impl Fn(bool, TimeoutCounter) + Send + Sync + 'static,
+    ) -> TimeoutCounter {
+        let counter = TimeoutCounter::new(
+            runtime,
+            journal,
+            self.hash,
+            self.timer_interval,
+            job,
+            on_timer,
+        );
+        self.timeout_counter = Some(counter.clone());
+        counter
     }
 
     pub fn init<LOOKUP, FALLBACK>(
@@ -178,10 +216,7 @@ impl SkipListAcquire {
 
             self.peer_set.add_peers(
                 limit,
-                &mut |peer| {
-                    peer.supports_feature(ProtocolFeature::LedgerReplay)
-                        && peer.has_ledger(self.hash, 0)
-                },
+                &mut |peer| peer.has_ledger(self.hash, 0),
                 &mut |peer| {
                     if peer.supports_feature(ProtocolFeature::LedgerReplay) {
                         self.peer_set.send_request(&request, Some(peer));
@@ -189,6 +224,10 @@ impl SkipListAcquire {
                         self.no_feature_peer_count += 1;
                         if self.no_feature_peer_count >= REPLAY_MAX_NO_FEATURE_PEER_COUNT {
                             self.fall_back = true;
+                            self.timer_interval = REPLAY_SUB_TASK_FALLBACK_TIMEOUT;
+                            if let Some(counter) = self.timeout_counter.as_ref() {
+                                counter.set_timer_interval(self.timer_interval);
+                            }
                         }
                     }
                 },

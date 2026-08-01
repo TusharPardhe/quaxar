@@ -1108,6 +1108,8 @@ fn is_valid_peer_endpoint(endpoint: SocketAddr) -> bool {
         && is_public_ip(endpoint.ip())
 }
 
+type ManifestsMessageProvider = Arc<dyn Fn() -> Option<ProtocolMessage> + Send + Sync>;
+
 pub struct OverlayImpl {
     setup: Setup,
     handoff: Arc<dyn OverlayHandoff>,
@@ -1139,6 +1141,8 @@ pub struct OverlayImpl {
     /// Hashes from the current local closed ledger and its parent, included in
     /// every outbound HTTP upgrade request like rippled's makeHandshake.
     handshake_ledgers: Arc<RwLock<Option<(Uint256, Uint256)>>>,
+    /// Cached manifest message provider installed by the app state owner.
+    manifests_message_provider: Arc<RwLock<Option<ManifestsMessageProvider>>>,
     session_runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -1231,8 +1235,31 @@ impl OverlayImpl {
             pending_outbound_ips: Arc::new(Mutex::new(HashSet::new())),
             peer_status_publisher: Arc::new(RwLock::new(None)),
             handshake_ledgers: Arc::new(RwLock::new(None)),
+            manifests_message_provider: Arc::new(RwLock::new(None)),
             session_runtime,
         })
+    }
+
+    pub fn set_manifests_message_provider<F>(&self, provider: F)
+    where
+        F: Fn() -> Option<ProtocolMessage> + Send + Sync + 'static,
+    {
+        *self
+            .manifests_message_provider
+            .write()
+            .expect("manifest message provider lock") = Some(Arc::new(provider));
+    }
+
+    fn send_cached_manifests(&self, peer: &Arc<PeerImp>) {
+        let provider = self
+            .manifests_message_provider
+            .read()
+            .expect("manifest message provider lock")
+            .as_ref()
+            .map(Arc::clone);
+        if let Some(message) = provider.and_then(|provider| provider()) {
+            peer.send(Message::new(message, None));
+        }
     }
 
     pub fn set_peer_status_publisher<F>(&self, publisher: F)
@@ -1601,10 +1628,10 @@ impl OverlayImpl {
                         &request,
                         &handshake_ctx,
                         protocol,
-                        true,  // compr — we support LZ4
-                        false, // ledger_replay — not implemented
-                        true,  // txrr — tx reduce relay
-                        true,  // vprr — validation/proposal reduce relay
+                        true, // compr — we support LZ4
+                        true, // ledger_replay — supported
+                        true, // txrr — tx reduce relay
+                        true, // vprr — validation/proposal reduce relay
                     );
                     accepted_peer = Some((peer, request.headers().clone()));
                     let response_wire = serialize_response(&response);
@@ -1699,6 +1726,7 @@ impl OverlayImpl {
             pending_outbound_ips: Arc::clone(&self.pending_outbound_ips),
             peer_status_publisher: Arc::clone(&self.peer_status_publisher),
             handshake_ledgers: Arc::clone(&self.handshake_ledgers),
+            manifests_message_provider: Arc::clone(&self.manifests_message_provider),
             session_runtime: Arc::clone(&self.session_runtime),
         }
     }
@@ -2686,6 +2714,7 @@ impl OverlayImpl {
             result.session = None;
             return Err(PEER_LIMIT_REJECTION_REASON);
         }
+        self.send_cached_manifests(&result.peer);
         if let Some(session) = result.session.take() {
             self.spawn_peer_session(Arc::clone(&result.peer), session);
         }
@@ -2733,6 +2762,7 @@ impl Overlay for OverlayImpl {
         let config = ConnectAttemptConfig {
             server_name: address.ip().to_string(),
             compr_enabled: true,
+            ledger_replay_enabled: true,
             tx_reduce_relay_enabled: self.setup.tx_reduce_relay_enabled,
             vp_reduce_relay_enabled: self.setup.vp_reduce_relay_base_squelch_enabled,
             ..ConnectAttemptConfig::default()

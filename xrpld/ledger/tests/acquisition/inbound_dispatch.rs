@@ -192,6 +192,7 @@ fn inbound_run_data_tracks_useful_peer_counts_and_resets_dispatch_latch() {
                 InboundLedgerDataType::TransactionNode,
                 InboundLedgerPacketError::EmptyNodes
             ),],
+            invalid_packets: Vec::new(),
         }
     );
     assert!(!inbound.receive_dispatched());

@@ -207,7 +207,7 @@ pub use read_view::{
 pub use replay::{LedgerReplay, LedgerReplayError};
 pub use replay_task::{
     LedgerReplayTask, LedgerReplayTaskParameter, REPLAY_TASK_MAX_TIMEOUTS_MINIMUM,
-    REPLAY_TASK_MAX_TIMEOUTS_MULTIPLIER, ReplayTaskError,
+    REPLAY_TASK_MAX_TIMEOUTS_MULTIPLIER, REPLAY_TASK_TIMEOUT, ReplayTaskError,
 };
 pub use replayer::{LedgerReplayer, REPLAY_MAX_TASK_SIZE, REPLAY_MAX_TASKS};
 pub use sandbox::Sandbox;
@@ -221,7 +221,8 @@ use shamap::sync::{SHAMapMissingNode, SHAMapType, SyncState, SyncTree};
 use shamap::traversal::TraversalError;
 use shamap::tree_node::SHAMapNodeType;
 pub use skip_list_acquire::{
-    REPLAY_MAX_NO_FEATURE_PEER_COUNT, REPLAY_SUB_TASK_MAX_TIMEOUTS, SkipListAcquire, SkipListData,
+    REPLAY_MAX_NO_FEATURE_PEER_COUNT, REPLAY_SUB_TASK_FALLBACK_TIMEOUT,
+    REPLAY_SUB_TASK_MAX_TIMEOUTS, REPLAY_SUB_TASK_TIMEOUT, SkipListAcquire, SkipListData,
 };
 pub use state_map::{LedgerSetupError, encode_amendments_entry, encode_fee_settings_entry};
 use std::collections::{BTreeMap, BTreeSet, HashSet};

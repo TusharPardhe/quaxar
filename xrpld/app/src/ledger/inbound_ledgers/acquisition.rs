@@ -1319,16 +1319,19 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         .stats
         .state_duplicate_nodes
         .fetch_add(result.state_duplicate_nodes, Ordering::Relaxed);
-    state
-        .lifecycle
-        .packet_step_errors
-        .fetch_add(result.malformed_packets.len() as u64, Ordering::Relaxed);
+    state.lifecycle.packet_step_errors.fetch_add(
+        (result.malformed_packets.len() + result.invalid_packets.len()) as u64,
+        Ordering::Relaxed,
+    );
     state
         .stats
         .malformed_packets
         .fetch_add(result.malformed_packets.len() as u64, Ordering::Relaxed);
     for (peer_id, packet_type, error) in result.malformed_packets {
         charge_malformed_packet(state, peer_id, packet_type, error);
+    }
+    for (peer_id, packet_type, error) in result.invalid_packets {
+        charge_invalid_data_packet(state, peer_id, packet_type, error);
     }
 
     let reply_requests: Vec<_> = result
@@ -1369,13 +1372,34 @@ fn charge_malformed_packet(
             "ledger_data empty header"
         }
         (_, InboundLedgerPacketError::EmptyNodes) => "ledger_data no nodes",
+        (_, InboundLedgerPacketError::EmptyNodeData) => "ledger_data empty node",
         (_, InboundLedgerPacketError::InvalidHeader) => "ledger_data invalid header",
-        (_, InboundLedgerPacketError::MissingNodeId) => "ledger_data bad node",
+        (_, InboundLedgerPacketError::MissingNodeId) => "ledger_data missing node id",
+        (_, InboundLedgerPacketError::InvalidNodeId) => "ledger_data invalid node id",
+        (_, InboundLedgerPacketError::InvalidNodeData) => "ledger_data malformed node data",
+        (_, InboundLedgerPacketError::InvalidData) => "ledger_data invalid data",
     };
     peer.charge(
         (*resource::FEE_MALFORMED_REQUEST).clone(),
         context.to_owned(),
     );
+}
+
+fn charge_invalid_data_packet(
+    state: &AcquisitionState,
+    peer_id: u64,
+    packet_type: ledger::InboundLedgerDataType,
+    error: InboundLedgerPacketError,
+) {
+    let Some(peer) = state.peer_set.find_peer(peer_id as u32) else {
+        return;
+    };
+    let context = match (packet_type, error) {
+        (ledger::InboundLedgerDataType::Base, _) => "ledger_data invalid root",
+        (_, InboundLedgerPacketError::InvalidData) => "ledger_data invalid node",
+        (_, _) => "ledger_data invalid data",
+    };
+    peer.charge((*resource::FEE_INVALID_DATA).clone(), context.to_owned());
 }
 
 fn process_timeout_job(state: &Arc<AcquisitionState>) {

@@ -797,6 +797,38 @@ fn finalize_connected_peer_activates_and_applies_negotiated_flags() {
 }
 
 #[test]
+fn finalize_connected_peer_sends_cached_manifests() {
+    let overlay = OverlayImpl::new(test_setup(), Arc::new(TestHandoff)).expect("overlay");
+    overlay.set_manifests_message_provider(|| {
+        Some(ProtocolMessage::new(ProtocolPayload::Manifests(
+            TmManifests {
+                list: vec![wire::TmManifest {
+                    stobject: vec![1, 2, 3],
+                }],
+                ..Default::default()
+            },
+        )))
+    });
+    let peer = peer(130, 71);
+
+    overlay
+        .finalize_connect_result(ConnectAttemptResult {
+            peer: Arc::clone(&peer),
+            response: Response::builder().status(101).body(()).expect("response"),
+            negotiated_features: HeaderMap::new(),
+            session: None,
+        })
+        .expect("connect result should finalize");
+
+    let messages = peer.queued_messages();
+    assert_eq!(messages.len(), 1);
+    assert!(matches!(
+        messages[0].protocol().payload,
+        ProtocolPayload::Manifests(TmManifests { ref list, .. }) if list.len() == 1
+    ));
+}
+
+#[test]
 fn finalize_connected_peer_rejects_unreserved_peer_when_limit_is_full() {
     let overlay = OverlayImpl::new(
         Setup {

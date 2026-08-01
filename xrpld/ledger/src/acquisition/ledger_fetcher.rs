@@ -225,8 +225,12 @@ impl InboundLedgerPacket {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundLedgerPacketError {
     EmptyNodes,
+    EmptyNodeData,
     InvalidHeader,
     MissingNodeId,
+    InvalidNodeId,
+    InvalidNodeData,
+    InvalidData,
 }
 
 /// Result of processing a bounded contiguous range of an inbound packet.
@@ -327,6 +331,10 @@ pub struct InboundLedgerRunDataResult {
     pub packet_stats: Vec<InboundLedgerPacketDebugStats>,
     /// Packets that rippled charges as malformed, with their source peer.
     pub malformed_packets: Vec<(u64, InboundLedgerDataType, InboundLedgerPacketError)>,
+    /// Packets containing data that decoded structurally but failed SHAMap
+    /// validation, with their source peer. This is charged separately from
+    /// malformed input as rippled `kFeeInvalidData`.
+    pub invalid_packets: Vec<(u64, InboundLedgerDataType, InboundLedgerPacketError)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1125,6 +1133,15 @@ impl InboundLedgerLocal {
                 if let (Some(peer_id), Some(error)) = (entry.peer_id, error) {
                     result.malformed_packets.push((peer_id, packet_type, error));
                 }
+                if let (Some(peer_id), Some(stats)) = (entry.peer_id, san)
+                    && stats.is_invalid()
+                {
+                    result.invalid_packets.push((
+                        peer_id,
+                        packet_type,
+                        InboundLedgerPacketError::InvalidData,
+                    ));
+                }
                 let count = san.map(|san| san.get_good()).unwrap_or(-1);
                 if count > 0 {
                     result.useful_packets += 1;
@@ -1334,6 +1351,15 @@ impl InboundLedgerLocal {
                 };
                 if let (Some(peer_id), Some(error)) = (entry.peer_id, error) {
                     result.malformed_packets.push((peer_id, packet_type, error));
+                }
+                if let (Some(peer_id), Some(stats)) = (entry.peer_id, san)
+                    && stats.is_invalid()
+                {
+                    result.invalid_packets.push((
+                        peer_id,
+                        packet_type,
+                        InboundLedgerPacketError::InvalidData,
+                    ));
                 }
                 let count = san.map(|san| san.get_good()).unwrap_or(-1);
                 if count > 0 {
@@ -1673,7 +1699,7 @@ impl InboundLedgerLocal {
         )?;
         Ok(InboundLedgerPacketStep {
             next_node: end,
-            complete: end == packet.nodes.len() || !stats.is_good(),
+            complete: end == packet.nodes.len() || stats.is_invalid(),
             stats,
         })
     }
@@ -1754,6 +1780,26 @@ impl InboundLedgerLocal {
                 if packet.nodes.iter().any(|node| node.node_id.is_none()) {
                     journal.warn("Got bad node");
                     return Err(InboundLedgerPacketError::MissingNodeId);
+                }
+                if packet.nodes.iter().any(|node| node.node_data.is_empty()) {
+                    journal.warn("Got empty node data");
+                    return Err(InboundLedgerPacketError::EmptyNodeData);
+                }
+                if packet.nodes.iter().any(|node| {
+                    node.node_id.as_deref().is_none_or(|node_id| {
+                        shamap::node_id::deserialize_shamap_node_id(node_id).is_none()
+                    })
+                }) {
+                    journal.warn("Got invalid node id");
+                    return Err(InboundLedgerPacketError::InvalidNodeId);
+                }
+                if packet
+                    .nodes
+                    .iter()
+                    .any(|node| SHAMapTreeNode::make_from_wire(&node.node_data).is_err())
+                {
+                    journal.warn("Got invalid node data");
+                    return Err(InboundLedgerPacketError::InvalidNodeData);
                 }
 
                 let mut san = SHAMapAddNode::default();
@@ -2016,7 +2062,7 @@ impl InboundLedgerLocal {
                 )
             };
             *san += added;
-            if !san.is_good() {
+            if added.is_invalid() {
                 journal.warn("Received bad node data");
                 return;
             }
@@ -2113,7 +2159,7 @@ impl InboundLedgerLocal {
             }
             node_count += 1;
             *san += added;
-            if !san.is_good() {
+            if added.is_invalid() {
                 journal.warn("Received bad node data");
                 return;
             }

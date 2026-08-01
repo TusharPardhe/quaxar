@@ -1701,8 +1701,8 @@ fn run_start_mode_consensus_loop(
                         }
 
                         // OverlayImpl::sendEndpoints runs every second in rippled. Broadcast
-                        // from the live bootstrap timer at a less chatty 15-second cadence,
-                        // including this listener and currently discovered peers.
+                        // from this live bootstrap timer every tick, including this listener
+                        // and currently discovered peers.
                         static LAST_ENDPOINTS_SECS: std::sync::atomic::AtomicU64 =
                             std::sync::atomic::AtomicU64::new(0);
                         let now_secs = std::time::SystemTime::now()
@@ -1711,7 +1711,7 @@ fn run_start_mode_consensus_loop(
                             .unwrap_or(0);
                         let last_endpoints =
                             LAST_ENDPOINTS_SECS.load(std::sync::atomic::Ordering::Relaxed);
-                        if now_secs.saturating_sub(last_endpoints) >= 15 {
+                        if now_secs.saturating_sub(last_endpoints) >= 1 {
                             LAST_ENDPOINTS_SECS
                                 .store(now_secs, std::sync::atomic::Ordering::Relaxed);
                             let peers = overlay_rt.overlay().active_peers();
