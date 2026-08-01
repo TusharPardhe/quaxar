@@ -114,6 +114,166 @@ The PeerFinder task performs its internal maintenance every second and attempts 
 
 ---
 
+## Validation Trie: Receipt → update_trie → acquire → get_preferred
+
+This section covers Quaxar's validation trie advancement chain, the bug that
+caused trie stall at seq 106,005,273, and the fix.
+
+### TMValidation Receipt Chain
+
+```mermaid
+flowchart TD
+    WIRE["TMValidation arrives\noverlay message router"] --> DESER["Deserialize STValidation\nset_seen(close_time)"]
+    DESER --> CURRENT{"is_current(\nparms, close_time,\nsign_time, seen_time)?"}
+    CURRENT -->|no| DROP1["Reject stale"]
+    CURRENT -->|yes| TRUSTED{"validator_list\n.trusted(signer_public)?"}
+    TRUSTED --> SUPPRESS{"hash_router\nseen before?"}
+    SUPPRESS -->|yes| DROP2["Duplicate"]
+    SUPPRESS -->|no| QUEUE["Queue for bootstrap loop"]
+    QUEUE --> HANDLE["Signature check + handle_new_validation\nconsensus/driver.rs:88-112\nrcl_validations.rs:347-414"]
+    HANDLE --> MARK{"get_trusted_key()\nreturns master_key?"}
+    MARK -->|yes| SET_TRUST["val.set_trusted()"]
+    SET_TRUST --> ADD
+    MARK -->|no| ADD["*** validations.add(node_id, val) ***\nrcl_support/validations.rs:550"]
+    ADD --> STATUS{"outcome?"}
+    STATUS -->|Current + trusted| CHECK_ACCEPT["check_accept(hash, seq)"]
+    STATUS -->|Current| RELAY["Relay to peers if appropriate"]
+    STATUS -->|Stale/BadSeq| LOG["Log and drop"]
+```
+
+### Validations::add → update_trie_validation
+
+```mermaid
+flowchart TD
+    ADD["add(node_id, val)\nvalidations.rs:550"] --> IS_CUR{"is_current?"}
+    IS_CUR -->|no| STALE["return Stale"]
+    IS_CUR -->|yes| LOCK["lock inner"]
+    LOCK --> SEQ["seq_enforcers.try_advance"]
+    SEQ --> OK{"advancing?"}
+    OK -->|no| BAD["return BadSeq/Conflicting/Multiple"]
+    OK -->|yes| BY_LEDGER["by_ledger.insert(ledger_id, node_id, val)"]
+    BY_LEDGER --> CUR{"current.get(node_id)?"}
+    CUR -->|None| NEW{"val.trusted()?"}
+    NEW -->|yes| UT_NEW["*** update_trie_validation(adaptor, node_id, val, None) ***\nvalidations.rs:611"]
+    NEW -->|no| INSERT["current.insert"]
+    CUR -->|Some old| NEWER{"val.sign_time > old.sign_time?"}
+    NEWER -->|no| STALE2["return Stale"]
+    NEWER -->|yes| REPLACE["old_key = (old.seq, old.id)\ncurrent.insert(node_id, val)"]
+    REPLACE --> TRUST{"val.trusted()?"}
+    TRUST -->|yes| UT_REPLACE["*** update_trie_validation(adaptor, node_id, val, Some(old_key)) ***\nvalidations.rs:618-620"]
+    TRUST -->|no| RET["return Current"]
+    UT_NEW --> RET
+    UT_REPLACE --> RET
+    INSERT --> RET
+```
+
+✅ Matches rippled Validations.h:591-669 exactly.
+
+### update_trie_validation → acquire Gate
+
+```mermaid
+flowchart TD
+    UT["update_trie_validation(adaptor, node_id, val, prior)\nvalidations.rs:443"] --> CLEAR{"prior is Some?"}
+    CLEAR -->|yes| RM["acquiring.remove(prior, node_id)\nif empty: remove key"]
+    CLEAR -->|no| CHECK
+    RM --> CHECK["*** check_acquired(adaptor) ***\nflush pending → trie"]
+    CHECK --> FLUSH["For each (seq,id) in acquiring:\nadaptor.acquire(id)\nif found → update_trie_ledger → remove"]
+    FLUSH --> KEY["val_key = (val.seq, val.ledger_id)"]
+    KEY --> EXISTS{"acquiring.contains(val_key)?"}
+    EXISTS -->|yes| ADD_NODE["acquiring[val_key].insert(node_id)\n(multiple validators waiting)"]
+    EXISTS -->|no| TRY["*** ledger = adaptor.acquire(val.ledger_id) ***\nrcl_validation.rs:262"]
+    TRY --> FOUND{"found?"}
+    FOUND -->|yes| INSERT_TRIE["*** update_trie_ledger(node_id, ledger) ***\nvalidations.rs:433\n→ trie.remove(old) + trie.insert(new)"]
+    FOUND -->|no| DEFER["acquiring[val_key].insert(node_id)\n→ trie NOT updated"]
+    DEFER --> ASYNC["Async: JtAdvance GetConsL2\nacquire_closed_ledger_async(hash, Consensus)"]
+```
+
+✅ Matches rippled Validations.h:405-443 exactly.
+
+### adaptor.acquire(): Three-Level Lookup
+
+```mermaid
+flowchart TD
+    ACQ["acquire(ledger_id)\nrcl_validation.rs:262"] --> LOCAL{"self.ledgers.lock()\n.get(ledger_id)?"}
+    LOCAL -->|found| WRAP["return Some(RclValidatedLedger)"]
+    LOCAL -->|miss| RUNTIME{"ledger_master_runtime\navailable?"}
+    RUNTIME -->|no| NONE["return None"]
+    RUNTIME -->|yes| HISTORY["ledger_history()\n.get_cached_ledger_by_hash(hash)"]
+    HISTORY --> HIST_FOUND{"found in\nTaggedCache?"}
+    HIST_FOUND -->|yes| WRAP2["return Some(RclValidatedLedger)"]
+    HIST_FOUND -->|no| ASYNC["Post JtAdvance GetConsL2:\nacquire_closed_ledger_async(hash, Consensus)"]
+    ASYNC --> NONE2["return None"]
+```
+
+**THE BUG:** Before commit `61cf458`, `record_consensus_built_ledger()` did NOT
+call `register_ledger()`. The local `self.ledgers` map was only populated by
+acquisition completions (via `ConsensusEvent::LedgerDone` or
+`network_ops_strand.rs` drain loops). Consensus-built ledgers went into
+`ledger_history` TaggedCache only, but under mainnet memory pressure (27 GB RSS,
+31.7M cache entries), the TaggedCache swept entries before `acquire()` checked
+them. Result: ALL `acquire()` calls returned None → all validations deferred to
+`acquiring_` → trie froze at the last acquisition-era seq.
+
+**THE FIX (commit 61cf458):** Added `self.validations().register_ledger(&ledger)`
+in `record_consensus_built_ledger()` so every consensus-built ledger is
+immediately in the local HashMap (never swept). Now `acquire()` always finds
+built ledgers on its first check.
+
+### get_preferred(): Trie → Preferred LCL
+
+```mermaid
+flowchart TD
+    GP["get_preferred(curr)\nvalidations.rs:722"] --> TRIE["trie.get_preferred(largest_seq)"]
+    TRIE --> HAVE{"preferred is Some?"}
+    HAVE -->|no| FALLBACK["acquiring map: max by count, tie-break by id"]
+    FALLBACK --> FB{"any entry?"}
+    FB -->|no| NONE["return None\n(outer: fall back to peer counts)"]
+    FB -->|yes| RET_ACQ["return Some(seq, id)"]
+    HAVE -->|yes| PARENT{"preferred.seq == curr.seq() + 1\nAND preferred.ancestor(curr.seq()) == curr.id()?"}
+    PARENT -->|yes| STAY["*** return Some((curr.seq, curr.id)) ***\n'we might be about to generate it'\nTHIS PREVENTS OSCILLATION"]
+    PARENT -->|no| AHEAD{"preferred.seq > curr.seq()?"}
+    AHEAD -->|yes| RET_AHEAD["return Some((preferred.seq, preferred.id))"]
+    AHEAD -->|no| DIFF{"curr[preferred.seq] != preferred.id?"}
+    DIFF -->|yes| RET_DIFF["return Some((preferred.seq, preferred.id))"]
+    DIFF -->|no| RET_CURR["return Some((curr.seq, curr.id))\n(same chain, stick)"]
+```
+
+✅ Matches rippled Validations.h:810-852 exactly.
+
+### Steady-State: Why a Caught-Up Node Stays at Full
+
+```
+1. Consensus builds ledger N:
+   record_consensus_built_ledger(N)
+   → register_ledger(N)          ← THE FIX
+   → ledger_history.insert(N)
+   → check_accept(N)
+
+2. Trusted validation for N arrives:
+   → add(nodeID, val_for_N)
+   → val.trusted() → update_trie_validation(adaptor, nodeID, val, prior)
+   → check_acquired (flush pending)
+   → acquire(N.hash) → self.ledgers.get(N) → FOUND! (from step 1)
+   → trie.insert(N) — TRIE ADVANCES TO N ✓
+
+3. get_prev_ledger in next round:
+   → get_preferred(curr=N)
+   → trie returns N+1 (next network tip)
+   → PARENT_CHECK: N+1.seq == N.seq+1 AND ancestor(N.seq)==N.id → TRUE
+   → return (N.seq, N.id) = our LCL
+   → preferred == LCL → NO consensusViewChange → STAYS FULL ✓
+```
+
+⚠️ **Before the fix:** Step 2's `acquire(N.hash)` missed because `self.ledgers`
+was empty for built ledgers and `ledger_history` had swept N under memory
+pressure. The trie froze, `get_preferred` returned a stale seq on a different
+chain (the old acquisition-era LCL), causing demotion every 25-second round.
+Note: demotion only occurs when preferred is on a DIFFERENT chain or strictly
+ahead without being our immediate child; same-chain earlier/same seq returns
+`curr` (validations.rs:752-757).
+
+---
+
 ## State Machine Diagram
 
 ```mermaid
