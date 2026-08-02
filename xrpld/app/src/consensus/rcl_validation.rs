@@ -201,6 +201,12 @@ pub struct RclValidationsAdaptor {
     ledger_master_runtime: parking_lot::Mutex<
         Option<Arc<crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime>>,
     >,
+    /// The application-owned cache/provider/closed-slot lookup path. This is
+    /// intentionally separate from `ledger_master_runtime`, whose purpose is
+    /// inbound acquisition after a durable exact-hash miss.
+    loaded_ledger_runtime: parking_lot::Mutex<
+        Option<Arc<crate::ledger::loaded_ledger_runtime::AppLoadedLedgerRuntime>>,
+    >,
     overlay: parking_lot::Mutex<Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>>,
     job_queue: parking_lot::Mutex<Option<Arc<JobQueue>>>,
 }
@@ -216,6 +222,7 @@ impl RclValidationsAdaptor {
             ledgers: parking_lot::Mutex::new(std::collections::HashMap::new()),
             now: Arc::new(now),
             ledger_master_runtime: parking_lot::Mutex::new(None),
+            loaded_ledger_runtime: parking_lot::Mutex::new(None),
             overlay: parking_lot::Mutex::new(None),
             job_queue: parking_lot::Mutex::new(None),
         }
@@ -236,6 +243,17 @@ impl RclValidationsAdaptor {
         runtime: Option<Arc<crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime>>,
     ) {
         *self.ledger_master_runtime.lock() = runtime;
+    }
+
+    /// Attach the application-owned exact-hash lookup path. In a configured
+    /// node it performs the same LedgerMaster lookup rippled's adaptor calls:
+    /// history cache, durable provider reload, then the current closed-ledger
+    /// slot.
+    pub fn set_loaded_ledger_runtime(
+        &self,
+        runtime: Option<Arc<crate::ledger::loaded_ledger_runtime::AppLoadedLedgerRuntime>>,
+    ) {
+        *self.loaded_ledger_runtime.lock() = runtime;
     }
 
     /// Attach (or detach) the overlay so `acquire` can resolve a ledger
@@ -264,45 +282,43 @@ impl consensus::rcl_support::ValidationsAdaptor for RclValidationsAdaptor {
             return Some(ledger);
         }
 
-        // Matches the reference's `RCLValidationsAdaptor::acquire`: a
-        // local-map miss falls back to the shared ledger history cache
-        // (populated by completed acquisitions/validated ledgers from
-        // anywhere in the app, not just this adaptor's own
-        // `register_ledger` calls), and if THAT also misses, actively
-        // dispatches a fetch (matching the reference's `GetConsL2` job
-        // calling `InboundLedgers::acquireAsync`) rather than silently
-        // giving up. This is the third of the reference's three
-        // redundant acquisition triggers (the other two being
+        // Matches the reference's `RCLValidationsAdaptor::acquire`: after the
+        // adaptor-local map misses, consult the application-owned
+        // LedgerMaster path (history cache -> durable provider reload ->
+        // current closed-ledger slot). Only a complete exact-hash miss dispatches
+        // `GetConsL2`/`InboundLedgers::acquireAsync`, rather than silently
+        // giving up. This is the third of the reference's three redundant
+        // acquisition triggers (the other two being
         // `Consensus::checkLedger`'s `acquireLedger` and `InboundLedger`'s
-        // own retry timer) -- `Validations::updateTrie` calls this
-        // adaptor method every time a new TRUSTED validation references a
-        // ledger not yet cached, so leaving this as a pure cache read
-        // (the bug this replaces) meant the trie could never actively
-        // pull in ledgers referenced only by validations, weakening
-        // fork-recovery specifically in the scenario where a node has
-        // fallen behind and peers are validating ledgers it has not
-        // acquired via any other path.
-        let Some(runtime) = self.ledger_master_runtime.lock().clone() else {
+        // own retry timer). `Validations::updateTrie` calls this adaptor
+        // method every time a new TRUSTED validation references a ledger not
+        // yet available, so a cache-only lookup left the trie unable to pull
+        // in persisted ledger ancestry after restart or cache eviction.
+        let runtime = { self.ledger_master_runtime.lock().clone() };
+        let Some(runtime) = runtime else {
             return None;
         };
 
         let hash = basics::sha_map_hash::SHAMapHash::new(*ledger_id);
-        if let Some(ledger) = runtime
-            .ledger_master()
-            .ledger_history()
-            .get_cached_ledger_by_hash(hash)
-        {
-            return Some(RclValidatedLedger::from_ledger(&ledger));
-        }
-
-        // Rippled's LedgerMaster::getLedgerByHash (LedgerMaster.cpp:1722-1724)
-        // also checks the actual closed-ledger slot as a fallback when the
-        // history cache misses. This handles the case where the ledger was
-        // swept from the TaggedCache but is still the node's current LCL.
-        if let Some(closed) = runtime.ledger_master().closed_ledger() {
-            if closed.header().hash.as_uint256() == ledger_id {
-                return Some(RclValidatedLedger::from_ledger(&closed));
+        let loaded_runtime = { self.loaded_ledger_runtime.lock().clone() };
+        if let Some(loaded_runtime) = loaded_runtime {
+            // Match rippled RCLValidationsAdaptor::acquire exactly: call the
+            // application LedgerMaster lookup before requesting an inbound
+            // ledger. AppLoadedLedgerRuntime performs cache -> provider/NuDB
+            // reload -> current closed slot and canonicalizes a provider hit in
+            // LedgerHistory. Do not hold an adaptor mutex during this I/O.
+            match loaded_runtime.get_history_ledger_by_hash(hash) {
+                Ok(Some(ledger)) => return Some(RclValidatedLedger::from_ledger(&ledger)),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(target: "consensus", %ledger_id, ?error,
+                        "provider-backed exact-hash ledger lookup failed before consensus acquisition");
+                }
             }
+        } else if let Some(ledger) = runtime.ledger_master().get_ledger_by_hash(hash) {
+            // Preserve the cache/closed-slot behavior for isolated users that
+            // have wired an inbound runtime but no application storage runtime.
+            return Some(RclValidatedLedger::from_ledger(&ledger));
         }
 
         let requested_hash = *ledger_id;
@@ -345,10 +361,61 @@ impl consensus::rcl::AsValidationKey<RclValidationsAdaptor> for Arc<STValidation
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ledger::Ledger as LedgerImpl;
+    use basics::basic_config::BasicConfig;
+    use basics::sha_map_hash::SHAMapHash;
+    use basics::tagged_cache::MonotonicClock;
+    use ledger::{Ledger as LedgerImpl, LedgerHeader, LedgerMasterConfig, calculate_ledger_hash};
+    use nodestore::{DummyScheduler, ManagerImp, NullJournal, Scheduler};
     use protocol::{
         KeyType, SecretKey, calc_node_id, derive_public_key, generate_secret_key, random_seed,
     };
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use xrpld_core::{DatabaseCon, LEDGER_DB_INIT};
+
+    fn memory_node_store() -> (TempDir, crate::SHAMapStoreNodeStore) {
+        let temp = TempDir::new().expect("tempdir");
+        let mut config = BasicConfig::new();
+        config.set_legacy("database_path", temp.path().join("sql").to_string_lossy());
+        let node_db = config.section_mut("node_db");
+        node_db.set("type", "Memory");
+        node_db.set("path", temp.path().join("node").to_string_lossy());
+
+        let bootstrap = crate::shamap::shamap_store_bootstrap::bootstrap_shamap_store(
+            &config,
+            false,
+            128,
+            1,
+            8,
+            64,
+            2,
+            &ManagerImp::new(),
+            Arc::new(DummyScheduler) as Arc<dyn Scheduler>,
+            Arc::new(NullJournal),
+        )
+        .expect("memory node store");
+        (temp, bootstrap.node_store)
+    }
+
+    fn insert_ledger_header(db: &DatabaseCon, header: LedgerHeader) {
+        db.get_session()
+            .execute(
+                "INSERT INTO Ledgers (LedgerHash, LedgerSeq, PrevHash, TotalCoins, ClosingTime, PrevClosingTime, CloseTimeRes, CloseFlags, AccountSetHash, TransSetHash) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    header.hash.as_uint256().to_string(),
+                    i64::from(header.seq),
+                    header.parent_hash.as_uint256().to_string(),
+                    i64::try_from(header.drops).expect("drops fit SQLite integer"),
+                    i64::from(header.close_time),
+                    i64::from(header.parent_close_time),
+                    i64::from(header.close_time_resolution),
+                    i64::from(header.close_flags),
+                    header.account_hash.as_uint256().to_string(),
+                    header.tx_hash.as_uint256().to_string(),
+                ],
+            )
+            .expect("ledger header insert");
+    }
 
     fn signed_validation(ledger_hash: Uint256, seq: u32, sign_time: u32) -> Arc<STValidation> {
         let seed = random_seed();
@@ -400,5 +467,123 @@ mod tests {
 
         let id = *ledger.header().hash.as_uint256();
         assert!(consensus::rcl_support::ValidationsAdaptor::acquire(&adaptor, &id).is_some());
+    }
+
+    #[test]
+    fn rcl_validations_adaptor_reloads_persisted_hash_after_local_and_cache_misses() {
+        let (temp, node_store) = memory_node_store();
+        let ledger_db = Arc::new(
+            DatabaseCon::new_at_path(temp.path(), "ledger.db", &[], LEDGER_DB_INIT)
+                .expect("ledger db"),
+        );
+        let relational = Arc::new(crate::SqliteSHAMapStoreRelational::new(
+            Arc::clone(&ledger_db),
+            None,
+            false,
+            100,
+            Duration::from_secs(0),
+        ));
+
+        // Empty state and transaction roots require no fetched SHAMap node,
+        // so this header can be loaded exclusively from the persisted ledger
+        // table while the cache, closed slot, and adaptor map all remain empty.
+        let header = LedgerHeader {
+            seq: 777,
+            drops: 1_000_000,
+            parent_hash: SHAMapHash::new(Uint256::from_u64(776)),
+            close_time: 1_777,
+            parent_close_time: 1_767,
+            close_time_resolution: 10,
+            close_flags: 0,
+            ..LedgerHeader::default()
+        };
+        let header = LedgerHeader {
+            hash: calculate_ledger_hash(&header),
+            ..header
+        };
+        insert_ledger_header(&ledger_db, header);
+
+        let mut root = crate::ApplicationRoot::new(0).expect("application root");
+        let ledger_master = Arc::new(crate::AppLedgerMaster::new(
+            MonotonicClock::default(),
+            LedgerMasterConfig::default(),
+        ));
+        let master_runtime = Arc::new(crate::AppLedgerMasterRuntime::with_ledger_master(
+            Arc::clone(&ledger_master),
+        ));
+        let _ = root.attach_ledger_master_runtime(Arc::clone(&master_runtime));
+        // The real LCL lives in ApplicationRoot's shared ledger-master state,
+        // not in the wrapped AppLedgerMaster slot. Give it the same hash as
+        // the persisted header: successful lookup must still populate history,
+        // proving provider reload happens before the closed-slot fallback.
+        root.on_closed_ledger(Arc::new(LedgerImpl::from_header_hashes(header)));
+        let lookup_runtime = Arc::new(
+            crate::AppLoadedLedgerRuntime::with_sources_and_ledger_master_state(
+                Arc::clone(&ledger_master),
+                Some(relational),
+                Some(node_store),
+                Some(root.ledger_master_state()),
+            ),
+        );
+        let adaptor = RclValidationsAdaptor::new(|| NetClockTimePoint::new(1000));
+        adaptor.set_ledger_master_runtime(Some(master_runtime));
+        adaptor.set_loaded_ledger_runtime(Some(lookup_runtime));
+
+        assert!(ledger_master.get_ledger_by_hash(header.hash).is_none());
+        assert!(
+            ledger_master
+                .ledger_history()
+                .get_cached_ledger_by_hash(header.hash)
+                .is_none()
+        );
+        let loaded =
+            consensus::rcl_support::ValidationsAdaptor::acquire(&adaptor, header.hash.as_uint256())
+                .expect("provider-backed exact-hash lookup must resolve the persisted ledger");
+
+        assert_eq!(loaded.ledger_id, *header.hash.as_uint256());
+        assert_eq!(loaded.ledger_seq, header.seq);
+        assert!(
+            ledger_master
+                .ledger_history()
+                .get_cached_ledger_by_hash(header.hash)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rcl_validations_adaptor_uses_application_roots_current_closed_ledger_on_durable_miss() {
+        let mut root = crate::ApplicationRoot::new(0).expect("application root");
+        let ledger_master = Arc::new(crate::AppLedgerMaster::new(
+            MonotonicClock::default(),
+            LedgerMasterConfig::default(),
+        ));
+        let master_runtime = Arc::new(crate::AppLedgerMasterRuntime::with_ledger_master(
+            Arc::clone(&ledger_master),
+        ));
+        let _ = root.attach_ledger_master_runtime(Arc::clone(&master_runtime));
+
+        let closed = Arc::new(LedgerImpl::from_ledger_seq_and_close_time(
+            778, 1_778, false,
+        ));
+        let closed_hash = closed.header().hash;
+        root.on_closed_ledger(closed);
+        assert!(ledger_master.get_ledger_by_hash(closed_hash).is_none());
+
+        let adaptor = RclValidationsAdaptor::new(|| NetClockTimePoint::new(1000));
+        adaptor.set_ledger_master_runtime(Some(master_runtime));
+        adaptor.set_loaded_ledger_runtime(Some(Arc::new(
+            crate::AppLoadedLedgerRuntime::with_sources_and_ledger_master_state(
+                Arc::clone(&ledger_master),
+                None,
+                None,
+                Some(root.ledger_master_state()),
+            ),
+        )));
+
+        let loaded =
+            consensus::rcl_support::ValidationsAdaptor::acquire(&adaptor, closed_hash.as_uint256())
+                .expect("current ApplicationRoot closed ledger must be a lookup fallback");
+        assert_eq!(loaded.ledger_id, *closed_hash.as_uint256());
+        assert_eq!(loaded.ledger_seq, 778);
     }
 }

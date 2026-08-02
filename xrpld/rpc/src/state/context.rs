@@ -16,9 +16,8 @@ use basics::tagged_cache::MonotonicClock;
 use ledger::{
     AccountStateSF, FetchPackCache, FetchPackContainer, InboundLedgerDataType, InboundLedgerLocal,
     InboundLedgerNodeData, InboundLedgerObjectType, InboundLedgerPacket, InboundLedgerPlannerState,
-    InboundLedgerReason, InboundLedgerStore, LedgerConfig, LedgerPersistence,
-    LedgerSyncFilterStore, LedgerTxReadError, TransactionStateSF,
-    make_inbound_needed_by_hash_request,
+    InboundLedgerReason, InboundLedgerStore, LedgerConfig, LedgerSyncFilterStore,
+    LedgerTxReadError, TransactionStateSF, make_inbound_needed_by_hash_request,
 };
 use nodestore::{FetchType, NodeObjectType as NodeStoreObjectType};
 use overlay::{
@@ -2605,41 +2604,16 @@ impl RpcRuntime for ApplicationRoot {
             );
         };
 
-        let persistence = LedgerPersistence::new(Arc::new(self.build_ledger_persistence_runtime()));
-        let is_current = self
-            .validated_ledger_seq()
-            .is_none_or(|validated| acquired_ledger.header().seq >= validated);
-
-        if ledger_master_runtime
+        // Match rippled doLedgerRequest -> getOrAcquireLedger: acquiring a
+        // ledger for an RPC response must not change the node's closed,
+        // validated, or published ledger. Cache it by exact hash only; LCL
+        // installation remains exclusively in the consensus/endConsensus and
+        // checkAccept flows.
+        ledger_master_runtime
             .ledger_master()
-            .set_full_ledger(
-                &persistence,
-                Arc::clone(&acquired_ledger),
-                true,
-                is_current,
-                None,
-                None,
-            )
-            .is_err()
-        {
-            return Status::new(RpcErrorCode::Internal);
-        }
-
-        if is_current {
-            self.on_closed_ledger(Arc::clone(&acquired_ledger));
-            self.on_published_ledger(Arc::clone(&acquired_ledger));
-            let _ = self.on_validated_ledger(Arc::clone(&acquired_ledger));
-            self.set_status_rpc_current_ledger_index(Some(
-                acquired_ledger.header().seq.saturating_add(1),
-            ));
-            self.set_need_network_ledger(false);
-            if matches!(
-                self.network_ops_operating_mode(),
-                NetworkOpsOperatingMode::Disconnected | NetworkOpsOperatingMode::Connected
-            ) {
-                let _ = self.set_network_ops_operating_mode(NetworkOpsOperatingMode::Tracking);
-            }
-        }
+            .ledger_history()
+            .insert(Arc::clone(&acquired_ledger), false);
+        self.validations().register_ledger(acquired_ledger.as_ref());
 
         Status::OK
     }
@@ -2664,41 +2638,16 @@ impl RpcRuntime for ApplicationRoot {
             );
         };
 
-        let persistence = LedgerPersistence::new(Arc::new(self.build_ledger_persistence_runtime()));
-        let is_current = self
-            .validated_ledger_seq()
-            .is_none_or(|validated| acquired_ledger.header().seq >= validated);
-
-        if ledger_master_runtime
+        // Match rippled doLedgerRequest -> getOrAcquireLedger: acquiring a
+        // ledger for an RPC response must not change the node's closed,
+        // validated, or published ledger. Cache it by exact hash only; LCL
+        // installation remains exclusively in the consensus/endConsensus and
+        // checkAccept flows.
+        ledger_master_runtime
             .ledger_master()
-            .set_full_ledger(
-                &persistence,
-                Arc::clone(&acquired_ledger),
-                true,
-                is_current,
-                None,
-                None,
-            )
-            .is_err()
-        {
-            return Status::new(RpcErrorCode::Internal);
-        }
-
-        if is_current {
-            self.on_closed_ledger(Arc::clone(&acquired_ledger));
-            self.on_published_ledger(Arc::clone(&acquired_ledger));
-            let _ = self.on_validated_ledger(Arc::clone(&acquired_ledger));
-            self.set_status_rpc_current_ledger_index(Some(
-                acquired_ledger.header().seq.saturating_add(1),
-            ));
-            self.set_need_network_ledger(false);
-            if matches!(
-                self.network_ops_operating_mode(),
-                NetworkOpsOperatingMode::Disconnected | NetworkOpsOperatingMode::Connected
-            ) {
-                let _ = self.set_network_ops_operating_mode(NetworkOpsOperatingMode::Tracking);
-            }
-        }
+            .ledger_history()
+            .insert(Arc::clone(&acquired_ledger), false);
+        self.validations().register_ledger(acquired_ledger.as_ref());
 
         Status::OK
     }

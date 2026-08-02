@@ -313,6 +313,21 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
         previous
     }
 
+    /// Provide the application-owned cache/provider/current-closed-LCL
+    /// exact-hash lookup path to the validation adaptor. This is wired independently of
+    /// inbound acquisition because it must complete before `GetConsL2` is
+    /// scheduled, matching rippled's `LedgerMaster::getLedgerByHash` call.
+    pub fn set_loaded_ledger_runtime(
+        &self,
+        runtime: Option<Arc<crate::ledger::loaded_ledger_runtime::AppLoadedLedgerRuntime>>,
+    ) {
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .adaptor()
+            .set_loaded_ledger_runtime(runtime);
+    }
+
     /// Provide the overlay to the inner validation adaptor so it can resolve
     /// ledger sequence numbers from peers when the local cache misses.
     pub fn set_overlay(&self, overlay: Option<Arc<overlay::runtime::overlay_impl::OverlayImpl>>) {

@@ -208,6 +208,10 @@ impl ConsensusJobScheduler {
         }
     }
 
+    /// True while accepted work has been captured (schedule_accept) but the
+    /// JtAccept job has not yet handed it back to the strand as a command.
+    /// This is the async window between scheduling and execution that
+    /// reconciliation/StartRound must not race ahead of.
     fn has_pending_accept(&self) -> bool {
         self.pending_accept
             .lock()
@@ -457,6 +461,8 @@ fn strand_loop(
                     let _lcl_transition_guard = root.lcl_transition_gate().lock();
                     let local_prev_id = prev_ledger.id();
                     if runner.phase() != ConsensusPhase::Accepted
+                        || scheduler.accept_is_queued()
+                        || scheduler.has_pending_accept()
                         || network_closed != local_prev_id
                         || root.closed_ledger().is_none_or(|current| {
                             *current.header().hash.as_uint256() != local_prev_id
@@ -466,6 +472,8 @@ fn strand_loop(
                             target: "consensus",
                             %local_prev_id,
                             %network_closed,
+                            accept_is_queued = scheduler.accept_is_queued(),
+                            has_pending_accept = scheduler.has_pending_accept(),
                             "discarded stale or recovery-conflicting external start-round command"
                         );
                         continue;
@@ -701,13 +709,11 @@ fn strand_loop(
         // Capture the phase before reconciliation can begin a WrongLedger or
         // replacement round. This is the sole endConsensus cadence token for
         // peer-status cycling, mode promotion, and the ordinary next round.
-        let end_consensus_pass = should_reconcile_preferred_lcl(runner.phase());
-        // Rippled guarantees doAccept() runs BEFORE endConsensus/checkLastClosedLedger
-        // (RCLConsensus.cpp:438-450). Don't run reconciliation while accept work
-        // is still pending — it would restart the round before the accepted ledger
-        // is built, discarding locally-built progress.
-        let end_consensus_pass =
-            end_consensus_pass && !scheduler.accept_is_queued() && !scheduler.has_pending_accept();
+        let end_consensus_pass = should_run_end_consensus_reconciliation(
+            runner.phase(),
+            scheduler.accept_is_queued(),
+            scheduler.has_pending_accept(),
+        );
         if end_consensus_pass {
             // endConsensus invalidates obsolete peer status before evaluating
             // the preferred LCL, whether or not this pass later performs a jump.
@@ -717,14 +723,18 @@ fn strand_loop(
         // All inbound sources above persist first. A completed ledger is
         // immediately cache history; generic WrongLedger recovery may consume
         // it regardless of later preferred-LCL observations.
-        let reconciliation = reconcile_preferred_lcl(
-            &root,
-            &shared_inbound,
-            &mut runner,
-            &consensus_rt,
-            &mut last_round_ledger_id,
-            &mut lcl_audit_sampler,
-        );
+        let reconciliation = if end_consensus_pass {
+            reconcile_preferred_lcl(
+                &root,
+                &shared_inbound,
+                &mut runner,
+                &consensus_rt,
+                &mut last_round_ledger_id,
+                &mut lcl_audit_sampler,
+            )
+        } else {
+            PreferredLclReconciliation::NoChange
+        };
 
         // `checkAccept`/publication/history do not select, acquire, install,
         // or clear recovery intent. Mode advancement is the sole exception:
@@ -814,6 +824,18 @@ fn should_reconcile_preferred_lcl(phase: ConsensusPhase) -> bool {
     phase == ConsensusPhase::Accepted
 }
 
+/// Rippled's endConsensus exists only after doAccept returns. Quaxar's
+/// JtAccept-to-strand handoff has an async window between `schedule_accept`
+/// and the command reaching the strand; suppress the equivalent pass while
+/// accepted work is in that window (queued or awaiting queue capacity).
+fn should_run_end_consensus_reconciliation(
+    phase: ConsensusPhase,
+    accept_is_queued: bool,
+    has_pending_accept: bool,
+) -> bool {
+    should_reconcile_preferred_lcl(phase) && !accept_is_queued && !has_pending_accept
+}
+
 /// Rippled advances from CONNECTED/SYNCING to TRACKING/FULL in endConsensus
 /// only if checkLastClosedLedger did not report an abnormal ledger change.
 fn should_promote_operating_mode_at_end_consensus(
@@ -840,6 +862,7 @@ fn reconcile_preferred_lcl(
         return PreferredLclReconciliation::NoChange;
     }
 
+    let _lcl_transition_guard = root.lcl_transition_gate().lock();
     let Some(lm_rt) = root.ledger_master_runtime() else {
         return PreferredLclReconciliation::NoChange;
     };
@@ -848,7 +871,6 @@ fn reconcile_preferred_lcl(
         return PreferredLclReconciliation::NoChange;
     };
 
-    let _lcl_transition_guard = root.lcl_transition_gate().lock();
     let our_hash = *our_closed.header().hash.as_uint256();
     let parent_hash = *our_closed.header().parent_hash.as_uint256();
     // NOTE: Rippled's checkLastClosedLedger (NetworkOPs.cpp:1902-2005) has NO
@@ -1407,7 +1429,7 @@ fn persist_completed_inbound_ledger(
             let normalized_seq = normalized.header().seq;
             let was_complete = lm.have_ledger(normalized_seq);
             let persistence =
-                ledger::LedgerPersistence::new(Arc::new(root.build_ledger_persistence_runtime()));
+                ledger::LedgerPersistence::new(root.build_ledger_persistence_runtime());
             match lm.set_full_ledger(
                 &persistence,
                 Arc::clone(&normalized),
@@ -1592,7 +1614,7 @@ mod tests {
         ConsensusJobScheduler, MAX_LEDGER_COMPLETIONS_PER_TURN, MAX_PROPOSALS_PER_TURN,
         PreferredLclReconciliation, drain_bounded, persist_completed_inbound_ledger,
         record_completed_inbound_ledger, should_promote_operating_mode_at_end_consensus,
-        should_reconcile_preferred_lcl,
+        should_reconcile_preferred_lcl, should_run_end_consensus_reconciliation,
     };
     use crate::ApplicationRoot;
     use crate::consensus::rcl_consensus::PendingAcceptWork;
@@ -1652,6 +1674,21 @@ mod tests {
         assert!(!should_reconcile_preferred_lcl(ConsensusPhase::Open));
         assert!(!should_reconcile_preferred_lcl(ConsensusPhase::Establish));
         assert!(should_reconcile_preferred_lcl(ConsensusPhase::Accepted));
+        assert!(!should_run_end_consensus_reconciliation(
+            ConsensusPhase::Accepted,
+            true,
+            false
+        ));
+        assert!(!should_run_end_consensus_reconciliation(
+            ConsensusPhase::Accepted,
+            false,
+            true
+        ));
+        assert!(should_run_end_consensus_reconciliation(
+            ConsensusPhase::Accepted,
+            false,
+            false
+        ));
     }
 
     #[test]

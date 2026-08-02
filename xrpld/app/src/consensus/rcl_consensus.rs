@@ -1224,7 +1224,7 @@ impl AppConsensus {
             work.close_resolution,
             work.correct_close_time,
             work.base_fee_drops,
-            work.txns,
+            work.txns.clone(),
         ) {
             Ok(outcome) => {
                 // Carry the exact child that atomically replaced the captured
@@ -1381,16 +1381,37 @@ impl AppConsensus {
             }
             Err(err) => {
                 tracing::error!(target: "consensus", closed_seq, %err, "synchronous accept: accept_ledger_with_txns failed");
-                if err.starts_with("stale consensus parent")
-                    && self.restart_stale_accept_on_current_lcl(now, work.parent_ledger.as_ref())
-                {
+                if self.restart_stale_accept_on_current_lcl(now, work.parent_ledger.as_ref()) {
                     return;
                 }
-                // Do not independently restart or choose an LCL here.
-                // The strand owns both recovery target identity and the
-                // Accepted -> next-round transition, including the
-                // WrongLedger path for a missing preferred target.
-                root.notify_consensus_event();
+                // The captured parent is still current, yet the build itself
+                // failed (e.g. a storage/traversal error). Rippled's doAccept
+                // has no failure path to mirror here (buildLCL is
+                // unconditional), so there is no equivalent retry semantics
+                // to match. Treat this the same as a stale-parent recovery:
+                // restart consensus on the current LCL rather than leaving
+                // the round permanently Accepted with no forward progress.
+                let current_lcl = root.closed_ledger();
+                if let Some(current_lcl) = current_lcl {
+                    let current_hash = *current_lcl.header().hash.as_uint256();
+                    root.process_closed_ledger_txq(current_lcl.as_ref(), true);
+                    root.rebuild_open_ledger_after_consensus(
+                        current_lcl.header().seq.saturating_add(1),
+                        current_lcl.fees().base,
+                        current_hash,
+                    );
+                    if let Some(inbound_tx) = root.inbound_transactions().lock().ok().as_mut() {
+                        inbound_tx.new_round(current_lcl.header().seq);
+                    }
+                    let proposing = self.adaptor.is_validator()
+                        && !self.adaptor.options.standalone
+                        && self.adaptor.network_ops_mode_owner.operating_mode()
+                            == crate::network::network_ops::NetworkOpsOperatingMode::Full;
+                    let prev_cx = crate::consensus_ledger_from_ledger(&current_lcl);
+                    self.start_round(now, current_hash, prev_cx, proposing);
+                    tracing::warn!(target: "consensus", closed_seq,
+                        "restarted consensus on current LCL after unrecoverable accept build failure");
+                }
             }
         }
     }
