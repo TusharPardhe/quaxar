@@ -1659,6 +1659,45 @@ fn application_root_can_own_ledger_master_runtime_local_and_held_tx_paths() {
 }
 
 #[test]
+fn application_root_shares_one_persistence_runtime_with_real_dedup_state_across_calls() {
+    use ledger::LedgerPersistenceRuntime;
+
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let first = app.build_ledger_persistence_runtime();
+    let second = app.build_ledger_persistence_runtime();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "build_ledger_persistence_runtime must return the same shared instance, \
+         not a fresh throwaway one, so mark_saved/pending dedup state is real \
+         across calls (matching rippled's long-lived HashRouter/PendingSaves)"
+    );
+
+    let hash = SHAMapHash::new(Uint256::from_u64(42));
+    assert!(
+        first.mark_saved(hash),
+        "first mark_saved for a fresh hash should succeed"
+    );
+    assert!(
+        !second.mark_saved(hash),
+        "mark_saved for the same hash through a second handle must observe \
+         the first call's dedup state -- proving the runtime is truly shared"
+    );
+}
+
+#[test]
+fn application_root_refreshes_persistence_runtime_in_place_on_storage_attach() {
+    let mut app = ApplicationRoot::new(0).expect("root shell should build");
+    let before = app.build_ledger_persistence_runtime();
+    app.attach_node_store(None);
+    let after = app.build_ledger_persistence_runtime();
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "attaching storage must rebuild the shared persistence runtime so its \
+         relational/node-store targets are current"
+    );
+}
+
+#[test]
 fn application_root_can_own_network_ops_runtime_and_bridge_held_tx_queue() {
     let mut app = ApplicationRoot::new(0).expect("root shell should build");
     let runtime = app.attach_default_network_ops_runtime();

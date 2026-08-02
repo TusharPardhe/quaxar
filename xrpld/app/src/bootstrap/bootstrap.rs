@@ -2989,8 +2989,7 @@ fn hydrate_loaded_ledger(
     ledger: Arc<Ledger>,
     ledger_master: Arc<crate::AppLedgerMaster>,
 ) -> Result<(), String> {
-    let persistence =
-        ledger::LedgerPersistence::new(Arc::new(root.build_ledger_persistence_runtime()));
+    let persistence = ledger::LedgerPersistence::new(root.build_ledger_persistence_runtime());
     let ledger = root.ledger_with_node_fetcher(ledger);
     ledger_master.set_closed_ledger(Arc::clone(&ledger));
     ledger_master

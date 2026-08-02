@@ -187,6 +187,13 @@ pub struct ApplicationRoot {
     registry: ApplicationRegistryOwners,
     basic_app: Arc<BasicApp>,
     job_queue: Arc<JobQueue>,
+    /// Shared, persistent ledger persistence runtime -- constructed once so
+    /// its hash-router-style dedup (`saved_hashes`) and pending-save gating
+    /// (`pending`) are real bookkeeping across calls, matching the
+    /// reference's long-lived `HashRouter`/`PendingSaves` members on
+    /// `Application`. Rebuilt (state reset) only when storage targets
+    /// change, which happens once at startup, not on the hot path.
+    ledger_persistence_runtime: Arc<std::sync::RwLock<Arc<crate::AppLedgerPersistenceRuntime>>>,
     time_keeper: Arc<TimeKeeper<SystemTimeKeeperClock>>,
     /// Built-in SNTP client for environments where host NTP cannot be
     /// configured (LXC, Docker, managed VPS).  `None` when not initialised.
@@ -2740,9 +2747,22 @@ impl ApplicationRoot {
             .lock()
             .expect("network_ops_state_sink mutex poisoned") = Some(Arc::clone(&network_ops_state));
 
+        let transaction_master = Arc::new(TransactionMaster::new());
+        let shared_job_queue = Arc::new(job_queue.clone());
+
         let app_root = Ok(Self {
             basic_app: Arc::new(BasicApp::new(io_threads)?),
-            job_queue: Arc::new(job_queue.clone()),
+            job_queue: Arc::clone(&shared_job_queue),
+            ledger_persistence_runtime: Arc::new(std::sync::RwLock::new(Arc::new(
+                crate::AppLedgerPersistenceRuntime::with_job_queue(
+                    None,
+                    None,
+                    Arc::clone(&transaction_master),
+                    0,
+                    None,
+                    Some(Arc::clone(&shared_job_queue)),
+                ),
+            ))),
             time_keeper: Arc::clone(&time_keeper),
             sntp_client: None,
             stop_tree: Arc::new(StopTree::new("application")),
@@ -2768,7 +2788,7 @@ impl ApplicationRoot {
             ledger_master_runtime: None,
             consensus_runtime: None,
             ledger_master_state,
-            transaction_master: Arc::new(TransactionMaster::new()),
+            transaction_master: Arc::clone(&transaction_master),
             validations,
             validators,
             status_rpc_state: Arc::new(StatusRpcState::new()),
@@ -3586,7 +3606,10 @@ impl ApplicationRoot {
                 *guard = Some(ns.clone());
             }
         }
-        std::mem::replace(&mut self.registry.node_store, node_store)
+        let previous = std::mem::replace(&mut self.registry.node_store, node_store);
+        self.refresh_validation_ledger_lookup_runtime();
+        self.refresh_ledger_persistence_runtime();
+        previous
     }
 
     pub fn relational_database(
@@ -3601,14 +3624,20 @@ impl ApplicationRoot {
             Arc<crate::shamap::shamap_store_relational::SqliteSHAMapStoreRelational>,
         >,
     ) -> Option<Arc<crate::shamap::shamap_store_relational::SqliteSHAMapStoreRelational>> {
-        std::mem::replace(&mut self.registry.relational_database, relational_database)
+        let previous =
+            std::mem::replace(&mut self.registry.relational_database, relational_database);
+        self.refresh_validation_ledger_lookup_runtime();
+        self.refresh_ledger_persistence_runtime();
+        previous
     }
 
     pub fn attach_ledger_db(
         &mut self,
         ledger_db: Option<std::sync::Arc<rdb::LedgerDb>>,
     ) -> Option<std::sync::Arc<rdb::LedgerDb>> {
-        std::mem::replace(&mut self.registry.ledger_db, ledger_db)
+        let previous = std::mem::replace(&mut self.registry.ledger_db, ledger_db);
+        self.refresh_ledger_persistence_runtime();
+        previous
     }
 
     /// Return a reference to the ledger header database, if open.
@@ -3616,13 +3645,27 @@ impl ApplicationRoot {
         self.registry.ledger_db.as_ref()
     }
 
-    pub fn build_ledger_persistence_runtime(&self) -> crate::AppLedgerPersistenceRuntime {
-        crate::AppLedgerPersistenceRuntime::new(
+    fn refresh_ledger_persistence_runtime(&self) {
+        let runtime = Arc::new(crate::AppLedgerPersistenceRuntime::with_job_queue(
             self.registry.relational_database.clone(),
             self.registry.node_store.clone(),
             Arc::clone(&self.transaction_master),
             self.registry.network_id_service.get_network_id(),
             self.registry.ledger_db.clone(),
+            Some(Arc::clone(&self.job_queue)),
+        ));
+        *self
+            .ledger_persistence_runtime
+            .write()
+            .expect("ledger persistence runtime lock must not be poisoned") = runtime;
+    }
+
+    pub fn build_ledger_persistence_runtime(&self) -> Arc<crate::AppLedgerPersistenceRuntime> {
+        Arc::clone(
+            &self
+                .ledger_persistence_runtime
+                .read()
+                .expect("ledger persistence runtime lock must not be poisoned"),
         )
     }
 
@@ -3994,6 +4037,20 @@ impl ApplicationRoot {
         &self.validations
     }
 
+    fn refresh_validation_ledger_lookup_runtime(&self) {
+        let lookup_runtime = self.ledger_master_runtime().map(|runtime| {
+            Arc::new(
+                crate::ledger::loaded_ledger_runtime::AppLoadedLedgerRuntime::with_sources_and_ledger_master_state(
+                    runtime.ledger_master(),
+                    self.relational_database().clone(),
+                    self.node_store().clone(),
+                    Some(Arc::clone(&self.ledger_master_state)),
+                ),
+            )
+        });
+        self.validations.set_loaded_ledger_runtime(lookup_runtime);
+    }
+
     pub fn attach_ledger_master_runtime(
         &mut self,
         ledger_master_runtime: Arc<AppLedgerMasterRuntime>,
@@ -4005,7 +4062,9 @@ impl ApplicationRoot {
         let _ = self
             .validations
             .set_ledger_master_runtime(Some(Arc::clone(&ledger_master_runtime)));
-        self.ledger_master_runtime.replace(ledger_master_runtime)
+        let previous = self.ledger_master_runtime.replace(ledger_master_runtime);
+        self.refresh_validation_ledger_lookup_runtime();
+        previous
     }
 
     pub fn attach_default_ledger_master_runtime(&mut self) -> Arc<AppLedgerMasterRuntime> {
@@ -5972,23 +6031,6 @@ impl ApplicationRoot {
         l.set_full();
         let validated = Arc::new(l);
 
-        // A successful quorum check is necessary but not sufficient for a
-        // rippled (LedgerMaster.cpp:973-984) marks the ledger validated/full
-        // and sets validated state immediately, then schedules persistence
-        // asynchronously. Failed saving is handled later by failedSave.
-        // Do not block visible promotion on persistence acknowledgement.
-        use ledger::LedgerPersistenceRuntime;
-        let persistence_rt = self.build_ledger_persistence_runtime();
-        if !persistence_rt.save_validated_ledger(Arc::clone(&validated), true) {
-            tracing::warn!(
-                target: "ledger",
-                seq = validated.header().seq,
-                hash = %validated.header().hash,
-                "failed to persist validated ledger (will retry on next advance)"
-            );
-            // Continue with visible promotion regardless — matching rippled
-        }
-
         lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
         // `setFullLedger` in rippled indexes validated ledgers in
         // LedgerHistory. The history scheduler needs this by-sequence entry
@@ -6003,9 +6045,24 @@ impl ApplicationRoot {
         lm.mark_ledger_complete(validated.header().seq);
         self.note_validated_ledger_for_sync(Arc::clone(&validated));
 
-        // Persistence completed above, before this ledger became visible as
-        // validated. The remaining work updates in-memory indexes and runtime
-        // mirrors only.
+        // Matches rippled's `LedgerMaster::checkAccept`: visibility is
+        // promoted first (above: `setValidLedger` equivalent), then
+        // persistence is dispatched via `pendSaveValidated(app_, ledger,
+        // true, true)` (LedgerMaster.cpp:976). `is_synchronous=true` here
+        // matches that call exactly -- rippled's `pendSaveValidated` still
+        // prefers `should_work`/dedup short-circuits over inline execution,
+        // and never gates visibility on the save regardless of the flag.
+        let persistence_rt = self.build_ledger_persistence_runtime();
+        ledger::LedgerPersistence::new(persistence_rt).pend_save_validated(
+            Arc::clone(&validated),
+            true,
+            true,
+        );
+
+        // Persistence is dispatched above, after this ledger became visible
+        // as validated (matching rippled's setValidLedger-then-
+        // pendSaveValidated ordering). The remaining work updates in-memory
+        // indexes and runtime mirrors only.
 
         // Rippled parity: after promoting a validated ledger, update the fee
         // tracker with the ledger's base fee so the fee escalation algorithm
@@ -6244,9 +6301,14 @@ impl ApplicationRoot {
                 }
             }
             self.promote_operating_mode_after_accepted_ledger(closed.as_ref());
-            use ledger::LedgerPersistenceRuntime;
-            self.build_ledger_persistence_runtime()
-                .save_validated_ledger(Arc::clone(&closed), true);
+            // Visibility (on_closed_ledger/on_validated_ledger above) already
+            // promoted before persistence dispatch. `is_current=true` matches
+            // the visibility layer above: `on_validated_ledger` unconditionally
+            // inserts into ledger_history with `validated=true` (see its own
+            // comment on `--start` mode reachability), so this call must agree
+            // with that already-established "current" status.
+            ledger::LedgerPersistence::new(self.build_ledger_persistence_runtime())
+                .pend_save_validated(Arc::clone(&closed), true, true);
             let next_open_index = closed_seq.saturating_add(1);
             self.clear_open_ledger_account_seqs();
             self.rebuild_open_ledger_after_close(
@@ -6344,17 +6406,19 @@ impl ApplicationRoot {
         // next open ledger causing duplicate application on subsequent accepts.
         let _ = self.update_local_tx(closed.as_ref());
 
-        use ledger::LedgerPersistenceRuntime;
-        {
-            let rt = crate::AppLedgerPersistenceRuntime::new(
-                self.registry.relational_database.clone(),
-                None,
-                Arc::clone(&self.transaction_master),
-                self.registry.network_id_service.get_network_id(),
-                self.registry.ledger_db.clone(),
-            );
-            let saved = rt.save_validated_ledger(Arc::clone(&closed), true);
-        }
+        // Visibility (on_closed_ledger/on_validated_ledger above) already
+        // promoted before persistence dispatch, matching rippled's
+        // setValidLedger-before-pendSaveValidated ordering. `is_current=true`
+        // matches the visibility layer above: `on_validated_ledger`
+        // unconditionally inserts with `validated=true` (see its own comment
+        // on why `--start` mode reachability requires this), so this call
+        // must agree with that already-established "current" status rather
+        // than diverge from it -- unlike rippled, where a single `isCurrent`
+        // parameter drives both the history insert and this dispatch
+        // together (LedgerMaster.cpp:828-841), Quaxar's `on_validated_ledger`
+        // always inserts as current regardless of caller context.
+        ledger::LedgerPersistence::new(self.build_ledger_persistence_runtime())
+            .pend_save_validated(Arc::clone(&closed), true, true);
 
         let next_open_index = closed_seq.saturating_add(1);
         self.clear_open_ledger_account_seqs();
@@ -6872,9 +6936,17 @@ impl ApplicationRoot {
         // promotion path (`check_accept_ledger`) persists the authoritative
         // network ledger after quorum instead.
         if self.standalone() {
-            use ledger::LedgerPersistenceRuntime;
-            self.build_ledger_persistence_runtime()
-                .save_validated_ledger(Arc::clone(&closed), true);
+            // Visibility (on_closed_ledger above) already promoted before
+            // persistence dispatch here. `is_current=false` matches this
+            // path's actual visibility state: unlike the accept_standalone_
+            // ledger call site, this function never calls on_validated_ledger
+            // -- record_consensus_built_ledger (called earlier by this same
+            // build) inserts into ledger_history with `validated=false`
+            // (pre-validation insert), matching rippled's storeLedger
+            // pattern. Passing `is_current=true` here would misrepresent
+            // this ledger as already validated when it is not.
+            ledger::LedgerPersistence::new(self.build_ledger_persistence_runtime())
+                .pend_save_validated(Arc::clone(&closed), true, false);
         }
 
         let next_open_index = closed_seq.saturating_add(1);
