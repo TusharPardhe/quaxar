@@ -8,6 +8,7 @@ use basics::basic_config::Section;
 use dashmap::DashMap;
 use rayon::prelude::*;
 use std::any::Any;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -47,14 +48,40 @@ const NUDB_SPILL_RECORD_HEADER_SIZE: usize = 8;
 const NUDB_U48_MAX: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 #[cfg(test)]
-static NUDB_TEST_CRASH_AFTER_PRIMARY_BUCKET: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
-static NUDB_TEST_CRASH_AFTER_SPLIT: AtomicBool = AtomicBool::new(false);
+#[derive(Clone, Copy)]
+enum NuDbTestCrashPoint {
+    PrimaryBucket,
+    Split,
+}
 
 #[cfg(test)]
-fn nudb_test_crash_if_requested(flag: &AtomicBool, point: &str) {
-    if flag.swap(false, Ordering::SeqCst) {
-        panic!("NuDB test crash after {point}");
+thread_local! {
+    static NUDB_TEST_CRASH_AFTER_PRIMARY_BUCKET: Cell<bool> = const { Cell::new(false) };
+    static NUDB_TEST_CRASH_AFTER_SPLIT: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+fn set_nudb_test_crash(point: NuDbTestCrashPoint) {
+    match point {
+        NuDbTestCrashPoint::PrimaryBucket => {
+            NUDB_TEST_CRASH_AFTER_PRIMARY_BUCKET.with(|flag| flag.set(true));
+        }
+        NuDbTestCrashPoint::Split => {
+            NUDB_TEST_CRASH_AFTER_SPLIT.with(|flag| flag.set(true));
+        }
+    }
+}
+
+#[cfg(test)]
+fn nudb_test_crash_if_requested(point: NuDbTestCrashPoint, description: &str) {
+    let requested = match point {
+        NuDbTestCrashPoint::PrimaryBucket => {
+            NUDB_TEST_CRASH_AFTER_PRIMARY_BUCKET.with(|flag| flag.replace(false))
+        }
+        NuDbTestCrashPoint::Split => NUDB_TEST_CRASH_AFTER_SPLIT.with(|flag| flag.replace(false)),
+    };
+    if requested {
+        panic!("NuDB test crash after {description}");
     }
 }
 
@@ -1613,7 +1640,7 @@ impl NuDbBackend {
         runtime.split_fraction = runtime.split_threshold / 2;
         #[cfg(test)]
         nudb_test_crash_if_requested(
-            &NUDB_TEST_CRASH_AFTER_PRIMARY_BUCKET,
+            NuDbTestCrashPoint::PrimaryBucket,
             "primary bucket creation",
         );
         Ok(())
@@ -1714,7 +1741,7 @@ impl NuDbBackend {
         self.write_key_bucket_with_header(left_index, &left, header)?;
         self.write_key_bucket_with_header(right_index, &right, header)?;
         #[cfg(test)]
-        nudb_test_crash_if_requested(&NUDB_TEST_CRASH_AFTER_SPLIT, "bucket split");
+        nudb_test_crash_if_requested(NuDbTestCrashPoint::Split, "bucket split");
 
         Ok(())
     }
@@ -3304,9 +3331,10 @@ mod tests {
     use super::{
         NUDB_APPNUM, NUDB_CURRENT_VERSION, NUDB_DATA_FILE_HEADER_SIZE, NUDB_DEFAULT_BLOCK_SIZE,
         NUDB_KEY_FILE_HEADER_SIZE, NUDB_KEY_FILE_TYPE, NUDB_TARGET_LOAD_FACTOR,
-        NUDB_TEST_CRASH_AFTER_PRIMARY_BUCKET, NUDB_TEST_CRASH_AFTER_SPLIT, NuDbBackendConfig,
+        NuDbBackendConfig,
         NuDbFileSetState, NuDbKeyFileHeader, NuDbLayout, NuDbMetadataHeader, NuDbOpenAction,
-        NuDbOpenArgs, NuDbOpenState, encode_nudb_key_file_header, nudb_bucket_capacity,
+        NuDbOpenArgs, NuDbOpenState, NuDbTestCrashPoint, encode_nudb_key_file_header,
+        nudb_bucket_capacity, set_nudb_test_crash,
         nudb_decode_load_factor, nudb_encode_load_factor, nudb_pepper, parse_nudb_block_size,
         read_nudb_key_file_header, read_nudb_log_file_header, validate_nudb_block_size,
     };
@@ -3384,7 +3412,7 @@ mod tests {
             "an empty NuDB key file contains only its header block"
         );
 
-        NUDB_TEST_CRASH_AFTER_PRIMARY_BUCKET.store(true, Ordering::SeqCst);
+        set_nudb_test_crash(NuDbTestCrashPoint::PrimaryBucket);
         let crash = panic::catch_unwind(AssertUnwindSafe(|| {
             let _ = backend.store(test_object(0x91, b"primary-ordering"));
         }));
@@ -3431,7 +3459,7 @@ mod tests {
             let mut runtime = backend.runtime.lock().expect("runtime");
             runtime.split_fraction = runtime.split_threshold - 65_536;
         }
-        NUDB_TEST_CRASH_AFTER_SPLIT.store(true, Ordering::SeqCst);
+        set_nudb_test_crash(NuDbTestCrashPoint::Split);
         let crash = panic::catch_unwind(AssertUnwindSafe(|| {
             let _ = backend.store(Arc::clone(&interrupted));
         }));

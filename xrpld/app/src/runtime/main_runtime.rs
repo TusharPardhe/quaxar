@@ -772,11 +772,10 @@ mod tests {
         cancelled_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("shutdown must cancel the snapshot worker before joining");
-        assert_eq!(
-            events.lock().expect("events mutex").as_slice(),
-            &["snapshot:cancelled".to_owned()],
-            "NodeStore must remain live until the cancelled writer exits"
-        );
+        // The cancellation notification proves the export worker observed the
+        // request. Shutdown is free to proceed to NodeStore teardown before
+        // this test thread observes the notification, so assert ordering only
+        // after joining shutdown below.
 
         shutdown.join().expect("shutdown should complete");
         assert_eq!(
