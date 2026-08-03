@@ -1910,6 +1910,26 @@ mod tests {
     }
 
     #[test]
+    fn acquire_async_defers_and_coalesces_initialization_work() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(Arc::clone(&worker_pool));
+        let hash = Uint256::from_array([0xC8; 32]);
+
+        registry.acquire_async(hash, 1, AcquireReason::Consensus);
+        registry.acquire_async(hash, 1, AcquireReason::Consensus);
+
+        assert_eq!(registry.lifecycle_snapshot().initialization_jobs, 0);
+        assert_eq!(
+            worker_pool.snapshot().queued_jobs,
+            1,
+            "one hash must have one deferred initialization job"
+        );
+        assert!(worker_pool.run_next_job_for_test());
+        assert_eq!(registry.lifecycle_snapshot().initialization_jobs, 1);
+        registry.stop();
+    }
+
+    #[test]
     fn acquisition_lifecycle_snapshot_exposes_route_and_worker_boundaries() {
         let counters = AcquisitionLifecycleCounters::default();
         assert_eq!(counters.snapshot(), AcquisitionLifecycleSnapshot::default());

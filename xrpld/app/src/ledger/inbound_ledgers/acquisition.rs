@@ -542,13 +542,23 @@ pub struct AcquisitionState {
 }
 
 impl AcquisitionState {
-    /// Perform `InboundLedger::init`: try local storage, add peers, then queue
-    /// the immediate TimeoutCounter job.
+    /// Queue `InboundLedger::init` on the bounded acquisition pool.
+    ///
+    /// Local-store inspection can traverse a large SHAMap. Unlike rippled,
+    /// Quaxar's callers include the NetworkOPs strand, so executing that work
+    /// inline would starve consensus, completion polling, and LCL recovery.
+    /// Registry insertion/deduplication is complete before this handoff; only
+    /// the expensive initialization phase is asynchronous.
     pub fn start(self: &Arc<Self>) {
-        self.lifecycle
-            .initialization_jobs
-            .fetch_add(1, Ordering::Relaxed);
-        run_acquisition_job(self, "initialization", || process_init(self));
+        let state = Arc::clone(self);
+        self.worker_pool.submit_ledger_data(Box::new(move || {
+            state
+                .lifecycle
+                .initialization_jobs
+                .fetch_add(1, Ordering::Relaxed);
+            state.stats.worker_jobs.fetch_add(1, Ordering::Relaxed);
+            run_acquisition_job(&state, "initialization", || process_init(&state));
+        }));
     }
 
     /// Equivalent to `InboundLedger::gotData` dispatch coalescing.
@@ -2060,6 +2070,29 @@ mod tests {
         assert_eq!(charges.len(), 1);
         assert_eq!(charges[0].0, (*resource::FEE_MALFORMED_REQUEST).clone());
         assert_eq!(charges[0].1, "ledger_data empty header");
+    }
+
+    #[test]
+    fn acquisition_start_queues_initialization_before_timeout_work() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, state, lifecycle) = timeout_state(Arc::clone(&worker_pool));
+
+        state.start();
+
+        assert_eq!(lifecycle.initialization_jobs.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            worker_pool.snapshot().queued_jobs,
+            1,
+            "initialization must be handed to the worker instead of the caller"
+        );
+        assert!(worker_pool.run_next_job_for_test());
+        assert_eq!(lifecycle.initialization_jobs.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            worker_pool.snapshot().queued_jobs,
+            1,
+            "initialization must enqueue the first timeout only after its worker turn"
+        );
+        worker_pool.stop();
     }
 
     #[test]
