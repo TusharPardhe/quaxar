@@ -1355,8 +1355,26 @@ impl InboundLedgers {
                 && (entry.completed_ledger.is_some()
                     || entry.state.completed.load(Ordering::Acquire))
         });
-        if completed && let Some(entry) = inner.entries.remove(hash) {
-            entry.state.stopped.store(true, Ordering::Release);
+        if completed {
+            if let Some(entry) = inner.entries.remove(hash) {
+                tracing::info!(
+                    target: "lcl_trace",
+                    event = "inbound_completion_acknowledged",
+                    %hash,
+                    seq = entry.seq,
+                    reason = ?entry.reason,
+                    acquisition_id = entry.id,
+                    "LCL trace: completed inbound ledger removed after acknowledgement"
+                );
+                entry.state.stopped.store(true, Ordering::Release);
+            }
+        } else {
+            tracing::warn!(
+                target: "lcl_trace",
+                event = "inbound_completion_ack_rejected",
+                %hash,
+                "LCL trace: completion acknowledgement found no completed registry entry"
+            );
         }
     }
 

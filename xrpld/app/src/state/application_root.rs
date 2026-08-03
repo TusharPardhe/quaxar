@@ -58,8 +58,8 @@ use crate::state::transactor_dispatcher::handle_real_dispatch;
 use crate::tx_queue::transaction::{Transaction, TransactionCloseTimeSource};
 use crate::tx_queue::transaction_master::{SharedTransaction, TransactionMaster};
 use crate::validator::validator_list::{
-    ListDisposition, PublisherListStats, SystemValidatorListClock, ValidatorBlobInfo, ValidatorList,
-    ValidatorListStatusSnapshot,
+    ListDisposition, PublisherListStats, SystemValidatorListClock, ValidatorBlobInfo,
+    ValidatorList, ValidatorListStatusSnapshot,
 };
 use crate::validator::validator_site::ValidatorSite;
 use basics::base_uint::{Uint160, Uint256};
@@ -67,18 +67,18 @@ use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::MonotonicClock;
 use ledger::OrderBookDB;
 use ledger::{
-    CanonicalTXSet, Ledger, LedgerMasterCaughtUp, LedgerNodeObjectType, NullOrderBookDBJournal,
-    NullOrderBookDBRuntime, ApplyView, OpenView, ReadView, Sandbox, TxsRawView,
+    ApplyView, CanonicalTXSet, Ledger, LedgerMasterCaughtUp, LedgerNodeObjectType,
+    NullOrderBookDBJournal, NullOrderBookDBRuntime, OpenView, ReadView, Sandbox, TxsRawView,
 };
 use overlay::Cluster;
 use overlay::{OverlayHandoff, OverlayImpl, PeerReservationSource};
 use perflog::PerfLogImp;
 use protocol::{
-    AccountID, BatchTransactionFlags, JsonOptions, JsonValue, NodeID, NotTec, PublicKey, Rules,
-    STAmount, STLedgerEntry, STObject, STTx, SecretKey, SeqProxy, Serializer, StBase, Ter, TxType,
-    REFERENCE_FEE_UNITS_DEPRECATED, XRPAmount, account_keylet, calc_account_id, calc_node_id,
-    feature_xrp_fees, get_field_by_symbol, is_tec_claim, is_tef_failure, is_tem_malformed,
-    is_tes_success, lsfDisableMaster, tfInnerBatchTxn,
+    AccountID, BatchTransactionFlags, JsonOptions, JsonValue, NodeID, NotTec, PublicKey,
+    REFERENCE_FEE_UNITS_DEPRECATED, Rules, STAmount, STLedgerEntry, STObject, STTx, SecretKey,
+    SeqProxy, Serializer, StBase, Ter, TxType, XRPAmount, account_keylet, calc_account_id,
+    calc_node_id, feature_xrp_fees, get_field_by_symbol, is_tec_claim, is_tef_failure,
+    is_tem_malformed, is_tes_success, lsfDisableMaster, tfInnerBatchTxn,
 };
 use shamap::family::{NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
 use shamap::tree_node_cache::TreeNodeCache;
@@ -1467,13 +1467,13 @@ impl crate::BuildLedgerView for StandaloneLedgerBuildView {
 
     fn apply_to_ledger(mut self, ledger: &mut Ledger) -> Result<(), crate::BuildLedgerError> {
         if let Some(table) = self.state_table.take() {
-            table
-                .apply(&mut self.inner)
-                .map_err(|error| crate::BuildLedgerError::View(format!("state view apply failed: {error:?}")))?;
+            table.apply(&mut self.inner).map_err(|error| {
+                crate::BuildLedgerError::View(format!("state view apply failed: {error:?}"))
+            })?;
         }
-        self.inner
-            .apply(ledger)
-            .map_err(|error| crate::BuildLedgerError::View(format!("accepted view apply failed: {error:?}")))
+        self.inner.apply(ledger).map_err(|error| {
+            crate::BuildLedgerError::View(format!("accepted view apply failed: {error:?}"))
+        })
     }
 }
 
@@ -4374,7 +4374,10 @@ impl ApplicationRoot {
                 "type".to_owned(),
                 JsonValue::String("transaction".to_owned()),
             ),
-            ("status".to_owned(), JsonValue::String("proposed".to_owned())),
+            (
+                "status".to_owned(),
+                JsonValue::String("proposed".to_owned()),
+            ),
             (
                 "ledger_current_index".to_owned(),
                 JsonValue::Unsigned(u64::from(self.open_ledger().current().ledger_current_index)),
@@ -5218,7 +5221,9 @@ impl ApplicationRoot {
         site_uri: String,
         hash: Uint256,
     ) -> PublisherListStats {
-        self.registry.hash_router.add_suppression_peer(hash, peer_id);
+        self.registry
+            .hash_router
+            .add_suppression_peer(hash, peer_id);
         self.apply_validator_lists(manifest, version, blobs, site_uri, hash)
     }
 
@@ -5234,7 +5239,9 @@ impl ApplicationRoot {
         hash: Uint256,
         peer_id: overlay::PeerId,
     ) -> bool {
-        self.registry.hash_router.add_suppression_peer(hash, peer_id)
+        self.registry
+            .hash_router
+            .add_suppression_peer(hash, peer_id)
     }
 
     fn broadcast_v1_validator_list(&self, result: &PublisherListStats, hash: Uint256) {
@@ -5246,9 +5253,8 @@ impl ApplicationRoot {
         let Some(to_skip) = self.registry.hash_router.should_relay(hash) else {
             return;
         };
-        let Some(serde_json::Value::Object(body)) = self
-            .validators
-            .get_available(&publisher.to_hex(), Some(1))
+        let Some(serde_json::Value::Object(body)) =
+            self.validators.get_available(&publisher.to_hex(), Some(1))
         else {
             return;
         };
@@ -5286,7 +5292,9 @@ impl ApplicationRoot {
             peer.send(overlay::Message::new(protocol.clone(), None));
             // Match v1 sendValidatorList: each successful outbound message is
             // recorded as a suppression peer before future rebroadcasts.
-            self.registry.hash_router.add_suppression_peer(hash, peer.id());
+            self.registry
+                .hash_router
+                .add_suppression_peer(hash, peer.id());
         }
     }
 
@@ -5999,8 +6007,10 @@ impl ApplicationRoot {
             (
                 "txn_count".to_owned(),
                 protocol::JsonValue::Unsigned(
-                    ledger.tx_snapshot().map(|transactions| transactions.len()).unwrap_or_default()
-                        as u64,
+                    ledger
+                        .tx_snapshot()
+                        .map(|transactions| transactions.len())
+                        .unwrap_or_default() as u64,
                 ),
             ),
         ]);
@@ -6014,7 +6024,9 @@ impl ApplicationRoot {
             if let Some(runtime) = self.ledger_master_runtime() {
                 notification.insert(
                     "validated_ledgers".to_owned(),
-                    protocol::JsonValue::String(runtime.ledger_master().complete_ledgers().to_string()),
+                    protocol::JsonValue::String(
+                        runtime.ledger_master().complete_ledgers().to_string(),
+                    ),
                 );
             }
         }
@@ -6392,15 +6404,43 @@ impl ApplicationRoot {
     /// canonicalized as a nonvalidated history cache entry; callers must still
     /// apply compatibility, quorum, and publication policy themselves.
     pub(crate) fn resolve_ledger_by_hash(&self, hash: SHAMapHash) -> Option<Arc<Ledger>> {
-        let loaded = crate::ledger::loaded_ledger_runtime::AppLoadedLedgerRuntime::from_root(self)?;
-        match loaded.get_history_ledger_by_hash(hash) {
+        let cache_visible_before = self.ledger_master_runtime().is_some_and(|runtime| {
+            runtime
+                .ledger_master()
+                .ledger_history()
+                .get_cached_ledger_by_hash(hash)
+                .is_some()
+        });
+        let Some(loaded) =
+            crate::ledger::loaded_ledger_runtime::AppLoadedLedgerRuntime::from_root(self)
+        else {
+            tracing::warn!(
+                target: "lcl_trace",
+                event = "resolver_runtime_unavailable",
+                %hash,
+                cache_visible_before,
+                "LCL trace: exact-hash resolver has no loaded-ledger runtime"
+            );
+            return None;
+        };
+        let resolved = match loaded.get_history_ledger_by_hash(hash) {
             Ok(ledger) => ledger,
             Err(error) => {
                 tracing::warn!(target: "ledger", %hash, ?error,
                     "provider-backed exact-hash ledger lookup failed");
                 None
             }
-        }
+        };
+        tracing::info!(
+            target: "lcl_trace",
+            event = "resolver_lookup",
+            %hash,
+            cache_visible_before,
+            resolved = resolved.is_some(),
+            resolved_seq = resolved.as_ref().map(|ledger| ledger.header().seq),
+            "LCL trace: exact-hash ledger resolver completed"
+        );
+        resolved
     }
 
     pub fn on_validated_ledger(&self, ledger: Arc<Ledger>) -> bool {
@@ -6451,7 +6491,11 @@ impl ApplicationRoot {
     /// excluding validators in the current negative UNL. `ValidatorList`
     /// already calculates `quorum()` from the effective UNL, so callers must
     /// filter the votes but must not reduce the quorum again.
-    fn trusted_validations_for_ledger(&self, hash: Uint256, seq: u32) -> Vec<protocol::STValidation> {
+    fn trusted_validations_for_ledger(
+        &self,
+        hash: Uint256,
+        seq: u32,
+    ) -> Vec<protocol::STValidation> {
         self.validators().negative_unl_filter_validations(
             self.validations()
                 .store()
@@ -6501,6 +6545,16 @@ impl ApplicationRoot {
                 .map(|current| (*current.header().hash.as_uint256(), current.header().seq));
             let last_valid_before = lm.last_valid_ledger();
             if seq < current_valid_seq {
+                tracing::info!(
+                    target: "lcl_trace",
+                    event = "validation_observation_ignored_old",
+                    observed_hash = %hash,
+                    observed_seq = seq,
+                    current_valid_seq,
+                    ?validated_anchor,
+                    ?last_valid_before,
+                        "LCL trace: validation observation is older than the validated head"
+                );
                 tracing::debug!(
                     target: "lcl_audit",
                     observed_hash = %hash,
@@ -6514,6 +6568,19 @@ impl ApplicationRoot {
             }
             let val_count = self.trusted_validation_count_for_ledger(hash, seq);
             let quorum = self.validators().quorum();
+            tracing::info!(
+                target: "lcl_trace",
+                event = "validation_observed",
+                observed_hash = %hash,
+                observed_seq = seq,
+                current_valid_seq,
+                val_count,
+                quorum,
+                quorum_reached = val_count >= quorum,
+                ?validated_anchor,
+                ?last_valid_before,
+                "LCL trace: quorum state evaluated for validation-backed ledger"
+            );
             tracing::debug!(
                 target: "lcl_audit",
                 observed_hash = %hash,
@@ -6546,6 +6613,15 @@ impl ApplicationRoot {
                 .building_ledger()
                 .is_some_and(|building| building == seq);
             if already_validated || building_same_seq {
+                tracing::info!(
+                    target: "lcl_trace",
+                    event = "validation_adoption_deferred",
+                    observed_hash = %hash,
+                    observed_seq = seq,
+                    already_validated,
+                    building_same_seq,
+                    "LCL trace: validation-backed ledger adoption deferred"
+                );
                 tracing::debug!(
                     target: "lcl_audit",
                     observed_hash = %hash,
@@ -6577,6 +6653,14 @@ impl ApplicationRoot {
                         acquisition_dispatched = true;
                     }
                 }
+                tracing::info!(
+                    target: "lcl_trace",
+                    event = "validation_resolver_miss_acquire",
+                    requested_hash = %hash,
+                    requested_seq = seq,
+                    acquisition_dispatched,
+                    "LCL trace: validation-backed ledger unavailable; acquisition requested"
+                );
                 tracing::debug!(
                     target: "lcl_audit",
                     requested_hash = %hash,
@@ -6594,6 +6678,16 @@ impl ApplicationRoot {
                 ledger.header().seq,
             );
             let quorum = self.validators().quorum();
+            tracing::info!(
+                target: "lcl_trace",
+                event = "validation_resolver_hit",
+                candidate_hash = %ledger.header().hash,
+                candidate_seq = ledger.header().seq,
+                candidate_parent_hash = %ledger.header().parent_hash,
+                val_count,
+                quorum,
+                "LCL trace: validation-backed ledger resolved before adoption"
+            );
             tracing::debug!(target: "lcl_audit",
                 candidate_hash = %ledger.header().hash,
                 candidate_seq = ledger.header().seq,
@@ -6622,6 +6716,14 @@ impl ApplicationRoot {
 
         let current_valid_seq = lm.valid_ledger_seq();
         if ledger.header().seq <= current_valid_seq {
+            tracing::info!(
+                target: "lcl_trace",
+                event = "validation_adoption_skipped_nonadvancing",
+                candidate_hash = %ledger.header().hash,
+                candidate_seq = ledger.header().seq,
+                current_valid_seq,
+                "LCL trace: resolved validation ledger cannot advance the validated head"
+            );
             tracing::debug!(
                 target: "lcl_audit",
                 candidate_hash = %ledger.header().hash,
@@ -6650,6 +6752,19 @@ impl ApplicationRoot {
             self.current_close_time_seconds(),
         );
         if !accepted {
+            tracing::info!(
+                target: "lcl_trace",
+                event = "validation_adoption_rejected",
+                candidate_hash = %ledger.header().hash,
+                candidate_seq = ledger.header().seq,
+                current_valid_seq,
+                val_count,
+                quorum,
+                can_be_current,
+                sequence_advances = ledger.header().seq > current_valid_seq,
+                quorum_reached = val_count >= quorum,
+                "LCL trace: resolved validation ledger failed adoption gates"
+            );
             tracing::debug!(
                 target: "lcl_audit",
                 candidate_hash = %ledger.header().hash,
@@ -6680,6 +6795,15 @@ impl ApplicationRoot {
         let validated = Arc::new(l);
 
         lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, Some(validated_sign_time));
+        tracing::info!(
+            target: "lcl_trace",
+            event = "validation_adoption_committed",
+            validated_hash = %validated.header().hash,
+            validated_seq = validated.header().seq,
+            validated_sign_time,
+            previous_valid_seq = current_valid_seq,
+            "LCL trace: validation-backed ledger committed as validated"
+        );
         // `set_valid_ledger_no_sweep` is necessary for partially acquired
         // catch-up ledgers, but this quorum-backed full ledger follows the
         // normal `setValidLedger` path and must sweep LocalTxs now.

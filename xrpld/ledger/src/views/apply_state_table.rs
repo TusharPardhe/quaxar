@@ -369,7 +369,8 @@ impl ApplyStateTable {
                         key.data()[3],
                         entry.sle.get_type(),
                     );
-                    batch_ops.push((crate::StateBatchOp::Delete, *key, Vec::new()));
+                    let payload = entry.sle.get_serializer().data().to_vec();
+                    batch_ops.push((crate::StateBatchOp::Delete, *key, payload));
                 }
                 Action::Insert => {
                     tracing::debug!(target: "ledger",                        "[sandbox_apply] INSERT key={:02x}{:02x}{:02x}{:02x} sle_type={:?}",
@@ -428,7 +429,8 @@ impl ApplyStateTable {
         for (key, entry) in &self.items {
             match entry.action {
                 Action::Erase => {
-                    batch_ops.push((crate::StateBatchOp::Delete, *key, Vec::new()));
+                    let payload = entry.sle.get_serializer().data().to_vec();
+                    batch_ops.push((crate::StateBatchOp::Delete, *key, payload));
                 }
                 Action::Insert | Action::Modify => {
                     let payload = threaded_payload(entry.sle.as_ref(), tx_id, ledger_seq, rules);
@@ -528,4 +530,87 @@ fn threaded_payload(
         &mut previous_ledger_seq,
     );
     threaded.get_serializer().data().to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use basics::base_uint::Uint256;
+    use protocol::{LedgerEntryType, STLedgerEntry, XRPAmount};
+
+    use super::{Action, ApplyStateTable, StateEntry};
+    use crate::Rules;
+    use crate::raw_view::RawView;
+    use crate::read_view::ViewError;
+
+    #[derive(Default)]
+    struct RecordingRawView {
+        erased_types: Vec<LedgerEntryType>,
+    }
+
+    impl RawView for RecordingRawView {
+        fn raw_erase(&mut self, sle: Arc<STLedgerEntry>) -> Result<(), ViewError> {
+            self.erased_types.push(sle.get_type());
+            Ok(())
+        }
+
+        fn raw_insert(&mut self, _sle: Arc<STLedgerEntry>) -> Result<(), ViewError> {
+            unreachable!("erase-only regression")
+        }
+
+        fn raw_replace(&mut self, _sle: Arc<STLedgerEntry>) -> Result<(), ViewError> {
+            unreachable!("erase-only regression")
+        }
+
+        fn raw_destroy_xrp(&mut self, _fee: XRPAmount) -> Result<(), ViewError> {
+            Ok(())
+        }
+    }
+
+    fn table_with_erased_offer(key: Uint256) -> ApplyStateTable {
+        let mut table = ApplyStateTable::new();
+        table.items.insert(
+            key,
+            StateEntry {
+                action: Action::Erase,
+                sle: Arc::new(STLedgerEntry::from_type_and_key(
+                    LedgerEntryType::Offer,
+                    key,
+                )),
+            },
+        );
+        table
+    }
+
+    #[test]
+    fn erase_batch_preserves_sle_type_through_generic_raw_view() {
+        let key = Uint256::from_array([0xA5; 32]);
+        let table = table_with_erased_offer(key);
+        let mut view = RecordingRawView::default();
+
+        table
+            .apply(&mut view)
+            .expect("normal erase batch should apply through generic RawView");
+
+        assert_eq!(view.erased_types, vec![LedgerEntryType::Offer]);
+    }
+
+    #[test]
+    fn threaded_erase_batch_preserves_sle_type_through_generic_raw_view() {
+        let key = Uint256::from_array([0x5A; 32]);
+        let table = table_with_erased_offer(key);
+        let mut view = RecordingRawView::default();
+
+        table
+            .apply_with_tx_thread(
+                &mut view,
+                Uint256::from_array([0x3C; 32]),
+                1,
+                &Rules::default(),
+            )
+            .expect("threaded erase batch should apply through generic RawView");
+
+        assert_eq!(view.erased_types, vec![LedgerEntryType::Offer]);
+    }
 }

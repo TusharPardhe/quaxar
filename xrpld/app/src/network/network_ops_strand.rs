@@ -632,13 +632,26 @@ fn strand_loop(
         // The sender is only a wakeup optimization. If it is disconnected or
         // not yet drained, completed acquisition state remains recoverable
         // here and follows the same storeLedger -> checkAccept path.
+        let mut registry_completion_count = 0usize;
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let lm = lm_rt.ledger_master();
-            for (_, ledger, reason) in
-                shared_inbound.poll_results_bounded(MAX_LEDGER_COMPLETIONS_PER_TURN)
-            {
+            let registry_completions =
+                shared_inbound.poll_results_bounded(MAX_LEDGER_COMPLETIONS_PER_TURN);
+            registry_completion_count = registry_completions.len();
+            if registry_completion_count != 0 {
+                tracing::info!(
+                    target: "lcl_trace",
+                    event = "completion_batch_polled",
+                    source = "registry_poll",
+                    count = registry_completion_count,
+                    runner_phase = ?runner.phase(),
+                    "LCL trace: completed inbound ledgers are ready for persistence"
+                );
+            }
+            for (_, ledger, reason) in registry_completions {
                 let ledger = Arc::new(ledger);
                 let persisted = persist_completed_inbound_ledger(&root, &lm, &ledger, reason);
+                trace_completed_inbound_handoff("registry_poll", &lm, &ledger, reason, persisted);
                 root.check_accept_hash_seq(*ledger.header().hash.as_uint256(), ledger.header().seq);
                 if persisted.acknowledged {
                     shared_inbound.acknowledge_completed(ledger.header().hash.as_uint256());
@@ -673,6 +686,13 @@ fn strand_loop(
                     let lm = lm_rt.ledger_master();
                     let persisted =
                         persist_completed_inbound_ledger(&root, &lm, &ledger, completion.reason);
+                    trace_completed_inbound_handoff(
+                        "completed_ledgers_rx",
+                        &lm,
+                        &ledger,
+                        completion.reason,
+                        persisted,
+                    );
                     root.check_accept_hash_seq(
                         *ledger.header().hash.as_uint256(),
                         ledger.header().seq,
@@ -697,7 +717,16 @@ fn strand_loop(
                 let ledger = completion.ledger;
                 let persisted = root.ledger_master_runtime().map(|lm_rt| {
                     let lm = lm_rt.ledger_master();
-                    persist_completed_inbound_ledger(&root, &lm, &ledger, completion.reason)
+                    let persisted =
+                        persist_completed_inbound_ledger(&root, &lm, &ledger, completion.reason);
+                    trace_completed_inbound_handoff(
+                        "shared_completed_rx",
+                        &lm,
+                        &ledger,
+                        completion.reason,
+                        persisted,
+                    );
+                    persisted
                 });
                 root.check_accept_hash_seq(*ledger.header().hash.as_uint256(), ledger.header().seq);
                 if persisted.is_some_and(|result| result.acknowledged) {
@@ -717,6 +746,12 @@ fn strand_loop(
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let pending = lm_rt.take_pending_consensus_ledger();
             if let Some(hash) = pending {
+                tracing::info!(
+                    target: "lcl_trace",
+                    event = "pending_consensus_target_acquire",
+                    %hash,
+                    "LCL trace: pending consensus ledger is being acquired"
+                );
                 // A pending consensus ledger is keyed by hash only. Do not
                 // infer its sequence from a peer's independent history range.
                 shared_inbound.acquire_closed_ledger_async(hash, AcquireReason::Consensus);
@@ -732,7 +767,26 @@ fn strand_loop(
             scheduler.accept_is_queued(),
             scheduler.has_pending_accept(),
         );
+        if registry_completion_count != 0 && !end_consensus_pass {
+            tracing::info!(
+                target: "lcl_trace",
+                event = "reconcile_deferred_after_completion",
+                completion_count = registry_completion_count,
+                runner_phase = ?runner.phase(),
+                accept_queued = scheduler.accept_is_queued(),
+                pending_accept = scheduler.has_pending_accept(),
+                "LCL trace: completion persisted but preferred-LCL reconciliation awaits Accepted"
+            );
+        }
         if end_consensus_pass {
+            tracing::info!(
+                target: "lcl_trace",
+                event = "end_consensus_reconcile_enter",
+                runner_phase = ?runner.phase(),
+                accept_queued = scheduler.accept_is_queued(),
+                pending_accept = scheduler.has_pending_accept(),
+                "LCL trace: entering preferred-LCL reconciliation"
+            );
             // endConsensus invalidates obsolete peer status before evaluating
             // the preferred LCL, whether or not this pass later performs a jump.
             cycle_obsolete_peer_statuses(&root);
@@ -753,6 +807,17 @@ fn strand_loop(
         } else {
             PreferredLclReconciliation::NoChange
         };
+        if end_consensus_pass {
+            tracing::info!(
+                target: "lcl_trace",
+                event = "end_consensus_reconcile_outcome",
+                reconciliation = ?reconciliation,
+                runner_phase = ?runner.phase(),
+                current_mode = ?root.network_ops_operating_mode(),
+                need_network_ledger = root.need_network_ledger(),
+                "LCL trace: preferred-LCL reconciliation completed"
+            );
+        }
 
         // `checkAccept`/publication/history do not select, acquire, install,
         // or clear recovery intent. Mode advancement is the sole exception:
@@ -794,6 +859,17 @@ fn strand_loop(
                     last_timer_tick = Instant::now();
                     tracing::info!(target: "consensus", seq = closed.header().seq,
                         "Consensus started next round after checkLastClosedLedger");
+                    tracing::info!(
+                        target: "lcl_trace",
+                        event = "ordinary_consensus_round_started",
+                        local_lcl_hash = %closed_id,
+                        local_lcl_seq = closed.header().seq,
+                        started_prev_ledger = %runner.prev_ledger_id(),
+                        proposing,
+                        current_mode = ?root.network_ops_operating_mode(),
+                        need_network_ledger = root.need_network_ledger(),
+                        "LCL trace: ordinary consensus round started after no reconciliation change"
+                    );
                     tracing::debug!(
                         target: "lcl_audit",
                         local_lcl_hash = %closed_id,
@@ -922,6 +998,19 @@ fn reconcile_preferred_lcl(
         &peer_counts,
     );
     let preferred_hash = preference_diagnostic.selected;
+    tracing::info!(
+        target: "lcl_trace",
+        event = "preferred_lcl_selected",
+        local_lcl_hash = %our_hash,
+        local_lcl_seq = our_closed.header().seq,
+        preferred_lcl_hash = %preferred_hash,
+        peer_count = peers.len(),
+        selected_trusted_validation_count = root.validations().num_trusted_for_ledger(preferred_hash),
+        selected_peer_lcl_support = peer_counts.get(&preferred_hash).copied().unwrap_or_default(),
+        validation_selection_source = ?preference_diagnostic.selection_source,
+        validation_working_source = ?preference_diagnostic.working_source,
+        "LCL trace: preferred-LCL selection evaluated"
+    );
     let emit_audit = audit_sampler.should_emit();
     if emit_audit {
         let inbound_lifecycle = shared_inbound.lifecycle_snapshot();
@@ -964,9 +1053,23 @@ fn reconcile_preferred_lcl(
     // Rippled does not switch back to its immediate predecessor. A zero
     // preference is likewise not an actionable recovery target.
     if preferred_hash.is_zero() || preferred_hash == parent_hash {
+        tracing::info!(
+            target: "lcl_trace",
+            event = "preferred_lcl_not_actionable",
+            preferred_lcl_hash = %preferred_hash,
+            parent_hash = %parent_hash,
+            "LCL trace: preferred LCL is zero or the local parent"
+        );
         return PreferredLclReconciliation::NoChange;
     }
     if preferred_hash == our_hash {
+        tracing::info!(
+            target: "lcl_trace",
+            event = "preferred_lcl_already_local",
+            preferred_lcl_hash = %preferred_hash,
+            local_lcl_seq = our_closed.header().seq,
+            "LCL trace: preferred LCL already matches local closed ledger"
+        );
         return PreferredLclReconciliation::NoChange;
     }
 
@@ -985,6 +1088,14 @@ fn reconcile_preferred_lcl(
         // Deduplication happens INSIDE acquire(): ledgers_.find(hash) returns
         // the existing entry without creating a new one. Our registry does
         // the same via entries.get_mut(&hash). Match rippled exactly.
+        tracing::info!(
+            target: "lcl_trace",
+            event = "preferred_lcl_resolver_miss",
+            preferred_lcl_hash = %preferred_hash,
+            local_lcl_hash = %our_hash,
+            local_lcl_seq = our_closed.header().seq,
+            "LCL trace: preferred LCL is not resolver-visible; requesting consensus acquisition"
+        );
         shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
         shared_inbound.record_recovery_lcl_decision(
             preferred_hash,
@@ -1019,6 +1130,14 @@ fn reconcile_preferred_lcl(
 
     let candidate_hash = *candidate.header().hash.as_uint256();
     if candidate_hash != preferred_hash {
+        tracing::warn!(
+            target: "lcl_trace",
+            event = "preferred_lcl_hash_mismatch",
+            preferred_lcl_hash = %preferred_hash,
+            candidate_hash = %candidate_hash,
+            candidate_seq = candidate.header().seq,
+            "LCL trace: resolver returned a ledger with the wrong hash"
+        );
         shared_inbound.record_recovery_lcl_decision(
             preferred_hash,
             Some(candidate.as_ref()),
@@ -1049,6 +1168,15 @@ fn reconcile_preferred_lcl(
         );
     }
     if !state_complete || !tx_complete {
+        tracing::info!(
+            target: "lcl_trace",
+            event = "preferred_lcl_incomplete",
+            preferred_lcl_hash = %preferred_hash,
+            candidate_seq = candidate.header().seq,
+            state_complete,
+            tx_complete,
+            "LCL trace: resolver-visible preferred LCL is incomplete"
+        );
         shared_inbound.record_recovery_lcl_decision(
             preferred_hash,
             Some(candidate.as_ref()),
@@ -1058,6 +1186,17 @@ fn reconcile_preferred_lcl(
         return PreferredLclReconciliation::Pending;
     }
     if !can_be_current || !compatible {
+        tracing::warn!(
+            target: "lcl_trace",
+            event = "preferred_lcl_rejected",
+            preferred_lcl_hash = %preferred_hash,
+            candidate_hash = %candidate_hash,
+            candidate_seq = candidate.header().seq,
+            can_be_current,
+            compatible,
+            compatibility = ?compatibility_audit,
+            "LCL trace: resolver-visible preferred LCL failed admission"
+        );
         // Match rippled: keep our current LCL as the networkClosed output for
         // this pass; do not create or retire a separate exact-target state.
         shared_inbound.record_recovery_lcl_decision(
@@ -1117,6 +1256,17 @@ fn switch_last_closed_ledger(
             (*closed.header().hash.as_uint256(), closed.header().seq)
         }),
         "LCL_AUDIT preferred-LCL switch admitted"
+    );
+    tracing::info!(
+        target: "lcl_trace",
+        event = "preferred_lcl_switch_admitted",
+        target_hash = %target,
+        new_hash = %new_hash,
+        new_seq,
+        prior_closed = ?root.closed_ledger().map(|closed| {
+            (*closed.header().hash.as_uint256(), closed.header().seq)
+        }),
+        "LCL trace: switching to resolver-visible preferred LCL"
     );
 
     // This matches rippled switchLastClosedLedger: the visible waiting state
@@ -1421,6 +1571,34 @@ fn check_accept_and_advance(
             }
         }
     }
+}
+
+fn trace_completed_inbound_handoff(
+    source: &'static str,
+    lm: &ledger::LedgerMaster,
+    ledger: &Arc<ledger::Ledger>,
+    reason: AcquireReason,
+    persisted: CompletionPersistence,
+) {
+    let cache_visible_after = lm
+        .ledger_history()
+        .get_cached_ledger_by_hash(ledger.header().hash)
+        .is_some();
+    tracing::info!(
+        target: "lcl_trace",
+        event = "inbound_completion_persisted",
+        source,
+        reason = ?reason,
+        ledger_hash = %ledger.header().hash,
+        ledger_seq = ledger.header().seq,
+        immutable = ledger.is_immutable(),
+        state_synching = ledger.state_map().is_synching(),
+        tx_synching = ledger.tx_map().is_synching(),
+        cache_visible_after,
+        inserted = persisted.inserted,
+        acknowledged = persisted.acknowledged,
+        "LCL trace: inbound ledger completion persisted before adoption"
+    );
 }
 
 fn persist_completed_inbound_ledger(

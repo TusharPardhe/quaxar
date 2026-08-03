@@ -8,6 +8,29 @@ use protocol::{STLedgerEntry, Serializer, XRPAmount};
 use crate::Ledger;
 use crate::read_view::{TypedLedgerEntryRef, ViewError};
 
+fn decode_batch_sle(payload: &[u8], key: Uint256) -> Result<Arc<STLedgerEntry>, ViewError> {
+    if payload.is_empty() {
+        return Err(ViewError::Conversion(
+            "state batch operation omitted serialized ledger entry".to_owned(),
+        ));
+    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut serial = protocol::SerialIter::new(payload);
+        let sle = STLedgerEntry::from_serial_iter(&mut serial, key);
+        if !serial.empty() || sle.get_serializer().data() != payload {
+            return Err(ViewError::Conversion(
+                "state batch ledger entry is not a canonical standalone encoding".to_owned(),
+            ));
+        }
+        Ok(Arc::new(sle))
+    }))
+    .unwrap_or_else(|_| {
+        Err(ViewError::Conversion(
+            "state batch ledger entry could not be decoded".to_owned(),
+        ))
+    })
+}
+
 pub trait RawView {
     fn raw_erase(&mut self, sle: Arc<STLedgerEntry>) -> Result<(), ViewError>;
     fn raw_insert(&mut self, sle: Arc<STLedgerEntry>) -> Result<(), ViewError>;
@@ -22,25 +45,13 @@ pub trait RawView {
         for (op, key, payload) in ops {
             match op {
                 crate::StateBatchOp::Insert => {
-                    let sle = Arc::new(protocol::STLedgerEntry::from_serial_iter(
-                        &mut protocol::SerialIter::new(payload),
-                        *key,
-                    ));
-                    self.raw_insert(sle)?;
+                    self.raw_insert(decode_batch_sle(payload, *key)?)?;
                 }
                 crate::StateBatchOp::Update => {
-                    let sle = Arc::new(protocol::STLedgerEntry::from_serial_iter(
-                        &mut protocol::SerialIter::new(payload),
-                        *key,
-                    ));
-                    self.raw_replace(sle)?;
+                    self.raw_replace(decode_batch_sle(payload, *key)?)?;
                 }
                 crate::StateBatchOp::Delete => {
-                    let sle = Arc::new(protocol::STLedgerEntry::from_type_and_key(
-                        protocol::LedgerEntryType::Any,
-                        *key,
-                    ));
-                    self.raw_erase(sle)?;
+                    self.raw_erase(decode_batch_sle(payload, *key)?)?;
                 }
             }
         }
@@ -129,5 +140,77 @@ impl TxsRawView for Ledger {
         let metadata = metadata.ok_or(ViewError::MissingMetadata(key))?;
         self.insert_tx_map_item(key, txn.data().to_vec(), metadata.data().to_vec())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use basics::base_uint::Uint256;
+    use protocol::{LedgerEntryType, STLedgerEntry, XRPAmount};
+
+    use super::{RawView, ViewError};
+    use crate::StateBatchOp;
+
+    #[derive(Default)]
+    struct RecordingRawView {
+        erased_type: Option<LedgerEntryType>,
+    }
+
+    impl RawView for RecordingRawView {
+        fn raw_erase(&mut self, sle: Arc<STLedgerEntry>) -> Result<(), ViewError> {
+            self.erased_type = Some(sle.get_type());
+            Ok(())
+        }
+
+        fn raw_insert(&mut self, _sle: Arc<STLedgerEntry>) -> Result<(), ViewError> {
+            unreachable!("delete-only regression")
+        }
+
+        fn raw_replace(&mut self, _sle: Arc<STLedgerEntry>) -> Result<(), ViewError> {
+            unreachable!("delete-only regression")
+        }
+
+        fn raw_destroy_xrp(&mut self, _fee: XRPAmount) -> Result<(), ViewError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn batch_delete_rejects_empty_or_malformed_payload_without_panicking() {
+        let key = Uint256::from_array([0x5A; 32]);
+        let erased = STLedgerEntry::from_type_and_key(LedgerEntryType::Offer, key);
+        let mut valid_payload_with_trailing_object_end = erased.get_serializer().data().to_vec();
+        // `0xE1` is an STObject end marker. The permissive object decoder consumes
+        // it, so canonical round-trip validation must reject it explicitly.
+        valid_payload_with_trailing_object_end.push(0xE1);
+        let mut view = RecordingRawView::default();
+
+        for payload in [
+            Vec::new(),
+            vec![0xFF],
+            valid_payload_with_trailing_object_end,
+        ] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                view.raw_apply_batch(&[(StateBatchOp::Delete, key, payload)])
+            }));
+            assert!(result.is_ok(), "malformed delete must not unwind");
+            assert!(result.expect("caught result").is_err());
+        }
+        assert_eq!(view.erased_type, None);
+    }
+
+    #[test]
+    fn batch_delete_preserves_erased_sle_type_for_generic_raw_views() {
+        let key = Uint256::from_array([0xA5; 32]);
+        let erased = STLedgerEntry::from_type_and_key(LedgerEntryType::Offer, key);
+        let payload = erased.get_serializer().data().to_vec();
+        let mut view = RecordingRawView::default();
+
+        view.raw_apply_batch(&[(StateBatchOp::Delete, key, payload)])
+            .expect("typed delete payload should apply without an Any SLE");
+
+        assert_eq!(view.erased_type, Some(LedgerEntryType::Offer));
     }
 }
