@@ -7519,11 +7519,13 @@ impl ApplicationRoot {
                     } else {
                         completed_transaction_ids.insert(transaction_id);
                         failed_txns.push((transaction_id, result));
-                        tracing::debug!(
+                        tracing::warn!(
                             target: "ledger",
                             closed_seq,
                             pass,
                             tx_id = %transaction_id,
+                            account = %sttx.get_account_id(protocol::get_field_by_symbol("sfAccount")),
+                            seq = sttx.get_seq_proxy().value(),
                             ?txn_type,
                             ?result,
                             "consensus transaction failed"
