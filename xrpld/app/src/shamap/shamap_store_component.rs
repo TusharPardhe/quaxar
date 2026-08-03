@@ -3,9 +3,10 @@ use crate::shamap::shamap_store_app_runtime::SHAMapStoreRotationWindow;
 use crate::{
     SHAMapStore, SHAMapStoreCopyDisposition, SHAMapStoreHealthPolicy, SHAMapStoreHealthRuntime,
     SHAMapStoreRuntime, SHAMapStoreSavedState, SHAMapStoreSavedStateDb, SHAMapStoreWorkerStep,
-    run_shamap_store_worker_step,
+    run_shamap_store_worker_step_with_policy_refresh,
 };
 use ledger::Ledger;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -60,6 +61,14 @@ struct SHAMapStoreComponentInner {
     state_db: Option<Arc<SHAMapStoreSavedStateDb>>,
     wake_mutex: Mutex<bool>,
     wake_condvar: Condvar,
+    /// Mirrors rippled's atomic `canDelete_`: maintenance observes the newest
+    /// policy at its next destructive boundary without taking the producer
+    /// store mutex.
+    can_delete: AtomicU32,
+    /// Serializes worker snapshots from the managed worker and direct test or
+    /// operator drains. Producers never take this lease, so a health-blocked
+    /// online-delete worker cannot delay validation notification.
+    worker_execution: Mutex<()>,
 }
 
 pub struct SHAMapStoreComponent {
@@ -89,6 +98,7 @@ impl SHAMapStoreComponent {
         runtime: Box<dyn SHAMapStoreComponentRuntime>,
         state_db: Option<SHAMapStoreSavedStateDb>,
     ) -> Self {
+        let can_delete = store.get_can_delete();
         Self {
             inner: Arc::new(SHAMapStoreComponentInner {
                 store: Mutex::new(store),
@@ -96,6 +106,8 @@ impl SHAMapStoreComponent {
                 state_db: state_db.map(Arc::new),
                 wake_mutex: Mutex::new(false),
                 wake_condvar: Condvar::new(),
+                can_delete: AtomicU32::new(can_delete),
+                worker_execution: Mutex::new(()),
             }),
             worker: Mutex::new(None),
         }
@@ -160,25 +172,20 @@ impl SHAMapStoreComponent {
             .lock()
             .expect("shamap store mutex must not be poisoned");
         let can_delete = store.set_can_delete(can_delete);
+        let effective_can_delete = store.get_can_delete();
         if store.advisory_delete() {
             if let Some(state_db) = &self.inner.state_db {
                 state_db.set_can_delete(can_delete)?;
             }
         }
+        self.inner
+            .can_delete
+            .store(effective_can_delete, Ordering::Release);
         Ok(can_delete)
     }
 
     pub fn process_queued_ledger(&self) -> Result<Option<SHAMapStoreWorkerStep>, String> {
-        let mut store = self
-            .store()
-            .lock()
-            .expect("shamap store mutex must not be poisoned");
-        let mut runtime = self
-            .inner
-            .runtime
-            .lock()
-            .expect("shamap store runtime mutex must not be poisoned");
-        run_shamap_store_worker_step(&mut store, runtime.as_mut(), self.inner.state_db.as_ref())
+        run_detached_worker_step(&self.inner)
     }
 
     pub fn saved_state(&self) -> SHAMapStoreSavedState {
@@ -188,6 +195,50 @@ impl SHAMapStoreComponent {
             .saved_state()
             .clone()
     }
+}
+
+/// Execute one detached maintenance snapshot. The exclusive worker lease keeps
+/// snapshot state linear while the shared store mutex remains free for
+/// `on_ledger_closed` and policy updates.
+fn run_detached_worker_step(
+    inner: &Arc<SHAMapStoreComponentInner>,
+) -> Result<Option<SHAMapStoreWorkerStep>, String> {
+    let _execution = inner
+        .worker_execution
+        .lock()
+        .expect("shamap store worker execution mutex must not be poisoned");
+    let Some(mut worker_store) = inner
+        .store
+        .lock()
+        .expect("shamap store mutex must not be poisoned")
+        .take_worker_snapshot()
+    else {
+        return Ok(None);
+    };
+    let result = {
+        let mut runtime = inner
+            .runtime
+            .lock()
+            .expect("shamap store runtime mutex must not be poisoned");
+        run_shamap_store_worker_step_with_policy_refresh(
+            &mut worker_store,
+            runtime.as_mut(),
+            inner.state_db.as_ref(),
+            |worker_store| {
+                // Rippled's `canDelete_` is atomic and its maintenance worker
+                // reads it at the ready-to-delete boundary. Preserve that
+                // nonblocking policy model rather than taking `store` while
+                // runtime maintenance is active.
+                worker_store.set_can_delete(inner.can_delete.load(Ordering::Acquire));
+            },
+        )
+    };
+    inner
+        .store
+        .lock()
+        .expect("shamap store mutex must not be poisoned")
+        .merge_worker_state(&worker_store);
+    result
 }
 
 impl ManagedComponent for SHAMapStoreComponent {
@@ -202,6 +253,9 @@ impl ManagedComponent for SHAMapStoreComponent {
                 store.set_can_delete(can_delete);
             }
         }
+        self.inner
+            .can_delete
+            .store(store.get_can_delete(), Ordering::Release);
         let mut runtime = self
             .inner
             .runtime
@@ -260,19 +314,7 @@ impl ManagedComponent for SHAMapStoreComponent {
                             return;
                         }
 
-                        let mut store = inner
-                            .store
-                            .lock()
-                            .expect("shamap store mutex must not be poisoned");
-                        let mut runtime = inner
-                            .runtime
-                            .lock()
-                            .expect("shamap store runtime mutex must not be poisoned");
-                        let _ = run_shamap_store_worker_step(
-                            &mut store,
-                            runtime.as_mut(),
-                            inner.state_db.as_ref(),
-                        );
+                        let _ = run_detached_worker_step(&inner);
                     }
                 }));
             }
@@ -336,8 +378,8 @@ mod tests {
     use basics::basic_config::BasicConfig;
     use ledger::Ledger;
     use std::sync::Arc;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -490,6 +532,139 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(condition(), "condition should become true");
+    }
+
+    struct BlockingHealthRuntime {
+        gate: Arc<(Mutex<(bool, bool)>, Condvar)>,
+        clear_prior_calls: Arc<AtomicUsize>,
+    }
+
+    impl SHAMapStoreRuntime for BlockingHealthRuntime {
+        fn start_background_work(&mut self) {}
+
+        fn stop_background_work(&mut self) {}
+
+        fn minimum_sql_seq(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    impl SHAMapStoreHealthRuntime for BlockingHealthRuntime {
+        fn is_stopping(&self) -> bool {
+            false
+        }
+
+        fn operating_mode(&self) -> SHAMapStoreOperatingMode {
+            if self.gate.0.lock().expect("blocking health gate").1 {
+                SHAMapStoreOperatingMode::Full
+            } else {
+                SHAMapStoreOperatingMode::Other
+            }
+        }
+
+        fn validated_ledger_age(&self) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    impl super::SHAMapStoreComponentRuntime for BlockingHealthRuntime {
+        fn sleep(&mut self, _duration: Duration) {
+            let (lock, wake) = &*self.gate;
+            let mut state = lock.lock().expect("blocking health gate");
+            state.0 = true;
+            wake.notify_all();
+            while !state.1 {
+                state = wake.wait(state).expect("blocking health wait");
+            }
+        }
+
+        fn clear_prior(&mut self, _last_rotated: u32) -> Result<(), String> {
+            self.clear_prior_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ledger_notification_does_not_wait_for_a_health_blocked_worker() {
+        let gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        let clear_prior_calls = Arc::new(AtomicUsize::new(0));
+        let component = Arc::new(SHAMapStoreComponent::new(
+            SHAMapStore::new(10, true, 0),
+            Box::new(BlockingHealthRuntime {
+                gate: Arc::clone(&gate),
+                clear_prior_calls: Arc::clone(&clear_prior_calls),
+            }),
+            None,
+        ));
+
+        // Establish the rotation baseline. Sequence 110 is eligible to rotate
+        // from 100, then stalls in healthWait exactly like the production
+        // online-delete worker.
+        component.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
+            100, 0, false,
+        )));
+        component
+            .process_queued_ledger()
+            .expect("baseline processing")
+            .expect("baseline ledger");
+
+        component.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
+            110, 0, false,
+        )));
+        let worker = {
+            let component = Arc::clone(&component);
+            thread::spawn(move || component.process_queued_ledger())
+        };
+        {
+            let (lock, wake) = &*gate;
+            let mut state = lock.lock().expect("blocking health gate");
+            while !state.0 {
+                state = wake
+                    .wait_timeout(state, Duration::from_secs(1))
+                    .expect("blocking health entry wait")
+                    .0;
+                assert!(state.0, "worker should enter the health wait");
+            }
+        }
+
+        let (notified_tx, notified_rx) = std::sync::mpsc::channel();
+        let notification = {
+            let component = Arc::clone(&component);
+            thread::spawn(move || {
+                component.on_ledger_closed(Arc::new(Ledger::from_ledger_seq_and_close_time(
+                    111, 0, false,
+                )));
+                notified_tx.send(()).expect("notification result");
+            })
+        };
+        notified_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("ledger notification must not block behind maintenance");
+
+        // Revoke the advisory deletion permission while the detached worker
+        // sleeps. The worker must refresh this live value before clear_prior.
+        component.set_can_delete(98).expect("revoke can_delete");
+        let queued_worker = {
+            let component = Arc::clone(&component);
+            thread::spawn(move || component.process_queued_ledger())
+        };
+
+        {
+            let (lock, wake) = &*gate;
+            let mut state = lock.lock().expect("blocking health gate");
+            state.1 = true;
+            wake.notify_all();
+        }
+        worker.join().expect("worker join").expect("worker result");
+        queued_worker
+            .join()
+            .expect("queued worker join")
+            .expect("queued worker result");
+        notification.join().expect("notification join");
+
+        assert_eq!(clear_prior_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(component.saved_state().last_rotated, 100);
+        assert_eq!(component.snapshot().queued_ledger_seq(), None);
     }
 
     #[test]

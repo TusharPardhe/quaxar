@@ -19,6 +19,22 @@ pub fn run_shamap_store_worker_step(
     runtime: &mut dyn SHAMapStoreComponentRuntime,
     state_db: Option<&Arc<SHAMapStoreSavedStateDb>>,
 ) -> Result<Option<SHAMapStoreWorkerStep>, String> {
+    run_shamap_store_worker_step_with_policy_refresh(store, runtime, state_db, |_| {})
+}
+
+/// Run one maintenance step, refreshing live policy immediately before the
+/// destructive online-delete boundary. The component uses this variant after
+/// detaching a private worker snapshot, so an RPC policy update made while a
+/// health wait is in progress cannot be bypassed by stale snapshot state.
+pub fn run_shamap_store_worker_step_with_policy_refresh<F>(
+    store: &mut SHAMapStore,
+    runtime: &mut dyn SHAMapStoreComponentRuntime,
+    state_db: Option<&Arc<SHAMapStoreSavedStateDb>>,
+    mut refresh_policy: F,
+) -> Result<Option<SHAMapStoreWorkerStep>, String>
+where
+    F: FnMut(&mut SHAMapStore),
+{
     let Some(validated_ledger) = store.take_queued_ledger() else {
         return Ok(None);
     };
@@ -69,6 +85,20 @@ pub fn run_shamap_store_worker_step(
             runloop: step,
             rotated: false,
             stopped: true,
+            minimum_online: store.minimum_online(runtime),
+        }));
+    }
+
+    refresh_policy(store);
+    if !store
+        .rotation_decision(validated_seq, SHAMapStoreHealthStatus::KeepGoing)
+        .ready_to_rotate
+    {
+        store.finish_rendezvous();
+        return Ok(Some(SHAMapStoreWorkerStep {
+            runloop: step,
+            rotated: false,
+            stopped: false,
             minimum_online: store.minimum_online(runtime),
         }));
     }
