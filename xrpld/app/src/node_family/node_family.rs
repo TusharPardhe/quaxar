@@ -30,6 +30,9 @@ pub struct NodeSizeResourceProfile {
     pub tree_cache_age_seconds: i64,
     /// rippled SizedItem::SweepInterval — how often doSweep runs (seconds).
     pub sweep_interval_seconds: u64,
+    /// rippled SizedItem::LedgerFetch — maximum adjacent ledgers prefetched
+    /// by one `LedgerMaster::fetchForHistory` pass.
+    pub ledger_fetch_size: u32,
     /// rippled kFullBelowTargetSize (constant 524288 in Tuning.h).
     pub full_below_target_size: usize,
     /// rippled kFullBelowExpiration (constant 10 minutes in Tuning.h).
@@ -48,6 +51,7 @@ impl NodeSizeResourceProfile {
                 tree_cache_size: 262_144,
                 tree_cache_age_seconds: 30,
                 sweep_interval_seconds: 10,
+                ledger_fetch_size: 2,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             },
@@ -55,6 +59,7 @@ impl NodeSizeResourceProfile {
                 tree_cache_size: 524_288,
                 tree_cache_age_seconds: 60,
                 sweep_interval_seconds: 30,
+                ledger_fetch_size: 3,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             },
@@ -62,6 +67,7 @@ impl NodeSizeResourceProfile {
                 tree_cache_size: 4_194_304,
                 tree_cache_age_seconds: 120,
                 sweep_interval_seconds: 90,
+                ledger_fetch_size: 5,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             },
@@ -69,6 +75,7 @@ impl NodeSizeResourceProfile {
                 tree_cache_size: 8_388_608,
                 tree_cache_age_seconds: 900,
                 sweep_interval_seconds: 120,
+                ledger_fetch_size: 8,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             },
@@ -77,6 +84,7 @@ impl NodeSizeResourceProfile {
                 tree_cache_size: 2_097_152,
                 tree_cache_age_seconds: 90,
                 sweep_interval_seconds: 60,
+                ledger_fetch_size: 4,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             },
@@ -342,6 +350,7 @@ mod tests {
                 tree_cache_size: 262_144,
                 tree_cache_age_seconds: 30,
                 sweep_interval_seconds: 10,
+                ledger_fetch_size: 2,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             }
@@ -352,6 +361,7 @@ mod tests {
                 tree_cache_size: 2_097_152,
                 tree_cache_age_seconds: 90,
                 sweep_interval_seconds: 60,
+                ledger_fetch_size: 4,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             }
@@ -362,6 +372,7 @@ mod tests {
                 tree_cache_size: 8_388_608,
                 tree_cache_age_seconds: 900,
                 sweep_interval_seconds: 120,
+                ledger_fetch_size: 8,
                 full_below_target_size: 524_288,
                 full_below_expiration_seconds: 600,
             }

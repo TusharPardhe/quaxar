@@ -34,9 +34,11 @@ use crate::runtime::component_runtime::{AppConsensusRuntime, ConsensusCommand};
 
 use overlay::inbound::QueuedProposal;
 
-// History acquisition is retried promptly after the registry finishes a
-// ledger. InboundLedgers deduplicates by hash/sequence, as rippled does.
-const HISTORY_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+// Quaxar's strand polls more often than rippled's JtAdvance worker. Keep the
+// history retry cadence to one consensus heartbeat so an existing History
+// request is not repeatedly touched and a sparse skip list cannot fan out
+// acquisitions between heartbeats.
+const HISTORY_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 // A polling turn must always return to the heartbeat scheduler. The overlay
 // channels can be continuously non-empty under peer load; draining either one
 // without a budget would otherwise defer the next JtNetopTimer forever.
@@ -266,6 +268,8 @@ pub struct NetworkOpsStrandDeps {
     pub consensus_rt: Arc<AppConsensusRuntime>,
     pub shared_inbound: Arc<InboundLedgers>,
     pub configured_ledger_history: u32,
+    /// rippled `SizedItem::LedgerFetch` for the configured node-size profile.
+    pub configured_ledger_fetch_size: u32,
     /// Consensus event channel sender for LedgerDone events from storeLedger drain.
     pub event_tx: Option<std::sync::mpsc::SyncSender<crate::consensus::driver::ConsensusEvent>>,
     /// Receiver for completed ledgers from shared_inbound acquisition.
@@ -368,6 +372,7 @@ fn strand_loop(
         consensus_rt,
         shared_inbound,
         configured_ledger_history,
+        configured_ledger_fetch_size,
         event_tx,
         shared_completed_rx,
     } = deps;
@@ -390,6 +395,10 @@ fn strand_loop(
     let mut last_round_ledger_id: Option<Uint256> = None;
     let mut last_history_tick = Instant::now();
     let mut history_fetch_pack: Option<(u32, Instant)> = None;
+    // Matches LedgerMaster::histLedger_: after a primary history result is
+    // materialized, its normal skip list is the closest reference for the
+    // next predecessor lookup.
+    let mut history_reference: Option<Arc<ledger::Ledger>> = None;
     // Match rippled's `acquiringLedger_`: only issue ONE acquireAsync per
     // unique preferred-LCL hash. Prevents flooding peers with parallel
     // Sample repeating LCL diagnostics while leaving recovery decisions and
@@ -769,8 +778,10 @@ fn strand_loop(
             &root,
             &shared_inbound,
             configured_ledger_history,
+            configured_ledger_fetch_size,
             &mut last_history_tick,
             &mut history_fetch_pack,
+            &mut history_reference,
             should_promote_operating_mode_at_end_consensus(end_consensus_pass, reconciliation),
         );
 
@@ -1015,15 +1026,13 @@ fn reconcile_preferred_lcl(
         return PreferredLclReconciliation::NoChange;
     }
 
-    if matches!(
-        root.network_ops_operating_mode(),
-        NetworkOpsOperatingMode::Tracking | NetworkOpsOperatingMode::Full
-    ) {
-        root.set_network_ops_operating_mode(NetworkOpsOperatingMode::Connected);
-    }
-
-    let candidate =
-        root.resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash));
+    let candidate = root
+        .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash))
+        // `checkLastClosedLedger` immediately asks InboundLedgers for a
+        // resolver miss. A completed entry can therefore be admitted and
+        // switched in this endConsensus pass; only a still-unavailable entry
+        // proceeds to generic WrongLedger recovery.
+        .or_else(|| shared_inbound.acquire(preferred_hash, 0, AcquireReason::Consensus));
     let Some(candidate) = candidate else {
         // Rippled re-invokes InboundLedgers::acquire(hash, 0, CONSENSUS) on
         // every endConsensus pass (NetworkOPs.cpp:1979-1981) unconditionally.
@@ -1038,7 +1047,6 @@ fn reconcile_preferred_lcl(
             local_lcl_seq = our_closed.header().seq,
             "LCL trace: preferred LCL is not resolver-visible; requesting consensus acquisition"
         );
-        shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
         shared_inbound.record_recovery_lcl_decision(
             preferred_hash,
             None,
@@ -1055,18 +1063,14 @@ fn reconcile_preferred_lcl(
             );
         }
 
-        // endConsensus -> beginConsensus preserves the actual local LCL as
-        // the ledger object while naming the desired network LCL by hash.
-        // Generic Consensus then owns its normal WrongLedger/GetConsL1 path.
-        let now = root.shared_time_keeper().close_time();
-        let prev_cx = crate::consensus_ledger_from_ledger(&our_closed);
-        if let Some(inbound_tx) = root.inbound_transactions().lock().ok().as_mut() {
-            inbound_tx.new_round(our_closed.header().seq);
-        }
-        runner.start_round(now, preferred_hash, prev_cx, false);
-        consensus_rt.update_phase(runner.phase());
-        consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
-        *last_round_ledger_id = Some(preferred_hash);
+        restart_preferred_lcl_recovery(
+            root,
+            runner,
+            consensus_rt,
+            last_round_ledger_id,
+            preferred_hash,
+            &our_closed,
+        );
         return PreferredLclReconciliation::Pending;
     };
 
@@ -1085,6 +1089,15 @@ fn reconcile_preferred_lcl(
             Some(candidate.as_ref()),
             "check_last_closed_ledger",
             "rejected_hash_mismatch",
+        );
+        shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
+        restart_preferred_lcl_recovery(
+            root,
+            runner,
+            consensus_rt,
+            last_round_ledger_id,
+            preferred_hash,
+            &our_closed,
         );
         return PreferredLclReconciliation::Pending;
     }
@@ -1125,6 +1138,19 @@ fn reconcile_preferred_lcl(
             "check_last_closed_ledger",
             "selected_but_incomplete",
         );
+        // `getLedgerByHash` in rippled only hands checkLastClosedLedger a
+        // completed inbound ledger. A resolver-visible partial ledger is
+        // therefore equivalent to a miss: keep the desired hash as
+        // `networkClosed` and let generic WrongLedger recovery acquire it.
+        shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
+        restart_preferred_lcl_recovery(
+            root,
+            runner,
+            consensus_rt,
+            last_round_ledger_id,
+            preferred_hash,
+            &our_closed,
+        );
         return PreferredLclReconciliation::Pending;
     }
     if !can_be_current || !compatible {
@@ -1162,6 +1188,11 @@ fn reconcile_preferred_lcl(
         return PreferredLclReconciliation::NoChange;
     }
 
+    // Rippled demotes only after the candidate survives canBeCurrent and
+    // compatibility admission. In particular, an incompatible resolver hit
+    // returns false from checkLastClosedLedger without a FULL→CONNECTED flap.
+    demote_for_preferred_lcl_divergence(root);
+
     switch_last_closed_ledger(
         root,
         shared_inbound,
@@ -1172,6 +1203,44 @@ fn reconcile_preferred_lcl(
         candidate,
     );
     PreferredLclReconciliation::Switched
+}
+
+/// Demote only once a preferred-LCL divergence has become actionable.
+///
+/// Rippled performs this after the `canBeCurrent`/`isCompatible` rejection
+/// path in `checkLastClosedLedger`, not immediately after selecting a different
+/// preferred hash.
+fn demote_for_preferred_lcl_divergence(root: &ApplicationRoot) {
+    if matches!(
+        root.network_ops_operating_mode(),
+        NetworkOpsOperatingMode::Tracking | NetworkOpsOperatingMode::Full
+    ) {
+        root.set_network_ops_operating_mode(NetworkOpsOperatingMode::Connected);
+    }
+}
+
+/// Preserve rippled's endConsensus → beginConsensus path when the preferred
+/// LCL is absent or incomplete. The local closed ledger supplies the ledger
+/// object, while `target` remains the desired networkClosed hash for generic
+/// WrongLedger/GetConsL1 recovery.
+fn restart_preferred_lcl_recovery(
+    root: &ApplicationRoot,
+    runner: &mut dyn ConsensusRunner,
+    consensus_rt: &AppConsensusRuntime,
+    last_round_ledger_id: &mut Option<Uint256>,
+    target: Uint256,
+    our_closed: &Arc<ledger::Ledger>,
+) {
+    demote_for_preferred_lcl_divergence(root);
+    let now = root.shared_time_keeper().close_time();
+    let prev_cx = crate::consensus_ledger_from_ledger(our_closed);
+    if let Some(inbound_tx) = root.inbound_transactions().lock().ok().as_mut() {
+        inbound_tx.new_round(our_closed.header().seq);
+    }
+    runner.start_round(now, target, prev_cx, false);
+    consensus_rt.update_phase(runner.phase());
+    consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
+    *last_round_ledger_id = Some(target);
 }
 
 /// Commit the resident, currently preferred LCL. Inbound completion only
@@ -1251,8 +1320,10 @@ fn check_accept_and_advance(
     root: &ApplicationRoot,
     shared_inbound: &Arc<InboundLedgers>,
     configured_ledger_history: u32,
+    configured_ledger_fetch_size: u32,
     last_history_tick: &mut Instant,
     history_fetch_pack: &mut Option<(u32, Instant)>,
+    history_reference: &mut Option<Arc<ledger::Ledger>>,
     allow_mode_promotion: bool,
 ) {
     let Some(lm_rt) = root.ledger_master_runtime() else {
@@ -1314,12 +1385,9 @@ fn check_accept_and_advance(
     // This is reached only from a captured endConsensus pass with no preferred
     // LCL change. Do not let routine Open/Establish maintenance or a switching
     // pass promote the node, matching NetworkOPsImp::endConsensus.
-    // Quaxar's AppOpenLedgerView does not retain the reference open ledger's
-    // parentCloseTime. Until that exact timestamp is modeled, keep the
-    // need-network-ledger guard here to prevent a freshly seeded local genesis
-    // LCL from appearing network-fresh and falsely entering FULL.
+    // The TRACKING transition alone is guarded by needNetworkLedger. As in
+    // NetworkOPsImp::endConsensus, the subsequent FULL freshness check is not.
     if allow_mode_promotion
-        && !root.need_network_ledger()
         && root
             .published_ledger()
             .or_else(|| root.closed_ledger())
@@ -1442,27 +1510,41 @@ fn check_accept_and_advance(
             );
 
             if should_acquire {
-                // Rippled parity: batch prefetch up to ledgerFetchSize (256)
-                // consecutive missing ledgers going backward from `missing`.
-                // Matches LedgerMaster::doAdvance prefetch loop.
-                let prefetch_limit = configured_ledger_history.min(256);
+                // Mirror rippled `fetchForHistory`: examine at most the
+                // node-size-specific `ledgerFetchSize` adjacent sequence
+                // numbers starting at `missing`. Do not keep scanning backward
+                // until sparse skip-list hashes happen to be found; that turns
+                // one bounded fetch pass into unbounded historical fan-out.
+                let prefetch_limit = configured_ledger_fetch_size
+                    .min(missing.saturating_sub(earliest_seq).saturating_add(1));
+                let prefetch_floor = missing
+                    .saturating_sub(prefetch_limit.saturating_sub(1))
+                    .max(earliest_seq);
                 let mut prefetch_count = 0u32;
 
-                for seq in (earliest_seq..=missing).rev() {
-                    if prefetch_count >= prefetch_limit {
-                        break;
-                    }
+                for seq in (prefetch_floor..=missing).rev() {
                     if complete.contains(seq) {
                         continue;
                     }
-                    // `getLedgerHashForHistory` first consults its local
-                    // history index, then derives the exact canonical hash
-                    // from the current validated ledger's skip list. Without
-                    // the second source a fresh node that has only its latest
-                    // validated ledger cannot begin backfill at all: no
-                    // earlier sequence has been inserted into the local
-                    // by-sequence cache yet.
-                    let Some(sha_hash) = history_hash_for_seq(&lm, seq) else {
+                    // `getLedgerHashForHistory` first consults the local
+                    // history index, then a recent history reference and the
+                    // validated skip list. If a direct lookup crosses a
+                    // 256-ledger skip-list boundary, it acquires the aligned
+                    // reference ledger before retrying the target lookup.
+                    let Some(sha_hash) = history_hash_for_seq(
+                        root,
+                        &lm,
+                        shared_inbound,
+                        history_reference.as_ref(),
+                        seq,
+                    ) else {
+                        // This is rippled's `clearLedger(missing + 1)` path:
+                        // an unresolved primary hash is not a reason to scan
+                        // a sparse, unbounded lower range in this pass.
+                        if seq == missing {
+                            lm.clear_ledger(missing.saturating_add(1));
+                            break;
+                        }
                         continue;
                     };
                     let hash = *sha_hash.as_uint256();
@@ -1479,6 +1561,13 @@ fn check_accept_and_advance(
                             &ledger,
                             AcquireReason::History,
                         );
+                        if seq == missing {
+                            *history_reference = Some(ledger);
+                            // `fetchForHistory` returns immediately after its
+                            // primary candidate is materialized. Prefetch is
+                            // only the fallback for an unavailable primary.
+                            break;
+                        }
                         continue;
                     }
                     // Rippled consults recentFailures_ only for the primary
@@ -1509,6 +1598,12 @@ fn check_accept_and_advance(
                             &ledger,
                             AcquireReason::History,
                         );
+                        if seq == missing {
+                            *history_reference = Some(ledger);
+                            // As above, a primary acquire that completed is
+                            // not followed by speculative predecessors.
+                            break;
+                        }
                         continue;
                     }
                     // In rippled, getFetchPack follows only an acquire() that
@@ -1517,6 +1612,8 @@ fn check_accept_and_advance(
                         request_history_fetch_pack(
                             root,
                             &lm,
+                            shared_inbound,
+                            history_reference.as_ref(),
                             missing,
                             configured_ledger_history,
                             history_fetch_pack,
@@ -1537,6 +1634,12 @@ fn check_accept_and_advance(
                 }
             }
         }
+    } else {
+        // LedgerMaster::doAdvance resets histLedger_ whenever its history
+        // acquisition gate is closed (publication lag, stale validated age,
+        // overload, or write pressure). Retaining it across that boundary can
+        // otherwise reuse a stale-chain skip list after recovery.
+        *history_reference = None;
     }
 }
 
@@ -1671,6 +1774,8 @@ fn persist_completed_inbound_ledger(
 fn request_history_fetch_pack(
     root: &ApplicationRoot,
     lm: &ledger::LedgerMaster,
+    shared_inbound: &Arc<InboundLedgers>,
+    history_reference: Option<&Arc<ledger::Ledger>>,
     missing: u32,
     fetch_depth: u32,
     in_flight: &mut Option<(u32, Instant)>,
@@ -1694,7 +1799,13 @@ fn request_history_fetch_pack(
     if missing <= earliest {
         return;
     }
-    let Some(have_hash) = history_hash_for_seq(lm, missing.saturating_add(1)) else {
+    let Some(have_hash) = history_hash_for_seq(
+        root,
+        lm,
+        shared_inbound,
+        history_reference,
+        missing.saturating_add(1),
+    ) else {
         return;
     };
 
@@ -1719,32 +1830,91 @@ fn request_history_fetch_pack(
         "requested history fetch pack");
 }
 
-/// Resolve the canonical hash for a history candidate without selecting a
-/// fork by sequence. Only the validated ledger's skip list and the validated
-/// history index are eligible sources; arbitrary completed acquisitions must
-/// never steer trusted-history backfill.
-fn history_hash_for_seq(
-    lm: &ledger::LedgerMaster,
+/// Resolve a canonical hash from one locally trusted history reference.
+fn history_hash_from_reference(
+    reference: &ledger::Ledger,
     seq: u32,
 ) -> Option<basics::sha_map_hash::SHAMapHash> {
-    let history = lm.ledger_history();
-    let indexed = history.get_ledger_hash(seq);
+    if seq == 0 || reference.header().seq < seq {
+        return None;
+    }
+    if reference.header().seq == seq {
+        return Some(reference.header().hash);
+    }
+    reference
+        .hash_of_seq(seq, &ledger::NullLedgerJournal)
+        .filter(|hash| !hash.is_zero())
+}
+
+/// Match rippled `walkHashBySeq`: when a target is outside a reference
+/// ledger's direct 256-entry skip-list window, acquire the next 256-aligned
+/// ledger whose hash is permanently addressable from that reference.
+fn history_hash_from_reference_or_candidate(
+    root: &ApplicationRoot,
+    shared_inbound: &Arc<InboundLedgers>,
+    reference: &ledger::Ledger,
+    seq: u32,
+) -> Option<basics::sha_map_hash::SHAMapHash> {
+    if let Some(hash) = history_hash_from_reference(reference, seq) {
+        return Some(hash);
+    }
+
+    let candidate_seq = seq.saturating_add(255) & !255;
+    if candidate_seq <= seq || reference.header().seq < candidate_seq {
+        return None;
+    }
+    let candidate_hash = history_hash_from_reference(reference, candidate_seq)?;
+    let candidate = root.resolve_ledger_by_hash(candidate_hash).or_else(|| {
+        shared_inbound.acquire(
+            *candidate_hash.as_uint256(),
+            candidate_seq,
+            AcquireReason::History,
+        )
+    })?;
+    if candidate.header().seq != candidate_seq {
+        tracing::warn!(
+            target: "history",
+            requested_seq = seq,
+            candidate_seq,
+            candidate_hash = %candidate_hash,
+            resolved_seq = candidate.header().seq,
+            "history reference ledger had an unexpected sequence"
+        );
+        return None;
+    }
+    history_hash_from_reference(candidate.as_ref(), seq)
+}
+
+/// Resolve the canonical hash for a history candidate without selecting a
+/// fork by sequence. This is the active equivalent of rippled
+/// `getLedgerHashForHistory`: check the validated history index, then
+/// `histLedger_`, then the validated ledger, walking through a bounded
+/// 256-aligned reference acquisition when necessary.
+fn history_hash_for_seq(
+    root: &ApplicationRoot,
+    lm: &ledger::LedgerMaster,
+    shared_inbound: &Arc<InboundLedgers>,
+    history_reference: Option<&Arc<ledger::Ledger>>,
+    seq: u32,
+) -> Option<basics::sha_map_hash::SHAMapHash> {
+    let indexed = lm.ledger_history().get_ledger_hash(seq);
     if !indexed.is_zero() {
         return Some(indexed);
     }
 
-    let hash = lm
-        .validated_ledger()
-        .and_then(|validated| {
-            if validated.header().seq == seq {
-                Some(validated.header().hash)
-            } else {
-                validated.hash_of_seq(seq, &ledger::NullLedgerJournal)
-            }
-        })
-        .filter(|hash| !hash.is_zero());
+    if let Some(reference) = history_reference
+        && let Some(hash) =
+            history_hash_from_reference_or_candidate(root, shared_inbound, reference.as_ref(), seq)
+    {
+        return Some(hash);
+    }
 
-    hash
+    let validated = lm.validated_ledger()?;
+    if history_reference.is_some_and(|reference| reference.header().hash == validated.header().hash)
+    {
+        return None;
+    }
+    history_hash_from_reference_or_candidate(root, shared_inbound, validated.as_ref(), seq)
 }
 
 /// A history fetch may be persisted as trusted full history only if a current
@@ -1882,6 +2052,37 @@ mod tests {
         assert!(!history_fetch_pack_requested(true, true, false));
         assert!(!history_fetch_pack_requested(true, false, true));
         assert!(!history_fetch_pack_requested(false, false, false));
+    }
+
+    #[test]
+    fn history_prefetch_window_is_contiguous_and_bounded() {
+        let missing: u32 = 10_000;
+        let earliest: u32 = 1;
+        let history_prefetch_limit: u32 = 4; // rippled medium `SizedItem::LedgerFetch`
+        let limit = history_prefetch_limit.min(missing - earliest + 1);
+        let floor = missing
+            .saturating_sub(limit.saturating_sub(1))
+            .max(earliest);
+        let window: Vec<u32> = (floor..=missing).rev().collect();
+
+        assert_eq!(window.len(), history_prefetch_limit as usize);
+        assert_eq!(window.first(), Some(&missing));
+        assert_eq!(window.last(), Some(&(missing - history_prefetch_limit + 1)));
+        assert!(window.windows(2).all(|pair| pair[0] == pair[1] + 1));
+    }
+
+    #[test]
+    fn history_prefetch_window_respects_earliest_sequence_floor() {
+        let missing: u32 = 10;
+        let earliest: u32 = 5;
+        let history_prefetch_limit: u32 = 4; // rippled medium `SizedItem::LedgerFetch`
+        let limit = history_prefetch_limit.min(missing - earliest + 1);
+        let floor = missing
+            .saturating_sub(limit.saturating_sub(1))
+            .max(earliest);
+        let window: Vec<u32> = (floor..=missing).rev().collect();
+
+        assert_eq!(window, vec![10, 9, 8, 7]);
     }
 
     #[test]

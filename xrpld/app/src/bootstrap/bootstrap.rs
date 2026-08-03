@@ -1646,6 +1646,7 @@ fn run_start_mode_consensus_loop(
         consensus_rt: Arc::clone(&consensus_rt),
         shared_inbound: Arc::clone(&shared_inbound),
         configured_ledger_history,
+        configured_ledger_fetch_size: node_size_profile.ledger_fetch_size,
         event_tx: Some(event_tx.clone()),
         shared_completed_rx: Some(shared_completed_rx),
     });
