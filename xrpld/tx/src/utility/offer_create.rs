@@ -227,7 +227,8 @@ where
         Ok(Some(owner_page)) => {
             offer_sle.set_field_u64(sf("sfOwnerNode"), owner_page);
         }
-        _ => return ApplyResult::new(Ter::TEF_FAILURE, false, false),
+        Ok(None) => return ApplyResult::new(Ter::TEC_DIR_FULL, false, false),
+        Err(_) => return ApplyResult::new(Ter::TEF_FAILURE, false, false),
     }
 
     // Insert into book directory and record the page
@@ -240,7 +241,8 @@ where
         Ok(Some(book_page)) => {
             offer_sle.set_field_u64(sf("sfBookNode"), book_page);
         }
-        _ => return ApplyResult::new(Ter::TEF_FAILURE, false, false),
+        Ok(None) => return ApplyResult::new(Ter::TEC_DIR_FULL, false, false),
+        Err(_) => return ApplyResult::new(Ter::TEF_FAILURE, false, false),
     }
 
     // Adjust owner count

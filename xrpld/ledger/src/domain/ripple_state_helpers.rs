@@ -265,8 +265,18 @@ pub fn issue_iou<V: ApplyView>(
             protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(low_account.data()));
         let high_dir =
             protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(high_account.data()));
-        let _ = crate::views::directory::dir_insert(view, &low_dir, line_keylet.key, &|_obj| {});
-        let _ = crate::views::directory::dir_insert(view, &high_dir, line_keylet.key, &|_obj| {});
+        if matches!(
+            crate::views::directory::dir_insert(view, &low_dir, line_keylet.key, &|_obj| {}),
+            Ok(None)
+        ) {
+            return Ter::TEC_DIR_FULL;
+        }
+        if matches!(
+            crate::views::directory::dir_insert(view, &high_dir, line_keylet.key, &|_obj| {}),
+            Ok(None)
+        ) {
+            return Ter::TEC_DIR_FULL;
+        }
 
         // Adjust owner count for receiver
         let acct_keylet =
@@ -711,21 +721,31 @@ fn direct_send_no_fee_iou<V: ApplyView>(
         let low_dir = protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(
             (if b_sender_high { receiver } else { sender }).data(),
         ));
-        let _ = crate::dir_append(
-            view as &mut dyn ApplyView,
-            &low_dir,
-            line_keylet.key,
-            &|_| {},
-        );
+        if matches!(
+            crate::dir_append(
+                view as &mut dyn ApplyView,
+                &low_dir,
+                line_keylet.key,
+                &|_| {},
+            ),
+            Ok(None)
+        ) {
+            return Ter::TEC_DIR_FULL;
+        }
         let high_dir = protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(
             (if b_sender_high { sender } else { receiver }).data(),
         ));
-        let _ = crate::dir_append(
-            view as &mut dyn ApplyView,
-            &high_dir,
-            line_keylet.key,
-            &|_| {},
-        );
+        if matches!(
+            crate::dir_append(
+                view as &mut dyn ApplyView,
+                &high_dir,
+                line_keylet.key,
+                &|_| {},
+            ),
+            Ok(None)
+        ) {
+            return Ter::TEC_DIR_FULL;
+        }
 
         // Adjust receiver's owner count
         if let Ok(Some(rcv_sle)) = view.peek(protocol::account_keylet(

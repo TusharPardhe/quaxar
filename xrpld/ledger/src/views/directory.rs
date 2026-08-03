@@ -11,6 +11,11 @@ use crate::views::apply_view::ApplyView;
 
 pub const DIR_NODE_MAX_ENTRIES: usize = 32;
 
+/// reference: `kDirNodeMaxPages` in `xrpl/protocol/Protocol.h`. Legacy cap on
+/// the number of pages a directory chain may grow to; made obsolete by the
+/// `fixDirectoryLimit` amendment.
+pub const DIR_NODE_MAX_PAGES: u64 = 262_144;
+
 fn sf(name: &str) -> &'static protocol::SField {
     protocol::get_field_by_symbol(name)
 }
@@ -122,6 +127,14 @@ fn insert_key(
     Ok(page)
 }
 
+/// reference: `ApplyView::dirAdd` -> `directory::insertPage` in
+/// `xrpl/ledger/ApplyView.cpp` -- before the `fixDirectoryLimit` amendment,
+/// directory chains were capped at `kDirNodeMaxPages` pages. Pure predicate
+/// so the boundary condition is unit-testable without an `ApplyView`.
+fn directory_page_limit_exceeded(new_page: u64, fix_directory_limit_enabled: bool) -> bool {
+    !fix_directory_limit_enabled && new_page >= DIR_NODE_MAX_PAGES
+}
+
 fn insert_page(
     view: &mut dyn ApplyView,
     page: u64,
@@ -134,6 +147,12 @@ fn insert_page(
 ) -> Result<Option<u64>, ViewError> {
     let new_page = page.wrapping_add(1);
     if new_page == 0 {
+        return Ok(None);
+    }
+    let fix_directory_limit_enabled = view
+        .rules()
+        .enabled(&protocol::feature_id("fixDirectoryLimit"));
+    if directory_page_limit_exceeded(new_page, fix_directory_limit_enabled) {
         return Ok(None);
     }
 
@@ -372,4 +391,30 @@ pub fn dir_remove(
     }
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // reference: `ApplyView::dirAdd` -> `directory::insertPage` in
+    // `xrpl/ledger/ApplyView.cpp`, guarded by
+    // `!view.rules().enabled(fixDirectoryLimit) && page >= kDirNodeMaxPages`.
+
+    #[test]
+    fn page_limit_enforced_when_fix_directory_limit_disabled() {
+        assert!(!directory_page_limit_exceeded(
+            DIR_NODE_MAX_PAGES - 1,
+            false
+        ));
+        assert!(directory_page_limit_exceeded(DIR_NODE_MAX_PAGES, false));
+        assert!(directory_page_limit_exceeded(DIR_NODE_MAX_PAGES + 1, false));
+    }
+
+    #[test]
+    fn page_limit_bypassed_when_fix_directory_limit_enabled() {
+        assert!(!directory_page_limit_exceeded(DIR_NODE_MAX_PAGES, true));
+        assert!(!directory_page_limit_exceeded(DIR_NODE_MAX_PAGES + 1, true));
+        assert!(!directory_page_limit_exceeded(u64::MAX - 1, true));
+    }
 }

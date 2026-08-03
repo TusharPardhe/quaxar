@@ -1685,9 +1685,9 @@ fn has_deposit_preauth_reserve<V: ledger::ApplyView>(
 ) -> bool {
     let balance = pre_fee_balance_drops
         .unwrap_or_else(|| owner.get_field_amount(sf("sfBalance")).xrp().drops());
-    let reserve = view
-        .fees()
-        .account_reserve(owner.get_field_u32(sf("sfOwnerCount")) as usize + 1) as i64;
+    let reserve =
+        view.fees()
+            .account_reserve(owner.get_field_u32(sf("sfOwnerCount")) as usize + 1) as i64;
     balance >= reserve
 }
 
@@ -2276,7 +2276,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 return Ter::TEF_TOO_BIG;
             }
             for entry_key in &entries {
-                let Some(entry) = view.peek(protocol::child_keylet(*entry_key)).ok().flatten() else {
+                let Some(entry) = view.peek(protocol::child_keylet(*entry_key)).ok().flatten()
+                else {
                     return Ter::TEF_BAD_LEDGER;
                 };
                 if !matches!(
@@ -2310,7 +2311,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             }
 
             for entry_key in entries {
-                let Some(entry) = view.peek(protocol::child_keylet(entry_key)).ok().flatten() else {
+                let Some(entry) = view.peek(protocol::child_keylet(entry_key)).ok().flatten()
+                else {
                     return Ter::TEF_BAD_LEDGER;
                 };
                 let result = match entry.get_type() {
@@ -2333,7 +2335,9 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                         ledger::credential_helpers::delete_sle(view, entry)
                             .unwrap_or(Ter::TEF_BAD_LEDGER)
                     }
-                    LedgerEntryType::Delegate => remove_account_delete_delegate(view, account, entry),
+                    LedgerEntryType::Delegate => {
+                        remove_account_delete_delegate(view, account, entry)
+                    }
                     _ => Ter::TEC_HAS_OBLIGATIONS,
                 };
                 if result != Ter::TES_SUCCESS {
@@ -2342,7 +2346,11 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             }
 
             if let Ok(Some(root_directory)) = view.peek(owner_dir) {
-                if !root_directory.get_field_v256(sf("sfIndexes")).value().is_empty() {
+                if !root_directory
+                    .get_field_v256(sf("sfIndexes"))
+                    .value()
+                    .is_empty()
+                {
                     return Ter::TEC_HAS_OBLIGATIONS;
                 }
                 if view.erase(root_directory).is_err() {
@@ -2459,7 +2467,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                 .is_field_present(unauthorize_field)
                 .then(|| sttx.get_account_id(unauthorize_field));
             let authorize_credentials_present = sttx.is_field_present(authorize_credentials_field);
-            let unauthorize_credentials_present = sttx.is_field_present(unauthorize_credentials_field);
+            let unauthorize_credentials_present =
+                sttx.is_field_present(unauthorize_credentials_field);
             if !deposit_preauth_check_extra_features(
                 authorize_credentials_present,
                 unauthorize_credentials_present,
@@ -2505,7 +2514,9 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     Uint160::from_void(authorized.data()),
                 );
                 if !view
-                    .exists(protocol::account_keylet(Uint160::from_void(authorized.data())))
+                    .exists(protocol::account_keylet(Uint160::from_void(
+                        authorized.data(),
+                    )))
                     .unwrap_or(false)
                 {
                     return Ter::TEC_NO_TARGET;
@@ -2549,9 +2560,8 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             } else {
                 unauthorize_credentials_field
             };
-            let credential_pairs = sorted_deposit_preauth_credentials(
-                &sttx.get_field_array(credentials_field),
-            );
+            let credential_pairs =
+                sorted_deposit_preauth_credentials(&sttx.get_field_array(credentials_field));
             let credential_hashes = deposit_preauth_credential_hashes(&credential_pairs);
             let keylet = protocol::deposit_preauth_credentials_keylet(
                 Uint160::from_void(account.data()),
@@ -3044,14 +3054,17 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             }
             // Add to owner directory
             let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
-            if let Ok(Some(page)) = ledger::dir_append(view, &owner_dir, check_keylet.key, &|_| {})
-            {
-                sle.set_field_u64(sf("sfOwnerNode"), page);
+            match ledger::dir_append(view, &owner_dir, check_keylet.key, &|_| {}) {
+                Ok(Some(page)) => sle.set_field_u64(sf("sfOwnerNode"), page),
+                Ok(None) => return Ter::TEC_DIR_FULL,
+                Err(_) => {}
             }
             // Add to destination directory
             let dst_dir = owner_dir_keylet(Uint160::from_void(dst.data()));
-            if let Ok(Some(page)) = ledger::dir_append(view, &dst_dir, check_keylet.key, &|_| {}) {
-                sle.set_field_u64(sf("sfDestinationNode"), page);
+            match ledger::dir_append(view, &dst_dir, check_keylet.key, &|_| {}) {
+                Ok(Some(page)) => sle.set_field_u64(sf("sfDestinationNode"), page),
+                Ok(None) => return Ter::TEC_DIR_FULL,
+                Err(_) => {}
             }
             let _ = view.insert(Arc::new(sle));
             if let Ok(Some(acct)) =
@@ -3241,13 +3254,17 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             }
             // Add to owner directory
             let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
-            if let Ok(Some(page)) = ledger::dir_append(view, &owner_dir, chan_keylet.key, &|_| {}) {
-                sle.set_field_u64(sf("sfOwnerNode"), page);
+            match ledger::dir_append(view, &owner_dir, chan_keylet.key, &|_| {}) {
+                Ok(Some(page)) => sle.set_field_u64(sf("sfOwnerNode"), page),
+                Ok(None) => return Ter::TEC_DIR_FULL,
+                Err(_) => {}
             }
             // Add to destination's owner directory
             let dst_dir = owner_dir_keylet(Uint160::from_void(dst.data()));
-            if let Ok(Some(page)) = ledger::dir_append(view, &dst_dir, chan_keylet.key, &|_| {}) {
-                sle.set_field_u64(sf("sfDestinationNode"), page);
+            match ledger::dir_append(view, &dst_dir, chan_keylet.key, &|_| {}) {
+                Ok(Some(page)) => sle.set_field_u64(sf("sfDestinationNode"), page),
+                Ok(None) => return Ter::TEC_DIR_FULL,
+                Err(_) => {}
             }
             let _ = view.insert(Arc::new(sle));
             // Adjust owner count
@@ -4648,10 +4665,10 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             }
             if is_new {
                 let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-                if let Ok(Some(page)) =
-                    ledger::dir_append(view, &owner_dir, did_keylet.key, &|_| {})
-                {
-                    sle.set_field_u64(sf("sfOwnerNode"), page);
+                match ledger::dir_append(view, &owner_dir, did_keylet.key, &|_| {}) {
+                    Ok(Some(page)) => sle.set_field_u64(sf("sfOwnerNode"), page),
+                    Ok(None) => return Ter::TEC_DIR_FULL,
+                    Err(_) => {}
                 }
                 let _ = view.insert(Arc::new(sle));
                 if let Ok(Some(acct)) =

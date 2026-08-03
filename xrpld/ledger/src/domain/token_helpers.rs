@@ -301,12 +301,14 @@ fn add_empty_iou_holding<V: ApplyView>(
     let low_dir = owner_dir_keylet(to_uint160(if high { dst } else { src }));
     let low_node = match crate::dir_insert(view, &low_dir, line_keylet.key, &|_| {}) {
         Ok(Some(page)) => page,
-        _ => return protocol::Ter::TEF_BAD_LEDGER,
+        Ok(None) => return protocol::Ter::TEC_DIR_FULL,
+        Err(_) => return protocol::Ter::TEF_BAD_LEDGER,
     };
     let high_dir = owner_dir_keylet(to_uint160(if high { src } else { dst }));
     let high_node = match crate::dir_insert(view, &high_dir, line_keylet.key, &|_| {}) {
         Ok(Some(page)) => page,
-        _ => return protocol::Ter::TEF_BAD_LEDGER,
+        Ok(None) => return protocol::Ter::TEC_DIR_FULL,
+        Err(_) => return protocol::Ter::TEF_BAD_LEDGER,
     };
     obj.set_field_u64(sf("sfLowNode"), low_node);
     obj.set_field_u64(sf("sfHighNode"), high_node);
@@ -430,7 +432,8 @@ fn add_empty_mpt_holding<V: ApplyView>(
     let owner_dir = owner_dir_keylet(to_uint160(*account));
     let owner_node = match crate::dir_append(view, &owner_dir, token_keylet.key, &|_| {}) {
         Ok(Some(page)) => page,
-        _ => return protocol::Ter::TEF_BAD_LEDGER,
+        Ok(None) => return protocol::Ter::TEC_DIR_FULL,
+        Err(_) => return protocol::Ter::TEF_BAD_LEDGER,
     };
 
     let mut token = STLedgerEntry::new(token_keylet);

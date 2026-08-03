@@ -590,10 +590,14 @@ fn trust_create<V: ledger::ApplyView>(
     let high_account = if b_high { account } else { dst };
 
     let low_dir = protocol::owner_dir_keylet(Uint160::from_void(low_account.data()));
-    let _ = ledger::dir_append(view, &low_dir, key, &|_| {});
+    if matches!(ledger::dir_append(view, &low_dir, key, &|_| {}), Ok(None)) {
+        return Ter::TEC_DIR_FULL;
+    }
 
     let high_dir = protocol::owner_dir_keylet(Uint160::from_void(high_account.data()));
-    let _ = ledger::dir_append(view, &high_dir, key, &|_| {});
+    if matches!(ledger::dir_append(view, &high_dir, key, &|_| {}), Ok(None)) {
+        return Ter::TEC_DIR_FULL;
+    }
 
     let _ = view.insert(new_sle);
 

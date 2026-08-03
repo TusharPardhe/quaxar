@@ -53,7 +53,8 @@ pub fn apply_xchain_create_bridge<V: ApplyView>(view: &mut V, sttx: &STTx) -> Te
         &describe,
     ) {
         Ok(Some(p)) => p,
-        _ => return Ter::TEC_DIR_FULL,
+        Ok(None) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEC_DIR_FULL,
     };
     sle_bridge.set_field_u64(sf("sfOwnerNode"), page);
 
@@ -165,7 +166,8 @@ pub fn apply_xchain_create_claim_id<V: ApplyView>(view: &mut V, sttx: &STTx) -> 
         &describe,
     ) {
         Ok(Some(p)) => p,
-        _ => return Ter::TEC_DIR_FULL,
+        Ok(None) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEC_DIR_FULL,
     };
     sle_claim_id.set_field_u64(sf("sfOwnerNode"), page);
 
@@ -1075,7 +1077,8 @@ pub fn apply_xchain_add_account_create_attestation<V: ApplyView>(view: &mut V, s
             &describe,
         ) {
             Ok(Some(page)) => page,
-            _ => return Ter::TEC_DIR_FULL,
+            Ok(None) => return Ter::TEC_DIR_FULL,
+            Err(_) => return Ter::TEC_DIR_FULL,
         };
         sle_claim_id.set_field_u64(sf("sfOwnerNode"), page);
 

@@ -162,7 +162,8 @@ pub fn check_create_mpt<V: ApplyView>(
         Ok(Some(owner_node)) => {
             mptoken.set_field_u64(sf("sfOwnerNode"), owner_node);
         }
-        _ => return Ter::TEC_DIR_FULL,
+        Ok(None) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEC_DIR_FULL,
     }
 
     if view.insert(Arc::new(mptoken)).is_err() {

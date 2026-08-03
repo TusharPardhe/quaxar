@@ -920,7 +920,8 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
                 &|_| {},
             ) {
                 Ok(Some(page)) => page,
-                _ => return Ter::TEF_BAD_LEDGER,
+                Ok(None) => return Ter::TEC_DIR_FULL,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
             };
             let borrower_page = match ledger::dir_insert(
                 view,
@@ -929,7 +930,8 @@ pub fn apply_loan_set<V: ApplyView>(view: &mut V, sttx: &STTx, pre_fee_balance_d
                 &|_| {},
             ) {
                 Ok(Some(page)) => page,
-                _ => return Ter::TEF_BAD_LEDGER,
+                Ok(None) => return Ter::TEC_DIR_FULL,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
             };
             loan.set_field_u64(sf("sfLoanBrokerNode"), broker_pseudo_page);
             loan.set_field_u64(sf("sfOwnerNode"), borrower_page);
@@ -1091,7 +1093,8 @@ pub fn apply_loan_broker_set<V: ApplyView>(
         &|_| {},
     ) {
         Ok(Some(page)) => page,
-        _ => return Ter::TEF_BAD_LEDGER,
+        Ok(None) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let vault_page = match ledger::dir_insert(
         view,
@@ -1100,7 +1103,8 @@ pub fn apply_loan_broker_set<V: ApplyView>(
         &|_| {},
     ) {
         Ok(Some(page)) => page,
-        _ => return Ter::TEF_BAD_LEDGER,
+        Ok(None) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
     let _ = ledger::adjust_owner_count(view, &owner_sle, 2);

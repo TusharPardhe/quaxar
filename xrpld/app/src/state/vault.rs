@@ -848,7 +848,8 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         &|_| {},
     ) {
         Ok(Some(page)) => page,
-        _ => return Ter::TEF_BAD_LEDGER,
+        Ok(None) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
     let mut issuance = STLedgerEntry::new(issuance_keylet);
     issuance.set_account_id(sf("sfIssuer"), pseudo);
@@ -902,7 +903,8 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
     let owner_page = match dir_append(view, &owner_dir_keylet(to_160(&owner)), keylet.key, &|_| {})
     {
         Ok(Some(page)) => page,
-        _ => return Ter::TEF_BAD_LEDGER,
+        Ok(None) => return Ter::TEC_DIR_FULL,
+        Err(_) => return Ter::TEF_BAD_LEDGER,
     };
 
     let mut vault = STLedgerEntry::from_type_and_key(LedgerEntryType::Vault, keylet.key);
