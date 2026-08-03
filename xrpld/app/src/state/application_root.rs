@@ -6431,7 +6431,7 @@ impl ApplicationRoot {
                 None
             }
         };
-        tracing::info!(
+        tracing::debug!(
             target: "lcl_trace",
             event = "resolver_lookup",
             %hash,
@@ -6545,9 +6545,9 @@ impl ApplicationRoot {
                 .map(|current| (*current.header().hash.as_uint256(), current.header().seq));
             let last_valid_before = lm.last_valid_ledger();
             if seq < current_valid_seq {
-                tracing::info!(
-                    target: "lcl_trace",
-                    event = "validation_observation_ignored_old",
+                tracing::debug!(
+                target: "lcl_trace",
+                event = "validation_observation_ignored_old",
                     observed_hash = %hash,
                     observed_seq = seq,
                     current_valid_seq,
@@ -6568,19 +6568,34 @@ impl ApplicationRoot {
             }
             let val_count = self.trusted_validation_count_for_ledger(hash, seq);
             let quorum = self.validators().quorum();
-            tracing::info!(
-                target: "lcl_trace",
-                event = "validation_observed",
-                observed_hash = %hash,
-                observed_seq = seq,
-                current_valid_seq,
-                val_count,
-                quorum,
-                quorum_reached = val_count >= quorum,
-                ?validated_anchor,
-                ?last_valid_before,
-                "LCL trace: quorum state evaluated for validation-backed ledger"
-            );
+            if val_count >= quorum {
+                tracing::info!(
+                    target: "lcl_trace",
+                    event = "validation_quorum_observed",
+                    observed_hash = %hash,
+                    observed_seq = seq,
+                    current_valid_seq,
+                    val_count,
+                    quorum,
+                    ?validated_anchor,
+                    ?last_valid_before,
+                    "LCL trace: quorum reached for validation-backed ledger"
+                );
+            } else {
+                tracing::debug!(
+                    target: "lcl_trace",
+                    event = "validation_observed",
+                    observed_hash = %hash,
+                    observed_seq = seq,
+                    current_valid_seq,
+                    val_count,
+                    quorum,
+                    quorum_reached = false,
+                    ?validated_anchor,
+                    ?last_valid_before,
+                    "LCL trace: validation quorum not yet reached"
+                );
+            }
             tracing::debug!(
                 target: "lcl_audit",
                 observed_hash = %hash,
@@ -6653,7 +6668,7 @@ impl ApplicationRoot {
                         acquisition_dispatched = true;
                     }
                 }
-                tracing::info!(
+                tracing::debug!(
                     target: "lcl_trace",
                     event = "validation_resolver_miss_acquire",
                     requested_hash = %hash,
@@ -6678,7 +6693,7 @@ impl ApplicationRoot {
                 ledger.header().seq,
             );
             let quorum = self.validators().quorum();
-            tracing::info!(
+            tracing::debug!(
                 target: "lcl_trace",
                 event = "validation_resolver_hit",
                 candidate_hash = %ledger.header().hash,
@@ -6752,19 +6767,35 @@ impl ApplicationRoot {
             self.current_close_time_seconds(),
         );
         if !accepted {
-            tracing::info!(
-                target: "lcl_trace",
-                event = "validation_adoption_rejected",
-                candidate_hash = %ledger.header().hash,
-                candidate_seq = ledger.header().seq,
-                current_valid_seq,
-                val_count,
-                quorum,
-                can_be_current,
-                sequence_advances = ledger.header().seq > current_valid_seq,
-                quorum_reached = val_count >= quorum,
-                "LCL trace: resolved validation ledger failed adoption gates"
-            );
+            if val_count >= quorum || !can_be_current {
+                tracing::info!(
+                    target: "lcl_trace",
+                    event = "validation_adoption_rejected",
+                    candidate_hash = %ledger.header().hash,
+                    candidate_seq = ledger.header().seq,
+                    current_valid_seq,
+                    val_count,
+                    quorum,
+                    can_be_current,
+                    sequence_advances = ledger.header().seq > current_valid_seq,
+                    quorum_reached = val_count >= quorum,
+                    "LCL trace: validation-backed ledger failed a meaningful adoption gate"
+                );
+            } else {
+                tracing::debug!(
+                    target: "lcl_trace",
+                    event = "validation_adoption_rejected",
+                    candidate_hash = %ledger.header().hash,
+                    candidate_seq = ledger.header().seq,
+                    current_valid_seq,
+                    val_count,
+                    quorum,
+                    can_be_current,
+                    sequence_advances = ledger.header().seq > current_valid_seq,
+                    quorum_reached = false,
+                    "LCL trace: validation-backed ledger lacks quorum"
+                );
+            }
             tracing::debug!(
                 target: "lcl_audit",
                 candidate_hash = %ledger.header().hash,
