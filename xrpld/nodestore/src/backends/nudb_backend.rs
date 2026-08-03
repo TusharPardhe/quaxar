@@ -8,6 +8,7 @@ use basics::basic_config::Section;
 use dashmap::DashMap;
 use rayon::prelude::*;
 use std::any::Any;
+#[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -3346,7 +3347,6 @@ mod tests {
     use dashmap::DashMap;
     use std::fs;
     use std::panic::{self, AssertUnwindSafe};
-    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
