@@ -1061,3 +1061,85 @@ fn nudb_flush_fix_enables_state_reads_across_builds() {
     }
     // Reaching here without panic proves flush fix works
 }
+
+#[test]
+#[ignore = "requires mainnet NuDB (NUDB_PATH env or default) and mainnet RPC access"]
+fn mainnet_ledger_106053457_replay_reproduces_offer_create_divergence() {
+    let nudb_path = std::env::var("NUDB_PATH").unwrap_or_else(|_| DEFAULT_NUDB_PATH.to_string());
+    if !Path::new(&nudb_path).exists() {
+        eprintln!(
+            "skipping mainnet replay: NuDB path does not exist: {}",
+            nudb_path
+        );
+        return;
+    }
+
+    let parent_seq = 106_053_456;
+    let child_seq = 106_053_457;
+
+    let parent = load_parent_ledger(parent_seq, &nudb_path)
+        .unwrap_or_else(|error| panic!("failed to load mainnet parent ledger: {}", error));
+    let expected_parent_header =
+        fetch_ledger_header(parent_seq).expect("fetch expected parent header");
+    assert_eq!(
+        parent.header().account_hash,
+        expected_parent_header.account_hash,
+        "parent account hash must match canonical chain before child replay"
+    );
+
+    let acquired_header = fetch_ledger_header(child_seq).expect("fetch canonical child header");
+    let tx_items = fetch_tx_items_for_ledger(child_seq).expect("fetch canonical child tx items");
+
+    eprintln!(
+        "mainnet_106053457: parent_seq={} child_seq={} tx_count={}",
+        parent_seq,
+        child_seq,
+        tx_items.len()
+    );
+
+    let (built, ters) = replay_child_ledger_unverified(&parent, acquired_header.clone(), &tx_items)
+        .expect("replay child ledger");
+
+    // Print every non-tesSUCCESS/non-tecCLAIM result with its account+sequence
+    // so the exact failing transaction(s) and TER codes are visible without
+    // grepping production logs.
+    for ((tx_data, tx_id), ter) in tx_items.iter().zip(ters.iter()) {
+        let mut outer = SerialIter::new(tx_data);
+        let tx_bytes = outer.get_vl();
+        let mut sit = SerialIter::new(&tx_bytes);
+        let sttx = STTx::from_serial_iter(&mut sit);
+        let account = sttx.get_account_id(protocol::get_field_by_symbol("sfAccount"));
+        let seq = sttx.get_field_u32(protocol::get_field_by_symbol("sfSequence"));
+        let is_success = matches!(*ter, Ter::TES_SUCCESS) || protocol::is_tec_claim(*ter);
+        eprintln!(
+            "mainnet_106053457: tx_id={} account={} seq={} ter={:?} ok={}",
+            tx_id, account, seq, ter, is_success
+        );
+    }
+
+    let failing: Vec<_> = ters
+        .iter()
+        .enumerate()
+        .filter(|(_, ter)| !matches!(**ter, Ter::TES_SUCCESS) && !protocol::is_tec_claim(**ter))
+        .collect();
+    eprintln!(
+        "mainnet_106053457: {} of {} transactions did not apply",
+        failing.len(),
+        ters.len()
+    );
+
+    eprintln!(
+        "mainnet_106053457: built account_hash={} expected={}",
+        built.header().account_hash,
+        acquired_header.account_hash
+    );
+    eprintln!(
+        "mainnet_106053457: built ledger_hash={} expected={}",
+        protocol::calculate_ledger_hash(&built.header()),
+        acquired_header.hash
+    );
+
+    // Intentionally not asserting equality yet — this test exists to
+    // reproduce and observe the divergence deterministically. Once the root
+    // cause is fixed, promote these to hard assertions.
+}
