@@ -322,6 +322,23 @@ impl MonitoredMode {
 /// application responsible for serializing access. That constraint carries
 /// over unchanged: callers must synchronize access to a shared
 /// `Consensus<A>` instance (e.g. behind a `Mutex`) themselves.
+/// Read-only per-round evidence used by the diagnostics build. It has no
+/// effect on consensus progression or peer handling.
+#[derive(Clone, Copy, Debug)]
+pub struct ConsensusRoundDiagnostics {
+    pub phase: ConsensusPhase,
+    pub mode: ConsensusMode,
+    pub prev_proposers: usize,
+    pub current_peer_positions: usize,
+    pub acquired_tx_sets: usize,
+    pub peer_positions_with_acquired_set: usize,
+    pub selected_tx_set_peer_support: usize,
+    pub selected_tx_set_acquired: bool,
+    pub dispute_count: usize,
+    pub converge_percent: i64,
+    pub consensus_state: Option<ConsensusState>,
+}
+
 pub struct Consensus<A: ConsensusAdaptor, C: ConsensusClock = SystemConsensusClock> {
     clock: C,
 
@@ -412,6 +429,38 @@ impl<A: ConsensusAdaptor, C: ConsensusClock> Consensus<A, C> {
 
     pub fn mode(&self) -> ConsensusMode {
         self.mode.get()
+    }
+
+    /// Return a read-only snapshot of the active round for diagnostics. The
+    /// selected transaction-set id is normally the set captured at onAccept.
+    pub fn round_diagnostics(
+        &self,
+        selected_tx_set: &<A::TxSet as ConsensusTxSet>::Id,
+    ) -> ConsensusRoundDiagnostics {
+        let peer_positions_with_acquired_set = self
+            .curr_peer_positions
+            .values()
+            .filter(|position| self.acquired.contains_key(position.proposal().position()))
+            .count();
+        let selected_tx_set_peer_support = self
+            .curr_peer_positions
+            .values()
+            .filter(|position| position.proposal().position() == selected_tx_set)
+            .count();
+        let result = self.result.as_ref();
+        ConsensusRoundDiagnostics {
+            phase: self.phase,
+            mode: self.mode.get(),
+            prev_proposers: self.prev_proposers,
+            current_peer_positions: self.curr_peer_positions.len(),
+            acquired_tx_sets: self.acquired.len(),
+            peer_positions_with_acquired_set,
+            selected_tx_set_peer_support,
+            selected_tx_set_acquired: self.acquired.contains_key(selected_tx_set),
+            dispute_count: result.map_or(0, |result| result.disputes.len()),
+            converge_percent: self.converge_percent,
+            consensus_state: result.map(|result| result.state),
+        }
     }
 
     /// Kick off the next round of consensus. Matches `startRound`.

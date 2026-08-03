@@ -572,7 +572,18 @@ fn strand_loop(
                 proposal.suppression,
                 prop,
             );
-            runner.peer_proposal(now, &peer_pos);
+            let accepted = runner.peer_proposal(now, &peer_pos);
+            tracing::info!(
+                target: "consensus_trace",
+                event = "proposal_strand_processed",
+                round_prev = %runner.prev_ledger_id(),
+                proposal_prev = %proposal.previous_ledger,
+                proposal_tx_set = %proposal.current_tx_hash,
+                proposal_seq = proposal.message.propose_seq,
+                accepted,
+                phase = ?runner.phase(),
+                "CONSENSUS_TRACE trusted proposal processed by strand"
+            );
         });
         consensus_rt.update_phase(runner.phase());
         consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
@@ -589,7 +600,15 @@ fn strand_loop(
             runner.got_tx_set(now, tx_set);
             announce_completed_tx_set(&root, hash);
             consensus_rt.update_phase(runner.phase());
-            tracing::debug!(target: "consensus", %hash, "strand: got_tx_set processed");
+            tracing::info!(
+                target: "consensus_trace",
+                event = "txset_strand_completed",
+                source = "txset_receiver",
+                round_prev = %runner.prev_ledger_id(),
+                tx_set = %hash,
+                phase = ?runner.phase(),
+                "CONSENSUS_TRACE completed transaction set delivered to strand"
+            );
         });
 
         // Also drain a bounded slice from the map-complete receiver.
@@ -605,7 +624,15 @@ fn strand_loop(
                 runner.got_tx_set(now, tx_set);
                 announce_completed_tx_set(&root, hash);
                 consensus_rt.update_phase(runner.phase());
-                tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (map_complete)");
+                tracing::info!(
+                    target: "consensus_trace",
+                    event = "txset_strand_completed",
+                    source = "map_complete_receiver",
+                    round_prev = %runner.prev_ledger_id(),
+                    tx_set = %hash,
+                    phase = ?runner.phase(),
+                    "CONSENSUS_TRACE completed transaction set delivered to strand"
+                );
             });
         }
 
@@ -629,7 +656,15 @@ fn strand_loop(
             runner.got_tx_set(now, tx_set);
             announce_completed_tx_set(&root, hash);
             consensus_rt.update_phase(runner.phase());
-            tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (durable map completion)");
+            tracing::info!(
+                target: "consensus_trace",
+                event = "txset_strand_completed",
+                source = "durable_map_completion",
+                round_prev = %runner.prev_ledger_id(),
+                tx_set = %hash,
+                phase = ?runner.phase(),
+                "CONSENSUS_TRACE completed transaction set delivered to strand"
+            );
         }
 
         // ─── 5. Persist inbound completion before LCL reconciliation ────
