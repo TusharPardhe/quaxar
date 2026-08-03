@@ -13,7 +13,10 @@ use protocol::{
     KeyType, PublicKey, parse_base58_node_public, sha512_digest, sha512_half, verify_digest,
 };
 
-use crate::protocol_version::{ProtocolVersion, supported_protocol_versions};
+use crate::protocol_version::{
+    ProtocolVersion, is_protocol_supported, negotiate_protocol_version, parse_protocol_versions,
+    supported_protocol_versions,
+};
 
 pub const FEATURE_COMPR: &str = "compr";
 pub const FEATURE_VPRR: &str = "vprr";
@@ -143,6 +146,58 @@ pub fn make_features_response_header(
         header.push_str("vprr=1;");
     }
     header
+}
+
+fn has_header_token(headers: &HeaderMap, name: &str, expected: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case(expected))
+        })
+}
+
+/// Validate an inbound peer Upgrade request before allocating an active peer.
+/// This mirrors `OverlayImpl::onHandoff`: an Upgrade request must identify
+/// itself as a peer and offer at least one mutually supported XRPL version.
+pub fn negotiate_inbound_peer_upgrade(request: &Request<()>) -> Option<ProtocolVersion> {
+    if request.method() != Method::GET
+        || request.version() < Version::HTTP_11
+        || !has_header_token(request.headers(), "Connection", "Upgrade")
+        || !has_header_token(request.headers(), "Connect-As", "Peer")
+    {
+        return None;
+    }
+    let offered = request.headers().get(UPGRADE)?.to_str().ok()?;
+    negotiate_protocol_version(parse_protocol_versions(offered))
+}
+
+/// Validate the peer Upgrade response selected by an outbound connection.
+/// A response selects one (not a list of) supported protocol version.
+pub fn validate_outbound_peer_upgrade(response: &Response<()>) -> Result<ProtocolVersion, String> {
+    if response.version() < Version::HTTP_11
+        || !has_header_token(response.headers(), "Connection", "Upgrade")
+    {
+        return Err("missing HTTP Upgrade connection token".to_owned());
+    }
+    let offered = response
+        .headers()
+        .get(UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "missing peer Upgrade protocol".to_owned())?;
+    if offered.split(',').count() != 1 {
+        return Err("peer Upgrade response selected multiple protocols".to_owned());
+    }
+    let versions = parse_protocol_versions(offered);
+    let [version] = versions.as_slice() else {
+        return Err("peer Upgrade response selected an invalid protocol".to_owned());
+    };
+    if !is_protocol_supported(*version) {
+        return Err("peer Upgrade response selected an unsupported protocol".to_owned());
+    }
+    Ok(*version)
 }
 
 pub fn make_request(
@@ -588,7 +643,7 @@ mod tests {
 
     use basics::base_uint::Uint256;
     use basics::base64::base64_encode;
-    use http::{HeaderMap, HeaderValue, StatusCode};
+    use http::{HeaderMap, HeaderValue, Response, StatusCode};
     use protocol::{KeyType, SecretKey, derive_public_key, sign_digest};
 
     use super::{
@@ -596,8 +651,9 @@ mod tests {
         HandshakeContext, HandshakeVerificationContext, X_PROTOCOL_CTL, build_handshake,
         feature_enabled, get_feature_value, is_feature_value, is_public_ip,
         make_features_request_header, make_features_response_header, make_request, make_response,
-        make_shared_value_from_finished_messages, parse_http_request, parse_http_response,
-        serialize_request, serialize_response, verify_handshake,
+        make_shared_value_from_finished_messages, negotiate_inbound_peer_upgrade, parse_http_request,
+        parse_http_response, serialize_request, serialize_response, validate_outbound_peer_upgrade,
+        verify_handshake,
     };
 
     #[test]
@@ -651,6 +707,37 @@ mod tests {
         let wire = serialize_response(&response);
         let parsed = parse_http_response(&wire).expect("response should parse");
         assert_eq!(parsed.status(), StatusCode::SWITCHING_PROTOCOLS);
+    }
+
+    #[test]
+    fn peer_upgrade_negotiation_requires_connect_as_and_a_single_response_version() {
+        let mut request = make_request(false, false, false, false, false);
+        assert_eq!(
+            negotiate_inbound_peer_upgrade(&request),
+            Some(crate::protocol_version::ProtocolVersion::new(2, 2))
+        );
+
+        request.headers_mut().insert("Connect-As", HeaderValue::from_static("Client"));
+        assert_eq!(negotiate_inbound_peer_upgrade(&request), None);
+
+        let response = Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "XRPL/2.2")
+            .body(())
+            .expect("response");
+        assert_eq!(
+            validate_outbound_peer_upgrade(&response),
+            Ok(crate::protocol_version::ProtocolVersion::new(2, 2))
+        );
+
+        let multi = Response::builder()
+            .status(StatusCode::SWITCHING_PROTOCOLS)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "XRPL/2.1, XRPL/2.2")
+            .body(())
+            .expect("response");
+        assert!(validate_outbound_peer_upgrade(&multi).is_err());
     }
 
     #[test]

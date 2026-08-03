@@ -153,9 +153,11 @@ fn parent_with_account_in_nudb(
               ledger_seq: u32| match &ns_write {
             app::SHAMapStoreNodeStore::Single(db) => {
                 db.store(test_node_type(object_type), data, hash, ledger_seq)
+                    .expect("test node store write should succeed")
             }
             app::SHAMapStoreNodeStore::Rotating(db) => {
                 db.store(test_node_type(object_type), data, hash, ledger_seq)
+                    .expect("test node store write should succeed")
             }
         },
     ));
@@ -206,9 +208,11 @@ fn backed_fee_ledger_without_fetcher(
               ledger_seq: u32| match &ns_write {
             app::SHAMapStoreNodeStore::Single(db) => {
                 db.store(test_node_type(object_type), data, hash, ledger_seq)
+                    .expect("test node store write should succeed")
             }
             app::SHAMapStoreNodeStore::Rotating(db) => {
                 db.store(test_node_type(object_type), data, hash, ledger_seq)
+                    .expect("test node store write should succeed")
             }
         },
     ));

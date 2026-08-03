@@ -162,7 +162,7 @@ pub(super) fn mpt_transfer_is_dex(
     )
 }
 
-pub(super) fn validates_mpt_transfers<V: ApplyView>(
+pub(super) fn validates_mpt_transfers<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     txn_type: protocol::TxType,
     cross_currency_payment: bool,
@@ -239,7 +239,7 @@ pub(super) fn same_optional_h256(
         && (!before_present || before.get_field_h256(field) == after.get_field_h256(field))
 }
 
-pub(super) fn record_mpt_issuance_lifecycle<V: ApplyView>(
+pub(super) fn record_mpt_issuance_lifecycle<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     txn_type: protocol::TxType,
     lifecycle: &mut MptIssuanceLifecycle,
@@ -299,7 +299,7 @@ pub(super) fn record_mpt_issuance_lifecycle<V: ApplyView>(
     };
 }
 
-pub(super) fn is_vault_pseudo_account<V: ApplyView>(
+pub(super) fn is_vault_pseudo_account<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     account: AccountID,
 ) -> bool {

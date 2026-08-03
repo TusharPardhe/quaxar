@@ -21,6 +21,90 @@ struct RotatingState {
     archive_backend: Arc<dyn Backend>,
 }
 
+/// Read-only snapshot view captured from a rotating database. Holding both
+/// backend Arcs prevents the retired archive from being dropped while a
+/// background snapshot export is still traversing it.
+struct RotatingSnapshotBackend {
+    writable_backend: Arc<dyn Backend>,
+    archive_backend: Arc<dyn Backend>,
+}
+
+impl Backend for RotatingSnapshotBackend {
+    fn get_name(&self) -> String {
+        self.writable_backend.get_name()
+    }
+
+    fn get_block_size(&self) -> Option<usize> {
+        self.writable_backend.get_block_size()
+    }
+
+    fn open(&self, _create_if_missing: bool) -> Result<(), String> {
+        Err("rotating snapshot backend is an already-open read-only view".to_owned())
+    }
+
+    fn is_open(&self) -> bool {
+        self.writable_backend.is_open() && self.archive_backend.is_open()
+    }
+
+    fn close(&self) -> Result<(), String> {
+        // The database owner, not the export view, owns backend lifecycle.
+        Ok(())
+    }
+
+    fn fetch(&self, hash: &Uint256) -> (Option<Arc<NodeObject>>, Status) {
+        let (object, status) = self.writable_backend.fetch(hash);
+        if object.is_some() || status != Status::NotFound {
+            return (object, status);
+        }
+        self.archive_backend.fetch(hash)
+    }
+
+    fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status) {
+        let mut results = Vec::with_capacity(hashes.len());
+        let mut status = Status::Ok;
+        for hash in hashes {
+            let (object, result_status) = self.fetch(hash);
+            if !matches!(result_status, Status::Ok | Status::NotFound) && status == Status::Ok {
+                status = result_status;
+            }
+            results.push(object);
+        }
+        (results, status)
+    }
+
+    fn store(&self, _object: Arc<NodeObject>) -> Result<(), String> {
+        Err("rotating snapshot backend is read-only".to_owned())
+    }
+
+    fn store_batch(&self, _batch: &crate::Batch) {}
+
+    fn store_batch_result(&self, _batch: &crate::Batch) -> Result<(), String> {
+        Err("rotating snapshot backend is read-only".to_owned())
+    }
+
+    fn sync(&self) {}
+
+    fn for_each(&self, callback: &mut dyn FnMut(Arc<NodeObject>)) {
+        self.writable_backend.for_each(callback);
+        self.archive_backend.for_each(callback);
+    }
+
+    fn for_each_result(&self, callback: &mut dyn FnMut(Arc<NodeObject>)) -> Result<(), String> {
+        self.writable_backend.for_each_result(callback)?;
+        self.archive_backend.for_each_result(callback)
+    }
+
+    fn get_write_load(&self) -> i32 {
+        0
+    }
+
+    fn set_delete_path(&self) {}
+
+    fn fd_required(&self) -> i32 {
+        0
+    }
+}
+
 struct DatabaseRotatingCore {
     state: Arc<Mutex<RotatingState>>,
     rotation_in_flight: Arc<std::sync::atomic::AtomicBool>,
@@ -293,6 +377,14 @@ impl DatabaseRotatingImp {
         state.writable_backend.sync();
     }
 
+    pub fn sync_result(&self) -> Result<(), String> {
+        let state = self
+            .state
+            .lock()
+            .expect("rotating backend mutex must not be poisoned");
+        state.writable_backend.sync_result()
+    }
+
     pub fn store(
         &self,
         object_type: NodeObjectType,
@@ -446,6 +538,10 @@ impl DatabaseTrait for DatabaseRotatingImp {
         DatabaseRotatingImp::sync(self);
     }
 
+    fn sync_result(&self) -> Result<(), String> {
+        DatabaseRotatingImp::sync_result(self)
+    }
+
     fn fetch_node_object(
         &self,
         hash: &Uint256,
@@ -509,7 +605,10 @@ impl DatabaseTrait for DatabaseRotatingImp {
             .state
             .lock()
             .expect("rotating backend mutex must not be poisoned");
-        Some(Arc::clone(&state.writable_backend))
+        Some(Arc::new(RotatingSnapshotBackend {
+            writable_backend: Arc::clone(&state.writable_backend),
+            archive_backend: Arc::clone(&state.archive_backend),
+        }))
     }
 }
 
@@ -537,7 +636,8 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 mod tests {
     use super::DatabaseRotatingImp;
     use crate::{
-        Backend, DummyScheduler, FetchType, NodeObject, NodeObjectType, NullJournal, Status,
+        Backend, Database, DummyScheduler, FetchType, NodeObject, NodeObjectType, NullJournal,
+        Status,
     };
     use basics::{base_uint::Uint256, basic_config::Section};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -771,6 +871,40 @@ mod tests {
         assert_eq!(database.take_copy_forward_count(), 1);
 
         database.set_rotation_in_flight(false);
+        database.stop();
+    }
+
+    #[test]
+    fn rotating_snapshot_export_view_traverses_writable_and_archive_backends() {
+        let writable = Arc::new(TestBackend::new("writable"));
+        let archive = Arc::new(TestBackend::new("archive"));
+        let writable_object = sample_object(0x51);
+        let archive_object = sample_object(0x52);
+        writable
+            .store(Arc::clone(&writable_object))
+            .expect("writable store should succeed");
+        archive
+            .store(Arc::clone(&archive_object))
+            .expect("archive store should succeed");
+        let database = DatabaseRotatingImp::new(
+            Arc::new(DummyScheduler),
+            1,
+            Arc::clone(&writable) as Arc<dyn Backend>,
+            Arc::clone(&archive) as Arc<dyn Backend>,
+            &config(),
+            Arc::new(NullJournal),
+        )
+        .expect("rotating database");
+
+        let export = Database::export_backend(database.as_ref()).expect("export backend");
+        let mut hashes = Vec::new();
+        export
+            .for_each_result(&mut |object| hashes.push(*object.hash()))
+            .expect("snapshot traversal");
+
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.contains(writable_object.hash()));
+        assert!(hashes.contains(archive_object.hash()));
         database.stop();
     }
 

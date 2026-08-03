@@ -912,6 +912,10 @@ impl InboundLedgers {
     /// `InboundLedgersImp::sweep`. Failed hashes separately remain in the
     /// five-minute recent-failure cache.
     pub fn sweep(&self) {
+        // TaggedCache only expires age/size entries when swept. Keep the
+        // shared fetch-pack source on the same lifecycle cadence as rippled's
+        // inbound-ledger cache rather than retaining stale peer data forever.
+        self.fetch_pack.sweep();
         let now = Instant::now();
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
         let mut to_remove = Vec::new();
@@ -922,14 +926,28 @@ impl InboundLedgers {
             }
         }
 
+        let mut swept_states = Vec::new();
         for hash in to_remove {
             if let Some(entry) = inner.entries.remove(&hash) {
-                entry.state.stopped.store(true, Ordering::Release);
+                swept_states.push(entry.state);
             }
         }
         inner
             .recent_failures
             .retain(|_, when| when.elapsed() < FAILURE_COOLDOWN);
+        drop(inner);
+
+        // Mirrors InboundLedger destruction: useful state-node packets that
+        // were received but not yet processed can seed a later acquisition.
+        for state in swept_states {
+            state.stopped.store(true, Ordering::Release);
+            for received in state.take_buffered_packets() {
+                if received.packet.packet_type == ledger::InboundLedgerDataType::StateNode {
+                    let stored = self.stash_stale_packet(&received.packet);
+                    self.note_stale_packet_result(stored);
+                }
+            }
+        }
     }
 
     /// Record a preferred-LCL request, selection, installation, or rejection

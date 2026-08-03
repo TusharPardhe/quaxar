@@ -165,6 +165,8 @@ pub use ledger_to_json::{
 };
 pub use local_txs::LocalTxs;
 pub use master::{
+    FETCH_PACK_REPLY_CONTINUATION_LIMIT, FETCH_PACK_STATE_NODE_LIMIT,
+    FETCH_PACK_TRANSACTION_NODE_LIMIT, FetchPackBuildError, FetchPackObject,
     LEDGER_MASTER_DEFAULT_FETCH_PACK_AGE, LEDGER_MASTER_DEFAULT_HISTORY_AGE,
     LEDGER_MASTER_DEFAULT_PATH_FIND_JOB_LIMIT, LedgerMaster, LedgerMasterCaughtUp,
     LedgerMasterConfig, LedgerMasterPathWork,
@@ -524,6 +526,21 @@ pub struct Ledger {
     node_writer: Option<
         Arc<dyn Fn(LedgerNodeObjectType, basics::base_uint::Uint256, Vec<u8>, u32) + Send + Sync>,
     >,
+    /// Fallible node writer used by normal consensus acceptance. The legacy
+    /// writer remains for compatibility callers, but this path propagates
+    /// backend failures before a ledger can be promoted/released.
+    node_writer_result: Option<
+        Arc<
+            dyn Fn(
+                    LedgerNodeObjectType,
+                    basics::base_uint::Uint256,
+                    Vec<u8>,
+                    u32,
+                ) -> Result<(), String>
+                + Send
+                + Sync,
+        >,
+    >,
     /// Persistent mutable tree for the state map — matches reference where stateMap_
     /// is a single persistent SHAMap that all rawInsert/rawErase/rawReplace
     /// operate on directly. Initialized on first mutation, persists across all
@@ -551,6 +568,7 @@ impl Ledger {
             immutable: false,
             node_fetcher: None,
             node_writer: None,
+            node_writer_result: None,
             mutable_state: None,
         }
     }
@@ -691,6 +709,7 @@ impl Ledger {
             immutable: false,
             node_fetcher: None,
             node_writer: None,
+            node_writer_result: None,
             mutable_state: None,
         }
     }
@@ -737,6 +756,7 @@ impl Ledger {
             immutable: false,
             node_fetcher: prev_ledger.node_fetcher.clone(),
             node_writer: prev_ledger.node_writer.clone(),
+            node_writer_result: prev_ledger.node_writer_result.clone(),
             mutable_state: None,
         }
     }
@@ -753,6 +773,7 @@ impl Ledger {
             immutable: true,
             node_fetcher: None,
             node_writer: None,
+            node_writer_result: None,
             mutable_state: None,
         }
     }
@@ -786,6 +807,7 @@ impl Ledger {
             immutable: true,
             node_fetcher: None,
             node_writer: None,
+            node_writer_result: None,
             mutable_state: None,
         };
         let mut loaded = true;
@@ -1999,6 +2021,49 @@ impl Ledger {
     ///   each flushed node is canonicalized into the cache before NuDB
     ///   persistence. When `None`, only NuDB persistence occurs (backward
     ///   compatible with callers that don't have a cache reference).
+    pub fn persist_dirty_nodes_to_store_result(
+        &mut self,
+        tree_cache: Option<
+            &shamap::tree_node_cache::TreeNodeCache<
+                basics::tagged_cache::MonotonicClock,
+                basics::hardened_hash::HardenedHashBuilder,
+            >,
+        >,
+    ) -> Result<(), String> {
+        let ledger_seq = self.header.seq;
+        let writer = self
+            .node_writer_result
+            .clone()
+            .ok_or_else(|| "missing node writer for backed consensus ledger".to_owned())?;
+
+        let mut flush = |tree: &mut MutableTree, object_type: LedgerNodeObjectType| {
+            tree.try_flush_dirty(&mut |node| {
+                if let Some(cache) = tree_cache {
+                    let mut node_ref = node.clone();
+                    let key = *node.get_hash().as_uint256();
+                    cache.canonicalize_replace_client(&key, &mut node_ref);
+                }
+                let hash = node.get_hash();
+                let data = node
+                    .serialize_with_prefix()
+                    .map_err(|error| format!("serialize dirty SHAMap node failed: {error:?}"))?;
+                writer(object_type, *hash.as_uint256(), data, ledger_seq)?;
+                Ok::<_, String>(node)
+            })
+            .map(|_| ())
+        };
+
+        let mut state_tree = self.mutable_state.take().unwrap_or_else(|| {
+            MutableTree::from_loaded_root(self.state_map.root(), ledger_seq.max(1))
+        });
+        flush(&mut state_tree, LedgerNodeObjectType::AccountNode)?;
+        self.mutable_state = Some(state_tree);
+
+        let mut tx_tree = MutableTree::from_loaded_root(self.tx_map.root(), ledger_seq.max(1));
+        flush(&mut tx_tree, LedgerNodeObjectType::TransactionNode)?;
+        Ok(())
+    }
+
     pub fn persist_dirty_nodes_to_store(
         &mut self,
         tree_cache: Option<
@@ -2096,6 +2161,29 @@ impl Ledger {
         >,
     ) {
         self.node_writer = Some(writer);
+    }
+
+    /// Attach a fallible writer for consensus acceptance persistence. Unlike
+    /// the legacy callback, errors are returned to the caller so it can avoid
+    /// marking/releasing a ledger whose nodes are not durable.
+    pub fn set_node_writer_result(
+        &mut self,
+        writer: Arc<
+            dyn Fn(
+                    LedgerNodeObjectType,
+                    basics::base_uint::Uint256,
+                    Vec<u8>,
+                    u32,
+                ) -> Result<(), String>
+                + Send
+                + Sync,
+        >,
+    ) {
+        self.node_writer_result = Some(writer);
+    }
+
+    pub fn has_node_writer_result(&self) -> bool {
+        self.node_writer_result.is_some()
     }
 
     pub fn set_accepted(
@@ -2555,15 +2643,17 @@ impl Ledger {
                 SHAMapType::State,
                 self.header.account_hash,
             ));
-        } else if parallel {
+        } else if parallel && self.state_map.root().is_inner() {
             if !self.state_map.walk_map_parallel_with_family(
                 SHAMapType::State,
                 &mut missing_nodes1,
                 WALK_LEDGER_MAX_MISSING_NODES,
                 family,
             ) {
-                // Parallel walk failed operationally (worker panic or non-inner root).
-                // Treat as if we found missing nodes — don't trust the result.
+                // Parallel traversal failure is distinct from a leaf root: a
+                // leaf-only SHAMap is already completely resident and needs no
+                // worker traversal. An inner-tree failure means completeness
+                // cannot be established and must reject explicit startup.
                 missing_nodes1.push(SHAMapMissingNode::from_hash(
                     SHAMapType::State,
                     self.header.account_hash,
@@ -2988,6 +3078,15 @@ mod tests {
     use basics::base_uint::Uint256;
     use protocol::{ApplyFlags, Keylet, LedgerEntryType, STLedgerEntry, Serializer, XRPAmount};
     use std::sync::Arc;
+
+    #[test]
+    fn fallible_dirty_flush_requires_node_writer() {
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(10, 1_000, true);
+        let error = ledger
+            .persist_dirty_nodes_to_store_result(None)
+            .expect_err("backed consensus ledger cannot silently skip persistence");
+        assert!(error.contains("missing node writer"));
+    }
 
     #[derive(Debug, Default)]
     struct MockBaseView {

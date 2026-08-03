@@ -85,6 +85,10 @@ where
     pub fn table(&self) -> &ApplyStateTable {
         &self.table
     }
+
+    pub fn into_table(self) -> ApplyStateTable {
+        self.table
+    }
 }
 
 impl<B> ReadView for ApplyViewImpl<B>

@@ -89,6 +89,24 @@ fn with_flow<R>(f: impl FnOnce(&mut FlowSandbox<Sandbox<Ledger>>) -> R) -> R {
     f(&mut flow)
 }
 
+fn amm_invariant_ledger() -> Ledger {
+    let mut ledger = test_ledger();
+    // ValidAMM::finalize gates its strict AMM checks on fixAMMv1_3.
+    // fixCleanup3_2_0 alone must not change that amendment boundary.
+    ledger.set_rules(Rules::new([
+        feature_id("fixCleanup3_2_0"),
+        feature_id("fixAMMv1_3"),
+    ]));
+    ledger
+}
+
+fn with_amm_invariant_flow<R>(f: impl FnOnce(&mut FlowSandbox<Sandbox<Ledger>>) -> R) -> R {
+    let base = Arc::new(amm_invariant_ledger());
+    let mut parent = Sandbox::new(base, ApplyFlags::default());
+    let mut flow = FlowSandbox::new(&mut parent);
+    f(&mut flow)
+}
+
 fn with_lending_flow<R>(f: impl FnOnce(&mut FlowSandbox<Sandbox<Ledger>>) -> R) -> R {
     let base = Arc::new(lending_ledger());
     let mut parent = Sandbox::new(base, ApplyFlags::default());
@@ -520,6 +538,45 @@ fn invariant_rejects_bad_book_directory_exchange_rate() {
                 XRPAmount::from_drops(10)
             ),
             Ter::TEC_INVARIANT_FAILED
+        );
+    });
+}
+
+#[test]
+fn invariant_recovery_preserves_fee_claim_or_escalates_repeated_failure() {
+    // After Transactor::reset has discarded doApply work, a valid fee/sequence
+    // context keeps the original tecINVARIANT_FAILED result.
+    with_flow(|flow| {
+        assert_eq!(
+            check_invariants(
+                &flow,
+                TxType::OFFER_CREATE,
+                Ter::TEC_INVARIANT_FAILED,
+                XRPAmount::from_drops(10),
+            ),
+            Ter::TEC_INVARIANT_FAILED
+        );
+    });
+
+    // A second invariant violation in that fee-claim context is a hard tef
+    // failure, matching ApplyContext::failInvariantCheck in rippled.
+    with_flow(|flow| {
+        let mut key_bytes = [0_u8; 32];
+        key_bytes[24..].copy_from_slice(&6_u64.to_be_bytes());
+        let key = Uint256::from_array(key_bytes);
+        let mut dir = STLedgerEntry::from_type_and_key(LedgerEntryType::DirectoryNode, key);
+        dir.set_field_h256(sf("sfRootIndex"), key);
+        dir.set_field_u64(sf("sfExchangeRate"), 7);
+        flow.insert(Arc::new(dir)).expect("insert malformed directory");
+
+        assert_eq!(
+            check_invariants(
+                &flow,
+                TxType::OFFER_CREATE,
+                Ter::TEC_INVARIANT_FAILED,
+                XRPAmount::from_drops(10),
+            ),
+            Ter::TEF_INVARIANT_FAILED
         );
     });
 }
@@ -2955,7 +3012,7 @@ fn invariant_rejects_loan_broker_cover_above_pseudo_balance_after_cleanup_3_1_3(
 
 #[test]
 fn invariant_rejects_amm_zero_lp_tokens() {
-    with_flow(|flow| {
+    with_amm_invariant_flow(|flow| {
         let issuer = acct(0x66);
         let issue1 = Issue {
             currency: iou_currency(b"AAA"),
@@ -2995,7 +3052,7 @@ fn invariant_rejects_amm_zero_lp_tokens() {
 
 #[test]
 fn invariant_rejects_amm_create_lp_tokens_above_pool_product() {
-    with_flow(|flow| {
+    with_amm_invariant_flow(|flow| {
         let issue1 = Issue {
             currency: iou_currency(b"AAA"),
             account: acct(0x81),
@@ -3021,7 +3078,7 @@ fn invariant_rejects_amm_create_lp_tokens_above_pool_product() {
 
 #[test]
 fn invariant_rejects_amm_deposit_lp_tokens_above_pool_product() {
-    with_flow(|flow| {
+    with_amm_invariant_flow(|flow| {
         let issue1 = Issue {
             currency: iou_currency(b"AAA"),
             account: acct(0x84),
@@ -3242,7 +3299,7 @@ fn invariant_rejects_amm_bid_lp_token_balance_increase() {
 
 #[test]
 fn invariant_rejects_amm_delete_that_leaves_amm_entry() {
-    let base = Arc::new(test_ledger());
+    let base = Arc::new(amm_invariant_ledger());
     let mut parent = Sandbox::new(base, ApplyFlags::default());
     let issuer = acct(0x90);
     let amm_account = acct(0x91);
@@ -3275,7 +3332,7 @@ fn invariant_rejects_amm_delete_that_leaves_amm_entry() {
 
 #[test]
 fn invariant_rejects_payment_that_modifies_amm_entry() {
-    let base = Arc::new(test_ledger());
+    let base = Arc::new(amm_invariant_ledger());
     let mut parent = Sandbox::new(base, ApplyFlags::default());
     let issuer = acct(0x92);
     let amm_account = acct(0x93);

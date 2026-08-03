@@ -2718,7 +2718,9 @@ impl RpcRuntime for ApplicationRoot {
     }
 
     fn export_snapshot(&self, output_path: &str) -> Result<JsonValue, String> {
-        use nodestore::snapshot::{SnapshotManifest, export_snapshot, manifest::SNAPSHOT_VERSION};
+        use nodestore::snapshot::{
+            SnapshotManifest, export_snapshot_with_cancellation, manifest::SNAPSHOT_VERSION,
+        };
         use std::path::Path;
 
         let validated = self
@@ -2753,51 +2755,53 @@ impl RpcRuntime for ApplicationRoot {
         let ledger_hash = header.hash.to_string();
         let account_hash = header.account_hash.to_string();
         let output_owned = output_path.to_owned();
-        let export_state = self.begin_snapshot_export(output_owned.clone(), ledger_seq)?;
-        let export_state_for_thread = std::sync::Arc::clone(&export_state);
-
-        // Spawn export on a background thread to avoid blocking the RPC handler
-        // and to prevent memory pressure on the main thread pool.
-        std::thread::Builder::new()
-            .name(format!("snapshot-export-{}", ledger_seq))
-            .spawn(move || {
-                let path = Path::new(&output_owned);
-                tracing::info!(
-                    target: "snapshot",
-                    ledger_seq,
-                    path = %path.display(),
-                    "Background snapshot export started"
-                );
-                match export_snapshot(backend.as_ref(), &manifest, path) {
-                    Ok(()) => {
-                        let file_size = std::fs::metadata(path)
-                            .map(|metadata| metadata.len())
-                            .unwrap_or(0);
-                        export_state_for_thread.complete(file_size);
+        self.start_snapshot_export(
+            output_owned.clone(),
+            ledger_seq,
+            move |export_state, cancellation| {
+                std::thread::Builder::new()
+                    .name(format!("snapshot-export-{ledger_seq}"))
+                    .spawn(move || {
+                        let path = Path::new(&output_owned);
                         tracing::info!(
                             target: "snapshot",
                             ledger_seq,
                             path = %path.display(),
-                            file_size,
-                            "Snapshot export completed successfully"
+                            "Background snapshot export started"
                         );
-                    }
-                    Err(e) => {
-                        export_state_for_thread.fail(e.to_string());
-                        tracing::error!(
-                            target: "snapshot",
-                            error = %e,
-                            ledger_seq,
-                            "Snapshot export failed"
-                        );
-                    }
-                }
-            })
-            .map_err(|e| {
-                let message = format!("Failed to spawn export thread: {e}");
-                export_state.fail(message.clone());
-                message
-            })?;
+                        match export_snapshot_with_cancellation(
+                            backend.as_ref(),
+                            &manifest,
+                            path,
+                            &cancellation,
+                        ) {
+                            Ok(()) => {
+                                let file_size = std::fs::metadata(path)
+                                    .map(|metadata| metadata.len())
+                                    .unwrap_or(0);
+                                export_state.complete(file_size);
+                                tracing::info!(
+                                    target: "snapshot",
+                                    ledger_seq,
+                                    path = %path.display(),
+                                    file_size,
+                                    "Snapshot export completed successfully"
+                                );
+                            }
+                            Err(e) => {
+                                export_state.fail(e.to_string());
+                                tracing::error!(
+                                    target: "snapshot",
+                                    error = %e,
+                                    ledger_seq,
+                                    "Snapshot export failed"
+                                );
+                            }
+                        }
+                    })
+                    .map_err(|error| format!("Failed to spawn export thread: {error}"))
+            },
+        )?;
 
         Ok(protocol::json!({
             "status": "started",

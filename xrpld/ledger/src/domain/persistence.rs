@@ -30,6 +30,10 @@ pub trait LedgerPersistenceRuntime: Send + Sync + 'static {
     fn should_work(&self, seq: u32, is_synchronous: bool) -> bool;
     fn pending(&self, seq: u32) -> bool;
     fn save_validated_ledger(&self, ledger: Arc<Ledger>, is_current: bool) -> bool;
+    /// Invoked only when an asynchronously queued save fails after its caller
+    /// has received queue-admission success. The application owner clears the
+    /// optimistic completion claim and reacquires the exact ledger.
+    fn failed_save(&self, _seq: u32, _hash: SHAMapHash) {}
     fn enqueue_job(
         &self,
         job_type: LedgerPersistenceJobType,
@@ -100,28 +104,33 @@ pub fn pend_save_validated(
             job_type,
             job_name,
             Box::new(move || {
-                let _ = save_validated_ledger(runtime_for_job, ledger_for_job, is_current);
+                let _ = save_validated_ledger(runtime_for_job, ledger_for_job, is_current, true);
             }),
         ) {
             return true;
         }
     }
 
-    save_validated_ledger(runtime, ledger, is_current)
+    save_validated_ledger(runtime, ledger, is_current, false)
 }
 
 fn save_validated_ledger(
     runtime: Arc<dyn LedgerPersistenceRuntime>,
     ledger: Arc<Ledger>,
     is_current: bool,
+    notify_async_failure: bool,
 ) -> bool {
     let seq = ledger.header().seq;
     if !runtime.start_work(seq) {
         return true;
     }
 
+    let hash = ledger.header().hash;
     let result = runtime.save_validated_ledger(ledger, is_current);
     runtime.finish_work(seq);
+    if !result && notify_async_failure {
+        runtime.failed_save(seq, hash);
+    }
     result
 }
 

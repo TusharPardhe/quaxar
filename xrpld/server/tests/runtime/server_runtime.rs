@@ -302,3 +302,48 @@ fn application_root_runtime_serves_ws_status_page_from_owned_health_source() {
 
     runtime.stop();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_runtime_enforces_port_protocol_policy_on_live_listener() {
+    let dispatcher = RecordingDispatcher::default();
+    let runtime = ServerRuntime::new(
+        Handle::current(),
+        dispatcher.clone(),
+        vec![policy("ws_only", 0, false, true)],
+    );
+
+    runtime.start().expect("runtime should start");
+    let addr = runtime.bound_listener_addrs()[0];
+    let response = task::spawn_blocking(move || {
+        let mut stream = std::net::TcpStream::connect(addr)
+            .expect("client should connect to websocket-only listener");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout should set");
+        stream
+            .write_all(
+                concat!(
+                    "POST / HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Connection: close\r\n",
+                    "Content-Type: application/json\r\n",
+                    "Content-Length: 40\r\n",
+                    "\r\n",
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}"
+                )
+                .as_bytes(),
+            )
+            .expect("client should write request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("client should read response");
+        String::from_utf8(response).expect("response should be utf-8")
+    })
+    .await
+    .expect("blocking client should finish");
+
+    assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+    assert!(dispatcher.calls().is_empty());
+    runtime.stop();
+}

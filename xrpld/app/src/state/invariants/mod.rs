@@ -28,7 +28,25 @@ use permissioned_dex::*;
 use permissioned_domain::*;
 use vault::*;
 
-pub fn check_invariants_for_tx<V: ApplyView>(
+/// Mirrors `ApplyContext::failInvariantCheck`: a broken invariant while
+/// recovering a prior invariant failure is a hard failure and must not enter
+/// the ledger as a fee-claim transaction.
+fn invariant_failure_result(result: Ter) -> Ter {
+    if matches!(result, Ter::TEC_INVARIANT_FAILED | Ter::TEF_INVARIANT_FAILED) {
+        Ter::TEF_INVARIANT_FAILED
+    } else {
+        Ter::TEC_INVARIANT_FAILED
+    }
+}
+
+fn map_invariant_result(result: Ter, checked: Result<Ter, ()>) -> Ter {
+    match checked {
+        Ok(result) => result,
+        Err(()) => invariant_failure_result(result),
+    }
+}
+
+pub fn check_invariants_for_tx<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     tx: &STTx,
     result: Ter,
@@ -52,29 +70,35 @@ pub fn check_invariants_for_tx<V: ApplyView>(
         .then(|| tx.get_field_amount(sf("sfAmount")));
     let tx_has_holder = tx.is_field_present(sf("sfHolder"));
     let cross_currency_payment = payment_is_cross_currency(tx);
-    check_invariants_inner(
-        sandbox,
-        txn_type,
-        tx_domain,
-        tx_account,
-        tx_destination,
-        tx_holder,
-        tx_amount,
-        tx_has_holder,
-        cross_currency_payment,
+    map_invariant_result(
         result,
-        fee,
+        check_invariants_inner(
+            sandbox,
+            txn_type,
+            tx_domain,
+            tx_account,
+            tx_destination,
+            tx_holder,
+            tx_amount,
+            tx_has_holder,
+            cross_currency_payment,
+            result,
+            fee,
+        ),
     )
 }
 
-pub fn check_invariants<V: ApplyView>(
+pub fn check_invariants<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     txn_type: protocol::TxType,
     result: Ter,
     fee: XRPAmount,
 ) -> Ter {
-    check_invariants_inner(
-        sandbox, txn_type, None, None, None, None, None, false, false, result, fee,
+    map_invariant_result(
+        result,
+        check_invariants_inner(
+            sandbox, txn_type, None, None, None, None, None, false, false, result, fee,
+        ),
     )
 }
 
@@ -92,7 +116,7 @@ fn payment_is_cross_currency(tx: &STTx) -> bool {
     send_max.asset() != amount.asset()
 }
 
-fn check_invariants_inner<V: ApplyView>(
+fn check_invariants_inner<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     txn_type: protocol::TxType,
     tx_domain: Option<Uint256>,
@@ -104,7 +128,7 @@ fn check_invariants_inner<V: ApplyView>(
     cross_currency_payment: bool,
     result: Ter,
     fee: XRPAmount,
-) -> Ter {
+) -> Result<Ter, ()> {
     let mut xrp_balance_change: i64 = 0;
     let mut has_xrp_trust_line = false;
     let mut deep_freeze_violation = false;
@@ -162,7 +186,7 @@ fn check_invariants_inner<V: ApplyView>(
         // 4. LedgerEntryTypesMatch
         if let (Some(b), Some(a)) = (before_sle, after_sle) {
             if b.get_type() != a.get_type() {
-                return Ter::TEC_INVARIANT_FAILED;
+                return Err(());
             }
         }
 
@@ -177,7 +201,7 @@ fn check_invariants_inner<V: ApplyView>(
                     && txn_type != protocol::TxType::AMM_WITHDRAW
                     && txn_type != protocol::TxType::AMM_CLAWBACK
                 {
-                    return Ter::TEC_INVARIANT_FAILED;
+                    return Err(());
                 }
             }
         }
@@ -213,7 +237,7 @@ fn check_invariants_inner<V: ApplyView>(
                 record_mpt_accounting(&mut mpt_accounting, a, false);
                 record_mpt_transfer(&mut mpt_transfers, a, false);
                 if fix_cleanup_3_2_0 && protocol::has_invalid_amount(&a.clone_as_object()) {
-                    return Ter::TEC_INVARIANT_FAILED;
+                    return Err(());
                 }
             }
         }
@@ -243,7 +267,7 @@ fn check_invariants_inner<V: ApplyView>(
         if fix_cleanup_3_2_0 {
             if !maybe_record_directory_root(&mut directory_roots, is_delete, before_sle, after_sle)
             {
-                return Ter::TEC_INVARIANT_FAILED;
+                return Err(());
             }
         }
 
@@ -255,7 +279,7 @@ fn check_invariants_inner<V: ApplyView>(
                     if a.is_field_present(balance_field) {
                         let bal = a.get_field_amount(balance_field);
                         if bal.negative() || bal.xrp().drops() > protocol::INITIAL_XRP.drops() {
-                            return Ter::TEC_INVARIANT_FAILED;
+                            return Err(());
                         }
                     }
                 }
@@ -267,7 +291,7 @@ fn check_invariants_inner<V: ApplyView>(
                         let seq = a.get_field_u32(get_field_by_symbol("sfSequence"));
                         let expected_seq = sandbox.header().seq;
                         if seq != expected_seq && seq != 0 {
-                            return Ter::TEC_INVARIANT_FAILED;
+                            return Err(());
                         }
                     }
                 }
@@ -294,7 +318,7 @@ fn check_invariants_inner<V: ApplyView>(
                 if let Some(a) = after_sle {
                     let amt = a.get_field_amount(get_field_by_symbol("sfAmount"));
                     if amt.signum() <= 0 {
-                        return Ter::TEC_INVARIANT_FAILED;
+                        return Err(());
                     }
                 }
 
@@ -340,7 +364,7 @@ fn check_invariants_inner<V: ApplyView>(
                         || pays.negative()
                         || pays.mantissa() == 0
                     {
-                        return Ter::TEC_INVARIANT_FAILED;
+                        return Err(());
                     }
                 }
             }
@@ -372,7 +396,7 @@ fn check_invariants_inner<V: ApplyView>(
                         );
                     }
                     if fix_cleanup_3_2_0 && !validate_mpt_entry(a) {
-                        return Ter::TEC_INVARIANT_FAILED;
+                        return Err(());
                     }
                 }
             }
@@ -381,7 +405,7 @@ fn check_invariants_inner<V: ApplyView>(
                     && let Some(a) = after_sle
                     && !validate_vault_entry(a)
                 {
-                    return Ter::TEC_INVARIANT_FAILED;
+                    return Err(());
                 }
             }
             LedgerEntryType::AMM => {
@@ -390,7 +414,7 @@ fn check_invariants_inner<V: ApplyView>(
                     && let Some(a) = after_sle
                     && !validate_amm_entry(a)
                 {
-                    return Ter::TEC_INVARIANT_FAILED;
+                    return Err(());
                 }
             }
             LedgerEntryType::Loan => {
@@ -398,7 +422,7 @@ fn check_invariants_inner<V: ApplyView>(
                     && let Some(a) = after_sle
                     && !validate_loan_entry(before_sle, a)
                 {
-                    return Ter::TEC_INVARIANT_FAILED;
+                    return Err(());
                 }
             }
             LedgerEntryType::LoanBroker => {
@@ -412,7 +436,7 @@ fn check_invariants_inner<V: ApplyView>(
                         a,
                     )
                 {
-                    return Ter::TEC_INVARIANT_FAILED;
+                    return Err(());
                 }
             }
             _ => {}
@@ -420,13 +444,13 @@ fn check_invariants_inner<V: ApplyView>(
     }
 
     if has_xrp_trust_line || deep_freeze_violation || mpt_issuance_locked_violation {
-        return Ter::TEC_INVARIANT_FAILED;
+        return Err(());
     }
 
     if (fix_cleanup_3_1_3 || txn_type == protocol::TxType::PERMISSIONED_DOMAIN_SET)
         && !validates_permissioned_domain(txn_type, result, fix_cleanup_3_1_3, &permissioned_domain)
     {
-        return Ter::TEC_INVARIANT_FAILED;
+        return Err(());
     }
 
     if permissioned_dex_invariant_enabled {
@@ -439,7 +463,7 @@ fn check_invariants_inner<V: ApplyView>(
             fix_cleanup_3_2_0,
             &permissioned_dex,
         ) {
-            return Ter::TEC_INVARIANT_FAILED;
+            return Err(());
         }
     }
 
@@ -453,12 +477,12 @@ fn check_invariants_inner<V: ApplyView>(
         mptokens_v2_enabled,
         &clawback,
     ) {
-        return Ter::TEC_INVARIANT_FAILED;
+        return Err(());
     }
 
     if fix_cleanup_3_2_0 || mptokens_v2_enabled {
         if !validates_mpt_issuance_lifecycle(&mpt_issuance_lifecycle) {
-            return Ter::TEC_INVARIANT_FAILED;
+            return Err(());
         }
         if !validates_mpt_lifecycle_counts(
             txn_type,
@@ -469,7 +493,7 @@ fn check_invariants_inner<V: ApplyView>(
             mptokens_v2_enabled,
             &mpt_issuance_lifecycle,
         ) {
-            return Ter::TEC_INVARIANT_FAILED;
+            return Err(());
         }
     }
 
@@ -482,14 +506,14 @@ fn check_invariants_inner<V: ApplyView>(
                 )),
                 Ok(Some(_))
             ) {
-                return Ter::TEC_INVARIANT_FAILED;
+                return Err(());
             }
         }
     }
 
     if mpt_transfer_invariant_enabled {
         if !validates_mpt_accounting(&mpt_accounting, mptokens_v2_enabled) {
-            return Ter::TEC_INVARIANT_FAILED;
+            return Err(());
         }
         if !validates_mpt_transfers(
             sandbox,
@@ -499,12 +523,12 @@ fn check_invariants_inner<V: ApplyView>(
             mptokens_v2_enabled,
             &mpt_transfers,
         ) {
-            return Ter::TEC_INVARIANT_FAILED;
+            return Err(());
         }
     }
 
     if amm_invariant_enabled && !validates_amm_state(sandbox, txn_type, result, &amm) {
-        return Ter::TEC_INVARIANT_FAILED;
+        return Err(());
     }
 
     if vault_invariant_enabled
@@ -521,11 +545,11 @@ fn check_invariants_inner<V: ApplyView>(
             &vault,
         )
     {
-        return Ter::TEC_INVARIANT_FAILED;
+        return Err(());
     }
 
     if fix_cleanup_3_3_0 && !validates_object_deletion(sandbox, &object_deletion) {
-        return Ter::TEC_INVARIANT_FAILED;
+        return Err(());
     }
 
     if lending_protocol_enabled {
@@ -534,7 +558,7 @@ fn check_invariants_inner<V: ApplyView>(
                 sandbox.read(protocol::loan_broker_keylet_from_key(broker_id)),
                 Ok(Some(_))
             ) {
-                return Ter::TEC_INVARIANT_FAILED;
+                return Err(());
             }
         }
     }
@@ -543,15 +567,15 @@ fn check_invariants_inner<V: ApplyView>(
     // Since our sandbox does not contain the fee deduction (it's applied to the parent view),
     // the net XRP change inside the sandbox MUST be <= 0.
     if xrp_balance_change > 0 {
-        return Ter::TEC_INVARIANT_FAILED;
+        return Err(());
     }
 
     // 3. TransactionFeeCheck
     if fee.drops() < 0 || fee.drops() > protocol::INITIAL_XRP.drops() {
-        return Ter::TEC_INVARIANT_FAILED;
+        return Err(());
     }
 
-    result
+    Ok(result)
 }
 
 #[cfg(test)]

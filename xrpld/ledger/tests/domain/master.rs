@@ -116,6 +116,59 @@ impl LedgerPersistenceRuntime for NoopPersistenceRuntime {
     }
 }
 
+#[derive(Debug, Default)]
+struct FailingPersistenceRuntime;
+
+impl LedgerPersistenceRuntime for FailingPersistenceRuntime {
+    fn mark_saved(&self, _hash: SHAMapHash) -> bool {
+        true
+    }
+
+    fn start_work(&self, _seq: u32) -> bool {
+        true
+    }
+
+    fn finish_work(&self, _seq: u32) {}
+
+    fn should_work(&self, _seq: u32, _is_synchronous: bool) -> bool {
+        true
+    }
+
+    fn pending(&self, _seq: u32) -> bool {
+        false
+    }
+
+    fn save_validated_ledger(&self, _ledger: Arc<Ledger>, _is_current: bool) -> bool {
+        false
+    }
+
+    fn enqueue_job(
+        &self,
+        _job_type: ledger::LedgerPersistenceJobType,
+        _job_name: String,
+        _job: ledger::LedgerPersistenceJob,
+    ) -> bool {
+        false
+    }
+}
+
+#[test]
+fn set_full_ledger_retracts_complete_range_when_sync_save_fails() {
+    let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
+    let persistence = LedgerPersistence::new(Arc::new(FailingPersistenceRuntime));
+    let ledger = immutable_ledger(33, 0x21, 0x33);
+
+    assert!(
+        !master
+            .set_full_ledger(&persistence, Arc::clone(&ledger), true, false, None, None)
+            .expect("failed persistence is a result, not a traversal error")
+    );
+    assert!(
+        !master.have_ledger(33),
+        "a ledger whose synchronous save failed must not remain complete"
+    );
+}
+
 #[test]
 fn set_full_ledger_clears_mismatched_previous_sequence() {
     let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());

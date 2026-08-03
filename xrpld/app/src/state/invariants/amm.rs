@@ -91,7 +91,7 @@ pub(super) fn valid_amm_balances(
     zero_allowed && amount.signum() == 0 && amount2.signum() == 0 && lp_tokens.signum() == 0
 }
 
-pub(super) fn amm_pool_holds<V: ApplyView>(
+pub(super) fn amm_pool_holds<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     state: &AmmState,
 ) -> Option<(STAmount, STAmount)> {
@@ -108,7 +108,7 @@ pub(super) fn amm_pool_holds<V: ApplyView>(
     ))
 }
 
-pub(super) fn validates_amm_create<V: ApplyView>(
+pub(super) fn validates_amm_create<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     state: &AmmState,
 ) -> bool {
@@ -123,7 +123,7 @@ pub(super) fn validates_amm_create<V: ApplyView>(
         && ledger::amm_helpers::amm_lp_tokens(&amount, &amount2, lp_tokens.issue()) == *lp_tokens
 }
 
-pub(super) fn validates_amm_general<V: ApplyView>(
+pub(super) fn validates_amm_general<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     state: &AmmState,
     zero_allowed: bool,
@@ -159,7 +159,7 @@ pub(super) fn validates_amm_general<V: ApplyView>(
     ledger::amm_helpers::within_relative_distance_amount(pool_product_mean, lp_number, distance)
 }
 
-pub(super) fn validates_amm_state<V: ApplyView>(
+pub(super) fn validates_amm_state<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     txn_type: protocol::TxType,
     result: Ter,

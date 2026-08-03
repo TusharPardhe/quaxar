@@ -244,7 +244,7 @@ fn persist_tree_subtree(
     if node.get_hash().is_zero() {
         return;
     }
-    database.store(
+    let _ = database.store(
         object_type,
         node.serialize_with_prefix()
             .expect("tree node should serialize"),
@@ -519,7 +519,10 @@ online_delete = 256
     let transaction_db =
         DatabaseCon::new_at_path(&database_path, "transaction.db", &[], TRANSACTION_DB_INIT)
             .expect("transaction db");
-    assert!(count_rows(&ledger_db, "Ledgers") >= 1);
+    // startGenesisLedger stores genesis/next in LedgerHistory and switches the
+    // LCL, but does not call setFullLedger or save an unvalidated ledger to
+    // relational history. Persistence starts at validated/full promotion.
+    assert_eq!(count_rows(&ledger_db, "Ledgers"), 0);
     assert!(count_rows(&transaction_db, "Transactions") >= 0);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -984,7 +987,7 @@ fn app_bootstrap_applies_path_search_max_defaults_and_explicit_override() {
         &validator_default_path,
         r#"
 [validation_seed]
-sEd7nQwT6zqW6nNw4j6wYf3qvFGYQmQ
+shUwVw52ofnCUX5m7kPTKzJdr4HEH
 
 [server]
 port_rpc
@@ -1050,7 +1053,7 @@ protocol = http,ws
         &validator_override_path,
         r#"
 [validation_seed]
-sEd7nQwT6zqW6nNw4j6wYf3qvFGYQmQ
+shUwVw52ofnCUX5m7kPTKzJdr4HEH
 
 [path_search_max]
 9
@@ -1185,8 +1188,8 @@ path = {}
     .expect("network bootstrap should build");
 
     assert!(bootstrap.runtime.root().need_network_ledger());
-    assert_eq!(bootstrap.runtime.root().closed_ledger_seq(), Some(1));
-    assert_eq!(bootstrap.runtime.root().published_ledger_seq(), Some(1));
+    assert_eq!(bootstrap.runtime.root().closed_ledger_seq(), Some(2));
+    assert_eq!(bootstrap.runtime.root().published_ledger_seq(), None);
     assert_eq!(bootstrap.runtime.root().validated_ledger_seq(), None);
     assert_eq!(
         bootstrap.runtime.root().network_ops_operating_mode_string(),
@@ -1258,9 +1261,10 @@ path = {}
     )
     .expect("fresh bootstrap should build");
 
-    // Genesis ledger is seeded as closed/published but must NOT be validated.
-    assert_eq!(bootstrap.runtime.root().closed_ledger_seq(), Some(1));
-    assert_eq!(bootstrap.runtime.root().published_ledger_seq(), Some(1));
+    // Genesis plus its immutable successor are stored; the successor is the
+    // closed LCL but must not be published/validated on a network startup.
+    assert_eq!(bootstrap.runtime.root().closed_ledger_seq(), Some(2));
+    assert_eq!(bootstrap.runtime.root().published_ledger_seq(), None);
     assert_eq!(
         bootstrap.runtime.root().validated_ledger_seq(),
         None,
@@ -1276,7 +1280,114 @@ path = {}
 }
 
 #[test]
-fn app_bootstrap_normal_restores_latest_and_configured_history() {
+fn app_bootstrap_fast_load_falls_back_to_genesis_when_durable_load_fails() {
+    let dir = TempDir::new().expect("tempdir");
+    let config_path = dir.path().join("xrpld.cfg");
+    let database_path = dir.path().join("sql");
+    let node_db_path = dir.path().join("node");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = Memory
+path = {}
+fast_load = 1
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let bootstrap = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Normal,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("fast_load fallback should seed genesis successor");
+
+    assert_eq!(bootstrap.root.closed_ledger_seq(), Some(2));
+    assert_eq!(bootstrap.root.validated_ledger_seq(), None);
+    assert_eq!(bootstrap.root.published_ledger_seq(), None);
+}
+
+#[test]
+fn app_bootstrap_normal_starts_genesis_next_lcl_even_with_durable_history() {
+    let dir = TempDir::new().expect("tempdir");
+    let parent = persisted_bootstrap_state_only_ledger(20);
+    let latest = persisted_bootstrap_replay_ledger(21, *parent.header().hash.as_uint256(), &[]);
+    let (database_path, node_db_path, config_path) =
+        persist_bootstrap_storage(&dir, &[parent, latest], "RocksDB");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let bootstrap = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Normal,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("Normal startup should seed rippled-style genesis successor");
+
+    assert_eq!(bootstrap.root.closed_ledger_seq(), Some(2));
+    assert_eq!(bootstrap.root.validated_ledger_seq(), None);
+    assert_eq!(bootstrap.root.published_ledger_seq(), None);
+    assert_eq!(
+        bootstrap.root.open_ledger().current().parent_hash,
+        *bootstrap
+            .root
+            .closed_ledger()
+            .expect("next LCL")
+            .header()
+            .hash
+            .as_uint256()
+    );
+}
+
+#[test]
+fn app_bootstrap_load_restores_latest_and_configured_history() {
     let dir = TempDir::new().expect("tempdir");
     let parent = persisted_bootstrap_state_only_ledger(20);
     let latest = persisted_bootstrap_replay_ledger(21, *parent.header().hash.as_uint256(), &[]);
@@ -1316,11 +1427,11 @@ path = {}
         &config,
         &AppBootstrapOptions {
             config_path,
-            start_type: StartUpType::Normal,
+            start_type: StartUpType::Load,
             ..AppBootstrapOptions::default()
         },
     )
-    .expect("Normal startup should restore durable storage");
+    .expect("Load startup should restore durable storage");
 
     assert_eq!(bootstrap.root.closed_ledger_seq(), Some(21));
     assert_eq!(bootstrap.root.validated_ledger_seq(), Some(21));
@@ -1330,7 +1441,42 @@ path = {}
         .ledger_master_runtime()
         .expect("ledger master runtime")
         .ledger_master();
-    assert!(master.have_ledger(20));
     assert!(master.have_ledger(21));
-    assert_eq!(master.complete_ledgers().to_string(), "20-21");
+    // Explicit Load registers the selected durable LCL; older configured
+    // history is hydrated lazily through provider/NuDB recovery.
+    assert_eq!(master.complete_ledgers().to_string(), "21");
+}
+
+#[test]
+fn app_bootstrap_rejects_present_but_malformed_validation_seed_configuration() {
+    let dir = TempDir::new().expect("tempdir");
+    let config_path = dir.path().join("xrpld.cfg");
+    fs::write(
+        &config_path,
+        r#"
+[validation_seed]
+first-seed
+second-seed
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+"#,
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config should parse");
+    let error = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect_err("multi-line validation seed must not be silently ignored");
+    assert!(error.contains("[validation_seed]"));
 }

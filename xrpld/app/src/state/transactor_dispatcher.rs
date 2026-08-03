@@ -1655,6 +1655,115 @@ fn replace_signer_list<V: ledger::ApplyView>(
     Ter::TES_SUCCESS
 }
 
+fn sorted_deposit_preauth_credentials(credentials: &STArray) -> Vec<(AccountID, Vec<u8>)> {
+    let mut sorted = credentials
+        .iter()
+        .map(|credential| {
+            (
+                credential.get_account_id(sf("sfIssuer")),
+                credential.get_field_vl(sf("sfCredentialType")),
+            )
+        })
+        .collect::<Vec<_>>();
+    sorted.sort_unstable();
+    sorted
+}
+
+fn deposit_preauth_credential_hashes(credentials: &[(AccountID, Vec<u8>)]) -> Vec<Uint256> {
+    credentials
+        .iter()
+        .map(|(issuer, credential_type)| {
+            protocol::sha512_half_slices(&[issuer.data(), credential_type])
+        })
+        .collect()
+}
+
+fn has_deposit_preauth_reserve<V: ledger::ApplyView>(
+    view: &V,
+    owner: &STLedgerEntry,
+    pre_fee_balance_drops: Option<i64>,
+) -> bool {
+    let balance = pre_fee_balance_drops
+        .unwrap_or_else(|| owner.get_field_amount(sf("sfBalance")).xrp().drops());
+    let reserve = view
+        .fees()
+        .account_reserve(owner.get_field_u32(sf("sfOwnerCount")) as usize + 1) as i64;
+    balance >= reserve
+}
+
+fn remove_deposit_preauth_entry<V: ledger::ApplyView>(
+    view: &mut V,
+    preauth: Arc<STLedgerEntry>,
+) -> Ter {
+    let owner = preauth.get_account_id(sf("sfAccount"));
+    let owner_node = preauth.get_field_u64(sf("sfOwnerNode"));
+    let owner_dir = owner_dir_keylet(Uint160::from_void(owner.data()));
+    if !ledger::dir_remove(view, &owner_dir, owner_node, *preauth.key(), false).unwrap_or(false) {
+        return Ter::TEF_BAD_LEDGER;
+    }
+    let Some(owner_sle) = view
+        .peek(protocol::account_keylet(Uint160::from_void(owner.data())))
+        .ok()
+        .flatten()
+    else {
+        return Ter::TEF_INTERNAL;
+    };
+    if ledger::adjust_owner_count(view, &owner_sle, -1).is_err() {
+        return Ter::TEF_INTERNAL;
+    }
+    view.erase(preauth)
+        .map(|_| Ter::TES_SUCCESS)
+        .unwrap_or(Ter::TEF_BAD_LEDGER)
+}
+
+fn remove_account_delete_owned_entry<V: ledger::ApplyView>(
+    view: &mut V,
+    account: AccountID,
+    entry: Arc<STLedgerEntry>,
+) -> Ter {
+    let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
+    if !ledger::dir_remove(
+        view,
+        &owner_dir,
+        entry.get_field_u64(sf("sfOwnerNode")),
+        *entry.key(),
+        false,
+    )
+    .unwrap_or(false)
+    {
+        return Ter::TEF_BAD_LEDGER;
+    }
+    view.erase(entry)
+        .map(|_| Ter::TES_SUCCESS)
+        .unwrap_or(Ter::TEF_BAD_LEDGER)
+}
+
+fn remove_account_delete_delegate<V: ledger::ApplyView>(
+    view: &mut V,
+    account: AccountID,
+    entry: Arc<STLedgerEntry>,
+) -> Ter {
+    if remove_account_delete_owned_entry(view, account, Arc::clone(&entry)) != Ter::TES_SUCCESS {
+        return Ter::TEF_BAD_LEDGER;
+    }
+    if entry.is_field_present(sf("sfDestinationNode")) {
+        let authorized = entry.get_account_id(sf("sfAuthorize"));
+        let destination_dir = owner_dir_keylet(Uint160::from_void(authorized.data()));
+        if !ledger::dir_remove(
+            view,
+            &destination_dir,
+            entry.get_field_u64(sf("sfDestinationNode")),
+            *entry.key(),
+            false,
+        )
+        .unwrap_or(false)
+        {
+            return Ter::TEF_BAD_LEDGER;
+        }
+    }
+    Ter::TES_SUCCESS
+}
+
 pub fn handle_real_dispatch<V: ledger::ApplyView>(
     view: &mut V,
     sttx: &STTx,
@@ -2062,100 +2171,210 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
 
         TxType::ACCOUNT_DELETE => {
             let account = sttx.get_account_id(sf("sfAccount"));
-            let destination = sttx.get_account_id(sf("sfDestination"));
-            // Preclaim checks
-            if account == destination {
-                return Ter::TEM_DST_IS_SRC;
+            let destination_field = sf("sfDestination");
+            if !sttx.is_field_present(destination_field) {
+                return Ter::TEM_MALFORMED;
             }
+            let destination = sttx.get_account_id(destination_field);
+            let credential_ids_present = sttx.is_field_present(sf("sfCredentialIDs"));
+            if !account_delete_check_extra_features(
+                credential_ids_present,
+                view.rules().enabled(&protocol::feature_id("Credentials")),
+            ) {
+                return Ter::TEM_DISABLED;
+            }
+            let preflight = run_account_delete_preflight(
+                AccountDeletePreflightFacts {
+                    account,
+                    destination,
+                },
+                || ledger::credential_helpers::check_fields(sttx),
+            );
+            if preflight != Ter::TES_SUCCESS {
+                return preflight;
+            }
+
             let src_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
             let dst_keylet = protocol::account_keylet(Uint160::from_void(destination.data()));
             let Some(src) = view.peek(src_keylet).ok().flatten() else {
-                return Ter::TEF_INTERNAL;
+                return Ter::TER_NO_ACCOUNT;
             };
-            if view.peek(dst_keylet).ok().flatten().is_none() {
+            let Some(dst) = view.peek(dst_keylet).ok().flatten() else {
                 return Ter::TEC_NO_DST;
+            };
+            if dst.is_flag(protocol::lsfRequireDestTag)
+                && !sttx.is_field_present(sf("sfDestinationTag"))
+            {
+                return Ter::TEC_DST_TAG_NEEDED;
             }
-            // Sequence gap: account must be old enough (256 ledgers)
-            let acct_seq = src.get_field_u32(sf("sfSequence"));
-            let ledger_seq = view.header().seq;
-            if ledger_seq.saturating_sub(acct_seq) < 256 {
+            let credentials_valid = ledger::credential_helpers::valid(view, sttx, &account)
+                .unwrap_or(Ter::TEF_BAD_LEDGER);
+            if credentials_valid != Ter::TES_SUCCESS {
+                return credentials_valid;
+            }
+            if !credential_ids_present && dst.is_flag(protocol::lsfDepositAuth) {
+                let preauth = protocol::deposit_preauth_keylet(
+                    Uint160::from_void(destination.data()),
+                    Uint160::from_void(account.data()),
+                );
+                if !view.exists(preauth).unwrap_or(false) {
+                    return Ter::TEC_NO_PERMISSION;
+                }
+            }
+
+            if src.get_field_u32(sf("sfMintedNFTokens"))
+                != src.get_field_u32(sf("sfBurnedNFTokens"))
+            {
+                return Ter::TEC_HAS_OBLIGATIONS;
+            }
+            let nft_min = protocol::nft_page_min_keylet(Uint160::from_void(account.data()));
+            let nft_max = protocol::nft_page_max_keylet(Uint160::from_void(account.data()));
+            match view.succ(nft_min.key, Some(nft_max.key.next())) {
+                Ok(Some(_)) => return Ter::TEC_HAS_OBLIGATIONS,
+                Ok(None) => {}
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            }
+
+            const SEQUENCE_DELTA: u32 = 255;
+            if src
+                .get_field_u32(sf("sfSequence"))
+                .saturating_add(SEQUENCE_DELTA)
+                > view.header().seq
+            {
                 return Ter::TEC_TOO_SOON;
             }
-            // Scan owner directory — only tickets and credentials are deletable
+            let first_nftoken_sequence = src
+                .is_field_present(sf("sfFirstNFTokenSequence"))
+                .then(|| src.get_field_u32(sf("sfFirstNFTokenSequence")))
+                .unwrap_or(0);
+            if first_nftoken_sequence
+                .saturating_add(src.get_field_u32(sf("sfMintedNFTokens")))
+                .saturating_add(SEQUENCE_DELTA)
+                > view.header().seq
+            {
+                return Ter::TEC_TOO_SOON;
+            }
+
             let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
+            let mut entries = Vec::new();
             if view.exists(owner_dir).unwrap_or(false) {
-                // Collect all directory entries
                 let mut page = 0_u64;
-                let mut all_entries: Vec<basics::math::base_uint::Uint256> = Vec::new();
                 loop {
                     let page_keylet = protocol::page_keylet(owner_dir, page);
                     let Some(node) = view.peek(page_keylet).ok().flatten() else {
                         break;
                     };
-                    all_entries
-                        .extend(node.get_field_v256(sf("sfIndexes")).value().iter().copied());
+                    entries.extend(node.get_field_v256(sf("sfIndexes")).value().iter().copied());
                     let next = node.get_field_u64(sf("sfIndexNext"));
                     if next == 0 || next == page {
                         break;
                     }
                     page = next;
                 }
-                // Check each entry type to determine if it blocks deletion
-                // lightweight account-owned objects. Obligations like AMM, Vault, Loan
-                // cannot be deleted.
-                for entry_key in &all_entries {
-                    let Some(entry_sle) =
-                        view.peek(protocol::child_keylet(*entry_key)).ok().flatten()
-                    else {
-                        return Ter::TEF_BAD_LEDGER;
-                    };
-                    match entry_sle.get_type() {
-                        // Non-obligation objects that can be
-                        // deleted during AccountDelete (non-obligation deleter)
-                        LedgerEntryType::Ticket
-                        | LedgerEntryType::Credential
-                        | LedgerEntryType::DepositPreauth
-                        | LedgerEntryType::DID
+            }
+            if entries.len() > ACCOUNT_DELETE_MAX_DELETABLE_DIR_ENTRIES as usize {
+                return Ter::TEF_TOO_BIG;
+            }
+            for entry_key in &entries {
+                let Some(entry) = view.peek(protocol::child_keylet(*entry_key)).ok().flatten() else {
+                    return Ter::TEF_BAD_LEDGER;
+                };
+                if !matches!(
+                    entry.get_type(),
+                    LedgerEntryType::Offer
                         | LedgerEntryType::SignerList
+                        | LedgerEntryType::Ticket
+                        | LedgerEntryType::DepositPreauth
                         | LedgerEntryType::NFTokenOffer
-                        | LedgerEntryType::NFTokenPage
+                        | LedgerEntryType::DID
                         | LedgerEntryType::Oracle
+                        | LedgerEntryType::Credential
                         | LedgerEntryType::Delegate
-                        | LedgerEntryType::DirectoryNode => {
-                            // deletable
-                        }
-                        _ => {
-                            return Ter::TEC_HAS_OBLIGATIONS;
-                        }
-                    }
-                }
-                // Delete all deletable entries
-                for entry_key in all_entries {
-                    if let Ok(Some(entry_sle)) = view.peek(protocol::child_keylet(entry_key)) {
-                        let owner_node = entry_sle.get_field_u64(sf("sfOwnerNode"));
-                        let _ = ledger::dir_remove(view, &owner_dir, owner_node, entry_key, false);
-                        if let Ok(Some(acct)) = view.peek(src_keylet) {
-                            let _ = ledger::adjust_owner_count(view, &acct, -1);
-                        }
-                        let _ = view.erase(entry_sle);
-                    }
+                ) {
+                    return Ter::TEC_HAS_OBLIGATIONS;
                 }
             }
-            // Transfer remaining XRP to destination, delete account
-            if let (Ok(Some(src)), Ok(Some(dst))) = (view.peek(src_keylet), view.peek(dst_keylet)) {
-                let balance = src.get_field_amount(sf("sfBalance")).xrp();
-                let mut dst_obj = dst.clone_as_object();
-                let dst_bal = dst.get_field_amount(sf("sfBalance")).xrp();
-                dst_obj.set_field_amount(
-                    sf("sfBalance"),
-                    STAmount::from_xrp_amount(XRPAmount::from_drops(
-                        dst_bal.drops() + balance.drops(),
-                    )),
+
+            if credential_ids_present {
+                let verified = ledger::credential_helpers::verify_deposit_preauth(
+                    sttx,
+                    view,
+                    &account,
+                    &destination,
+                    Some(dst.as_ref()),
+                )
+                .unwrap_or(Ter::TEF_BAD_LEDGER);
+                if verified != Ter::TES_SUCCESS {
+                    return verified;
+                }
+            }
+
+            for entry_key in entries {
+                let Some(entry) = view.peek(protocol::child_keylet(entry_key)).ok().flatten() else {
+                    return Ter::TEF_BAD_LEDGER;
+                };
+                let result = match entry.get_type() {
+                    LedgerEntryType::Offer => {
+                        crate::state::offer_create::offer_delete_pub(view, &account, entry)
+                    }
+                    LedgerEntryType::SignerList => remove_signer_list(view, account),
+                    LedgerEntryType::Ticket | LedgerEntryType::DID | LedgerEntryType::Oracle => {
+                        remove_account_delete_owned_entry(view, account, entry)
+                    }
+                    LedgerEntryType::DepositPreauth => remove_deposit_preauth_entry(view, entry),
+                    LedgerEntryType::NFTokenOffer => {
+                        match ledger::nftoken_helpers::delete_token_offer(view, entry) {
+                            Ok(true) => Ter::TES_SUCCESS,
+                            Ok(false) => Ter::TEF_BAD_LEDGER,
+                            Err(_) => Ter::TEF_BAD_LEDGER,
+                        }
+                    }
+                    LedgerEntryType::Credential => {
+                        ledger::credential_helpers::delete_sle(view, entry)
+                            .unwrap_or(Ter::TEF_BAD_LEDGER)
+                    }
+                    LedgerEntryType::Delegate => remove_account_delete_delegate(view, account, entry),
+                    _ => Ter::TEC_HAS_OBLIGATIONS,
+                };
+                if result != Ter::TES_SUCCESS {
+                    return result;
+                }
+            }
+
+            if let Ok(Some(root_directory)) = view.peek(owner_dir) {
+                if !root_directory.get_field_v256(sf("sfIndexes")).value().is_empty() {
+                    return Ter::TEC_HAS_OBLIGATIONS;
+                }
+                if view.erase(root_directory).is_err() {
+                    return Ter::TEF_BAD_LEDGER;
+                }
+            }
+
+            let balance = src.get_field_amount(sf("sfBalance")).xrp();
+            let mut dst_obj = dst.clone_as_object();
+            let dst_balance = dst.get_field_amount(sf("sfBalance")).xrp();
+            dst_obj.set_field_amount(
+                sf("sfBalance"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(
+                    dst_balance.drops().saturating_add(balance.drops()),
+                )),
+            );
+            let destination_flags = dst.get_field_u32(sf("sfFlags"));
+            if balance.drops() > 0 && destination_flags & protocol::lsfPasswordSpent != 0 {
+                dst_obj.set_field_u32(
+                    sf("sfFlags"),
+                    destination_flags & !protocol::lsfPasswordSpent,
                 );
-                let _ = view.update(Arc::new(STLedgerEntry::from_stobject(dst_obj, *dst.key())));
-                let _ = view.erase(src);
             }
-            Ter::TES_SUCCESS
+            if view
+                .update(Arc::new(STLedgerEntry::from_stobject(dst_obj, *dst.key())))
+                .is_err()
+            {
+                return Ter::TEF_BAD_LEDGER;
+            }
+            view.erase(src)
+                .map(|_| Ter::TES_SUCCESS)
+                .unwrap_or(Ter::TEF_BAD_LEDGER)
         }
 
         TxType::LEDGER_STATE_FIX => apply_ledger_state_fix(view, sttx),
@@ -2229,48 +2448,158 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
 
         TxType::DEPOSIT_PREAUTH => {
             let account = sttx.get_account_id(sf("sfAccount"));
-            if sttx.is_field_present(sf("sfAuthorize")) {
-                let auth_account = sttx.get_account_id(sf("sfAuthorize"));
-                let preauth_keylet = protocol::deposit_preauth_keylet(
+            let authorize_field = sf("sfAuthorize");
+            let unauthorize_field = sf("sfUnauthorize");
+            let authorize_credentials_field = sf("sfAuthorizeCredentials");
+            let unauthorize_credentials_field = sf("sfUnauthorizeCredentials");
+            let authorize = sttx
+                .is_field_present(authorize_field)
+                .then(|| sttx.get_account_id(authorize_field));
+            let unauthorize = sttx
+                .is_field_present(unauthorize_field)
+                .then(|| sttx.get_account_id(unauthorize_field));
+            let authorize_credentials_present = sttx.is_field_present(authorize_credentials_field);
+            let unauthorize_credentials_present = sttx.is_field_present(unauthorize_credentials_field);
+            if !deposit_preauth_check_extra_features(
+                authorize_credentials_present,
+                unauthorize_credentials_present,
+                view.rules().enabled(&protocol::feature_id("Credentials")),
+            ) {
+                return Ter::TEM_DISABLED;
+            }
+            let preflight = run_deposit_preauth_preflight(
+                DepositPreauthPreflightFacts {
+                    account,
+                    authorize,
+                    unauthorize,
+                    authorize_is_zero: authorize.is_some_and(|value| value.is_zero()),
+                    unauthorize_is_zero: unauthorize.is_some_and(|value| value.is_zero()),
+                    authorize_credentials_present,
+                    unauthorize_credentials_present,
+                },
+                || {
+                    let credentials = sttx.get_field_array(if authorize_credentials_present {
+                        authorize_credentials_field
+                    } else {
+                        unauthorize_credentials_field
+                    });
+                    ledger::credential_helpers::check_array(
+                        &credentials,
+                        ledger::credential_helpers::MAX_CREDENTIALS_ARRAY_SIZE,
+                    )
+                },
+            );
+            if preflight != Ter::TES_SUCCESS {
+                return preflight;
+            }
+
+            let account_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
+            let Some(owner) = view.peek(account_keylet).ok().flatten() else {
+                return Ter::TEF_INTERNAL;
+            };
+            let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
+
+            if let Some(authorized) = authorize {
+                let keylet = protocol::deposit_preauth_keylet(
                     Uint160::from_void(account.data()),
-                    Uint160::from_void(auth_account.data()),
+                    Uint160::from_void(authorized.data()),
                 );
-                let mut sle = STLedgerEntry::new(preauth_keylet);
-                sle.set_account_id(sf("sfAccount"), account);
-                sle.set_account_id(sf("sfAuthorize"), auth_account);
-                // Add to owner directory
-                let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
-                if let Ok(Some(page)) =
-                    ledger::dir_append(view, &owner_dir, preauth_keylet.key, &|_| {})
+                if !view
+                    .exists(protocol::account_keylet(Uint160::from_void(authorized.data())))
+                    .unwrap_or(false)
                 {
-                    sle.set_field_u64(sf("sfOwnerNode"), page);
+                    return Ter::TEC_NO_TARGET;
                 }
-                let _ = view.insert(Arc::new(sle));
-                if let Ok(Some(acct)) =
-                    view.peek(protocol::account_keylet(Uint160::from_void(account.data())))
+                if view.exists(keylet).unwrap_or(false) {
+                    return Ter::TEC_DUPLICATE;
+                }
+                if !has_deposit_preauth_reserve(view, owner.as_ref(), pre_fee_balance_drops) {
+                    return Ter::TEC_INSUFFICIENT_RESERVE;
+                }
+                let owner_node = match ledger::dir_insert(view, &owner_dir, keylet.key, &|_| {}) {
+                    Ok(Some(page)) => page,
+                    Ok(None) => return Ter::TEC_DIR_FULL,
+                    Err(_) => return Ter::TEF_BAD_LEDGER,
+                };
+                let mut preauth = STLedgerEntry::new(keylet);
+                preauth.set_account_id(sf("sfAccount"), account);
+                preauth.set_account_id(authorize_field, authorized);
+                preauth.set_field_u64(sf("sfOwnerNode"), owner_node);
+                if view.insert(Arc::new(preauth)).is_err()
+                    || ledger::adjust_owner_count(view, &owner, 1).is_err()
                 {
-                    let _ = ledger::adjust_owner_count(view, &acct, 1);
+                    return Ter::TEF_INTERNAL;
                 }
-            } else if sttx.is_field_present(sf("sfUnauthorize")) {
-                let unauth_account = sttx.get_account_id(sf("sfUnauthorize"));
-                let preauth_keylet = protocol::deposit_preauth_keylet(
+                return Ter::TES_SUCCESS;
+            }
+
+            if let Some(unauthorized) = unauthorize {
+                let keylet = protocol::deposit_preauth_keylet(
                     Uint160::from_void(account.data()),
-                    Uint160::from_void(unauth_account.data()),
+                    Uint160::from_void(unauthorized.data()),
                 );
-                if let Ok(Some(preauth_sle)) = view.peek(preauth_keylet) {
-                    let owner_node = preauth_sle.get_field_u64(sf("sfOwnerNode"));
-                    let owner_dir = owner_dir_keylet(Uint160::from_void(account.data()));
-                    let _ =
-                        ledger::dir_remove(view, &owner_dir, owner_node, *preauth_sle.key(), false);
-                    let _ = view.erase(preauth_sle);
-                    if let Ok(Some(acct)) =
-                        view.peek(protocol::account_keylet(Uint160::from_void(account.data())))
+                let Some(preauth) = view.peek(keylet).ok().flatten() else {
+                    return Ter::TEC_NO_ENTRY;
+                };
+                return remove_deposit_preauth_entry(view, preauth);
+            }
+
+            let credentials_field = if authorize_credentials_present {
+                authorize_credentials_field
+            } else {
+                unauthorize_credentials_field
+            };
+            let credential_pairs = sorted_deposit_preauth_credentials(
+                &sttx.get_field_array(credentials_field),
+            );
+            let credential_hashes = deposit_preauth_credential_hashes(&credential_pairs);
+            let keylet = protocol::deposit_preauth_credentials_keylet(
+                Uint160::from_void(account.data()),
+                &credential_hashes,
+            );
+            if authorize_credentials_present {
+                for (issuer, _) in &credential_pairs {
+                    if !view
+                        .exists(protocol::account_keylet(Uint160::from_void(issuer.data())))
+                        .unwrap_or(false)
                     {
-                        let _ = ledger::adjust_owner_count(view, &acct, -1);
+                        return Ter::TEC_NO_ISSUER;
                     }
                 }
+                if view.exists(keylet).unwrap_or(false) {
+                    return Ter::TEC_DUPLICATE;
+                }
+                if !has_deposit_preauth_reserve(view, owner.as_ref(), pre_fee_balance_drops) {
+                    return Ter::TEC_INSUFFICIENT_RESERVE;
+                }
+                let owner_node = match ledger::dir_insert(view, &owner_dir, keylet.key, &|_| {}) {
+                    Ok(Some(page)) => page,
+                    Ok(None) => return Ter::TEC_DIR_FULL,
+                    Err(_) => return Ter::TEF_BAD_LEDGER,
+                };
+                let mut sorted_credentials = STArray::new(authorize_credentials_field);
+                for (issuer, credential_type) in credential_pairs {
+                    let mut credential = STObject::make_inner_object(sf("sfCredential"));
+                    credential.set_account_id(sf("sfIssuer"), issuer);
+                    credential.set_field_vl(sf("sfCredentialType"), &credential_type);
+                    sorted_credentials.push_back(credential);
+                }
+                let mut preauth = STLedgerEntry::new(keylet);
+                preauth.set_account_id(sf("sfAccount"), account);
+                preauth.set_field_array(authorize_credentials_field, sorted_credentials);
+                preauth.set_field_u64(sf("sfOwnerNode"), owner_node);
+                if view.insert(Arc::new(preauth)).is_err()
+                    || ledger::adjust_owner_count(view, &owner, 1).is_err()
+                {
+                    return Ter::TEF_INTERNAL;
+                }
+                Ter::TES_SUCCESS
+            } else {
+                let Some(preauth) = view.peek(keylet).ok().flatten() else {
+                    return Ter::TEC_NO_ENTRY;
+                };
+                remove_deposit_preauth_entry(view, preauth)
             }
-            Ter::TES_SUCCESS
         }
 
         // --- Escrows ---

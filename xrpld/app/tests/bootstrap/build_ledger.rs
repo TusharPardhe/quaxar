@@ -1,8 +1,8 @@
 use std::{cell::RefCell, collections::BTreeSet, rc::Rc, sync::Arc};
 
 use app::{
-    BuildLedgerJournal, BuildLedgerView, LedgerReplay, apply_transactions, build_ledger,
-    build_ledger_replay, decode_acquired_tx_set,
+    BuildLedgerError, BuildLedgerJournal, BuildLedgerView, LedgerReplay, apply_transactions,
+    build_ledger, build_ledger_replay, decode_acquired_tx_set,
 };
 use basics::{base_uint::Uint256, intrusive_pointer::make_shared_intrusive};
 use ledger::{CanonicalTXSet, Ledger, LedgerHeader};
@@ -70,8 +70,9 @@ impl BuildLedgerView for StubBuildView {
         self.applied.len()
     }
 
-    fn apply_to_ledger(self, _ledger: &mut Ledger) {
+    fn apply_to_ledger(self, _ledger: &mut Ledger) -> Result<(), BuildLedgerError> {
         self.events.borrow_mut().push("view.apply");
+        Ok(())
     }
 }
 
@@ -320,14 +321,14 @@ fn build_ledger_finalizes_skiplist_flush_unshare_and_accept_in() {
             let events = Rc::clone(&events);
             move |_ledger| {
                 events.borrow_mut().push("flush_state");
-                7
+                Ok::<_, BuildLedgerError>(7)
             }
         },
         {
             let events = Rc::clone(&events);
             move |_ledger| {
                 events.borrow_mut().push("flush_tx");
-                11
+                Ok::<_, BuildLedgerError>(11)
             }
         },
         {
@@ -400,8 +401,8 @@ fn build_ledger_replay_applies_ordered_txns_in_input_order_with_replay_flags() {
             seen.borrow_mut()
                 .push((tx.get_transaction_id(), flags.bits()));
         },
-        |_ledger| 0,
-        |_ledger| 0,
+        |_ledger| Ok::<_, BuildLedgerError>(0),
+        |_ledger| Ok::<_, BuildLedgerError>(0),
         |_ledger| {},
     )
     .expect("replay build should succeed");
@@ -511,8 +512,8 @@ fn ledger_replay_from_replay_ledger_sorts_by_metadata_index() {
             seen.borrow_mut()
                 .push((tx.get_transaction_id(), flags.bits()));
         },
-        |_ledger| 0,
-        |_ledger| 0,
+        |_ledger| Ok::<_, BuildLedgerError>(0),
+        |_ledger| Ok::<_, BuildLedgerError>(0),
         |_ledger| {},
     )
     .expect("replay build should succeed");

@@ -55,10 +55,12 @@ fn make_node_writer(
     Arc::new(
         move |object_type, hash, data, ledger_seq| match &node_store {
             app::SHAMapStoreNodeStore::Single(db) => {
-                db.store(test_node_type(object_type), data, hash, ledger_seq);
+                db.store(test_node_type(object_type), data, hash, ledger_seq)
+                    .expect("test node store write should succeed");
             }
             app::SHAMapStoreNodeStore::Rotating(db) => {
-                db.store(test_node_type(object_type), data, hash, ledger_seq);
+                db.store(test_node_type(object_type), data, hash, ledger_seq)
+                    .expect("test node store write should succeed");
             }
         },
     )

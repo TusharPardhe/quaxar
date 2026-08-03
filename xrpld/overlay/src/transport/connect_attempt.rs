@@ -19,7 +19,7 @@ use tokio_openssl::SslStream;
 
 use crate::handshake::{
     HandshakeContext, build_handshake, make_request, make_shared_value_from_finished_messages,
-    parse_http_response, serialize_request,
+    parse_http_response, serialize_request, validate_outbound_peer_upgrade,
 };
 use crate::peer::peer::Peer;
 use crate::peer_imp::PeerImp;
@@ -67,6 +67,9 @@ pub enum ConnectAttemptError {
     InvalidServerName,
     InvalidHttp(String),
     Protocol(String),
+    /// The overlay already has an active or registered outbound attempt for
+    /// this endpoint. This is suppression, not a network failure.
+    DuplicateOutboundAttempt,
     Redirect(Vec<SocketAddr>),
     Timeout(ConnectionStep),
 }
@@ -78,6 +81,7 @@ impl std::fmt::Display for ConnectAttemptError {
             Self::InvalidServerName => write!(formatter, "invalid server name"),
             Self::InvalidHttp(error) => write!(formatter, "{error}"),
             Self::Protocol(error) => write!(formatter, "{error}"),
+            Self::DuplicateOutboundAttempt => write!(formatter, "duplicate outbound attempt"),
             Self::Redirect(peers) => {
                 if peers.is_empty() {
                     write!(formatter, "http status 503 redirected with no peers")
@@ -149,20 +153,36 @@ impl ConnectAttempt {
     }
 
     pub async fn run(&self) -> Result<ConnectAttemptResult, ConnectAttemptError> {
-        timeout(
-            self.config.connect_timeout,
-            self.run_inner(self.stop_requested.clone()),
-        )
-        .await
-        .map_err(|_| {
-            tracing::warn!(
-                target: "overlay",
-                ip = %self.remote_endpoint,
-                reason = "timeout",
-                "Connection attempt failed"
-            );
-            ConnectAttemptError::Timeout(ConnectionStep::Init)
-        })?
+        self.run_inner(self.stop_requested.clone()).await
+    }
+
+    async fn await_phase<T, F>(
+        &self,
+        step: ConnectionStep,
+        stop_requested: &mut watch::Receiver<bool>,
+        operation: F,
+    ) -> Result<T, ConnectAttemptError>
+    where
+        F: std::future::Future<Output = Result<T, ConnectAttemptError>>,
+    {
+        tokio::select! {
+            biased;
+            changed = stop_requested.changed() => {
+                let _ = changed;
+                Err(Self::shutdown_started_error())
+            }
+            result = timeout(self.config.connect_timeout, operation) => {
+                result.map_err(|_| {
+                    tracing::warn!(
+                        target: "overlay",
+                        ip = %self.remote_endpoint,
+                        ?step,
+                        "Connection attempt phase timed out"
+                    );
+                    ConnectAttemptError::Timeout(step)
+                })?
+            }
+        }
     }
 
     async fn run_inner(
@@ -171,16 +191,17 @@ impl ConnectAttempt {
     ) -> Result<ConnectAttemptResult, ConnectAttemptError> {
         self.ensure_not_stopping(&stop_requested)?;
         tracing::debug!(target: "overlay", ip = %self.remote_endpoint, "TCP connect starting");
-        let tcp_stream = tokio::select! {
-            biased;
-            changed = stop_requested.changed() => {
-                let _ = changed;
-                return Err(Self::shutdown_started_error());
-            }
-            result = TcpStream::connect(self.remote_endpoint) => {
-                result.map_err(ConnectAttemptError::Io)?
-            }
-        };
+        let tcp_stream = self
+            .await_phase(
+                ConnectionStep::TcpConnect,
+                &mut stop_requested,
+                async {
+                    TcpStream::connect(self.remote_endpoint)
+                        .await
+                        .map_err(ConnectAttemptError::Io)
+                },
+            )
+            .await?;
 
         // Disable Nagle's algorithm for low-latency request-response pipelining.
         let _ = tcp_stream.set_nodelay(true);
@@ -192,16 +213,17 @@ impl ConnectAttempt {
         let mut tls_stream = SslStream::new(ssl, tcp_stream)
             .map_err(|error| ConnectAttemptError::Protocol(error.to_string()))?;
         self.ensure_not_stopping(&stop_requested)?;
-        tokio::select! {
-            biased;
-            changed = stop_requested.changed() => {
-                let _ = changed;
-                return Err(Self::shutdown_started_error());
-            }
-            result = std::pin::Pin::new(&mut tls_stream).connect() => {
-                result.map_err(|error| ConnectAttemptError::Protocol(error.to_string()))?
-            }
-        };
+        self.await_phase(
+            ConnectionStep::TlsHandshake,
+            &mut stop_requested,
+            async {
+                std::pin::Pin::new(&mut tls_stream)
+                    .connect()
+                    .await
+                    .map_err(|error| ConnectAttemptError::Protocol(error.to_string()))
+            },
+        )
+        .await?;
 
         let shared_value = make_shared_value(&tls_stream)?;
         tracing::debug!(target: "overlay", ip = %self.remote_endpoint, "TLS handshake complete, sending HTTP upgrade");
@@ -222,39 +244,33 @@ impl ConnectAttempt {
 
         let wire_request = serialize_request(&request);
         self.ensure_not_stopping(&stop_requested)?;
-        tokio::select! {
-            biased;
-            changed = stop_requested.changed() => {
-                let _ = changed;
-                return Err(Self::shutdown_started_error());
-            }
-            result = tls_stream.write_all(&wire_request) => {
-                result.map_err(ConnectAttemptError::Io)?
-            }
-        };
+        self.await_phase(
+            ConnectionStep::HttpWrite,
+            &mut stop_requested,
+            async {
+                tls_stream
+                    .write_all(&wire_request)
+                    .await
+                    .map_err(ConnectAttemptError::Io)
+            },
+        )
+        .await?;
         self.ensure_not_stopping(&stop_requested)?;
-        tokio::select! {
-            biased;
-            changed = stop_requested.changed() => {
-                let _ = changed;
-                return Err(Self::shutdown_started_error());
-            }
-            result = tls_stream.flush() => {
-                result.map_err(ConnectAttemptError::Io)?
-            }
-        };
+        self.await_phase(
+            ConnectionStep::HttpWrite,
+            &mut stop_requested,
+            async { tls_stream.flush().await.map_err(ConnectAttemptError::Io) },
+        )
+        .await?;
 
         self.ensure_not_stopping(&stop_requested)?;
-        let wire_response = tokio::select! {
-            biased;
-            changed = stop_requested.changed() => {
-                let _ = changed;
-                return Err(Self::shutdown_started_error());
-            }
-            result = read_http_response(&mut tls_stream) => {
-                result?
-            }
-        };
+        let wire_response = self
+            .await_phase(
+                ConnectionStep::HttpRead,
+                &mut stop_requested,
+                async { read_http_response(&mut tls_stream).await.map_err(ConnectAttemptError::Io) },
+            )
+            .await?;
         let response =
             parse_http_response(&wire_response).map_err(ConnectAttemptError::InvalidHttp)?;
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
@@ -280,6 +296,7 @@ impl ConnectAttempt {
                 response.status().as_u16()
             )));
         }
+        validate_outbound_peer_upgrade(&response).map_err(ConnectAttemptError::Protocol)?;
         let peer = (self.verify_response)(&response, self.remote_endpoint, &shared_value)?;
 
         tracing::info!(

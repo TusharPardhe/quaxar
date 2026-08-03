@@ -29,6 +29,8 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use time::Duration;
 
+type FailedSaveHandler = Arc<dyn Fn(u32, SHAMapHash) + Send + Sync + 'static>;
+
 #[derive(Clone)]
 struct PersistenceNodeStoreFetcher {
     node_store: crate::SHAMapStoreNodeStore,
@@ -113,6 +115,7 @@ pub struct AppLedgerPersistenceRuntime {
     /// via `ApplicationRoot`'s shared job queue, matching the reference's
     /// `app_.getJobQueue()` access from `pendSaveValidated`.
     job_queue: Option<Arc<crate::job::job_queue::JobQueue>>,
+    failed_save_handler: Option<FailedSaveHandler>,
 }
 
 impl AppLedgerPersistenceRuntime {
@@ -141,6 +144,26 @@ impl AppLedgerPersistenceRuntime {
         ledger_db: Option<Arc<rdb::LedgerDb>>,
         job_queue: Option<Arc<crate::job::job_queue::JobQueue>>,
     ) -> Self {
+        Self::with_job_queue_and_failed_save_handler(
+            relational_database,
+            node_store,
+            transaction_master,
+            network_id,
+            ledger_db,
+            job_queue,
+            None,
+        )
+    }
+
+    pub fn with_job_queue_and_failed_save_handler(
+        relational_database: Option<Arc<SqliteSHAMapStoreRelational>>,
+        node_store: Option<crate::SHAMapStoreNodeStore>,
+        transaction_master: Arc<TransactionMaster>,
+        network_id: u32,
+        ledger_db: Option<Arc<rdb::LedgerDb>>,
+        job_queue: Option<Arc<crate::job::job_queue::JobQueue>>,
+        failed_save_handler: Option<FailedSaveHandler>,
+    ) -> Self {
         Self {
             relational_database,
             node_store,
@@ -150,6 +173,7 @@ impl AppLedgerPersistenceRuntime {
             saved_hashes: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashSet::new()),
             job_queue,
+            failed_save_handler,
         }
     }
 }
@@ -232,6 +256,12 @@ impl LedgerPersistenceRuntime for AppLedgerPersistenceRuntime {
                 );
                 false
             }
+        }
+    }
+
+    fn failed_save(&self, seq: u32, hash: SHAMapHash) {
+        if let Some(handler) = self.failed_save_handler.as_ref() {
+            handler(seq, hash);
         }
     }
 

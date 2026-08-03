@@ -6,6 +6,7 @@ use crate::consensus::rcl_validations::SharedAppValidations;
 use crate::job::job_queue::JobQueue;
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::ledger::ledger_master_state::SharedLedgerMasterState;
+use crate::load::fee_vote::FeeSetup;
 use crate::load::load_fee_track::SharedLoadFeeTrack;
 use crate::load::load_manager::{LoadManager, LoadManagerTiming};
 use crate::network::network_ops::networkops_apply_flags;
@@ -57,7 +58,8 @@ use crate::state::transactor_dispatcher::handle_real_dispatch;
 use crate::tx_queue::transaction::{Transaction, TransactionCloseTimeSource};
 use crate::tx_queue::transaction_master::{SharedTransaction, TransactionMaster};
 use crate::validator::validator_list::{
-    SystemValidatorListClock, ValidatorList, ValidatorListStatusSnapshot,
+    ListDisposition, PublisherListStats, SystemValidatorListClock, ValidatorBlobInfo, ValidatorList,
+    ValidatorListStatusSnapshot,
 };
 use crate::validator::validator_site::ValidatorSite;
 use basics::base_uint::{Uint160, Uint256};
@@ -65,18 +67,18 @@ use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::MonotonicClock;
 use ledger::OrderBookDB;
 use ledger::{
-    CanonicalTXSet, Ledger, LedgerMasterCaughtUp, LedgerNodeObjectType, OpenView, ReadView,
-    Sandbox, TxsRawView,
+    CanonicalTXSet, Ledger, LedgerMasterCaughtUp, LedgerNodeObjectType, NullOrderBookDBJournal,
+    NullOrderBookDBRuntime, ApplyView, OpenView, ReadView, Sandbox, TxsRawView,
 };
 use overlay::Cluster;
 use overlay::{OverlayHandoff, OverlayImpl, PeerReservationSource};
 use perflog::PerfLogImp;
 use protocol::{
     AccountID, BatchTransactionFlags, JsonOptions, JsonValue, NodeID, NotTec, PublicKey, Rules,
-    STAmount, STLedgerEntry, STObject, STTx, SecretKey, SeqProxy, Serializer, Ter, TxType,
-    XRPAmount, account_keylet, calc_account_id, calc_node_id, feature_xrp_fees,
-    get_field_by_symbol, is_tec_claim, is_tef_failure, is_tem_malformed, is_tes_success,
-    lsfDisableMaster, tfInnerBatchTxn,
+    STAmount, STLedgerEntry, STObject, STTx, SecretKey, SeqProxy, Serializer, StBase, Ter, TxType,
+    REFERENCE_FEE_UNITS_DEPRECATED, XRPAmount, account_keylet, calc_account_id, calc_node_id,
+    feature_xrp_fees, get_field_by_symbol, is_tec_claim, is_tef_failure, is_tem_malformed,
+    is_tes_success, lsfDisableMaster, tfInnerBatchTxn,
 };
 use shamap::family::{NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
 use shamap::tree_node_cache::TreeNodeCache;
@@ -104,6 +106,20 @@ fn to_nodestore_type(object_type: LedgerNodeObjectType) -> nodestore::NodeObject
 
 fn consensus_status_event(event: i32, have_correct_lcl: bool) -> i32 {
     if have_correct_lcl { event } else { 4 } // neLOST_SYNC
+}
+
+/// Reference `LedgerMaster::setValidLedger` uses the median signing time of
+/// trusted validations. For an even sample, average the two middle elements
+/// without overflow; if quorum has not been reached, retain the ledger close
+/// time as the only trustworthy fallback.
+fn median_validation_sign_time(mut sign_times: Vec<u32>, quorum: usize, fallback: u32) -> u32 {
+    if quorum == 0 || sign_times.len() < quorum {
+        return fallback;
+    }
+    sign_times.sort_unstable();
+    let low = sign_times[(sign_times.len() - 1) / 2];
+    let high = sign_times[sign_times.len() / 2];
+    low.saturating_add((high - low) / 2)
 }
 
 /// A preferred LCL equal to the local closed ledger or its immediate parent
@@ -139,6 +155,7 @@ macro_rules! full_sync_debug {
 #[derive(Clone)]
 struct AppLoadManagerEvents {
     collector_manager: CollectorManager,
+    fee_change_reporter: Arc<FeeChangeReporter>,
 }
 
 impl crate::load::load_manager::LoadManagerEvents for AppLoadManagerEvents {
@@ -146,6 +163,11 @@ impl crate::load::load_manager::LoadManagerEvents for AppLoadManagerEvents {
         self.collector_manager
             .group("load_manager")
             .record_event("fee_change");
+        // LoadManager outlives no ApplicationRoot state: it holds this
+        // standalone reporter, not a root callback. A stopped JobQueue rejects
+        // the work cleanly, and normal reports retain the server-stream
+        // deduplication shared with all other fee-change paths.
+        let _ = self.fee_change_reporter.report_fee_change();
     }
 }
 
@@ -160,6 +182,9 @@ pub struct ApplicationRootOptions {
     pub start_ledger: Option<String>,
     pub import: bool,
     pub quorum: Option<usize>,
+    /// Target fee schedule advertised by this validator on voting ledgers.
+    /// The reference reads this from the configured `[voting]` section.
+    pub fee_setup: FeeSetup,
     pub collector_params: CollectorParams,
     pub load_manager_timing: LoadManagerTiming,
 }
@@ -176,9 +201,159 @@ impl Default for ApplicationRootOptions {
             start_ledger: None,
             import: false,
             quorum: None,
+            fee_setup: FeeSetup::default(),
             collector_params: CollectorParams::default(),
             load_manager_timing: LoadManagerTiming::default(),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClosedLedgerHistoryAction {
+    Store,
+    AlreadyStored,
+}
+
+/// The fee fields emitted on the `server` stream. This mirrors rippled's
+/// `NetworkOPsImp::ServerFeeSummary`: notification is driven by the fee
+/// values themselves, not by every OpenLedger acceptance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ServerFeeSummary {
+    load_factor_server: u32,
+    load_base_server: u32,
+    base_fee: u64,
+    min_processing_fee_level: u64,
+    open_ledger_fee_level: u64,
+    reference_fee_level: u64,
+}
+
+impl ServerFeeSummary {
+    fn load_factor(self) -> u64 {
+        let fee_escalation = basics::mul_div::mul_div(
+            self.open_ledger_fee_level,
+            u64::from(self.load_base_server),
+            self.reference_fee_level,
+        )
+        .unwrap_or(u64::MAX);
+        u64::from(self.load_factor_server).max(fee_escalation)
+    }
+}
+
+type SubscriptionPublisher = Arc<dyn Fn(&str, protocol::JsonValue) + Send + Sync + 'static>;
+type SharedSubscriptionPublisher = Arc<std::sync::RwLock<Option<SubscriptionPublisher>>>;
+
+/// The lifecycle-independent portion of `NetworkOPs::reportFeeChange`.
+///
+/// It deliberately owns only the shared application services it needs, not an
+/// `ApplicationRoot`. `LoadManager` can therefore report fee changes without a
+/// root-reference cycle, while a stopped job queue makes late shutdown reports
+/// harmless.
+#[derive(Clone)]
+struct FeeChangeReporter {
+    job_queue: Arc<JobQueue>,
+    load_fee_track: Arc<SharedLoadFeeTrack>,
+    open_ledger: SharedAppOpenLedger,
+    tx_q: SharedAppTxQ,
+    network_ops_state: Arc<SharedNetworkOpsState>,
+    subscription_manager: SharedSubscriptionPublisher,
+    last_summary: Arc<Mutex<Option<ServerFeeSummary>>>,
+}
+
+impl FeeChangeReporter {
+    fn server_fee_summary(&self) -> ServerFeeSummary {
+        let current = self.open_ledger.current();
+        let mut lock = AppTxQLock;
+        let metrics = self.tx_q.get_metrics(&mut lock, current.as_ref());
+        ServerFeeSummary {
+            load_factor_server: self.load_fee_track.load_factor(),
+            load_base_server: self.load_fee_track.load_base(),
+            base_fee: current.base_fee_drops,
+            min_processing_fee_level: metrics.min_processing_fee_level,
+            open_ledger_fee_level: metrics.open_ledger_fee_level,
+            reference_fee_level: metrics.reference_fee_level,
+        }
+    }
+
+    fn fee_change_payload(&self, summary: ServerFeeSummary) -> JsonValue {
+        JsonValue::Object(std::collections::BTreeMap::from([
+            (
+                "type".to_owned(),
+                JsonValue::String("serverStatus".to_owned()),
+            ),
+            (
+                "server_status".to_owned(),
+                JsonValue::String(self.network_ops_state.operating_mode().as_str().to_owned()),
+            ),
+            (
+                "load_base".to_owned(),
+                JsonValue::Unsigned(u64::from(summary.load_base_server)),
+            ),
+            (
+                "load_factor_server".to_owned(),
+                JsonValue::Unsigned(u64::from(summary.load_factor_server)),
+            ),
+            (
+                "load_factor".to_owned(),
+                JsonValue::Unsigned(summary.load_factor()),
+            ),
+            (
+                "load_factor_fee_escalation".to_owned(),
+                JsonValue::Unsigned(summary.open_ledger_fee_level),
+            ),
+            (
+                "load_factor_fee_queue".to_owned(),
+                JsonValue::Unsigned(summary.min_processing_fee_level),
+            ),
+            (
+                "load_factor_fee_reference".to_owned(),
+                JsonValue::Unsigned(summary.reference_fee_level),
+            ),
+            ("base_fee".to_owned(), JsonValue::Unsigned(summary.base_fee)),
+        ]))
+    }
+
+    fn report_fee_change(&self) -> bool {
+        let publisher = self
+            .subscription_manager
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        let Some(publisher) = publisher else {
+            return false;
+        };
+
+        let summary = self.server_fee_summary();
+        let payload = self.fee_change_payload(summary);
+        let mut last_summary = self
+            .last_summary
+            .lock()
+            .expect("last fee summary mutex must not be poisoned");
+        if *last_summary == Some(summary) {
+            return false;
+        }
+
+        let scheduled = self.job_queue.add_job(
+            crate::job::job_types::JobType::JtClientFeeChange,
+            "feeChange",
+            move || publisher("server", payload),
+        );
+        if scheduled {
+            *last_summary = Some(summary);
+        }
+        scheduled
+    }
+}
+
+fn queue_relay_envelope(
+    raw_transaction: Vec<u8>,
+    local_timestamp: u64,
+    locally_queued: bool,
+) -> overlay::TmTransaction {
+    overlay::TmTransaction {
+        raw_transaction,
+        status: 2, // tsCURRENT
+        receive_timestamp: Some(local_timestamp),
+        deferred: Some(locally_queued),
     }
 }
 
@@ -202,6 +377,11 @@ pub struct ApplicationRoot {
     collector_manager: Arc<CollectorManager>,
     load_manager: Arc<LoadManager>,
     load_fee_track: Arc<SharedLoadFeeTrack>,
+    /// Configured `[voting]` fee targets supplied to the consensus adaptor.
+    fee_vote_setup: FeeSetup,
+    /// Lifecycle-safe server fee reporter shared with LoadManager and the
+    /// normal NetworkOps/consensus paths.
+    fee_change_reporter: Arc<FeeChangeReporter>,
     node_store_scheduler: Arc<NodeStoreScheduler>,
     node_family: Option<Arc<dyn NodeFamilyRuntime>>,
     resolver_runtime: Option<Arc<AppResolverRuntime>>,
@@ -269,6 +449,11 @@ pub struct ApplicationRoot {
     /// next-round handoff. It is re-entrant because consensus-built checking
     /// can synchronously promote a preferred LCL on the same strand.
     lcl_transition_gate: Arc<parking_lot::ReentrantMutex<()>>,
+    /// Serializes validation acceptance with publication planning and commit.
+    /// Rippled holds LedgerMaster::mutex_ across this equivalent checkAccept →
+    /// tryAdvance path; keep it separate from the re-entrant LCL transition
+    /// gate because it never recursively switches the closed ledger.
+    validation_advance_gate: Arc<parking_lot::Mutex<()>>,
     /// Condvar to wake the consensus strand loop immediately when proposals
     /// arrive from the overlay, removing the 50ms poll latency. Matches
     /// rippled's strand-based immediate dispatch of proposals.
@@ -1221,6 +1406,15 @@ struct StandaloneAcceptedTx {
     metadata: Arc<Serializer>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptedLedgerLclInstall {
+    /// Legacy/non-consensus callers install the built child immediately.
+    Unconditional,
+    /// The active consensus path installs only after `consensusBuilt` and
+    /// `OpenLedger::accept`, matching rippled `doAccept` ordering.
+    Deferred,
+}
+
 #[derive(Clone)]
 pub(crate) struct AcceptedLedgerOutcome {
     /// Exact locally built child that atomically replaced its captured parent.
@@ -1237,13 +1431,17 @@ pub(crate) struct AcceptedLedgerOutcome {
     pub retry_transactions: Vec<Arc<STTx>>,
 }
 
-#[derive(Clone)]
 struct StandaloneLedgerBuildView {
     inner: OpenView<Ledger>,
+    state_table: Option<ledger::ApplyStateTable>,
 }
 
 impl StandaloneLedgerBuildView {
-    fn from_base(base: Arc<Ledger>, entries: &[StandaloneAcceptedTx]) -> Self {
+    fn from_base(
+        base: Arc<Ledger>,
+        entries: &[StandaloneAcceptedTx],
+        state_table: Option<ledger::ApplyStateTable>,
+    ) -> Self {
         let mut inner = OpenView::new_closed(base);
         for entry in entries {
             inner
@@ -1254,7 +1452,7 @@ impl StandaloneLedgerBuildView {
                 )
                 .expect("standalone accepted tx overlay should insert");
         }
-        Self { inner }
+        Self { inner, state_table }
     }
 }
 
@@ -1267,10 +1465,15 @@ impl crate::BuildLedgerView for StandaloneLedgerBuildView {
         self.inner.tx_count()
     }
 
-    fn apply_to_ledger(self, ledger: &mut Ledger) {
+    fn apply_to_ledger(mut self, ledger: &mut Ledger) -> Result<(), crate::BuildLedgerError> {
+        if let Some(table) = self.state_table.take() {
+            table
+                .apply(&mut self.inner)
+                .map_err(|error| crate::BuildLedgerError::View(format!("state view apply failed: {error:?}")))?;
+        }
         self.inner
             .apply(ledger)
-            .expect("standalone accepted tx overlay should apply");
+            .map_err(|error| crate::BuildLedgerError::View(format!("accepted view apply failed: {error:?}")))
     }
 }
 
@@ -1633,8 +1836,8 @@ pub fn apply_submit_transactor_shell_with_delivered_amount<V: ledger::ApplyView>
     })
 }
 
-fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
-    view: &mut V,
+fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
+    view: &mut ledger::FlowSandbox<'_, V>,
     tx: &STTx,
     txn_type: TxType,
     run_batch_followup: bool,
@@ -1952,18 +2155,20 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
             return result;
         }
 
-        if protocol::is_tes_success(result) || protocol::is_tec_claim(result) {
-            let fee_amt = if tx.is_field_present(fee_field) {
-                tx.get_field_amount(fee_field).xrp()
-            } else {
-                protocol::XRPAmount::from_drops(0)
-            };
-            result = crate::state::invariants::check_invariants_for_tx(&inner, tx, result, fee_amt);
-        }
-
-        // tecOVERSIZE check
+        // Rippld computes oversize before invariant evaluation; invariant
+        // failure must retain precedence rather than being overwritten later.
         if inner.item_count() > 32768 {
             result = Ter::TEC_OVERSIZE;
+        }
+
+        let fee_amt = if tx.is_field_present(fee_field) {
+            tx.get_field_amount(fee_field).xrp()
+        } else {
+            protocol::XRPAmount::from_drops(0)
+        };
+
+        if protocol::is_tes_success(result) || protocol::is_tec_claim(result) {
+            result = crate::state::invariants::check_invariants_for_tx(&inner, tx, result, fee_amt);
         }
 
         let do_offers = result == Ter::TEC_OVERSIZE || result == Ter::TEC_KILLED;
@@ -1972,10 +2177,13 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
         let do_credentials = result == Ter::TEC_EXPIRED;
 
         if result == Ter::TEC_INVARIANT_FAILED {
-            // Transactor::reset(fee) discards all doApply mutations and leaves
-            // only the fee and sequence/ticket work in the outer transaction
-            // view. Those mutations were applied before this inner sandbox.
+            // `inner` is the doApply portion of this transaction context. Its
+            // drop is equivalent to Transactor::reset's discard because the
+            // outer FlowSandbox contains only the already-replayed fee and
+            // sequence/ticket changes. Recheck that real fee-claim context:
+            // a repeated failure maps to tefINVARIANT_FAILED in the checker.
             drop(inner);
+            result = crate::state::invariants::check_invariants_for_tx(view, tx, result, fee_amt);
         } else if !do_offers && !do_lines_or_mpts && !do_nf_token_offers && !do_credentials {
             if result != Ter::TEC_KILLED {
                 // Apply inner sandbox changes to outer view (normal path)
@@ -2158,7 +2366,10 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView>(
     ter
 }
 
-fn apply_submit_batch_followup<V: ledger::ApplyView>(view: &mut V, batch_tx: &STTx) -> Ter {
+fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
+    view: &mut ledger::FlowSandbox<'_, V>,
+    batch_tx: &STTx,
+) -> Ter {
     let batch_mode = BatchTransactionFlags::from_bits(batch_tx.get_flags());
     let mut whole_batch = ledger::FlowSandbox::new(view);
     let mut applied = 0_usize;
@@ -2688,6 +2899,7 @@ impl ApplicationRoot {
             start_ledger,
             import,
             quorum,
+            fee_setup,
             collector_params,
             load_manager_timing,
         } = options;
@@ -2707,17 +2919,9 @@ impl ApplicationRoot {
                 .expect("application root must own a perf log"),
         );
         let job_queue = JobQueue::with_worker_threads(job_queue_threads.max(1));
+        let shared_job_queue = Arc::new(job_queue.clone());
         let load_fee_track = Arc::new(SharedLoadFeeTrack::default());
         let collector_manager = CollectorManager::new(collector_params);
-        let load_manager = LoadManager::with_timing(
-            job_queue.clone(),
-            load_fee_track.clone(),
-            Arc::new(AppLoadManagerEvents {
-                collector_manager: collector_manager.clone(),
-            }),
-            registry.logs.journal("load_manager"),
-            load_manager_timing,
-        );
         let time_keeper = Arc::new(TimeKeeper::new());
         let close_time_provider = Arc::clone(&time_keeper)
             as Arc<dyn crate::ledger::ledger_master_state::LedgerMasterCloseTimeProvider>;
@@ -2727,12 +2931,12 @@ impl ApplicationRoot {
             Arc::clone(&ledger_master_state),
             registry.logs.journal("Validations"),
         );
-        let validators = Arc::new(ValidatorList::new(
-            ManifestCache::new(),
-            ManifestCache::new(),
+        let validators = Arc::new(ValidatorList::new_with_shared_caches(
+            Arc::clone(&registry.validator_manifest_cache),
+            Arc::clone(&registry.publisher_manifest_cache),
             SystemValidatorListClock,
             std::env::temp_dir().join("xrpld-application-root-validator-list"),
-            None,
+            quorum,
         ));
         let _ = validators.load(None, &[], &[], None);
 
@@ -2747,8 +2951,30 @@ impl ApplicationRoot {
             .lock()
             .expect("network_ops_state_sink mutex poisoned") = Some(Arc::clone(&network_ops_state));
 
+        let shared_subscription_manager: SharedSubscriptionPublisher =
+            Arc::new(std::sync::RwLock::new(None));
+        let fee_change_reporter = Arc::new(FeeChangeReporter {
+            job_queue: Arc::clone(&shared_job_queue),
+            load_fee_track: Arc::clone(&load_fee_track),
+            open_ledger: registry.open_ledger.clone(),
+            tx_q: registry.tx_q.clone(),
+            network_ops_state: Arc::clone(&network_ops_state),
+            subscription_manager: Arc::clone(&shared_subscription_manager),
+            last_summary: Arc::new(Mutex::new(None)),
+        });
+        let load_fee_control: Arc<dyn crate::load::load_manager::LoadFeeControl> =
+            load_fee_track.clone();
+        let load_manager = LoadManager::with_timing(
+            job_queue.clone(),
+            load_fee_control,
+            Arc::new(AppLoadManagerEvents {
+                collector_manager: collector_manager.clone(),
+                fee_change_reporter: Arc::clone(&fee_change_reporter),
+            }),
+            registry.logs.journal("load_manager"),
+            load_manager_timing,
+        );
         let transaction_master = Arc::new(TransactionMaster::new());
-        let shared_job_queue = Arc::new(job_queue.clone());
 
         let app_root = Ok(Self {
             basic_app: Arc::new(BasicApp::new(io_threads)?),
@@ -2769,6 +2995,8 @@ impl ApplicationRoot {
             collector_manager: Arc::new(collector_manager),
             load_manager: Arc::new(load_manager),
             load_fee_track,
+            fee_vote_setup: fee_setup,
+            fee_change_reporter,
             registry,
             node_store_scheduler: Arc::new(NodeStoreScheduler::new(job_queue)),
             node_family: None,
@@ -2781,7 +3009,7 @@ impl ApplicationRoot {
             ledger_delta_publisher: None,
             ledger_close_publisher: None,
             transaction_publisher: None,
-            shared_subscription_manager: Arc::new(std::sync::RwLock::new(None)),
+            shared_subscription_manager,
             network_ops_state,
             network_ops_runtime: None,
             network_ops_validation_runtime: None,
@@ -2812,6 +3040,7 @@ impl ApplicationRoot {
             open_ledger_sandbox: Arc::new(std::sync::Mutex::new(None)),
             close_gate: Arc::new(std::sync::Mutex::new(())),
             lcl_transition_gate: Arc::new(parking_lot::ReentrantMutex::new(())),
+            validation_advance_gate: Arc::new(parking_lot::Mutex::new(())),
             consensus_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             shared_tree_cache: std::sync::OnceLock::new(),
             shared_full_below_cache: std::sync::OnceLock::new(),
@@ -2861,6 +3090,11 @@ impl ApplicationRoot {
     /// preferred LCL while the consensus strand owns the outer transition.
     pub fn lcl_transition_gate(&self) -> &parking_lot::ReentrantMutex<()> {
         &self.lcl_transition_gate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validation_advance_gate(&self) -> &parking_lot::Mutex<()> {
+        &self.validation_advance_gate
     }
 
     /// Enqueue an already-authorized `JtBatch` job. Async ingress invokes
@@ -3153,9 +3387,28 @@ impl ApplicationRoot {
             .unwrap_or_default()
     }
 
+    /// Matches rippled `buildLCL` calling `LedgerMaster::storeLedger` before
+    /// `doAccept` emits accepted status/local validation. Makes the child
+    /// visible by exact hash to validation `checkAccept` without running the
+    /// later consensusBuilt scan yet.
+    pub(crate) fn store_consensus_ledger(&self, ledger: Arc<Ledger>) -> Arc<Ledger> {
+        let ledger = self.ledger_with_node_fetcher(ledger);
+        if let Some(runtime) = self.ledger_master_runtime()
+            && ledger.header().hash.is_non_zero()
+        {
+            runtime
+                .ledger_master()
+                .ledger_history()
+                .insert(Arc::clone(&ledger), false);
+        }
+        self.validations().register_ledger(&ledger);
+        ledger
+    }
+
     /// Execute the ledger-master portion of `consensusBuilt` exactly once for
-    /// a locally built ledger. The live AppConsensus path calls this after
-    /// construction and before any next-round decision; alternate acceptors
+    /// a child previously registered through `store_consensus_ledger`.
+    /// The live AppConsensus path calls this after notification/local validation
+    /// and before OpenLedger acceptance; alternate acceptors store first then
     /// reuse it through `on_consensus_built_ledger`.
     pub(crate) fn record_consensus_built_ledger(
         &self,
@@ -3167,20 +3420,20 @@ impl ApplicationRoot {
             lm_rt.set_building_ledger(0);
         }
         let ledger = self.ledger_with_node_fetcher(ledger);
+        // Rippled consensusBuilt clears building state then returns in
+        // standalone mode before built-ledger metadata/checkAccept scanning.
+        if self.standalone() {
+            return ledger;
+        }
         if let Some(runtime) = self.ledger_master_runtime()
             && ledger.header().hash.is_non_zero()
         {
-            let ledger_master = runtime.ledger_master();
-            let history = ledger_master.ledger_history();
-            history.insert(Arc::clone(&ledger), false);
-            history.built_ledger(Arc::clone(&ledger), consensus_hash, JsonValue::Null);
+            runtime.ledger_master().ledger_history().built_ledger(
+                Arc::clone(&ledger),
+                consensus_hash,
+                JsonValue::Null,
+            );
         }
-        // Matches rippled: the built ledger must be immediately findable by
-        // Validations::updateTrie → acquire() so the trie advances on the same
-        // consensus round. Without this, acquire() must fall back to the
-        // ledger_history TaggedCache which may have swept the entry under heavy
-        // load, causing the trie to stall.
-        self.validations().register_ledger(&ledger);
 
         // `consensusBuilt` must check the built ledger and then scan the
         // current trusted validations before any next-round semantics.
@@ -3190,6 +3443,7 @@ impl ApplicationRoot {
 
     pub fn on_consensus_built_ledger(&self, ledger: Arc<Ledger>) {
         let consensus_hash = *ledger.header().tx_hash.as_uint256();
+        let ledger = self.store_consensus_ledger(ledger);
         let ledger = self.record_consensus_built_ledger(ledger, consensus_hash);
         let _ = self.process_closed_ledger_txq(ledger.as_ref(), false);
 
@@ -3213,10 +3467,9 @@ impl ApplicationRoot {
                 .ledger_master()
                 .set_closed_ledger(Arc::clone(&ledger));
         }
-        // `on_closed_ledger` (called next) is the single source of truth
-        // for the closed-ledger tracker; only `ledger_history` needs
-        // populating here for by-hash/by-seq lookups.
-        self.on_closed_ledger(Arc::clone(&ledger));
+        // buildLCL/storeLedger already populated history and the validation
+        // cache above; mirror switchLCL without a second store/register.
+        self.on_closed_ledger_after_store(Arc::clone(&ledger));
         self.set_status_rpc_current_ledger_index(Some(next_open_index));
         self.set_status_rpc_queue_report(Some(self.tx_q_rpc_report()));
 
@@ -3559,6 +3812,38 @@ impl ApplicationRoot {
         }))
     }
 
+    pub fn node_writer_result_from_store(
+        &self,
+    ) -> Option<
+        std::sync::Arc<
+            dyn Fn(
+                    ledger::LedgerNodeObjectType,
+                    basics::base_uint::Uint256,
+                    Vec<u8>,
+                    u32,
+                ) -> Result<(), String>
+                + Send
+                + Sync,
+        >,
+    > {
+        let ns = self.node_store().as_ref().cloned().or_else(|| {
+            self.shared_consensus_node_store
+                .read()
+                .ok()
+                .and_then(|guard| guard.clone())
+        })?;
+        Some(std::sync::Arc::new(
+            move |object_type, hash, data, ledger_seq| match &ns {
+                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Single(db) => {
+                    db.store(to_nodestore_type(object_type), data, hash, ledger_seq)
+                }
+                crate::shamap::shamap_store_backend::SHAMapStoreNodeStore::Rotating(db) => {
+                    db.store(to_nodestore_type(object_type), data, hash, ledger_seq)
+                }
+            },
+        ))
+    }
+
     pub fn node_writer_from_store(
         &self,
     ) -> Option<
@@ -3646,14 +3931,36 @@ impl ApplicationRoot {
     }
 
     fn refresh_ledger_persistence_runtime(&self) {
-        let runtime = Arc::new(crate::AppLedgerPersistenceRuntime::with_job_queue(
-            self.registry.relational_database.clone(),
-            self.registry.node_store.clone(),
-            Arc::clone(&self.transaction_master),
-            self.registry.network_id_service.get_network_id(),
-            self.registry.ledger_db.clone(),
-            Some(Arc::clone(&self.job_queue)),
-        ));
+        let failed_save_handler = self.ledger_master_runtime().map(|runtime| {
+            let ledger_master = runtime.ledger_master();
+            let inbound_ledgers = Arc::clone(&runtime.inbound_ledgers);
+            Arc::new(move |seq: u32, hash: SHAMapHash| {
+                // Mirrors LedgerMaster::failedSave: a queue-admitted save that
+                // later fails must retract its complete-ledger claim and
+                // reacquire the exact hash, never a sequence-selected fork.
+                ledger_master.clear_ledger(seq);
+                if let Ok(guard) = inbound_ledgers.lock()
+                    && let Some(inbound) = guard.as_ref()
+                {
+                    inbound.acquire_async(
+                        *hash.as_uint256(),
+                        seq,
+                        crate::ledger::inbound_ledgers::AcquireReason::Generic,
+                    );
+                }
+            }) as Arc<dyn Fn(u32, SHAMapHash) + Send + Sync>
+        });
+        let runtime = Arc::new(
+            crate::AppLedgerPersistenceRuntime::with_job_queue_and_failed_save_handler(
+                self.registry.relational_database.clone(),
+                self.registry.node_store.clone(),
+                Arc::clone(&self.transaction_master),
+                self.registry.network_id_service.get_network_id(),
+                self.registry.ledger_db.clone(),
+                Some(Arc::clone(&self.job_queue)),
+                failed_save_handler,
+            ),
+        );
         *self
             .ledger_persistence_runtime
             .write()
@@ -3681,26 +3988,26 @@ impl ApplicationRoot {
         Arc::clone(&self.time_keeper)
     }
 
-    /// Initialise and start the built-in SNTP client with the given server
-    /// list.  The client runs in a background tokio task and periodically
-    /// updates the `TimeKeeper`'s SNTP offset.
+    /// Initialise the optional SNTP worker. Its TimeKeeper callback and
+    /// worker handle remain application-owned until MainRuntime shutdown.
     pub fn start_sntp_client(&mut self, servers: Vec<String>) {
-        if servers.is_empty() {
+        if servers.is_empty() || self.sntp_client.is_some() {
             return;
         }
         let client = crate::state::sntp::SntpClient::new(self.registry.logs.journal("sntp"));
-        // Spawn a task that polls the SNTP client offset and pushes it
-        // into the TimeKeeper.
-        let sntp = client.clone();
-        let tk = Arc::clone(&self.time_keeper);
-        tokio::spawn(async move {
-            loop {
-                tk.set_sntp_offset(sntp.offset_seconds());
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            }
-        });
-        client.run(servers);
-        self.sntp_client = Some(client);
+        let time_keeper = Arc::clone(&self.time_keeper);
+        match client.start(servers, move |offset| time_keeper.set_sntp_offset(offset)) {
+            Ok(()) => self.sntp_client = Some(client),
+            Err(error) => tracing::warn!(target: "sntp", %error, "SNTP client did not start"),
+        }
+    }
+
+    /// Stop and join the SNTP worker before the application-owned TimeKeeper
+    /// and its runtime resources are torn down.
+    pub fn stop_sntp_client(&self) {
+        if let Some(client) = self.sntp_client.as_ref() {
+            client.stop();
+        }
     }
 
     pub fn stop_tree(&self) -> &StopTree {
@@ -3809,7 +4116,7 @@ impl ApplicationRoot {
         overlay_runtime: Arc<AppOverlayRuntime>,
     ) -> Option<Arc<AppOverlayRuntime>> {
         let overlay = overlay_runtime.overlay();
-        let manifests = Arc::clone(&self.registry.manifest_cache);
+        let manifests = Arc::clone(&self.registry.validator_manifest_cache);
         overlay.set_manifests_message_provider(move || {
             // rippled 3.2.1: kMaxManifestsPerMessage = 200, kMaxManifestBytes = 358.
             // Cap outgoing manifest messages to prevent oversized TMManifests
@@ -4033,6 +4340,76 @@ impl ApplicationRoot {
         }
     }
 
+    /// Publish an applied open-ledger transaction to the real-time proposed
+    /// stream. Accepted transaction publication remains owned by
+    /// `on_published_ledger`, which emits only after validation/publication.
+    pub fn publish_proposed_transaction(
+        &self,
+        transaction: &SharedTransaction,
+        result: Ter,
+    ) -> bool {
+        let stx = Arc::clone(
+            transaction
+                .lock()
+                .expect("transaction mutex must not be poisoned")
+                .get_s_transaction(),
+        );
+        // Match `NetworkOPsImp::pubProposedTransaction`: inner Batch entries
+        // are implementation details of their outer transaction and are never
+        // exposed to client streams.
+        if stx.is_flag(tfInnerBatchTxn) {
+            return false;
+        }
+
+        let publisher = self
+            .shared_subscription_manager
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        let Some(publisher) = publisher else {
+            return false;
+        };
+        let payload = std::collections::BTreeMap::from([
+            (
+                "type".to_owned(),
+                JsonValue::String("transaction".to_owned()),
+            ),
+            ("status".to_owned(), JsonValue::String("proposed".to_owned())),
+            (
+                "ledger_current_index".to_owned(),
+                JsonValue::Unsigned(u64::from(self.open_ledger().current().ledger_current_index)),
+            ),
+            (
+                "hash".to_owned(),
+                JsonValue::String(stx.get_transaction_id().to_string()),
+            ),
+            ("transaction".to_owned(), stx.json(JsonOptions::NONE)),
+            (
+                "engine_result".to_owned(),
+                JsonValue::String(protocol::trans_token(result).to_owned()),
+            ),
+            (
+                "engine_result_code".to_owned(),
+                JsonValue::Signed(i64::from(result.to_int())),
+            ),
+            (
+                "engine_result_message".to_owned(),
+                JsonValue::String(protocol::trans_human(result).to_owned()),
+            ),
+            ("validated".to_owned(), JsonValue::Bool(false)),
+        ]);
+        publisher("transactions_proposed", JsonValue::Object(payload));
+        true
+    }
+
+    /// Schedule rippled's `NetworkOPs::reportFeeChange` server-stream
+    /// notification only when its ServerFeeSummary equivalent changed. Callers
+    /// invoke this after the shared open ledger has been rebuilt, because the
+    /// summary reflects its new fee and TxQ metrics.
+    pub fn report_fee_change(&self) -> bool {
+        self.fee_change_reporter.report_fee_change()
+    }
+
     pub fn validations(&self) -> &SharedAppValidations<SystemTimeKeeperClock> {
         &self.validations
     }
@@ -4064,6 +4441,7 @@ impl ApplicationRoot {
             .set_ledger_master_runtime(Some(Arc::clone(&ledger_master_runtime)));
         let previous = self.ledger_master_runtime.replace(ledger_master_runtime);
         self.refresh_validation_ledger_lookup_runtime();
+        self.refresh_ledger_persistence_runtime();
         previous
     }
 
@@ -4172,7 +4550,7 @@ impl ApplicationRoot {
 
         if self.runtime_bindings.validator_site.is_none() {
             self.runtime_bindings.validator_site =
-                Some(Arc::new(AppValidatorSiteRuntime::default()));
+                Some(Arc::new(AppValidatorSiteRuntime::new(self.clone())));
         }
 
         if self.runtime_bindings.perf_log.is_none() {
@@ -4228,7 +4606,7 @@ impl ApplicationRoot {
                 validator_token_lines,
             ),
             Some(Arc::new(crate::load::fee_vote::FeeVote::new(
-                crate::load::fee_vote::FeeSetup::default(),
+                self.fee_vote_setup,
                 crate::load::fee_vote::NullFeeVoteJournal,
             ))),
             {
@@ -4577,8 +4955,12 @@ impl ApplicationRoot {
                 *sandbox_holder.lock().expect("sandbox mutex") = Some(submit_view);
                 changed
             },
-            || {},
-            |_tx, _result| {},
+            || {
+                let _ = self.report_fee_change();
+            },
+            |tx, result| {
+                let _ = self.publish_proposed_transaction(tx, result);
+            },
             |_tx| {},
             |_tx| false,
             |tx| {
@@ -4602,19 +4984,13 @@ impl ApplicationRoot {
                     let stx = guard.get_s_transaction();
                     (guard.get_id(), stx.get_serializer().data().to_vec())
                 };
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-                    .saturating_sub(946684800);
+                let local_timestamp = self.shared_time_keeper().now().as_seconds() as u64;
+                // `deferred` is produced locally by NetworkOps from the apply
+                // result (`result == terQUEUED`). Never forward wire envelope
+                // metadata retained from the peer that submitted this tx.
                 overlay_rt.overlay().relay_transaction(
                     tx_id,
-                    Some(overlay::TmTransaction {
-                        raw_transaction: raw_bytes,
-                        status: 2, // tsCURRENT
-                        receive_timestamp: Some(now),
-                        deferred: Some(deferred),
-                    }),
+                    Some(queue_relay_envelope(raw_bytes, local_timestamp, deferred)),
                     &to_skip,
                 );
             },
@@ -4768,6 +5144,9 @@ impl ApplicationRoot {
         let trust_changes = self
             .validators
             .update_trusted(&seen_validators, lcl.header().close_time);
+        // Expiry and rotation can change UNL blocking without changing the
+        // trusted key set, so synchronize before this early return.
+        self.set_unl_blocked(self.validators.unl_blocked());
         if trust_changes.added.is_empty() && trust_changes.removed.is_empty() {
             return;
         }
@@ -4797,8 +5176,143 @@ impl ApplicationRoot {
             .set_trusted_validators(self.validators.get_quorum_keys().1);
     }
 
+    /// Apply a validator-list collection from an owned site or a peer-facing
+    /// application path, then perform the app-owned side effects that must not
+    /// be left to a one-shot bootstrap fetch.
+    pub fn apply_validator_lists(
+        &self,
+        manifest: &str,
+        version: u32,
+        blobs: &[ValidatorBlobInfo],
+        site_uri: String,
+        hash: Uint256,
+    ) -> PublisherListStats {
+        let result = self
+            .validators
+            .apply_lists(manifest, version, blobs, site_uri, Some(hash));
+
+        if result.best_disposition() <= ListDisposition::KnownSequence {
+            self.broadcast_v1_validator_list(&result, hash);
+        }
+        if result.publisher_key.is_some()
+            && let Err(error) = self.persist_manifest_caches()
+        {
+            // Runtime refreshes have no startup Result channel. Keep the
+            // verified in-memory list, but make failed durable persistence
+            // visible immediately rather than deferring it to shutdown.
+            tracing::error!(target: "manifest", %error,
+                "failed to persist trusted validator-list manifests");
+        }
+        result
+    }
+
+    /// Apply a v1 list received from a peer. The source peer is installed in
+    /// HashRouter before rebroadcast selection, preventing an accepted list
+    /// from being echoed straight back to its sender.
+    pub fn apply_validator_lists_from_peer(
+        &self,
+        peer_id: overlay::PeerId,
+        manifest: &str,
+        version: u32,
+        blobs: &[ValidatorBlobInfo],
+        site_uri: String,
+        hash: Uint256,
+    ) -> PublisherListStats {
+        self.registry.hash_router.add_suppression_peer(hash, peer_id);
+        self.apply_validator_lists(manifest, version, blobs, site_uri, hash)
+    }
+
+    pub(crate) fn validator_list_relay_skip(
+        &self,
+        hash: Uint256,
+    ) -> Option<std::collections::BTreeSet<overlay::PeerId>> {
+        self.registry.hash_router.should_relay(hash)
+    }
+
+    pub(crate) fn add_validator_list_suppression_peer(
+        &self,
+        hash: Uint256,
+        peer_id: overlay::PeerId,
+    ) -> bool {
+        self.registry.hash_router.add_suppression_peer(hash, peer_id)
+    }
+
+    fn broadcast_v1_validator_list(&self, result: &PublisherListStats, hash: Uint256) {
+        use overlay::{Overlay, Peer, ProtocolFeature};
+
+        let Some(publisher) = result.publisher_key else {
+            return;
+        };
+        let Some(to_skip) = self.registry.hash_router.should_relay(hash) else {
+            return;
+        };
+        let Some(serde_json::Value::Object(body)) = self
+            .validators
+            .get_available(&publisher.to_hex(), Some(1))
+        else {
+            return;
+        };
+        let Some(manifest) = body.get("manifest").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let Some(blob) = body.get("blob").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let Some(signature) = body.get("signature").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let Some(signature) = basics::string_utilities::str_unhex(signature) else {
+            return;
+        };
+        let protocol = overlay::ProtocolMessage::new(overlay::ProtocolPayload::ValidatorList(
+            overlay::TmValidatorList {
+                manifest: basics::base64::base64_decode(manifest),
+                blob: basics::base64::base64_decode(blob),
+                signature,
+                version: 1,
+            },
+        ));
+        let Some(overlay_rt) = self.overlay_runtime() else {
+            return;
+        };
+        for peer in overlay_rt.overlay().active_peers() {
+            if to_skip.contains(&peer.id())
+                || !peer.supports_feature(ProtocolFeature::ValidatorListPropagation)
+                || peer.publisher_list_sequence(publisher).unwrap_or_default() >= result.sequence
+            {
+                continue;
+            }
+            peer.set_publisher_list_sequence(publisher, result.sequence);
+            peer.send(overlay::Message::new(protocol.clone(), None));
+            // Match v1 sendValidatorList: each successful outbound message is
+            // recorded as a suppression peer before future rebroadcasts.
+            self.registry.hash_router.add_suppression_peer(hash, peer.id());
+        }
+    }
+
+    pub fn validator_sites(&self) -> Arc<ValidatorSite> {
+        Arc::clone(&self.registry.validator_sites)
+    }
+
+    pub fn persist_manifest_caches(&self) -> Result<(), String> {
+        self.registry.validator_manifest_cache.save_to_wallet(
+            self.registry.wallet_db.as_ref(),
+            "ValidatorManifests",
+            |public_key| self.validators.listed(*public_key),
+        )?;
+        self.registry.publisher_manifest_cache.save_to_wallet(
+            self.registry.wallet_db.as_ref(),
+            "PublisherManifests",
+            |public_key| self.validators.trusted_publisher(*public_key),
+        )
+    }
+
     pub fn manifest_cache(&self) -> &Arc<ManifestCache> {
-        &self.registry.manifest_cache
+        &self.registry.validator_manifest_cache
+    }
+
+    pub fn publisher_manifest_cache(&self) -> &Arc<ManifestCache> {
+        &self.registry.publisher_manifest_cache
     }
 
     pub fn receive_validation_to_network_ops(
@@ -4914,13 +5428,26 @@ impl ApplicationRoot {
         self.status_rpc_state.set_server_domain(server_domain)
     }
 
-    pub fn begin_snapshot_export(
+    /// Start an RPC snapshot export under the application lifecycle owner.
+    /// The state atomically records the worker and its owned cancellation
+    /// token before this call returns; `MainRuntime::shutdown` requests
+    /// cancellation and joins it before any storage component stops.
+    pub fn start_snapshot_export(
         &self,
         output: String,
         ledger_seq: u32,
-    ) -> Result<Arc<SnapshotExportState>, String> {
-        self.snapshot_export_state.begin(output, ledger_seq)?;
-        Ok(Arc::clone(&self.snapshot_export_state))
+        spawn: impl FnOnce(
+            Arc<SnapshotExportState>,
+            nodestore::snapshot::SnapshotExportCancellation,
+        ) -> Result<std::thread::JoinHandle<()>, String>,
+    ) -> Result<(), String> {
+        self.snapshot_export_state.start(output, ledger_seq, spawn)
+    }
+
+    /// Request cancellation of RPC snapshot work and join it before storage
+    /// teardown, so no writer can retain a NodeStore backend after shutdown.
+    pub fn quiesce_snapshot_export(&self) {
+        self.snapshot_export_state.quiesce();
     }
 
     pub fn snapshot_export_status(&self) -> SnapshotExportStatus {
@@ -5132,7 +5659,7 @@ impl ApplicationRoot {
     /// return it unchanged.
     pub fn ledger_with_node_fetcher(&self, ledger: Arc<Ledger>) -> Arc<Ledger> {
         let has_shared_family = self.node_family().is_some();
-        if (ledger.has_node_fetcher() && ledger.has_node_writer() && !has_shared_family)
+        if (ledger.has_node_fetcher() && ledger.has_node_writer_result() && !has_shared_family)
             || (!ledger.state_map().backed() && !ledger.tx_map().backed())
         {
             return ledger;
@@ -5140,7 +5667,8 @@ impl ApplicationRoot {
 
         let fetcher = self.node_fetcher_from_store();
         let writer = self.node_writer_from_store();
-        if fetcher.is_none() && writer.is_none() {
+        let writer_result = self.node_writer_result_from_store();
+        if fetcher.is_none() && writer.is_none() && writer_result.is_none() {
             tracing::warn!(target: "ledger",
                 "[ledger_fetcher] WARNING: backed ledger seq={} stored without node fetcher/writer \
                  (node store not yet attached) — reads/writes will fail with MissingNode",
@@ -5169,6 +5697,11 @@ impl ApplicationRoot {
             && !ledger_with_fetcher.has_node_writer()
         {
             ledger_with_fetcher.set_node_writer(writer);
+        }
+        if let Some(writer) = writer_result
+            && !ledger_with_fetcher.has_node_writer_result()
+        {
+            ledger_with_fetcher.set_node_writer_result(writer);
         }
         match ledger_with_fetcher.setup_from_state_map(&feature_xrp_fees()) {
             Ok(true) => {
@@ -5223,26 +5756,22 @@ impl ApplicationRoot {
     }
 
     pub fn on_closed_ledger(&self, ledger: Arc<Ledger>) {
-        self.on_closed_ledger_inner(ledger, None)
+        self.on_closed_ledger_inner(ledger, ClosedLedgerHistoryAction::Store)
             .expect("unconditional closed-ledger promotion cannot fail");
     }
 
-    /// Install a locally built consensus child only if the exact LCL snapshot
-    /// used as its parent is still current. A failed compare means a trusted
-    /// validation or acquired ledger won the race and the child must be
-    /// discarded rather than rolling the LCL back.
-    fn on_closed_ledger_if_current(
-        &self,
-        expected_current: &Arc<Ledger>,
-        ledger: Arc<Ledger>,
-    ) -> Result<(), String> {
-        self.on_closed_ledger_inner(ledger, Some(expected_current))
+    /// Mirrors rippled switchLCL after buildLCL has already called storeLedger:
+    /// update only canonical closed-LCL side effects, without a second
+    /// LedgerHistory insert or validation-adaptor registration.
+    fn on_closed_ledger_after_store(&self, ledger: Arc<Ledger>) {
+        self.on_closed_ledger_inner(ledger, ClosedLedgerHistoryAction::AlreadyStored)
+            .expect("unconditional switchLCL cannot fail");
     }
 
     fn on_closed_ledger_inner(
         &self,
         ledger: Arc<Ledger>,
-        expected_current: Option<&Arc<Ledger>>,
+        history_action: ClosedLedgerHistoryAction,
     ) -> Result<(), String> {
         let _lcl_transition_guard = self.lcl_transition_gate.lock();
         // Diagnostic: check incoming tree state before clone
@@ -5270,42 +5799,20 @@ impl ApplicationRoot {
         let closed_ledger_changed = self
             .closed_ledger()
             .is_none_or(|previous| previous.header().hash != normalized.header().hash);
-        if let Some(expected_current) = expected_current {
-            // Hold the submit/close gate while atomically installing the new
-            // parent view and clearing state derived from the old one.
+        if closed_ledger_changed {
+            // A Sandbox owns its parent view. Reusing one after a LCL switch
+            // makes submit preclaim read the old state and can turn an account
+            // that is visible through validated RPC into a false terNO_ACCOUNT.
+            // Serialize against direct submit application; consensus on_close
+            // already uses this same gate while it captures its tx set.
             let _close_guard = self
                 .close_gate
                 .lock()
                 .expect("close_gate mutex must not be poisoned");
-            if !self
-                .ledger_master_state
-                .replace_closed_ledger_if_current(expected_current, Arc::clone(&normalized))
-            {
-                return Err(format!(
-                    "stale consensus parent: captured={} current={}",
-                    expected_current.header().hash,
-                    self.closed_ledger()
-                        .map(|current| current.header().hash.to_string())
-                        .unwrap_or_else(|| "none".to_owned())
-                ));
-            }
             self.clear_open_ledger_account_seqs();
-        } else {
-            if closed_ledger_changed {
-                // A Sandbox owns its parent view. Reusing one after a LCL switch
-                // makes submit preclaim read the old state and can turn an account
-                // that is visible through validated RPC into a false terNO_ACCOUNT.
-                // Serialize against direct submit application; consensus on_close
-                // already uses this same gate while it captures its tx set.
-                let _close_guard = self
-                    .close_gate
-                    .lock()
-                    .expect("close_gate mutex must not be poisoned");
-                self.clear_open_ledger_account_seqs();
-            }
-            self.ledger_master_state
-                .note_closed_ledger(Arc::clone(&normalized));
         }
+        self.ledger_master_state
+            .note_closed_ledger(Arc::clone(&normalized));
 
         if let Some(overlay_runtime) = self.overlay_runtime() {
             overlay_runtime.overlay().set_handshake_ledgers(
@@ -5373,7 +5880,8 @@ impl ApplicationRoot {
         // `closed_ledger`/`set_closed_ledger` are no longer read or
         // written anywhere in the bootstrap loop -- `root.closed_ledger()`
         // (this tracker) is the only source of truth now, everywhere.
-        if let Some(runtime) = self.ledger_master_runtime()
+        if history_action == ClosedLedgerHistoryAction::Store
+            && let Some(runtime) = self.ledger_master_runtime()
             && normalized.is_immutable()
         {
             // Still feed `ledger_history` (needed for by-hash/by-seq lookup
@@ -5454,27 +5962,98 @@ impl ApplicationRoot {
         }
     }
 
+    fn ledger_closed_notification(&self, ledger: &Ledger) -> protocol::JsonValue {
+        let mut notification = std::collections::BTreeMap::from([
+            (
+                "type".to_owned(),
+                protocol::JsonValue::String("ledgerClosed".to_owned()),
+            ),
+            (
+                "ledger_index".to_owned(),
+                protocol::JsonValue::Unsigned(u64::from(ledger.header().seq)),
+            ),
+            (
+                "ledger_hash".to_owned(),
+                protocol::JsonValue::String(ledger.header().hash.to_string()),
+            ),
+            (
+                "ledger_time".to_owned(),
+                protocol::JsonValue::Unsigned(u64::from(ledger.header().close_time)),
+            ),
+            (
+                "network_id".to_owned(),
+                protocol::JsonValue::Unsigned(u64::from(self.network_id())),
+            ),
+            (
+                "fee_base".to_owned(),
+                protocol::JsonValue::Unsigned(ledger.fees().base),
+            ),
+            (
+                "reserve_base".to_owned(),
+                protocol::JsonValue::Unsigned(ledger.fees().reserve),
+            ),
+            (
+                "reserve_inc".to_owned(),
+                protocol::JsonValue::Unsigned(ledger.fees().increment),
+            ),
+            (
+                "txn_count".to_owned(),
+                protocol::JsonValue::Unsigned(
+                    ledger.tx_snapshot().map(|transactions| transactions.len()).unwrap_or_default()
+                        as u64,
+                ),
+            ),
+        ]);
+        if !ledger.rules().enabled(&feature_xrp_fees()) {
+            notification.insert(
+                "fee_ref".to_owned(),
+                protocol::JsonValue::Unsigned(u64::from(REFERENCE_FEE_UNITS_DEPRECATED)),
+            );
+        }
+        if self.network_ops_operating_mode() >= NetworkOpsOperatingMode::Syncing {
+            if let Some(runtime) = self.ledger_master_runtime() {
+                notification.insert(
+                    "validated_ledgers".to_owned(),
+                    protocol::JsonValue::String(runtime.ledger_master().complete_ledgers().to_string()),
+                );
+            }
+        }
+        protocol::JsonValue::Object(notification)
+    }
+
     pub fn on_published_ledger(&self, ledger: Arc<Ledger>) {
         self.ledger_master_state
             .note_published_ledger(self.ledger_with_node_fetcher(Arc::clone(&ledger)));
+        let notification = self.ledger_closed_notification(ledger.as_ref());
+        if let Some(publisher) = self.ledger_close_publisher.as_ref() {
+            publisher(notification.clone());
+        }
+        let publisher = self
+            .shared_subscription_manager
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned());
+        if let Some(publisher) = publisher.as_ref() {
+            publisher("ledger", notification);
+        }
         let Ok(transactions) = ledger.tx_snapshot() else {
             return;
         };
-        let Ok(guard) = self.shared_subscription_manager.read() else {
-            return;
-        };
-        let Some(publisher) = guard.as_ref() else {
+        let Some(publisher) = publisher.as_ref() else {
             return;
         };
         for (transaction, meta) in transactions {
-            publisher(
-                "transactions",
-                crate::ledger_to_json::ledger_to_json_tx::transaction_subscription_event(
-                    ledger.as_ref(),
-                    transaction.as_ref(),
-                    &meta,
-                ),
+            let event = crate::ledger_to_json::ledger_to_json_tx::transaction_subscription_event(
+                ledger.as_ref(),
+                transaction.as_ref(),
+                &meta,
             );
+            // `transactions` receives only accepted events. The distinct
+            // real-time stream receives both proposed and the terminal
+            // validated event, matching rippled's STransactions/SRtTransactions
+            // split.
+            publisher("transactions", event.clone());
+            publisher("transactions_proposed", event);
         }
     }
 
@@ -5484,6 +6063,30 @@ impl ApplicationRoot {
 
     pub fn published_ledger_seq(&self) -> Option<u32> {
         self.ledger_master_state.published_ledger_seq()
+    }
+
+    fn publish_full_ledger(
+        &self,
+        lm: &crate::AppLedgerMaster,
+        ledger: Arc<Ledger>,
+    ) -> Result<Arc<Ledger>, String> {
+        let persistence = ledger::LedgerPersistence::new(self.build_ledger_persistence_runtime());
+        let mut full = ledger;
+        {
+            let full_ledger = Arc::make_mut(&mut full);
+            full_ledger.set_validated();
+            full_ledger.set_full();
+        }
+        lm.set_full_ledger(&persistence, Arc::clone(&full), true, true, None, None)
+            .map_err(|error| format!("publication setFullLedger failed: {error:?}"))?;
+        lm.set_pub_ledger(Arc::clone(&full));
+        self.on_published_ledger(Arc::clone(&full));
+        let _ = self.order_book_db().setup(
+            Arc::clone(&full),
+            Arc::new(NullOrderBookDBRuntime),
+            Arc::new(NullOrderBookDBJournal),
+        );
+        Ok(full)
     }
 
     /// Matches rippled's `tryAdvance()` → `doAdvance()` →
@@ -5497,6 +6100,11 @@ impl ApplicationRoot {
     /// - If gap > MAX_LEDGER_GAP (100): jump to validated directly
     /// - Otherwise: walk sequentially (handled by plan_advance_publication)
     pub fn try_advance_publication(&self) {
+        let _advance_guard = self.validation_advance_gate.lock();
+        self.try_advance_publication_serialized();
+    }
+
+    fn try_advance_publication_serialized(&self) {
         let Some(lm_rt) = self.ledger_master_runtime() else {
             return;
         };
@@ -5522,8 +6130,12 @@ impl ApplicationRoot {
                         seq = ledger.header().seq,
                         "tryAdvance: publishing first validated ledger"
                     );
-                    self.on_published_ledger(Arc::clone(ledger));
-                    lm_rt.ledger_master().set_pub_ledger(Arc::clone(ledger));
+                    if let Err(error) =
+                        self.publish_full_ledger(lm_rt.ledger_master().as_ref(), Arc::clone(ledger))
+                    {
+                        tracing::error!(target: "ledger", %error,
+                            "tryAdvance: failed to publish first full ledger");
+                    }
                 }
             }
             AppLedgerMasterPublishAdvance::GapTooLarge => {
@@ -5533,8 +6145,12 @@ impl ApplicationRoot {
                         seq = ledger.header().seq,
                         "tryAdvance: gap too large, jumping to validated ledger"
                     );
-                    self.on_published_ledger(Arc::clone(ledger));
-                    lm_rt.ledger_master().set_pub_ledger(Arc::clone(ledger));
+                    if let Err(error) =
+                        self.publish_full_ledger(lm_rt.ledger_master().as_ref(), Arc::clone(ledger))
+                    {
+                        tracing::error!(target: "ledger", %error,
+                            "tryAdvance: failed to publish gap ledger");
+                    }
                 }
             }
             AppLedgerMasterPublishAdvance::Sequential => {
@@ -5544,8 +6160,13 @@ impl ApplicationRoot {
                         seq = ledger.header().seq,
                         "tryAdvance: publishing sequential ledger"
                     );
-                    self.on_published_ledger(Arc::clone(ledger));
-                    lm_rt.ledger_master().set_pub_ledger(Arc::clone(ledger));
+                    if let Err(error) =
+                        self.publish_full_ledger(lm_rt.ledger_master().as_ref(), Arc::clone(ledger))
+                    {
+                        tracing::error!(target: "ledger", %error,
+                            "tryAdvance: failed to publish sequential full ledger");
+                        break;
+                    }
                 }
                 if !report.published.is_empty() {}
                 // If there's a missing ledger, trigger acquisition.
@@ -5830,14 +6451,31 @@ impl ApplicationRoot {
     /// excluding validators in the current negative UNL. `ValidatorList`
     /// already calculates `quorum()` from the effective UNL, so callers must
     /// filter the votes but must not reduce the quorum again.
+    fn trusted_validations_for_ledger(&self, hash: Uint256, seq: u32) -> Vec<protocol::STValidation> {
+        self.validators().negative_unl_filter_validations(
+            self.validations()
+                .store()
+                .trusted_for_ledger_by_sequence(hash, seq),
+        )
+    }
+
     pub fn trusted_validation_count_for_ledger(&self, hash: Uint256, seq: u32) -> usize {
-        self.validators()
-            .negative_unl_filter_validations(
-                self.validations()
-                    .store()
-                    .trusted_for_ledger_by_sequence(hash, seq),
-            )
-            .len()
+        self.trusted_validations_for_ledger(hash, seq).len()
+    }
+
+    /// Mirrors `LedgerMaster::setValidLedger`: age the validated head from
+    /// the sample median of quorum-backed trusted validation signing times.
+    /// The fallback is the ledger close time when there is no usable quorum.
+    fn trusted_validation_sign_time(&self, hash: Uint256, seq: u32, fallback: u32) -> u32 {
+        let validations = self.trusted_validations_for_ledger(hash, seq);
+        median_validation_sign_time(
+            validations
+                .into_iter()
+                .map(|validation| validation.get_sign_time())
+                .collect(),
+            self.validators().quorum(),
+            fallback,
+        )
     }
 
     /// Matches rippled's `LedgerMaster::checkAccept(hash, seq)`
@@ -5975,6 +6613,11 @@ impl ApplicationRoot {
         let Some(lm_rt) = self.ledger_master_runtime() else {
             return;
         };
+        // Keep sequence observation, quorum admission, validated promotion and
+        // tryAdvance publication in one critical section. Without this, two
+        // different-sequence validation callbacks can both plan from the same
+        // pre-published state and later publish/overwrite out of order.
+        let _advance_guard = self.validation_advance_gate.lock();
         let lm = lm_rt.ledger_master();
 
         let current_valid_seq = lm.valid_ledger_seq();
@@ -5993,6 +6636,11 @@ impl ApplicationRoot {
         let val_count = self.trusted_validation_count_for_ledger(
             *ledger.header().hash.as_uint256(),
             ledger.header().seq,
+        );
+        let validated_sign_time = self.trusted_validation_sign_time(
+            *ledger.header().hash.as_uint256(),
+            ledger.header().seq,
+            ledger.header().close_time,
         );
         let can_be_current = lm.can_be_current(ledger.as_ref(), self.current_close_time_seconds());
         let accepted = lm.check_accept_ledger(
@@ -6031,7 +6679,14 @@ impl ApplicationRoot {
         l.set_full();
         let validated = Arc::new(l);
 
-        lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, None);
+        lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, Some(validated_sign_time));
+        // `set_valid_ledger_no_sweep` is necessary for partially acquired
+        // catch-up ledgers, but this quorum-backed full ledger follows the
+        // normal `setValidLedger` path and must sweep LocalTxs now.
+        if let Err(error) = self.update_local_tx(validated.as_ref()) {
+            tracing::warn!(target: "ledger", seq = validated.header().seq, ?error,
+                "check_accept: unable to sweep local transactions for validated ledger");
+        }
         // `setFullLedger` in rippled indexes validated ledgers in
         // LedgerHistory. The history scheduler needs this by-sequence entry
         // to retrieve the parent hash for its first predecessor request.
@@ -6043,7 +6698,16 @@ impl ApplicationRoot {
         // ledgers via the adaptor's local HashMap (never swept).
         self.validations().register_ledger(&validated);
         lm.mark_ledger_complete(validated.header().seq);
-        self.note_validated_ledger_for_sync(Arc::clone(&validated));
+        // Mirrors LedgerMaster::setValidLedger, which invokes both
+        // SHAMapStore::onLedgerClosed and AmendmentTable::doValidatedLedger.
+        // A lightweight pointer update leaves retention health and amendment
+        // state stale after validation-driven acquisition.
+        let _ = self.on_validated_ledger(Arc::clone(&validated));
+        // `on_validated_ledger` records the ledger close time for generic
+        // callers. Restore the quorum-backed signing-time median required by
+        // `LedgerMaster::setValidLedger` for validated-age/caught-up checks.
+        self.ledger_master_state
+            .set_validated_close_time(validated_sign_time);
 
         // Matches rippled's `LedgerMaster::checkAccept`: visibility is
         // promoted first (above: `setValidLedger` equivalent), then
@@ -6064,10 +6728,30 @@ impl ApplicationRoot {
         // pendSaveValidated ordering). The remaining work updates in-memory
         // indexes and runtime mirrors only.
 
-        // Rippled parity: after promoting a validated ledger, update the fee
-        // tracker with the ledger's base fee so the fee escalation algorithm
-        // reflects current network conditions. In rippled this is:
-        //   app_.getFeeTrack().setClusterFee(ledger->fees().base)
+        // Mirror LedgerMaster::checkAccept: median trusted sfLoadFee values
+        // for the accepted ledger and its parent, defaulting to the local load
+        // base when no validator supplied a load fee. This is remote fee
+        // consensus, distinct from the validated ledger base fee below.
+        let load_base = self.load_fee_track.load_base();
+        let mut validation_fees = self.validations().fees_for_ledger(
+            *validated.header().hash.as_uint256(),
+            validated.header().seq,
+            load_base,
+        );
+        validation_fees.extend(self.validations().fees_for_ledger(
+            *validated.header().parent_hash.as_uint256(),
+            validated.header().seq.saturating_sub(1),
+            load_base,
+        ));
+        validation_fees.sort_unstable();
+        let remote_fee = validation_fees
+            .get(validation_fees.len() / 2)
+            .copied()
+            .unwrap_or(load_base);
+        self.load_fee_track.set_remote_fee(remote_fee);
+
+        // Record the accepted ledger's base fee separately for cluster/base
+        // fee tracking and RPC presentation.
         self.load_fee_track
             .update_from_validated_ledger(validated.fees().base);
 
@@ -6111,7 +6795,7 @@ impl ApplicationRoot {
         // install this ledger as the closed LCL, rebuild the open ledger,
         // change operating mode, or emit a switched-ledger StatusChange;
         // NetworkOpsStrand owns those actions after preferred-LCL selection.
-        self.try_advance_publication();
+        self.try_advance_publication_serialized();
 
         // Consensus advancement after validating a new ledger.
         //
@@ -6273,33 +6957,8 @@ impl ApplicationRoot {
             // This matches rippled's standalone acceptLedger which
             // unconditionally validates since there's no network quorum.
             self.on_validated_ledger(Arc::clone(&closed));
-            // Notify WebSocket subscribers about the ledger close.
-            if let Ok(guard) = self.shared_subscription_manager.read() {
-                if let Some(publisher) = guard.as_ref() {
-                    let mut notification = std::collections::BTreeMap::new();
-                    notification.insert(
-                        "type".to_owned(),
-                        protocol::JsonValue::String("ledgerClosed".to_owned()),
-                    );
-                    notification.insert(
-                        "ledger_index".to_owned(),
-                        protocol::JsonValue::Unsigned(u64::from(closed.header().seq)),
-                    );
-                    notification.insert(
-                        "ledger_hash".to_owned(),
-                        protocol::JsonValue::String(closed.header().hash.to_string()),
-                    );
-                    notification.insert(
-                        "ledger_time".to_owned(),
-                        protocol::JsonValue::Unsigned(u64::from(closed.header().close_time)),
-                    );
-                    notification.insert(
-                        "validated_ledgers".to_owned(),
-                        protocol::JsonValue::String(format!("2-{}", closed.header().seq)),
-                    );
-                    publisher("ledger", protocol::JsonValue::Object(notification));
-                }
-            }
+            // on_published_ledger above emits the canonical ledgerClosed
+            // subscription event for both standalone and normal publication.
             self.promote_operating_mode_after_accepted_ledger(closed.as_ref());
             // Visibility (on_closed_ledger/on_validated_ledger above) already
             // promoted before persistence dispatch. `is_current=true` matches
@@ -6509,7 +7168,7 @@ impl ApplicationRoot {
     ) -> Result<AcceptedLedgerOutcome, String> {
         self.accept_ledger_with_txns_outcome_on_parent(
             self.closed_ledger().or_else(|| self.validated_ledger()),
-            None,
+            AcceptedLedgerLclInstall::Unconditional,
             closed_seq,
             close_time,
             close_resolution,
@@ -6517,14 +7176,17 @@ impl ApplicationRoot {
             base_fee_drops,
             txns,
         )
+        .map_err(|error| format!("accepted ledger build failed: {error:?}"))
     }
 
     /// Builds a consensus result on the exact parent captured by `on_accept`.
     ///
-    /// The accept job runs asynchronously, so re-reading `closed_ledger` here
-    /// can select a ledger installed by a concurrent validation or LCL switch.
-    /// Rippled builds against the round's `prevLedger`; preserve that parent
-    /// rather than combining an old consensus result with a new chain tip.
+    /// Rippled `doAccept` builds on generic Consensus's captured `prevLedger`
+    /// even when it differs from the global closed slot during legitimate
+    /// WrongLedger/SwitchedLedger recovery. The child is deliberately not
+    /// installed here: `RCLConsensus` performs `consensusBuilt`, accepts the
+    /// new open ledger, then switches the closed LCL, matching the reference
+    /// ordering.
     pub(crate) fn accept_ledger_with_txns_outcome_from_consensus_parent(
         &self,
         parent_ledger: Arc<Ledger>,
@@ -6534,25 +7196,10 @@ impl ApplicationRoot {
         correct_close_time: bool,
         base_fee_drops: u64,
         txns: Vec<Arc<protocol::STTx>>,
-    ) -> Result<AcceptedLedgerOutcome, String> {
-        // Keep all build-time effects (transaction-master state, TxQ, and
-        // delta publication) within the same transition as the conditional
-        // LCL install. An authoritative promotion therefore cannot turn a
-        // discarded child into partially committed local state.
-        let _lcl_transition_guard = self.lcl_transition_gate.lock();
-        let Some(expected_current) = self.closed_ledger() else {
-            return Err("stale consensus parent: no current closed ledger".to_owned());
-        };
-        if expected_current.header().hash != parent_ledger.header().hash {
-            return Err(format!(
-                "stale consensus parent: captured={} current={}",
-                parent_ledger.header().hash,
-                expected_current.header().hash
-            ));
-        }
+    ) -> Result<AcceptedLedgerOutcome, crate::bootstrap::build_ledger::BuildLedgerError> {
         self.accept_ledger_with_txns_outcome_on_parent(
             Some(parent_ledger),
-            Some(expected_current),
+            AcceptedLedgerLclInstall::Deferred,
             closed_seq,
             close_time,
             close_resolution,
@@ -6562,17 +7209,64 @@ impl ApplicationRoot {
         )
     }
 
+    /// Install a consensus-built child after the rippled-equivalent
+    /// `consensusBuilt` and `OpenLedger::accept` steps. Mirrors
+    /// `LedgerMaster::switchLCL` in `doAccept` without a separate
+    /// global-parent rejection.
+    pub(crate) fn install_consensus_child(&self, child: Arc<Ledger>) {
+        // Mirrors LedgerMaster::switchLCL from rippled `doAccept`: reject an
+        // invalid LCL object, then install the captured generic Consensus
+        // child without a separate global-parent rejection gate and run the
+        // immediate post-switch checkAccept.
+        assert!(
+            child.is_immutable(),
+            "xrpl::LedgerMaster::switchLCL : mutable consensus child"
+        );
+        assert!(
+            !child.open(),
+            "xrpl::LedgerMaster::switchLCL : open consensus child"
+        );
+        self.on_closed_ledger_after_store(Arc::clone(&child));
+        if let Some(runtime) = self.ledger_master_runtime() {
+            let ledger_master = runtime.ledger_master();
+            if self.standalone() {
+                // Mirrors LedgerMaster::switchLCL standalone branch:
+                // setFullLedger(lastClosed, true, false); tryAdvance().
+                let persistence =
+                    ledger::LedgerPersistence::new(self.build_ledger_persistence_runtime());
+                let _ = ledger_master.set_full_ledger(
+                    &persistence,
+                    Arc::clone(&child),
+                    true,
+                    false,
+                    None,
+                    None,
+                );
+                if ledger_master.try_advance() {
+                    let _ = ledger_master.do_advance();
+                }
+                if let Some(published) = ledger_master.published_ledger() {
+                    self.on_published_ledger(published);
+                }
+            } else {
+                // Non-standalone switchLCL immediately checks validations
+                // for the newly relevant LCL.
+                self.check_accept_ledger(child);
+            }
+        }
+    }
+
     fn accept_ledger_with_txns_outcome_on_parent(
         &self,
         parent_ledger: Option<Arc<Ledger>>,
-        expected_current: Option<Arc<Ledger>>,
+        lcl_install: AcceptedLedgerLclInstall,
         closed_seq: u32,
         close_time: u32,
         close_resolution: u8,
         correct_close_time: bool,
         _base_fee_drops: u64,
         txns: Vec<Arc<protocol::STTx>>,
-    ) -> Result<AcceptedLedgerOutcome, String> {
+    ) -> Result<AcceptedLedgerOutcome, crate::bootstrap::build_ledger::BuildLedgerError> {
         // Ensure the parent ledger has a node_fetcher attached. The
         // closed_ledger slot may hold a ledger whose fetcher was not set
         // (e.g. when check_accept_ledger promotes an acquired ledger via
@@ -6812,6 +7506,17 @@ impl ApplicationRoot {
             );
         }
 
+        let state_table = state_view
+            .into_inner()
+            .expect("state view mutex must not be poisoned")
+            .into_table();
+        let mut state_table = Some(state_table);
+        let needs_durable_persistence = self.node_store().is_some()
+            || self
+                .shared_consensus_node_store
+                .read()
+                .ok()
+                .is_some_and(|guard| guard.is_some());
         let closed = match parent_ledger {
             Some(parent) => crate::build_ledger_from_view(
                 Arc::clone(&parent),
@@ -6820,16 +7525,38 @@ impl ApplicationRoot {
                 close_resolution,
                 accept_journal.as_ref(),
                 |built| {
-                    StandaloneLedgerBuildView::from_base(Arc::new(built.clone()), &accepted_entries)
+                    StandaloneLedgerBuildView::from_base(
+                        Arc::new(built.clone()),
+                        &accepted_entries,
+                        state_table.take(),
+                    )
                 },
-                |_ledger| 0,
-                |_ledger| 0,
+                move |ledger| {
+                    if !ledger.has_node_fetcher() {
+                        if let Some(fetcher) = self.node_fetcher_from_store() {
+                            ledger.set_node_fetcher(fetcher);
+                        }
+                    }
+                    if needs_durable_persistence {
+                        if !ledger.has_node_writer_result() {
+                            let writer = self.node_writer_result_from_store().ok_or_else(|| {
+                                crate::bootstrap::build_ledger::BuildLedgerError::Persist(
+                                    "missing fallible node writer for consensus ledger".to_owned(),
+                                )
+                            })?;
+                            ledger.set_node_writer_result(writer);
+                        }
+                        ledger.state_map_mut().set_backed();
+                        ledger.tx_map_mut().set_backed();
+                        ledger
+                            .persist_dirty_nodes_to_store_result(self.shared_tree_cache())
+                            .map_err(crate::bootstrap::build_ledger::BuildLedgerError::Persist)?;
+                    }
+                    Ok(0)
+                },
+                |_ledger| Ok(0),
                 |_ledger| {},
-            )
-            .map_err(|error| {
-                tracing::error!(target: "app", "Failed to apply state to closed ledger");
-                format!("standalone ledger build failed: {error:?}")
-            })?,
+            )?,
             None => {
                 let mut closed =
                     Ledger::from_ledger_seq_and_close_time(closed_seq, close_time, false);
@@ -6837,71 +7564,13 @@ impl ApplicationRoot {
                     StandaloneLedgerBuildView::from_base(
                         Arc::new(closed.clone()),
                         &accepted_entries,
+                        state_table.take(),
                     ),
                     &mut closed,
-                );
+                )?;
                 closed.set_accepted(close_time, close_resolution, correct_close_time);
                 Arc::new(closed)
             }
-        };
-
-        // Apply accumulated state changes from the transactor to the closed ledger
-        let closed = {
-            let view = state_view
-                .into_inner()
-                .expect("state view mutex must not be poisoned");
-            let mut ledger = Arc::try_unwrap(closed).unwrap_or_else(|arc| (*arc).clone());
-            let _ = view.table().apply(&mut ledger);
-            // Matches rippled's BuildLedger.cpp lines 69-73:
-            //   built->stateMap().flushDirty(AccountNode)
-            //   built->txMap().flushDirty(TransactionNode)
-            //   built->unshare()
-            // Re-back the SHAMaps and persist all dirty nodes to NuDB.
-            // This ensures peers can serve this ledger via InboundLedger's
-            // SHAMap-walk protocol. The in-memory tree stays intact for
-            // immediate serving via get_node_fat.
-            //
-            // Ensure the ledger has both fetcher and writer before persist.
-            // Without the writer, persist_dirty_nodes_to_store silently
-            // does nothing (early-returns on writer.is_none()), leaving
-            // dirty nodes only in memory. When the next round builds from
-            // this ledger as parent, any evicted/released nodes become
-            // unreadable (MissingNode) because they were never flushed to
-            // NuDB. Similarly, without a fetcher, update_skip_list in
-            // build_ledger_from_view fails on the first traversal into a
-            // node not held in memory.
-            if !ledger.has_node_fetcher() {
-                if let Some(fetcher) = self.node_fetcher_from_store() {
-                    ledger.set_node_fetcher(fetcher);
-                }
-            }
-            if !ledger.has_node_writer() {
-                if let Some(writer) = self.node_writer_from_store() {
-                    ledger.set_node_writer(writer);
-                } else {
-                    tracing::error!(target: "app",
-                        seq = ledger.header().seq,
-                        node_store_available = self.node_store().is_some(),
-                        "[accept] CANNOT attach writer — node_store_from_store returned None"
-                    );
-                }
-            }
-            tracing::info!(target: "app",
-                seq = ledger.header().seq,
-                has_fetcher = ledger.has_node_fetcher(),
-                has_writer = ledger.has_node_writer(),
-                "[accept] post-attach state before persist"
-            );
-            ledger.state_map_mut().set_backed();
-            ledger.tx_map_mut().set_backed();
-            // Persist dirty nodes to NuDB + tree cache.
-            // Matches rippled's BuildLedger.cpp lines 69-73:
-            //   built->stateMap().flushDirty(AccountNode)
-            //   built->txMap().flushDirty(TransactionNode)
-            // Passing the shared tree cache ensures canonicalize is called
-            // during flush (matching rippled's writeNode → canonicalize + db().store()).
-            ledger.persist_dirty_nodes_to_store(self.shared_tree_cache());
-            Arc::new(ledger)
         };
 
         let tx_count = accepted_entries.len();
@@ -6916,13 +7585,11 @@ impl ApplicationRoot {
         // bookkeeping occur atomically with the required checkAccept scan.
 
         // A locally accepted consensus result is an LCL candidate, not proof
-        // that this exact ledger has network quorum. `check_accept_ledger`
-        // alone publishes/promotes a trusted validated ledger. Publishing or
-        // promoting here allowed a stale local branch to report FULL before
-        // post-accept preferred-LCL reconciliation completed.
-        if let Some(expected_current) = expected_current.as_ref() {
-            self.on_closed_ledger_if_current(expected_current, Arc::clone(&closed))?;
-        } else {
+        // that this exact ledger has network quorum. The active consensus path
+        // defers installation until after `consensusBuilt` and open-ledger
+        // acceptance, matching rippled `doAccept`. Legacy callers retain the
+        // historical unconditional promotion behavior.
+        if lcl_install == AcceptedLedgerLclInstall::Unconditional {
             self.on_closed_ledger(Arc::clone(&closed));
         }
 
@@ -6931,11 +7598,11 @@ impl ApplicationRoot {
         // next open ledger causing duplicate application on subsequent accepts.
         let _ = self.update_local_tx(closed.as_ref());
 
-        // A live consensus close is a local candidate, not evidence that its
-        // transaction set entered the trusted network ledger. The validated
-        // promotion path (`check_accept_ledger`) persists the authoritative
-        // network ledger after quorum instead.
-        if self.standalone() {
+        // In deferred consensus acceptance, rippled switchLCL's standalone
+        // branch performs the only setFullLedger/tryAdvance persistence after
+        // the child is installed. Persisting here first would mark the hash
+        // saved while still unvalidated and suppress that authoritative save.
+        if self.standalone() && lcl_install == AcceptedLedgerLclInstall::Unconditional {
             // Visibility (on_closed_ledger above) already promoted before
             // persistence dispatch here. `is_current=false` matches this
             // path's actual visibility state: unlike the accept_standalone_
@@ -7108,11 +7775,11 @@ impl ServiceRegistry for ApplicationRoot {
     }
 
     fn get_validator_manifests(&self) -> &Self::ManifestCache {
-        &self.registry.manifest_cache
+        &self.registry.validator_manifest_cache
     }
 
     fn get_publisher_manifests(&self) -> &Self::ManifestCache {
-        &self.registry.manifest_cache
+        &self.registry.publisher_manifest_cache
     }
 
     fn get_overlay(&self) -> &Self::Overlay {

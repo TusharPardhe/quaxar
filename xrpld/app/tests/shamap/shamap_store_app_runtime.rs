@@ -126,7 +126,9 @@ impl Backend for TestBackend {
         (Vec::new(), Status::NotFound)
     }
 
-    fn store(&self, _object: Arc<NodeObject>) {}
+    fn store(&self, _object: Arc<NodeObject>) -> Result<(), String> {
+        Ok(())
+    }
 
     fn store_batch(&self, _batch: &Batch) {}
 

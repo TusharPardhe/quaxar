@@ -164,12 +164,17 @@ where
     }
 
     pub fn canonicalize(&self, txn: &mut SharedTransaction) {
-        let txn_id = txn
-            .lock()
-            .expect("transaction mutex must not be poisoned")
-            .get_id();
+        let (txn_id, relay_metadata) = {
+            let guard = txn.lock().expect("transaction mutex must not be poisoned");
+            (guard.get_id(), guard.relay_metadata())
+        };
         if !txn_id.is_zero() {
             self.cache.canonicalize_replace_client(&txn_id, txn);
+            if let Some(metadata) = relay_metadata {
+                txn.lock()
+                    .expect("transaction mutex must not be poisoned")
+                    .merge_relay_metadata(metadata);
+            }
         }
     }
 

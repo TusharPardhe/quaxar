@@ -255,14 +255,6 @@ mod tests {
     };
     use app::ManagedComponent;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    fn install_crypto() {
-        use std::sync::Once;
-        static INSTALL: Once = Once::new();
-        INSTALL.call_once(|| {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        });
-    }
     #[test]
     fn parse_server_bootstrap_args_defaults_like_the_simple_server_shell() {
         let config = parse_server_bootstrap_args(["xrpld-server".to_owned()])
@@ -315,7 +307,6 @@ mod tests {
 
     #[test]
     fn build_runtime_report_records_deferred_peer_and_secure_protocols() {
-        install_crypto();
         let config = ServerBootstrapConfig {
             bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             protocols: vec!["http".to_owned(), "peer".to_owned(), "https".to_owned()],

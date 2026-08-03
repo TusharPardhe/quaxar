@@ -59,7 +59,7 @@ pub(super) fn record_permissioned_dex(
     }
 }
 
-pub(super) fn validates_permissioned_dex<V: ApplyView>(
+pub(super) fn validates_permissioned_dex<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     txn_type: protocol::TxType,
     result: Ter,

@@ -208,14 +208,27 @@ pub(crate) fn transaction_subscription_event(
     txn: &STTx,
     meta: &TxMeta,
 ) -> JsonValue {
+    let result = meta.get_result_ter();
+    let mut transaction = txn.json(JsonOptions::NONE);
+    if let JsonValue::Object(object) = &mut transaction {
+        object.insert(
+            "date".to_owned(),
+            JsonValue::Unsigned(u64::from(ledger.header().close_time)),
+        );
+    }
     let mut meta_json = meta.get_json(JsonOptions::NONE);
     insert_delivered_amount(&mut meta_json, ledger, txn, meta);
+    insert_mp_token_issuance_id(&mut meta_json, txn, meta);
     JsonValue::Object(BTreeMap::from([
         (
             "type".to_owned(),
             JsonValue::String("transaction".to_owned()),
         ),
-        ("transaction".to_owned(), txn.json(JsonOptions::NONE)),
+        (
+            "hash".to_owned(),
+            JsonValue::String(txn.get_transaction_id().to_string()),
+        ),
+        ("transaction".to_owned(), transaction),
         ("meta".to_owned(), meta_json),
         (
             "ledger_index".to_owned(),
@@ -225,7 +238,26 @@ pub(crate) fn transaction_subscription_event(
             "ledger_hash".to_owned(),
             JsonValue::String(ledger.header().hash.to_string()),
         ),
+        (
+            "close_time_iso".to_owned(),
+            JsonValue::String(to_string_iso(basics::chrono::NetClockTimePoint::new(
+                ledger.header().close_time,
+            ))),
+        ),
         ("validated".to_owned(), JsonValue::Bool(true)),
+        ("status".to_owned(), JsonValue::String("closed".to_owned())),
+        (
+            "engine_result".to_owned(),
+            JsonValue::String(protocol::trans_token(result).to_owned()),
+        ),
+        (
+            "engine_result_code".to_owned(),
+            JsonValue::Signed(i64::from(result.to_int())),
+        ),
+        (
+            "engine_result_message".to_owned(),
+            JsonValue::String(protocol::trans_human(result).to_owned()),
+        ),
     ]))
 }
 
@@ -309,6 +341,47 @@ fn get_created_mp_token_issuance_id(meta: &TxMeta) -> Option<protocol::MPTID> {
 
 pub(crate) fn fill_json_queue_tx(fill: &AppLedgerFill<'_>, txn: &STTx) -> JsonValue {
     fill_json_tx_entry(fill, fill.is_binary(), fill.is_expanded(), txn, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transaction_subscription_event;
+    use ledger::Ledger;
+    use protocol::{
+        JsonValue, STArray, STObject, STTx, StBase, TxMeta, TxType, get_field_by_symbol,
+    };
+
+    #[test]
+    fn validated_subscription_event_matches_rippled_trans_json_shape() {
+        let ledger = Ledger::from_ledger_seq_and_close_time(42, 600_000_000, false);
+        let tx = STTx::new(TxType::PAYMENT, |_| {});
+        let mut meta_object = STObject::new(get_field_by_symbol("sfTransactionMetaData"));
+        meta_object.set_field_u8(get_field_by_symbol("sfTransactionResult"), 0);
+        meta_object.set_field_u32(get_field_by_symbol("sfTransactionIndex"), 0);
+        meta_object.set_field_array(
+            get_field_by_symbol("sfAffectedNodes"),
+            STArray::new(get_field_by_symbol("sfAffectedNodes")),
+        );
+        let meta = TxMeta::from_stobject(tx.get_transaction_id(), 42, meta_object);
+
+        let JsonValue::Object(event) = transaction_subscription_event(&ledger, &tx, &meta) else {
+            panic!("subscription event should be an object");
+        };
+        assert_eq!(event.get("validated"), Some(&JsonValue::Bool(true)));
+        assert_eq!(event.get("status"), Some(&JsonValue::String("closed".to_owned())));
+        assert_eq!(event.get("engine_result"), Some(&JsonValue::String("tesSUCCESS".to_owned())));
+        assert!(event.contains_key("engine_result_code"));
+        assert!(event.contains_key("engine_result_message"));
+        assert!(event.contains_key("hash"));
+        assert!(event.contains_key("close_time_iso"));
+        let JsonValue::Object(transaction) = event.get("transaction").expect("transaction") else {
+            panic!("transaction should be an object");
+        };
+        assert_eq!(
+            transaction.get("date"),
+            Some(&JsonValue::Unsigned(u64::from(ledger.header().close_time))),
+        );
+    }
 }
 
 #[allow(dead_code)]

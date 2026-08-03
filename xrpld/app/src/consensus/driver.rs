@@ -72,7 +72,7 @@ pub fn spawn_event_loop(
     shared_inbound: Arc<InboundLedgers>,
     event_rx: Receiver<ConsensusEvent>,
     stop: Arc<AtomicBool>,
-) {
+) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("consensus-event-loop".into())
         .spawn(move || {
@@ -167,5 +167,5 @@ pub fn spawn_event_loop(
                 }
             }
         })
-        .expect("spawn consensus-event-loop thread");
+        .expect("spawn consensus-event-loop thread")
 }

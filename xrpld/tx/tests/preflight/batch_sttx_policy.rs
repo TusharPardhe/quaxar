@@ -1,3 +1,4 @@
+use basics::base_uint::Uint256;
 use protocol::{
     AccountID, BatchTransactionFlags, INNER_BATCH_TRANSACTION_FLAG, Rules, STAmount, STArray,
     STObject, STTx, StBase, Ter, TxType, get_field_by_symbol,
@@ -167,7 +168,7 @@ fn tx_sttx_batch_preflight_rejects_typed_check_cash_without_amount_or_deliver_mi
         tx.set_account_id(get_field_by_symbol("sfAccount"), outer);
         tx.set_field_h256(
             get_field_by_symbol("sfCheckID"),
-            protocol::Uint256::from_u64(1),
+            Uint256::from_u64(1),
         );
         tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(0, false));
         tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);

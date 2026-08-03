@@ -171,6 +171,10 @@ pub struct QueuedOverlayInboundHandler {
     /// matching reference where gotLedgerData dispatches directly from the network thread.
     #[allow(clippy::type_complexity)]
     ledger_data_router: Mutex<Option<Arc<dyn Fn(PeerId, TmLedgerData) + Send + Sync>>>,
+    /// Serializes fallback drain with all direct ledger-data delivery. A
+    /// router installed during startup must replay older packets before any
+    /// concurrent ingress can overtake them.
+    ledger_data_delivery_gate: Mutex<()>,
     /// Direct routing callback for inbound transactions — dispatches
     /// immediately to a JobQueue worker on receipt, matching reference
     /// PeerImp::handleTransaction -> JobQueue::addJob(JtTransaction,
@@ -214,6 +218,7 @@ impl Default for QueuedOverlayInboundHandler {
             inner: Mutex::new(OverlayInboundSnapshot::default()),
             ledger_data_tx: Mutex::new(None),
             ledger_data_router: Mutex::new(None),
+            ledger_data_delivery_gate: Mutex::new(()),
             transaction_router: Mutex::new(None),
             validation_router: Mutex::new(None),
             validation_notify_tx: Mutex::new(None),
@@ -263,6 +268,10 @@ impl QueuedOverlayInboundHandler {
     /// called FIRST (before the channel), directly from the network thread.
     /// This eliminates the router thread channel hop for maximum throughput.
     pub fn set_ledger_data_router(&self, router: Box<dyn Fn(PeerId, TmLedgerData) + Send + Sync>) {
+        let _delivery_gate = self
+            .ledger_data_delivery_gate
+            .lock()
+            .expect("ledger_data_delivery_gate lock");
         tracing::info!(target: "consensus", handler_ptr = format!("{:p}", self), "set_ledger_data_router: SETTING router");
         let router: Arc<dyn Fn(PeerId, TmLedgerData) + Send + Sync> = Arc::from(router);
         let queued = {
@@ -296,6 +305,10 @@ impl QueuedOverlayInboundHandler {
     /// those packets must be replayed instead of remaining invisible to the
     /// acquisition registry.
     pub fn drain_ledger_data_to_router(&self) -> usize {
+        let _delivery_gate = self
+            .ledger_data_delivery_gate
+            .lock()
+            .expect("ledger_data_delivery_gate lock");
         let (router, packets) = {
             let router_guard = self
                 .ledger_data_router
@@ -504,6 +517,27 @@ impl QueuedOverlayInboundHandler {
         std::mem::take(&mut self.inner.lock().expect("overlay inbound lock").get_ledgers)
     }
 
+    /// Atomically drain the validator-message families owned by bootstrap.
+    ///
+    /// A snapshot followed by separate drains can split a v2 collection from
+    /// its neighboring manifest or v1 list as ingress continues. Keep these
+    /// queues under one lock so every packet is either in this batch or left
+    /// intact for the next housekeeping pass.
+    pub fn take_validator_messages(
+        &self,
+    ) -> (
+        Vec<PeerMessage<TmManifests>>,
+        Vec<PeerMessage<TmValidatorList>>,
+        Vec<PeerMessage<TmValidatorListCollection>>,
+    ) {
+        let mut inbound = self.inner.lock().expect("overlay inbound lock");
+        (
+            std::mem::take(&mut inbound.manifests),
+            std::mem::take(&mut inbound.validator_lists),
+            std::mem::take(&mut inbound.validator_list_collections),
+        )
+    }
+
     /// Drain only validator list messages from the queue.
     pub fn take_validator_lists(&self) -> Vec<PeerMessage<TmValidatorList>> {
         std::mem::take(
@@ -627,6 +661,10 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     }
 
     fn on_ledger_data(&self, peer: &Arc<PeerImp>, message: TmLedgerData) {
+        let _delivery_gate = self
+            .ledger_data_delivery_gate
+            .lock()
+            .expect("ledger_data_delivery_gate lock");
         let mut message = Some(message);
         let router = self
             .ledger_data_router
@@ -1033,6 +1071,39 @@ mod tests {
         assert!(snapshot.ledger_data.is_empty());
         assert!(snapshot.get_objects.is_empty());
         assert!(snapshot.transactions.is_empty());
+    }
+
+    #[test]
+    fn validator_message_drain_is_atomic_and_preserves_later_ingress() {
+        let handler = QueuedOverlayInboundHandler::default();
+        {
+            let mut snapshot = handler.inner.lock().expect("overlay inbound lock");
+            snapshot.manifests.push(PeerMessage {
+                peer_id: 1,
+                message: TmManifests::default(),
+            });
+            snapshot.validator_lists.push(PeerMessage {
+                peer_id: 2,
+                message: TmValidatorList::default(),
+            });
+            snapshot.validator_list_collections.push(PeerMessage {
+                peer_id: 3,
+                message: TmValidatorListCollection::default(),
+            });
+        }
+
+        let (manifests, lists, collections) = handler.take_validator_messages();
+        assert_eq!(manifests.iter().map(|message| message.peer_id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(lists.iter().map(|message| message.peer_id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(collections.iter().map(|message| message.peer_id).collect::<Vec<_>>(), vec![3]);
+
+        handler.inner.lock().expect("overlay inbound lock").validator_list_collections.push(PeerMessage {
+            peer_id: 4,
+            message: TmValidatorListCollection::default(),
+        });
+        let (_, lists, collections) = handler.take_validator_messages();
+        assert!(lists.is_empty());
+        assert_eq!(collections.iter().map(|message| message.peer_id).collect::<Vec<_>>(), vec![4]);
     }
 
     #[test]

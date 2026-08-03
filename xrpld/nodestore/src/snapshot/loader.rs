@@ -173,8 +173,13 @@ pub fn load_snapshot(
         while offset < decompressed.len() {
             let (node_type_byte, hash, data_range, consumed) =
                 decode_node_record(&decompressed, offset, i)?;
-            let object_type =
-                NodeObjectType::try_from(node_type_byte).unwrap_or(NodeObjectType::Unknown);
+            let object_type = NodeObjectType::try_from(node_type_byte).map_err(|_| {
+                SnapshotError::MalformedNodeRecord {
+                    chunk_index: i,
+                    offset,
+                    reason: format!("unsupported node type {node_type_byte}"),
+                }
+            })?;
             batch.push(Arc::new(NodeObject::new(
                 object_type,
                 decompressed[data_range].to_vec(),
@@ -183,7 +188,11 @@ pub fn load_snapshot(
             offset += consumed;
         }
 
-        backend.store_batch(&batch);
+        backend
+            .store_batch_result(&batch)
+            .map_err(|reason| SnapshotError::BackendWriteFailed {
+                reason: format!("chunk {i}: {reason}"),
+            })?;
         total_nodes += batch.len() as u64;
         if (i + 1) % 10 == 0 || i + 1 == manifest.chunks.len() {
             tracing::info!(
@@ -217,10 +226,22 @@ pub fn load_snapshot(
             computed: computed_file_hash,
         });
     }
+    let mut trailing_byte = [0u8; 1];
+    if reader
+        .read(&mut trailing_byte)
+        .map_err(|e| SnapshotError::io("checking for trailing data", e))?
+        != 0
+    {
+        return Err(SnapshotError::TrailingData);
+    }
 
     verify_shamap_root(backend, "account-state", manifest.account_hash)?;
     verify_shamap_root(backend, "transaction", manifest.tx_hash)?;
-    backend.sync();
+    backend
+        .sync_result()
+        .map_err(|e| SnapshotError::BackendWriteFailed {
+            reason: format!("final sync: {e}"),
+        })?;
     import_guard.complete();
 
     tracing::info!(

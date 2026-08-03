@@ -12,7 +12,7 @@
 use crate::{
     CanonicalTXSet, FetchPackCache, Ledger, LedgerConfig, LedgerHistory, LedgerHolder,
     LedgerJournal, LedgerMasterSweepTarget, LedgerPersistence, LocalTxs, NullLedgerJournal,
-    SHAMapHash, sweep_ledger_master_like,
+    ReadView, SHAMapHash, sweep_ledger_master_like,
 };
 use basics::base_uint::Uint256;
 use basics::hardened_hash::HardenedHashBuilder;
@@ -31,6 +31,37 @@ pub const LEDGER_MASTER_DEFAULT_HISTORY_AGE: Duration = Duration::minutes(5);
 pub const LEDGER_MASTER_DEFAULT_FETCH_PACK_AGE: Duration = Duration::seconds(45);
 pub const LEDGER_MASTER_DEFAULT_PATH_FIND_JOB_LIMIT: u32 = 2;
 pub const LEDGER_MASTER_MAX_PUBLISH_GAP: u32 = 100;
+
+/// Rippled's `populateFetchPack` limits. State-map differences are allowed to
+/// be larger than the reply continuation threshold; transaction maps are
+/// independently bounded because a requester is unlikely to have historical
+/// transaction nodes.
+pub const FETCH_PACK_STATE_NODE_LIMIT: usize = 16_384;
+pub const FETCH_PACK_TRANSACTION_NODE_LIMIT: usize = 512;
+pub const FETCH_PACK_REPLY_CONTINUATION_LIMIT: usize = 512;
+
+/// One object in a ledger-owned fetch pack. The overlay crate converts these
+/// into `TMIndexedObject` so ledger assembly stays independent of transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchPackObject {
+    pub hash: Uint256,
+    pub data: Vec<u8>,
+    pub ledger_seq: u32,
+}
+
+/// The request failures for which PeerImp charges a requester. A missing
+/// immediate predecessor is distinct from a later history-chain stop: no
+/// object can be sent for the initial requested predecessor, so rippled
+/// charges `kFeeRequestNoReply`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchPackBuildError {
+    Stale,
+    RequestedLedgerMissing,
+    RequestedLedgerPredecessorMissing,
+    RequestedLedgerOpen,
+    RequestedLedgerTooEarly,
+    Traversal,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LedgerMasterConfig {
@@ -620,9 +651,17 @@ where
             }
         }
 
+        // Mark before queue admission so an eager worker's failed-save
+        // callback cannot clear the range and then lose a later optimistic
+        // insert. Asynchronous failure retracts it through failed_save; a
+        // synchronous failure is directly observable below.
+        let seq = ledger.header().seq;
+        self.mark_ledger_complete(seq);
         let saved =
             persistence.pend_save_validated(Arc::clone(&ledger), is_synchronous, is_current);
-        self.mark_ledger_complete(ledger.header().seq);
+        if !saved {
+            self.clear_ledger(seq);
+        }
 
         if ledger.header().seq > self.valid_ledger_seq() {
             self.set_valid_ledger(Arc::clone(&ledger), consensus_hash, sign_time)?;
@@ -821,6 +860,115 @@ where
         self.fetch_packs.get_fetch_pack(hash)
     }
 
+    /// Match `LedgerMaster::getEarliestFetch`: do not expose a history range
+    /// wider than the configured fetch depth behind the current closed ledger.
+    pub fn earliest_fetch(&self, fetch_depth: u32) -> u32 {
+        self.closed_ledger()
+            .map(|ledger| ledger.header().seq.saturating_sub(fetch_depth))
+            .unwrap_or_default()
+    }
+
+    /// Build rippled's fetch pack for the ledger identified by `have_hash`.
+    /// The response walks predecessor history, adding for each predecessor:
+    /// header, state-map differences against its child, then its entire
+    /// transaction-map difference. The caller owns load/peer admission; this
+    /// method owns the ledger-history traversal and exact pack ordering.
+    pub fn make_fetch_pack(
+        &self,
+        have_hash: Uint256,
+        earliest_fetch: u32,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<FetchPackObject>, FetchPackBuildError> {
+        self.make_fetch_pack_with_fetcher(have_hash, earliest_fetch, deadline, &|_| None)
+    }
+
+    /// Build a FetchPack while resolving released SHAMap nodes through the
+    /// caller's durable node-store fetcher. The no-fetch convenience wrapper
+    /// above remains useful for fully resident test maps, but serving paths
+    /// must use this method so historical state and transaction maps are not
+    /// silently truncated.
+    pub fn make_fetch_pack_with_fetcher<F>(
+        &self,
+        have_hash: Uint256,
+        earliest_fetch: u32,
+        deadline: std::time::Instant,
+        node_fetcher: &F,
+    ) -> Result<Vec<FetchPackObject>, FetchPackBuildError>
+    where
+        F: ?Sized
+            + Fn(
+                SHAMapHash,
+            ) -> Option<
+                basics::memory::intrusive_pointer::SharedIntrusive<
+                    shamap::tree_node::SHAMapTreeNode,
+                >,
+            >,
+    {
+        if std::time::Instant::now() > deadline {
+            return Err(FetchPackBuildError::Stale);
+        }
+
+        let Some(mut have) = self.get_ledger_by_hash(SHAMapHash::new(have_hash)) else {
+            return Err(FetchPackBuildError::RequestedLedgerMissing);
+        };
+        if have.open() {
+            return Err(FetchPackBuildError::RequestedLedgerOpen);
+        }
+        if have.header().seq < earliest_fetch {
+            return Err(FetchPackBuildError::RequestedLedgerTooEarly);
+        }
+
+        let Some(mut want) = self.get_ledger_by_hash(have.header().parent_hash) else {
+            return Err(FetchPackBuildError::RequestedLedgerPredecessorMissing);
+        };
+        let mut objects = Vec::new();
+
+        loop {
+            let sequence = want.header().seq;
+            objects.push(FetchPackObject {
+                hash: *want.header().hash.as_uint256(),
+                data: crate::serialize_prefixed_ledger_header(&want.header(), false),
+                ledger_seq: sequence,
+            });
+            append_fetch_pack_map(
+                want.state_map(),
+                Some(have.state_map()),
+                FETCH_PACK_STATE_NODE_LIMIT,
+                sequence,
+                node_fetcher,
+                &mut objects,
+            )
+            .map_err(|_| FetchPackBuildError::Traversal)?;
+            if want.header().tx_hash.is_non_zero() {
+                // Transaction maps are per-ledger. Unlike the state map, do
+                // not use the child map as a diff baseline.
+                append_fetch_pack_map(
+                    want.tx_map(),
+                    None,
+                    FETCH_PACK_TRANSACTION_NODE_LIMIT,
+                    sequence,
+                    node_fetcher,
+                    &mut objects,
+                )
+                .map_err(|_| FetchPackBuildError::Traversal)?;
+            }
+
+            if objects.len() >= FETCH_PACK_REPLY_CONTINUATION_LIMIT
+                || std::time::Instant::now() > deadline
+            {
+                break;
+            }
+
+            have = want;
+            let Some(parent) = self.get_ledger_by_hash(have.header().parent_hash) else {
+                break;
+            };
+            want = parent;
+        }
+
+        Ok(objects)
+    }
+
     pub fn got_fetch_pack(&self, _progress: bool, _seq: u32) -> bool {
         !self.got_fetch_pack_in_flight.swap(true, Ordering::AcqRel)
     }
@@ -890,6 +1038,56 @@ where
 
         state.path_find_threads > 0 && !is_stopping
     }
+}
+
+fn append_fetch_pack_map<F>(
+    want: &shamap::sync::SyncTree,
+    have: Option<&shamap::sync::SyncTree>,
+    limit: usize,
+    ledger_seq: u32,
+    node_fetcher: &F,
+    objects: &mut Vec<FetchPackObject>,
+) -> Result<(), TraversalError>
+where
+    F: ?Sized
+        + Fn(
+            SHAMapHash,
+        ) -> Option<
+            basics::memory::intrusive_pointer::SharedIntrusive<
+                shamap::tree_node::SHAMapTreeNode,
+            >,
+        >,
+{
+    debug_assert_ne!(limit, 0);
+    let want_root = want.root();
+    let have_root = have.map(shamap::sync::SyncTree::root);
+    let have_backed = have.is_some_and(shamap::sync::SyncTree::backed);
+    let mut want_fetch = |hash| node_fetcher(hash);
+    let mut have_fetch = |hash| node_fetcher(hash);
+    let mut added = 0usize;
+
+    shamap::difference::visit_differences(
+        &want_root,
+        have_root.as_ref(),
+        want.backed(),
+        &mut want_fetch,
+        have_backed,
+        &mut have_fetch,
+        &mut |node: &basics::memory::intrusive_pointer::SharedIntrusive<
+            shamap::tree_node::SHAMapTreeNode,
+        >| {
+            let Ok(data) = node.serialize_with_prefix() else {
+                return true;
+            };
+            objects.push(FetchPackObject {
+                hash: *node.get_hash().as_uint256(),
+                data,
+                ledger_seq,
+            });
+            added += 1;
+            added < limit
+        },
+    )
 }
 
 fn ledger_age(stored_close_time: u32, now_close_time: u32) -> Duration {
@@ -1079,6 +1277,59 @@ mod tests {
         Arc::new(ledger)
     }
 
+    fn ledger_with_maps(
+        seq: u32,
+        parent: &Arc<Ledger>,
+        state_fill: u8,
+        tx_fill: Option<u8>,
+    ) -> Arc<Ledger> {
+        let state_root = state_leaf(state_fill);
+        let tx_root = tx_fill.map(|fill| {
+            make_shared_intrusive(SHAMapTreeNode::new_leaf(
+                SHAMapNodeType::TransactionNm,
+                SHAMapItem::new(Uint256::from_array([fill; 32]), vec![fill; 12]),
+                0,
+            ))
+        });
+        let mut header = LedgerHeader {
+            seq,
+            account_hash: state_root.get_hash(),
+            tx_hash: tx_root
+                .as_ref()
+                .map(|root| root.get_hash())
+                .unwrap_or_default(),
+            parent_hash: parent.header().hash,
+            close_time: seq + 100,
+            close_time_resolution: 30,
+            ..LedgerHeader::default()
+        };
+        header.hash = calculate_ledger_hash(&header);
+        let mut ledger = Ledger::from_maps(
+            header,
+            SyncTree::from_root_with_type(
+                state_root,
+                SHAMapType::State,
+                true,
+                seq,
+                SyncState::Immutable,
+            ),
+            tx_root.map_or_else(
+                || SyncTree::new_with_type(SHAMapType::Transaction, true, seq),
+                |root| {
+                    SyncTree::from_root_with_type(
+                        root,
+                        SHAMapType::Transaction,
+                        true,
+                        seq,
+                        SyncState::Immutable,
+                    )
+                },
+            ),
+        );
+        ledger.set_immutable(true);
+        Arc::new(ledger)
+    }
+
     #[test]
     fn master_tracks_published_and_validated_age() {
         let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
@@ -1100,6 +1351,102 @@ mod tests {
         assert_eq!(
             master.get_validated_ledger_age(ledger.header().close_time + 30),
             Duration::seconds(20)
+        );
+    }
+
+    #[test]
+    fn make_fetch_pack_assembles_predecessor_header_then_state_and_transaction_nodes() {
+        let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
+        let oldest = immutable_ledger(40, 0x01);
+        let want = ledger_with_maps(41, &oldest, 0x41, Some(0x51));
+        let have = ledger_with_maps(42, &want, 0x42, Some(0x52));
+        master.ledger_history().insert(Arc::clone(&oldest), false);
+        master.ledger_history().insert(Arc::clone(&want), false);
+        master.ledger_history().insert(Arc::clone(&have), false);
+        master.set_closed_ledger(Arc::clone(&have));
+
+        let objects = master
+            .make_fetch_pack(
+                *have.header().hash.as_uint256(),
+                master.earliest_fetch(16),
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .expect("fetch pack should assemble from local predecessor history");
+
+        assert!(objects.len() >= 3, "header plus state and tx map nodes");
+        assert_eq!(objects[0].hash, *want.header().hash.as_uint256());
+        assert_eq!(objects[0].ledger_seq, want.header().seq);
+        assert_eq!(
+            objects[0].data,
+            crate::serialize_prefixed_ledger_header(&want.header(), false),
+            "each predecessor starts with its prefixed ledger header"
+        );
+        assert_eq!(objects[1].ledger_seq, want.header().seq);
+        assert_eq!(
+            objects[1].hash,
+            *want.state_map().root().get_hash().as_uint256()
+        );
+        assert_eq!(objects[2].ledger_seq, want.header().seq);
+        assert_eq!(
+            objects[2].hash,
+            *want.tx_map().root().get_hash().as_uint256()
+        );
+        assert_eq!(
+            objects[3].hash,
+            *oldest.header().hash.as_uint256(),
+            "the pack continues with the next predecessor only after the first ledger's maps"
+        );
+        assert_eq!(objects[3].ledger_seq, oldest.header().seq);
+    }
+
+    #[test]
+    fn make_fetch_pack_enforces_staleness_and_earliest_fetch_eligibility() {
+        let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
+        let old = immutable_ledger(10, 0x01);
+        let have = linked_ledger(&old, 120);
+        master.ledger_history().insert(Arc::clone(&old), false);
+        master.ledger_history().insert(Arc::clone(&have), false);
+        master.set_closed_ledger(Arc::clone(&have));
+
+        assert_eq!(
+            master.make_fetch_pack(
+                *have.header().hash.as_uint256(),
+                12,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ),
+            Err(FetchPackBuildError::RequestedLedgerTooEarly)
+        );
+        assert_eq!(
+            master.make_fetch_pack(
+                *have.header().hash.as_uint256(),
+                0,
+                std::time::Instant::now() - std::time::Duration::from_millis(1),
+            ),
+            Err(FetchPackBuildError::Stale)
+        );
+        assert_eq!(master.earliest_fetch(1), have.header().seq - 1);
+        assert_eq!(
+            master.make_fetch_pack(
+                Uint256::from_u64(0xDEAD),
+                0,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ),
+            Err(FetchPackBuildError::RequestedLedgerMissing)
+        );
+
+        let absent_parent = immutable_ledger(90, 0xBA);
+        let have_without_parent = linked_ledger(&absent_parent, 91);
+        master
+            .ledger_history()
+            .insert(Arc::clone(&have_without_parent), false);
+        assert_eq!(
+            master.make_fetch_pack(
+                *have_without_parent.header().hash.as_uint256(),
+                0,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            ),
+            Err(FetchPackBuildError::RequestedLedgerPredecessorMissing),
+            "an initial missing predecessor cannot produce a pack"
         );
     }
 

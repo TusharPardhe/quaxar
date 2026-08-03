@@ -295,7 +295,7 @@ pub(super) fn find_vault_share(
         .find(|candidate| candidate.share_mpt_id == share_mpt_id)
 }
 
-pub(super) fn read_vault_share<V: ApplyView>(
+pub(super) fn read_vault_share<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     share_mpt_id: MPTID,
 ) -> Option<VaultSharesSnapshot> {
@@ -491,7 +491,7 @@ pub(super) fn vault_asset_delta(
         .filter(|delta| delta.delta != RuntimeNumber::zero())
 }
 
-pub(super) fn validates_vault_state<V: ApplyView>(
+pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
     sandbox: &FlowSandbox<V>,
     txn_type: protocol::TxType,
     tx_account: Option<AccountID>,

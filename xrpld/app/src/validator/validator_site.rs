@@ -1,6 +1,7 @@
 //! Validator-site fetch and apply owner.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use basics::string_utilities::{ParsedUrl, parse_url};
@@ -16,10 +17,14 @@ pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 pub const MAX_REDIRECTS: u16 = 3;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Thread-safe owner for configured and cached validator-list sites. The
+/// runtime owns one instance for its whole life; fetch work is synchronous in
+/// this port, but state remains synchronized so status reads and refreshes can
+/// safely share that instance.
+#[derive(Debug, Clone)]
 pub struct ValidatorSite {
     request_timeout: Duration,
-    sites: Vec<Site>,
+    sites: Arc<Mutex<Vec<Site>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,48 +122,52 @@ impl ValidatorSite {
     pub fn new(request_timeout: Duration) -> Self {
         Self {
             request_timeout,
-            sites: Vec::new(),
+            sites: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub fn load(&mut self, site_uris: &[String]) -> bool {
-        self.sites.clear();
-        if site_uris.is_empty() {
-            return true;
+    /// Configure remote sites. Configuration is all-or-nothing: an invalid
+    /// URI leaves no partially configured active site set.
+    pub fn load(&self, site_uris: &[String]) -> bool {
+        let mut sites = self.sites.lock().expect("validator sites lock");
+        let mut configured = Vec::with_capacity(site_uris.len());
+        if !Self::append_sites(&mut configured, site_uris) {
+            return false;
         }
-        for uri in site_uris {
-            let Ok(resource) = SiteResource::new(uri.clone()) else {
-                return false;
-            };
-            self.sites.push(Site {
-                starting_resource: resource.clone(),
-                loaded_resource: resource,
-                active_resource: None,
-                redirect_count: 0,
-                refresh_interval: DEFAULT_REFRESH_INTERVAL,
-                next_refresh: SystemTime::now(),
-                last_refresh_status: None,
-            });
-        }
+        *sites = configured;
         true
     }
 
+    /// Add cached validator-list files when configured endpoints are absent or
+    /// fail. Cache URIs are deduplicated so retrying an endpoint cannot grow
+    /// the site list indefinitely.
+    pub fn load_cached_lists<S: ValidatorSiteSink>(&self, sink: &S) -> bool {
+        let cached = sink.load_lists();
+        let mut sites = self.sites.lock().expect("validator sites lock");
+        Self::append_sites(&mut sites, &cached)
+    }
+
     pub fn refresh_due<S: ValidatorSiteSink, T: ValidatorSiteTransport>(
-        &mut self,
+        &self,
         sink: &mut S,
         transport: &T,
         now: SystemTime,
     ) {
-        for index in 0..self.sites.len() {
-            if self.sites[index].next_refresh <= now {
-                self.refresh_site(index, sink, transport, now);
-            }
+        let mut sites = self.sites.lock().expect("validator sites lock");
+        let due = sites
+            .iter()
+            .enumerate()
+            .filter_map(|(index, site)| (site.next_refresh <= now).then_some(index))
+            .collect::<Vec<_>>();
+        for index in due {
+            self.refresh_site(&mut sites, index, sink, transport, now);
         }
     }
 
     pub fn get_json(&self) -> JsonValue {
-        let mut sites = Vec::with_capacity(self.sites.len());
-        for site in &self.sites {
+        let sites = self.sites.lock().expect("validator sites lock");
+        let mut entries = Vec::with_capacity(sites.len());
+        for site in sites.iter() {
             let mut entry = BTreeMap::new();
             let uri = if site.loaded_resource != site.starting_resource {
                 format!(
@@ -193,28 +202,56 @@ impl ValidatorSite {
                     );
                 }
             }
-            sites.push(JsonValue::Object(entry));
+            entries.push(JsonValue::Object(entry));
         }
         JsonValue::Object(BTreeMap::from([(
             "validator_sites".to_owned(),
-            JsonValue::Array(sites),
+            JsonValue::Array(entries),
         )]))
     }
 
+    fn append_sites(sites: &mut Vec<Site>, site_uris: &[String]) -> bool {
+        let mut additions = Vec::new();
+        for uri in site_uris {
+            if sites.iter().any(|site| site.loaded_resource.uri == *uri)
+                || additions
+                    .iter()
+                    .any(|site: &Site| site.loaded_resource.uri == *uri)
+            {
+                continue;
+            }
+            let Ok(resource) = SiteResource::new(uri.clone()) else {
+                return false;
+            };
+            additions.push(Site {
+                starting_resource: resource.clone(),
+                loaded_resource: resource,
+                active_resource: None,
+                redirect_count: 0,
+                refresh_interval: DEFAULT_REFRESH_INTERVAL,
+                next_refresh: SystemTime::now(),
+                last_refresh_status: None,
+            });
+        }
+        sites.extend(additions);
+        true
+    }
+
     fn refresh_site<S: ValidatorSiteSink, T: ValidatorSiteTransport>(
-        &mut self,
+        &self,
+        sites: &mut Vec<Site>,
         site_index: usize,
         sink: &mut S,
         transport: &T,
         now: SystemTime,
     ) {
-        let resource = self.sites[site_index].starting_resource.clone();
-        self.sites[site_index].active_resource = Some(resource.clone());
-        self.sites[site_index].redirect_count = 0;
-        self.sites[site_index].next_refresh = now + self.sites[site_index].refresh_interval;
+        let resource = sites[site_index].starting_resource.clone();
+        sites[site_index].active_resource = Some(resource.clone());
+        sites[site_index].redirect_count = 0;
+        sites[site_index].next_refresh = now + sites[site_index].refresh_interval;
 
         loop {
-            let active = self.sites[site_index]
+            let active = sites[site_index]
                 .active_resource
                 .clone()
                 .expect("active resource");
@@ -222,38 +259,39 @@ impl ValidatorSite {
                 Ok(response) => response,
                 Err(message) => {
                     tracing::warn!(target: "validator_site", uri = %active.uri, %message, "Fetch failed");
-                    self.record_error(site_index, now, &message, true, sink);
+                    self.record_error(sites, site_index, now, &message, true, sink);
                     return;
                 }
             };
 
             match response.status {
-                200 => match self.parse_json_response(site_index, &response.body, sink, now) {
+                200 => match Self::parse_json_response(sites, site_index, &response.body, sink, now) {
                     Ok(()) => {
                         tracing::info!(target: "validator_site", uri = %active.uri, "Loaded validator list");
                         return;
                     }
                     Err(message) => {
                         tracing::warn!(target: "validator_site", uri = %active.uri, %message, "Parse failed");
-                        self.record_error(site_index, now, &message, false, sink);
+                        self.record_error(sites, site_index, now, &message, false, sink);
                         return;
                     }
                 },
-                301 | 302 | 307 | 308 => match self.process_redirect(site_index, response.location)
+                301 | 302 | 307 | 308 => match Self::process_redirect(sites, site_index, response.location)
                 {
                     Ok(new_resource) => {
                         if matches!(response.status, 301 | 308) {
-                            self.sites[site_index].starting_resource = new_resource.clone();
+                            sites[site_index].starting_resource = new_resource.clone();
                         }
-                        self.sites[site_index].active_resource = Some(new_resource);
+                        sites[site_index].active_resource = Some(new_resource);
                     }
                     Err(message) => {
-                        self.record_error(site_index, now, &message, false, sink);
+                        self.record_error(sites, site_index, now, &message, false, sink);
                         return;
                     }
                 },
                 status => {
                     self.record_error(
+                        sites,
                         site_index,
                         now,
                         &format!("bad result code {status}"),
@@ -267,7 +305,7 @@ impl ValidatorSite {
     }
 
     fn parse_json_response<S: ValidatorSiteSink>(
-        &mut self,
+        sites: &mut [Site],
         site_index: usize,
         response_text: &str,
         sink: &mut S,
@@ -282,14 +320,15 @@ impl ValidatorSite {
         let version = body
             .get("version")
             .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| "missing fields".to_owned())? as u32;
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| "missing fields".to_owned())?;
         let blobs = ValidatorList::<crate::validator::validator_list::SystemValidatorListClock>::parse_blobs(
             version, &body,
         );
         if blobs.is_empty() {
             return Err("missing fields".to_owned());
         }
-        let uri = self.sites[site_index]
+        let uri = sites[site_index]
             .active_resource
             .as_ref()
             .expect("active resource")
@@ -298,7 +337,7 @@ impl ValidatorSite {
         let hash = validator_list_collection_hash(manifest, version, &blobs);
         let result = sink.apply_lists(manifest, version, &blobs, uri, hash);
 
-        self.sites[site_index].last_refresh_status = Some(RefreshStatus {
+        sites[site_index].last_refresh_status = Some(RefreshStatus {
             refreshed: now,
             disposition: result.best_disposition(),
             message: String::new(),
@@ -308,22 +347,22 @@ impl ValidatorSite {
             .and_then(serde_json::Value::as_u64)
         {
             let refresh_minutes = refresh_minutes.clamp(1, 24 * 60);
-            self.sites[site_index].refresh_interval = Duration::from_secs(refresh_minutes * 60);
-            self.sites[site_index].next_refresh = now + self.sites[site_index].refresh_interval;
+            sites[site_index].refresh_interval = Duration::from_secs(refresh_minutes * 60);
+            sites[site_index].next_refresh = now + sites[site_index].refresh_interval;
         }
-        self.sites[site_index].active_resource = None;
+        sites[site_index].active_resource = None;
         Ok(())
     }
 
     fn process_redirect(
-        &mut self,
+        sites: &mut [Site],
         site_index: usize,
         location: Option<String>,
     ) -> Result<SiteResource, String> {
         let Some(location) = location else {
             return Err("missing location".to_owned());
         };
-        if self.sites[site_index].redirect_count == MAX_REDIRECTS {
+        if sites[site_index].redirect_count == MAX_REDIRECTS {
             return Err("max redirects".to_owned());
         }
         let resource = SiteResource::new(location)?;
@@ -333,29 +372,35 @@ impl ValidatorSite {
                 resource.parsed.scheme
             ));
         }
-        self.sites[site_index].redirect_count += 1;
+        sites[site_index].redirect_count += 1;
         Ok(resource)
     }
 
     fn record_error<S: ValidatorSiteSink>(
-        &mut self,
+        &self,
+        sites: &mut Vec<Site>,
         site_index: usize,
         now: SystemTime,
         message: &str,
         retry: bool,
         sink: &S,
     ) {
-        self.sites[site_index].last_refresh_status = Some(RefreshStatus {
+        sites[site_index].last_refresh_status = Some(RefreshStatus {
             refreshed: now,
             disposition: ListDisposition::Invalid,
             message: message.to_owned(),
         });
         if retry {
-            self.sites[site_index].next_refresh = now + ERROR_RETRY_INTERVAL;
+            sites[site_index].next_refresh = now + ERROR_RETRY_INTERVAL;
         }
-        self.sites[site_index].active_resource = None;
-        if self.sites.is_empty() {
-            let _ = sink.load_lists();
+        sites[site_index].active_resource = None;
+
+        // Rippled's missingSite() loads valid cache files after every failed
+        // endpoint request. They carry a 24-hour refresh interval and their
+        // signed expiration is still enforced by ValidatorList.
+        let cached = sink.load_lists();
+        if !cached.is_empty() && !Self::append_sites(sites, &cached) {
+            tracing::warn!(target: "validator_site", "Ignoring invalid cached validator-list URI");
         }
     }
 }
@@ -466,6 +511,7 @@ mod tests {
     #[derive(Default)]
     struct FakeSink {
         calls: Vec<(String, u32, Vec<ValidatorBlobInfo>)>,
+        cached: Vec<String>,
     }
 
     impl ValidatorSiteSink for FakeSink {
@@ -480,6 +526,10 @@ mod tests {
             self.calls
                 .push((manifest.to_owned(), version, blobs.to_vec()));
             PublisherListStats::new(ListDisposition::Accepted)
+        }
+
+        fn load_lists(&self) -> Vec<String> {
+            self.cached.clone()
         }
     }
 
@@ -499,28 +549,31 @@ mod tests {
         }
     }
 
+    fn valid_body() -> String {
+        serde_json::json!({
+            "manifest": "ZmFrZQ==",
+            "version": 1,
+            "blob": "Zm9v",
+            "signature": "AABB"
+        })
+        .to_string()
+    }
+
     #[test]
     fn validator_site_load_rejects_invalid_file_hostnames() {
-        let mut site = ValidatorSite::new(Duration::from_secs(20));
+        let site = ValidatorSite::new(Duration::from_secs(20));
         assert!(!site.load(&["file://localhost/home/user/vl.txt".to_owned()]));
         assert!(site.load(&["https://ripple.com/validators".to_owned()]));
     }
 
     #[test]
     fn validator_site_applies_valid_json_response() {
-        let body = serde_json::json!({
-            "manifest": "ZmFrZQ==",
-            "version": 1,
-            "blob": "Zm9v",
-            "signature": "AABB"
-        })
-        .to_string();
         let transport = QueueTransport(std::sync::Mutex::new(VecDeque::from([Ok(SiteResponse {
             status: 200,
             location: None,
-            body,
+            body: valid_body(),
         })])));
-        let mut site = ValidatorSite::new(Duration::from_secs(20));
+        let site = ValidatorSite::new(Duration::from_secs(20));
         assert!(site.load(&["https://ripple.com/validators".to_owned()]));
         let mut sink = FakeSink::default();
         site.refresh_due(&mut sink, &transport, SystemTime::now());
@@ -549,7 +602,7 @@ mod tests {
                 body,
             }),
         ])));
-        let mut site = ValidatorSite::new(Duration::from_secs(20));
+        let site = ValidatorSite::new(Duration::from_secs(20));
         assert!(site.load(&["https://ripple.com/validators".to_owned()]));
         let mut sink = FakeSink::default();
         site.refresh_due(&mut sink, &transport, SystemTime::now());
@@ -570,5 +623,30 @@ mod tests {
         assert_eq!(sink.calls.len(), 1);
         assert!(DEFAULT_REFRESH_INTERVAL.as_secs() > 0);
         let _ = ReqwestValidatorSiteTransport;
+    }
+
+    #[test]
+    fn validator_site_loads_cached_file_after_endpoint_failure() {
+        let site = ValidatorSite::new(Duration::from_secs(20));
+        assert!(site.load(&["https://ripple.com/validators".to_owned()]));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2_200_000_000);
+        let transport = QueueTransport(std::sync::Mutex::new(VecDeque::from([
+            Err("offline".to_owned()),
+            Err("offline".to_owned()),
+            Ok(SiteResponse {
+                status: 200,
+                location: None,
+                body: valid_body(),
+            }),
+        ])));
+        let mut sink = FakeSink {
+            cached: vec!["file:///tmp/cached-validator-list.json".to_owned()],
+            ..Default::default()
+        };
+
+        site.refresh_due(&mut sink, &transport, now);
+        site.refresh_due(&mut sink, &transport, now + Duration::from_secs(30));
+
+        assert_eq!(sink.calls.len(), 1, "cached list should be applied after failure");
     }
 }

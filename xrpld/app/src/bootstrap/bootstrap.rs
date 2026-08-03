@@ -91,7 +91,7 @@ impl Default for AppBootstrapOptions {
             start_valid: false,
             elb_support: false,
             io_threads: 6,
-            job_queue_threads: 1,
+            job_queue_threads: 0,
             debug: false,
             silent: false,
             verbose: false,
@@ -276,11 +276,10 @@ struct BootstrapNodeStoreFetcher {
     node_store: crate::SHAMapStoreNodeStore,
 }
 
-/// Minimal `ValidatorSiteSink` that delegates to `ValidatorList::apply_lists`
-/// for the bootstrap initial validator-list fetch.
-struct BootstrapValidatorSiteSink(
-    Arc<crate::ValidatorList<crate::validator::validator_list::SystemValidatorListClock>>,
-);
+/// Bootstrap adapter for the shared validator-site owner. ApplicationRoot
+/// performs list application, trusted-manifest durability, and v1 suppression
+/// aware rebroadcasting; this sink only bridges the generic site interface.
+struct BootstrapValidatorSiteSink(crate::ApplicationRoot);
 
 impl crate::ValidatorSiteSink for BootstrapValidatorSiteSink {
     fn apply_lists(
@@ -291,12 +290,16 @@ impl crate::ValidatorSiteSink for BootstrapValidatorSiteSink {
         site_uri: String,
         hash: basics::base_uint::Uint256,
     ) -> crate::PublisherListStats {
-        self.0
-            .apply_lists(manifest, version, blobs, site_uri, Some(hash))
+        let stats = self
+            .0
+            .apply_validator_lists(manifest, version, blobs, site_uri, hash);
+        synchronize_unl_blocked(&self.0);
+        broadcast_validator_list_collection(&self.0, &stats, hash);
+        stats
     }
 
     fn load_lists(&self) -> Vec<String> {
-        self.0.load_lists()
+        self.0.validators().load_lists()
     }
 }
 
@@ -611,10 +614,28 @@ pub fn build_bootstrap_root(
     config: &BasicConfig,
     options: &AppBootstrapOptions,
 ) -> Result<AppBootstrapRoot, String> {
+    let mut effective_options = options.clone();
+    let fast_load = node_db_fast_load(config);
+    if fast_load
+        && !matches!(
+            effective_options.start_type,
+            StartUpType::Replay | StartUpType::LoadFile
+        )
+    {
+        // Matches rippled Main.cpp: fast_load selects Load unless an earlier
+        // explicit Replay or LoadFile branch already selected the startup mode.
+        effective_options.start_type = StartUpType::Load;
+    }
+    let options = &effective_options;
     let io_threads = config_legacy_usize(config, "io_workers").unwrap_or(options.io_threads);
-    let job_queue_threads = config_legacy_usize(config, "workers")
-        .unwrap_or(options.job_queue_threads)
-        .max(1);
+    let requested_job_queue_threads =
+        config_legacy_usize(config, "workers").unwrap_or(options.job_queue_threads);
+    let job_queue_threads = if requested_job_queue_threads != 0 {
+        requested_job_queue_threads
+    } else {
+        default_job_queue_threads(config, options.standalone)
+    }
+    .max(1);
     let ledger_history = config_legacy_u32(config, "ledger_history").unwrap_or(0);
     let path_search_old = config_legacy_u32(config, "path_search_old").unwrap_or(2);
     let path_search = config_legacy_u32(config, "path_search").unwrap_or(2);
@@ -697,34 +718,24 @@ pub fn build_bootstrap_root(
         }
     }
 
-    // Load validation seed into config BEFORE consensus runtime is created,
-    // so the consensus adaptor can read it.
-    if let Ok(seed) = config.legacy("validation_seed") {
+    // Preserve section presence: ValidatorKeys distinguishes no configured
+    // source from a present-but-invalid source. `legacy` also enforces the
+    // single-value configuration contract instead of silently ignoring it.
+    if config.exists("validation_seed") {
+        let seed = config
+            .legacy("validation_seed")
+            .map_err(|error| format!("invalid [validation_seed] configuration: {error}"))?;
         root.set_validation_seed(seed);
     }
-    // Load [validator_token] section lines for validator key derivation.
-    {
-        let token_section = config.section("validator_token");
-        let token_values = token_section.values();
-        if !token_values.is_empty() {
-            root.set_validator_token(token_values.to_vec());
-            tracing::info!(target: "app", "Validator token loaded from config");
-        }
+    // Preserve [validator_token] presence even when empty so ValidatorKeys
+    // rejects malformed configured tokens rather than treating them as absent.
+    if config.exists("validator_token") {
+        let token_values = config.section("validator_token").values();
+        root.set_validator_token(token_values.to_vec());
+        tracing::info!(target: "app", "Validator token configured");
     }
 
     let _ = root.attach_default_consensus_runtime();
-
-    // Rippled parity: setMaxDisallowedLedger — store the highest ledger seq
-    // from the relational database so validators can reject stale proposals.
-    if root.validation_public_key().is_some() {
-        if let Some(max_seq) = root
-            .relational_database()
-            .as_ref()
-            .and_then(|db| db.max_ledger_seq())
-        {
-            root.set_max_disallowed_ledger(max_seq);
-        }
-    }
 
     let node_store_kind = attach_shamap_store_if_configured(
         &mut root,
@@ -747,18 +758,88 @@ pub fn build_bootstrap_root(
         root.set_node_identity(identity);
     }
 
+    // Restore persisted validator/publisher manifests before ValidatorList
+    // resolves configured and live signing keys, matching ApplicationImp
+    // startup's ValidatorManifests/PublisherManifests load sequence.
+    root.manifest_cache()
+        .load_from_wallet(root.wallet_db().as_ref(), "ValidatorManifests")?;
+    root.publisher_manifest_cache()
+        .load_from_wallet(root.wallet_db().as_ref(), "PublisherManifests")?;
+
+    // Match ApplicationImp::setup: validate one local key source, install the
+    // configured validator manifest and any revocations into the same cache
+    // used by ValidatorList, then pass the derived signing key to load().
+    let validator_keys = crate::validator::validator_keys::ValidatorKeys::from_sources(
+        root.config().validation_seed.as_deref(),
+        root.config().validator_token.as_deref(),
+    );
+    if validator_keys.config_invalid() {
+        return Err("invalid [validation_seed] or [validator_token] configuration".to_owned());
+    }
+    if let Some(keys) = validator_keys.keys.as_ref() {
+        root.set_validation_public_key(keys.public_key);
+    }
+    if !validator_keys.manifest.is_empty() {
+        let manifest = crate::validator::validator_list::deserialize_manifest_base64_bounded(
+            &validator_keys.manifest,
+        )
+        .ok_or_else(|| "invalid configured validator manifest".to_owned())?;
+        if root.manifest_cache().apply_manifest(manifest)
+            == crate::state::manifest::ManifestDisposition::Invalid
+        {
+            return Err("configured validator manifest rejected".to_owned());
+        }
+    }
+    let raw_revocation = config
+        .section("validator_key_revocation")
+        .values()
+        .iter()
+        .map(|line| line.trim())
+        .collect::<String>();
+    if !raw_revocation.is_empty() {
+        let revocation = crate::validator::validator_list::deserialize_manifest_base64_bounded(
+            &raw_revocation,
+        )
+        .filter(crate::state::manifest::Manifest::revoked)
+        .ok_or_else(|| "invalid [validator_key_revocation] manifest".to_owned())?;
+        if root.manifest_cache().apply_manifest(revocation)
+            == crate::state::manifest::ManifestDisposition::Invalid
+        {
+            return Err("validator key revocation rejected".to_owned());
+        }
+    }
+
+    // Rippled parity: setMaxDisallowedLedger after the local signing key has
+    // been configured, so validators reject stale proposal ledgers.
+    if root.validation_public_key().is_some()
+        && let Some(max_seq) = root
+            .relational_database()
+            .as_ref()
+            .and_then(|db| db.max_ledger_seq())
+    {
+        root.set_max_disallowed_ledger(max_seq);
+    }
+
     // Wire up validator list publisher keys from config, matching reference
     // Application::setup() → validators->load(...)
     {
         let publisher_keys: Vec<String> = config.section("validator_list_keys").values().to_vec();
-        tracing::debug!(target: "bootstrap", ?publisher_keys, "Validator list keys loaded");
+        let list_threshold = validator_list_threshold_from_config(config, publisher_keys.len())?;
+        tracing::debug!(target: "bootstrap", ?publisher_keys, ?list_threshold,
+            "Validator list keys and threshold loaded");
         let config_keys: Vec<String> = config.section("validators").values().to_vec();
-        let _ = root.validators().load(
+        if !root.validators().load(
             root.validation_public_key(),
             &config_keys,
             &publisher_keys,
-            None,
-        );
+            list_threshold,
+        ) {
+            return Err("invalid entry in validator configuration".to_owned());
+        }
+        // Configured local manifests become durable as soon as their master
+        // keys are listed, rather than waiting for shutdown.
+        root.persist_manifest_caches()?;
+        install_trusted_first_manifest_provider(&root);
         // When using static [validators] (no validator_list_sites), we must
         // explicitly promote key_listings to trusted_master_keys. Without this,
         // validations from peers are dropped as "untrusted".
@@ -773,16 +854,29 @@ pub fn build_bootstrap_root(
     {
         let site_uris: Vec<String> = config.section("validator_list_sites").values().to_vec();
         tracing::debug!(target: "bootstrap", ?site_uris, "Validator list sites loaded");
-        if !site_uris.is_empty() {
-            let validators = root.validators();
-            let mut site = crate::ValidatorSite::new(std::time::Duration::from_secs(30));
-            site.load(&site_uris);
-            let mut sink = BootstrapValidatorSiteSink(validators.clone());
-            let transport = crate::ReqwestValidatorSiteTransport;
-            site.refresh_due(&mut sink, &transport, std::time::SystemTime::now());
-            // Mark validators as trusted after loading the list.
-            validators.update_trusted(&std::collections::HashSet::new(), 0);
+        let site = root.validator_sites();
+        if !site.load(&site_uris) {
+            return Err("invalid entry in [validator_list_sites]".to_owned());
         }
+        let mut sink = BootstrapValidatorSiteSink(root.clone());
+        // With no configured endpoint, rippled starts from usable persisted
+        // cache files. On configured-endpoint failure, ValidatorSite performs
+        // this same fallback during its owned refresh loop.
+        if site_uris.is_empty() {
+            let _ = site.load_cached_lists(&sink);
+        }
+        let transport = crate::ReqwestValidatorSiteTransport;
+        site.refresh_due(&mut sink, &transport, std::time::SystemTime::now());
+        // Initial trusted manifests must survive a crash before the recurring
+        // runtime receives its first later refresh.
+        root.persist_manifest_caches()?;
+        // Mark validators as trusted after loading the list.
+        let validators = root.validators();
+        validators.update_trusted(
+            &std::collections::HashSet::new(),
+            root.current_close_time_seconds(),
+        );
+        synchronize_unl_blocked(&root);
     }
 
     let report = AppBootstrapReport {
@@ -878,10 +972,15 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
         let stop_requested = Arc::new(AtomicBool::new(false));
         let stop_thread = spawn_shutdown_watcher(Arc::clone(&runtime), Arc::clone(&stop_requested));
 
-        runtime.run();
+        runtime.wait_for_stop();
 
         stop_requested.store(true, Ordering::Release);
         let _ = stop_thread.join();
+        if let Err(error) = runtime.root().persist_manifest_caches() {
+            tracing::error!(target: "manifest", %error,
+                "failed to persist manifests during standalone shutdown");
+        }
+        runtime.shutdown();
         return Ok(());
     }
 
@@ -954,9 +1053,11 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
     let stop_requested = Arc::new(AtomicBool::new(false));
     let stop_thread = spawn_shutdown_watcher(Arc::clone(&runtime), Arc::clone(&stop_requested));
 
-    runtime.run();
+    runtime.wait_for_stop();
 
-    // Signal the consensus event loop to stop, then join it.
+    // Quiesce bootstrap-owned consensus/acquisition work before managed
+    // shutdown reaches NodeStore. MainRuntime::run() cannot do this itself
+    // because these handles are owned only by this bootstrap path.
     consensus_stop.store(true, Ordering::Release);
     if let Some(handle) = consensus_thread {
         let _ = handle.join();
@@ -964,6 +1065,11 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
 
     stop_requested.store(true, Ordering::Release);
     let _ = stop_thread.join();
+    if let Err(error) = runtime.root().persist_manifest_caches() {
+        tracing::error!(target: "manifest", %error,
+            "failed to persist manifests after consensus shutdown");
+    }
+    runtime.shutdown();
     Ok(())
 }
 
@@ -974,6 +1080,88 @@ pub fn run_bootstrap_runtime(bootstrap: AppBootstrapRuntime) -> Result<(), Strin
 /// thread.  This loop handles the remaining overlay duties: serving
 /// GetLedger requests, draining completed ledger acquisitions, processing
 /// fetch packs, ticking inbound transactions, and draining validator lists.
+const CANDIDATE_ACQUIRE_TICK: Duration = Duration::from_millis(250);
+
+fn ledger_data_sequence_is_admissible(
+    packet_type: i32,
+    ledger_seq: u32,
+    valid_ledger_seq: Option<u32>,
+    validated_age: Duration,
+) -> bool {
+    // Matches PeerImp::onMessage(TMLedgerData): candidate transaction sets
+    // never carry a ledger sequence. Ordinary data is rejected only while the
+    // local validated ledger is fresh, avoiding a permanent future-sequence
+    // gate during initial catchup.
+    if packet_type == 3 {
+        return ledger_seq == 0;
+    }
+    validated_age > Duration::from_secs(10)
+        || valid_ledger_seq.is_none_or(|valid_seq| ledger_seq <= valid_seq.saturating_add(10))
+}
+
+/// PeerImp rejects empty and oversized TMLedgerData node vectors before
+/// relaying or scheduling them. Candidate payloads need this explicit gate so
+/// an empty transaction-set reply incurs kFeeInvalidData rather than entering
+/// InboundTransactions as a no-op.
+fn ledger_data_nodes_are_admissible(node_count: usize) -> bool {
+    (1..=HARD_MAX_REPLY_NODES).contains(&node_count)
+}
+
+/// Mirrors `InboundTransactionsImp::gotData`: candidate-set data is charged by
+/// its delivery outcome, rather than silently discarding an unknown or bad set.
+fn candidate_ledger_data_charge(
+    status: &ledger::InboundTransactionsDataStatus,
+) -> Option<(resource::Charge, &'static str)> {
+    match status {
+        ledger::InboundTransactionsDataStatus::NoAcquire => {
+            Some(((*resource::FEE_USELESS_DATA).clone(), "ledger_data"))
+        }
+        ledger::InboundTransactionsDataStatus::MissingNodeId => {
+            Some(((*resource::FEE_MALFORMED_REQUEST).clone(), "ledger_data"))
+        }
+        ledger::InboundTransactionsDataStatus::InvalidNodeId => {
+            Some(((*resource::FEE_INVALID_DATA).clone(), "ledger_data"))
+        }
+        ledger::InboundTransactionsDataStatus::Applied(stats) if !stats.is_useful() => {
+            Some(((*resource::FEE_USELESS_DATA).clone(), "ledger_data not useful"))
+        }
+        ledger::InboundTransactionsDataStatus::Applied(_) => None,
+    }
+}
+
+fn process_candidate_ledger_data(
+    root: &crate::ApplicationRoot,
+    overlay: &Arc<overlay::OverlayImpl>,
+    peer_id: overlay::PeerId,
+    hash: Uint256,
+    message: overlay::TmLedgerData,
+) {
+    let peer = overlay.find_peer_by_short_id(peer_id);
+    let mut guard = root
+        .inbound_transactions()
+        .lock()
+        .expect("inbound_transactions mutex");
+    let status = guard.got_data(hash, peer.clone(), &message);
+    if let Some((fee, context)) = candidate_ledger_data_charge(&status)
+        && let Some(peer) = peer
+    {
+        peer.charge(fee, context.to_owned());
+    }
+    if let Some(acquire) = guard.acquire(hash)
+        && acquire.is_complete()
+    {
+        let set = Arc::new(acquire.map().clone());
+        guard.give_set(hash, set, true);
+    }
+}
+
+/// Every `PeerImp::getLedger` selector resolves to a ledger before this single
+/// retention gate is applied. Keep hash, sequence, and closed selectors on the
+/// same floor rather than letting hash-only requests bypass history policy.
+fn sequence_is_fetchable_at_floor(sequence: u32, earliest_fetch: u32) -> bool {
+    sequence >= earliest_fetch
+}
+
 fn run_start_mode_consensus_loop(
     runtime: Arc<MainRuntime>,
     stop: Arc<AtomicBool>,
@@ -1002,6 +1190,7 @@ fn run_start_mode_consensus_loop(
     >(1_024);
 
     let lm_rt_for_shared_inbound = runtime.root().ledger_master_runtime();
+    let mut worker_handles = Vec::<std::thread::JoinHandle<()>>::new();
     // Use the app's shared TreeNodeCache (properly sized per node_size profile,
     // matching rippled's NodeFamily::tnCache_ which uses getValueFor(TreeCacheSize)).
     // This is the key to bounded memory during acquisition — the cache evicts
@@ -1082,12 +1271,12 @@ fn run_start_mode_consensus_loop(
     // Spawn consensus event loop (validation/ledger promotion)
     let event_loop_app = runtime.root().clone();
     let event_loop_stop = Arc::clone(&stop);
-    crate::consensus::driver::spawn_event_loop(
+    worker_handles.push(crate::consensus::driver::spawn_event_loop(
         event_loop_app,
         Arc::clone(&shared_inbound),
         event_rx,
         event_loop_stop,
-    );
+    ));
 
     // Validation forwarding thread
     {
@@ -1182,30 +1371,41 @@ fn run_start_mode_consensus_loop(
                     }
                 }));
         }
-        std::thread::Builder::new()
-            .name("validation-forwarder".into())
-            .spawn(move || {
-                loop {
-                    let _ = val_notify_rx.recv();
-                    if fwd_stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let root = fwd_runtime.root();
-                    let Some(overlay_rt) = root.overlay_runtime() else {
-                        continue;
-                    };
-                    let validations = overlay_rt.overlay().take_validations();
-                    for queued in validations {
-                        match fwd_event_tx
-                            .send(crate::consensus::driver::ConsensusEvent::Validation(queued))
-                        {
+        worker_handles.push(
+            std::thread::Builder::new()
+                .name("validation-forwarder".into())
+                .spawn(move || {
+                    loop {
+                        match val_notify_rx.recv_timeout(Duration::from_millis(25)) {
                             Ok(()) => {}
-                            Err(_) => return,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if fwd_stop.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                        if fwd_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let root = fwd_runtime.root();
+                        let Some(overlay_rt) = root.overlay_runtime() else {
+                            continue;
+                        };
+                        let validations = overlay_rt.overlay().take_validations();
+                        for queued in validations {
+                            match fwd_event_tx
+                                .send(crate::consensus::driver::ConsensusEvent::Validation(queued))
+                            {
+                                Ok(()) => {}
+                                Err(_) => return,
+                            }
                         }
                     }
-                }
-            })
-            .expect("spawn validation-forwarder thread");
+                })
+                .expect("spawn validation-forwarder thread"),
+        );
     }
 
     // Transaction relay router. PeerImp schedules `RcvCheckTx` on the JobQueue;
@@ -1219,7 +1419,13 @@ fn run_start_mode_consensus_loop(
             .set_transaction_router(Box::new(move |_peer_id, message| {
                 let root = router_root.clone();
                 let queue = job_queue.clone();
-                let raw_transaction = message.message.raw_transaction;
+                let inbound = message.message;
+                let raw_transaction = inbound.raw_transaction;
+                let relay_metadata = crate::tx_queue::transaction::TransactionRelayMetadata::new(
+                    inbound.status,
+                    inbound.receive_timestamp,
+                    inbound.deferred,
+                );
                 let _ = queue.add_job(
                     crate::job::job_types::JobType::JtTransaction,
                     "RcvCheckTx",
@@ -1235,7 +1441,10 @@ fn run_start_mode_consensus_loop(
                         let st_tx = Arc::new(st_tx);
                         let mut transaction: crate::SharedTransaction =
                             Arc::new(std::sync::Mutex::new(
-                                crate::tx_queue::transaction::Transaction::new(Arc::clone(&st_tx)),
+                                crate::tx_queue::transaction::Transaction::new_with_relay_metadata(
+                                    Arc::clone(&st_tx),
+                                    relay_metadata,
+                                ),
                             ));
                         if let Some(network_ops_runtime) = root.network_ops_runtime() {
                             let batch_root = root.clone();
@@ -1264,6 +1473,36 @@ fn run_start_mode_consensus_loop(
             .set_ledger_data_router(Box::new(move |peer_id, message| {
                 use overlay::Overlay;
 
+                if !ledger_data_sequence_is_admissible(
+                    message.r#type,
+                    message.ledger_seq,
+                    router_root.validated_ledger_seq(),
+                    router_root.validated_ledger_age(),
+                ) {
+                    router_shared_inbound.note_wire_ledger_data_invalid_hash();
+                    if let Some(peer) = router_overlay.find_peer_by_short_id(peer_id) {
+                        peer.charge(
+                            (*resource::FEE_INVALID_DATA).clone(),
+                            "TMLedgerData invalid ledger sequence".to_owned(),
+                        );
+                    }
+                    return;
+                }
+
+                // PeerImp validates the node vector before cookie relaying.
+                // In particular, an empty candidate payload is invalid data,
+                // not a harmless incomplete response.
+                if !ledger_data_nodes_are_admissible(message.nodes.len()) {
+                    router_shared_inbound.note_wire_ledger_data_invalid_hash();
+                    if let Some(peer) = router_overlay.find_peer_by_short_id(peer_id) {
+                        peer.charge(
+                            (*resource::FEE_INVALID_DATA).clone(),
+                            "TMLedgerData invalid node count".to_owned(),
+                        );
+                    }
+                    return;
+                }
+
                 // Request-cookie relay (matching rippled PeerImp::onMessage TMLedgerData)
                 if let Some(cookie) = message.request_cookie {
                     router_shared_inbound.note_wire_ledger_data_relayed();
@@ -1285,17 +1524,27 @@ fn run_start_mode_consensus_loop(
                 };
                 match message.r#type {
                     3 => {
-                        let peer = router_overlay.find_peer_by_short_id(peer_id);
-                        let mut guard = router_root
-                            .inbound_transactions()
-                            .lock()
-                            .expect("inbound_transactions mutex");
-                        let _status = guard.got_data(hash, peer, &message);
-                        if let Some(acquire) = guard.acquire(hash) {
-                            if acquire.is_complete() {
-                                let set = Arc::new(acquire.map().clone());
-                                guard.give_set(hash, set, true);
-                            }
+                        // PeerImp::onMessage(TMLedgerData) moves candidate-set
+                        // processing to JtTxnData. Keep the peer callback
+                        // bounded: `got_data` can advance a SHAMap acquisition.
+                        let candidate_root = router_root.clone();
+                        let candidate_overlay = router_overlay.clone();
+                        let queued_message = message;
+                        if !router_root.job_queue().add_job(
+                            crate::job::job_types::JobType::JtTxnData,
+                            "RcvPeerData",
+                            move || {
+                                process_candidate_ledger_data(
+                                    &candidate_root,
+                                    &candidate_overlay,
+                                    peer_id,
+                                    hash,
+                                    queued_message,
+                                );
+                            },
+                        ) {
+                            tracing::debug!(target: "consensus", peer_id,
+                                "candidate ledger-data job rejected during shutdown");
                         }
                     }
                     0 | 1 | 2 => {
@@ -1327,13 +1576,19 @@ fn run_start_mode_consensus_loop(
                         );
                         if !routed {
                             if let Some(packet) = stale_packet {
+                                // Rippled routes valid untracked liAS_NODE
+                                // data through InboundLedgers::gotStaleData
+                                // for later fetch-pack recovery. It is useful
+                                // peer work, not an unsolicited-data charge.
                                 let stored = router_shared_inbound.stash_stale_packet(&packet);
                                 router_shared_inbound.note_stale_packet_result(stored);
+                                return;
                             }
-                            // Peer sent unsolicited ledger data — charge them
+                            // Base and transaction-node responses with no
+                            // active acquisition remain unsolicited.
                             if let Some(peer) = router_overlay.find_peer_by_short_id(peer_id) {
                                 peer.charge(
-                                    resource::Charge::new(20, "unsolicited ledger data"),
+                                    (*resource::FEE_USELESS_DATA).clone(),
                                     "Unsolicited TmLedgerData response".to_owned(),
                                 );
                             }
@@ -1458,25 +1713,46 @@ fn run_start_mode_consensus_loop(
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         let router_root = runtime.root().clone();
         let router_overlay_rt = Arc::clone(&overlay_rt);
+        let get_ledger_fetch_depth = configured_ledger_history;
         overlay_rt
             .overlay()
             .queued_inbound()
             .set_get_ledger_router(Box::new(move |peer_id, message| {
-                let req = overlay::PeerMessage { peer_id, message };
-                if req.message.itype == 3 {
-                    // liTS_CANDIDATE: serve inline for minimal latency
-                    serve_one_get_ledger_request(&router_root, &router_overlay_rt, req);
-                } else {
-                    let job_root = router_root.clone();
-                    let job_overlay_rt = Arc::clone(&router_overlay_rt);
-                    router_root.job_queue().add_job(
-                        crate::job::job_types::JobType::JtLedgerReq,
-                        "RcvGetLedger",
-                        move || {
-                            serve_one_get_ledger_request(&job_root, &job_overlay_rt, req);
-                        },
-                    );
+                // PeerImp rejects a request more than ten ledgers ahead while
+                // the validated ledger is fresh. This app-owned router has the
+                // live LedgerMaster age/sequence required for that check.
+                if router_root.validated_ledger_age() <= Duration::from_secs(10)
+                    && message.ledger_seq.is_some_and(|seq| {
+                        seq > router_root.validated_ledger_seq().unwrap_or_default().saturating_add(10)
+                    })
+                {
+                    if let Some(peer) = router_overlay_rt.overlay().find_peer_by_short_id(peer_id) {
+                        peer.charge(
+                            (*resource::FEE_INVALID_DATA).clone(),
+                            "TMGetLedger invalid ledger sequence".to_owned(),
+                        );
+                    }
+                    return;
                 }
+                let req = overlay::PeerMessage { peer_id, message };
+                // `PeerImp::onMessage(TMGetLedger)` queues every valid request,
+                // including liTS_CANDIDATE, on JtLedgerReq. Candidate-set map
+                // walks are just as peer-controlled and must not run inline on
+                // the overlay callback path.
+                let job_root = router_root.clone();
+                let job_overlay_rt = Arc::clone(&router_overlay_rt);
+                router_root.job_queue().add_job(
+                    crate::job::job_types::JobType::JtLedgerReq,
+                    "RcvGetLedger",
+                    move || {
+                        serve_one_get_ledger_request(
+                            &job_root,
+                            &job_overlay_rt,
+                            req,
+                            get_ledger_fetch_depth,
+                        );
+                    },
+                );
             }));
     }
 
@@ -1489,21 +1765,44 @@ fn run_start_mode_consensus_loop(
         let router_root = runtime.root().clone();
         let router_overlay_rt = Arc::clone(&overlay_rt);
         let router_shared_inbound = Arc::clone(&shared_inbound);
+        // `LedgerMaster::getEarliestFetch` uses the configured history depth.
+        // Keep that policy with the live overlay router rather than deriving a
+        // separate retention range in a transport-only helper.
+        let fetch_pack_depth = configured_ledger_history;
         overlay_rt
             .overlay()
             .queued_inbound()
             .set_get_objects_router(Box::new(move |peer_id, message| {
                 let msg_envelope = overlay::PeerMessage { peer_id, message };
                 let msg = &msg_envelope.message;
+                // PeerImp's send-queue overload admission applies to every
+                // query before dispatching by object type, including FetchPack
+                // and otTRANSACTIONS requests.
+                if msg.query
+                    && router_overlay_rt
+                        .overlay()
+                        .find_peer_by_short_id(peer_id)
+                        .is_some_and(|peer| {
+                            !get_object_query_send_queue_is_admissible(peer.send_queue_size())
+                        })
+                {
+                    return;
+                }
                 if !msg.query {
-                    // Non-query TMGetObjectByHash messages are content-addressed
-                    // NodeStore/fetch-pack blobs, not TMLedgerData packets. As in
-                    // PeerImp, cache every structurally valid reply regardless of
-                    // its object type; consumers validate the hash against data.
-                    let mut stored = 0;
+                    // Match PeerImp's reply path: a fetch pack is segmented by
+                    // ledger sequence, and nodes for a ledger that is already
+                    // complete are ignored as late data. Generic object replies
+                    // continue to populate the shared content-addressed cache.
+                    let is_fetch_pack = msg.r#type
+                        == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack
+                            as i32;
                     let ledger_master = router_root
                         .ledger_master_runtime()
                         .map(|runtime| runtime.ledger_master());
+                    let mut stored = 0usize;
+                    let mut pack_seq = 0u32;
+                    let mut store_current_pack = true;
+                    let mut progress = false;
 
                     for obj in &msg.objects {
                         let (Some(hash_bytes), Some(data)) = (&obj.hash, &obj.data) else {
@@ -1513,8 +1812,23 @@ fn run_start_mode_consensus_loop(
                             continue;
                         };
 
+                        if is_fetch_pack
+                            && let Some(ledger_seq) = obj.ledger_seq
+                            && ledger_seq != pack_seq
+                        {
+                            pack_seq = ledger_seq;
+                            store_current_pack = ledger_master
+                                .as_ref()
+                                .is_none_or(|master| !master.have_ledger(ledger_seq));
+                            progress |= store_current_pack;
+                        }
+                        if is_fetch_pack && !store_current_pack {
+                            continue;
+                        }
+
                         // Preserve both established cache owners used by the
-                        // shared acquisition lifecycle.
+                        // shared acquisition lifecycle. Consumers verify the
+                        // content-addressed hash when retrieving each object.
                         if let Some(ledger_master) = ledger_master.as_ref() {
                             ledger_master.add_fetch_pack(hash, data.clone());
                         }
@@ -1522,51 +1836,226 @@ fn run_start_mode_consensus_loop(
                         stored += 1;
                     }
 
-                    // PeerImp's completion notification is specific to replies
-                    // tagged as fetch packs; ordinary object replies only cache.
-                    if msg.r#type
-                        == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack
-                            as i32
-                        && stored > 0
-                    {
-                        router_root.signal_fetch_pack_ready();
-                        router_shared_inbound.notify_fetch_pack_ready();
+                    if is_fetch_pack {
+                        tracing::debug!(target: "consensus", peer_id, pack_seq, stored, progress,
+                            "processed fetch-pack reply");
+                        let dispatch = ledger_master
+                            .as_ref()
+                            .is_none_or(|master| master.got_fetch_pack(progress, pack_seq));
+                        if dispatch {
+                            let ready_root = router_root.clone();
+                            let ready_inbound = Arc::clone(&router_shared_inbound);
+                            let ready_master = ledger_master.clone();
+                            let rejected_master = ledger_master.clone();
+                            let queued = router_root.job_queue().add_job(
+                                crate::job::job_types::JobType::JtLedgerData,
+                                "GotFetchPack",
+                                move || {
+                                    // A reply can contain no useful/complete
+                                    // nodes; it still releases the single-flight
+                                    // completion path, as in gotFetchPack.
+                                    ready_root.signal_fetch_pack_ready();
+                                    ready_inbound.notify_fetch_pack_ready();
+                                    if let Some(master) = ready_master {
+                                        master.finish_got_fetch_pack();
+                                    }
+                                },
+                            );
+                            if !queued {
+                                // `gotFetchPack` owns an atomic single-flight
+                                // flag. Clear it synchronously when shutdown
+                                // refuses the completion job.
+                                if let Some(master) = rejected_master {
+                                    master.finish_got_fetch_pack();
+                                }
+                            }
+                        }
                     }
                 } else if msg.r#type
                     == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32
                 {
+                    // PeerImp handles FetchPack separately from generic object
+                    // serving: fast admission happens on ingress, then the
+                    // expensive history/map traversal is serialized on JtPack.
+                    let Some(peer) = router_overlay_rt.overlay().find_peer_by_short_id(peer_id)
+                    else {
+                        return;
+                    };
+                    match classify_fetch_pack_request(
+                        router_root.load_fee_track_loaded_local(),
+                        router_root.validated_ledger_age(),
+                        router_root
+                            .job_queue()
+                            .job_count(crate::job::job_types::JobType::JtPack),
+                        msg.ledger_hash.as_deref(),
+                    ) {
+                        FetchPackAdmission::Busy => return,
+                        FetchPackAdmission::Malformed => {
+                            peer.charge(
+                                (*resource::FEE_MALFORMED_REQUEST).clone(),
+                                "FetchPack hash size malformed".to_owned(),
+                            );
+                        }
+                        FetchPackAdmission::Accepted(ledger_hash) => {
+                            peer.charge(
+                                (*resource::FEE_HEAVY_BURDEN_PEER).clone(),
+                                "FetchPack request".to_owned(),
+                            );
+                            let job_root = router_root.clone();
+                            let job_overlay_rt = Arc::clone(&router_overlay_rt);
+                            let job_peer_id = peer_id;
+                            let issued_at = std::time::Instant::now();
+                            let job_fetch_depth = fetch_pack_depth;
+                            let _ = router_root.job_queue().add_job(
+                                crate::job::job_types::JobType::JtPack,
+                                "MakeFetchPack",
+                                move || {
+                                    serve_fetch_pack_request(
+                                        &job_root,
+                                        &job_overlay_rt,
+                                        job_peer_id,
+                                        ledger_hash,
+                                        issued_at,
+                                        job_fetch_depth,
+                                    );
+                                },
+                            );
+                        }
+                    }
+                } else if msg.r#type
+                    == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtTransactions
+                        as i32
+                {
+                    // PeerImp routes reduce-relay object requests through its
+                    // dedicated JtRequestedTxn lane and answers with a
+                    // TMTransactions batch rather than a GetObjects reply.
+                    let Some(peer) = router_overlay_rt.overlay().find_peer_by_short_id(peer_id)
+                    else {
+                        return;
+                    };
+                    if !peer.tx_reduce_relay_enabled() {
+                        peer.charge(
+                            (*resource::FEE_MALFORMED_REQUEST).clone(),
+                            "TMGetObjectByHash transactions disabled".to_owned(),
+                        );
+                        return;
+                    }
+                    if !transaction_object_request_is_admissible(&msg.objects) {
+                        peer.charge(
+                            (*resource::FEE_MALFORMED_REQUEST).clone(),
+                            "TMGetObjectByHash transactions malformed".to_owned(),
+                        );
+                        return;
+                    }
                     let job_root = router_root.clone();
                     let job_overlay_rt = Arc::clone(&router_overlay_rt);
-                    router_root.job_queue().add_job(
-                        crate::job::job_types::JobType::JtLedgerReq,
-                        "RcvGetObjByHash",
+                    if !router_root.job_queue().add_job(
+                        crate::job::job_types::JobType::JtRequestedTxn,
+                        "DoTxs",
                         move || {
-                            serve_fetch_pack_request(&job_root, &job_overlay_rt, &msg_envelope);
-                        },
-                    );
-                } else {
-                    let job_root = router_root.clone();
-                    let job_overlay_rt = Arc::clone(&router_overlay_rt);
-                    router_root.job_queue().add_job(
-                        crate::job::job_types::JobType::JtLedgerReq,
-                        "RcvGetObjByHash",
-                        move || {
-                            serve_get_object_by_hash_request(
+                            serve_requested_transactions(
                                 &job_root,
                                 &job_overlay_rt,
                                 &msg_envelope,
                             );
                         },
-                    );
+                    ) {
+                        tracing::debug!(target: "overlay", peer_id,
+                            "requested-transaction job rejected during shutdown");
+                    }
+                } else {
+                    match classify_generic_get_object_request(
+                        msg.ledger_hash.as_deref(),
+                        msg.objects.len(),
+                    ) {
+                        GenericGetObjectAdmission::MalformedLedgerHash => {
+                            if let Some(peer) = router_overlay_rt
+                                .overlay()
+                                .find_peer_by_short_id(peer_id)
+                            {
+                                peer.charge(
+                                    (*resource::FEE_MALFORMED_REQUEST).clone(),
+                                    "get object ledger hash".to_owned(),
+                                );
+                            }
+                        }
+                        GenericGetObjectAdmission::Oversized => {
+                            if let Some(peer) = router_overlay_rt
+                                .overlay()
+                                .find_peer_by_short_id(peer_id)
+                            {
+                                peer.charge(
+                                    (*resource::FEE_INVALID_DATA).clone(),
+                                    "oversized get object request".to_owned(),
+                                );
+                            }
+                        }
+                        GenericGetObjectAdmission::Accepted => {
+                            let job_root = router_root.clone();
+                            let job_overlay_rt = Arc::clone(&router_overlay_rt);
+                            let queued = router_root.job_queue().add_job(
+                                crate::job::job_types::JobType::JtLedgerReq,
+                                "RcvGetObjByHash",
+                                move || {
+                                    serve_get_object_by_hash_request(
+                                        &job_root,
+                                        &job_overlay_rt,
+                                        &msg_envelope,
+                                    );
+                                },
+                            );
+                            // PeerImp bills this base burden only after bounded
+                            // job admission succeeds, closing the enqueue-flood
+                            // window without charging shutdown rejections.
+                            if queued
+                                && let Some(peer) = router_overlay_rt
+                                    .overlay()
+                                    .find_peer_by_short_id(peer_id)
+                            {
+                                peer.charge(
+                                    (*resource::FEE_MODERATE_BURDEN_PEER).clone(),
+                                    "received a get object by hash request".to_owned(),
+                                );
+                            }
+                        }
+                    }
+
                 }
             }));
+    }
+
+    // TransactionAcquire is a TimeoutCounter with a 250 ms interval in
+    // rippled. Keep its retry/add-peer cadence independent from the one-second
+    // cache/overlay housekeeping loop below.
+    {
+        let candidate_stop = Arc::clone(&stop);
+        let candidate_root = runtime.root().clone();
+        worker_handles.push(
+            std::thread::Builder::new()
+                .name("candidate-acquire-timer".into())
+                .spawn(move || {
+                    while !candidate_stop.load(Ordering::Acquire) {
+                        std::thread::sleep(CANDIDATE_ACQUIRE_TICK);
+                        if candidate_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        candidate_root
+                            .inbound_transactions()
+                            .lock()
+                            .expect("inbound_transactions mutex")
+                            .tick_pending_acquires();
+                    }
+                })
+                .expect("spawn candidate-acquire-timer thread"),
+        );
     }
 
     // Forward map-complete (tx-set acquisition) results to the strand.
     if let Some(rx) = map_complete_rx {
         let txset_tx = strand.txset_tx.clone();
         let fwd_stop = Arc::clone(&stop);
-        std::thread::Builder::new()
+        worker_handles.push(
+            std::thread::Builder::new()
             .name("map-complete-fwd".into())
             .spawn(move || {
                 let mut pending = None;
@@ -1595,7 +2084,8 @@ fn run_start_mode_consensus_loop(
                     }
                 }
             })
-            .expect("spawn map-complete-fwd thread");
+            .expect("spawn map-complete-fwd thread"),
+        );
     }
 
     // ===================================================================
@@ -1610,10 +2100,10 @@ fn run_start_mode_consensus_loop(
         let hk_full_below_cache = Arc::clone(shared_inbound.full_below_cache());
         let hk_tree_cache = Arc::clone(&app_tree_cache);
         let hk_sweep_interval = node_size_profile.sweep_interval_seconds;
-        std::thread::Builder::new()
+        worker_handles.push(
+            std::thread::Builder::new()
             .name("housekeeping-timer".into())
             .spawn(move || {
-                let mut last_acquire_tick = std::time::Instant::now();
                 // rippled sweeps TreeNodeCache every SweepInterval (60s for medium)
                 let mut last_cache_sweep = std::time::Instant::now();
                 while !hk_stop.load(Ordering::Acquire) {
@@ -1626,16 +2116,7 @@ fn run_start_mode_consensus_loop(
                         continue;
                     };
 
-                    // Tick pending tx-set acquisitions (every ~1s now instead of 500ms)
-                    if last_acquire_tick.elapsed() >= Duration::from_millis(500) {
-                        let mut guard = root
-                            .inbound_transactions()
-                            .lock()
-                            .expect("inbound_transactions mutex");
-                        guard.tick_pending_acquires();
-                        last_acquire_tick = std::time::Instant::now();
-                        hk_shared_inbound.sweep();
-                    }
+                    hk_shared_inbound.sweep();
 
                     // TreeNodeCache sweep — matching rippled's doSweep which calls
                     // nodeFamily_.sweep() at SweepInterval cadence (config-based per node_size).
@@ -1700,55 +2181,62 @@ fn run_start_mode_consensus_loop(
                             overlay_rt.overlay().sweep_relay_history(5000);
                         }
 
-                        // OverlayImpl::sendEndpoints runs every second in rippled. Broadcast
-                        // from this live bootstrap timer every tick, including this listener
-                        // and currently discovered peers.
-                        static LAST_ENDPOINTS_SECS: std::sync::atomic::AtomicU64 =
+                        // OverlayImpl calls sendEndpoints every second, but
+                        // PeerFinder::buildEndpointsForPeers handouts only when
+                        // its 151-second broadcast deadline is due. Build a
+                        // distinct, bounded handout for each peer: an IPv6
+                        // unspecified self entry at hop 0 plus filtered live
+                        // endpoints, never a once-per-second full fanout.
+                        static LAST_ENDPOINT_HANDOUT_SECS: std::sync::atomic::AtomicU64 =
                             std::sync::atomic::AtomicU64::new(0);
                         let now_secs = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        let last_endpoints =
-                            LAST_ENDPOINTS_SECS.load(std::sync::atomic::Ordering::Relaxed);
-                        if now_secs.saturating_sub(last_endpoints) >= 1 {
-                            LAST_ENDPOINTS_SECS
-                                .store(now_secs, std::sync::atomic::Ordering::Relaxed);
+                        let last_handout = LAST_ENDPOINT_HANDOUT_SECS
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if now_secs.saturating_sub(last_handout)
+                            >= ENDPOINT_HANDOUT_INTERVAL.as_secs()
+                        {
+                            LAST_ENDPOINT_HANDOUT_SECS.store(
+                                now_secs,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                             let peers = overlay_rt.overlay().active_peers();
-                            let listener_endpoint = overlay_rt
+                            let listener_port = overlay_rt
                                 .listener_setup()
-                                .map(|setup| format!("{}:{}", setup.ip, setup.port));
-                            let discovered_endpoints = peers
+                                .map(|setup| setup.port);
+                            let candidates = peers
                                 .iter()
                                 .map(|peer| peer.remote_address())
-                                .collect::<std::collections::BTreeSet<_>>();
+                                .collect::<Vec<_>>();
+                            let now = std::time::Instant::now();
 
                             for peer in &peers {
-                                let mut endpoints_v2 =
-                                    Vec::with_capacity(1 + discovered_endpoints.len().min(9));
-                                if let Some(endpoint) = &listener_endpoint {
-                                    endpoints_v2.push(
-                                        overlay::message::wire::tm_endpoints::TmEndpointv2 {
-                                            endpoint: endpoint.clone(),
-                                            hops: 0,
-                                        },
-                                    );
-                                }
-                                for endpoint in &discovered_endpoints {
-                                    if endpoint.ip() == peer.remote_address().ip()
-                                        || endpoints_v2.len() >= 10
-                                    {
-                                        continue;
-                                    }
-                                    endpoints_v2.push(
-                                        overlay::message::wire::tm_endpoints::TmEndpointv2 {
-                                            endpoint: endpoint.to_string(),
-                                            hops: 1,
-                                        },
-                                    );
-                                }
+                                let endpoints_v2 = build_endpoint_handout(
+                                    listener_port,
+                                    peer.remote_address(),
+                                    candidates.iter().copied(),
+                                    |endpoint, hops| {
+                                        if peer.should_filter_recent_endpoint(
+                                            endpoint,
+                                            hops,
+                                            now,
+                                            ENDPOINT_HANDOUT_TTL,
+                                        ) {
+                                            return false;
+                                        }
+                                        peer.remember_recent_endpoint(
+                                            endpoint,
+                                            hops,
+                                            now,
+                                            ENDPOINT_HANDOUT_TTL,
+                                        );
+                                        true
+                                    },
+                                );
                                 if !endpoints_v2.is_empty() {
-                                    let message = overlay::Message::new(
+                                    peer.send(overlay::Message::new(
                                         overlay::ProtocolMessage::new(
                                             overlay::ProtocolPayload::Endpoints(
                                                 overlay::TmEndpoints {
@@ -1758,8 +2246,7 @@ fn run_start_mode_consensus_loop(
                                             ),
                                         ),
                                         None,
-                                    );
-                                    peer.send(message);
+                                    ));
                                 }
                             }
                         }
@@ -1769,22 +2256,29 @@ fn run_start_mode_consensus_loop(
                         // lifecycle in this global housekeeping loop.
                     }
 
+                    let (manifests, validator_lists, validator_list_collections) =
+                        take_validator_list_inbound(&overlay_rt.overlay());
+
                     // Drain accepted manifest updates, install them in the shared
                     // validator ManifestCache, and relay only newly accepted blobs.
                     // This is OverlayImpl::onManifests parity; do not echo a
                     // peer's accepted manifests back to that peer.
-                    let manifests = overlay_rt.overlay().take_manifests();
+                    let manifests = manifests;
                     for inbound in manifests {
                         let mut relay_list = Vec::new();
-                        // rippled 3.2.1: kMaxManifestBytes=358, kMaxManifestsPerMessage=200.
-                        // Only relay manifests that are within size bounds and were accepted.
-                        // rippled relays accepted gossip only if trusted or already known
-                        // (OverlayImpl.cpp:705-736).
-                        const MAX_MANIFEST_BYTES: usize = 358;
-                        const MAX_MANIFESTS_PER_MESSAGE: usize = 200;
+                        let mut trusted_manifest_accepted = false;
+                        // Snapshot the cache before this TMManifests message.
+                        // A new untrusted key may be admitted for processing,
+                        // but it is relayable only when it was already known
+                        // before this message arrived.
+                        let known_master_keys = root.manifest_cache().known_master_keys();
+                        // rippled bounds untrusted work to 200 per message but
+                        // never drops a trusted validator manifest merely
+                        // because it follows untrusted gossip.
+                        let mut untrusted_processed = 0usize;
+                        let mut skipped_untrusted = false;
 
                         for wire_manifest in inbound.message.list {
-                            // Reject oversized manifests before decoding (3.2.1 fix)
                             if wire_manifest.stobject.len() > MAX_MANIFEST_BYTES {
                                 continue;
                             }
@@ -1799,15 +2293,52 @@ fn run_start_mode_consensus_loop(
                                 continue;
                             };
 
-                            if root.manifest_cache().apply_manifest(manifest)
-                                == crate::state::manifest::ManifestDisposition::Accepted
-                            {
+                            let master_key = manifest.master_key;
+                            let is_trusted = root.validators().listed(master_key);
+                            let known_before_message = known_master_keys.contains(&master_key);
+                            let Some(policy) = manifest_rate_limit_policy(
+                                is_trusted,
+                                &mut untrusted_processed,
+                            ) else {
+                                skipped_untrusted = true;
+                                continue;
+                            };
+
+                            let disposition = root
+                                .manifest_cache()
+                                .apply_manifest_with_policy(manifest, policy);
+                            if relay_accepted_manifest(
+                                disposition,
+                                is_trusted,
+                                known_before_message,
+                            ) {
+                                if is_trusted {
+                                    root.manifest_cache().promote_to_trusted(&master_key);
+                                    trusted_manifest_accepted = true;
+                                }
+                                // Relay only newly accepted trusted manifests, or
+                                // accepted untrusted updates to masters already
+                                // known before this message. Never relay a
+                                // first-seen untrusted key, stale cache entry, or
+                                // rejected admission.
                                 relay_list.push(wire_manifest);
                             }
-                            // Cap relay list to prevent oversized outgoing messages
-                            if relay_list.len() >= MAX_MANIFESTS_PER_MESSAGE {
-                                break;
-                            }
+                        }
+
+                        if skipped_untrusted
+                            && let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(inbound.peer_id)
+                        {
+                            peer.charge(
+                                (*resource::FEE_MALFORMED_REQUEST).clone(),
+                                "too many untrusted manifests".to_owned(),
+                            );
+                        }
+
+                        if trusted_manifest_accepted
+                            && let Err(error) = root.persist_manifest_caches()
+                        {
+                            tracing::error!(target: "manifest", %error,
+                                "failed to persist newly accepted trusted manifest");
                         }
 
                         if !relay_list.is_empty() {
@@ -1829,24 +2360,31 @@ fn run_start_mode_consensus_loop(
                     }
 
                     // Drain validator list messages and apply them to the local UNL
-                    let messages = overlay_rt.overlay().take_validator_lists();
+                    let messages = validator_lists;
                     if !messages.is_empty() {
-                        let validators = root.validators();
                         for msg in messages {
                             let tm = &msg.message;
                             let manifest_b64 = basics::base64::base64_encode(&tm.manifest);
                             let blob_info = crate::validator::validator_list::ValidatorBlobInfo {
                                 blob: basics::base64::base64_encode(&tm.blob),
-                                signature: basics::base64::base64_encode(&tm.signature),
+                                signature: basics::str_hex::str_hex(&tm.signature),
                                 manifest: None,
                             };
-                            let stats = validators.apply_lists(
+                            let hash = crate::validator::validator_list::validator_list_collection_hash(
+                                &manifest_b64,
+                                tm.version,
+                                std::slice::from_ref(&blob_info),
+                            );
+                            let stats = root.apply_validator_lists_from_peer(
+                                msg.peer_id,
                                 &manifest_b64,
                                 tm.version,
                                 &[blob_info],
                                 String::new(),
-                                None,
+                                hash,
                             );
+                            synchronize_unl_blocked(&root);
+                            broadcast_validator_list_collection(&root, &stats, hash);
                             tracing::trace!(
                                 target: "overlay",
                                 version = tm.version,
@@ -1855,9 +2393,21 @@ fn run_start_mode_consensus_loop(
                             );
                         }
                     }
+
+                    // v2 validator-list collections use the same application
+                    // and replay semantics as v1, but preserve all current and
+                    // pending blobs for peers that negotiated the v2 feature.
+                    for collection in validator_list_collections {
+                        apply_validator_list_collection_from_peer(
+                            &root,
+                            collection.peer_id,
+                            &collection.message,
+                        );
+                    }
                 }
             })
-            .expect("spawn housekeeping-timer thread");
+            .expect("spawn housekeeping-timer thread"),
+        );
     }
 
     // ===================================================================
@@ -1868,19 +2418,428 @@ fn run_start_mode_consensus_loop(
         std::thread::sleep(Duration::from_millis(500));
     }
 
+    // Mirror ApplicationImp::run: NetworkOPs stops first, then the active
+    // InboundLedgers registry quiesces its acquisitions and worker pool before
+    // bootstrap returns to MainRuntime::shutdown (which stops NodeStore).
     strand.stop();
+    shared_inbound.stop();
+    for handle in worker_handles {
+        let _ = handle.join();
+    }
     tracing::info!(target: "consensus", "Overlay service loop stopped");
+}
+
+/// PeerFinder::Tuning::kSecondsPerMessage. OverlayImpl ticks every second,
+/// but peer endpoint handouts are intentionally much less frequent.
+const ENDPOINT_HANDOUT_INTERVAL: Duration = Duration::from_secs(151);
+const ENDPOINT_HANDOUT_TTL: Duration = Duration::from_secs(30);
+const ENDPOINT_HANDOUT_LIMIT: usize = 12; // 2 * PeerFinder::kMaxHops
+
+fn canonical_endpoint_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(ipv6) => ipv6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(ipv6)),
+        std::net::IpAddr::V4(_) => ip,
+    }
+}
+
+/// Bootstrap-local equivalent of PeerFinder::Logic::buildEndpointsForPeers:
+/// give each target a bounded, deduplicated handout and let its recent-endpoint
+/// state suppress repeated work. Active peer addresses are the live endpoints
+/// available to this bootstrap-owned runtime; the application PeerFinder owns
+/// longer-lived cache discovery separately.
+fn build_endpoint_handout<F>(
+    listening_port: Option<u16>,
+    recipient: std::net::SocketAddr,
+    candidates: impl IntoIterator<Item = std::net::SocketAddr>,
+    mut admit: F,
+) -> Vec<overlay::message::wire::tm_endpoints::TmEndpointv2>
+where
+    F: FnMut(std::net::SocketAddr, u32) -> bool,
+{
+    let mut endpoints = Vec::with_capacity(ENDPOINT_HANDOUT_LIMIT);
+    if let Some(port) = listening_port {
+        endpoints.push(overlay::message::wire::tm_endpoints::TmEndpointv2 {
+            // Rippled advertises an unspecified IPv6 address: recipients use
+            // their socket's remote address for hop-zero self advertisements.
+            endpoint: std::net::SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), port)
+                .to_string(),
+            hops: 0,
+        });
+    }
+
+    let mut seen_ips = std::collections::BTreeSet::new();
+    let candidates = candidates
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    for endpoint in candidates {
+        if endpoints.len() >= ENDPOINT_HANDOUT_LIMIT
+            || canonical_endpoint_ip(endpoint.ip()) == canonical_endpoint_ip(recipient.ip())
+        {
+            continue;
+        }
+        let hops = 1;
+        if !seen_ips.insert(canonical_endpoint_ip(endpoint.ip())) || !admit(endpoint, hops) {
+            continue;
+        }
+        endpoints.push(overlay::message::wire::tm_endpoints::TmEndpointv2 {
+            endpoint: endpoint.to_string(),
+            hops,
+        });
+    }
+    endpoints
+}
+
+const MAX_MANIFEST_BYTES: usize = 358;
+const MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE: usize = 200;
+
+/// Select startup manifest gossip like rippled OverlayImpl::getManifestsMessage:
+/// every listed (trusted) manifest precedes an independently capped tail of
+/// untrusted gossip. The caller snapshots cache bytes before consulting the
+/// ValidatorList, avoiding manifest-cache/validator-list lock inversion.
+fn trusted_first_manifest_payloads(
+    entries: impl IntoIterator<Item = (bool, Vec<u8>)>,
+) -> Vec<Vec<u8>> {
+    let mut trusted = Vec::new();
+    let mut untrusted = Vec::new();
+    for (is_trusted, serialized) in entries {
+        if is_trusted {
+            trusted.push(serialized);
+        } else {
+            untrusted.push(serialized);
+        }
+    }
+    trusted.extend(untrusted.into_iter().take(MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE));
+    trusted
+}
+
+/// The application root attaches an early generic provider while constructing
+/// the overlay. Reinstall it after manifests and ValidatorList have loaded so
+/// newly connected peers receive all listed identities first, then only the
+/// bounded untrusted tail used by the reference startup gossip path.
+fn install_trusted_first_manifest_provider(root: &crate::ApplicationRoot) {
+    let Some(overlay_rt) = root.overlay_runtime() else {
+        return;
+    };
+    let manifests = Arc::clone(root.manifest_cache());
+    let validators = root.validators();
+    overlay_rt.overlay().set_manifests_message_provider(move || {
+        let entries = manifests
+            .serialized_manifests()
+            .into_iter()
+            .filter_map(|serialized| {
+                if serialized.len() > crate::validator::validator_list::MAX_MANIFEST_BYTES {
+                    return None;
+                }
+                let manifest = crate::state::manifest::deserialize_manifest(&serialized)?;
+                Some((validators.listed(manifest.master_key), serialized))
+            });
+        let list = trusted_first_manifest_payloads(entries)
+            .into_iter()
+            .map(|stobject| overlay::message::wire::TmManifest { stobject })
+            .collect::<Vec<_>>();
+        (!list.is_empty()).then(|| {
+            overlay::ProtocolMessage::new(overlay::ProtocolPayload::Manifests(
+                overlay::TmManifests {
+                    list,
+                    ..Default::default()
+                },
+            ))
+        })
+    });
+}
+
+fn synchronize_unl_blocked(root: &crate::ApplicationRoot) {
+    root.set_unl_blocked(root.validators().unl_blocked());
+}
+
+/// `Config::validatorListThreshold`: no value and explicit zero select the
+/// computed default; a nonzero threshold must be a single positive integer no
+/// greater than the number of configured publisher keys.
+fn validator_list_threshold_from_config(
+    config: &BasicConfig,
+    publisher_key_count: usize,
+) -> Result<Option<usize>, String> {
+    let values = config.section("validator_list_threshold").values();
+    match values {
+        [] => Ok(None),
+        [raw] => {
+            let threshold = raw.trim().parse::<usize>().map_err(|_| {
+                "[validator_list_threshold] must contain a non-negative integer".to_owned()
+            })?;
+            if threshold == 0 {
+                return Ok(None);
+            }
+            if threshold > publisher_key_count {
+                return Err(
+                    "Value in config section [validator_list_threshold] exceeds the number of configured list keys"
+                        .to_owned(),
+                );
+            }
+            Ok(Some(threshold))
+        }
+        _ => Err(
+            "Config section [validator_list_threshold] should contain single value only"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Convert a peer collection only after the same bounded manifest admission
+/// used by `Manifest.cpp`; version and blob-count checks mirror PeerImp.
+fn validator_list_collection_blobs(
+    collection: &overlay::TmValidatorListCollection,
+) -> Option<(String, u32, Vec<crate::ValidatorBlobInfo>)> {
+    if collection.version < 2
+        || collection.manifest.is_empty()
+        || collection.manifest.len() > crate::validator::validator_list::MAX_MANIFEST_BYTES
+        || collection.blobs.is_empty()
+        || collection.blobs.len() > crate::validator::validator_list::MAX_SUPPORTED_BLOBS
+    {
+        return None;
+    }
+    let mut blobs = Vec::with_capacity(collection.blobs.len());
+    for blob in &collection.blobs {
+        if blob
+            .manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.len() > crate::validator::validator_list::MAX_MANIFEST_BYTES)
+        {
+            return None;
+        }
+        blobs.push(crate::ValidatorBlobInfo {
+            blob: basics::base64::base64_encode(&blob.blob),
+            signature: basics::str_hex::str_hex(&blob.signature),
+            manifest: blob
+                .manifest
+                .as_ref()
+                .map(|manifest| basics::base64::base64_encode(manifest)),
+        });
+    }
+    Some((
+        basics::base64::base64_encode(&collection.manifest),
+        collection.version,
+        blobs,
+    ))
+}
+
+#[derive(Debug)]
+struct ValidatorListCollectionMessage {
+    message: overlay::Message,
+    hash: Uint256,
+}
+
+fn build_validator_list_collection_messages(
+    collection: &crate::ValidatorListCollectionForBroadcast,
+    peer_sequence: usize,
+    max_message_size: usize,
+) -> Vec<ValidatorListCollectionMessage> {
+    let blobs = collection.blobs.iter().filter(|entry| entry.sequence > peer_sequence).filter_map(|entry| {
+        Some(overlay::message::wire::ValidatorBlobInfo {
+            manifest: entry.blob.manifest.as_ref().map(|manifest| basics::base64::base64_decode(manifest)),
+            blob: basics::base64::base64_decode(&entry.blob.blob),
+            signature: basics::string_utilities::str_unhex(&entry.blob.signature)?,
+        })
+    }).collect::<Vec<_>>();
+    if blobs.is_empty() {
+        return Vec::new();
+    }
+
+    fn build_part(
+        version: u32,
+        manifest: &[u8],
+        blobs: &[overlay::message::wire::ValidatorBlobInfo],
+        max_message_size: usize,
+        messages: &mut Vec<ValidatorListCollectionMessage>,
+    ) {
+        let collection = overlay::TmValidatorListCollection {
+            version,
+            manifest: manifest.to_vec(),
+            blobs: blobs.to_vec(),
+        };
+        let payload = overlay::ProtocolPayload::ValidatorListCollection(collection);
+        if overlay::HEADER_BYTES.saturating_add(payload.encoded_len()) <= max_message_size {
+            let hash = protocol::sha512_half(payload.encode_to_vec());
+            messages.push(ValidatorListCollectionMessage {
+                message: overlay::Message::new(overlay::ProtocolMessage::new(payload), None),
+                hash,
+            });
+        } else if blobs.len() > 1 {
+            let middle = blobs.len() / 2;
+            build_part(version, manifest, &blobs[..middle], max_message_size, messages);
+            build_part(version, manifest, &blobs[middle..], max_message_size, messages);
+        }
+    }
+
+    let mut messages = Vec::new();
+    build_part(
+        collection.version.max(2),
+        &basics::base64::base64_decode(&collection.manifest),
+        &blobs,
+        max_message_size,
+        &mut messages,
+    );
+    messages
+}
+
+/// Send v2 collections with PeerImp-compatible recipient filtering, bounded
+/// frames, and both original and emitted-message suppression records.
+fn broadcast_validator_list_collection(
+    root: &crate::ApplicationRoot,
+    stats: &crate::PublisherListStats,
+    hash: Uint256,
+) {
+    use overlay::{Overlay, ProtocolFeature};
+
+    if stats.best_disposition() > crate::ListDisposition::KnownSequence {
+        return;
+    }
+    let Some(publisher) = stats.publisher_key else {
+        return;
+    };
+    let Some(to_skip) = root.validator_list_relay_skip(hash) else {
+        return;
+    };
+    let Some(collection) = root.validators().collection_for_broadcast(publisher) else {
+        return;
+    };
+    let Some(overlay_rt) = root.overlay_runtime() else {
+        return;
+    };
+    for peer in overlay_rt.overlay().active_peers() {
+        if to_skip.contains(&peer.id()) || !peer.supports_feature(ProtocolFeature::ValidatorList2Propagation) {
+            continue;
+        }
+        let peer_sequence = peer.publisher_list_sequence(publisher).unwrap_or_default();
+        if peer_sequence >= collection.max_sequence {
+            continue;
+        }
+        let messages = build_validator_list_collection_messages(
+            &collection,
+            peer_sequence,
+            overlay::MAXIMUM_MESSAGE_SIZE,
+        );
+        // Match the reference empty-placeholder behavior: do not rebuild an
+        // unsendable oversized collection for this peer on every refresh.
+        peer.set_publisher_list_sequence(publisher, collection.max_sequence);
+        for message in messages {
+            peer.send(message.message);
+            root.add_validator_list_suppression_peer(message.hash, peer.id());
+        }
+        root.add_validator_list_suppression_peer(hash, peer.id());
+    }
+}
+
+/// Apply a received v2 collection through the shared ValidatorList state and
+/// then run the bootstrap-owned UNL synchronization and v2 propagation.
+fn apply_validator_list_collection_from_peer(
+    root: &crate::ApplicationRoot,
+    peer_id: overlay::PeerId,
+    collection: &overlay::TmValidatorListCollection,
+) {
+    let Some((manifest, version, blobs)) = validator_list_collection_blobs(collection) else {
+        return;
+    };
+    let hash = crate::validator::validator_list::validator_list_collection_hash(
+        &manifest,
+        version,
+        &blobs,
+    );
+    let stats = root.apply_validator_lists_from_peer(
+        peer_id,
+        &manifest,
+        version,
+        &blobs,
+        String::new(),
+        hash,
+    );
+    synchronize_unl_blocked(root);
+    broadcast_validator_list_collection(root, &stats, hash);
+}
+
+/// Atomically consume only bootstrap-owned validator queues, leaving every
+/// unrelated inbound family to its designated consumer.
+fn take_validator_list_inbound(
+    overlay: &Arc<overlay::OverlayImpl>,
+) -> (
+    Vec<overlay::PeerMessage<overlay::TmManifests>>,
+    Vec<overlay::PeerMessage<overlay::TmValidatorList>>,
+    Vec<overlay::PeerMessage<overlay::TmValidatorListCollection>>,
+) {
+    overlay.queued_inbound().take_validator_messages()
+}
+
+
+/// Apply rippled's trust-first `TMManifests` admission rule. Trusted entries
+/// never consume the untrusted-work budget, so they remain processable after
+/// a peer has sent its 200th untrusted manifest.
+fn manifest_rate_limit_policy(
+    is_trusted: bool,
+    untrusted_processed: &mut usize,
+) -> Option<crate::state::manifest::ManifestRateLimitCapPolicy> {
+    if is_trusted {
+        return Some(crate::state::manifest::ManifestRateLimitCapPolicy::Uncapped);
+    }
+    if *untrusted_processed >= MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE {
+        return None;
+    }
+    *untrusted_processed += 1;
+    Some(crate::state::manifest::ManifestRateLimitCapPolicy::Capped)
+}
+
+fn relay_accepted_manifest(
+    disposition: crate::state::manifest::ManifestDisposition,
+    is_trusted: bool,
+    known_before_message: bool,
+) -> bool {
+    disposition == crate::state::manifest::ManifestDisposition::Accepted
+        && (is_trusted || known_before_message)
+}
+
+/// Matches PeerImp::processLedgerRequest: every non-candidate request is
+/// refused once the peer reaches the drop-send-queue threshold. A relay cookie
+/// bypasses resource charging only; it does not bypass this overload gate.
+fn get_ledger_send_queue_is_admissible(itype: i32, send_queue_depth: usize) -> bool {
+    itype == 3 || send_queue_depth < overlay::DROP_SEND_QUEUE
 }
 
 fn serve_one_get_ledger_request(
     root: &crate::ApplicationRoot,
     overlay_rt: &Arc<crate::runtime::overlay_runtime::AppOverlayRuntime>,
     req: overlay::PeerMessage<overlay::TmGetLedger>,
+    fetch_depth: u32,
 ) {
     use overlay::Overlay;
 
-    // rippled serves seq-only requests via getLedgerBySeq (PeerImp.cpp:3319+).
-    // If hash is missing but seq is present, resolve the hash from LedgerMaster.
+    let itype = req.message.itype;
+    let serving_peer = overlay_rt.overlay().find_peer_by_short_id(req.peer_id);
+
+    // `PeerImp::processLedgerRequest` charges every non-relayed request before
+    // resolving it. Normal ledger requests additionally refuse local overload
+    // for non-cluster peers; candidate requests retain rippled's exception.
+    if req.message.request_cookie.is_none()
+        && let Some(peer) = serving_peer.as_ref()
+    {
+        peer.charge(
+            (*resource::FEE_MODERATE_BURDEN_PEER).clone(),
+            "received get ledger request".to_owned(),
+        );
+    }
+    if serving_peer.as_ref().is_some_and(|peer| {
+        !get_ledger_send_queue_is_admissible(itype, peer.send_queue_size())
+    }) {
+        return;
+    }
+    if itype != 3
+        && root.load_fee_track_loaded_local()
+        && serving_peer.as_ref().is_some_and(|peer| !peer.cluster())
+    {
+        return;
+    }
+
+    // `PeerImp::getLedger` selects by hash, then sequence, then ltCLOSED.
     let hash = if let Some(hash_bytes) = req.message.ledger_hash.as_deref() {
         match Uint256::from_slice(hash_bytes) {
             Some(h) => h,
@@ -1891,11 +2850,8 @@ fn serve_one_get_ledger_request(
         // rippled rejects sequences below getEarliestFetch() (PeerImp.cpp:3336).
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let lm = lm_rt.ledger_master();
-            // Reject requests below our validated range floor
-            if let Some((earliest, _)) = lm.full_validated_range() {
-                if seq < earliest {
-                    return;
-                }
+            if !sequence_is_fetchable_at_floor(seq, lm.earliest_fetch(fetch_depth)) {
+                return;
             }
             match lm.get_ledger_by_seq(seq, &ledger::NullLedgerJournal) {
                 Some(ledger) if ledger.header().seq == seq => *ledger.header().hash.as_uint256(),
@@ -1904,11 +2860,15 @@ fn serve_one_get_ledger_request(
         } else {
             return;
         }
+    } else if req.message.ltype == Some(2) {
+        match root.closed_ledger() {
+            Some(ledger) => *ledger.header().hash.as_uint256(),
+            None => return,
+        }
     } else {
         return;
     };
 
-    let itype = req.message.itype;
     let mut nodes: Vec<overlay::message::wire::TmLedgerNode> = Vec::new();
 
     // liTS_CANDIDATE (3) uses InboundTransactions, not LedgerMaster.
@@ -1921,26 +2881,25 @@ fn serve_one_get_ledger_request(
             .expect("inbound_transactions mutex");
         let set = guard.get_set(hash, false);
         if set.is_none() {
-            // Log both the requested hash AND every stored hash for direct comparison
-            let stored: Vec<Uint256> = guard.stored_hashes();
-            let match_found = stored.iter().any(|h| *h == hash);
-            tracing::warn!(target: "consensus",
-                requested = %hash,
-                stored_count = stored.len(),
-                btree_match = match_found,
-                "liTS_CANDIDATE: set not found"
-            );
-            if !stored.is_empty() {
-                for (i, h) in stored.iter().enumerate().take(3) {
-                    tracing::warn!(target: "consensus",
-                        index = i,
-                        stored_hash = %h,
-                        bytes_match = (h.data() == hash.data()),
-                        "liTS_CANDIDATE: stored hash comparison"
-                    );
+            drop(guard);
+            // `PeerImp::getTxSet` relays an indirect miss exactly once. The
+            // cookie identifies the requesting peer so the eventual reply
+            // routes back without a second relay loop.
+            if req.message.query_type.is_some() && req.message.request_cookie.is_none() {
+                let mut relayed = req.message.clone();
+                relayed.request_cookie = Some(req.peer_id as u64);
+                if let Some(peer) = overlay_rt
+                    .overlay()
+                    .active_peers()
+                    .into_iter()
+                    .find(|peer| peer.id() != req.peer_id && peer.has_tx_set(hash))
+                {
+                    peer.send(overlay::Message::new(
+                        overlay::ProtocolMessage::new(overlay::ProtocolPayload::GetLedger(relayed)),
+                        None,
+                    ));
                 }
             }
-            drop(guard);
             return;
         }
         drop(guard);
@@ -1951,68 +2910,41 @@ fn serve_one_get_ledger_request(
             >,
         > { None };
         let requested_node_ids = &req.message.node_i_ds;
-        if requested_node_ids.is_empty() {
-            // No specific nodes requested: nothing to do
-            return;
-        }
-        // Check if this is a root-only request (first request from TransactionAcquire).
-        // If so, serve ALL nodes at once for 1-round-trip acquisition (matching rxrpl).
-        let is_root_request = requested_node_ids.len() == 1
-            && requested_node_ids[0]
-                == shamap::nodes::node_id::SHAMapNodeId::default().get_raw_string();
+        let default_depth = if serving_peer.as_ref().is_some_and(|peer| peer.is_high_latency()) {
+            2
+        } else {
+            1
+        };
+        let query_depth = req.message.query_depth.unwrap_or(default_depth);
 
-        if is_root_request {
-            // Serve the entire tree in one response: root + all inner + all leaves.
-            // depth=8 covers any realistic tx-set (1000 txns fit in depth 4-5).
-            // fat_leaves=true ensures leaf nodes (actual transactions) are included,
-            // enabling single-round-trip acquisition (rxrpl-style bypass).
-            let mut fetch = |_h: basics::sha_map_hash::SHAMapHash| -> Option<
-                basics::memory::intrusive_pointer::SharedIntrusive<
-                    shamap::nodes::tree_node::SHAMapTreeNode,
-                >,
-            > { None };
-            let root_id = shamap::nodes::node_id::SHAMapNodeId::default();
+        // Candidate sets follow the same requested-node traversal contract as
+        // rippled: no root expansion shortcut, no transaction leaves, bounded
+        // requested-node loop, and response limits applied during assembly.
+        for node_id_bytes in requested_node_ids {
+            if nodes.len() >= overlay::SOFT_MAX_REPLY_NODES {
+                break;
+            }
+            let Some(node_id) = shamap::nodes::node_id::deserialize_shamap_node_id(node_id_bytes)
+            else {
+                continue;
+            };
             let mut data: Vec<(shamap::nodes::node_id::SHAMapNodeId, Vec<u8>)> = Vec::new();
-            let _ = sync_tree.get_node_fat(root_id, &mut data, true, 8, &mut fetch);
-            tracing::debug!(target: "consensus",
-                %hash,
-                total_nodes = data.len(),
-                "liTS_CANDIDATE: serving full tree (fat_leaves=true, depth=8)"
-            );
-            for (nid, ndata) in &data {
-                nodes.push(overlay::message::wire::TmLedgerNode {
-                    nodeid: Some(nid.get_raw_string()),
-                    nodedata: ndata.clone(),
-                });
-                if nodes.len() >= 12_288 {
-                    break;
+            if sync_tree
+                .get_node_fat(node_id, &mut data, false, query_depth, &mut fetch)
+                .is_ok()
+            {
+                for (nid, ndata) in data {
+                    if nodes.len() >= HARD_MAX_REPLY_NODES {
+                        break;
+                    }
+                    nodes.push(overlay::message::wire::TmLedgerNode {
+                        nodeid: Some(nid.get_raw_string()),
+                        nodedata: ndata,
+                    });
                 }
             }
-        } else {
-            for node_id_bytes in requested_node_ids {
-                let Some(node_id) =
-                    shamap::nodes::node_id::deserialize_shamap_node_id(node_id_bytes)
-                else {
-                    continue;
-                };
-                let mut data: Vec<(shamap::nodes::node_id::SHAMapNodeId, Vec<u8>)> = Vec::new();
-                if sync_tree
-                    .get_node_fat(node_id, &mut data, false, 1, &mut fetch)
-                    .is_ok()
-                {
-                    for (nid, ndata) in &data {
-                        nodes.push(overlay::message::wire::TmLedgerNode {
-                            nodeid: Some(nid.get_raw_string()),
-                            nodedata: ndata.clone(),
-                        });
-                        if nodes.len() >= HARD_MAX_REPLY_NODES {
-                            break;
-                        }
-                    }
-                }
-                if nodes.len() >= HARD_MAX_REPLY_NODES {
-                    break;
-                }
+            if nodes.len() >= HARD_MAX_REPLY_NODES {
+                break;
             }
         }
 
@@ -2048,10 +2980,49 @@ fn serve_one_get_ledger_request(
         return;
     };
     let lm = lm_rt.ledger_master();
+    let earliest_fetch = lm.earliest_fetch(fetch_depth);
 
-    let Some(ledger) = lm.get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(hash)) else {
+    let ledger = lm
+        .get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(hash))
+        .or_else(|| root.closed_ledger().filter(|ledger| ledger.header().hash.as_uint256() == &hash));
+    let Some(ledger) = ledger else {
+        // `PeerImp::getLedger` relays an indirect miss only when it did not
+        // already carry a cookie.
+        if req.message.query_type.is_some() && req.message.request_cookie.is_none() {
+            let mut relayed = req.message.clone();
+            relayed.request_cookie = Some(req.peer_id as u64);
+            if let Some(peer) = overlay_rt.overlay().active_peers().into_iter().find(|peer| {
+                peer.id() != req.peer_id
+                    && peer.has_ledger(hash, req.message.ledger_seq.unwrap_or_default())
+            }) {
+                peer.send(overlay::Message::new(
+                    overlay::ProtocolMessage::new(overlay::ProtocolPayload::GetLedger(relayed)),
+                    None,
+                ));
+            }
+        }
         return;
     };
+    // Apply the same earliest-fetch retention guard after every selector
+    // resolves: hash, sequence, and ltCLOSED all share this PeerImp rule.
+    if !sequence_is_fetchable_at_floor(ledger.header().seq, earliest_fetch) {
+        return;
+    }
+    if req
+        .message
+        .ledger_seq
+        .is_some_and(|sequence| sequence != ledger.header().seq)
+    {
+        if req.message.request_cookie.is_none()
+            && let Some(peer) = serving_peer.as_ref()
+        {
+            peer.charge(
+                (*resource::FEE_MALFORMED_REQUEST).clone(),
+                "TMGetLedger resolved ledger sequence mismatch".to_owned(),
+            );
+        }
+        return;
+    }
 
     match itype {
         0 => {
@@ -2088,7 +3059,12 @@ fn serve_one_get_ledger_request(
                 ledger.state_map()
             };
             let fat_leaves = true; // rippled: fatLeaves{true} for both liTX_NODE and liAS_NODE
-            let depth = req.message.query_depth.map(|d| d.min(3)).unwrap_or(1); // rippled: kMaxQueryDepth=3
+            let default_depth = if serving_peer.as_ref().is_some_and(|peer| peer.is_high_latency()) {
+                2
+            } else {
+                1
+            };
+            let depth = req.message.query_depth.unwrap_or(default_depth); // rippled: kMaxQueryDepth=3
 
             // rippled kSoftMaxReplyNodes = 8192: stop processing requested
             // node IDs once we've accumulated this many output nodes.
@@ -2151,118 +3127,187 @@ fn serve_one_get_ledger_request(
     }
 }
 
-/// Serve a fetch pack request from a peer (matching rippled doFetchPack/makeFetchPack).
-///
-/// Given a `TMGetObjectByHash` with `query=true, type=otFETCH_PACK`, we:
-/// 1. Look up the ledger with the requested hash (`have`).
-/// 2. Look up its parent ledger (`want`).
-/// 3. Walk the state map diff (nodes in `have` not in `want`) using `visit_differences`.
-/// 4. Serialize each differing node with its hash and send as response.
-/// Cap at 512 objects per response, matching rippled.
+/// FetchPack requests use dedicated PeerImp/JtPack admission, rather than the
+/// generic `JtLedgerReq` node-store route. This mirrors the reference limits:
+/// never queue under local load, when the validated ledger is old, or once the
+/// pack queue already contains more than ten waiting jobs.
+const FETCH_PACK_MAX_QUEUED_JOBS: usize = 10;
+const FETCH_PACK_MAX_VALIDATED_LEDGER_AGE: Duration = Duration::from_secs(40);
+const FETCH_PACK_REQUEST_STALE_AFTER: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchPackAdmission {
+    Busy,
+    Malformed,
+    Accepted(Uint256),
+}
+
+fn classify_fetch_pack_request(
+    loaded_local: bool,
+    validated_ledger_age: Duration,
+    queued_pack_jobs: usize,
+    ledger_hash: Option<&[u8]>,
+) -> FetchPackAdmission {
+    if loaded_local
+        || validated_ledger_age > FETCH_PACK_MAX_VALIDATED_LEDGER_AGE
+        || queued_pack_jobs > FETCH_PACK_MAX_QUEUED_JOBS
+    {
+        return FetchPackAdmission::Busy;
+    }
+    ledger_hash
+        .and_then(Uint256::from_slice)
+        .map_or(FetchPackAdmission::Malformed, FetchPackAdmission::Accepted)
+}
+
+fn fetch_pack_failure_charge(
+    error: ledger::FetchPackBuildError,
+) -> Option<(resource::Charge, &'static str)> {
+    match error {
+        ledger::FetchPackBuildError::Stale => None,
+        ledger::FetchPackBuildError::RequestedLedgerMissing
+        | ledger::FetchPackBuildError::RequestedLedgerPredecessorMissing
+        | ledger::FetchPackBuildError::Traversal => Some((
+            (*resource::FEE_REQUEST_NO_REPLY).clone(),
+            "get_object ledger",
+        )),
+        ledger::FetchPackBuildError::RequestedLedgerOpen => Some((
+            (*resource::FEE_MALFORMED_REQUEST).clone(),
+            "get_object ledger open",
+        )),
+        ledger::FetchPackBuildError::RequestedLedgerTooEarly => Some((
+            (*resource::FEE_MALFORMED_REQUEST).clone(),
+            "get_object ledger early",
+        )),
+    }
+}
+
+/// Execute a previously admitted FetchPack request. The peer is looked up only
+/// after cheap stale/load checks, which is the Rust equivalent of rippled's
+/// weak peer capture: a disconnected peer cannot keep an expensive map walk
+/// alive or receive a stale response.
 fn serve_fetch_pack_request(
     root: &crate::ApplicationRoot,
     overlay_rt: &Arc<crate::runtime::overlay_runtime::AppOverlayRuntime>,
-    req: &overlay::PeerMessage<overlay::TmGetObjectByHash>,
+    peer_id: overlay::PeerId,
+    have_hash: Uint256,
+    issued_at: std::time::Instant,
+    fetch_depth: u32,
 ) {
     use overlay::Overlay;
 
-    let Some(ledger_hash_bytes) = req.message.ledger_hash.as_deref() else {
+    if issued_at.elapsed() > FETCH_PACK_REQUEST_STALE_AFTER
+        || root.load_fee_track_loaded_local()
+        || root.validated_ledger_age() > FETCH_PACK_MAX_VALIDATED_LEDGER_AGE
+    {
         return;
-    };
-    let Some(ledger_hash) = Uint256::from_slice(ledger_hash_bytes) else {
+    }
+    let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(peer_id) else {
         return;
     };
     let Some(lm_rt) = root.ledger_master_runtime() else {
         return;
     };
     let lm = lm_rt.ledger_master();
-
-    // Get the ledger the peer specified ("have" in rippled terms).
-    let Some(have) = lm.get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(ledger_hash))
-    else {
+    let Some(node_fetcher) = root.node_fetcher_from_store() else {
+        peer.charge(
+            (*resource::FEE_REQUEST_NO_REPLY).clone(),
+            "get_object ledger node store unavailable".to_owned(),
+        );
         return;
     };
-
-    // Get its parent ("want" in rippled terms — the ledger the peer needs to catch up to).
-    let parent_hash = *have.header().parent_hash.as_uint256();
-    if parent_hash == Uint256::zero() {
-        return;
-    }
-    let Some(want) = lm.get_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(parent_hash))
-    else {
-        return;
+    let deadline = issued_at + FETCH_PACK_REQUEST_STALE_AFTER;
+    let objects = match lm.make_fetch_pack_with_fetcher(
+        have_hash,
+        lm.earliest_fetch(fetch_depth),
+        deadline,
+        node_fetcher.as_ref(),
+    ) {
+        Ok(objects) => objects,
+        Err(error) => {
+            let Some((fee, context)) = fetch_pack_failure_charge(error) else {
+                return;
+            };
+            peer.charge(fee, context.to_owned());
+            return;
+        }
     };
-
-    // Diff state maps: find nodes in `have` that are missing from `want`.
-    // This matches rippled's populateFetchPack(have->stateMap(), &want->stateMap(), 16384, ...).
-    let have_root = have.state_map().root();
-    let want_root = want.state_map().root();
-
-    let mut objects: Vec<overlay::message::wire::TmIndexedObject> = Vec::new();
-    let have_seq = have.header().seq;
-    let mut no_op_fetch = |_h: basics::sha_map_hash::SHAMapHash| -> Option<
-        basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
-    > { None };
-    let mut no_op_fetch2 = |_h: basics::sha_map_hash::SHAMapHash| -> Option<
-        basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
-    > { None };
-
-    let _ = shamap::difference::visit_differences(
-        &have_root,
-        Some(&want_root),
-        have.state_map().backed(),
-        &mut no_op_fetch,
-        want.state_map().backed(),
-        &mut no_op_fetch2,
-        &mut |node: &basics::memory::intrusive_pointer::SharedIntrusive<
-            shamap::tree_node::SHAMapTreeNode,
-        >| {
-            if objects.len() >= 512 {
-                return false; // stop iteration
-            }
-            let hash = node.get_hash();
-            if let Ok(data) = node.serialize_with_prefix() {
-                objects.push(overlay::message::wire::TmIndexedObject {
-                    hash: Some(hash.as_uint256().data().to_vec()),
-                    node_id: None,
-                    index: None,
-                    data: Some(data),
-                    ledger_seq: Some(have_seq),
-                });
-            }
-            objects.len() < 512
-        },
-    );
-
     if objects.is_empty() {
         return;
     }
 
-    tracing::info!(target: "consensus",
-        objects = objects.len(),
-        seq = have_seq,
-        "Serving fetch pack to peer"
-    );
+    let object_count = objects.len();
+    let response_objects = objects
+        .into_iter()
+        .map(|object| overlay::message::wire::TmIndexedObject {
+            hash: Some(object.hash.data().to_vec()),
+            node_id: None,
+            index: None,
+            data: Some(object.data),
+            ledger_seq: Some(object.ledger_seq),
+        })
+        .collect();
+    tracing::info!(target: "consensus", peer_id, objects = object_count,
+        "Serving ledger-master fetch pack to peer");
 
-    let reply = overlay::TmGetObjectByHash {
-        r#type: overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32,
-        query: false,
-        ledger_hash: Some(ledger_hash_bytes.to_vec()),
-        fat: None,
-        objects,
-    };
-
-    let response = overlay::ProtocolMessage::new(overlay::ProtocolPayload::GetObjects(reply));
-    let message = overlay::Message::new(response, None);
-    if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
-        peer.send(message);
-    }
+    peer.send(overlay::Message::new(
+        overlay::ProtocolMessage::new(overlay::ProtocolPayload::GetObjects(
+            overlay::TmGetObjectByHash {
+                r#type: overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack
+                    as i32,
+                query: false,
+                ledger_hash: Some(have_hash.data().to_vec()),
+                fat: None,
+                objects: response_objects,
+            },
+        )),
+        None,
+    ));
 }
 
 // --- GetObjectByHash rate limiting constants (matching rippled Tuning.h) ---
 
 /// Hard ceiling: reject requests asking for more than this many objects.
 const HARD_MAX_REPLY_NODES: usize = 12_288;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenericGetObjectAdmission {
+    MalformedLedgerHash,
+    Oversized,
+    Accepted,
+}
+
+/// All PeerImp TMGetObjectByHash query types share this overload gate before
+/// their FetchPack, transaction-reduction, or generic serving branch.
+fn get_object_query_send_queue_is_admissible(send_queue_depth: usize) -> bool {
+    send_queue_depth < overlay::DROP_SEND_QUEUE
+}
+
+/// `PeerImp::doTransactions` rejects an oversized batch or a malformed/missing
+/// hash as a complete request failure, rather than returning a partial batch.
+fn transaction_object_request_is_admissible(
+    objects: &[overlay::message::wire::TmIndexedObject],
+) -> bool {
+    objects.len() <= overlay::slot::MAX_TX_QUEUE_SIZE
+        && objects
+            .iter()
+            .all(|object| object.hash.as_deref().and_then(Uint256::from_slice).is_some())
+}
+
+/// Match the cheap PeerImp admission checks before queueing any NodeStore work.
+/// Object hashes are intentionally validated by the worker and count as
+/// misses; only the optional ledger hash is a request-level structural field.
+fn classify_generic_get_object_request(
+    ledger_hash: Option<&[u8]>,
+    requested: usize,
+) -> GenericGetObjectAdmission {
+    if ledger_hash.is_some_and(|hash| Uint256::from_slice(hash).is_none()) {
+        GenericGetObjectAdmission::MalformedLedgerHash
+    } else if requested > HARD_MAX_REPLY_NODES {
+        GenericGetObjectAdmission::Oversized
+    } else {
+        GenericGetObjectAdmission::Accepted
+    }
+}
 
 /// First N objects per request are free (no cost charged).
 const FREE_OBJECTS_PER_REQUEST: u32 = 16;
@@ -2288,6 +3333,78 @@ const COST_BAND_MEDIUM: u32 = 100;
 /// Surcharge for large requests (>1024 objects).
 const COST_BAND_LARGE: u32 = 1000;
 
+fn requested_transaction_envelope(
+    transaction: &crate::Transaction,
+    timestamp: u64,
+) -> overlay::TmTransaction {
+    overlay::TmTransaction {
+        raw_transaction: transaction.get_s_transaction().get_serializer().data().to_vec(),
+        // PeerImp sends tsCURRENT only for included transactions; every
+        // other cached state is tsNEW in a requested transaction batch.
+        status: if transaction.get_status() == crate::TransStatus::INCLUDED {
+            2
+        } else {
+            1
+        },
+        receive_timestamp: Some(timestamp),
+        deferred: Some(transaction.get_submit_result().queued),
+    }
+}
+
+/// Serve a transaction-reduction object query through TMTransactions, matching
+/// PeerImp::doTransactions. Any cache miss invalidates the whole request and
+/// emits no partial reply.
+fn serve_requested_transactions(
+    root: &crate::ApplicationRoot,
+    overlay_rt: &Arc<crate::runtime::overlay_runtime::AppOverlayRuntime>,
+    req: &overlay::PeerMessage<overlay::TmGetObjectByHash>,
+) {
+    use overlay::Overlay;
+
+    let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) else {
+        return;
+    };
+    if !peer.tx_reduce_relay_enabled() || !transaction_object_request_is_admissible(&req.message.objects) {
+        peer.charge(
+            (*resource::FEE_MALFORMED_REQUEST).clone(),
+            "TMGetObjectByHash transactions malformed".to_owned(),
+        );
+        return;
+    }
+
+    let timestamp = u64::from(root.current_network_time_seconds());
+    let mut transactions = Vec::with_capacity(req.message.objects.len());
+    for object in &req.message.objects {
+        let hash = Uint256::from_slice(
+            object
+                .hash
+                .as_deref()
+                .expect("transaction request was prevalidated"),
+        )
+        .expect("transaction request hash was prevalidated");
+        let Some(transaction) = root.fetch_cached_transaction(&hash) else {
+            peer.charge(
+                (*resource::FEE_MALFORMED_REQUEST).clone(),
+                "TMGetObjectByHash transaction not found".to_owned(),
+            );
+            return;
+        };
+        let transaction = transaction
+            .lock()
+            .expect("canonical transaction mutex must not be poisoned");
+        transactions.push(requested_transaction_envelope(&transaction, timestamp));
+    }
+
+    if !transactions.is_empty() {
+        peer.send(overlay::Message::new(
+            overlay::ProtocolMessage::new(overlay::ProtocolPayload::Transactions(
+                overlay::TmTransactions { transactions },
+            )),
+            None,
+        ));
+    }
+}
+
 /// Serve a generic GetObjectByHash query from a peer (matching rippled processGetObjectByHash).
 ///
 /// Looks up each requested hash in the node store, tracks hits/misses, applies
@@ -2303,26 +3420,16 @@ fn serve_get_object_by_hash_request(
     let msg = &req.message;
     let requested = msg.objects.len();
 
-    // Hard limit: reject oversized requests before touching the node store.
-    if requested > HARD_MAX_REPLY_NODES {
-        tracing::warn!(target: "overlay",
-            peer_id = req.peer_id,
-            requested,
-            limit = HARD_MAX_REPLY_NODES,
-            "GetObjectByHash: oversized request rejected"
-        );
-        if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
-            peer.charge(
-                (*resource::FEE_MALFORMED_REQUEST).clone(),
-                "GetObjectByHash oversized request".to_owned(),
-            );
-        }
+    // The router performs request-level admission before queueing. Preserve
+    // this defensive worker gate for direct callers without reclassifying it.
+    if !matches!(
+        classify_generic_get_object_request(msg.ledger_hash.as_deref(), requested),
+        GenericGetObjectAdmission::Accepted
+    ) {
         return;
     }
 
-    let Some(node_store) = root.node_store().as_ref() else {
-        return;
-    };
+    let node_store = root.node_store().clone();
 
     let mut reply_objects: Vec<overlay::message::wire::TmIndexedObject> = Vec::new();
     let mut hits: u32 = 0;
@@ -2340,14 +3447,14 @@ fn serve_get_object_by_hash_request(
         };
 
         let ledger_seq = obj.ledger_seq.unwrap_or(0);
-        let fetched = match node_store {
+        let fetched = node_store.as_ref().and_then(|node_store| match node_store {
             crate::SHAMapStoreNodeStore::Single(database) => {
                 database.fetch_node_object(&hash, ledger_seq, FetchType::Synchronous, false)
             }
             crate::SHAMapStoreNodeStore::Rotating(database) => {
                 database.fetch_node_object(&hash, ledger_seq, FetchType::Synchronous, false)
             }
-        };
+        });
 
         if let Some(node_object) = fetched {
             hits += 1;
@@ -2395,11 +3502,9 @@ fn serve_get_object_by_hash_request(
                 "GetObjectByHash cost exceeded drop threshold".to_owned(),
             );
         }
-        return;
-    }
-
-    // Charge the peer with the computed cost.
-    if cost > 0 {
+    } else if cost > 0 {
+        // Charge the peer with the dynamic lookup cost. The admission-time
+        // moderate burden was already applied after successful job queueing.
         if let Some(peer) = overlay_rt.overlay().find_peer_by_short_id(req.peer_id) {
             peer.charge(
                 resource::Charge::new(cost as i32, "GetObjectByHash differential"),
@@ -2408,10 +3513,9 @@ fn serve_get_object_by_hash_request(
         }
     }
 
-    // Send reply only if we found at least one object.
-    if reply_objects.is_empty() {
-        return;
-    }
+    // PeerImp always sends the query-shaped reply, including an empty object
+    // list for an all-miss request. The empty reply terminates remote retry
+    // state without making the requester infer a transport failure.
 
     tracing::trace!(target: "overlay",
         peer_id = req.peer_id,
@@ -2581,6 +3685,41 @@ fn attach_relational_database_if_configured(
     Ok(true)
 }
 
+fn default_job_queue_threads(config: &BasicConfig, standalone: bool) -> usize {
+    // Matches rippled Application.cpp JobQueue construction: standalone uses
+    // one worker; otherwise medium/default nodes use 2 + min(cores, 4), with
+    // larger nodes receiving the same documented escalation.
+    if standalone {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let configured_node_size = configured_node_size_from_config(config);
+    let node_size = configured_node_size.as_deref();
+    match node_size {
+        Some("huge") if cores >= 16 => 6 + cores.min(8),
+        Some("large") if cores >= 8 => 4 + cores.min(6),
+        _ => 2 + cores.min(4),
+    }
+}
+
+fn node_db_fast_load(config: &BasicConfig) -> bool {
+    let section = config.section("node_db");
+    section
+        .get::<bool>("fast_load")
+        .ok()
+        .flatten()
+        .or_else(|| {
+            section
+                .get::<i32>("fast_load")
+                .ok()
+                .flatten()
+                .map(|value| value != 0)
+        })
+        .unwrap_or(false)
+}
+
 fn configured_node_size_from_config(config: &BasicConfig) -> Option<String> {
     if !config.exists("node_size") {
         return None;
@@ -2639,7 +3778,15 @@ fn initialize_startup_ledger_state(
     config: &BasicConfig,
 ) -> Result<(), String> {
     match options.start_type {
-        StartUpType::Load => load_startup_ledger_from_storage(root, options),
+        StartUpType::Load => match load_startup_ledger_from_storage(root, options) {
+            Ok(()) => Ok(()),
+            Err(error) if node_db_fast_load(config) => {
+                tracing::warn!(target: "bootstrap", %error,
+                    "fast_load durable ledger unavailable; falling back to genesis startup");
+                seed_startup_ledger_state(root, options, config)
+            }
+            Err(error) => Err(error),
+        },
         StartUpType::Replay => replay_startup_ledger_from_storage(root, options),
         StartUpType::LoadFile => load_startup_ledger_from_file(root, options),
         StartUpType::Network => {
@@ -2649,28 +3796,17 @@ fn initialize_startup_ledger_state(
             seed_startup_ledger_state(root, options, config)
         }
         StartUpType::Normal => {
-            if !root.config().standalone {
-                // Start from the newest durable local ledger just as rippled's
-                // getLastFullLedger() does, then let switchLCL catch up to the
-                // network.  Falling back to genesis is only correct when this
-                // is genuinely the first startup or the local store is empty.
-                root.set_need_network_ledger(true);
-            }
-            match load_startup_ledger_from_storage(root, options) {
-                Ok(()) => {
-                    let history_depth = config_legacy_u32(config, "ledger_history").unwrap_or(0);
-                    rehydrate_configured_history(root, history_depth)
-                }
-                Err(error) => {
-                    tracing::info!(target: "bootstrap", %error,
-                        "No usable durable startup ledger; seeding genesis ledger");
-                    seed_startup_ledger_state(root, options, config)
-                }
-            }
+            // Matches rippled Application.cpp normal startup branch: Normal
+            // falls through to startGenesisLedger(). Durable getLastFullLedger
+            // recovery is reserved for explicit Load/LoadFile/Replay modes.
+            // NuDB remains attached and available for later node/history
+            // acquisition; this changes startup selection, not retention.
+            seed_startup_ledger_state(root, options, config)
         }
         StartUpType::Fresh | StartUpType::Snapshot => {
             // Rippled parity: --start (Fresh) does NOT set need_network_ledger.
-            // Only Network and Normal modes require network ledger acquisition.
+            // Only explicit Network mode requires network-ledger acquisition
+            // at startup; Normal begins from genesis like rippled.
             seed_startup_ledger_state(root, options, config)
         }
     }
@@ -2806,18 +3942,17 @@ fn load_complete_ledger_from_storage(
         return Ok(None);
     };
 
-    // Match rippled's `getLastFullLedger` (Application.cpp:1694-1735): do NOT
-    // walk the full state tree on normal startup. rippled only verifies the
-    // header hash matches and that FeeSettings is readable (via the normal
-    // `ledger->read(keylet::feeSettings())` path). The expensive walkLedger
-    // call in rippled's `loadOldLedger` is guarded by UNREACHABLE — it's an
-    // assertion, not a graceful recovery path.
-    //
-    // If `finish_load_by_index_or_hash` fails (which reads FeeSettings via
-    // the family-backed state map), the ledger's critical path nodes are
-    // genuinely missing, and we return None so the caller falls back to
-    // network acquisition — matching rippled's SHAMapMissingNode catch that
-    // returns empty and triggers setNeedNetworkLedger.
+    // Explicit Load/LoadFile in rippled loadOldLedger requires a complete
+    // walkLedger(..., true) before switchLCL/setFullLedger. Unlike normal
+    // getLastFullLedger recovery, this mode must reject a partial local ledger.
+    if !loaded.walk_ledger_with_family(&journal, true, &family) {
+        tracing::warn!(target: "bootstrap", seq = loaded.header().seq,
+            "Explicit startup ledger is missing SHAMap nodes");
+        return Ok(None);
+    }
+
+    // Finish fee/rule setup after the complete walk. Normal startup no longer
+    // reaches this path; it follows rippled startGenesisLedger instead.
     match loaded.finish_load_by_index_or_hash(&journal) {
         Ok(()) => {}
         Err(error) => {
@@ -2991,22 +4126,31 @@ fn hydrate_loaded_ledger(
 ) -> Result<(), String> {
     let persistence = ledger::LedgerPersistence::new(root.build_ledger_persistence_runtime());
     let ledger = root.ledger_with_node_fetcher(ledger);
-    ledger_master.set_closed_ledger(Arc::clone(&ledger));
+
+    // Matches rippled loadOldLedger(): switchLCL(loadLedger), mark the ledger
+    // validated, then setFullLedger(loadLedger, true, false). Avoid direct
+    // wrapped-master closed/pub/valid writes: ApplicationRoot owns the
+    // canonical closed slot and app-visible bridges.
+    root.on_closed_ledger(Arc::clone(&ledger));
     ledger_master
         .set_full_ledger(&persistence, Arc::clone(&ledger), true, false, None, None)
         .map_err(|error| format!("ledger master bootstrap failed: {error:?}"))?;
-    ledger_master.set_pub_ledger(Arc::clone(&ledger));
-    let _ = ledger_master.set_valid_ledger(Arc::clone(&ledger), None, None);
-
-    root.on_closed_ledger(Arc::clone(&ledger));
-    root.on_published_ledger(Arc::clone(&ledger));
     let _ = root.on_validated_ledger(Arc::clone(&ledger));
+    if let Some(published) = ledger_master.published_ledger() {
+        // setFullLedger selects the publication ledger in the wrapped
+        // LedgerMaster. Mirror that authoritative selection into the app-owned
+        // publication tracker rather than independently selecting `ledger`.
+        root.on_published_ledger(published);
+    }
 
     let next_index = ledger.header().seq.saturating_add(1);
     let base_fee = ledger.fees().base.max(10);
     let _ = root.open_ledger().modify(|view| {
-        view.ledger_current_index = next_index;
-        view.base_fee_drops = base_fee;
+        *view = crate::AppOpenLedgerView::with_parent_hash(
+            next_index,
+            base_fee,
+            *ledger.header().hash.as_uint256(),
+        );
         true
     });
 
@@ -3331,76 +4475,95 @@ fn seed_startup_ledger_state(
     // release the tree.
     // =========================================================================
     if root.node_store().is_some() {
-        let writer = root.node_writer_from_store();
+        let writer = root.node_writer_result_from_store();
         let tree_cache = root.shared_tree_cache();
         if writer.is_some() || tree_cache.is_some() {
             let mut genesis_for_persist = closed.as_ref().clone();
-            if let Some(w) = writer {
-                genesis_for_persist.set_node_writer(w);
-            }
+            let writer = writer.ok_or_else(|| {
+                "missing fallible node writer while persisting genesis ledger".to_owned()
+            })?;
+            genesis_for_persist.set_node_writer_result(writer);
             genesis_for_persist.state_map_mut().set_backed();
             genesis_for_persist.tx_map_mut().set_backed();
-            // Persist dirty nodes to NuDB + tree cache.
-            // Matches rippled's `stateMap_.flushDirty(AccountNode)` in
-            // Ledger::Ledger(kCreateGenesis, ...) constructor.
-            genesis_for_persist.persist_dirty_nodes_to_store(tree_cache);
+            // Persist dirty nodes to NuDB + tree cache. Propagate failure:
+            // rippled flushDirty/writeNode does not silently continue after a
+            // backend write failure, and startup must not release an
+            // unpersisted genesis tree.
+            genesis_for_persist
+                .persist_dirty_nodes_to_store_result(tree_cache)
+                .map_err(|error| format!("genesis NuDB persistence failed: {error}"))?;
             tracing::info!(
                 target: "bootstrap",
                 seq = closed.header().seq,
-                has_writer = genesis_for_persist.has_node_writer(),
+                has_fallible_writer = genesis_for_persist.has_node_writer_result(),
                 has_tree_cache = tree_cache.is_some(),
                 "Genesis state nodes persisted to NuDB (before on_closed_ledger)"
             );
         }
     }
 
-    root.on_closed_ledger(Arc::clone(&closed));
-    root.on_published_ledger(Arc::clone(&closed));
-
-    // ledger header to SQLite so that subsequent loads can find it.
-    if let Some(relational) = root.relational_database() {
-        if let Ok(accepted) = ledger::AcceptedLedger::new(Arc::clone(&closed)) {
-            let _ = relational.write_accepted_ledger(
-                &accepted,
-                &root.transaction_master(),
-                root.network_id(),
-            );
+    // Construct the immutable next ledger before releasing the genesis tree.
+    // This is rippled ApplicationImp::startGenesisLedger(): store genesis,
+    // create next from genesis, update its skip list, set immutable, emplace
+    // open ledger from next, store next, then switchLCL(next).
+    let mut next = Ledger::from_previous(closed.as_ref(), root.current_close_time_seconds());
+    if root.node_store().is_some() {
+        let writer = root.node_writer_result_from_store().ok_or_else(|| {
+            "missing fallible node writer while constructing initial next ledger".to_owned()
+        })?;
+        next.set_node_writer_result(writer);
+        if let Some(fetcher) = root.node_fetcher_from_store() {
+            next.set_node_fetcher(fetcher);
         }
+        next.state_map_mut().set_backed();
+        next.tx_map_mut().set_backed();
+    }
+    next.update_skip_list()
+        .map_err(|error| format!("initial next-ledger skip list failed: {error:?}"))?;
+    if root.node_store().is_some() {
+        next.persist_dirty_nodes_to_store_result(root.shared_tree_cache())
+            .map_err(|error| format!("initial next-ledger NuDB persistence failed: {error}"))?;
+    }
+    next.set_immutable(true);
+    let next = Arc::new(next);
+
+    // Rippld stores genesis but does not switch LCL to it. Store by hash, then
+    // switch directly to the immutable next ledger below.
+    if let Some(runtime) = root.ledger_master_runtime() {
+        runtime
+            .ledger_master()
+            .ledger_history()
+            .insert(Arc::clone(&closed), false);
     }
 
-    // Only mark the genesis ledger as validated when explicitly requested
-    // (standalone / --valid mode) or when loading a specific ledger from
-    // local storage.  For a normal network start (Fresh or Network startup
-    // type without --valid), the genesis ledger must NOT be pre-validated:
-    // the node must wait for real network validations before promoting its
-    // validated-ledger pointer.  Marking genesis validated here is what
-    // caused the premature `validated_ledger.seq=1` and the early
-    // `tracking` state promotion that blocked ledger resolution.
-    //
-    // `switchLCL()` — it never calls `setValidLedger()` for network nodes.
-    if options.standalone
-        || options.start_valid
-        || matches!(
-            options.start_type,
-            StartUpType::Load | StartUpType::LoadFile | StartUpType::Replay
-        )
-    {
-        let _ = root.on_validated_ledger(Arc::clone(&closed));
-    }
-
-    let next_index = closed.header().seq.saturating_add(1);
+    let next_open_index = next.header().seq.saturating_add(1);
     let _ = root.open_ledger().modify(|view| {
-        view.ledger_current_index = next_index;
-        if view.base_fee_drops == 0 {
-            view.base_fee_drops = 10;
-        }
+        *view = crate::AppOpenLedgerView::with_parent_hash(
+            next_open_index,
+            next.fees().base.max(10),
+            *next.header().hash.as_uint256(),
+        );
         true
     });
+    // switchLCL(next) occurs after the open ledger is based on next.
+    root.on_closed_ledger(Arc::clone(&next));
+
+    // Only standalone startup promotes the initial next LCL through the same
+    // switchLCL branch used by accepted children, including setFullLedger,
+    // tryAdvance, and the app publication bridge.
+    if options.standalone {
+        root.install_consensus_child(Arc::clone(&next));
+    }
 
     Ok(())
 }
 
 fn amendments_from_config(config: &BasicConfig, start_type: StartUpType) -> Vec<Uint256> {
+    // Rippld startGenesisLedger uses amendmentTable desired amendments only
+    // for Fresh. Normal, Network and Snapshot genesis starts use none.
+    if start_type != StartUpType::Fresh {
+        return Vec::new();
+    }
     let section = config.section("amendments");
     let values = section.values();
     if !values.is_empty() {
@@ -3415,14 +4578,6 @@ fn amendments_from_config(config: &BasicConfig, start_type: StartUpType) -> Vec<
                 Uint256::from_slice(&bytes)
             })
             .collect();
-    }
-
-    // Rippled's network startup creates a local genesis ledger with no
-    // initial amendments. Fresh/private startup uses the desired supported
-    // amendments. Keeping this distinction is required for genesis hash
-    // parity between --net and --start.
-    if start_type == StartUpType::Network {
-        return Vec::new();
     }
 
     REGISTERED_FEATURES
@@ -3693,10 +4848,409 @@ impl DescriptorLimitProvider for SystemDescriptorLimitProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::{MainRuntime, spawn_shutdown_watcher};
-    use crate::ApplicationRoot;
+    use super::{
+        ENDPOINT_HANDOUT_LIMIT, FetchPackAdmission, GenericGetObjectAdmission,
+        MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE, MainRuntime, build_endpoint_handout,
+        build_validator_list_collection_messages, candidate_ledger_data_charge, classify_fetch_pack_request,
+        classify_generic_get_object_request, fetch_pack_failure_charge,
+        get_ledger_send_queue_is_admissible, get_object_query_send_queue_is_admissible,
+        ledger_data_nodes_are_admissible, ledger_data_sequence_is_admissible,
+        manifest_rate_limit_policy, parse_basic_config_text, relay_accepted_manifest,
+        requested_transaction_envelope, sequence_is_fetchable_at_floor, spawn_shutdown_watcher,
+        transaction_object_request_is_admissible, trusted_first_manifest_payloads,
+        validator_list_collection_blobs, validator_list_threshold_from_config,
+    };
+    use crate::{
+        ApplicationRoot, ValidatorListBroadcastBlob, ValidatorListCollectionForBroadcast,
+    };
+    use crate::state::manifest::{ManifestDisposition, ManifestRateLimitCapPolicy};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    #[test]
+    fn validator_list_threshold_matches_config_source_validation() {
+        let configured = parse_basic_config_text(
+            "[validator_list_threshold]\n2\n[validator_list_keys]\na\nb\nc\n",
+        )
+        .expect("config parses");
+        assert_eq!(
+            validator_list_threshold_from_config(&configured, 3),
+            Ok(Some(2))
+        );
+
+        let computed = parse_basic_config_text("[validator_list_threshold]\n0\n")
+            .expect("config parses");
+        assert_eq!(validator_list_threshold_from_config(&computed, 0), Ok(None));
+
+        let multiple = parse_basic_config_text("[validator_list_threshold]\n1\n2\n")
+            .expect("config parses");
+        assert!(validator_list_threshold_from_config(&multiple, 2)
+            .expect_err("multiple threshold values are invalid")
+            .contains("single value"));
+
+        let exceeds = parse_basic_config_text("[validator_list_threshold]\n3\n")
+            .expect("config parses");
+        assert!(validator_list_threshold_from_config(&exceeds, 2)
+            .expect_err("threshold may not exceed publisher keys")
+            .contains("exceeds"));
+    }
+
+    #[test]
+    fn startup_manifest_gossip_is_trusted_first_with_bounded_untrusted_tail() {
+        let entries = std::iter::once((true, vec![1]))
+            .chain(std::iter::once((true, vec![2])))
+            .chain((0..MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE + 1).map(|n| {
+                (false, vec![u8::try_from(n % 255).expect("bounded byte")])
+            }));
+        let selected = trusted_first_manifest_payloads(entries);
+        assert_eq!(selected.len(), MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE + 2);
+        assert_eq!(&selected[..2], &[vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn validator_list_v2_messages_are_recipient_filtered_size_bounded_and_chunk_hashed() {
+        let blob = |sequence, fill| ValidatorListBroadcastBlob {
+            sequence,
+            blob: crate::ValidatorBlobInfo {
+                blob: basics::base64::base64_encode(&vec![fill; 128]),
+                signature: basics::str_hex::str_hex(&vec![fill; 72]),
+                manifest: None,
+            },
+        };
+        let collection = ValidatorListCollectionForBroadcast {
+            publisher_key: protocol::PublicKey::from_bytes([2; 33]),
+            max_sequence: 3,
+            version: 2,
+            manifest: basics::base64::base64_encode(&[0xAB; 16]),
+            blobs: vec![blob(1, 1), blob(2, 2), blob(3, 3)],
+        };
+        let one_blob = ValidatorListCollectionForBroadcast {
+            blobs: vec![collection.blobs[0].clone()],
+            ..collection.clone()
+        };
+        let max_size = build_validator_list_collection_messages(&one_blob, 0, usize::MAX)
+            .pop()
+            .expect("single blob collection")
+            .message
+            .get_buffer_size();
+        let messages = build_validator_list_collection_messages(&collection, 0, max_size);
+        assert_eq!(messages.len(), 3);
+        assert!(messages.iter().all(|message| message.message.get_buffer_size() <= max_size));
+        assert_eq!(messages.iter().map(|message| message.hash).collect::<std::collections::HashSet<_>>().len(), 3);
+
+        let later_peer = build_validator_list_collection_messages(&collection, 1, max_size);
+        assert_eq!(later_peer.len(), 2);
+        let fills = later_peer.iter().map(|message| match &message.message.protocol().payload {
+            overlay::ProtocolPayload::ValidatorListCollection(collection) => collection.blobs[0].blob[0],
+            _ => panic!("expected validator list collection"),
+        }).collect::<Vec<_>>();
+        assert_eq!(fills, vec![2, 3]);
+    }
+
+    #[test]
+    fn validator_list_collection_conversion_enforces_manifest_bounds() {
+        let collection = overlay::TmValidatorListCollection {
+            version: 2,
+            manifest: vec![7; crate::validator::validator_list::MAX_MANIFEST_BYTES],
+            blobs: vec![overlay::message::wire::ValidatorBlobInfo {
+                manifest: Some(vec![8; crate::validator::validator_list::MAX_MANIFEST_BYTES]),
+                blob: vec![9],
+                signature: vec![10],
+            }],
+        };
+        let (manifest, version, blobs) =
+            validator_list_collection_blobs(&collection).expect("bounded collection is accepted");
+        assert_eq!(version, 2);
+        assert_eq!(basics::base64::base64_decode(&manifest), collection.manifest);
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].manifest.as_ref().map(|m| basics::base64::base64_decode(m)),
+            collection.blobs[0].manifest);
+
+        let oversized = overlay::TmValidatorListCollection {
+            manifest: vec![0; crate::validator::validator_list::MAX_MANIFEST_BYTES + 1],
+            ..collection
+        };
+        assert!(validator_list_collection_blobs(&oversized).is_none());
+    }
+
+    #[test]
+    fn ledger_data_sequence_admission_matches_peerimp_rules() {
+        assert!(ledger_data_sequence_is_admissible(
+            3,
+            0,
+            Some(100),
+            Duration::from_secs(1),
+        ));
+        assert!(!ledger_data_sequence_is_admissible(
+            3,
+            1,
+            Some(100),
+            Duration::from_secs(1),
+        ));
+        assert!(ledger_data_sequence_is_admissible(
+            0,
+            110,
+            Some(100),
+            Duration::from_secs(10),
+        ));
+        assert!(!ledger_data_sequence_is_admissible(
+            0,
+            111,
+            Some(100),
+            Duration::from_secs(10),
+        ));
+        assert!(ledger_data_sequence_is_admissible(
+            0,
+            50_000,
+            Some(100),
+            Duration::from_secs(11),
+        ));
+    }
+
+    #[test]
+    fn get_ledger_send_queue_gate_rejects_all_normal_requests_at_drop_limit() {
+        assert!(get_ledger_send_queue_is_admissible(
+            0,
+            overlay::DROP_SEND_QUEUE - 1,
+        ));
+        assert!(!get_ledger_send_queue_is_admissible(
+            0,
+            overlay::DROP_SEND_QUEUE,
+        ));
+        assert!(!get_ledger_send_queue_is_admissible(
+            2,
+            overlay::DROP_SEND_QUEUE + 1,
+        ));
+        // Relayed normal requests use the same overload gate; only their
+        // resource charge is cookie-exempt.
+        assert!(!get_ledger_send_queue_is_admissible(
+            0,
+            overlay::DROP_SEND_QUEUE,
+        ));
+        assert!(get_ledger_send_queue_is_admissible(
+            3,
+            overlay::DROP_SEND_QUEUE + 1,
+        ));
+    }
+
+    #[test]
+    fn manifest_gossip_processes_trusted_after_untrusted_cap_and_relays_only_accepts() {
+        let mut untrusted_processed = 0;
+        for _ in 0..MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE {
+            assert_eq!(
+                manifest_rate_limit_policy(false, &mut untrusted_processed),
+                Some(ManifestRateLimitCapPolicy::Capped)
+            );
+        }
+        assert_eq!(
+            manifest_rate_limit_policy(false, &mut untrusted_processed),
+            None,
+            "the 201st untrusted manifest must not consume work"
+        );
+        assert_eq!(
+            manifest_rate_limit_policy(true, &mut untrusted_processed),
+            Some(ManifestRateLimitCapPolicy::Uncapped),
+            "trusted manifests remain processable beyond the untrusted cap"
+        );
+        assert_eq!(untrusted_processed, MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE);
+        assert!(relay_accepted_manifest(
+            ManifestDisposition::Accepted,
+            true,
+            false,
+        ));
+        assert!(relay_accepted_manifest(
+            ManifestDisposition::Accepted,
+            false,
+            true,
+        ));
+        assert!(
+            !relay_accepted_manifest(ManifestDisposition::Accepted, false, false),
+            "a first-seen untrusted master must not be relayed"
+        );
+        assert!(!relay_accepted_manifest(
+            ManifestDisposition::Stale,
+            true,
+            true,
+        ));
+        assert!(!relay_accepted_manifest(
+            ManifestDisposition::UntrustedCapacity,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn get_object_query_send_queue_gate_applies_to_every_query_type() {
+        assert!(get_object_query_send_queue_is_admissible(
+            overlay::DROP_SEND_QUEUE - 1,
+        ));
+        assert!(!get_object_query_send_queue_is_admissible(
+            overlay::DROP_SEND_QUEUE,
+        ));
+    }
+
+    #[test]
+    fn transaction_object_requests_require_bounded_well_formed_hashes() {
+        let valid = overlay::message::wire::TmIndexedObject {
+            hash: Some(basics::base_uint::Uint256::from_u64(7).data().to_vec()),
+            node_id: None,
+            index: None,
+            data: None,
+            ledger_seq: None,
+        };
+        assert!(transaction_object_request_is_admissible(std::slice::from_ref(&valid)));
+        let malformed = overlay::message::wire::TmIndexedObject {
+            hash: Some(vec![0; 31]),
+            ..valid.clone()
+        };
+        assert!(!transaction_object_request_is_admissible(&[malformed]));
+        let oversized = vec![valid; overlay::slot::MAX_TX_QUEUE_SIZE + 1];
+        assert!(!transaction_object_request_is_admissible(&oversized));
+    }
+
+    #[test]
+    fn requested_transaction_envelope_matches_peerimp_tmtransactions_fields() {
+        let st_tx = Arc::new(protocol::STTx::new(protocol::TxType::PAYMENT, |_| {}));
+        let mut transaction = crate::Transaction::new(Arc::clone(&st_tx));
+        transaction.set_status(crate::TransStatus::INCLUDED);
+        transaction.set_queued();
+
+        let envelope = requested_transaction_envelope(&transaction, 123_456);
+        assert_eq!(envelope.raw_transaction, st_tx.get_serializer().data());
+        assert_eq!(envelope.status, 2, "included transactions use tsCURRENT");
+        assert_eq!(envelope.receive_timestamp, Some(123_456));
+        assert_eq!(envelope.deferred, Some(true));
+
+        transaction.set_status(crate::TransStatus::HELD);
+        assert_eq!(requested_transaction_envelope(&transaction, 1).status, 1);
+    }
+
+    #[test]
+    fn endpoint_handout_is_per_peer_bounded_and_uses_unspecified_self_entry() {
+        let recipient = "192.0.2.1:51235".parse().expect("socket address");
+        let candidates = vec![
+            recipient,
+            "192.0.2.2:51235".parse().expect("socket address"),
+            "192.0.2.2:51236".parse().expect("socket address"),
+            "192.0.2.3:51235".parse().expect("socket address"),
+        ];
+        let handout = build_endpoint_handout(Some(51235), recipient, candidates, |_, _| true);
+        assert_eq!(handout[0].endpoint, "[::]:51235");
+        assert_eq!(handout[0].hops, 0);
+        assert!(handout.iter().skip(1).all(|endpoint| endpoint.hops == 1));
+        assert!(handout.iter().all(|endpoint| endpoint.endpoint != "192.0.2.1:51235"));
+        assert_eq!(handout.len(), 3, "the same endpoint IP is handed out once");
+        assert!(handout.len() <= ENDPOINT_HANDOUT_LIMIT);
+    }
+
+    #[test]
+    fn generic_get_object_admission_matches_peerimp_structural_gates() {
+        assert_eq!(
+            classify_generic_get_object_request(Some(&[7; 31]), 1),
+            GenericGetObjectAdmission::MalformedLedgerHash,
+        );
+        assert_eq!(
+            classify_generic_get_object_request(None, 12_289),
+            GenericGetObjectAdmission::Oversized,
+        );
+        assert_eq!(
+            classify_generic_get_object_request(
+                Some(basics::base_uint::Uint256::from_u64(7).data()),
+                1,
+            ),
+            GenericGetObjectAdmission::Accepted,
+        );
+    }
+
+    #[test]
+    fn candidate_ledger_data_node_count_matches_peerimp_invalid_data_gate() {
+        assert!(!ledger_data_nodes_are_admissible(0));
+        assert!(ledger_data_nodes_are_admissible(1));
+        assert!(ledger_data_nodes_are_admissible(overlay::HARD_MAX_REPLY_NODES));
+        assert!(!ledger_data_nodes_are_admissible(
+            overlay::HARD_MAX_REPLY_NODES + 1,
+        ));
+    }
+
+    #[test]
+    fn candidate_ledger_data_outcomes_use_reference_resource_fees() {
+        let no_acquire = candidate_ledger_data_charge(
+            &ledger::InboundTransactionsDataStatus::NoAcquire,
+        )
+        .expect("unknown candidate set must be charged");
+        assert_eq!(no_acquire.0.cost(), resource::FEE_USELESS_DATA.cost());
+        assert_eq!(no_acquire.1, "ledger_data");
+
+        let missing_id = candidate_ledger_data_charge(
+            &ledger::InboundTransactionsDataStatus::MissingNodeId,
+        )
+        .expect("missing candidate node id must be charged");
+        assert_eq!(missing_id.0.cost(), resource::FEE_MALFORMED_REQUEST.cost());
+
+        let invalid_id = candidate_ledger_data_charge(
+            &ledger::InboundTransactionsDataStatus::InvalidNodeId,
+        )
+        .expect("invalid candidate node id must be charged");
+        assert_eq!(invalid_id.0.cost(), resource::FEE_INVALID_DATA.cost());
+
+        let useful = ledger::InboundTransactionsDataStatus::Applied(
+            shamap::sync::SHAMapAddNode::useful(),
+        );
+        assert!(candidate_ledger_data_charge(&useful).is_none());
+    }
+
+    #[test]
+    fn earliest_fetch_floor_applies_independently_of_selector() {
+        assert!(!sequence_is_fetchable_at_floor(99, 100));
+        assert!(sequence_is_fetchable_at_floor(100, 100));
+        assert!(sequence_is_fetchable_at_floor(101, 100));
+    }
+
+    #[test]
+    fn fetch_pack_admission_matches_peerimp_load_age_queue_and_hash_gates() {
+        let valid = basics::base_uint::Uint256::from_u64(0x42);
+        assert_eq!(
+            classify_fetch_pack_request(false, Duration::from_secs(40), 10, Some(valid.data())),
+            FetchPackAdmission::Accepted(valid),
+        );
+        assert_eq!(
+            classify_fetch_pack_request(true, Duration::default(), 0, Some(valid.data())),
+            FetchPackAdmission::Busy,
+        );
+        assert_eq!(
+            classify_fetch_pack_request(false, Duration::from_secs(41), 0, Some(valid.data())),
+            FetchPackAdmission::Busy,
+        );
+        assert_eq!(
+            classify_fetch_pack_request(false, Duration::default(), 11, Some(valid.data())),
+            FetchPackAdmission::Busy,
+        );
+        assert_eq!(
+            classify_fetch_pack_request(false, Duration::default(), 0, Some(&[7; 31])),
+            FetchPackAdmission::Malformed,
+        );
+        assert_eq!(
+            classify_fetch_pack_request(false, Duration::default(), 0, None),
+            FetchPackAdmission::Malformed,
+        );
+    }
+
+    #[test]
+    fn fetch_pack_missing_initial_predecessor_charges_no_reply() {
+        let (fee, context) = fetch_pack_failure_charge(
+            ledger::FetchPackBuildError::RequestedLedgerPredecessorMissing,
+        )
+        .expect("missing initial predecessor must charge rather than silently return");
+        assert_eq!(fee.cost(), resource::FEE_REQUEST_NO_REPLY.cost());
+        assert_eq!(context, "get_object ledger");
+        assert!(fetch_pack_failure_charge(ledger::FetchPackBuildError::Stale).is_none());
+        let (traversal_fee, traversal_context) =
+            fetch_pack_failure_charge(ledger::FetchPackBuildError::Traversal)
+                .expect("unresolved historical SHAMap traversal must not emit a partial pack");
+        assert_eq!(traversal_fee.cost(), resource::FEE_REQUEST_NO_REPLY.cost());
+        assert_eq!(traversal_context, "get_object ledger");
+    }
 
     #[test]
     fn shutdown_watcher_exits_when_stop_is_already_requested() {
@@ -3707,5 +5261,13 @@ mod tests {
 
         let handle = spawn_shutdown_watcher(runtime, stop_requested);
         handle.join().expect("watcher should exit cleanly");
+    }
+
+    #[test]
+    fn b1_resource_charge_vectors_use_reference_fee_schedule() {
+        assert_eq!(resource::FEE_INVALID_DATA.cost(), 400);
+        assert_eq!(resource::FEE_USELESS_DATA.cost(), 150);
+        assert_eq!(resource::FEE_MALFORMED_REQUEST.cost(), 200);
+        assert_eq!(resource::FEE_MODERATE_BURDEN_PEER.cost(), 250);
     }
 }

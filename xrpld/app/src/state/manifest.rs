@@ -1,6 +1,6 @@
 #![cfg_attr(test, allow(dead_code))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
@@ -15,6 +15,7 @@ use protocol::{
     get_field_by_symbol, sf_generic, verify_st_object,
 };
 use serde_json::Value;
+use xrpld_core::DatabaseCon;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -104,12 +105,21 @@ pub struct ValidatorToken {
     pub validation_secret: SecretKey,
 }
 
+pub const MAX_UNTRUSTED_MANIFESTS: usize = 100;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestRateLimitCapPolicy {
+    Capped,
+    Uncapped,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestDisposition {
     Accepted = 0,
     Stale,
     BadMasterKey,
     BadEphemeralKey,
+    UntrustedCapacity,
     Invalid,
 }
 
@@ -117,6 +127,7 @@ pub enum ManifestDisposition {
 struct ManifestCacheState {
     manifests: HashMap<PublicKey, Manifest>,
     signing_to_master_keys: HashMap<PublicKey, PublicKey>,
+    untrusted_master_keys: HashSet<PublicKey>,
 }
 
 #[derive(Debug)]
@@ -138,6 +149,7 @@ impl Clone for ManifestCache {
             state: RwLock::new(ManifestCacheState {
                 manifests: state.manifests.clone(),
                 signing_to_master_keys: state.signing_to_master_keys.clone(),
+                untrusted_master_keys: state.untrusted_master_keys.clone(),
             }),
             sequence: AtomicU32::new(self.sequence.load(Ordering::Relaxed)),
         }
@@ -214,6 +226,19 @@ impl ManifestCache {
             .collect()
     }
 
+    /// Snapshot all known master keys, including revoked entries. TMManifests
+    /// relay policy must compare against the cache state before the message,
+    /// not the state after another entry in the same message was admitted.
+    pub fn known_master_keys(&self) -> HashSet<PublicKey> {
+        self.state
+            .read()
+            .expect("manifest cache read lock")
+            .manifests
+            .keys()
+            .copied()
+            .collect()
+    }
+
     pub fn revoked(&self, master_key: &PublicKey) -> bool {
         let state = self.state.read().expect("manifest cache read lock");
         state
@@ -222,8 +247,81 @@ impl ManifestCache {
             .is_some_and(Manifest::revoked)
     }
 
+    /// Load persisted manifests from the wallet database. Malformed or stale
+    /// rows are ignored just as rippled's ManifestCache only retains accepted
+    /// entries; SQLite failures remain startup errors.
+    pub fn load_from_wallet(&self, wallet_db: &DatabaseCon, table: &str) -> Result<(), String> {
+        let table = manifest_wallet_table(table)?;
+        let rows = {
+            let connection = wallet_db.get_session();
+            let mut statement = connection
+                .prepare(&format!("SELECT RawData FROM {table}"))
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        for raw in rows {
+            if let Some(manifest) = deserialize_manifest(&raw) {
+                let _ = self.apply_manifest(manifest);
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace one persisted manifest table atomically with the cache entries
+    /// selected by the caller, matching rippled's shutdown-time filtered save.
+    pub fn save_to_wallet(
+        &self,
+        wallet_db: &DatabaseCon,
+        table: &str,
+        include: impl Fn(&PublicKey) -> bool,
+    ) -> Result<(), String> {
+        let table = manifest_wallet_table(table)?;
+        let rows = self
+            .state
+            .read()
+            .expect("manifest cache read lock")
+            .manifests
+            .iter()
+            .filter(|(public_key, _)| include(public_key))
+            .map(|(_, manifest)| manifest.serialized.clone())
+            .collect::<Vec<_>>();
+        let mut connection = wallet_db.get_session();
+        let transaction = connection.transaction().map_err(|error| error.to_string())?;
+        transaction
+            .execute(&format!("DELETE FROM {table}"), [])
+            .map_err(|error| error.to_string())?;
+        for raw in rows {
+            transaction
+                .execute(&format!("INSERT INTO {table} (RawData) VALUES (?1)"), [raw])
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
     pub fn apply_manifest(&self, manifest: Manifest) -> ManifestDisposition {
+        self.apply_manifest_with_policy(manifest, ManifestRateLimitCapPolicy::Uncapped)
+    }
+
+    /// Apply a manifest under rippled's trusted-gossip capacity policy. New
+    /// untrusted keys consume one of 100 slots; configured, wallet-loaded, and
+    /// listed keys are uncapped and release any prior untrusted slot.
+    pub fn apply_manifest_with_policy(
+        &self,
+        manifest: Manifest,
+        policy: ManifestRateLimitCapPolicy,
+    ) -> ManifestDisposition {
         let mut state = self.state.write().expect("manifest cache write lock");
+        let is_new = !state.manifests.contains_key(&manifest.master_key);
+        if is_new
+            && matches!(policy, ManifestRateLimitCapPolicy::Capped)
+            && state.untrusted_master_keys.len() >= MAX_UNTRUSTED_MANIFESTS
+        {
+            return ManifestDisposition::UntrustedCapacity;
+        }
 
         if let Some(existing) = state.manifests.get(&manifest.master_key)
             && manifest.sequence <= existing.sequence
@@ -270,9 +368,34 @@ impl ManifestCache {
                 .insert(signing_key, manifest.master_key);
         }
 
+        if is_new && matches!(policy, ManifestRateLimitCapPolicy::Capped) {
+            state.untrusted_master_keys.insert(manifest.master_key);
+        } else if matches!(policy, ManifestRateLimitCapPolicy::Uncapped) {
+            state.untrusted_master_keys.remove(&manifest.master_key);
+        }
+
         state.manifests.insert(manifest.master_key, manifest);
         self.sequence.fetch_add(1, Ordering::Relaxed);
         ManifestDisposition::Accepted
+    }
+
+    /// Mark a key trusted after validator-list processing. This deliberately
+    /// never re-adds a key when it is later delisted, matching rippled's
+    /// permanent promotion behavior.
+    pub fn promote_to_trusted(&self, master_key: &PublicKey) {
+        self.state
+            .write()
+            .expect("manifest cache write lock")
+            .untrusted_master_keys
+            .remove(master_key);
+    }
+}
+
+fn manifest_wallet_table(table: &str) -> Result<&'static str, String> {
+    match table {
+        "ValidatorManifests" => Ok("ValidatorManifests"),
+        "PublisherManifests" => Ok("PublisherManifests"),
+        _ => Err(format!("unsupported manifest wallet table: {table}")),
     }
 }
 

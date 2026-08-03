@@ -249,6 +249,21 @@ fn drain_bounded<T>(
     }
 }
 
+fn announce_completed_tx_set(root: &ApplicationRoot, hash: Uint256) {
+    use overlay::Overlay;
+
+    let Some(overlay_runtime) = root.overlay_runtime() else {
+        return;
+    };
+    let message = overlay::ProtocolMessage::new(overlay::ProtocolPayload::HaveSet(
+        overlay::TmHaveTransactionSet {
+            status: 1, // protocol::tsHAVE
+            hash: hash.data().to_vec(),
+        },
+    ));
+    overlay_runtime.overlay().broadcast(&message);
+}
+
 /// Dependencies the strand needs (passed at construction).
 pub struct NetworkOpsStrandDeps {
     pub root: ApplicationRoot,
@@ -567,6 +582,7 @@ fn strand_loop(
                 0,
             );
             runner.got_tx_set(now, tx_set);
+            announce_completed_tx_set(&root, hash);
             consensus_rt.update_phase(runner.phase());
             tracing::debug!(target: "consensus", %hash, "strand: got_tx_set processed");
         });
@@ -582,6 +598,7 @@ fn strand_loop(
                     0,
                 );
                 runner.got_tx_set(now, tx_set);
+                announce_completed_tx_set(&root, hash);
                 consensus_rt.update_phase(runner.phase());
                 tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (map_complete)");
             });
@@ -605,6 +622,7 @@ fn strand_loop(
                 0,
             );
             runner.got_tx_set(now, tx_set);
+            announce_completed_tx_set(&root, hash);
             consensus_rt.update_phase(runner.phase());
             tracing::debug!(target: "consensus", %hash, "strand: got_tx_set (durable map completion)");
         }
@@ -1204,6 +1222,10 @@ fn check_accept_and_advance(
     // This is reached only from a captured endConsensus pass with no preferred
     // LCL change. Do not let routine Open/Establish maintenance or a switching
     // pass promote the node, matching NetworkOPsImp::endConsensus.
+    // Quaxar's AppOpenLedgerView does not retain the reference open ledger's
+    // parentCloseTime. Until that exact timestamp is modeled, keep the
+    // need-network-ledger guard here to prevent a freshly seeded local genesis
+    // LCL from appearing network-fresh and falsely entering FULL.
     if allow_mode_promotion
         && !root.need_network_ledger()
         && root
@@ -1305,7 +1327,10 @@ fn check_accept_and_advance(
         // Do not fetch below the configured NodeStore retention floor.
         // This matches nodeStore().earliestLedgerSeq(), falling back to the
         // historical genesis+1 guard only when no node store is attached.
-        let earliest_seq = root.minimum_online_seq().unwrap_or(2);
+        let earliest_seq = root
+            .minimum_online_seq()
+            .unwrap_or(2)
+            .max(lm.earliest_fetch(configured_ledger_history));
         // Find the first missing ledger scanning backward from valid_seq
         let mut missing_seq = None;
         for seq in (earliest_seq..valid_seq).rev() {
@@ -1376,7 +1401,13 @@ fn check_accept_and_advance(
                 }
 
                 if primary_history_pending {
-                    request_history_fetch_pack(root, &lm, missing, history_fetch_pack);
+                    request_history_fetch_pack(
+                        root,
+                        &lm,
+                        missing,
+                        configured_ledger_history,
+                        history_fetch_pack,
+                    );
                 }
 
                 if prefetch_count > 1 {
@@ -1478,6 +1509,7 @@ fn request_history_fetch_pack(
     root: &ApplicationRoot,
     lm: &ledger::LedgerMaster,
     missing: u32,
+    fetch_depth: u32,
     in_flight: &mut Option<(u32, Instant)>,
 ) {
     if let Some((requested_seq, issued_at)) = *in_flight {
@@ -1492,7 +1524,8 @@ fn request_history_fetch_pack(
     // gap as the peer's `have` anchor.
     let earliest = crate::ledger::loaded_ledger_runtime::AppLoadedLedgerRuntime::from_root(root)
         .map(|loaded| loaded.earliest_ledger_seq())
-        .unwrap_or(1);
+        .unwrap_or(1)
+        .max(lm.earliest_fetch(fetch_depth));
     if missing <= earliest {
         return;
     }
@@ -1794,9 +1827,12 @@ mod tests {
             close_time: 700,
             close_resolution: 30,
             correct_close_time: true,
+            close_time_adjustment_seconds: None,
             consensus_hash: Uint256::from_u64(70),
             have_correct_lcl: true,
+            consensus_succeeded: true,
             base_fee_drops: 10,
+            rejected_dispute_retries: Vec::new(),
             txns: Vec::new(),
             validation: None,
         };
@@ -1812,9 +1848,12 @@ mod tests {
             close_time: 800,
             close_resolution: 30,
             correct_close_time: true,
+            close_time_adjustment_seconds: None,
             consensus_hash: Uint256::from_u64(80),
             have_correct_lcl: true,
+            consensus_succeeded: true,
             base_fee_drops: 10,
+            rejected_dispute_retries: Vec::new(),
             txns: Vec::new(),
             validation: None,
         }));
@@ -1851,9 +1890,12 @@ mod tests {
             close_time: 900,
             close_resolution: 30,
             correct_close_time: true,
+            close_time_adjustment_seconds: None,
             consensus_hash: Uint256::from_u64(90),
             have_correct_lcl: true,
+            consensus_succeeded: true,
             base_fee_drops: 10,
+            rejected_dispute_retries: Vec::new(),
             txns: Vec::new(),
             validation: None,
         };

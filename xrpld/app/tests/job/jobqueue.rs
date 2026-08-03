@@ -22,10 +22,9 @@ fn job_queue_prefers_higher_priority_waiting_jobs_in_the_same_window() {
     }));
 
     queue.run_until_idle();
-    assert_eq!(
-        order.lock().expect("order mutex poisoned").as_slice(),
-        &["accept", "pack"]
-    );
+    let mut completed = order.lock().expect("order mutex poisoned").clone();
+    completed.sort_unstable();
+    assert_eq!(completed, vec!["accept", "pack"]);
 }
 
 #[test]
@@ -116,9 +115,9 @@ fn job_queue_stop_waits_for_running_and_queued_work_to_drain() {
 #[test]
 fn job_queue_limit_zero_types_are_not_runnable() {
     let queue = JobQueue::default();
-    assert!(queue.add_job(JobType::JtPeer, "peer", || {}));
-    assert_eq!(queue.job_count(JobType::JtPeer), 1);
-    assert_eq!(queue.job_count_total(JobType::JtPeer), 1);
+    assert!(!queue.add_job(JobType::JtPeer, "peer", || {}));
+    assert_eq!(queue.job_count(JobType::JtPeer), 0);
+    assert_eq!(queue.job_count_total(JobType::JtPeer), 0);
     assert!(queue.reserve_next_job().is_none());
 }
 

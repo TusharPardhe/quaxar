@@ -23,6 +23,12 @@ pub enum SnapshotError {
     /// The snapshot format version is not supported by this binary.
     UnsupportedVersion { found: u16, max_supported: u16 },
 
+    /// A fixed-width header field violated this format's canonical encoding.
+    MalformedHeader { reason: String },
+
+    /// Data followed the authenticated fixed-size footer.
+    TrailingData,
+
     /// A compressed chunk failed LZ4 decompression.
     DecompressionFailed { chunk_index: usize, reason: String },
 
@@ -74,6 +80,12 @@ pub enum SnapshotError {
         reason: String,
     },
 
+    /// The backend failed while traversing objects for export.
+    BackendTraversalFailed { reason: String },
+
+    /// Export was cooperatively cancelled before publishing its final file.
+    ExportCancelled,
+
     /// The backend refused a write.
     BackendWriteFailed { reason: String },
 
@@ -120,6 +132,8 @@ impl fmt::Display for SnapshotError {
                     "snapshot version {found} is not supported (max supported: {max_supported})"
                 )
             }
+            Self::MalformedHeader { reason } => write!(f, "snapshot header is malformed: {reason}"),
+            Self::TrailingData => write!(f, "snapshot contains data after its authenticated footer"),
             Self::DecompressionFailed {
                 chunk_index,
                 reason,
@@ -194,6 +208,10 @@ impl fmt::Display for SnapshotError {
                     "snapshot chunk {chunk_index} contains malformed node record at offset {offset}: {reason}"
                 )
             }
+            Self::BackendTraversalFailed { reason } => {
+                write!(f, "snapshot export: backend traversal failed: {reason}")
+            }
+            Self::ExportCancelled => write!(f, "snapshot export cancelled"),
             Self::BackendWriteFailed { reason } => {
                 write!(f, "snapshot loader: backend write failed: {reason}")
             }

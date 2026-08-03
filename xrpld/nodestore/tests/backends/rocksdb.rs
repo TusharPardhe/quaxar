@@ -1,7 +1,11 @@
-use basics::{base_uint::Uint256, basic_config::Section};
+use basics::{
+    base_uint::Uint256,
+    basic_config::Section,
+    rocksdb::{DBWithThreadMode, MultiThreaded, Options},
+};
 use nodestore::{
     Backend, JournalLevel, NodeObject, NodeObjectType, NodeStoreJournal, NullJournal,
-    RocksDbBackend, RocksDbConfigSnapshot,
+    RocksDbBackend, RocksDbConfigSnapshot, Status,
 };
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
@@ -42,6 +46,13 @@ fn sample_object(fill: u8, payload: &[u8]) -> Arc<NodeObject> {
         payload.to_vec(),
         Uint256::from_array([fill; 32]),
     )
+}
+
+fn insert_raw_rocksdb_entry(path: &std::path::Path, key: &[u8], value: &[u8]) {
+    let mut options = Options::default();
+    options.create_if_missing(true);
+    let db = DBWithThreadMode::<MultiThreaded>::open(&options, path).expect("open raw RocksDB");
+    db.put(key, value).expect("write raw RocksDB entry");
 }
 
 #[test]
@@ -285,6 +296,70 @@ fn rocksdb_fetch_batch_order_for_present_and_missing_keys() {
     );
 
     reopened.close().expect("close");
+}
+
+#[test]
+fn rocksdb_for_each_result_rejects_malformed_keys() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("malformed-key");
+    insert_raw_rocksdb_entry(&path, b"bad", &[0]);
+
+    let backend = RocksDbBackend::new(
+        NodeObject::KEY_BYTES,
+        &base_section(&path.to_string_lossy()),
+        Arc::new(nodestore::DummyScheduler),
+        Arc::new(NullJournal),
+    )
+    .expect("rocksdb backend");
+    backend.open(false).expect("open");
+
+    let error = backend
+        .for_each_result(&mut |_| {})
+        .expect_err("fallible traversal must reject malformed keys");
+    assert_eq!(error, "RocksDB traversal: bad key size = 3, expected 32");
+
+    backend.close().expect("close");
+}
+
+#[test]
+fn rocksdb_for_each_result_returns_decode_status_errors_and_legacy_for_each_skips_them() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("corrupt-value");
+    let hash = Uint256::from_array([0xD1; 32]);
+    insert_raw_rocksdb_entry(&path, hash.data(), &[0xFF]);
+
+    let journal = Arc::new(RecordingJournal::default());
+    let backend = RocksDbBackend::new(
+        NodeObject::KEY_BYTES,
+        &base_section(&path.to_string_lossy()),
+        Arc::new(nodestore::DummyScheduler),
+        journal.clone(),
+    )
+    .expect("rocksdb backend");
+    backend.open(false).expect("open");
+
+    let error = backend
+        .for_each_result(&mut |_| {})
+        .expect_err("fallible traversal must reject corrupt values");
+    assert_eq!(
+        error,
+        format!(
+            "RocksDB traversal: failed to decode NodeObject #{hash}: {:?}",
+            Status::DataCorrupt
+        )
+    );
+
+    let mut visited = Vec::new();
+    backend.for_each(&mut |node| visited.push(*node.hash()));
+    assert!(
+        visited.is_empty(),
+        "legacy traversal must skip corrupt entries"
+    );
+    assert!(journal.entries().iter().any(|(level, message)| {
+        *level == JournalLevel::Fatal && message == &format!("Corrupt NodeObject #{hash}")
+    }));
+
+    backend.close().expect("close");
 }
 
 #[test]

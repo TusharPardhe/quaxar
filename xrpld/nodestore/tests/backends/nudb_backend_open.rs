@@ -230,7 +230,7 @@ fn nudb_backend_deterministic_create_writes_cpp_shaped_key_header_and_opens() {
     assert_eq!(on_disk.uid, 41);
     assert_eq!(on_disk.salt, 99);
     assert_eq!(on_disk.appnum, NUDB_APPNUM);
-    assert_eq!(on_disk.buckets, 1);
+    assert_eq!(on_disk.buckets, 0);
     assert_eq!(backend.key_file_header(), Some(on_disk));
 
     let open_state: NuDbOpenState = backend.open_state();

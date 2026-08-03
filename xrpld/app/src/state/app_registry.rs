@@ -516,30 +516,61 @@ impl crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource for SharedApp
         parent_hash: &basics::base_uint::Uint256,
         completed_transaction_ids: &std::collections::HashSet<basics::base_uint::Uint256>,
         retry_transactions: &[std::sync::Arc<protocol::STTx>],
+        retries_first: bool,
     ) {
         // Snapshot, filter, and replace under one OpenLedger modification
         // lock. A separate current_open_transactions() call followed by a
         // later modify() would lose a local submission that arrived between
         // those two critical sections.
         self.modify(|view| {
-            let mut leftover: Vec<std::sync::Arc<protocol::STTx>> = view
+            let leftover: Vec<std::sync::Arc<protocol::STTx>> = view
                 .ordered_txs()
                 .into_iter()
                 .map(|record| record.tx.clone())
                 .filter(|tx| !completed_transaction_ids.contains(&tx.get_transaction_id()))
                 .collect();
-            for tx in retry_transactions {
-                if !completed_transaction_ids.contains(&tx.get_transaction_id())
-                    && !leftover
-                        .iter()
-                        .any(|existing| existing.get_transaction_id() == tx.get_transaction_id())
+            let mut next_transactions = Vec::new();
+            // Matches rippled OpenLedger::accept(retriesFirst=true): rejected
+            // disputes/retries are applied before current-open/local work.
+            if retries_first {
+                for tx in retry_transactions {
+                    if !completed_transaction_ids.contains(&tx.get_transaction_id())
+                        && !next_transactions.iter().any(
+                            |existing: &std::sync::Arc<protocol::STTx>| {
+                                existing.get_transaction_id() == tx.get_transaction_id()
+                            },
+                        )
+                    {
+                        next_transactions.push(std::sync::Arc::clone(tx));
+                    }
+                }
+            }
+            for tx in leftover {
+                if !next_transactions
+                    .iter()
+                    .any(|existing: &std::sync::Arc<protocol::STTx>| {
+                        existing.get_transaction_id() == tx.get_transaction_id()
+                    })
                 {
-                    leftover.push(std::sync::Arc::clone(tx));
+                    next_transactions.push(tx);
+                }
+            }
+            if !retries_first {
+                for tx in retry_transactions {
+                    if !completed_transaction_ids.contains(&tx.get_transaction_id())
+                        && !next_transactions.iter().any(
+                            |existing: &std::sync::Arc<protocol::STTx>| {
+                                existing.get_transaction_id() == tx.get_transaction_id()
+                            },
+                        )
+                    {
+                        next_transactions.push(std::sync::Arc::clone(tx));
+                    }
                 }
             }
 
             *view = AppOpenLedgerView::with_parent_hash(next_seq, base_fee, *parent_hash);
-            for tx in leftover {
+            for tx in next_transactions {
                 view.push_transaction(tx);
             }
             true
@@ -584,6 +615,7 @@ mod open_ledger_tests {
                 Arc::clone(&peer_retry),
                 Arc::clone(&peer_retry),
             ],
+            true,
         );
 
         let retained = open_ledger.current_open_transactions();
@@ -600,6 +632,17 @@ mod open_ledger_tests {
             ])
         );
         assert_eq!(open_ledger.current().ledger_current_index, 11);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|transaction| transaction.get_transaction_id())
+                .collect::<Vec<_>>(),
+            vec![
+                local_retry.get_transaction_id(),
+                peer_retry.get_transaction_id()
+            ],
+            "retry/dispute transactions must precede leftover local work"
+        );
     }
 }
 
@@ -1048,7 +1091,8 @@ pub struct ApplicationRegistryOwners {
     pub network_id_service: FixedNetworkIdService,
     pub hash_router: Arc<HashRouter>,
     pub validator_sites: Arc<ValidatorSite>,
-    pub manifest_cache: Arc<ManifestCache>,
+    pub validator_manifest_cache: Arc<ManifestCache>,
+    pub publisher_manifest_cache: Arc<ManifestCache>,
     pub cluster: Arc<Cluster>,
     pub resource_manager: Arc<ResourceManager>,
     pub inbound_ledgers: AppInboundLedgers,
@@ -1179,7 +1223,8 @@ impl ApplicationRegistryOwners {
             network_id_service: FixedNetworkIdService::new(0),
             hash_router: Arc::new(HashRouter::new(HashRouterSetup::default())),
             validator_sites: Arc::new(ValidatorSite::new(Duration::from_secs(30))),
-            manifest_cache: Arc::new(ManifestCache::new()),
+            validator_manifest_cache: Arc::new(ManifestCache::new()),
+            publisher_manifest_cache: Arc::new(ManifestCache::new()),
             cluster: Arc::new(Cluster::new()),
             resource_manager,
             inbound_ledgers,
@@ -1312,7 +1357,8 @@ mod tests {
             owners.hash_router.get_flags(Uint256::default()),
             HashRouterFlags::UNDEFINED
         );
-        assert_eq!(owners.manifest_cache.sequence(), 0);
+        assert_eq!(owners.validator_manifest_cache.sequence(), 0);
+        assert_eq!(owners.publisher_manifest_cache.sequence(), 0);
         assert!(matches!(
             owners.validator_sites.get_json(),
             JsonValue::Object(json) if json.contains_key("validator_sites")

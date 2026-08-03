@@ -108,7 +108,9 @@ impl Backend for FailingBatchBackend {
         (vec![None; hashes.len()], Status::Ok)
     }
 
-    fn store(&self, _object: Arc<NodeObject>) {}
+    fn store(&self, _object: Arc<NodeObject>) -> Result<(), String> {
+        Ok(())
+    }
 
     fn store_batch(&self, batch: &nodestore::Batch) {
         let call = self.calls.fetch_add(1, Ordering::Relaxed);
@@ -123,6 +125,10 @@ impl Backend for FailingBatchBackend {
 
     fn sync(&self) {}
 
+    fn sync_result(&self) -> Result<(), String> {
+        Err("injected sync failure".to_owned())
+    }
+
     fn for_each(&self, _callback: &mut dyn FnMut(Arc<NodeObject>)) {}
 
     fn get_write_load(&self) -> i32 {
@@ -134,6 +140,16 @@ impl Backend for FailingBatchBackend {
     fn fd_required(&self) -> i32 {
         0
     }
+}
+
+#[test]
+fn checked_sync_exposes_backend_durability_failure() {
+    let backend = FailingBatchBackend::default();
+    assert_eq!(
+        backend.sync_result(),
+        Err("injected sync failure".to_owned()),
+        "lifecycle owners must be able to reject a failed final durability barrier"
+    );
 }
 
 #[test]

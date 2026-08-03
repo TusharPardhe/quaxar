@@ -45,6 +45,13 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
 
     fn sync(&self);
 
+    /// Checked durability barrier. The default preserves legacy databases;
+    /// concrete fallible backends override through their database adapter.
+    fn sync_result(&self) -> Result<(), String> {
+        self.sync();
+        Ok(())
+    }
+
     fn fetch_node_object(
         &self,
         hash: &Uint256,
@@ -375,9 +382,9 @@ impl DatabaseRuntime {
         let mut batch = Vec::with_capacity(batch_write_preallocation_size);
         let store_batch = |batch: &mut Vec<Arc<NodeObject>>| {
             let begin = Instant::now();
-            let result = catch_unwind(AssertUnwindSafe(|| dst_backend.store_batch(batch)));
+            let result = catch_unwind(AssertUnwindSafe(|| dst_backend.store_batch_result(batch)));
             match result {
-                Ok(()) => {
+                Ok(Ok(())) => {
                     let size = batch
                         .iter()
                         .map(|node_object| node_object.data().len() as u64)
@@ -392,6 +399,14 @@ impl DatabaseRuntime {
                         .store_duration_us
                         .fetch_add(begin.elapsed().as_micros() as u64, Ordering::Relaxed);
                     batch.clear();
+                }
+                Ok(Err(error)) => {
+                    // Preserve the batch so callers that retry the import do
+                    // not silently skip objects rejected by the destination.
+                    self.inner.journal.log(
+                        JournalLevel::Error,
+                        &format!("import_internal batch write failed: {error}"),
+                    );
                 }
                 Err(payload) => {
                     // Mirror reference importInternal: keep the batch intact when the

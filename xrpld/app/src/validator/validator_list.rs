@@ -1,6 +1,7 @@
 //! Trusted validator list ownership and quorum logic.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
@@ -13,9 +14,15 @@ use protocol::{
 use time::OffsetDateTime;
 
 use crate::consensus::rcl_validations::RclValidationTrustSource;
-use crate::state::manifest::{ManifestCache, ManifestDisposition, deserialize_manifest_base64};
+use crate::state::manifest::{
+    Manifest, ManifestCache, ManifestDisposition, deserialize_manifest,
+};
 
 pub const MAX_SUPPORTED_BLOBS: usize = 5;
+/// `xrpl::kMaxManifestBytes`: reject oversized encoded manifests before
+/// deserializing them. The base64 limit is `4 * ceil(358 / 3)`.
+pub const MAX_MANIFEST_BYTES: usize = 358;
+pub const MAX_MANIFEST_BASE64_BYTES: usize = 4 * MAX_MANIFEST_BYTES.div_ceil(3);
 const CACHE_FILE_PREFIX: &str = "cache.";
 const RIPPLE_EPOCH_OFFSET: i64 = 946_684_800;
 
@@ -51,6 +58,25 @@ pub struct ValidatorBlobInfo {
     pub blob: String,
     pub signature: String,
     pub manifest: Option<String>,
+}
+
+/// One sequence-bearing validator-list blob prepared for v2 peer propagation.
+/// The wire protocol omits sequence because it is embedded in the signed list
+/// body; retaining it here lets the bootstrap match PeerImp's per-peer
+/// sequence filtering before constructing `TMValidatorListCollection`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatorListBroadcastBlob {
+    pub sequence: usize,
+    pub blob: ValidatorBlobInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatorListCollectionForBroadcast {
+    pub publisher_key: PublicKey,
+    pub max_sequence: usize,
+    pub version: u32,
+    pub manifest: String,
+    pub blobs: Vec<ValidatorListBroadcastBlob>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -156,8 +182,8 @@ impl ValidatorListClock for SystemValidatorListClock {
 
 #[derive(Clone, Debug)]
 pub struct ValidatorList<C = SystemValidatorListClock> {
-    validator_manifests: ManifestCache,
-    publisher_manifests: ManifestCache,
+    validator_manifests: std::sync::Arc<ManifestCache>,
+    publisher_manifests: std::sync::Arc<ManifestCache>,
     clock: C,
     state: std::sync::Arc<RwLock<ValidatorListState>>,
 }
@@ -166,6 +192,22 @@ impl<C: ValidatorListClock> ValidatorList<C> {
     pub fn new(
         validator_manifests: ManifestCache,
         publisher_manifests: ManifestCache,
+        clock: C,
+        data_path: impl Into<PathBuf>,
+        minimum_quorum: Option<usize>,
+    ) -> Self {
+        Self::new_with_shared_caches(
+            std::sync::Arc::new(validator_manifests),
+            std::sync::Arc::new(publisher_manifests),
+            clock,
+            data_path,
+            minimum_quorum,
+        )
+    }
+
+    pub fn new_with_shared_caches(
+        validator_manifests: std::sync::Arc<ManifestCache>,
+        publisher_manifests: std::sync::Arc<ManifestCache>,
         clock: C,
         data_path: impl Into<PathBuf>,
         minimum_quorum: Option<usize>,
@@ -219,7 +261,12 @@ impl<C: ValidatorListClock> ValidatorList<C> {
         }
 
         state.list_threshold = match list_threshold {
-            Some(list_threshold) => list_threshold,
+            Some(list_threshold)
+                if list_threshold > 0 && list_threshold <= state.publisher_lists.len() =>
+            {
+                list_threshold
+            }
+            Some(_) => return false,
             None if state.publisher_lists.len() < 3 => 1,
             None => (state.publisher_lists.len() / 2) + 1,
         };
@@ -344,7 +391,20 @@ impl<C: ValidatorListClock> ValidatorList<C> {
             if let Some(publisher_key) = result.publisher_key {
                 touched_publishers.insert(publisher_key);
             }
-            aggregate.merge(&result);
+            // Mirror ValidatorList::applyLists: the publisher metadata for a
+            // multi-blob v2 collection belongs to the best disposition, then
+            // the highest sequence on a tie. Every other disposition remains
+            // accounted for in the aggregate result.
+            if result.best_disposition() < aggregate.best_disposition()
+                || (result.best_disposition() == aggregate.best_disposition()
+                    && result.sequence > aggregate.sequence)
+            {
+                let mut selected = result;
+                selected.merge(&aggregate);
+                aggregate = selected;
+            } else {
+                aggregate.merge(&result);
+            }
         }
         for publisher_key in touched_publishers {
             clean_publisher_collection(
@@ -353,6 +413,20 @@ impl<C: ValidatorListClock> ValidatorList<C> {
                     .get_mut(&publisher_key)
                     .expect("publisher"),
             );
+            cache_publisher_file(&state, publisher_key);
+        }
+
+        // ValidatorList::applyListsAndBroadcast clears the network UNL block
+        // when an accepted update leaves every configured publisher available.
+        // Keep that state with ValidatorList; bootstrap synchronizes it to
+        // NetworkOPs after each site or peer application.
+        if aggregate.best_disposition() == ListDisposition::Accepted
+            && state
+                .publisher_lists
+                .values()
+                .all(|collection| collection.status == PublisherStatus::Available)
+        {
+            state.unl_blocked = false;
         }
         aggregate
     }
@@ -362,7 +436,12 @@ impl<C: ValidatorListClock> ValidatorList<C> {
         seen_validators: &HashSet<AccountID>,
         close_time: u32,
     ) -> TrustChanges {
+        // Match ValidatorList::updateTrusted: a close time more than 30
+        // seconds behind local network time is stale and must not postpone
+        // pending-list rotation or expiry during an LCL recovery.
+        let close_time = clamp_stale_lcl_close_time(close_time, self.clock.now_ripple());
         let mut state = self.state.write().expect("validator list write lock");
+        let mut all_publishers_available = true;
         let publisher_keys = state.publisher_lists.keys().copied().collect::<Vec<_>>();
         for publisher_key in publisher_keys {
             let mut collection = state
@@ -383,8 +462,15 @@ impl<C: ValidatorListClock> ValidatorList<C> {
                     &mut state.key_listings,
                     PublisherStatus::Expired,
                 );
+                state.unl_blocked = true;
+            }
+            if collection.status != PublisherStatus::Available {
+                all_publishers_available = false;
             }
             state.publisher_lists.insert(publisher_key, collection);
+        }
+        if all_publishers_available {
+            state.unl_blocked = false;
         }
 
         let mut changes = TrustChanges::default();
@@ -457,7 +543,73 @@ impl<C: ValidatorListClock> ValidatorList<C> {
             effective_unl_size,
             seen_size,
         );
+        // Match the final updateTrusted lock-down: if validator-list/static
+        // configuration exists but it yields no trusted validators, block.
+        if (!state.publisher_lists.is_empty() || !state.local_publisher_list.list.is_empty())
+            && state.trusted_master_keys.is_empty()
+        {
+            state.unl_blocked = true;
+        }
         changes
+    }
+
+    /// Current ValidatorList-owned UNL block state. The app bootstrap owns
+    /// applying this state to NetworkOPs after list application and trust
+    /// recomputation, just as reference ValidatorList receives NetworkOPs.
+    pub fn unl_blocked(&self) -> bool {
+        self.state
+            .read()
+            .expect("validator list read lock")
+            .unl_blocked
+    }
+
+    /// Snapshot the accepted current/pending lists needed to serve a v2
+    /// collection. Sequences are retained separately so each recipient gets
+    /// only entries newer than its advertised publisher sequence.
+    pub fn collection_for_broadcast(
+        &self,
+        publisher_key: PublicKey,
+    ) -> Option<ValidatorListCollectionForBroadcast> {
+        let state = self.state.read().expect("validator list read lock");
+        let collection = state.publisher_lists.get(&publisher_key)?;
+        let max_sequence = collection.max_sequence?;
+        if collection.status > PublisherStatus::Expired || collection.raw_version == 0 {
+            return None;
+        }
+
+        let mut blobs = Vec::with_capacity(1 + collection.remaining.len());
+        blobs.push(ValidatorListBroadcastBlob {
+            sequence: collection.current.sequence,
+            blob: ValidatorBlobInfo {
+                blob: collection.current.raw_blob.clone(),
+                signature: collection.current.raw_signature.clone(),
+                manifest: collection.current.raw_manifest.clone(),
+            },
+        });
+        blobs.extend(collection.remaining.iter().map(|(sequence, list)| {
+            ValidatorListBroadcastBlob {
+                sequence: *sequence,
+                blob: ValidatorBlobInfo {
+                    blob: list.raw_blob.clone(),
+                    signature: list.raw_signature.clone(),
+                    manifest: list.raw_manifest.clone(),
+                },
+            }
+        }));
+        Some(ValidatorListCollectionForBroadcast {
+            publisher_key,
+            max_sequence,
+            version: collection.raw_version.max(2),
+            manifest: collection.raw_manifest.clone(),
+            blobs,
+        })
+    }
+
+    pub fn apply_validator_manifest(
+        &self,
+        manifest: crate::state::manifest::Manifest,
+    ) -> crate::state::manifest::ManifestDisposition {
+        self.validator_manifests.apply_manifest(manifest)
     }
 
     pub fn quorum(&self) -> usize {
@@ -580,10 +732,17 @@ impl<C: ValidatorListClock> ValidatorList<C> {
             }
             let filename = state
                 .data_path
-                .join(format!("{CACHE_FILE_PREFIX}{}", public_key));
-            if filename.is_file() {
-                sites.push(format!("file://{}", filename.display()));
+                .join(format!("{CACHE_FILE_PREFIX}{}", public_key.to_hex()));
+            let Ok(metadata) = fs::metadata(&filename) else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.len() == 0 {
+                continue;
             }
+            let Ok(filename) = fs::canonicalize(filename) else {
+                continue;
+            };
+            sites.push(format!("file://{}", filename.display()));
         }
         sites
     }
@@ -734,7 +893,7 @@ impl<C: ValidatorListClock> ValidatorList<C> {
         hash: Option<basics::base_uint::Uint256>,
     ) -> PublisherListStats {
         let manifest = local_manifest.unwrap_or(global_manifest);
-        let Some(manifest) = deserialize_manifest_base64(manifest) else {
+        let Some(manifest) = deserialize_manifest_base64_bounded(manifest) else {
             return PublisherListStats::new(ListDisposition::Invalid);
         };
         let (result, publisher_key, list_json) =
@@ -1043,6 +1202,7 @@ struct ValidatorListState {
     local_pub_key: Option<PublicKey>,
     local_publisher_list: PublisherList,
     negative_unl: HashSet<PublicKey>,
+    unl_blocked: bool,
     data_path: PathBuf,
 }
 
@@ -1063,6 +1223,10 @@ fn update_publisher_list(
             }
             (Some(new_key), Some(old_key)) if new_key < old_key => {
                 *key_listings.entry(**new_key).or_default() += 1;
+                // Listed validator keys are trusted manifest identities. A
+                // previously gossip-admitted key must release its capped slot
+                // immediately, exactly as ValidatorList::updatePublisherList.
+                validator_manifests.promote_to_trusted(new_key);
                 new_iter.next();
             }
             (Some(_), Some(old_key)) => {
@@ -1071,6 +1235,7 @@ fn update_publisher_list(
             }
             (Some(new_key), None) => {
                 *key_listings.entry(**new_key).or_default() += 1;
+                validator_manifests.promote_to_trusted(new_key);
                 new_iter.next();
             }
             (None, Some(old_key)) => {
@@ -1082,7 +1247,7 @@ fn update_publisher_list(
     }
 
     for manifest in &current.manifests {
-        let Some(manifest) = deserialize_manifest_base64(manifest) else {
+        let Some(manifest) = deserialize_manifest_base64_bounded(manifest) else {
             continue;
         };
         if !key_listings.contains_key(&manifest.master_key) {
@@ -1090,6 +1255,54 @@ fn update_publisher_list(
         }
         let _ = validator_manifests.apply_manifest(manifest);
     }
+}
+
+/// Persist one accepted publisher collection as the locally served/cache
+/// representation. Cache writes intentionally do not affect list acceptance:
+/// rippled logs filesystem failures and retains the live verified list.
+fn cache_publisher_file(state: &ValidatorListState, publisher_key: PublicKey) {
+    if state.data_path.as_os_str().is_empty() {
+        return;
+    }
+    let Some(collection) = state.publisher_lists.get(&publisher_key) else {
+        return;
+    };
+    if collection.max_sequence.is_none() || !matches!(collection.raw_version, 1 | 2) {
+        return;
+    }
+
+    let filename = state
+        .data_path
+        .join(format!("{CACHE_FILE_PREFIX}{}", publisher_key.to_hex()));
+    let mut value = build_file_data(publisher_key.to_hex(), collection, None);
+    value["refresh_interval"] = serde_json::Value::from(24 * 60);
+
+    let result = filename
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| serde_json::to_string_pretty(&value).map_err(std::io::Error::other))
+        .and_then(|contents| fs::write(&filename, contents));
+    if let Err(error) = result {
+        tracing::error!(target: "validator_list", path = %filename.display(), %error,
+            "failed to cache validator list");
+    }
+}
+
+pub fn deserialize_manifest_base64_bounded(encoded: &str) -> Option<Manifest> {
+    // Reject before base64 decoding to retain the reference parser's bounded
+    // allocation behavior for peer and validator-list supplied manifests.
+    if encoded.is_empty() || encoded.len() > MAX_MANIFEST_BASE64_BYTES {
+        return None;
+    }
+    let serialized = basics::base64::base64_decode(encoded);
+    if serialized.is_empty() || serialized.len() > MAX_MANIFEST_BYTES {
+        return None;
+    }
+    deserialize_manifest(&serialized)
+}
+
+fn clamp_stale_lcl_close_time(close_time: u32, now: u32) -> u32 {
+    (now > close_time.saturating_add(30)).then_some(now).unwrap_or(close_time)
 }
 
 fn decrement_listing(key_listings: &mut HashMap<PublicKey, usize>, public_key: PublicKey) {
@@ -1316,7 +1529,8 @@ mod tests {
     use super::{
         ListDisposition, PublisherStatus, SystemValidatorListClock, ValidatorBlobInfo,
         ValidatorList, ValidatorListClock, ValidatorListExpiration, ValidatorListStatus,
-        validator_list_collection_hash,
+        MAX_MANIFEST_BASE64_BYTES, MAX_MANIFEST_BYTES, clamp_stale_lcl_close_time,
+        deserialize_manifest_base64_bounded, validator_list_collection_hash,
     };
     use protocol::JsonValue;
 
@@ -1386,6 +1600,23 @@ mod tests {
     }
 
     #[test]
+    fn stale_lcl_close_time_is_clamped_to_local_time_after_thirty_seconds() {
+        assert_eq!(clamp_stale_lcl_close_time(100, 130), 100);
+        assert_eq!(clamp_stale_lcl_close_time(100, 131), 131);
+        assert_eq!(clamp_stale_lcl_close_time(u32::MAX - 10, u32::MAX), u32::MAX - 10);
+    }
+
+    #[test]
+    fn bounded_manifest_decoder_rejects_oversized_encoded_payloads() {
+        let oversized = basics::base64::base64_encode(&vec![0; MAX_MANIFEST_BYTES + 1]);
+        assert!(oversized.len() <= MAX_MANIFEST_BASE64_BYTES);
+        assert!(deserialize_manifest_base64_bounded(&oversized).is_none());
+
+        let excessive_encoded = "A".repeat(MAX_MANIFEST_BASE64_BYTES + 1);
+        assert!(deserialize_manifest_base64_bounded(&excessive_encoded).is_none());
+    }
+
+    #[test]
     fn parse_blobs_matches_v1_and_v2_shape() {
         let v1 = serde_json::json!({
             "blob": "Zm9v",
@@ -1448,6 +1679,24 @@ mod tests {
             summary.get("validator_list_threshold"),
             Some(&JsonValue::Unsigned(0))
         );
+    }
+
+    #[test]
+    fn configured_publishers_with_no_trusted_validators_block_the_unl() {
+        let publisher_secret = SecretKey::from_bytes([31u8; 32]);
+        let publisher_key =
+            derive_public_key(KeyType::Ed25519, &publisher_secret).expect("publisher key");
+        let clock = SystemValidatorListClock;
+        let list = ValidatorList::new(
+            ManifestCache::new(),
+            ManifestCache::new(),
+            clock,
+            Path::new("/tmp"),
+            None,
+        );
+        assert!(list.load(None, &[], &[publisher_key.to_hex()], None));
+        list.update_trusted(&HashSet::new(), clock.now_ripple());
+        assert!(list.unl_blocked());
     }
 
     #[test]

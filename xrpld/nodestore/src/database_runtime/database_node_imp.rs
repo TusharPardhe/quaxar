@@ -147,6 +147,10 @@ impl DatabaseNodeImp {
         self.backend.sync();
     }
 
+    pub fn sync_result(&self) -> Result<(), String> {
+        self.backend.sync_result()
+    }
+
     pub fn fetch_node_object(
         &self,
         hash: &Uint256,
@@ -272,6 +276,10 @@ impl DatabaseTrait for DatabaseNodeImp {
 
     fn sync(&self) {
         DatabaseNodeImp::sync(self);
+    }
+
+    fn sync_result(&self) -> Result<(), String> {
+        DatabaseNodeImp::sync_result(self)
     }
 
     fn fetch_node_object(

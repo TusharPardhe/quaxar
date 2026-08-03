@@ -1,4 +1,6 @@
-use app::{ApplicationRoot, NetworkOpsValidationPublisher, validation_received_json};
+use app::{
+    ApplicationRoot, ApplicationRootOptions, NetworkOpsValidationPublisher, validation_received_json,
+};
 use basics::base_uint::Uint256;
 use basics::str_hex::str_hex;
 use protocol::{
@@ -292,6 +294,92 @@ fn networkops_recv_validation_bypasses_accept_for_concurrent_same_ledger() {
     let first_report = first.join().expect("first validation thread");
     assert!(!first_report.bypass_accept);
     assert_eq!(runtime.pending_validation_count(), 0);
+}
+
+#[test]
+fn concurrent_independent_quorum_candidates_publish_highest_sequence() {
+    let mut root = app::ApplicationRoot::with_options(ApplicationRootOptions {
+        quorum: Some(1),
+        ..ApplicationRootOptions::default()
+    })
+    .expect("application root");
+    let ledger_master_runtime = std::sync::Arc::new(app::AppLedgerMasterRuntime::default());
+    let _ = root.attach_ledger_master_runtime(std::sync::Arc::clone(&ledger_master_runtime));
+    let _ = root.attach_default_network_ops_validation_runtime();
+
+    let parent = ledger::Ledger::create_genesis(false, &ledger::LedgerConfig::default(), Vec::new())
+        .expect("genesis ledger");
+    let mut first = ledger::Ledger::from_previous(&parent, 0);
+    first.update_skip_list().expect("first skip list");
+    first.set_immutable(true);
+    let first = std::sync::Arc::new(first);
+    let mut second = ledger::Ledger::from_previous(first.as_ref(), 1);
+    second.update_skip_list().expect("second skip list");
+    second.set_immutable(true);
+    let second = std::sync::Arc::new(second);
+    let ledger_master = ledger_master_runtime.ledger_master();
+    ledger_master.ledger_history().insert(std::sync::Arc::clone(&first), false);
+    ledger_master.ledger_history().insert(std::sync::Arc::clone(&second), false);
+
+    let signing_time = root.shared_time_keeper().close_time().as_seconds();
+    let (first_public, first_validation) = signed_validation_with_fill(
+        0x51,
+        *first.header().hash.as_uint256(),
+        first.header().seq,
+        signing_time,
+        |_| {},
+    );
+    let (second_public, second_validation) = signed_validation_with_fill(
+        0x52,
+        *second.header().hash.as_uint256(),
+        second.header().seq,
+        signing_time,
+        |_| {},
+    );
+    assert!(root.validators().load(
+        None,
+        &[
+            first_public.to_node_public_base58(),
+            second_public.to_node_public_base58(),
+        ],
+        &[],
+        None,
+    ));
+    root.validators()
+        .update_trusted(&std::collections::HashSet::new(), 0);
+    assert_eq!(root.validators().quorum(), 1);
+
+    let root = std::sync::Arc::new(root);
+    let first_root = std::sync::Arc::clone(&root);
+    let first_worker = std::thread::spawn(move || {
+        let mut validation = first_validation;
+        first_root
+            .receive_validation_to_network_ops_with_accept(&mut validation, "peer-first", &*first_root)
+            .expect("validation runtime")
+    });
+    let second_root = std::sync::Arc::clone(&root);
+    let second_worker = std::thread::spawn(move || {
+        let mut validation = second_validation;
+        second_root
+            .receive_validation_to_network_ops_with_accept(&mut validation, "peer-second", &*second_root)
+            .expect("validation runtime")
+    });
+    let _ = first_worker.join().expect("first validation worker");
+    let _ = second_worker.join().expect("second validation worker");
+    root.try_advance_publication();
+
+    let expected_seq = second.header().seq;
+    assert_eq!(root.validated_ledger_seq(), Some(expected_seq));
+    assert_eq!(root.published_ledger_seq(), Some(expected_seq));
+    assert_eq!(ledger_master.valid_ledger_seq(), expected_seq);
+    assert_eq!(
+        ledger_master
+            .published_ledger()
+            .expect("published ledger")
+            .header()
+            .hash,
+        second.header().hash
+    );
 }
 
 #[test]

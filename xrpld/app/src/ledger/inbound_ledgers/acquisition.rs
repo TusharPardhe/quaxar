@@ -386,14 +386,19 @@ impl shamap::family::SHAMapNodeFetcher for WorkerNodeFetcher {
 pub struct WorkerStore {
     node_store: SHAMapStoreNodeStore,
     stats: Arc<AcquisitionStats>,
+    write_error: Option<String>,
 }
 
 impl WorkerStore {
-    fn sync(&self) {
+    fn sync(&self) -> Result<(), String> {
         match &self.node_store {
-            SHAMapStoreNodeStore::Single(db) => db.sync(),
-            SHAMapStoreNodeStore::Rotating(db) => db.sync(),
+            SHAMapStoreNodeStore::Single(db) => db.sync_result(),
+            SHAMapStoreNodeStore::Rotating(db) => db.sync_result(),
         }
+    }
+
+    fn take_write_error(&mut self) -> Option<String> {
+        self.write_error.take()
     }
 
     fn store_object(
@@ -408,7 +413,9 @@ impl WorkerStore {
             SHAMapStoreNodeStore::Rotating(db) => db.store(object_type, data, hash, seq),
         };
         if let Err(error) = result {
+            let message = error.to_string();
             tracing::error!(target: "nodestore", %error, "Failed to persist acquired SHAMap node");
+            self.write_error.get_or_insert(message);
         }
     }
 }
@@ -740,7 +747,7 @@ impl AcquisitionState {
         (self.failure_recorder)(*self.hash.as_uint256());
     }
 
-    fn take_buffered_packets(&self) -> Vec<ledger::InboundLedgerReceivedPacket> {
+    pub(crate) fn take_buffered_packets(&self) -> Vec<ledger::InboundLedgerReceivedPacket> {
         std::mem::take(
             &mut *self
                 .data_buffer
@@ -839,6 +846,7 @@ impl AcquisitionBuilder {
                 store: WorkerStore {
                     node_store: self.node_store.clone(),
                     stats: Arc::clone(&stats),
+                    write_error: None,
                 },
                 fetch_pack: WorkerFetchPack {
                     cache: self.fetch_pack,
@@ -1529,6 +1537,15 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
         state.mark_failed();
         return;
     }
+    if let Some(error) = mutable.store.take_write_error() {
+        let seq = state.seq;
+        let hash = state.hash;
+        drop(mutable);
+        tracing::error!(target: "inbound_ledger", seq, hash = %hash, %error,
+            "acquisition cannot complete because node persistence failed");
+        state.mark_failed();
+        return;
+    }
     if !mutable.inbound.is_complete() {
         return;
     }
@@ -1569,7 +1586,15 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
     // burst before publishing this ledger's SQL header through `setFullLedger`.
     // Otherwise a graceful restart can see the header while neither map root
     // is findable by hash in the NodeStore.
-    mutable.store.sync();
+    if let Err(error) = mutable.store.sync() {
+        let seq = state.seq;
+        let hash = state.hash;
+        drop(mutable);
+        tracing::error!(target: "inbound_ledger", seq, hash = %hash, %error,
+            "acquisition cannot complete because final NodeStore sync failed");
+        state.mark_failed();
+        return;
+    }
     if !ledger.is_immutable() {
         ledger.set_immutable(true);
     }

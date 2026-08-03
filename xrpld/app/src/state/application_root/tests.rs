@@ -20,14 +20,14 @@ use crate::{
 use basics::base_uint::{Uint160, Uint256};
 use basics::sha_map_hash::SHAMapHash;
 use ledger::{
-    ApplyView, LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader, ReadView, Sandbox,
-    calculate_ledger_hash,
+    ApplyView, Fees, LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader, ReadView, Sandbox,
+    calculate_ledger_hash, encode_fee_settings_entry,
 };
 use protocol::{
     AccountID, BatchTransactionFlags, INNER_BATCH_TRANSACTION_FLAG, KeyType, LedgerEntryType,
     Rules, STAmount, STArray, STLedgerEntry, STObject, STTx, SecretKey, SeqProxy, StBase, Ter,
-    TxType, account_keylet, calc_account_id, derive_public_key, get_field_by_symbol,
-    ticket_keylet_from_seq_proxy,
+    TxType, account_keylet, calc_account_id, derive_public_key, fee_settings_keylet,
+    get_field_by_symbol, ticket_keylet_from_seq_proxy,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -342,6 +342,24 @@ fn ledger_view(seq: u32, account: AccountID, account_sequence: u32, tx_ids: &[Ui
             ),
         )
         .expect("account root should insert");
+
+    let fee_keylet = fee_settings_keylet();
+    state_tree
+        .add_item(
+            SHAMapNodeType::AccountState,
+            SHAMapItem::new(
+                fee_keylet.key,
+                encode_fee_settings_entry(
+                    Fees {
+                        base: 10,
+                        reserve: 1_000_000,
+                        increment: 200_000,
+                    },
+                    false,
+                ),
+            ),
+        )
+        .expect("fee settings should insert");
 
     let mut tx_tree = MutableTree::new(1);
     for (index, tx_id) in tx_ids.iter().enumerate() {
@@ -1120,12 +1138,11 @@ fn application_root_accept_ledger_runs_closed_ledger_txq_maintenance() {
 }
 
 #[test]
-fn application_root_accept_ledger_rebuilds_next_open_with_current_and_queued_txs() {
+fn application_root_accept_ledger_rebuilds_next_open_with_queued_txs() {
     let mut app = ApplicationRoot::new(0).expect("root shell should build");
     let current_account = AccountID::from_array([0x11; 20]);
     let queued_account_id = AccountID::from_array([0x22; 20]);
     let destination = AccountID::from_array([0x99; 20]);
-    let current_tx = payment_tx(current_account, destination, 1, None, 10);
     let queued_tx = payment_tx(queued_account_id, destination, 1, None, 12);
     let queued_seq = SeqProxy::sequence(1);
     let queued_id = queued_tx.get_transaction_id();
@@ -1137,7 +1154,6 @@ fn application_root_accept_ledger_rebuilds_next_open_with_current_and_queued_txs
     app.on_closed_ledger(Arc::clone(&parent));
     let _ = app.open_ledger().modify(|view| {
         *view = AppOpenLedgerView::with_parent_hash(2, 10, *parent.header().hash.as_uint256());
-        view.push_transaction(Arc::clone(&current_tx));
         true
     });
 
@@ -1201,10 +1217,7 @@ fn application_root_accept_ledger_rebuilds_next_open_with_current_and_queued_txs
     );
     assert_eq!(
         rebuilt.tx_ids(),
-        vec![
-            current_tx.get_transaction_id(),
-            queued_tx.get_transaction_id()
-        ]
+        vec![queued_tx.get_transaction_id()]
     );
     assert!(app.tx_q_account_txs(queued_account_id).is_empty());
 }
@@ -1613,6 +1626,303 @@ fn application_root_tracks_validated_and_published_ledgers_without_service() {
 }
 
 #[test]
+fn application_root_configures_fee_voting_targets() {
+    let fee_setup = crate::FeeSetup {
+        reference_fee: protocol::XRPAmount::from_drops(42),
+        account_reserve: protocol::XRPAmount::from_drops(1_234_567),
+        owner_reserve: protocol::XRPAmount::from_drops(7_654_321),
+    };
+    let app = ApplicationRoot::with_options(super::ApplicationRootOptions {
+        fee_setup,
+        ..super::ApplicationRootOptions::default()
+    })
+    .expect("root shell should build");
+
+    assert_eq!(app.fee_vote_setup, fee_setup);
+}
+
+#[test]
+fn median_validation_sign_time_matches_rippled_even_odd_and_fallback_rules() {
+    assert_eq!(super::median_validation_sign_time(vec![30, 10, 20], 3, 99), 20);
+    assert_eq!(super::median_validation_sign_time(vec![40, 10, 30, 20], 4, 99), 25);
+    assert_eq!(super::median_validation_sign_time(vec![10, 20], 3, 99), 99);
+}
+
+#[test]
+fn application_root_published_ledger_emits_canonical_ledger_closed_event() {
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let event_sink = Arc::clone(&events);
+    app.set_subscription_publisher(move |stream, payload| {
+        event_sink
+            .lock()
+            .expect("ledger event sink")
+            .push((stream.to_owned(), payload));
+    });
+
+    let ledger = Arc::new(Ledger::from_ledger_seq_and_close_time(1_157, 101, false));
+    app.on_published_ledger(Arc::clone(&ledger));
+
+    let events = events.lock().expect("ledger event sink");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "ledger");
+    let protocol::JsonValue::Object(payload) = &events[0].1 else {
+        panic!("ledgerClosed payload should be an object");
+    };
+    assert_eq!(
+        payload.get("type"),
+        Some(&protocol::JsonValue::String("ledgerClosed".to_owned()))
+    );
+    assert_eq!(
+        payload.get("ledger_index"),
+        Some(&protocol::JsonValue::Unsigned(1_157))
+    );
+    assert_eq!(
+        payload.get("ledger_hash"),
+        Some(&protocol::JsonValue::String(ledger.header().hash.to_string()))
+    );
+    assert_eq!(
+        payload.get("ledger_time"),
+        Some(&protocol::JsonValue::Unsigned(101))
+    );
+    assert!(payload.contains_key("network_id"));
+    assert!(payload.contains_key("fee_base"));
+    assert!(payload.contains_key("reserve_base"));
+    assert!(payload.contains_key("reserve_inc"));
+    assert!(payload.contains_key("txn_count"));
+}
+
+#[test]
+fn application_root_queue_relay_envelope_replaces_hostile_inbound_metadata() {
+    let hostile = crate::tx_queue::transaction::TransactionRelayMetadata::new(
+        1, // tsINVALID
+        Some(1),
+        Some(false),
+    );
+    let message = super::queue_relay_envelope(vec![0xFA, 0xCE], 42_424, true);
+
+    assert_eq!(message.status, 2, "queue relay must emit tsCURRENT");
+    assert_eq!(message.receive_timestamp, Some(42_424));
+    assert_eq!(message.deferred, Some(true), "only local terQUEUED may defer");
+    assert_ne!(message.status, hostile.status);
+    assert_ne!(message.receive_timestamp, hostile.receive_timestamp);
+    assert_ne!(message.deferred, hostile.deferred);
+}
+
+#[test]
+fn application_root_proposed_transaction_payload_matches_rippled_parity_fields() {
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let event_sink = Arc::clone(&events);
+    app.set_subscription_publisher(move |stream, payload| {
+        event_sink
+            .lock()
+            .expect("proposed event sink")
+            .push((stream.to_owned(), payload));
+    });
+
+    let _ = app.open_ledger().modify(|view| {
+        view.ledger_current_index = 4_321;
+        true
+    });
+
+    let transaction = Arc::new(Mutex::new(Transaction::new(payment_tx(
+        account("4444444444444444444444444444444444444444"),
+        account("5555555555555555555555555555555555555555"),
+        1,
+        None,
+        10,
+    ))));
+    assert!(app.publish_proposed_transaction(&transaction, Ter::TES_SUCCESS));
+
+    let events = events.lock().expect("proposed event sink");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "transactions_proposed");
+    let protocol::JsonValue::Object(payload) = &events[0].1 else {
+        panic!("proposed transaction payload should be an object");
+    };
+    assert_eq!(payload.get("validated"), Some(&protocol::JsonValue::Bool(false)));
+    assert_eq!(
+        payload.get("engine_result"),
+        Some(&protocol::JsonValue::String("tesSUCCESS".to_owned()))
+    );
+    assert_eq!(
+        payload.get("status"),
+        Some(&protocol::JsonValue::String("proposed".to_owned()))
+    );
+    assert_eq!(
+        payload.get("ledger_current_index"),
+        Some(&protocol::JsonValue::Unsigned(4_321))
+    );
+    assert_eq!(
+        payload.get("hash"),
+        Some(&protocol::JsonValue::String(
+            transaction
+                .lock()
+                .expect("transaction mutex")
+                .get_s_transaction()
+                .get_transaction_id()
+                .to_string(),
+        ))
+    );
+    assert!(payload.contains_key("transaction"));
+}
+
+#[test]
+fn application_root_inner_batch_transaction_does_not_publish_proposed_event() {
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let event_sink = Arc::clone(&events);
+    app.set_subscription_publisher(move |stream, payload| {
+        event_sink
+            .lock()
+            .expect("proposed event sink")
+            .push((stream.to_owned(), payload));
+    });
+
+    let mut inner = (*payment_tx(
+        account("4444444444444444444444444444444444444444"),
+        account("5555555555555555555555555555555555555555"),
+        1,
+        None,
+        10,
+    ))
+    .clone();
+    inner.set_field_u32(get_field_by_symbol("sfFlags"), INNER_BATCH_TRANSACTION_FLAG);
+    let transaction = Arc::new(Mutex::new(Transaction::new(Arc::new(inner))));
+
+    assert!(
+        !app.publish_proposed_transaction(&transaction, Ter::TES_SUCCESS),
+        "inner Batch transactions are not client-visible proposed events"
+    );
+    assert!(
+        events.lock().expect("proposed event sink").is_empty(),
+        "inner Batch transactions must not publish on any subscription stream"
+    );
+}
+
+#[test]
+fn application_root_fee_change_notification_uses_client_fee_job_and_open_ledger_fee() {
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.set_subscription_publisher(move |stream, payload| {
+        sender
+            .send((stream.to_owned(), payload))
+            .expect("fee-change subscriber should receive one notification");
+    });
+
+    let _ = app.open_ledger().modify(|view| {
+        view.base_fee_drops = 42;
+        true
+    });
+    assert!(app.report_fee_change());
+
+    let (stream, payload) = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("client fee-change job should publish server status");
+    assert_eq!(stream, "server");
+    let protocol::JsonValue::Object(payload) = payload else {
+        panic!("server status should be an object");
+    };
+    assert_eq!(
+        payload.get("type"),
+        Some(&protocol::JsonValue::String("serverStatus".to_owned()))
+    );
+    assert_eq!(
+        payload.get("base_fee"),
+        Some(&protocol::JsonValue::Unsigned(42))
+    );
+
+    assert!(
+        !app.report_fee_change(),
+        "an unchanged ServerFeeSummary must not schedule another notification"
+    );
+
+    app.load_fee_track().set_remote_fee(512);
+    assert!(
+        app.report_fee_change(),
+        "a changed fee summary must schedule one replacement notification"
+    );
+    let (stream, payload) = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("changed client fee summary should publish server status");
+    assert_eq!(stream, "server");
+    let protocol::JsonValue::Object(payload) = payload else {
+        panic!("server status should be an object");
+    };
+    assert_eq!(
+        payload.get("load_factor_server"),
+        Some(&protocol::JsonValue::Unsigned(512))
+    );
+    assert!(payload.contains_key("load_factor_fee_escalation"));
+    assert!(payload.contains_key("load_factor_fee_queue"));
+    assert!(payload.contains_key("load_factor_fee_reference"));
+}
+
+#[test]
+fn application_root_load_manager_fee_change_publishes_server_subscription_event() {
+    let app = ApplicationRoot::with_options(super::ApplicationRootOptions {
+        job_queue_threads: 1,
+        load_manager_timing: crate::load::load_manager::LoadManagerTiming {
+            tick_interval: std::time::Duration::from_millis(5),
+            ..crate::load::load_manager::LoadManagerTiming::default()
+        },
+        ..super::ApplicationRootOptions::default()
+    })
+    .expect("root shell should build");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.set_subscription_publisher(move |stream, payload| {
+        sender
+            .send((stream.to_owned(), payload))
+            .expect("load manager fee-change subscriber should receive notification");
+    });
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    assert!(app.job_queue().add_job(
+        crate::job::job_types::JobType::JtPack,
+        "hold JQ slot",
+        move || {
+            started_tx.send(()).expect("holding job should start");
+            release_rx.recv().expect("holding job should release");
+        },
+    ));
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("holding JQ job should start");
+    assert!(app.job_queue().add_job(
+        crate::job::job_types::JobType::JtPack,
+        "queue overload",
+        || {},
+    ));
+    assert!(app.job_queue().is_overloaded(), "JQ should drive fee raising");
+
+    // FeeTrack requires one sustained-overload observation before changing the
+    // local fee; the LoadManager invocation below performs the changing one.
+    use crate::load::load_manager::LoadFeeControl;
+    assert!(!app.load_fee_track().raise_local_fee());
+    let fee_before = app.load_fee_track().local_fee();
+    app.load_manager().start();
+    app.load_manager().stop();
+    release_tx.send(()).expect("holding JQ job should release");
+    assert!(app.load_fee_track().local_fee() > fee_before);
+
+    let (stream, payload) = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("load-manager fee change should reach the server stream");
+    assert_eq!(stream, "server");
+    let protocol::JsonValue::Object(payload) = payload else {
+        panic!("load-manager server event should be an object");
+    };
+    assert_eq!(
+        payload.get("load_factor_server"),
+        Some(&protocol::JsonValue::Unsigned(u64::from(
+            app.load_fee_track().local_fee(),
+        )))
+    );
+}
+
+#[test]
 fn application_root_can_own_ledger_master_runtime_local_and_held_tx_paths() {
     let mut app = ApplicationRoot::new(0).expect("root shell should build");
     let runtime = Arc::new(AppLedgerMasterRuntime::default());
@@ -1839,6 +2149,23 @@ fn application_root_accept_ledger_builds_from_closed_parent_view() {
 }
 
 #[test]
+fn refresh_validator_trust_propagates_unl_block_and_clear_to_network_ops() {
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let lcl = Ledger::from_ledger_seq_and_close_time(1, app.current_close_time_seconds(), false);
+
+    app.set_unl_blocked(true);
+    app.refresh_validator_trust_for_consensus(&lcl);
+    assert!(!app.unl_blocked());
+
+    let publisher_secret = SecretKey::from_bytes([0x5A; 32]);
+    let publisher = derive_public_key(KeyType::Ed25519, &publisher_secret).expect("publisher key");
+    assert!(app.validators().load(None, &[], &[publisher.to_hex()], None));
+    app.refresh_validator_trust_for_consensus(&lcl);
+    assert!(app.validators().unl_blocked());
+    assert!(app.unl_blocked());
+}
+
+#[test]
 fn application_root_server_okay_matches_current_gate_order() {
     let app = ApplicationRoot::with_options(super::ApplicationRootOptions {
         elb_support: true,
@@ -1988,6 +2315,7 @@ fn consensus_outcome_defers_open_ledger_reset_to_outcome_handoff() {
         closed.header().hash.as_uint256(),
         &outcome.completed_transaction_ids,
         &outcome.retry_transactions,
+        false,
     );
 
     let next_open = app.open_ledger().current();
@@ -1996,44 +2324,40 @@ fn consensus_outcome_defers_open_ledger_reset_to_outcome_handoff() {
 }
 
 #[test]
-fn stale_consensus_outcome_does_not_overwrite_a_newer_lcl() {
+fn switched_ledger_consensus_child_can_replace_older_global_lcl() {
     let app = ApplicationRoot::new(0).expect("root shell should build");
-    let consensus_parent = {
+    let old_lcl = {
         let mut ledger = Ledger::from_ledger_seq_and_close_time(10, 1_000, false);
         ledger.set_accepted(1_000, 30, true);
         Arc::new(ledger)
     };
-    let newer_lcl = {
+    let switched_parent = {
         let mut ledger = Ledger::from_ledger_seq_and_close_time(20, 1_020, false);
         ledger.set_accepted(1_020, 30, true);
         Arc::new(ledger)
     };
-    app.on_closed_ledger(Arc::clone(&consensus_parent));
+    app.on_closed_ledger(Arc::clone(&old_lcl));
 
-    // The JtAccept task may execute after validation or acquisition has
-    // changed the global LCL. The old round must be discarded rather than
-    // building a child of its stale parent and rolling the LCL backwards.
-    app.on_closed_ledger(Arc::clone(&newer_lcl));
-    let error = match app.accept_ledger_with_txns_outcome_from_consensus_parent(
-        Arc::clone(&consensus_parent),
-        11,
-        1_010,
-        30,
-        true,
-        consensus_parent.fees().base,
-        Vec::new(),
-    ) {
-        Ok(_) => panic!("stale consensus acceptance must not overwrite newer LCL"),
-        Err(error) => error,
-    };
+    // Matches rippled WrongLedger/SwitchedLedger recovery: generic Consensus
+    // acquired `switched_parent`, so doAccept builds its child even though the
+    // global LCL still names `old_lcl`; switchLCL then installs that child
+    // without a separate global-parent rejection gate.
+    let outcome = app
+        .accept_ledger_with_txns_outcome_from_consensus_parent(
+            Arc::clone(&switched_parent),
+            21,
+            1_030,
+            30,
+            true,
+            switched_parent.fees().base,
+            Vec::new(),
+        )
+        .expect("switched parent must be accepted for build");
+    app.install_consensus_child(Arc::clone(&outcome.closed));
 
-    assert!(error.contains("stale consensus parent"));
-    let closed = app
-        .closed_ledger()
-        .expect("newer LCL should remain installed");
-    assert_eq!(closed.header().seq, newer_lcl.header().seq);
-    assert_eq!(closed.header().hash, newer_lcl.header().hash);
-    assert!(app.published_ledger().is_none());
+    let closed = app.closed_ledger().expect("switched child should install");
+    assert_eq!(closed.header().hash, outcome.closed.header().hash);
+    assert_eq!(closed.header().seq, 21);
 }
 
 #[test]
@@ -2068,6 +2392,35 @@ fn lcl_transition_gate_serializes_authoritative_promotions() {
 }
 
 #[test]
+fn validation_advance_gate_serializes_publication_planning() {
+    let mut root = ApplicationRoot::new(0).expect("root shell should build");
+    let _ = root.attach_ledger_master_runtime(Arc::new(AppLedgerMasterRuntime::default()));
+    let app = Arc::new(root);
+
+    let gate = app.validation_advance_gate().lock();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let worker_app = Arc::clone(&app);
+    let worker = std::thread::spawn(move || {
+        worker_app.try_advance_publication();
+        done_tx
+            .send(())
+            .expect("publication completion should be observed");
+    });
+
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "publication planning must wait for an in-flight validation advance"
+    );
+    drop(gate);
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("publication should proceed after validation transition ends");
+    worker.join().expect("publication worker should not panic");
+}
+
+#[test]
 fn live_consensus_accept_runs_consensus_built_lifecycle_before_next_round() {
     let mut app = ApplicationRoot::new(0).expect("root shell should build");
     let runtime = Arc::new(AppLedgerMasterRuntime::default());
@@ -2077,12 +2430,21 @@ fn live_consensus_accept_runs_consensus_built_lifecycle_before_next_round() {
     runtime.set_building_ledger(11);
 
     let outcome = app
-        .accept_ledger_with_txns_outcome(11, 1_010, 30, true, parent.fees().base, Vec::new())
+        .accept_ledger_with_txns_outcome_from_consensus_parent(
+            Arc::clone(&parent),
+            11,
+            1_010,
+            30,
+            true,
+            parent.fees().base,
+            Vec::new(),
+        )
         .expect("live consensus build should complete");
-    let built = app.closed_ledger().expect("built LCL should be installed");
+    let built = app.store_consensus_ledger(Arc::clone(&outcome.closed));
 
-    // This is the exact handoff AppConsensus performs before rebuilding the
-    // next open ledger or selecting the next preferred LCL.
+    // This is the exact handoff AppConsensus performs after the built child
+    // has first been stored for status/local validation: consensusBuilt,
+    // OpenLedger::accept, then switchLCL.
     let consensus_hash = Uint256::from_u64(0xCAFE);
     let recorded = app.record_consensus_built_ledger(Arc::clone(&built), consensus_hash);
     assert_eq!(recorded.header().hash, built.header().hash);
@@ -2103,8 +2465,12 @@ fn live_consensus_accept_runs_consensus_built_lifecycle_before_next_round() {
         built.header().hash.as_uint256(),
         &outcome.completed_transaction_ids,
         &outcome.retry_transactions,
+        false,
     );
     assert_eq!(app.open_ledger().current().ledger_current_index, 12);
+    app.install_consensus_child(Arc::clone(&built));
+    let closed = app.closed_ledger().expect("built LCL should install last");
+    assert_eq!(closed.header().hash, built.header().hash);
 }
 
 #[test]

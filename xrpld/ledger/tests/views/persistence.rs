@@ -112,8 +112,10 @@ struct RecordingPersistenceRuntime {
     finished: Mutex<Vec<u32>>,
     pending: Mutex<Vec<u32>>,
     save_calls: Mutex<Vec<(u32, bool)>>,
+    failed_saves: Mutex<Vec<(u32, SHAMapHash)>>,
     queued_jobs: Mutex<Vec<(LedgerPersistenceJobType, String)>>,
     allow_enqueue: bool,
+    fail_save: bool,
 }
 
 impl LedgerPersistenceRuntime for RecordingPersistenceRuntime {
@@ -148,7 +150,14 @@ impl LedgerPersistenceRuntime for RecordingPersistenceRuntime {
             .lock()
             .expect("save_calls mutex")
             .push((ledger.header().seq, is_current));
-        true
+        !self.fail_save
+    }
+
+    fn failed_save(&self, seq: u32, hash: SHAMapHash) {
+        self.failed_saves
+            .lock()
+            .expect("failed_saves mutex")
+            .push((seq, hash));
     }
 
     fn enqueue_job(
@@ -191,6 +200,34 @@ fn pend_save_validated_queues_current_save() {
             .expect("save_calls mutex")
             .as_slice(),
         &[(40, true)]
+    );
+}
+
+#[test]
+fn pend_save_validated_queued_failure_notifies_owner_after_work_finishes() {
+    let runtime = Arc::new(RecordingPersistenceRuntime {
+        allow_enqueue: true,
+        fail_save: true,
+        ..RecordingPersistenceRuntime::default()
+    });
+    let ledger = immutable_ledger(42, 0x33);
+    let hash = ledger.header().hash;
+
+    // Queue admission remains optimistic, matching rippled. The asynchronous
+    // completion hook is what retracts LedgerMaster's claim afterwards.
+    assert!(pend_save_validated(runtime.clone(), ledger, false, false));
+    assert_eq!(
+        runtime
+            .failed_saves
+            .lock()
+            .expect("failed_saves mutex")
+            .as_slice(),
+        &[(42, hash)]
+    );
+    assert_eq!(
+        runtime.finished.lock().expect("finished mutex").as_slice(),
+        &[42],
+        "failure notification runs only after pending work is released"
     );
 }
 

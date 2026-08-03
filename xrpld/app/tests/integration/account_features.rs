@@ -475,6 +475,49 @@ fn af_preauth_self_fails() {
         Ter::TES_SUCCESS
     );
 }
+
+#[test]
+fn af_preauth_rejects_duplicate_and_missing_unauthorize_entries() {
+    let a = acct(0x11);
+    let b = acct(0x22);
+    let l = build_ledger(vec![
+        account_root(a, 5_000_000_000, 0, 0),
+        account_root(b, 5_000_000_000, 0, 0),
+    ]);
+    let mut v = new_view(l);
+    let authorize = STTx::new(TxType::DEPOSIT_PREAUTH, |tx| {
+        tx.set_account_id(sf("sfAccount"), a);
+        tx.set_account_id(sf("sfAuthorize"), b);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        full_apply(&mut v, &authorize, TxType::DEPOSIT_PREAUTH),
+        Ter::TES_SUCCESS
+    );
+
+    let duplicate = STTx::new(TxType::DEPOSIT_PREAUTH, |tx| {
+        tx.set_account_id(sf("sfAccount"), a);
+        tx.set_account_id(sf("sfAuthorize"), b);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 2);
+    });
+    assert_eq!(
+        full_apply(&mut v, &duplicate, TxType::DEPOSIT_PREAUTH),
+        Ter::TEC_DUPLICATE
+    );
+
+    let missing = STTx::new(TxType::DEPOSIT_PREAUTH, |tx| {
+        tx.set_account_id(sf("sfAccount"), a);
+        tx.set_account_id(sf("sfUnauthorize"), acct(0x33));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 2);
+    });
+    assert_eq!(
+        full_apply(&mut v, &missing, TxType::DEPOSIT_PREAUTH),
+        Ter::TEC_NO_ENTRY
+    );
+}
 #[test]
 fn af_preauth_multiple() {
     let a = acct(0x11);
@@ -537,6 +580,44 @@ fn af_delete_basic() {
     });
     let r = handle_real_dispatch(&mut v, &tx, TxType::ACCOUNT_DELETE, None);
     assert_eq!(r, Ter::TES_SUCCESS);
+}
+
+#[test]
+fn af_delete_enforces_destination_tag_and_deposit_auth() {
+    let a = acct(0x11);
+    let b = acct(0x22);
+
+    let tag_ledger = build_ledger_at_sequence(
+        257,
+        vec![
+            account_root(a, 5_000_000_000, 0, 0),
+            account_root(b, 5_000_000_000, 0, protocol::lsfRequireDestTag),
+        ],
+    );
+    let mut tag_view = new_view(tag_ledger);
+    let tx = STTx::new(TxType::ACCOUNT_DELETE, |tx| {
+        tx.set_account_id(sf("sfAccount"), a);
+        tx.set_account_id(sf("sfDestination"), b);
+        tx.set_field_amount(sf("sfFee"), xrp(2_000_000));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut tag_view, &tx, TxType::ACCOUNT_DELETE, None),
+        Ter::TEC_DST_TAG_NEEDED
+    );
+
+    let auth_ledger = build_ledger_at_sequence(
+        257,
+        vec![
+            account_root(a, 5_000_000_000, 0, 0),
+            account_root(b, 5_000_000_000, 0, protocol::lsfDepositAuth),
+        ],
+    );
+    let mut auth_view = new_view(auth_ledger);
+    assert_eq!(
+        handle_real_dispatch(&mut auth_view, &tx, TxType::ACCOUNT_DELETE, None),
+        Ter::TEC_NO_PERMISSION
+    );
 }
 
 // ─── AccountSet: Clear Flags ────────────────────────────────────────────────

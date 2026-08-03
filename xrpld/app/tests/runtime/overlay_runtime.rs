@@ -112,7 +112,7 @@ fn build_overlay_setup_parses_config_backed_runtime_defaults_and_overrides() {
 }
 
 #[test]
-fn build_overlay_runtime_carries_server_port_budget_and_secure_listener_tls() {
+fn build_overlay_runtime_keeps_server_port_budget_separate_from_overlay_peer_budget() {
     let config = config_from_text(configured_overlay_text());
     let mut root = ApplicationRoot::new(0).expect("root");
     root.attach_server_ports_from_config(&config, false)
@@ -131,7 +131,7 @@ fn build_overlay_runtime_carries_server_port_budget_and_secure_listener_tls() {
     assert_eq!(listener.ip, "0.0.0.0");
     assert_eq!(listener.port, 51235);
     assert_eq!(listener.limit, 64);
-    assert_eq!(runtime.overlay().limit(), 64);
+    assert_eq!(runtime.overlay().limit(), 21);
     assert_eq!(runtime.fd_required(), 128);
     assert_eq!(runtime.network_id(), Some(21_338));
     assert!(runtime.has_listener_tls());
@@ -253,6 +253,9 @@ limit = 1
 
 [overlay]
 ip_limit = 32
+
+[peers_max]
+10
 "#,
     );
     let mut root = ApplicationRoot::new(0).expect("root");
@@ -263,10 +266,18 @@ ip_limit = 32
         .attach_configured_overlay_runtime(&config, Arc::new(BootstrapOverlayHandoff))
         .expect("overlay runtime");
     let first = overlay_peer(3, 13);
-    let reserved = overlay_peer(4, 14);
+    let additional = (4..=12)
+        .map(|id| overlay_peer(id, (id + 10) as u8))
+        .collect::<Vec<_>>();
+    let reserved = overlay_peer(13, 23);
 
-    assert_eq!(runtime.overlay().limit(), 1);
+    // rippled floors legacy [peers_max] at ten; the port's `limit` is a
+    // server-accept cap, not an overlay peer budget.
+    assert_eq!(runtime.overlay().limit(), 10);
     assert!(runtime.overlay().activate(Arc::clone(&first)));
+    for peer in &additional {
+        assert!(runtime.overlay().activate(Arc::clone(peer)));
+    }
     assert!(!runtime.overlay().activate(Arc::clone(&reserved)));
 
     assert!(
@@ -280,7 +291,7 @@ ip_limit = 32
     root.wire_overlay_membership_sources(runtime.overlay().as_ref());
 
     assert!(runtime.overlay().activate(Arc::clone(&reserved)));
-    assert_eq!(runtime.overlay().size(), 2);
+    assert_eq!(runtime.overlay().size(), 11);
     assert!(reserved.reserved());
 
     assert_eq!(
@@ -292,7 +303,7 @@ ip_limit = 32
     );
     runtime.overlay().refresh_membership_state();
 
-    assert_eq!(runtime.overlay().size(), 1);
+    assert_eq!(runtime.overlay().size(), 10);
     assert!(
         runtime
             .overlay()

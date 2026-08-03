@@ -408,36 +408,27 @@ impl JobQueue {
     /// stopped, matching the reference's refusal to accept jobs after
     /// `stop()` has been called.
     ///
-    /// # Panics (debug builds only)
-    ///
-    /// `job_type` must not be a "special" job type (`is_special()`,
-    /// i.e. limit `0`). The reference documents special job types as
-    /// "not dispatched by the job pool" -- they exist only to categorize
-    /// work that runs inline on other threads (peer I/O, disk access,
-    /// RPC handlers) rather than through `JobQueue`. Submitting one here
-    /// would create a job that can never satisfy `running < limit()`
-    /// (since the limit is zero) and would therefore sit in the queue
-    /// forever. This is checked with a `debug_assert!` rather than a
-    /// silent `false` return so the bug surfaces immediately in tests
-    /// rather than manifesting as a mysteriously stuck job queue.
+    /// Returns false for special job types (limit zero): rippled callers run
+    /// those inline/on their owning thread, never through the JobQueue.
     pub fn add_job<F>(&self, job_type: JobType, name: impl Into<String>, func: F) -> bool
     where
         F: FnOnce() + Send + 'static,
     {
-        debug_assert!(
-            !job_type.is_special(),
-            "JobQueue::add_job: {job_type:?} is a special job type (limit 0) and must never be \
-             dispatched through the job pool -- it belongs on whatever thread the reference \
-             documents it as running on instead"
-        );
+        if job_type.is_special() {
+            return false;
+        }
 
+        let mut state = self.inner.state.lock();
+        // Check again under the same lock that stop() waits on. Without this
+        // second check, a caller can observe stopping=false, block behind
+        // stop(), then enqueue after stop has observed an empty queue.
         if self.inner.stopping.load(AtomicOrdering::SeqCst)
             || self.inner.stopped.load(AtomicOrdering::SeqCst)
         {
             return false;
         }
 
-        let index = self.inner.next_index.fetch_add(1, AtomicOrdering::SeqCst);
+        let index = self.inner.next_index.fetch_add(1, AtomicOrdering::SeqCst) + 1;
         let job = Job {
             job_type,
             name: name.into(),
@@ -446,7 +437,6 @@ impl JobQueue {
             func: Box::new(func),
         };
 
-        let mut state = self.inner.state.lock();
         let counters = state.counters_mut(job_type);
         let under_limit = counters.waiting + counters.running < job_type.limit();
         if !under_limit {

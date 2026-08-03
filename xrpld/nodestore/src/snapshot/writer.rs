@@ -13,8 +13,11 @@
 
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
@@ -25,6 +28,58 @@ use crate::{Backend, NodeObject};
 /// Maximum `NodeObjectType` discriminant value that fits in a u8.
 /// The snapshot format stores node type as a single byte.
 const MAX_NODE_TYPE_U8: u32 = 255;
+
+/// Owned cooperative cancellation signal for a snapshot export task.
+///
+/// Cancellation is intentionally polling-only: the writer keeps filesystem
+/// ownership on its worker thread, so observing this signal lets its temporary
+/// file guard remove both artifacts before the task returns an error.
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotExportCancellation {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl SnapshotExportCancellation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+fn check_cancelled(cancellation: Option<&SnapshotExportCancellation>) -> Result<(), SnapshotError> {
+    if cancellation.is_some_and(SnapshotExportCancellation::is_cancelled) {
+        return Err(SnapshotError::ExportCancelled);
+    }
+    Ok(())
+}
+
+struct SnapshotTempFiles {
+    chunks: PathBuf,
+    snapshot: PathBuf,
+}
+
+impl SnapshotTempFiles {
+    fn new(chunks: &Path, snapshot: &Path) -> Self {
+        Self {
+            chunks: chunks.to_path_buf(),
+            snapshot: snapshot.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for SnapshotTempFiles {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.chunks);
+        let _ = fs::remove_file(&self.snapshot);
+    }
+}
 
 /// Export all nodes from `backend` into a snapshot file at `output_path`.
 ///
@@ -39,10 +94,33 @@ const MAX_NODE_TYPE_U8: u32 = 255;
 ///
 /// The final file is written to a `.tmp` sibling path, then atomically renamed
 /// into place so a crash never leaves a partial file at `output_path`.
+/// Export all nodes without a cancellation signal.
+///
+/// This retains the historical behavior used by automatic exports.
 pub fn export_snapshot(
     backend: &dyn Backend,
     manifest: &SnapshotManifest,
     output_path: &Path,
+) -> Result<(), SnapshotError> {
+    export_snapshot_inner(backend, manifest, output_path, None)
+}
+
+/// Export all nodes while polling `cancellation` between records, chunk work,
+/// and final-file copy operations.
+pub fn export_snapshot_with_cancellation(
+    backend: &dyn Backend,
+    manifest: &SnapshotManifest,
+    output_path: &Path,
+    cancellation: &SnapshotExportCancellation,
+) -> Result<(), SnapshotError> {
+    export_snapshot_inner(backend, manifest, output_path, Some(cancellation))
+}
+
+fn export_snapshot_inner(
+    backend: &dyn Backend,
+    manifest: &SnapshotManifest,
+    output_path: &Path,
+    cancellation: Option<&SnapshotExportCancellation>,
 ) -> Result<(), SnapshotError> {
     let start = Instant::now();
     tracing::info!(
@@ -59,6 +137,8 @@ pub fn export_snapshot(
     // Clean up any leftover temp files from a prior failed export
     let _ = fs::remove_file(&tmp_chunks_path);
     let _ = fs::remove_file(&tmp_final_path);
+    let _temporary_files = SnapshotTempFiles::new(&tmp_chunks_path, &tmp_final_path);
+    check_cancelled(cancellation)?;
 
     let chunks_file = File::create(&tmp_chunks_path)
         .map_err(|e| SnapshotError::io_path("creating temp chunks file", &tmp_chunks_path, e))?;
@@ -77,6 +157,7 @@ pub fn export_snapshot(
                        writer: &mut BufWriter<File>,
                        total: &mut u64|
      -> Result<(), SnapshotError> {
+        check_cancelled(cancellation)?;
         if buf.is_empty() {
             return Ok(());
         }
@@ -90,18 +171,23 @@ pub fn export_snapshot(
         writer
             .write_all(&compressed)
             .map_err(|e| SnapshotError::io("writing chunk to temp file", e))?;
+        check_cancelled(cancellation)?;
         *total += compressed.len() as u64;
         buf.clear();
         Ok(())
     };
 
-    // We need to propagate errors out of the for_each closure.
-    // Since for_each takes FnMut (no Result return), we capture errors.
+    // The callback itself cannot return a result, so capture serialization
+    // errors while the backend reports its own traversal failures directly.
     let mut export_error: Option<SnapshotError> = None;
 
-    backend.for_each(&mut |node: Arc<NodeObject>| {
+    let traversal_result = backend.for_each_result(&mut |node: Arc<NodeObject>| {
         if export_error.is_some() {
             return; // Skip remaining nodes after an error
+        }
+        if let Err(error) = check_cancelled(cancellation) {
+            export_error = Some(error);
+            return;
         }
 
         let obj_type_u32 = node.object_type() as u32;
@@ -150,6 +236,9 @@ pub fn export_snapshot(
         return Err(e);
     }
 
+    traversal_result.map_err(|reason| SnapshotError::BackendTraversalFailed { reason })?;
+    check_cancelled(cancellation)?;
+
     // Flush remaining buffer
     flush_chunk(
         &mut current_buf,
@@ -165,6 +254,7 @@ pub fn export_snapshot(
         .get_ref()
         .sync_all()
         .map_err(|e| SnapshotError::io("syncing temp chunks file", e))?;
+    check_cancelled(cancellation)?;
 
     tracing::info!(
         target: "snapshot",
@@ -186,6 +276,7 @@ pub fn export_snapshot(
     let mut file_hasher = Sha256::new();
 
     // Write header
+    check_cancelled(cancellation)?;
     let header = final_manifest.serialize_header();
     writer
         .write_all(&header)
@@ -194,6 +285,7 @@ pub fn export_snapshot(
 
     // Write chunk table
     for meta in &final_manifest.chunks {
+        check_cancelled(cancellation)?;
         let entry = SnapshotManifest::serialize_chunk_meta(meta);
         writer
             .write_all(&entry)
@@ -207,12 +299,14 @@ pub fn export_snapshot(
     let mut reader = BufReader::new(chunks_read_file);
     let mut copy_buf = vec![0u8; 64 * 1024]; // 64KB copy buffer
     loop {
+        check_cancelled(cancellation)?;
         let n = reader
             .read(&mut copy_buf)
             .map_err(|e| SnapshotError::io("reading temp chunks file", e))?;
         if n == 0 {
             break;
         }
+        check_cancelled(cancellation)?;
         writer
             .write_all(&copy_buf[..n])
             .map_err(|e| SnapshotError::io("writing chunk data", e))?;
@@ -220,6 +314,7 @@ pub fn export_snapshot(
     }
 
     // Write footer (file SHA-256)
+    check_cancelled(cancellation)?;
     let file_hash: [u8; 32] = file_hasher.finalize().into();
     writer
         .write_all(&file_hash)
@@ -235,6 +330,7 @@ pub fn export_snapshot(
 
     // ─── Atomic rename into place ────────────────────────────────────────────
 
+    check_cancelled(cancellation)?;
     fs::rename(&tmp_final_path, output_path)
         .map_err(|e| SnapshotError::io_path("renaming snapshot to final path", output_path, e))?;
 

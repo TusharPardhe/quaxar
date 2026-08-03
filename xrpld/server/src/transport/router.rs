@@ -4,7 +4,7 @@ use basics::make_ssl_context::{
 };
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use axum::Router;
 use axum::body::Body;
@@ -110,7 +110,19 @@ impl TryFrom<&ServerPortSetup> for RpcServerPortPolicy {
     }
 }
 
+fn install_rustls_crypto_provider() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 fn build_tls_config(port: &ServerPortSetup) -> Result<Arc<ServerConfig>, String> {
+    // The server crate enables Rustls' `ring` provider explicitly. Install it
+    // before using the builder so secure listeners do not depend on Rustls'
+    // feature-based default-provider inference.
+    install_rustls_crypto_provider();
+
     let (certs, key) = if port.ssl_key.is_empty()
         && port.ssl_cert.is_empty()
         && port.ssl_chain.is_empty()
@@ -299,12 +311,32 @@ where
     }
 
     pub fn with_port_policy(dispatcher: D, policy: RpcServerPortPolicy) -> Self {
+        Self::with_port_policy_and_subscriptions(
+            dispatcher,
+            policy,
+            Arc::new(SubscriptionManager::default()),
+            None,
+        )
+    }
+
+    /// Build a live listener with the exact per-port transport, authorization,
+    /// and status policy parsed from `[server]`. ServerRuntime must use this
+    /// constructor rather than the generic auth/subscription constructor: the
+    /// latter intentionally has no port policy and therefore cannot enforce a
+    /// HTTP-only or WebSocket-only configured listener.
+    pub fn with_port_policy_and_subscriptions(
+        dispatcher: D,
+        policy: RpcServerPortPolicy,
+        subscriptions: Arc<SubscriptionManager>,
+        status_source: Option<Arc<dyn ServerStatusSource>>,
+    ) -> Self {
         Self {
             dispatcher: Arc::new(dispatcher),
-            subscriptions: Arc::new(SubscriptionManager::default()),
+            subscriptions,
             auth: ServerAuth::new(policy.auth.clone()),
             config: RpcServerConfig {
                 port_policy: Some(policy),
+                status_source,
                 ..RpcServerConfig::default()
             },
             state: Arc::new(RpcServerState::default()),
@@ -316,9 +348,12 @@ where
         policy: RpcServerPortPolicy,
         status_source: Arc<dyn ServerStatusSource>,
     ) -> Self {
-        let mut server = Self::with_port_policy(dispatcher, policy);
-        server.config.status_source = Some(status_source);
-        server
+        Self::with_port_policy_and_subscriptions(
+            dispatcher,
+            policy,
+            Arc::new(SubscriptionManager::default()),
+            Some(status_source),
+        )
     }
 
     pub fn with_server_port(dispatcher: D, port: &ServerPortSetup) -> Result<Self, String> {
@@ -1205,13 +1240,6 @@ fn websocket_response(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Once;
-    fn install_crypto() {
-        static INSTALL: Once = Once::new();
-        INSTALL.call_once(|| {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        });
-    }
     use super::{
         JsonRpcEnvelope, RpcServer, RpcServerPortBuild, RpcServerPortPolicy,
         sanitize_request_value, websocket_response,
@@ -1232,7 +1260,6 @@ mod tests {
 
     #[test]
     fn server_port_policy_rejects_unsupported_transport_modes() {
-        install_crypto();
         let secure_port = ServerPortSetup {
             name: "port_secure".to_owned(),
             ip: "127.0.0.1".to_owned(),
@@ -1281,7 +1308,6 @@ mod tests {
 
     #[test]
     fn server_port_build_reports_deferred_modes_for_mixed_listener_ports() {
-        install_crypto();
         let mixed_port = ServerPortSetup {
             name: "port_mixed".to_owned(),
             ip: "127.0.0.1".to_owned(),

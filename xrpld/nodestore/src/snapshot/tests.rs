@@ -2,6 +2,7 @@ use basics::intrusive_pointer::make_shared_intrusive;
 use protocol::{LedgerHeader, calculate_ledger_hash};
 use shamap::nodes::item::SHAMapItem;
 use shamap::nodes::tree_node::{SHAMapNodeType, SHAMapTreeNode};
+use std::io::Write;
 use std::sync::Arc;
 
 use basics::base_uint::Uint256;
@@ -9,8 +10,11 @@ use basics::basic_config::Section;
 
 use crate::database_runtime::scheduler::DummyScheduler;
 use crate::snapshot::manifest::*;
-use crate::snapshot::{SnapshotError, SnapshotManifest, export_snapshot, load_snapshot};
-use crate::{Backend, Factory, MemoryFactory, NodeObject, NodeObjectType, NullJournal};
+use crate::snapshot::{
+    SnapshotError, SnapshotExportCancellation, SnapshotManifest, export_snapshot,
+    export_snapshot_with_cancellation, load_snapshot,
+};
+use crate::{Backend, Factory, MemoryFactory, NodeObject, NodeObjectType, NullJournal, Status};
 
 fn config(path: &str) -> Section {
     let mut section = Section::new("node_db");
@@ -28,6 +32,128 @@ fn make_backend(path: &str) -> Box<dyn Backend> {
         .expect("memory backend must be created");
     backend.open(true).expect("backend must open");
     backend
+}
+
+struct TraversalFailureBackend;
+
+impl Backend for TraversalFailureBackend {
+    fn get_name(&self) -> String {
+        "injected-traversal-failure".to_owned()
+    }
+
+    fn open(&self, _create_if_missing: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn is_open(&self) -> bool {
+        true
+    }
+
+    fn close(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn fetch(&self, _hash: &Uint256) -> (Option<Arc<NodeObject>>, Status) {
+        (None, Status::NotFound)
+    }
+
+    fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status) {
+        (vec![None; hashes.len()], Status::Ok)
+    }
+
+    fn store(&self, _object: Arc<NodeObject>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn store_batch(&self, _batch: &crate::Batch) {}
+
+    fn sync(&self) {}
+
+    fn for_each(&self, _callback: &mut dyn FnMut(Arc<NodeObject>)) {}
+
+    fn for_each_result(&self, callback: &mut dyn FnMut(Arc<NodeObject>)) -> Result<(), String> {
+        callback(Arc::new(NodeObject::new(
+            NodeObjectType::Ledger,
+            vec![1, 2, 3],
+            Uint256::from_array([0xEF; 32]),
+        )));
+        Err("injected NuDB traversal failure".to_owned())
+    }
+
+    fn get_write_load(&self) -> i32 {
+        0
+    }
+
+    fn set_delete_path(&self) {}
+
+    fn fd_required(&self) -> i32 {
+        0
+    }
+}
+
+struct CancellationDuringTraversalBackend {
+    cancellation: SnapshotExportCancellation,
+}
+
+impl Backend for CancellationDuringTraversalBackend {
+    fn get_name(&self) -> String {
+        "injected-cancellation".to_owned()
+    }
+
+    fn open(&self, _create_if_missing: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn is_open(&self) -> bool {
+        true
+    }
+
+    fn close(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn fetch(&self, _hash: &Uint256) -> (Option<Arc<NodeObject>>, Status) {
+        (None, Status::NotFound)
+    }
+
+    fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status) {
+        (vec![None; hashes.len()], Status::Ok)
+    }
+
+    fn store(&self, _object: Arc<NodeObject>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn store_batch(&self, _batch: &crate::Batch) {}
+
+    fn sync(&self) {}
+
+    fn for_each(&self, _callback: &mut dyn FnMut(Arc<NodeObject>)) {}
+
+    fn for_each_result(&self, callback: &mut dyn FnMut(Arc<NodeObject>)) -> Result<(), String> {
+        callback(Arc::new(NodeObject::new(
+            NodeObjectType::Ledger,
+            vec![1, 2, 3],
+            Uint256::from_array([0xCA; 32]),
+        )));
+        self.cancellation.cancel();
+        callback(Arc::new(NodeObject::new(
+            NodeObjectType::Ledger,
+            vec![4, 5, 6],
+            Uint256::from_array([0xCB; 32]),
+        )));
+        Ok(())
+    }
+
+    fn get_write_load(&self) -> i32 {
+        0
+    }
+
+    fn set_delete_path(&self) {}
+
+    fn fd_required(&self) -> i32 {
+        0
+    }
 }
 
 fn test_manifest() -> SnapshotManifest {
@@ -106,6 +232,66 @@ fn shamap_inner_with_child(child_hash: [u8; 32]) -> (Arc<NodeObject>, [u8; 32]) 
         Arc::new(NodeObject::new(NodeObjectType::AccountNode, data, hash)),
         hash_bytes,
     )
+}
+
+#[test]
+fn snapshot_export_cancellation_between_records_cleans_all_temporary_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output_path = dir.path().join("cancelled.xrpls");
+    let tmp_chunks_path = output_path.with_extension("xrpls.chunks.tmp");
+    let tmp_final_path = output_path.with_extension("xrpls.tmp");
+    let cancellation = SnapshotExportCancellation::new();
+    let backend = CancellationDuringTraversalBackend {
+        cancellation: cancellation.clone(),
+    };
+
+    let error =
+        export_snapshot_with_cancellation(&backend, &test_manifest(), &output_path, &cancellation)
+            .expect_err("cancellation between node records must stop export");
+
+    assert!(matches!(error, SnapshotError::ExportCancelled));
+    assert!(
+        !output_path.exists(),
+        "cancelled export must not publish output"
+    );
+    assert!(
+        !tmp_chunks_path.exists(),
+        "cancelled export must clean chunk temporary file"
+    );
+    assert!(
+        !tmp_final_path.exists(),
+        "cancelled export must clean final temporary file"
+    );
+}
+
+#[test]
+fn snapshot_export_fails_atomically_on_backend_traversal_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output_path = dir.path().join("failed.xrpls");
+    let tmp_chunks_path = output_path.with_extension("xrpls.chunks.tmp");
+    let tmp_final_path = output_path.with_extension("xrpls.tmp");
+    std::fs::write(&tmp_final_path, b"stale temporary output").expect("stale temp file");
+
+    let error = export_snapshot(&TraversalFailureBackend, &test_manifest(), &output_path)
+        .expect_err("injected traversal failure must fail export");
+
+    assert!(matches!(
+        error,
+        SnapshotError::BackendTraversalFailed { ref reason }
+            if reason == "injected NuDB traversal failure"
+    ));
+    assert!(
+        !output_path.exists(),
+        "failed export must not create final output"
+    );
+    assert!(
+        !tmp_chunks_path.exists(),
+        "chunk temporary file must be cleaned"
+    );
+    assert!(
+        !tmp_final_path.exists(),
+        "snapshot temporary file must be cleaned"
+    );
 }
 
 #[test]
@@ -387,4 +573,154 @@ fn truncated_file_detected() {
     let dst = make_backend("dst-trunc");
     let result = load_snapshot(dst.as_ref(), &snap_path);
     assert!(result.is_err());
+}
+
+
+#[test]
+fn snapshot_manifest_rejects_noncanonical_header_fields() {
+    let manifest = test_manifest();
+
+    let mut legacy_version = manifest.serialize_header();
+    legacy_version[8..10].copy_from_slice(&0_u16.to_be_bytes());
+    assert!(matches!(
+        SnapshotManifest::deserialize_header(&legacy_version),
+        Err(SnapshotError::UnsupportedVersion { found: 0, .. })
+    ));
+
+    let mut reserved = manifest.serialize_header();
+    reserved[SNAPSHOT_HEADER_SIZE - 1] = 1;
+    assert!(matches!(
+        SnapshotManifest::deserialize_header(&reserved),
+        Err(SnapshotError::MalformedHeader { .. })
+    ));
+
+    let mut zero_sequence = manifest.serialize_header();
+    zero_sequence[10..14].copy_from_slice(&0_u32.to_be_bytes());
+    assert!(matches!(
+        SnapshotManifest::deserialize_header(&zero_sequence),
+        Err(SnapshotError::MalformedHeader { .. })
+    ));
+}
+
+#[test]
+fn snapshot_record_decoder_rejects_overlong_length_varints() {
+    let mut record = vec![NodeObjectType::Ledger as u8];
+    record.extend_from_slice(&[0_u8; 32]);
+    record.extend_from_slice(&[0x80, 0x00]);
+
+    assert!(matches!(
+        decode_node_record(&record, 0, 0),
+        Err(SnapshotError::MalformedNodeRecord { ref reason, .. })
+            if reason == "data_len varint is not canonical"
+    ));
+}
+
+#[test]
+fn snapshot_loader_rejects_bytes_after_authenticated_footer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let snapshot = dir.path().join("trailing.xrpls");
+    let source = make_backend("src-trailing");
+    export_snapshot(source.as_ref(), &test_manifest(), &snapshot).expect("export snapshot");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&snapshot)
+        .expect("open snapshot")
+        .write_all(&[0xA5])
+        .expect("append trailing byte");
+
+    let destination = make_backend("dst-trailing");
+    assert!(matches!(
+        load_snapshot(destination.as_ref(), &snapshot),
+        Err(SnapshotError::TrailingData)
+    ));
+}
+
+struct RejectingBatchBackend {
+    aborted: std::sync::atomic::AtomicBool,
+}
+
+impl RejectingBatchBackend {
+    fn new() -> Self {
+        Self {
+            aborted: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl Backend for RejectingBatchBackend {
+    fn get_name(&self) -> String {
+        "rejecting-batch".to_owned()
+    }
+
+    fn open(&self, _create_if_missing: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn is_open(&self) -> bool {
+        true
+    }
+
+    fn close(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn fetch(&self, _hash: &Uint256) -> (Option<Arc<NodeObject>>, Status) {
+        (None, Status::NotFound)
+    }
+
+    fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status) {
+        (vec![None; hashes.len()], Status::Ok)
+    }
+
+    fn store(&self, _object: Arc<NodeObject>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn store_batch(&self, _batch: &crate::Batch) {}
+
+    fn store_batch_result(&self, _batch: &crate::Batch) -> Result<(), String> {
+        Err("injected batch write failure".to_owned())
+    }
+
+    fn sync(&self) {}
+
+    fn for_each(&self, _callback: &mut dyn FnMut(Arc<NodeObject>)) {}
+
+    fn get_write_load(&self) -> i32 {
+        0
+    }
+
+    fn set_delete_path(&self) {}
+
+    fn fd_required(&self) -> i32 {
+        0
+    }
+
+    fn bulk_import_abort(&self) {
+        self.aborted
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[test]
+fn snapshot_loader_propagates_batch_write_failure_and_aborts_import() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let snapshot = dir.path().join("batch-failure.xrpls");
+    let source = make_backend("src-batch-failure");
+    source
+        .store(Arc::new(NodeObject::new(
+            NodeObjectType::Ledger,
+            vec![1, 2, 3],
+            Uint256::from_array([0xB1; 32]),
+        )))
+        .expect("source store");
+    export_snapshot(source.as_ref(), &test_manifest(), &snapshot).expect("export snapshot");
+
+    let destination = RejectingBatchBackend::new();
+    assert!(matches!(
+        load_snapshot(&destination, &snapshot),
+        Err(SnapshotError::BackendWriteFailed { ref reason })
+            if reason.contains("injected batch write failure")
+    ));
+    assert!(destination.aborted.load(std::sync::atomic::Ordering::Acquire));
 }

@@ -132,6 +132,8 @@ fn nudb_foundation_reads_exact_cpp_shaped_key_header_bytes() {
     assert_eq!(read.salt, 20);
     assert_eq!(read.pepper, nudb_pepper(20));
     assert_eq!(read.block_size, 4096);
+    assert_eq!(read.buckets, 0);
+    assert_eq!(read.modulus, 1);
 }
 
 #[test]

@@ -14,7 +14,7 @@ use crate::message::{
 };
 use crate::overlay_impl::OverlayError;
 use crate::peer::{Peer, PeerId};
-use crate::peer_imp::{PeerImp, SEND_QUEUE_CAPACITY};
+use crate::peer_imp::PeerImp;
 use crate::tuning::{READ_ACTIVITY_DEADLINE, WRITE_DEADLINE};
 
 pub trait PeerSessionStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -87,7 +87,7 @@ impl PeerSessionStarter {
         // Disconnection for sustained large queues is handled by the per-peer
         // 60s timer (largeSendq_ over 4 ticks), not by refusing messages.
         let (sender, receiver) = mpsc::unbounded_channel();
-        let pending = peer.attach_session(sender.clone(), session_stop_tx);
+        let (pending, outbound_queue_depth) = peer.attach_session(sender.clone(), session_stop_tx);
         tracing::debug!(
             target: "overlay",
             peer_id = %peer.id(),
@@ -100,6 +100,7 @@ impl PeerSessionStarter {
                 stream,
                 receiver,
                 pending,
+                outbound_queue_depth,
                 stop_requested,
                 session_stop_rx,
                 hooks,
@@ -115,6 +116,7 @@ struct PeerSession {
     stream: Option<BoxPeerSessionStream>,
     outbound: mpsc::UnboundedReceiver<Message>,
     pending_outbound: Vec<Message>,
+    outbound_queue_depth: Arc<std::sync::atomic::AtomicUsize>,
     stop_requested: watch::Receiver<bool>,
     session_stop: watch::Receiver<bool>,
     hooks: Arc<dyn PeerSessionHooks>,
@@ -171,6 +173,7 @@ impl PeerSession {
         stream: BoxPeerSessionStream,
         outbound: mpsc::UnboundedReceiver<Message>,
         pending_outbound: Vec<Message>,
+        outbound_queue_depth: Arc<std::sync::atomic::AtomicUsize>,
         stop_requested: watch::Receiver<bool>,
         session_stop: watch::Receiver<bool>,
         hooks: Arc<dyn PeerSessionHooks>,
@@ -181,6 +184,7 @@ impl PeerSession {
             stream: Some(stream),
             outbound,
             pending_outbound,
+            outbound_queue_depth,
             stop_requested,
             session_stop,
             hooks,
@@ -241,9 +245,13 @@ impl PeerSession {
 
         let compression = self.peer.compression_enabled();
 
-        // Send any pending outbound messages before splitting
+        // Pending messages remain in the queue depth until their socket write
+        // completes, matching rippled's sendQueue_ ownership.
         for message in self.pending_outbound.drain(..) {
-            write_message_with_deadline(&mut writer, &message, compression).await?;
+            let write_result = write_message_with_deadline(&mut writer, &message, compression).await;
+            self.outbound_queue_depth
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            write_result?;
         }
 
         // Spawn a dedicated writer task — runs independently from the reader.
@@ -257,10 +265,12 @@ impl PeerSession {
         let mut writer_stop = self.stop_requested.clone();
         let mut writer_session_stop = self.session_stop.clone();
         let (writer_dead_tx, mut writer_dead_rx) = watch::channel(false);
+        let outbound_queue_depth = Arc::clone(&self.outbound_queue_depth);
         let writer_task = tokio::spawn(async move {
+            let mut write_failed = false;
             loop {
                 tokio::select! {
-                    biased; // prioritize stop signals
+                    biased; // prioritize shutdown signals
                     changed = writer_stop.changed() => {
                         let _ = changed;
                         break;
@@ -270,21 +280,36 @@ impl PeerSession {
                         break;
                     }
                     Some(message) = outbound_rx.recv() => {
-                        if write_message_with_deadline(&mut writer, &message, compression).await.is_err() {
+                        let write_result = write_message_with_deadline(&mut writer, &message, compression).await;
+                        outbound_queue_depth.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                        if write_result.is_err() {
+                            write_failed = true;
                             break;
                         }
-                        // Drain remaining outbound in one batch
+                        // Drain immediately available work in one batch. A
+                        // message leaves the depth only after its write returns.
                         while let Ok(message) = outbound_rx.try_recv() {
-                            if write_message_with_deadline(&mut writer, &message, compression).await.is_err() {
-                                // Signal reader that writer is dead
-                                let _ = writer_dead_tx.send(true);
-                                return;
+                            let write_result = write_message_with_deadline(&mut writer, &message, compression).await;
+                            outbound_queue_depth.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                            if write_result.is_err() {
+                                write_failed = true;
+                                break;
                             }
                         }
+                        if write_failed {
+                            break;
+                        }
                     }
+                    else => break,
                 }
             }
-            // Signal reader that writer exited
+
+            // `AsyncWrite::shutdown` on the TLS stream sends close_notify.
+            // Bound it so a non-cooperating peer cannot stall application
+            // shutdown after the writer has been told to stop.
+            if !write_failed {
+                let _ = timeout(WRITE_DEADLINE, writer.shutdown()).await;
+            }
             let _ = writer_dead_tx.send(true);
         });
 
@@ -333,8 +358,10 @@ impl PeerSession {
         }
         .await;
 
-        // Abort the writer task when the reader exits
-        writer_task.abort();
+        // Remove the sender and request the writer's graceful TLS shutdown.
+        // Joining it avoids dropping an in-flight close_notify on application
+        // stop and leaves no detached session writer behind.
+        self.peer.detach_session();
         let _ = writer_task.await;
 
         read_result
@@ -588,6 +615,7 @@ mod tests {
             })
         ));
         assert!(peer.queued_messages().is_empty());
+        assert_eq!(peer.send_queue_size(), 0);
 
         let live = Message::new(
             ProtocolMessage::new(ProtocolPayload::Ping(TmPing {
@@ -644,6 +672,58 @@ mod tests {
         let _ = stop_requested.send(true);
         handle.await.expect("session join").expect("session");
         assert!(hooks.closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn peer_session_queue_depth_includes_a_message_until_its_write_completes() {
+        let peer = peer(2);
+        let (local, mut remote) = duplex(1);
+        let (stop_requested, stop_rx) = watch::channel(false);
+        let session = PeerSessionStarter::new(Box::new(local), stop_rx);
+        let handle = session.start(
+            Arc::clone(&peer),
+            Arc::new(NoopPeerSessionHooks),
+            Arc::new(move |_peer_id: PeerId| {}),
+        );
+        let message = Message::new(
+            ProtocolMessage::new(ProtocolPayload::Transaction(TmTransaction {
+                raw_transaction: vec![0x55; 1024],
+                status: 1,
+                receive_timestamp: None,
+                deferred: None,
+            })),
+            None,
+        );
+        let wire_len = message.get_buffer_size();
+        peer.send(message);
+
+        // Reading one byte proves the writer started. The tiny duplex still
+        // blocks write_all for the remaining frame, so depth must remain one.
+        let mut first_byte = [0; 1];
+        timeout(Duration::from_secs(1), remote.read_exact(&mut first_byte))
+            .await
+            .expect("writer starts blocked socket write")
+            .expect("first blocked-write byte");
+        assert_eq!(peer.send_queue_size(), 1);
+
+        let mut remaining_wire = vec![0; wire_len - first_byte.len()];
+        remote
+            .read_exact(&mut remaining_wire)
+            .await
+            .expect("drain blocked write");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if peer.send_queue_size() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queue depth falls after write completion");
+
+        let _ = stop_requested.send(true);
+        handle.await.expect("session join").expect("session");
     }
 
     #[tokio::test]

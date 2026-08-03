@@ -66,7 +66,7 @@ impl BuildLedgerJournal for NullBuildLedgerJournal {
 pub trait BuildLedgerView {
     fn open(&self) -> bool;
     fn tx_count(&self) -> usize;
-    fn apply_to_ledger(self, ledger: &mut Ledger);
+    fn apply_to_ledger(self, ledger: &mut Ledger) -> Result<(), BuildLedgerError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +136,8 @@ impl From<LedgerTxReadError> for LedgerReplayError {
 pub enum BuildLedgerError {
     Mutation(MutationError),
     Traversal(TraversalError),
+    Persist(String),
+    View(String),
 }
 
 impl From<MutationError> for BuildLedgerError {
@@ -247,8 +249,8 @@ where
     J: BuildLedgerJournal,
     CreateView: FnOnce(&Ledger) -> V,
     Apply: FnMut(&mut V, &Arc<STTx>, bool, ApplyFlags) -> Result<ApplyTransactionResult, String>,
-    FlushState: FnMut(&mut Ledger) -> usize,
-    FlushTx: FnMut(&mut Ledger) -> usize,
+    FlushState: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
+    FlushTx: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
     Unshare: FnMut(&mut Ledger),
 {
     journal.debug(&format!(
@@ -316,8 +318,8 @@ where
     V: BuildLedgerView,
     J: BuildLedgerJournal,
     CreateView: FnOnce(&Ledger) -> V,
-    FlushState: FnMut(&mut Ledger) -> usize,
-    FlushTx: FnMut(&mut Ledger) -> usize,
+    FlushState: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
+    FlushTx: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
     Unshare: FnMut(&mut Ledger),
 {
     build_ledger_impl(
@@ -349,8 +351,8 @@ where
     J: BuildLedgerJournal,
     CreateView: FnOnce(&Ledger) -> V,
     Apply: FnMut(&mut V, &Arc<STTx>, ApplyFlags),
-    FlushState: FnMut(&mut Ledger) -> usize,
-    FlushTx: FnMut(&mut Ledger) -> usize,
+    FlushState: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
+    FlushTx: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
     Unshare: FnMut(&mut Ledger),
 {
     let replay_ledger = replay_data.replay();
@@ -393,8 +395,8 @@ where
     V: BuildLedgerView,
     J: BuildLedgerJournal,
     CreateView: FnOnce(&Ledger) -> V,
-    FlushState: FnMut(&mut Ledger) -> usize,
-    FlushTx: FnMut(&mut Ledger) -> usize,
+    FlushState: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
+    FlushTx: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
     Unshare: FnMut(&mut Ledger),
     ApplyTxs: FnOnce(&mut V, &Ledger, &J),
 {
@@ -407,12 +409,12 @@ where
     let mut accum = create_view(&built);
     assert!(!accum.open(), "xrpl::buildLedgerImpl : valid ledger state");
     apply_txs(&mut accum, &built, journal);
-    accum.apply_to_ledger(&mut built);
+    accum.apply_to_ledger(&mut built)?;
 
     built.update_skip_list()?;
     let flush_report = BuildLedgerFlushReport {
-        account_state_nodes: flush_state(&mut built),
-        transaction_nodes: flush_tx(&mut built),
+        account_state_nodes: flush_state(&mut built)?,
+        transaction_nodes: flush_tx(&mut built)?,
     };
     journal.debug(&format!(
         "Flushed {} accounts and {} transaction nodes",

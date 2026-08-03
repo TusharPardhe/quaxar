@@ -23,6 +23,7 @@ use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub const CRAWL_OPTION_DISABLED: u32 = 0;
@@ -33,6 +34,10 @@ pub const CRAWL_OPTION_UNL: u32 = 1 << 3;
 
 const DEFAULT_REDUCE_RELAY_WAIT: Duration = Duration::from_secs(600);
 const PEERFINDER_MAX_CONNECT_ATTEMPTS: usize = 20;
+// `OverlayImpl::Timer::onTimer` calls `Logic::autoconnect()` every second.
+// This is deliberately distinct from the currently-unused
+// `PeerFinder::Tuning::kSecondsPerConnect` declaration in local rippled.
+const PEERFINDER_AUTOCONNECT_INTERVAL: Duration = Duration::from_secs(1);
 const PEERFINDER_MAX_REDIRECTS: usize = 30;
 const PEERFINDER_MAX_HOPS: u32 = 6;
 const PEERFINDER_BOOTCACHE_SIZE: usize = 1_000;
@@ -327,6 +332,38 @@ fn bootstrap_can_dial_bootcache(
     auto_connect && bootstrap_needs_bootcache_dial(active_outbound_peers, target_outbound_peers)
 }
 
+/// `PeerFinder::Counts::attemptsNeeded` applies one global cap to every
+/// outbound stage. It intentionally does not shrink a batch to the number of
+/// normal outbound slots still needed: fixed slots are exempt from that target
+/// and normal attempts can race to the activation gate.
+fn peerfinder_attempt_budget(pending_outbound_attempts: usize) -> usize {
+    PEERFINDER_MAX_CONNECT_ATTEMPTS.saturating_sub(pending_outbound_attempts)
+}
+
+/// `Logic::autoconnect` returns immediately after a fixed batch, and also
+/// waits while the fixed set remains below its target but any outbound attempt
+/// is still in progress. This prevents livecache and bootcache dials from
+/// jumping ahead of fixed peers.
+fn fixed_stage_blocks_automatic_dials(
+    active_fixed_peers: usize,
+    fixed_peer_slots: usize,
+    fixed_attempts_started: usize,
+    pending_outbound_attempts: usize,
+) -> bool {
+    active_fixed_peers < fixed_peer_slots
+        && (fixed_attempts_started > 0 || pending_outbound_attempts > 0)
+}
+
+/// Livecache has the same stage barrier before bootcache fallback: when it
+/// supplied a batch, or an earlier batch is in flight, `Logic::autoconnect`
+/// returns rather than mixing bootcache addresses into the same cycle.
+fn livecache_stage_blocks_bootcache(
+    livecache_attempts_started: usize,
+    pending_outbound_attempts: usize,
+) -> bool {
+    livecache_attempts_started > 0 || pending_outbound_attempts > 0
+}
+
 fn fixed_retry_delay(failures: usize) -> Duration {
     let index = failures.min(FIXED_CONNECTION_BACKOFF_MINUTES.len().saturating_sub(1));
     Duration::from_secs(FIXED_CONNECTION_BACKOFF_MINUTES[index] * 60)
@@ -501,6 +538,7 @@ pub struct AppOverlayRuntime {
     network_ops_mode_owner: Option<AppNetworkOpsModeOwner>,
     status_rpc_state: Option<Arc<StatusRpcState>>,
     listener_task: Mutex<Option<tokio::task::JoinHandle<Result<(), overlay::OverlayError>>>>,
+    peerfinder_thread: Mutex<Option<JoinHandle<()>>>,
     started: AtomicBool,
     stopped: AtomicBool,
 }
@@ -548,6 +586,7 @@ impl AppOverlayRuntime {
             network_ops_mode_owner,
             status_rpc_state,
             listener_task: Mutex::new(None),
+            peerfinder_thread: Mutex::new(None),
             started: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
         }
@@ -597,10 +636,52 @@ impl ManagedComponent for AppOverlayRuntime {
             return Ok(());
         }
 
-        let runtime_handle = tokio::runtime::Handle::try_current().map_err(|_| {
+        tokio::runtime::Handle::try_current().map_err(|_| {
             self.started.store(false, Ordering::Release);
             "overlay runtime requires an active tokio runtime before start".to_owned()
         })?;
+
+        let overlay = Arc::clone(&self.overlay);
+        let fixed_endpoints = self.fixed_peer_endpoints.clone();
+        let endpoints = self.bootstrap_peer_endpoints.clone();
+        let peerfinder_bootcache_path = self.peerfinder_bootcache_path.clone();
+        let network_ops_mode_owner = self.network_ops_mode_owner.clone();
+        let status_rpc_state = self.status_rpc_state.clone();
+        let target_outbound_peers = overlay.peer_limits().outbound_max;
+        let auto_connect = self.bootstrap_can_dial_bootcache;
+        let peerfinder_thread = std::thread::Builder::new()
+            .name("xrpld-peerfinder".to_owned())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        tracing::error!(target: "peerfinder", %error,
+                            "PeerFinder runtime failed to start");
+                        return;
+                    }
+                };
+                runtime.block_on(run_live_peerfinder(
+                    overlay,
+                    fixed_endpoints,
+                    endpoints,
+                    peerfinder_bootcache_path,
+                    auto_connect,
+                    target_outbound_peers,
+                    network_ops_mode_owner,
+                    status_rpc_state,
+                ));
+            })
+            .map_err(|error| {
+                self.rollback_started(format!("PeerFinder worker start failed: {error}"))
+            })?;
+        *self
+            .peerfinder_thread
+            .lock()
+            .expect("overlay PeerFinder worker mutex must not be poisoned") =
+            Some(peerfinder_thread);
 
         if let Some(listener_setup) = self.listener_setup.as_ref()
             && !self.server_owns_listener
@@ -631,24 +712,6 @@ impl ManagedComponent for AppOverlayRuntime {
                 .expect("overlay listener task mutex must not be poisoned") = Some(task);
         }
 
-        let overlay = Arc::clone(&self.overlay);
-        let fixed_endpoints = self.fixed_peer_endpoints.clone();
-        let endpoints = self.bootstrap_peer_endpoints.clone();
-        let peerfinder_bootcache_path = self.peerfinder_bootcache_path.clone();
-        let network_ops_mode_owner = self.network_ops_mode_owner.clone();
-        let status_rpc_state = self.status_rpc_state.clone();
-        let target_outbound_peers = overlay.peer_limits().outbound_max;
-        runtime_handle.spawn(run_live_peerfinder(
-            overlay,
-            fixed_endpoints,
-            endpoints,
-            peerfinder_bootcache_path,
-            self.bootstrap_can_dial_bootcache,
-            target_outbound_peers,
-            network_ops_mode_owner,
-            status_rpc_state,
-        ));
-
         Ok(())
     }
 
@@ -663,6 +726,15 @@ impl ManagedComponent for AppOverlayRuntime {
         {
             task.abort();
         }
+        if let Some(worker) = self
+            .peerfinder_thread
+            .lock()
+            .expect("overlay PeerFinder worker mutex must not be poisoned")
+            .take()
+        {
+            let _ = worker.join();
+        }
+        self.overlay.wait_for_session_shutdown();
     }
 
     fn fd_required(&self) -> usize {
@@ -678,6 +750,23 @@ impl ManagedComponent for AppOverlayRuntime {
 
 impl AppOverlayRuntime {
     fn rollback_started(&self, error: String) -> String {
+        self.overlay.signal_stop();
+        if let Some(task) = self
+            .listener_task
+            .lock()
+            .expect("overlay listener task mutex must not be poisoned")
+            .take()
+        {
+            task.abort();
+        }
+        if let Some(worker) = self
+            .peerfinder_thread
+            .lock()
+            .expect("overlay PeerFinder worker mutex must not be poisoned")
+            .take()
+        {
+            let _ = worker.join();
+        }
         self.started.store(false, Ordering::Release);
         error
     }
@@ -696,6 +785,10 @@ enum PeerfinderConnectionEvent {
         address: SocketAddr,
         fixed: bool,
         peers: Vec<SocketAddr>,
+    },
+    Closed {
+        address: SocketAddr,
+        fixed: bool,
     },
 }
 
@@ -761,8 +854,11 @@ fn spawn_peerfinder_connect(
     fixed: bool,
     results: tokio::sync::mpsc::UnboundedSender<PeerfinderConnectionEvent>,
 ) {
+    // Register the attempt synchronously before spawning, so successive fixed
+    // endpoints that resolve to the same IP cannot both start a dial.
+    let connect = overlay.connect(address);
     tokio::spawn(async move {
-        match overlay.connect(address).await {
+        match connect.await {
             Ok(mut result) => {
                 if let Some(session) = result.session.take() {
                     overlay.spawn_peer_session(Arc::clone(&result.peer), session);
@@ -770,6 +866,10 @@ fn spawn_peerfinder_connect(
                 tracing::info!(target: "overlay", %address, peer_id = result.peer.id(), fixed,
                     "PeerFinder connected");
                 let _ = results.send(PeerfinderConnectionEvent::Success { address, fixed });
+            }
+            Err(overlay::ConnectAttemptError::DuplicateOutboundAttempt) => {
+                tracing::debug!(target: "overlay", %address, fixed,
+                    "PeerFinder duplicate endpoint dial suppressed");
             }
             Err(overlay::ConnectAttemptError::Redirect(peers)) => {
                 tracing::info!(target: "overlay", %address, redirect_count = peers.len(), fixed,
@@ -803,8 +903,16 @@ async fn run_live_peerfinder(
     let mut recent_attempts = HashMap::<IpAddr, Instant>::new();
     let mut fixed_retry_state = HashMap::<SocketAddr, (usize, Instant)>::new();
     let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut next_connect = Instant::now();
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    let outbound_failure_tx = result_tx.clone();
+    overlay.set_outbound_peer_failure_handler(move |address, fixed| {
+        let _ = outbound_failure_tx.send(PeerfinderConnectionEvent::Failure { address, fixed });
+    });
+    let outbound_close_tx = result_tx.clone();
+    overlay.set_outbound_peer_close_handler(move |address, fixed| {
+        let _ = outbound_close_tx.send(PeerfinderConnectionEvent::Closed { address, fixed });
+    });
+    let mut ticker = tokio::time::interval(PEERFINDER_AUTOCONNECT_INTERVAL);
+    let mut stop_requested = overlay.stop_receiver();
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // rippled arms its first periodic callback 1 second after setup
     // (OverlayImpl.cpp:131-161). tokio::time::interval fires immediately;
@@ -812,7 +920,17 @@ async fn run_live_peerfinder(
     ticker.tick().await;
 
     while !overlay.is_stopping() {
-        ticker.tick().await;
+        tokio::select! {
+            biased;
+            changed = stop_requested.changed() => {
+                let _ = changed;
+                break;
+            }
+            _ = ticker.tick() => {}
+        }
+        if overlay.is_stopping() {
+            break;
+        }
         let now = Instant::now();
         refresh_peer_count_and_operating_mode(
             overlay.as_ref(),
@@ -848,6 +966,16 @@ async fn run_live_peerfinder(
                             .insert(address, (failures, now + fixed_retry_delay(failures)));
                     }
                 }
+                PeerfinderConnectionEvent::Closed { address, fixed } => {
+                    // Mirrors PeerFinder::onClosed(slot): release the live
+                    // connection/attempt state without recording a valence
+                    // failure. A fixed peer is eligible for its normal retry
+                    // policy immediately after its slot disappears.
+                    recent_attempts.remove(&address.ip());
+                    if fixed {
+                        fixed_retry_state.remove(&address);
+                    }
+                }
                 PeerfinderConnectionEvent::Redirect {
                     address,
                     fixed,
@@ -871,28 +999,50 @@ async fn run_live_peerfinder(
             }
         }
 
-        if now >= next_connect {
-            for endpoint in &fixed_endpoints {
-                let Ok(addresses) = tokio::net::lookup_host(endpoint).await else {
-                    tracing::info!(target: "overlay", %endpoint,
-                        "PeerFinder failed to resolve fixed endpoint");
-                    continue;
-                };
-                let addresses = addresses.collect::<Vec<_>>();
-                overlay.remember_fixed_peer_endpoints(addresses.iter().copied());
-                for address in addresses {
-                    if fixed_retry_state_or_due(&fixed_retry_state, address, now).1 > now {
-                        continue;
-                    }
-                    spawn_peerfinder_connect(
-                        Arc::clone(&overlay),
-                        address,
-                        true,
-                        result_tx.clone(),
-                    );
+        // OverlayImpl::Timer invokes PeerFinder::autoconnect every second.
+        // `Logic::autoconnect` gives fixed peers the first chance to spend
+        // the one global 20-attempt budget, and does not enter automatic
+        // livecache/bootcache selection while fixed work remains in flight.
+        let mut fixed_attempts_started = 0;
+        let mut fixed_addresses = Vec::new();
+        for endpoint in &fixed_endpoints {
+            let Ok(addresses) = tokio::net::lookup_host(endpoint).await else {
+                tracing::info!(target: "overlay", %endpoint,
+                    "PeerFinder failed to resolve fixed endpoint");
+                continue;
+            };
+            let addresses = addresses.collect::<Vec<_>>();
+            overlay.remember_fixed_peer_endpoints(addresses.iter().copied());
+            fixed_addresses.extend(addresses);
+        }
+        let active_fixed_peers = overlay.active_fixed_peers_count();
+        let fixed_peer_slots = overlay.fixed_peer_slot_count();
+        if active_fixed_peers < fixed_peer_slots {
+            let mut attempt_budget = peerfinder_attempt_budget(overlay.pending_outbound_attempts());
+            for address in fixed_addresses {
+                if attempt_budget == 0 {
+                    break;
                 }
+                if fixed_retry_state_or_due(&fixed_retry_state, address, now).1 > now
+                    || overlay.outbound_endpoint_is_active_or_pending(address)
+                {
+                    continue;
+                }
+                // `connect` reserves the IP synchronously, so the next
+                // iteration observes same-IP fixed aliases as pending.
+                spawn_peerfinder_connect(Arc::clone(&overlay), address, true, result_tx.clone());
+                fixed_attempts_started += 1;
+                attempt_budget -= 1;
             }
+        }
 
+        let fixed_stage_blocks_automatic = fixed_stage_blocks_automatic_dials(
+            active_fixed_peers,
+            fixed_peer_slots,
+            fixed_attempts_started,
+            overlay.pending_outbound_attempts(),
+        );
+        if !fixed_stage_blocks_automatic {
             if auto_connect {
                 for endpoint in &bootstrap_endpoints {
                     let Ok(addresses) = tokio::net::lookup_host(endpoint).await else {
@@ -913,23 +1063,11 @@ async fn run_live_peerfinder(
                     .into_iter()
                     .map(|peer| peer.remote_address().ip())
                     .collect::<BTreeSet<_>>();
-                let attempt_budget = PEERFINDER_MAX_CONNECT_ATTEMPTS
-                    .saturating_sub(overlay.pending_outbound_attempts())
-                    .min(target_outbound_peers.saturating_sub(active_outbound));
-                let selected =
+                let attempt_budget = peerfinder_attempt_budget(overlay.pending_outbound_attempts());
+                let livecache_candidates =
                     caches.select_livecache(&connected_ips, &recent_attempts, now, attempt_budget);
-                let selected = if selected.is_empty() {
-                    select_bootcache_endpoints(
-                        &connected_ips,
-                        &caches.bootcache,
-                        &recent_attempts,
-                        now,
-                        attempt_budget,
-                    )
-                } else {
-                    selected
-                };
-                for address in selected {
+                let livecache_attempts_started = livecache_candidates.len();
+                for address in livecache_candidates {
                     recent_attempts.insert(address.ip(), now + PEERFINDER_RECENT_ATTEMPT_DURATION);
                     spawn_peerfinder_connect(
                         Arc::clone(&overlay),
@@ -938,8 +1076,30 @@ async fn run_live_peerfinder(
                         result_tx.clone(),
                     );
                 }
+
+                if !livecache_stage_blocks_bootcache(
+                    livecache_attempts_started,
+                    overlay.pending_outbound_attempts(),
+                ) {
+                    let bootcache_candidates = select_bootcache_endpoints(
+                        &connected_ips,
+                        &caches.bootcache,
+                        &recent_attempts,
+                        now,
+                        peerfinder_attempt_budget(overlay.pending_outbound_attempts()),
+                    );
+                    for address in bootcache_candidates {
+                        recent_attempts
+                            .insert(address.ip(), now + PEERFINDER_RECENT_ATTEMPT_DURATION);
+                        spawn_peerfinder_connect(
+                            Arc::clone(&overlay),
+                            address,
+                            false,
+                            result_tx.clone(),
+                        );
+                    }
+                }
             }
-            next_connect = now + Duration::from_secs(10);
         }
 
         if let Some(entries) = caches.take_update_if_due(now, false)
@@ -1041,13 +1201,7 @@ pub fn build_overlay_runtime(
                     .is_some_and(|listener| port.ip == listener.ip && port.port == listener.port)
         })
     });
-    let peer_limit_sections_configured = config.exists("peers_max")
-        || config.exists("peers_in_max")
-        || config.exists("peers_out_max");
     if let Some(listener) = listener_setup.as_ref() {
-        if !peer_limit_sections_configured {
-            setup.peer_limit = listener.limit as usize;
-        }
         setup.server_config = build_overlay_server_config(listener)?;
         setup.server_ssl_acceptor = build_overlay_ssl_acceptor(listener)?;
     }
@@ -1541,12 +1695,14 @@ mod tests {
     use super::{
         BOOTCACHE_STATIC_VALENCE, BootcacheEntry, BootstrapOverlayHandoff, CRAWL_OPTION_DISABLED,
         CRAWL_OPTION_OVERLAY, CRAWL_OPTION_SERVER_COUNTS, CRAWL_OPTION_SERVER_INFO,
-        CRAWL_OPTION_UNL, PeerfinderCaches, bootcache_on_failure, bootcache_on_success,
-        bootstrap_can_dial_bootcache, bootstrap_needs_bootcache_dial, build_overlay_runtime,
-        build_overlay_setup, default_overlay_client_config, fixed_retry_state_or_due, is_public_ip,
-        load_peerfinder_caches, overlay_server_config, parse_bootstrap_peer_endpoints,
-        parse_fixed_peer_ips, parse_peer_endpoints, peerfinder_outbound_target,
-        persist_peerfinder_bootcache, remember_bootcache_endpoint, select_bootcache_endpoints,
+        CRAWL_OPTION_UNL, PEERFINDER_AUTOCONNECT_INTERVAL, PeerfinderCaches, bootcache_on_failure,
+        bootcache_on_success, bootstrap_can_dial_bootcache, bootstrap_needs_bootcache_dial,
+        build_overlay_runtime, build_overlay_setup, default_overlay_client_config,
+        fixed_retry_state_or_due, fixed_stage_blocks_automatic_dials, is_public_ip,
+        livecache_stage_blocks_bootcache, load_peerfinder_caches, overlay_server_config,
+        parse_bootstrap_peer_endpoints, parse_fixed_peer_ips, parse_peer_endpoints,
+        peerfinder_attempt_budget, peerfinder_outbound_target, persist_peerfinder_bootcache,
+        remember_bootcache_endpoint, select_bootcache_endpoints,
     };
     use crate::runtime::main_runtime::ManagedComponent;
     use basics::basic_config::BasicConfig;
@@ -1797,6 +1953,13 @@ tx_min_peers = 9
         runtime.stop();
         assert!(runtime.stopped());
         assert!(runtime.overlay().is_stopping());
+        assert!(
+            runtime
+                .peerfinder_thread
+                .lock()
+                .expect("peerfinder worker lock")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1875,6 +2038,45 @@ tx_min_peers = 9
         assert!(bootstrap_can_dial_bootcache(true, 5, 10));
         assert!(!bootstrap_can_dial_bootcache(true, 10, 10));
         assert!(!bootstrap_can_dial_bootcache(false, 0, 10));
+    }
+
+    #[test]
+    fn peerfinder_autoconnect_matches_reference_overlay_timer_cadence() {
+        // Local rippled OverlayImpl::Timer::onTimer invokes autoConnect once
+        // per one-second timer firing; the unused tuning declaration does not
+        // introduce a ten-second scheduler gate.
+        assert_eq!(PEERFINDER_AUTOCONNECT_INTERVAL, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn peerfinder_attempt_budget_is_global_not_outbound_target_limited() {
+        // PeerFinder::Counts::attemptsNeeded only subtracts active connect
+        // attempts from kMaxConnectAttempts. It does not subtract the normal
+        // outbound target deficit, because fixed slots are exempt and normal
+        // attempts race to activation admission.
+        assert_eq!(peerfinder_attempt_budget(0), 20);
+        assert_eq!(peerfinder_attempt_budget(19), 1);
+        assert_eq!(peerfinder_attempt_budget(20), 0);
+        assert_eq!(peerfinder_attempt_budget(21), 0);
+    }
+
+    #[test]
+    fn fixed_stage_blocks_live_and_bootcache_until_its_batch_resolves() {
+        // Logic::autoconnect returns after emitting fixed endpoints, and also
+        // returns if no fixed endpoint is eligible while an attempt exists.
+        assert!(fixed_stage_blocks_automatic_dials(0, 2, 1, 1));
+        assert!(fixed_stage_blocks_automatic_dials(0, 2, 0, 1));
+        assert!(!fixed_stage_blocks_automatic_dials(0, 2, 0, 0));
+        assert!(!fixed_stage_blocks_automatic_dials(2, 2, 0, 1));
+    }
+
+    #[test]
+    fn livecache_stage_blocks_bootcache_fallback_until_attempts_resolve() {
+        // Logic::autoconnect returns after a livecache handout, and waits on
+        // an existing outbound attempt when no livecache address is eligible.
+        assert!(livecache_stage_blocks_bootcache(1, 1));
+        assert!(livecache_stage_blocks_bootcache(0, 1));
+        assert!(!livecache_stage_blocks_bootcache(0, 0));
     }
 
     #[test]

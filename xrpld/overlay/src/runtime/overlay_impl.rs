@@ -19,7 +19,7 @@ use protocol::{
     sha512_half as protocol_sha512_half, sign_digest,
 };
 use rand::seq::SliceRandom;
-use resource::{NullCollector, NullJournal, ResourceManager, make_manager};
+use resource::{Consumer, Disposition, NullCollector, NullJournal, ResourceManager, make_manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -34,7 +34,7 @@ use crate::connect_attempt::{
 use crate::handshake::{
     FEATURE_COMPR, FEATURE_LEDGER_REPLAY, FEATURE_TXRR, HandshakeContext,
     HandshakeVerificationContext, feature_enabled, is_feature_value, make_response,
-    parse_http_request, serialize_response, verify_handshake,
+    negotiate_inbound_peer_upgrade, parse_http_request, serialize_response, verify_handshake,
 };
 use crate::inbound::{
     OverlayInboundHandler, OverlayInboundSnapshot, QueuedEndpoint, QueuedEndpoints,
@@ -68,6 +68,12 @@ const PEERFINDER_MAX_ACCEPTED_ENDPOINTS: usize = 64;
 const PEERFINDER_REDIRECT_ENDPOINT_COUNT: usize = 10;
 const PEERFINDER_LIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 const PEERFINDER_SECONDS_PER_MESSAGE: Duration = Duration::from_secs(151);
+/// rippled `SSLHTTPPeer::doHandshake` arms the BaseHTTPPeer deadline before
+/// accepting TLS. Keep an equivalent bound around both inbound transport
+/// phases so one silent socket cannot retain an admission slot indefinitely.
+const INBOUND_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const INBOUND_HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const INBOUND_TLS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
 struct RedirectEndpoint {
@@ -82,6 +88,103 @@ fn canonical_peer_ip(ip: IpAddr) -> IpAddr {
             .map(IpAddr::V4)
             .unwrap_or(IpAddr::V6(ipv6)),
         IpAddr::V4(_) => ip,
+    }
+}
+
+/// An accepted TCP connection owns this reservation before TLS and HTTP work.
+/// It holds the inbound Resource consumer and an IP admission count until the
+/// connection is rejected or the consumer is transferred to its active peer.
+#[derive(Default)]
+struct InboundReservations {
+    by_ip: HashMap<IpAddr, usize>,
+}
+
+struct InboundReservation {
+    reservations: Arc<Mutex<InboundReservations>>,
+    /// PeerFinder applies `ipLimit` only to public remote addresses. Private
+    /// remotes still retain their Resource consumer, but carry no IP slot.
+    remote_ip: Option<IpAddr>,
+    consumer: Option<Consumer>,
+}
+
+impl InboundReservation {
+    fn into_consumer(mut self) -> Consumer {
+        let consumer = self
+            .consumer
+            .take()
+            .expect("inbound reservation must own a resource consumer");
+        self.release_ip();
+        consumer
+    }
+
+    fn release_ip(&mut self) {
+        let Some(remote_ip) = self.remote_ip.take() else {
+            return;
+        };
+        let mut reservations = self.reservations.lock().expect("inbound reservation lock");
+        let count = reservations
+            .by_ip
+            .get_mut(&remote_ip)
+            .expect("inbound reservation IP must exist");
+        *count -= 1;
+        if *count == 0 {
+            reservations.by_ip.remove(&remote_ip);
+        }
+    }
+}
+
+impl Drop for InboundReservation {
+    fn drop(&mut self) {
+        if self.consumer.is_some() {
+            self.release_ip();
+        }
+    }
+}
+
+/// An outbound attempt occupies its endpoint reservation until the attempt
+/// either fails or has atomically established an active peer. Drop covers
+/// cancellation and every asynchronous error path.
+struct OutboundAttemptReservation {
+    attempts: Arc<Mutex<HashSet<IpAddr>>>,
+    remote_ip: IpAddr,
+}
+
+#[derive(Default)]
+struct SessionTaskTracker {
+    active: Mutex<usize>,
+    drained: std::sync::Condvar,
+}
+
+impl SessionTaskTracker {
+    fn begin(&self) {
+        *self.active.lock().expect("overlay session task lock") += 1;
+    }
+
+    fn complete(&self) {
+        let mut active = self.active.lock().expect("overlay session task lock");
+        *active = active.saturating_sub(1);
+        if *active == 0 {
+            self.drained.notify_all();
+        }
+    }
+
+    fn wait_for_drain(&self) {
+        let mut active = self.active.lock().expect("overlay session task lock");
+        while *active != 0 {
+            active = self
+                .drained
+                .wait(active)
+                .expect("overlay session task condvar");
+        }
+    }
+}
+
+impl Drop for OutboundAttemptReservation {
+    fn drop(&mut self) {
+        self.attempts
+            .lock()
+            .expect("overlay pending outbound lock")
+            .remove(&self.remote_ip);
     }
 }
 
@@ -696,6 +799,10 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid get_ledger itype");
             return self.reject_malformed("invalid get_ledger type");
         }
+        // Verify ledger type (ltACCEPTED through ltCLOSED).
+        if message.ltype.is_some_and(|ltype| !(0..=2).contains(&ltype)) {
+            return self.reject_malformed("invalid get_ledger ledger type");
+        }
         if message.itype == 3 {
             if message
                 .ledger_hash
@@ -720,9 +827,21 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         }
         if message.itype != 0
             && (message.node_i_ds.is_empty()
-                || message.node_i_ds.iter().any(|node_id| node_id.is_empty()))
+                || message
+                    .node_i_ds
+                    .iter()
+                    .any(|node_id| !is_valid_shamap_node_id_wire(node_id)))
         {
             return self.reject_malformed("get_ledger invalid node ids");
+        }
+        // rippled accepts only qtINDIRECT when querytype is present.
+        if message.query_type.is_some_and(|query_type| query_type != 0) {
+            return self.reject_malformed("get_ledger invalid query type");
+        }
+        if message.query_depth.is_some_and(|depth| {
+            depth > crate::tuning::MAX_QUERY_DEPTH as u32 || message.itype == 0
+        }) {
+            return self.reject_malformed("get_ledger invalid query depth");
         }
 
         self.overlay
@@ -935,6 +1054,24 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         &mut self,
         message: &crate::message::TmGetObjectByHash,
     ) -> crate::router::RouteAction {
+        // Match PeerImp::onMessage(TMGetObjectByHash): the transaction-query
+        // branch is selected before the generic ledger-hash validation. A
+        // transaction-set query does not use that ledger selector, so rejecting
+        // it here would incorrectly prevent the requested-tx job from running.
+        if message.r#type == 7 {
+            if !self.peer.tx_reduce_relay_enabled() {
+                return self.reject_malformed("tx reduce-relay disabled");
+            }
+            tracing::trace!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Transaction get-objects query"
+            );
+            self.overlay
+                .inbound_handler
+                .on_get_objects(self.peer, message.clone());
+            return crate::router::RouteAction::Continue;
+        }
         if message
             .ledger_hash
             .as_deref()
@@ -942,9 +1079,6 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         {
             tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid get_objects ledger hash");
             return self.reject_malformed("get_objects malformed ledger hash");
-        }
-        if message.r#type == 7 && !self.peer.tx_reduce_relay_enabled() {
-            return crate::router::RouteAction::Continue;
         }
         tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Get objects request");
         self.overlay
@@ -1099,6 +1233,18 @@ impl MessageRouter for OverlayInboundRouter<'_> {
     }
 }
 
+fn request_connects_as_peer(request: &Request<()>) -> bool {
+    request
+        .headers()
+        .get("Connect-As")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|values| {
+            values
+                .split(',')
+                .any(|value| value.trim().eq_ignore_ascii_case("peer"))
+        })
+}
+
 fn is_valid_peer_endpoint(endpoint: SocketAddr) -> bool {
     endpoint.port() != 0
         && !endpoint.ip().is_unspecified()
@@ -1106,7 +1252,28 @@ fn is_valid_peer_endpoint(endpoint: SocketAddr) -> bool {
         && is_public_ip(endpoint.ip())
 }
 
+/// Structural equivalent of SHAMapNodeId::deserialize_shamap_node_id without
+/// adding an overlay-to-SHAMap crate dependency. The wire form is 32 masked
+/// key bytes followed by depth; bits below the selected depth must be zero.
+fn is_valid_shamap_node_id_wire(data: &[u8]) -> bool {
+    if data.len() != 33 {
+        return false;
+    }
+    let depth = data[32] as usize;
+    if depth > 64 {
+        return false;
+    }
+    let full_bytes = depth / 2;
+    if depth % 2 == 0 {
+        data[full_bytes..32].iter().all(|byte| *byte == 0)
+    } else {
+        data[full_bytes] & 0x0f == 0 && data[full_bytes + 1..32].iter().all(|byte| *byte == 0)
+    }
+}
+
 type ManifestsMessageProvider = Arc<dyn Fn() -> Option<ProtocolMessage> + Send + Sync>;
+type OutboundPeerFailureHandler = Arc<dyn Fn(SocketAddr, bool) + Send + Sync>;
+type OutboundPeerCloseHandler = Arc<dyn Fn(SocketAddr, bool) + Send + Sync>;
 
 pub struct OverlayImpl {
     setup: Setup,
@@ -1135,12 +1302,23 @@ pub struct OverlayImpl {
     inbound_handler: Arc<dyn OverlayInboundHandler>,
     redirect_endpoints: Arc<Mutex<HashMap<SocketAddr, RedirectEndpoint>>>,
     pending_outbound_ips: Arc<Mutex<HashSet<IpAddr>>>,
+    inbound_reservations: Arc<Mutex<InboundReservations>>,
     peer_status_publisher: Arc<RwLock<Option<PeerStatusPublisher>>>,
     /// Hashes from the current local closed ledger and its parent, included in
     /// every outbound HTTP upgrade request like rippled's makeHandshake.
     handshake_ledgers: Arc<RwLock<Option<(Uint256, Uint256)>>>,
     /// Cached manifest message provider installed by the app state owner.
     manifests_message_provider: Arc<RwLock<Option<ManifestsMessageProvider>>>,
+    /// App-owned PeerFinder failure sink for outbound peers that remain Not
+    /// Useful. Overlay retains only this callback, never PeerFinder state.
+    outbound_peer_failure_handler: Arc<RwLock<Option<OutboundPeerFailureHandler>>>,
+    /// App-owned PeerFinder close sink. Normal closure releases endpoint
+    /// attempt suppression without lowering bootcache valence.
+    outbound_peer_close_handler: Arc<RwLock<Option<OutboundPeerCloseHandler>>>,
+    /// Counts accepted inbound transports and active peer sessions through
+    /// their final close. AppOverlayRuntime waits for this owner after
+    /// broadcasting stop.
+    session_tasks: Arc<SessionTaskTracker>,
     session_runtime: Arc<tokio::runtime::Runtime>,
 }
 
@@ -1231,9 +1409,13 @@ impl OverlayImpl {
             inbound_handler,
             redirect_endpoints: Arc::new(Mutex::new(HashMap::new())),
             pending_outbound_ips: Arc::new(Mutex::new(HashSet::new())),
+            inbound_reservations: Arc::new(Mutex::new(InboundReservations::default())),
             peer_status_publisher: Arc::new(RwLock::new(None)),
             handshake_ledgers: Arc::new(RwLock::new(None)),
             manifests_message_provider: Arc::new(RwLock::new(None)),
+            outbound_peer_failure_handler: Arc::new(RwLock::new(None)),
+            outbound_peer_close_handler: Arc::new(RwLock::new(None)),
+            session_tasks: Arc::new(SessionTaskTracker::default()),
             session_runtime,
         })
     }
@@ -1246,6 +1428,26 @@ impl OverlayImpl {
             .manifests_message_provider
             .write()
             .expect("manifest message provider lock") = Some(Arc::new(provider));
+    }
+
+    pub fn set_outbound_peer_failure_handler(
+        &self,
+        handler: impl Fn(SocketAddr, bool) + Send + Sync + 'static,
+    ) {
+        *self
+            .outbound_peer_failure_handler
+            .write()
+            .expect("outbound peer failure handler lock") = Some(Arc::new(handler));
+    }
+
+    pub fn set_outbound_peer_close_handler(
+        &self,
+        handler: impl Fn(SocketAddr, bool) + Send + Sync + 'static,
+    ) {
+        *self
+            .outbound_peer_close_handler
+            .write()
+            .expect("outbound peer close handler lock") = Some(Arc::new(handler));
     }
 
     fn send_cached_manifests(&self, peer: &Arc<PeerImp>) {
@@ -1412,14 +1614,20 @@ impl OverlayImpl {
             }
             result = acceptor.listener.accept() => result?,
         };
+        if self.is_stopping() || *stop_requested.borrow() {
+            return Ok(());
+        }
 
-        self.handle_inbound_stream(
+        // Door::doAccept creates and starts an independent SSLHTTPPeer for
+        // every accepted socket before accepting again. Do the equivalent
+        // here: TLS/HTTP handshaking must never serially block the listener.
+        std::mem::drop(self.spawn_tracked_inbound_transport(
             tcp_stream,
             remote_address,
             stop_requested,
             Arc::clone(&acceptor.acceptor),
-        )
-        .await
+        ));
+        Ok(())
     }
 
     /// Continue an accepted TLS peer connection from a shared server listener.
@@ -1431,17 +1639,37 @@ impl OverlayImpl {
         tcp_stream: TcpStream,
         remote_address: SocketAddr,
     ) -> JoinHandle<Result<(), OverlayError>> {
+        let stop_requested = self.stop_requested.subscribe();
+        let acceptor = match self.setup.server_ssl_acceptor.clone() {
+            Some(acceptor) => acceptor,
+            None => {
+                return tokio::spawn(async {
+                    Err(OverlayError::Tls("missing server TLS acceptor".to_owned()))
+                });
+            }
+        };
+        self.spawn_tracked_inbound_transport(tcp_stream, remote_address, stop_requested, acceptor)
+    }
+
+    /// Own every accepted transport until it either exits before activation or
+    /// transfers the stream to a tracked PeerSession. This preserves shutdown
+    /// drain semantics while allowing the accept loop to continue immediately.
+    fn spawn_tracked_inbound_transport(
+        &self,
+        tcp_stream: TcpStream,
+        remote_address: SocketAddr,
+        stop_requested: watch::Receiver<bool>,
+        acceptor: Arc<openssl::ssl::SslAcceptor>,
+    ) -> JoinHandle<Result<(), OverlayError>> {
         let this = self.clone_for_tasks();
-        let stop_requested = this.stop_requested.subscribe();
-        let acceptor = this
-            .setup
-            .server_ssl_acceptor
-            .clone()
-            .ok_or_else(|| OverlayError::Tls("missing server TLS acceptor".to_owned()));
+        let tracker = Arc::clone(&self.session_tasks);
+        tracker.begin();
         tokio::spawn(async move {
-            let acceptor = acceptor?;
-            this.handle_inbound_stream(tcp_stream, remote_address, stop_requested, acceptor)
-                .await
+            let result = this
+                .handle_inbound_stream(tcp_stream, remote_address, stop_requested, acceptor)
+                .await;
+            tracker.complete();
+            result
         })
     }
 
@@ -1453,6 +1681,10 @@ impl OverlayImpl {
         acceptor: Arc<openssl::ssl::SslAcceptor>,
     ) -> Result<(), OverlayError> {
         tracing::debug!(target: "overlay", ip = %remote_address, "Inbound connection accepted");
+        // The transport remains independently bounded by the TLS and HTTP
+        // deadlines below. Peer resource/slot admission is intentionally
+        // deferred until the request-processing callback accepts this as a
+        // peer handoff, matching rippled OverlayImpl::onHandoff.
         // Disable Nagle's algorithm for low-latency request-response pipelining.
         let _ = tcp_stream.set_nodelay(true);
         let ssl = openssl::ssl::Ssl::new(acceptor.context())
@@ -1465,14 +1697,51 @@ impl OverlayImpl {
                 let _ = changed;
                 return Ok(());
             }
-            result = std::pin::Pin::new(&mut tls_stream).accept() => result,
+            result = timeout(
+                INBOUND_TLS_HANDSHAKE_TIMEOUT,
+                std::pin::Pin::new(&mut tls_stream).accept(),
+            ) => match result {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::debug!(
+                        target: "overlay",
+                        ip = %remote_address,
+                        timeout_secs = INBOUND_TLS_HANDSHAKE_TIMEOUT.as_secs(),
+                        "Inbound TLS handshake timed out"
+                    );
+                    return Ok(());
+                }
+            },
         };
         if let Err(error) = accept_result {
             tracing::debug!(target: "overlay", ip = %remote_address, %error, "TLS accept failed");
             return Ok(());
         }
 
-        let request = match read_http_request(&mut tls_stream, stop_requested.clone()).await? {
+        let request_stop_requested = stop_requested.clone();
+        let request_result = tokio::select! {
+            biased;
+            changed = stop_requested.changed() => {
+                let _ = changed;
+                return Ok(());
+            }
+            result = timeout(
+                INBOUND_HTTP_REQUEST_TIMEOUT,
+                read_http_request(&mut tls_stream, request_stop_requested),
+            ) => match result {
+                Ok(result) => result?,
+                Err(_) => {
+                    tracing::debug!(
+                        target: "overlay",
+                        ip = %remote_address,
+                        timeout_secs = INBOUND_HTTP_REQUEST_TIMEOUT.as_secs(),
+                        "Inbound HTTP upgrade request timed out"
+                    );
+                    return Ok(());
+                }
+            },
+        };
+        let request = match request_result {
             Some(request) => request,
             None => return Ok(()),
         };
@@ -1491,38 +1760,6 @@ impl OverlayImpl {
             )
         };
 
-        // Basic Resource Management (IP Throttling)
-        // Prevent connection floods by limiting active peers from the same IP.
-        let remote_ip = remote_address.ip();
-        let active_count = self
-            .active_peers
-            .read()
-            .expect("active peers rwlock")
-            .values()
-            .filter(|p| p.remote_address().ip() == remote_ip)
-            .count();
-        // rippled's PeerFinder tuning defaults an unspecified ip_limit to two
-        // inbound connections per IP. Honor an explicit configured limit here
-        // rather than retaining the former hard-coded cap of five.
-        let ip_limit = if self.setup.ip_limit == 0 {
-            2
-        } else {
-            self.setup.ip_limit
-        };
-        if active_count >= ip_limit {
-            tracing::warn!(target: "overlay", ip = %remote_ip, ip_limit, "Resource limit reached: too many active connections from IP");
-            let response = Response::builder()
-                .status(503)
-                .body(())
-                .map_err(|e| OverlayError::InvalidRequest(e.to_string()))?;
-            let response_wire = serialize_response(&response);
-            tls_stream
-                .write_all(&response_wire)
-                .await
-                .map_err(|e| OverlayError::Io(e))?;
-            return Ok(());
-        }
-
         // HTTP API interception
         let path = request.uri().path();
         if path == "/health" || path == "/crawl" || path.starts_with("/vl/") {
@@ -1537,6 +1774,7 @@ impl OverlayImpl {
                 .write_all(response_str.as_bytes())
                 .await
                 .map_err(|e| OverlayError::Io(e))?;
+            shutdown_inbound_tls(&mut tls_stream, stop_requested.clone()).await;
             return Ok(());
         }
 
@@ -1544,15 +1782,64 @@ impl OverlayImpl {
         let mut accepted_peer = None;
         let (response, response_wire) = match handoff {
             Handoff::Accepted => {
+                // Rippled's onHandoff sequence is processRequest → Resource
+                // consumer → inbound PeerFinder slot → Connect-As. The
+                // transport has already completed its independently timed
+                // asynchronous TLS/HTTP work; reserve both peer-admission
+                // resources here before validating Connect-As.
+                let inbound_reservation = match self.reserve_inbound(remote_address) {
+                    Some(reservation) => reservation,
+                    None => {
+                        tracing::warn!(
+                            target: "overlay",
+                            ip = %remote_address,
+                            "Inbound peer resource or IP slot limit reached"
+                        );
+                        return Ok(());
+                    }
+                };
+                if !request_connects_as_peer(&request) {
+                    tracing::warn!(
+                        target: "overlay",
+                        ip = %remote_address,
+                        "Inbound peer redirected: missing Connect-As peer token"
+                    );
+                    let (_, wire) = self.make_redirect_response(&request, remote_address)?;
+                    tls_stream.write_all(&wire).await?;
+                    tls_stream.flush().await?;
+                    shutdown_inbound_tls(&mut tls_stream, stop_requested.clone()).await;
+                    return Ok(());
+                }
+                let Some(protocol) = negotiate_inbound_peer_upgrade(&request) else {
+                    tracing::warn!(
+                        target: "overlay",
+                        ip = %remote_address,
+                        "Inbound peer rejected: unsupported Upgrade"
+                    );
+                    let response = Response::builder()
+                        .status(http::StatusCode::BAD_REQUEST)
+                        .header("Connection", "close")
+                        .body(())
+                        .map_err(|error| OverlayError::InvalidRequest(error.to_string()))?;
+                    let wire = serialize_response(&response);
+                    tls_stream.write_all(&wire).await?;
+                    tls_stream.flush().await?;
+                    shutdown_inbound_tls(&mut tls_stream, stop_requested.clone()).await;
+                    return Ok(());
+                };
                 let peer = match self.peer_from_request(&request, remote_address) {
                     Ok(peer) => peer,
                     Err(error) => {
                         tracing::warn!(target: "overlay", ip = %remote_address, %error, "Inbound peer rejected");
                         let response = Response::builder()
-                            .status(403)
+                            .status(http::StatusCode::FORBIDDEN)
+                            .header("Connection", "close")
                             .body(())
-                            .map_err(|e| OverlayError::InvalidRequest(e.to_string()))?;
-                        let _response_wire = serialize_response(&response);
+                            .map_err(|error| OverlayError::InvalidRequest(error.to_string()))?;
+                        let wire = serialize_response(&response);
+                        tls_stream.write_all(&wire).await?;
+                        tls_stream.flush().await?;
+                        shutdown_inbound_tls(&mut tls_stream, stop_requested.clone()).await;
                         return Ok(());
                     }
                 };
@@ -1583,8 +1870,8 @@ impl OverlayImpl {
                     let verify_ctx = crate::transport::handshake::HandshakeVerificationContext {
                         shared_value,
                         network_id: self.handshake_context().network_id,
-                        local_public_key: None,
-                        public_ip: self.handshake_context().local_ip,
+                        local_public_key: Some(self.identity.public_key()),
+                        public_ip: self.setup.public_ip,
                         remote_ip: remote_address.ip(),
                         clock_tolerance: std::time::Duration::from_secs(20),
                     };
@@ -1601,17 +1888,12 @@ impl OverlayImpl {
                         return Ok(());
                     }
 
-                    let offered = request
-                        .headers()
-                        .get("Upgrade")
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or_default();
-                    let protocol = negotiate_protocol_version(
-                        crate::protocol_version::parse_protocol_versions(offered),
-                    )
-                    .unwrap_or(crate::protocol_version::ProtocolVersion::new(2, 2));
                     // Build handshake context with real TLS Session-Signature.
                     let mut handshake_ctx = self.handshake_context();
+                    handshake_ctx.remote_ip = Some(remote_address.ip());
+                    // Rippled advertises configured public_ip as Local-IP;
+                    // a wildcard/local listener is intentionally not claimed.
+                    handshake_ctx.local_ip = self.setup.public_ip;
                     if let Some(sv) = inbound_shared_value {
                         match self.identity.sign_session(&sv) {
                             Ok(sig) => handshake_ctx.session_signature = sig,
@@ -1621,17 +1903,19 @@ impl OverlayImpl {
                             }
                         }
                     }
+                    let (compr_enabled, ledger_replay_enabled, txrr_enabled, vprr_enabled) =
+                        self.inbound_handshake_features();
                     let response = make_response(
                         true,
                         &request,
                         &handshake_ctx,
                         protocol,
-                        true, // compr — we support LZ4
-                        true, // ledger_replay — supported
-                        true, // txrr — tx reduce relay
-                        true, // vprr — validation/proposal reduce relay
+                        compr_enabled,
+                        ledger_replay_enabled,
+                        txrr_enabled,
+                        vprr_enabled,
                     );
-                    accepted_peer = Some((peer, request.headers().clone()));
+                    accepted_peer = Some((peer, request.headers().clone(), inbound_reservation));
                     let response_wire = serialize_response(&response);
                     (response, response_wire)
                 }
@@ -1679,7 +1963,13 @@ impl OverlayImpl {
                 result?;
             }
         }
-        if let Some((peer, headers)) = accepted_peer {
+        if accepted_peer.is_none() {
+            // A redirect or rejected handoff has no PeerSession writer. Send
+            // close_notify here before releasing the TLS stream.
+            shutdown_inbound_tls(&mut tls_stream, stop_requested.clone()).await;
+            return Ok(());
+        }
+        if let Some((peer, headers, inbound_reservation)) = accepted_peer {
             let result = ConnectAttemptResult {
                 peer,
                 response,
@@ -1689,7 +1979,7 @@ impl OverlayImpl {
                     stop_requested.clone(),
                 )),
             };
-            let _ = self.finalize_connect_result(result);
+            let _ = self.finalize_inbound_connect_result(result, inbound_reservation);
         }
         Ok(())
     }
@@ -1722,16 +2012,44 @@ impl OverlayImpl {
             inbound_handler: Arc::clone(&self.inbound_handler),
             redirect_endpoints: Arc::clone(&self.redirect_endpoints),
             pending_outbound_ips: Arc::clone(&self.pending_outbound_ips),
+            inbound_reservations: Arc::clone(&self.inbound_reservations),
             peer_status_publisher: Arc::clone(&self.peer_status_publisher),
             handshake_ledgers: Arc::clone(&self.handshake_ledgers),
             manifests_message_provider: Arc::clone(&self.manifests_message_provider),
+            outbound_peer_failure_handler: Arc::clone(&self.outbound_peer_failure_handler),
+            outbound_peer_close_handler: Arc::clone(&self.outbound_peer_close_handler),
+            session_tasks: Arc::clone(&self.session_tasks),
             session_runtime: Arc::clone(&self.session_runtime),
         }
     }
 
     pub fn activate(&self, peer: Arc<PeerImp>) -> bool {
+        self.activate_with_consumer(peer, None)
+    }
+
+    fn activate_with_inbound_reservation(
+        &self,
+        peer: Arc<PeerImp>,
+        reservation: InboundReservation,
+    ) -> bool {
+        self.activate_with_consumer(peer, Some(reservation))
+    }
+
+    fn activate_with_consumer(
+        &self,
+        peer: Arc<PeerImp>,
+        inbound_reservation: Option<InboundReservation>,
+    ) -> bool {
         self.apply_membership_state(&peer);
         let limits = self.setup.peer_limits();
+        // The public-key map is the activation gate. Holding it across the
+        // active-peer insertion makes duplicate node identity rejection
+        // atomic, rather than allowing two independent maps to race.
+        let mut by_public_key = self.by_public_key.write().expect("overlay public-key lock");
+        if by_public_key.contains_key(&peer.node_public()) {
+            tracing::warn!(target: "overlay", peer_id = %peer.id(), "Duplicate node public key rejected");
+            return false;
+        }
         let mut active_peers = self.active_peers.write().expect("overlay peers lock");
         let active_in_direction =
             self.directional_active_peers_count_locked(&active_peers, peer.inbound());
@@ -1752,23 +2070,39 @@ impl OverlayImpl {
             return false;
         }
         active_peers.insert(peer.id(), Arc::clone(&peer));
+        by_public_key.insert(peer.node_public(), Arc::clone(&peer));
         let total = active_peers.len();
         drop(active_peers);
+        drop(by_public_key);
 
-        let consumer = if peer.inbound() {
-            self.resource_manager
-                .new_inbound_endpoint(peer.remote_address())
-        } else {
-            self.resource_manager
-                .new_outbound_endpoint(peer.remote_address())
-        };
+        let consumer = inbound_reservation.map_or_else(
+            || {
+                if peer.inbound() {
+                    self.resource_manager
+                        .new_inbound_endpoint(peer.remote_address())
+                } else {
+                    self.resource_manager
+                        .new_outbound_endpoint(peer.remote_address())
+                }
+            },
+            InboundReservation::into_consumer,
+        );
+        consumer.set_public_key(*peer.node_public().as_bytes());
+        if !peer.inbound() {
+            let failure_handler = Arc::clone(&self.outbound_peer_failure_handler);
+            peer.set_outbound_failure_notifier(Arc::new(move |address, fixed| {
+                if let Some(handler) = failure_handler
+                    .read()
+                    .expect("outbound peer failure handler lock")
+                    .as_ref()
+                    .map(Arc::clone)
+                {
+                    handler(address, fixed);
+                }
+            }));
+        }
         peer.install_resource_consumer(consumer, Arc::clone(&self.peer_disconnect_charges));
         peer.start_lifecycle_timer(self.session_runtime.handle());
-
-        self.by_public_key
-            .write()
-            .expect("overlay public-key lock")
-            .insert(peer.node_public(), Arc::clone(&peer));
 
         tracing::info!(
             target: "overlay",
@@ -1785,8 +2119,20 @@ impl OverlayImpl {
 
     pub fn on_peer_deactivate(&self, id: PeerId) {
         let peer = {
+            // Keep the public-key gate before the peer map here as in
+            // activation. Remove an identity entry only when it still names
+            // this exact peer, so an old close cannot erase a newer mapping.
+            let mut by_public_key = self.by_public_key.write().expect("overlay public-key lock");
             let mut active_peers = self.active_peers.write().expect("overlay peers lock");
-            active_peers.remove(&id)
+            let peer = active_peers.remove(&id);
+            if let Some(peer) = &peer
+                && by_public_key
+                    .get(&peer.node_public())
+                    .is_some_and(|mapped| mapped.id() == id)
+            {
+                by_public_key.remove(&peer.node_public());
+            }
+            peer
         };
         if let Some(peer) = peer {
             tracing::info!(
@@ -1796,10 +2142,6 @@ impl OverlayImpl {
                 reason = "deactivated",
                 "Peer disconnected"
             );
-            self.by_public_key
-                .write()
-                .expect("overlay public-key lock")
-                .remove(&peer.node_public());
             peer.stop_lifecycle_timer();
             peer.detach_session();
             peer.clear_queued_messages();
@@ -1816,6 +2158,17 @@ impl OverlayImpl {
                 .expect("overlay slots lock")
                 .delete_peer(id, true);
             self.inc_peer_disconnect();
+            if !peer.inbound() {
+                if let Some(handler) = self
+                    .outbound_peer_close_handler
+                    .read()
+                    .expect("outbound peer close handler lock")
+                    .as_ref()
+                    .map(Arc::clone)
+                {
+                    handler(peer.remote_address(), peer.fixed());
+                }
+            }
             let total = self.active_peers.read().expect("overlay peers lock").len();
             tracing::info!(
                 target: "overlay",
@@ -1829,6 +2182,17 @@ impl OverlayImpl {
         tracing::info!(target: "overlay", "Overlay stopping");
         self.stopping.store(true, Ordering::Release);
         let _ = self.stop_requested.send(true);
+    }
+
+    pub fn stop_receiver(&self) -> watch::Receiver<bool> {
+        self.stop_requested.subscribe()
+    }
+
+    /// Wait for accepted inbound transports and peer sessions to finish their
+    /// stop-aware handshakes, drain queues, and emit TLS close_notify after
+    /// `signal_stop` has been broadcast.
+    pub fn wait_for_session_shutdown(&self) {
+        self.session_tasks.wait_for_drain();
     }
 
     /// Update the ledger hashes advertised on future outbound handshakes.
@@ -2600,6 +2964,19 @@ impl OverlayImpl {
         }
     }
 
+    /// Mirrors `makeResponse`: only advertise optional features enabled by
+    /// this node's configuration. Compression and ledger replay have no
+    /// independent Setup switch in the current Rust runtime, so they remain
+    /// enabled whenever the transport supports them.
+    fn inbound_handshake_features(&self) -> (bool, bool, bool, bool) {
+        (
+            true,
+            true,
+            self.setup.tx_reduce_relay_enabled,
+            self.setup.vp_reduce_relay_base_squelch_enabled,
+        )
+    }
+
     fn configure_connected_peer(&self, peer: &PeerImp, headers: &http::HeaderMap) {
         let protocol = headers
             .get("Upgrade")
@@ -2608,7 +2985,9 @@ impl OverlayImpl {
             .unwrap_or(ProtocolVersion::new(2, 2));
         peer.set_protocol_version(protocol);
         peer.set_compression_enabled(is_feature_value(headers, FEATURE_COMPR, "lz4"));
-        peer.set_tx_reduce_relay_enabled(feature_enabled(headers, FEATURE_TXRR));
+        peer.set_tx_reduce_relay_enabled(
+            self.setup.tx_reduce_relay_enabled && feature_enabled(headers, FEATURE_TXRR),
+        );
         peer.set_feature(
             ProtocolFeature::LedgerReplay,
             feature_enabled(headers, FEATURE_LEDGER_REPLAY),
@@ -2658,7 +3037,73 @@ impl OverlayImpl {
         Ok(peer)
     }
 
-    fn try_register_outbound_attempt(&self, address: SocketAddr) -> bool {
+    fn reserve_inbound(&self, remote_address: SocketAddr) -> Option<InboundReservation> {
+        // This is the source-ordered peer-admission portion of rippled
+        // OverlayImpl::onHandoff: after request processing identifies a peer,
+        // acquire the Resource consumer before the inbound PeerFinder slot.
+        // TLS and HTTP timeouts above bound pre-handoff transports.
+        let consumer = self.resource_manager.new_inbound_endpoint(remote_address);
+        if consumer.disposition() == Disposition::Drop {
+            let _ = consumer.disconnect_with_manager_journal();
+            tracing::warn!(target: "overlay", ip = %remote_address, "Inbound resource consumer rejected peer handoff");
+            return None;
+        }
+
+        let remote_ip = canonical_peer_ip(remote_address.ip());
+        // PeerFinder::Logic::newInboundSlot limits only public remote
+        // addresses. Private/RFC-1918 peers receive an inbound slot but do not
+        // consume `ipLimit`, which is designed to prevent public-IP fanout.
+        let reserved_ip_slot = is_public_ip(remote_ip).then_some(remote_ip);
+        if let Some(remote_ip) = reserved_ip_slot {
+            let ip_limit = if self.setup.ip_limit == 0 {
+                2
+            } else {
+                self.setup.ip_limit
+            };
+            let mut reservations = self
+                .inbound_reservations
+                .lock()
+                .expect("inbound reservation lock");
+            let active_from_ip = self
+                .active_peers
+                .read()
+                .expect("overlay peers lock")
+                .values()
+                .filter(|peer| canonical_peer_ip(peer.remote_address().ip()) == remote_ip)
+                .count();
+            let pending_from_ip = reservations
+                .by_ip
+                .get(&remote_ip)
+                .copied()
+                .unwrap_or_default();
+            if active_from_ip.saturating_add(pending_from_ip) >= ip_limit {
+                return None;
+            }
+            *reservations.by_ip.entry(remote_ip).or_default() += 1;
+        }
+        Some(InboundReservation {
+            reservations: Arc::clone(&self.inbound_reservations),
+            remote_ip: reserved_ip_slot,
+            consumer: Some(consumer),
+        })
+    }
+
+    pub fn outbound_endpoint_is_active_or_pending(&self, address: SocketAddr) -> bool {
+        self.prune_disconnected_peers();
+        let ip = canonical_peer_ip(address.ip());
+        self.active_peers
+            .read()
+            .expect("overlay peers lock")
+            .values()
+            .any(|peer| canonical_peer_ip(peer.remote_address().ip()) == ip)
+            || self
+                .pending_outbound_ips
+                .lock()
+                .expect("overlay pending outbound lock")
+                .contains(&ip)
+    }
+
+    fn reserve_outbound_attempt(&self, address: SocketAddr) -> Option<OutboundAttemptReservation> {
         self.prune_disconnected_peers();
         let ip = canonical_peer_ip(address.ip());
         if self
@@ -2669,20 +3114,17 @@ impl OverlayImpl {
             .any(|peer| canonical_peer_ip(peer.remote_address().ip()) == ip)
         {
             tracing::debug!(target: "overlay", ip = %address, "Duplicate outbound attempt blocked — already connected");
-            return false;
+            return None;
         }
-        self.pending_outbound_ips
+        let inserted = self
+            .pending_outbound_ips
             .lock()
             .expect("overlay pending outbound lock")
-            .insert(ip)
-    }
-
-    fn finish_outbound_attempt(&self, address: SocketAddr) {
-        tracing::debug!(target: "overlay", ip = %address, "Outbound attempt finished");
-        self.pending_outbound_ips
-            .lock()
-            .expect("overlay pending outbound lock")
-            .remove(&canonical_peer_ip(address.ip()));
+            .insert(ip);
+        inserted.then_some(OutboundAttemptReservation {
+            attempts: Arc::clone(&self.pending_outbound_ips),
+            remote_ip: ip,
+        })
     }
 
     pub fn active_outbound_peers_count(&self) -> usize {
@@ -2699,10 +3141,32 @@ impl OverlayImpl {
 
     fn finalize_connect_result(
         &self,
+        result: ConnectAttemptResult,
+    ) -> Result<ConnectAttemptResult, &'static str> {
+        self.finalize_connect_result_with_reservation(result, None)
+    }
+
+    fn finalize_inbound_connect_result(
+        &self,
+        result: ConnectAttemptResult,
+        reservation: InboundReservation,
+    ) -> Result<ConnectAttemptResult, &'static str> {
+        self.finalize_connect_result_with_reservation(result, Some(reservation))
+    }
+
+    fn finalize_connect_result_with_reservation(
+        &self,
         mut result: ConnectAttemptResult,
+        reservation: Option<InboundReservation>,
     ) -> Result<ConnectAttemptResult, &'static str> {
         self.configure_connected_peer(&result.peer, &result.negotiated_features);
-        if !self.activate(Arc::clone(&result.peer)) {
+        let activated = match reservation {
+            Some(reservation) => {
+                self.activate_with_inbound_reservation(Arc::clone(&result.peer), reservation)
+            }
+            None => self.activate(Arc::clone(&result.peer)),
+        };
+        if !activated {
             tracing::warn!(
                 target: "overlay",
                 ip = %result.peer.remote_address(),
@@ -2724,7 +3188,13 @@ impl OverlayImpl {
         let overlay = self.clone_for_tasks();
         let hooks = Arc::new(OverlayPeerSessionHooks::new(overlay.clone_for_tasks()));
         let on_close = Arc::new(move |peer_id| overlay.on_peer_deactivate(peer_id));
-        std::mem::drop(session.start_on(self.session_runtime.handle(), peer, hooks, on_close));
+        self.session_tasks.begin();
+        let tracker = Arc::clone(&self.session_tasks);
+        let session_task = session.start_on(self.session_runtime.handle(), peer, hooks, on_close);
+        std::mem::drop(self.session_runtime.handle().spawn(async move {
+            let _ = session_task.await;
+            tracker.complete();
+        }));
     }
 }
 
@@ -2748,13 +3218,12 @@ impl Overlay for OverlayImpl {
                 ))
             });
         }
-        if !self.try_register_outbound_attempt(address) {
-            return Box::pin(async {
-                Err(ConnectAttemptError::Protocol(
-                    "duplicate outbound attempt".to_owned(),
-                ))
-            });
-        }
+        let outbound_attempt = match self.reserve_outbound_attempt(address) {
+            Some(reservation) => reservation,
+            None => {
+                return Box::pin(async { Err(ConnectAttemptError::DuplicateOutboundAttempt) });
+            }
+        };
         tracing::info!(target: "overlay", ip = %address, "Outbound connection attempt");
         let connector = self.connector.clone();
         let config = ConnectAttemptConfig {
@@ -2799,11 +3268,14 @@ impl Overlay for OverlayImpl {
                 ))
             },
         );
+        let mut handshake_context = self.handshake_context();
+        handshake_context.remote_ip = Some(address.ip());
+        handshake_context.local_ip = self.setup.public_ip;
         let attempt = ConnectAttempt::new(
             address,
             config,
             connector,
-            self.handshake_context(),
+            handshake_context,
             sign_session,
             verify_response,
             self.stop_requested.subscribe(),
@@ -2812,9 +3284,11 @@ impl Overlay for OverlayImpl {
         Box::pin(async move {
             session_runtime
                 .spawn(async move {
-                    let result = attempt.run().await;
-                    overlay.finish_outbound_attempt(address);
-                    let result = result?;
+                    // Keep this reservation alive while finalization acquires
+                    // the active-peer/public-key gate. Dropping it any sooner
+                    // reopens the fixed-endpoint duplicate race.
+                    let _outbound_attempt = outbound_attempt;
+                    let result = attempt.run().await?;
                     if overlay.is_stopping() {
                         return Err(ConnectAttemptError::Timeout(
                             ConnectionStep::ShutdownStarted,
@@ -2991,6 +3465,22 @@ impl Overlay for OverlayImpl {
                 "relay_history sweep (HashRouter hold-time expiry)"
             );
         }
+    }
+}
+
+async fn shutdown_inbound_tls<S>(stream: &mut S, mut stop_requested: watch::Receiver<bool>)
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    if *stop_requested.borrow() {
+        return;
+    }
+    tokio::select! {
+        biased;
+        changed = stop_requested.changed() => {
+            let _ = changed;
+        }
+        _ = timeout(INBOUND_TLS_SHUTDOWN_TIMEOUT, stream.shutdown()) => {}
     }
 }
 

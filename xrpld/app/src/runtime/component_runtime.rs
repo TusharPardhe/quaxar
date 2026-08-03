@@ -6,12 +6,18 @@ use crate::network::network_ops_runtime::AppNetworkOpsRuntime;
 use crate::runtime::main_runtime::ManagedComponent;
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 use crate::state::app_registry::{AppInboundLedgers, AppInboundTransactions};
+use crate::state::application_root::ApplicationRoot;
+use crate::validator::validator_list::{PublisherListStats, ValidatorBlobInfo};
+use crate::validator::validator_site::{
+    ReqwestValidatorSiteTransport, ValidatorSite, ValidatorSiteSink,
+};
 use basics;
 use consensus;
 use ledger::LedgerCleaner;
 use perflog::{PerfLog, PerfLogImp};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // AppNodeStoreRuntime (unchanged)
@@ -344,13 +350,60 @@ impl ManagedComponent for AppConsensusRuntime {
 }
 
 // ---------------------------------------------------------------------------
-// AppValidatorSiteRuntime (unchanged)
+// AppValidatorSiteRuntime
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub struct AppValidatorSiteRuntime {
+    root: ApplicationRoot,
+    site: Arc<ValidatorSite>,
     started: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
+    worker: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+}
+
+impl std::fmt::Debug for AppValidatorSiteRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppValidatorSiteRuntime")
+            .field("started", &self.started.load(Ordering::Acquire))
+            .field("stopped", &self.stopped.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+struct RuntimeValidatorSiteSink {
+    root: ApplicationRoot,
+}
+
+impl ValidatorSiteSink for RuntimeValidatorSiteSink {
+    fn apply_lists(
+        &mut self,
+        manifest: &str,
+        version: u32,
+        blobs: &[ValidatorBlobInfo],
+        site_uri: String,
+        hash: basics::base_uint::Uint256,
+    ) -> PublisherListStats {
+        self.root
+            .apply_validator_lists(manifest, version, blobs, site_uri, hash)
+    }
+
+    fn load_lists(&self) -> Vec<String> {
+        self.root.validators().load_lists()
+    }
+}
+
+impl AppValidatorSiteRuntime {
+    pub fn new(root: ApplicationRoot) -> Self {
+        let site = root.validator_sites();
+        Self {
+            root,
+            site,
+            started: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            worker: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 impl ManagedComponent for AppValidatorSiteRuntime {
@@ -358,12 +411,48 @@ impl ManagedComponent for AppValidatorSiteRuntime {
         if self.stopped.load(Ordering::Acquire) {
             return Err("validator site runtime has already been stopped".to_owned());
         }
-        self.started.store(true, Ordering::Release);
+        if self.started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        let root = self.root.clone();
+        let site = Arc::clone(&self.site);
+        let stopped = Arc::clone(&self.stopped);
+        let worker = std::thread::Builder::new()
+            .name("validator-site-refresh".to_owned())
+            .spawn(move || {
+                let transport = ReqwestValidatorSiteTransport;
+                let mut sink = RuntimeValidatorSiteSink { root };
+                while !stopped.load(Ordering::Acquire) {
+                    site.refresh_due(&mut sink, &transport, std::time::SystemTime::now());
+                    // One-second polling only schedules due work; each site
+                    // retains its own 5-minute, server-provided, or retry
+                    // interval. Stop is checked frequently for bounded join.
+                    for _ in 0..10 {
+                        if stopped.load(Ordering::Acquire) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            })
+            .map_err(|error| format!("failed to spawn validator site runtime: {error}"))?;
+        *self.worker.lock().expect("validator site worker lock") = Some(worker);
         Ok(())
     }
 
     fn stop(&self) {
-        self.stopped.store(true, Ordering::Release);
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(worker) = self
+            .worker
+            .lock()
+            .expect("validator site worker lock")
+            .take()
+        {
+            let _ = worker.join();
+        }
     }
 }
 

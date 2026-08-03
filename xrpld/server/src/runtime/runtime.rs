@@ -288,10 +288,11 @@ where
         peer_handoff: Option<Arc<overlay::OverlayImpl>>,
     ) -> Result<(), String> {
         let listener_name = policy.name.clone();
-        let server = RpcServer::with_auth_and_subscriptions(
+        let server = RpcServer::with_port_policy_and_subscriptions(
             self.dispatcher.clone(),
-            crate::auth::ServerAuth::new(policy.auth.clone()),
+            policy.clone(),
             Arc::clone(&self.shared_subscriptions),
+            self.status_source.clone(),
         );
         let state = Arc::clone(&self.state);
         let shutdown = Arc::clone(&self.state);

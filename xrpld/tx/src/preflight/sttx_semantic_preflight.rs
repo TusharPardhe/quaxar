@@ -121,7 +121,8 @@ fn validate_sttx_common_transactor_preflight(tx: &STTx) -> NotTec {
 fn validate_sttx_typed_semantic_preflight(tx: &STTx, rules: &Rules, txn_type: TxType) -> NotTec {
     match txn_type {
         TxType::PAYMENT => validate_payment_preflight(tx),
-        TxType::ACCOUNT_DELETE => validate_account_delete_preflight(tx),
+        TxType::DEPOSIT_PREAUTH => validate_deposit_preauth_preflight(tx, rules),
+        TxType::ACCOUNT_DELETE => validate_account_delete_preflight(tx, rules),
         TxType::TICKET_CREATE => crate::run_ticket_create_preflight(
             tx.get_field_u32(get_field_by_symbol("sfTicketCount")),
         ),
@@ -181,11 +182,66 @@ fn validate_payment_preflight(tx: &STTx) -> NotTec {
     Ter::TES_SUCCESS
 }
 
-fn validate_account_delete_preflight(tx: &STTx) -> NotTec {
+fn validate_deposit_preauth_preflight(tx: &STTx, rules: &Rules) -> NotTec {
+    let account = tx.get_account_id(get_field_by_symbol("sfAccount"));
+    let authorize_field = get_field_by_symbol("sfAuthorize");
+    let unauthorize_field = get_field_by_symbol("sfUnauthorize");
+    let authorize_credentials_field = get_field_by_symbol("sfAuthorizeCredentials");
+    let unauthorize_credentials_field = get_field_by_symbol("sfUnauthorizeCredentials");
+    let authorize = tx
+        .is_field_present(authorize_field)
+        .then(|| tx.get_account_id(authorize_field));
+    let unauthorize = tx
+        .is_field_present(unauthorize_field)
+        .then(|| tx.get_account_id(unauthorize_field));
+    let authorize_credentials_present = tx.is_field_present(authorize_credentials_field);
+    let unauthorize_credentials_present = tx.is_field_present(unauthorize_credentials_field);
+
+    if !crate::deposit_preauth_check_extra_features(
+        authorize_credentials_present,
+        unauthorize_credentials_present,
+        rules.enabled(&protocol::feature_id("Credentials")),
+    ) {
+        return Ter::TEM_DISABLED;
+    }
+
+    crate::run_deposit_preauth_preflight(
+        crate::DepositPreauthPreflightFacts {
+            account,
+            authorize,
+            unauthorize,
+            authorize_is_zero: authorize.is_some_and(|account| account.is_zero()),
+            unauthorize_is_zero: unauthorize.is_some_and(|account| account.is_zero()),
+            authorize_credentials_present,
+            unauthorize_credentials_present,
+        },
+        || {
+            let credentials = tx.get_field_array(if authorize_credentials_present {
+                authorize_credentials_field
+            } else {
+                unauthorize_credentials_field
+            });
+            ledger::credential_helpers::check_array(
+                &credentials,
+                ledger::credential_helpers::MAX_CREDENTIALS_ARRAY_SIZE,
+            )
+        },
+    )
+}
+
+fn validate_account_delete_preflight(tx: &STTx, rules: &Rules) -> NotTec {
     let account = tx.get_account_id(get_field_by_symbol("sfAccount"));
     let destination_field = get_field_by_symbol("sfDestination");
     if !tx.is_field_present(destination_field) {
         return Ter::TEM_MALFORMED;
+    }
+
+    let credential_ids_present = tx.is_field_present(get_field_by_symbol("sfCredentialIDs"));
+    if !crate::account_delete_check_extra_features(
+        credential_ids_present,
+        rules.enabled(&protocol::feature_id("Credentials")),
+    ) {
+        return Ter::TEM_DISABLED;
     }
 
     crate::run_account_delete_preflight(
@@ -193,7 +249,7 @@ fn validate_account_delete_preflight(tx: &STTx) -> NotTec {
             account,
             destination: tx.get_account_id(destination_field),
         },
-        || Ter::TES_SUCCESS,
+        || ledger::credential_helpers::check_fields(tx),
     )
 }
 
