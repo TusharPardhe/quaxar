@@ -2207,6 +2207,7 @@ fn build_composed_runtime_from_path(
 
     Ok(AppBootstrapRuntime {
         runtime: Arc::new(MainRuntime::new(root)),
+        sweep_interval_seconds: report.sweep_interval_seconds,
         report,
     })
 }

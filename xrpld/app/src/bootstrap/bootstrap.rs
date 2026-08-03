@@ -124,6 +124,7 @@ pub struct AppBootstrapReport {
     pub startup_ledger_mode: StartUpType,
     pub io_threads: usize,
     pub job_queue_threads: usize,
+    pub sweep_interval_seconds: u64,
     pub ledger_history: u32,
     pub path_search_old: u32,
     pub path_search: u32,
@@ -161,7 +162,7 @@ pub struct AppBootstrapRoot {
 pub struct AppBootstrapRuntime {
     pub runtime: Arc<MainRuntime>,
     pub report: AppBootstrapReport,
-    sweep_interval_seconds: u64,
+    pub sweep_interval_seconds: u64,
 }
 
 #[derive(Debug, Default)]
@@ -752,6 +753,11 @@ pub fn build_bootstrap_root(
         io_threads,
     )?;
     let configured_node_size = configured_node_size_from_config(config);
+    let sweep_interval_seconds = configured_sweep_interval(
+        config,
+        crate::NodeSizeResourceProfile::for_node_size(configured_node_size.as_deref())
+            .sweep_interval_seconds,
+    )?;
     root.set_status_rpc_node_size(configured_node_size.clone());
     attach_bootstrap_node_family(&mut root, configured_node_size.as_deref());
     initialize_startup_ledger_state(&root, options, config)?;
@@ -890,6 +896,7 @@ pub fn build_bootstrap_root(
         startup_ledger_mode: options.start_type,
         io_threads,
         job_queue_threads,
+        sweep_interval_seconds,
         ledger_history,
         path_search_old,
         path_search,
