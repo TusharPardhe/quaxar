@@ -1704,9 +1704,18 @@ fn run_start_mode_consensus_loop(
                             return;
                         }
                         if trusted {
-                            // The consensus strand owns a bounded ingress queue;
-                            // never let an overlay job block waiting for it.
-                            let _ = proposal_tx.try_send(proposal);
+                            // rippled's JtProposalT calls directly into the
+                            // mutex-protected consensus engine, so a busy
+                            // consensus owner applies backpressure rather than
+                            // silently discarding a trusted proposal. The
+                            // strand is Quaxar's single owner; blocking until
+                            // it drains is the equivalent lossless handoff.
+                            if proposal_tx.send(proposal).is_err() {
+                                tracing::debug!(
+                                    target: "consensus",
+                                    "trusted proposal dropped because the consensus strand stopped"
+                                );
+                            }
                         } else if policy.should_relay() || cluster {
                             if let Some(overlay_runtime) = job_root.overlay_runtime() {
                                 overlay_runtime.overlay().relay_proposal(
@@ -4523,16 +4532,9 @@ fn seed_startup_ledger_state(
     //   setImmutable()
     // BEFORE `switchLCL` / `storeLedger` ever touches the ledger.
     //
-    // `on_closed_ledger` calls `release_maps_to_disk` which sets all child
-    // pointers to None on the SHARED root nodes (via SharedIntrusive refcount).
-    // Since `Ledger::clone()` is a shallow clone sharing the same root nodes,
-    // any clone made AFTER release will have an empty tree — only the root
-    // node can be persisted. The child nodes (account state, amendments, fee
-    // settings) would be lost.
-    //
-    // By persisting FIRST, the full tree is written to NuDB + tree cache while
-    // all nodes are still in memory. After this, `on_closed_ledger` can safely
-    // release the tree.
+    // Persist the full tree before the first closed-LCL installation, matching
+    // rippled's genesis construction. The active LCL remains resident after
+    // installation; it must not be forcibly evicted from the consensus path.
     // =========================================================================
     if root.node_store().is_some() {
         let writer = root.node_writer_result_from_store();

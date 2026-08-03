@@ -1056,9 +1056,10 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 tracing::debug!(target: "consensus", tx_id = %dispute.id(),
                     "failed to decode rejected dispute for retry");
             }
-            for tx in decoded.into_iter().map(|tx| {
-                canonicalize_consensus_transaction(self.transaction_master.as_ref(), tx)
-            }) {
+            for tx in decoded
+                .into_iter()
+                .map(|tx| canonicalize_consensus_transaction(self.transaction_master.as_ref(), tx))
+            {
                 if !matches!(
                     tx.get_txn_type(),
                     protocol::TxType::FEE
@@ -1628,10 +1629,10 @@ mod tests {
         pseudo_transaction_voting_enabled, trusted_validation_quorum_reached,
         update_operating_mode_after_accept,
     };
-    use crate::tx_queue::transaction::TransactionRelayMetadata;
     use crate::network::network_ops::{
         AppNetworkOpsModeOwner, NetworkOpsOperatingMode, SharedNetworkOpsState,
     };
+    use crate::tx_queue::transaction::TransactionRelayMetadata;
     use basics::base_uint::Uint256;
     use consensus::algorithm::types::ConsensusMode;
     use protocol::{AccountID, STAmount, STTx, TxType, get_field_by_symbol};
@@ -1773,6 +1774,27 @@ mod tests {
 
 impl ConsensusRunner for AppConsensus {
     fn peer_proposal(&mut self, now: NetClockTimePoint, peer_pos: &RclCxPeerPos) -> bool {
+        // Match NetworkOPsImp::processTrustedProposal: a proposal signed by
+        // either of this node's validation keys must neither influence local
+        // consensus nor be relayed. It may be a duplicate route or an
+        // operator key-reuse error, but it is not a peer position.
+        if self
+            .adaptor
+            .validator_keys
+            .keys
+            .as_ref()
+            .is_some_and(|keys| {
+                keys.public_key == *peer_pos.public_key()
+                    || keys.master_public_key == *peer_pos.public_key()
+            })
+        {
+            tracing::error!(
+                target: "consensus",
+                "received a trusted proposal signed by this node's validator key"
+            );
+            return false;
+        }
+
         // Signature was verified by `overlay_impl.rs::on_propose_ledger` before
         // this proposal was queued — matching rippled's `checkPropose` which
         // calls `peerPos.checkSign()` and drops invalid proposals before they

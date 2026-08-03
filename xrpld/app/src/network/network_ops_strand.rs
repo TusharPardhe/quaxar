@@ -572,7 +572,20 @@ fn strand_loop(
                 proposal.suppression,
                 prop,
             );
-            runner.peer_proposal(now, &peer_pos);
+            // `PeerImp::checkPropose` relays a trusted proposal only when
+            // `NetworkOPsImp::processTrustedProposal` accepts it. The strand
+            // owns that call in Quaxar, so preserve the same result-gated
+            // relay here rather than treating successful queueing as
+            // acceptance.
+            if runner.peer_proposal(now, &peer_pos)
+                && let Some(overlay_runtime) = root.overlay_runtime()
+            {
+                overlay_runtime.overlay().relay_proposal(
+                    proposal.message,
+                    proposal.suppression,
+                    proposal.public_key,
+                );
+            }
         });
         consensus_rt.update_phase(runner.phase());
         consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
