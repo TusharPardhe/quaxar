@@ -13,7 +13,7 @@ use overlay::Peer;
 use protocol::JsonValue;
 use shamap::family::{FullBelowCache, FullBelowCacheImpl};
 use shamap::tree_node_cache::TreeNodeCache;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -24,8 +24,8 @@ use crate::runtime::overlay_runtime::AppOverlayRuntime;
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 
 use super::acquisition::{
-    AcquisitionBuilder, AcquisitionFailureRecorder, AcquisitionPeerProvider, AcquisitionSnapshot,
-    AcquisitionState,
+    AcquisitionBuilder, AcquisitionCompletionRecorder, AcquisitionFailureRecorder,
+    AcquisitionPeerProvider, AcquisitionSnapshot, AcquisitionState,
 };
 use super::worker_pool::WorkerPool;
 
@@ -181,6 +181,7 @@ pub enum AcquireReason {
 pub struct CompletedInboundLedger {
     pub ledger: Arc<Ledger>,
     pub reason: AcquireReason,
+    pub acquisition_id: u64,
 }
 
 // ─── Entry ───────────────────────────────────────────────────────────────────
@@ -198,6 +199,10 @@ struct Entry {
     #[allow(dead_code)]
     started_at: Instant,
     completed_ledger: Option<Arc<Ledger>>,
+    /// Completion has been durably consumed by the app layer. Keep the
+    /// completed object in the registry until the normal sweep, matching
+    /// rippled's InboundLedgers map, while suppressing duplicate handoffs.
+    completion_acknowledged: bool,
     failed: bool,
 }
 
@@ -206,10 +211,18 @@ struct Entry {
 struct RegistryInner {
     entries: BTreeMap<Uint256, Entry>,
     recent_failures: HashMap<Uint256, Instant>,
+    /// Completed ledgers whose acquisition entry was swept before terminal
+    /// publication. This is the durable fallback for a full/disconnected
+    /// completion wakeup channel; entries remain until acknowledged.
+    orphaned_completions: VecDeque<CompletedInboundLedger>,
     /// Last key consumed by bounded result polling. Ordered traversal from
     /// this cursor keeps recovery fair while inspecting only one turn's
     /// budget, even when channel notification was lost.
     poll_cursor: Option<Uint256>,
+    /// Alternate which source receives the odd completion slot when both
+    /// orphaned retries and live entries are pending, preventing either class
+    /// from monopolizing bounded NetworkOps polling.
+    poll_orphans_first: bool,
 }
 
 fn failure_matches_entry(acquisition_id: Option<u64>, entry_id: u64) -> bool {
@@ -219,31 +232,21 @@ fn failure_matches_entry(acquisition_id: Option<u64>, entry_id: u64) -> bool {
 fn record_recent_failure_at(
     inner: &mut RegistryInner,
     hash: Uint256,
-    acquisition_id: Option<u64>,
+    _acquisition_id: Option<u64>,
     now: Instant,
 ) {
-    // A worker callback belongs to the acquisition that installed it. It must
-    // not create a hash-wide cooldown after that acquisition has been swept or
-    // replaced. Administrative hash-only callers intentionally retain the
-    // broad rippled `logFailure` behavior.
-    if let Some(acquisition_id) = acquisition_id
-        && inner
-            .entries
-            .get(&hash)
-            .is_none_or(|entry| entry.id != acquisition_id)
-    {
-        return;
-    }
+    // Match InboundLedgersImp::logFailure: AcqDone records a hash-wide
+    // cooldown even if the failed object has already been swept. Admission
+    // policy decides where that cooldown is consulted (History only).
 
     inner.recent_failures.entry(hash).or_insert(now);
     if let Some(entry) = inner.entries.get_mut(&hash)
-        && failure_matches_entry(acquisition_id, entry.id)
+        && failure_matches_entry(_acquisition_id, entry.id)
         && !entry.failed
     {
-        // `InboundLedger::done` touches the acquisition before dispatching
-        // InboundLedgers::logFailure. Touch exactly once on the first failure
-        // transition. Subsequent poll passes must not extend either this
-        // one-minute idle retention or the five-minute failure cooldown.
+        // InboundLedger::done touches the acquisition before queued AcqDone
+        // records the failure. Preserve that terminal sweep lifetime without
+        // extending it on later poll passes.
         entry.failed = true;
         entry.last_touched = now;
     }
@@ -251,6 +254,22 @@ fn record_recent_failure_at(
 
 fn record_recent_failure(inner: &mut RegistryInner, hash: Uint256, acquisition_id: Option<u64>) {
     record_recent_failure_at(inner, hash, acquisition_id, Instant::now());
+}
+
+/// Match `InboundLedger::done()`'s terminal `touch()`. The callback carries an
+/// acquisition identity so a delayed terminal event from a swept predecessor
+/// cannot extend the lifetime of a replacement entry for the same hash.
+fn touch_terminal_entry_at(
+    inner: &mut RegistryInner,
+    hash: Uint256,
+    acquisition_id: u64,
+    now: Instant,
+) {
+    if let Some(entry) = inner.entries.get_mut(&hash)
+        && entry.id == acquisition_id
+    {
+        entry.last_touched = now;
+    }
 }
 
 #[derive(Clone)]
@@ -570,7 +589,9 @@ impl InboundLedgers {
             inner: Arc::new(Mutex::new(RegistryInner {
                 entries: BTreeMap::new(),
                 recent_failures: HashMap::new(),
+                orphaned_completions: VecDeque::new(),
                 poll_cursor: None,
+                poll_orphans_first: true,
             })),
             worker_pool,
             node_store: Arc::new(RwLock::new(None)),
@@ -675,18 +696,6 @@ impl InboundLedgers {
 
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
 
-        // Check recent failures (5-min cooldown)
-        if let Some(failed_at) = inner.recent_failures.get(&hash) {
-            if failed_at.elapsed() < FAILURE_COOLDOWN {
-                tracing::info!(target: "inbound_ledger", %hash, seq, "acquire: REJECTED recent failure");
-                return None;
-            }
-        }
-        // Prune expired failures while we're here
-        inner
-            .recent_failures
-            .retain(|_, t| t.elapsed() < FAILURE_COOLDOWN);
-
         // Existing acquisition: a failed one returns immediately, exactly as
         // rippled checks `InboundLedger::isFailed()` before `update()`. Do
         // not touch it or refresh recent_failures: its first failure owns the
@@ -762,11 +771,40 @@ impl InboundLedgers {
                 record_recent_failure(&mut inner, failed_hash, Some(acquisition_id));
             })
         };
-
+        let completion_recorder: AcquisitionCompletionRecorder = {
+            let inner = Arc::clone(&self.inner);
+            Arc::new(move |completed_hash, ledger| {
+                let mut inner = inner
+                    .lock()
+                    .expect("inbound_ledgers completion recorder lock");
+                // Match InboundLedger::done(): terminal completion owns the
+                // last-action update, so queue latency cannot make a newly
+                // completed ledger eligible for an immediate sweep.
+                if let Some(entry) = inner.entries.get_mut(&completed_hash)
+                    && entry.id == acquisition_id
+                {
+                    entry.completed_ledger = Some(ledger);
+                    entry.last_touched = Instant::now();
+                } else {
+                    // A sweep may have unlinked the acquisition while its
+                    // final worker still held an Arc. Rippled's shared object
+                    // still runs done()/AcqDone in that case; retain the same
+                    // completion durably until NetworkOps consumes it.
+                    inner
+                        .orphaned_completions
+                        .push_back(CompletedInboundLedger {
+                            ledger,
+                            reason,
+                            acquisition_id,
+                        });
+                }
+            })
+        };
         let full_below_gen = self.full_below.generation().wrapping_add(1);
 
         let acq_state = AcquisitionBuilder {
             hash: SHAMapHash::new(hash),
+            acquisition_id,
             seq,
             reason,
             node_store: ns,
@@ -774,6 +812,7 @@ impl InboundLedgers {
             fetch_pack: Arc::clone(&self.fetch_pack),
             store_tx: self.completed_ledgers_tx.clone(),
             failure_recorder,
+            completion_recorder,
             full_below_generation: full_below_gen,
             worker_pool: Arc::clone(&self.worker_pool),
             initial_peers,
@@ -793,6 +832,7 @@ impl InboundLedgers {
                 last_touched: now,
                 started_at: now,
                 completed_ledger: None,
+                completion_acknowledged: false,
                 failed: false,
             },
         );
@@ -886,10 +926,9 @@ impl InboundLedgers {
                 );
                 return false;
             }
-            // An accepted response proves this acquisition remains active.
-            // Keep it through the sweep window while its potentially long
-            // account-state download is making progress.
-            entry.last_touched = Instant::now();
+            // Wire receipt does not change rippled InboundLedger::lastAction.
+            // Only construction, duplicate acquire/update, and terminal done
+            // refresh the sweep clock.
             Arc::clone(&entry.state)
         };
 
@@ -921,14 +960,49 @@ impl InboundLedgers {
         let mut to_remove = Vec::new();
 
         for (hash, entry) in &inner.entries {
-            if now.duration_since(entry.last_touched) > SWEEP_IDLE_TIMEOUT {
-                to_remove.push(*hash);
+            let idle_for = now.duration_since(entry.last_touched);
+            if idle_for > SWEEP_IDLE_TIMEOUT {
+                to_remove.push((
+                    *hash,
+                    entry.seq,
+                    entry.reason,
+                    idle_for,
+                    entry.failed || entry.state.failed.load(Ordering::Acquire),
+                    entry.completed_ledger.is_some()
+                        || entry.state.completed.load(Ordering::Acquire),
+                ));
             }
         }
 
         let mut swept_states = Vec::new();
-        for hash in to_remove {
+        for (hash, seq, reason, idle_for, failed, completed) in to_remove {
             if let Some(entry) = inner.entries.remove(&hash) {
+                tracing::info!(
+                    target: "lcl_trace",
+                    event = "inbound_swept",
+                    %hash,
+                    seq,
+                    reason = ?reason,
+                    idle_ms = idle_for.as_millis() as u64,
+                    failed,
+                    completed,
+                    "LCL trace: inbound acquisition removed by sweep"
+                );
+                if !entry.completion_acknowledged
+                    && let Some(ledger) = entry.completed_ledger.clone()
+                {
+                    // A completed result has not yet been durably consumed.
+                    // Preserve it after unlinking the entry so the strand can
+                    // retry persistence even when the wakeup channel was full
+                    // or disconnected.
+                    inner
+                        .orphaned_completions
+                        .push_back(CompletedInboundLedger {
+                            ledger,
+                            reason: entry.reason,
+                            acquisition_id: entry.id,
+                        });
+                }
                 swept_states.push(entry.state);
             }
         }
@@ -1250,6 +1324,7 @@ impl InboundLedgers {
             entry.state.stopped.store(true, Ordering::Release);
         }
         inner.recent_failures.clear();
+        inner.orphaned_completions.clear();
         drop(inner);
 
         self.worker_pool.stop();
@@ -1260,7 +1335,7 @@ impl InboundLedgers {
     /// Poll all completed acquisitions. Prefer `poll_results_bounded` from
     /// timer-driven consensus paths so a completion flood cannot starve the
     /// heartbeat.
-    pub fn poll_results(&self) -> Vec<(Uint256, Ledger, AcquireReason)> {
+    pub fn poll_results(&self) -> Vec<(Uint256, u64, Ledger, AcquireReason)> {
         self.poll_results_bounded(usize::MAX)
     }
 
@@ -1269,7 +1344,10 @@ impl InboundLedgers {
     /// the consumer calls `acknowledge_completed` after its cache/persistence
     /// work succeeds. This makes completion a two-phase handoff instead of
     /// treating an in-memory result as a durable ledger transition.
-    pub fn poll_results_bounded(&self, budget: usize) -> Vec<(Uint256, Ledger, AcquireReason)> {
+    pub fn poll_results_bounded(
+        &self,
+        budget: usize,
+    ) -> Vec<(Uint256, u64, Ledger, AcquireReason)> {
         // Snapshot under the registry mutex, then inspect each acquisition
         // after releasing it. Completion can race with a long map walk, so
         // never hold the registry lock while taking `state.mutable`.
@@ -1279,17 +1357,47 @@ impl InboundLedgers {
             Arc<AcquisitionState>,
             Option<Arc<Ledger>>,
             bool,
+            bool,
             AcquireReason,
-        )> = {
+        )>;
+        let mut completed: Vec<(Uint256, u64, Ledger, AcquireReason)>;
+        {
             let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-            let mut entries = Vec::with_capacity(budget);
-            if budget != 0 {
+            let orphan_budget =
+                if !inner.orphaned_completions.is_empty() && !inner.entries.is_empty() {
+                    let orphan_budget = if inner.poll_orphans_first {
+                        (budget + 1) / 2
+                    } else {
+                        budget / 2
+                    };
+                    inner.poll_orphans_first = !inner.poll_orphans_first;
+                    orphan_budget
+                } else {
+                    budget
+                };
+            completed = inner
+                .orphaned_completions
+                .iter()
+                .take(orphan_budget)
+                .map(|completion| {
+                    (
+                        *completion.ledger.header().hash.as_uint256(),
+                        completion.acquisition_id,
+                        (*completion.ledger).clone(),
+                        completion.reason,
+                    )
+                })
+                .collect();
+            let remaining = budget.saturating_sub(completed.len());
+            let mut snapshot = Vec::with_capacity(remaining);
+            if remaining != 0 {
                 let mut record = |hash: &Uint256, entry: &Entry| {
-                    entries.push((
+                    snapshot.push((
                         *hash,
                         entry.id,
                         Arc::clone(&entry.state),
                         entry.completed_ledger.clone(),
+                        entry.completion_acknowledged,
                         entry.failed,
                         entry.reason,
                     ));
@@ -1300,34 +1408,44 @@ impl InboundLedgers {
                             .entries
                             .range((Excluded(cursor), Unbounded))
                             .chain(inner.entries.range(..=cursor))
-                            .take(budget)
+                            .take(remaining)
                         {
                             record(hash, entry);
                         }
                     }
                     None => {
-                        for (hash, entry) in inner.entries.iter().take(budget) {
+                        for (hash, entry) in inner.entries.iter().take(remaining) {
                             record(hash, entry);
                         }
                     }
                 }
-                inner.poll_cursor = entries.last().map(|(hash, _, _, _, _, _)| *hash);
+                inner.poll_cursor = snapshot.last().map(|(hash, _, _, _, _, _, _)| *hash);
             }
-            entries
+            entries = snapshot;
         };
-
-        let mut completed = Vec::new();
         let mut failed_entries = Vec::new();
-        for (hash, acquisition_id, state, externally_completed, failed, reason) in entries {
+        for (
+            hash,
+            acquisition_id,
+            state,
+            externally_completed,
+            completion_acknowledged,
+            failed,
+            reason,
+        ) in entries
+        {
+            if completion_acknowledged {
+                continue;
+            }
             if failed || state.failed.load(Ordering::Acquire) {
                 failed_entries.push((hash, acquisition_id));
                 continue;
             }
             if let Some(ledger) = externally_completed {
-                completed.push((hash, (*ledger).clone(), reason));
+                completed.push((hash, acquisition_id, (*ledger).clone(), reason));
             } else if state.completed.load(Ordering::Acquire) {
                 if let Some(ledger) = state.completed_ledger() {
-                    completed.push((hash, (*ledger).clone(), reason));
+                    completed.push((hash, acquisition_id, (*ledger).clone(), reason));
                 } else {
                     failed_entries.push((hash, acquisition_id));
                 }
@@ -1347,16 +1465,25 @@ impl InboundLedgers {
     /// Acknowledge that a consumer has durably handled this completed result.
     /// A failed persistence attempt must not call this: the completed state is
     /// retained so the owner can retry on a later bounded poll.
-    pub fn acknowledge_completed(&self, hash: &Uint256) {
+    pub fn acknowledge_completed(&self, hash: &Uint256, acquisition_id: u64) {
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
         let completed = inner.entries.get(hash).is_some_and(|entry| {
             !entry.failed
                 && !entry.state.failed.load(Ordering::Acquire)
+                && entry.id == acquisition_id
                 && (entry.completed_ledger.is_some()
                     || entry.state.completed.load(Ordering::Acquire))
         });
+        let orphaned = inner.orphaned_completions.iter().position(|completion| {
+            completion.ledger.header().hash.as_uint256() == hash
+                && completion.acquisition_id == acquisition_id
+        });
         if completed {
-            if let Some(entry) = inner.entries.remove(hash) {
+            if let Some(entry) = inner.entries.get_mut(hash) {
+                // Keep completed ledgers resident until the ordinary inbound
+                // sweep. `acquire(hash, ...)` must still return this ledger,
+                // just as rippled finds completed InboundLedger objects.
+                entry.completion_acknowledged = true;
                 tracing::info!(
                     target: "lcl_trace",
                     event = "inbound_completion_acknowledged",
@@ -1364,10 +1491,11 @@ impl InboundLedgers {
                     seq = entry.seq,
                     reason = ?entry.reason,
                     acquisition_id = entry.id,
-                    "LCL trace: completed inbound ledger removed after acknowledgement"
+                    "LCL trace: completed inbound ledger retained until sweep after acknowledgement"
                 );
-                entry.state.stopped.store(true, Ordering::Release);
             }
+        } else if let Some(index) = orphaned {
+            inner.orphaned_completions.remove(index);
         } else {
             tracing::warn!(
                 target: "lcl_trace",
@@ -1626,22 +1754,23 @@ mod tests {
     use super::super::acquisition::AcquisitionSnapshot;
     use super::super::worker_pool::WorkerPool;
     use super::{
-        AcquireReason, AcquisitionLifecycleCounters, AcquisitionLifecycleSnapshot, InboundLedgers,
-        RecoveryLclDecision, RegistryInner, SWEEP_IDLE_TIMEOUT, acquisition_snapshot_json,
-        failure_matches_entry, record_recent_failure, record_recent_failure_at,
-        recovery_lcl_decision_json, response_sequence_matches_request,
+        AcquireReason, AcquisitionLifecycleCounters, AcquisitionLifecycleSnapshot,
+        CompletedInboundLedger, InboundLedgers, RecoveryLclDecision, RegistryInner,
+        SWEEP_IDLE_TIMEOUT, acquisition_snapshot_json, failure_matches_entry,
+        record_recent_failure, record_recent_failure_at, recovery_lcl_decision_json,
+        response_sequence_matches_request, touch_terminal_entry_at,
     };
     use basics::base_uint::Uint256;
     use basics::basic_config::BasicConfig;
     use basics::hardened_hash::HardenedHashBuilder;
     use basics::tagged_cache::MonotonicClock;
-    use ledger::{FetchPackCache, InboundLedgerDataType, InboundLedgerPacket};
+    use ledger::{FetchPackCache, InboundLedgerDataType, InboundLedgerPacket, Ledger};
     use nodestore::{DummyScheduler, ManagerImp, NullJournal, Scheduler};
     use overlay::{Peer, PeerImp, PeerSet as _};
     use protocol::{JsonValue, PublicKey};
     use shamap::family::FullBelowCacheImpl;
     use shamap::tree_node_cache::TreeNodeCache;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
@@ -1865,7 +1994,9 @@ mod tests {
         let mut inner = RegistryInner {
             entries: BTreeMap::new(),
             recent_failures: HashMap::new(),
+            orphaned_completions: VecDeque::new(),
             poll_cursor: None,
+            poll_orphans_first: true,
         };
 
         record_recent_failure(&mut inner, hash, None);
@@ -1885,7 +2016,9 @@ mod tests {
         let mut inner = RegistryInner {
             entries: BTreeMap::new(),
             recent_failures: HashMap::new(),
+            orphaned_completions: VecDeque::new(),
             poll_cursor: None,
+            poll_orphans_first: true,
         };
 
         record_recent_failure_at(&mut inner, hash, None, first_failure);
@@ -1902,19 +2035,196 @@ mod tests {
     }
 
     #[test]
-    fn delayed_failure_from_a_swept_acquisition_cannot_restart_cooldown() {
+    fn terminal_touch_refreshes_only_the_matching_acquisition() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let hash = Uint256::from_array([0xF6; 32]);
+        assert!(
+            registry
+                .acquire(hash, 0, AcquireReason::Consensus)
+                .is_none()
+        );
+
+        let first_id = {
+            let inner = registry.inner.lock().expect("registry lock");
+            inner.entries.get(&hash).expect("first entry").id
+        };
+        registry.remove(&hash);
+        assert!(
+            registry
+                .acquire(hash, 0, AcquireReason::Consensus)
+                .is_none()
+        );
+
+        let before = Instant::now() - Duration::from_secs(30);
+        let refreshed = Instant::now();
+        {
+            let mut inner = registry.inner.lock().expect("registry lock");
+            let replacement = inner.entries.get_mut(&hash).expect("replacement entry");
+            replacement.last_touched = before;
+            let replacement_id = replacement.id;
+            touch_terminal_entry_at(&mut inner, hash, first_id, refreshed);
+            assert_eq!(
+                inner
+                    .entries
+                    .get(&hash)
+                    .expect("replacement entry")
+                    .last_touched,
+                before,
+                "a delayed predecessor terminal callback must not refresh a replacement"
+            );
+            touch_terminal_entry_at(&mut inner, hash, replacement_id, refreshed);
+            assert_eq!(
+                inner
+                    .entries
+                    .get(&hash)
+                    .expect("replacement entry")
+                    .last_touched,
+                refreshed,
+                "the matching terminal callback must own the sweep timestamp"
+            );
+        }
+        registry.stop();
+    }
+
+    #[test]
+    fn swept_unacknowledged_completion_moves_to_durable_queue() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(44, 1_000, false);
+        ledger.set_immutable(true);
+        let ledger = Arc::new(ledger);
+        let hash = *ledger.header().hash.as_uint256();
+        assert!(
+            registry
+                .acquire(hash, 0, AcquireReason::Consensus)
+                .is_none()
+        );
+        registry.on_complete(hash, Arc::clone(&ledger));
+        {
+            let mut inner = registry.inner.lock().expect("registry lock");
+            inner
+                .entries
+                .get_mut(&hash)
+                .expect("completed entry")
+                .last_touched = Instant::now() - SWEEP_IDLE_TIMEOUT - Duration::from_secs(1);
+        }
+
+        registry.sweep();
+        assert!(!registry.contains(&hash));
+        let completed = registry.poll_results_bounded(1);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].0, hash);
+        registry.acknowledge_completed(&hash, completed[0].1);
+        assert!(registry.poll_results_bounded(1).is_empty());
+        registry.stop();
+    }
+
+    #[test]
+    fn orphaned_completion_remains_pollable_until_acknowledged() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(43, 1_000, false);
+        ledger.set_immutable(true);
+        let ledger = Arc::new(ledger);
+        let hash = *ledger.header().hash.as_uint256();
+        {
+            let mut inner = registry.inner.lock().expect("registry lock");
+            inner
+                .orphaned_completions
+                .push_back(CompletedInboundLedger {
+                    ledger: Arc::clone(&ledger),
+                    reason: AcquireReason::Consensus,
+                    acquisition_id: 17,
+                });
+        }
+
+        for _ in 0..2 {
+            let completed = registry.poll_results_bounded(1);
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0].0, hash);
+            assert_eq!(completed[0].2.header().seq, ledger.header().seq);
+        }
+        registry.acknowledge_completed(&hash, 17);
+        assert!(registry.poll_results_bounded(1).is_empty());
+        registry.stop();
+    }
+
+    #[test]
+    fn acknowledged_completion_remains_acquirable_until_sweep() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let hash = Uint256::from_array([0xF5; 32]);
+        assert!(
+            registry
+                .acquire(hash, 0, AcquireReason::Consensus)
+                .is_none()
+        );
+
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(42, 1_000, false);
+        ledger.set_immutable(true);
+        let ledger = Arc::new(ledger);
+        registry.on_complete(hash, Arc::clone(&ledger));
+        let acquisition_id = registry
+            .inner
+            .lock()
+            .expect("registry lock")
+            .entries
+            .get(&hash)
+            .expect("completed entry")
+            .id;
+        registry.acknowledge_completed(&hash, acquisition_id);
+
+        assert!(registry.contains(&hash));
+        assert_eq!(
+            registry
+                .acquire(hash, 0, AcquireReason::Consensus)
+                .expect("completed acquisition remains available until sweep")
+                .header()
+                .seq,
+            ledger.header().seq
+        );
+        registry.stop();
+    }
+
+    #[test]
+    fn consensus_acquire_ignores_recent_failure_cooldown() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let hash = Uint256::from_array([0xF4; 32]);
+        registry
+            .inner
+            .lock()
+            .expect("registry lock")
+            .recent_failures
+            .insert(hash, Instant::now());
+
+        assert!(
+            registry
+                .acquire(hash, 0, AcquireReason::Consensus)
+                .is_none(),
+            "consensus must create the hash-only target even after a History cooldown"
+        );
+        assert!(registry.contains(&hash));
+        registry.stop();
+    }
+
+    #[test]
+    fn delayed_failure_from_a_swept_acquisition_records_hash_cooldown() {
         let hash = Uint256::from_array([0xF3; 32]);
         let mut inner = RegistryInner {
             entries: BTreeMap::new(),
             recent_failures: HashMap::new(),
+            orphaned_completions: VecDeque::new(),
             poll_cursor: None,
+            poll_orphans_first: true,
         };
 
         record_recent_failure_at(&mut inner, hash, Some(17), Instant::now());
 
         assert!(
-            !inner.recent_failures.contains_key(&hash),
-            "a callback whose acquisition no longer exists must not create a new cooldown"
+            inner.recent_failures.contains_key(&hash),
+            "rippled AcqDone records the hash-wide cooldown even after the acquisition was swept"
         );
     }
 

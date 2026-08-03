@@ -37,10 +37,6 @@ use overlay::inbound::QueuedProposal;
 // History acquisition is retried promptly after the registry finishes a
 // ledger. InboundLedgers deduplicates by hash/sequence, as rippled does.
 const HISTORY_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_millis(200);
-/// Rippled expires a fetch-pack request after one second so a silent peer
-/// cannot permanently suppress a new request for the same missing ledger.
-const HISTORY_FETCH_PACK_STALE_AFTER: Duration = Duration::from_secs(1);
-
 // A polling turn must always return to the heartbeat scheduler. The overlay
 // channels can be continuously non-empty under peer load; draining either one
 // without a budget would otherwise defer the next JtNetopTimer forever.
@@ -648,13 +644,13 @@ fn strand_loop(
                     "LCL trace: completed inbound ledgers are ready for persistence"
                 );
             }
-            for (_, ledger, reason) in registry_completions {
+            for (hash, acquisition_id, ledger, reason) in registry_completions {
                 let ledger = Arc::new(ledger);
                 let persisted = persist_completed_inbound_ledger(&root, &lm, &ledger, reason);
                 trace_completed_inbound_handoff("registry_poll", &lm, &ledger, reason, persisted);
                 root.check_accept_hash_seq(*ledger.header().hash.as_uint256(), ledger.header().seq);
                 if persisted.acknowledged {
-                    shared_inbound.acknowledge_completed(ledger.header().hash.as_uint256());
+                    shared_inbound.acknowledge_completed(&hash, acquisition_id);
                 }
                 // Always register with the validations adaptor regardless of
                 // whether LedgerHistory already had this ledger. A ledger can
@@ -671,75 +667,21 @@ fn strand_loop(
             }
         }
 
-        // ─── 6b. storeLedger drain — completed InboundLedger results ─────
-        // Moved from the polling loop: drain completed_ledgers_rx and
-        // shared_completed_rx into LedgerHistory, matching rippled's
-        // storeLedger path.
+        // ─── 6b. completion wakeups ──────────────────────────────────────
+        // Registry polling above is the only persistence/checkAccept/ack owner.
+        // These bounded receivers merely wake this turn; processing them here
+        // would duplicate a completion that is still retained in the registry.
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let rx_guard = lm_rt
                 .completed_ledgers_rx
                 .lock()
                 .expect("completed_ledgers_rx");
             if let Some(rx) = rx_guard.as_ref() {
-                drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |completion| {
-                    let ledger = completion.ledger;
-                    let lm = lm_rt.ledger_master();
-                    let persisted =
-                        persist_completed_inbound_ledger(&root, &lm, &ledger, completion.reason);
-                    trace_completed_inbound_handoff(
-                        "completed_ledgers_rx",
-                        &lm,
-                        &ledger,
-                        completion.reason,
-                        persisted,
-                    );
-                    root.check_accept_hash_seq(
-                        *ledger.header().hash.as_uint256(),
-                        ledger.header().seq,
-                    );
-                    if persisted.acknowledged {
-                        shared_inbound.acknowledge_completed(ledger.header().hash.as_uint256());
-                    }
-                    root.validations().register_ledger(&ledger);
-                    if persisted.inserted {
-                        if let Some(ref tx) = event_tx {
-                            let _ =
-                                tx.try_send(crate::consensus::driver::ConsensusEvent::LedgerDone(
-                                    Arc::clone(&ledger),
-                                ));
-                        }
-                    }
-                });
+                drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |_| {});
             }
         }
         if let Some(ref rx) = shared_completed_rx {
-            drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |completion| {
-                let ledger = completion.ledger;
-                let persisted = root.ledger_master_runtime().map(|lm_rt| {
-                    let lm = lm_rt.ledger_master();
-                    let persisted =
-                        persist_completed_inbound_ledger(&root, &lm, &ledger, completion.reason);
-                    trace_completed_inbound_handoff(
-                        "shared_completed_rx",
-                        &lm,
-                        &ledger,
-                        completion.reason,
-                        persisted,
-                    );
-                    persisted
-                });
-                root.check_accept_hash_seq(*ledger.header().hash.as_uint256(), ledger.header().seq);
-                if persisted.is_some_and(|result| result.acknowledged) {
-                    shared_inbound.acknowledge_completed(ledger.header().hash.as_uint256());
-                }
-                root.validations().register_ledger(&ledger);
-                if persisted.is_some_and(|result| result.inserted) {
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx
-                            .try_send(crate::consensus::driver::ConsensusEvent::LedgerDone(ledger));
-                    }
-                }
-            });
+            drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |_| {});
         }
 
         // ─── 6c. pending_consensus_ledger → acquire_async ────────────────
@@ -1505,7 +1447,6 @@ fn check_accept_and_advance(
                 // Matches LedgerMaster::doAdvance prefetch loop.
                 let prefetch_limit = configured_ledger_history.min(256);
                 let mut prefetch_count = 0u32;
-                let mut primary_history_pending = false;
 
                 for seq in (earliest_seq..=missing).rev() {
                     if prefetch_count >= prefetch_limit {
@@ -1540,24 +1481,50 @@ fn check_accept_and_advance(
                         );
                         continue;
                     }
-                    if seq == missing {
-                        primary_history_pending = true;
-                    }
-                    if shared_inbound.has_entry_for_seq_or_hash(seq, &hash) {
+                    // Rippled consults recentFailures_ only for the primary
+                    // fetchForHistory request. Consensus and Generic callers
+                    // must be able to recreate a swept/failed hash immediately.
+                    let is_primary = seq == missing;
+                    let primary_history_failed = is_primary && shared_inbound.is_failure(&hash);
+                    if !history_acquire_allowed(is_primary, primary_history_failed) {
+                        tracing::debug!(
+                            target: "history",
+                            seq,
+                            %hash,
+                            "skipping primary history acquisition after recent failure"
+                        );
                         continue;
                     }
-                    shared_inbound.acquire_async(hash, seq, AcquireReason::History);
-                    prefetch_count += 1;
-                }
-
-                if primary_history_pending {
-                    request_history_fetch_pack(
-                        root,
-                        &lm,
-                        missing,
-                        configured_ledger_history,
-                        history_fetch_pack,
-                    );
+                    // `fetchForHistory` always calls acquire(), even when an
+                    // acquisition already exists. That update() touch prevents
+                    // a live request from being swept while it is still the
+                    // history target. If the completed ledger is returned,
+                    // materialize it exactly as the reference does.
+                    let already_in_progress = shared_inbound.has_entry_for_seq_or_hash(seq, &hash);
+                    if let Some(ledger) = shared_inbound.acquire(hash, seq, AcquireReason::History)
+                    {
+                        let _ = persist_completed_inbound_ledger(
+                            root,
+                            &lm,
+                            &ledger,
+                            AcquireReason::History,
+                        );
+                        continue;
+                    }
+                    // In rippled, getFetchPack follows only an acquire() that
+                    // returned no ledger, and only for the primary target.
+                    if history_fetch_pack_requested(is_primary, primary_history_failed, false) {
+                        request_history_fetch_pack(
+                            root,
+                            &lm,
+                            missing,
+                            configured_ledger_history,
+                            history_fetch_pack,
+                        );
+                    }
+                    if !already_in_progress {
+                        prefetch_count += 1;
+                    }
                 }
 
                 if prefetch_count > 1 {
@@ -1571,6 +1538,24 @@ fn check_accept_and_advance(
             }
         }
     }
+}
+
+fn history_acquire_allowed(is_primary: bool, recent_failure: bool) -> bool {
+    !is_primary || !recent_failure
+}
+
+/// `LedgerMaster::fetchForHistory` requests a fetch pack only after the direct
+/// primary acquire was permitted and returned no completed ledger.
+fn history_fetch_pack_requested(
+    is_primary: bool,
+    recent_failure: bool,
+    acquire_returned_ledger: bool,
+) -> bool {
+    is_primary && !recent_failure && !acquire_returned_ledger
+}
+
+fn same_history_fetch_pack_is_suppressed(in_flight: Option<(u32, Instant)>, missing: u32) -> bool {
+    in_flight.is_some_and(|(requested, _)| requested == missing)
 }
 
 fn trace_completed_inbound_handoff(
@@ -1690,8 +1675,10 @@ fn request_history_fetch_pack(
     fetch_depth: u32,
     in_flight: &mut Option<(u32, Instant)>,
 ) {
-    if let Some((requested_seq, issued_at)) = *in_flight {
-        if requested_seq == missing && issued_at.elapsed() <= HISTORY_FETCH_PACK_STALE_AFTER {
+    if let Some((requested_seq, _)) = *in_flight {
+        // LedgerMaster::fetchForHistory sets fetchSeq_ on its first request
+        // and suppresses the same missing sequence until the gap changes.
+        if requested_seq == missing {
             return;
         }
         *in_flight = None;
@@ -1823,9 +1810,11 @@ fn should_acquire_history(
 mod tests {
     use super::{
         ConsensusJobScheduler, MAX_LEDGER_COMPLETIONS_PER_TURN, MAX_PROPOSALS_PER_TURN,
-        PreferredLclReconciliation, drain_bounded, persist_completed_inbound_ledger,
-        record_completed_inbound_ledger, should_promote_operating_mode_at_end_consensus,
-        should_reconcile_preferred_lcl, should_run_end_consensus_reconciliation,
+        PreferredLclReconciliation, drain_bounded, history_acquire_allowed,
+        history_fetch_pack_requested, persist_completed_inbound_ledger,
+        record_completed_inbound_ledger, same_history_fetch_pack_is_suppressed,
+        should_promote_operating_mode_at_end_consensus, should_reconcile_preferred_lcl,
+        should_run_end_consensus_reconciliation,
     };
     use crate::ApplicationRoot;
     use crate::consensus::rcl_consensus::PendingAcceptWork;
@@ -1840,7 +1829,7 @@ mod tests {
     use ledger::{Ledger, LedgerHeader, LedgerMaster, LedgerMasterConfig, calculate_ledger_hash};
     use std::sync::Arc;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn immutable_ledger(seq: u32, parent_fill: u8) -> Arc<Ledger> {
         let mut header = LedgerHeader {
@@ -1878,6 +1867,28 @@ mod tests {
         );
         ledger.set_immutable(true);
         Arc::new(ledger)
+    }
+
+    #[test]
+    fn history_failure_cooldown_applies_only_to_primary_history_fetch() {
+        assert!(!history_acquire_allowed(true, true));
+        assert!(history_acquire_allowed(true, false));
+        assert!(history_acquire_allowed(false, true));
+    }
+
+    #[test]
+    fn history_fetch_pack_follows_only_a_permitted_empty_primary_acquire() {
+        assert!(history_fetch_pack_requested(true, false, false));
+        assert!(!history_fetch_pack_requested(true, true, false));
+        assert!(!history_fetch_pack_requested(true, false, true));
+        assert!(!history_fetch_pack_requested(false, false, false));
+    }
+
+    #[test]
+    fn same_history_fetch_pack_remains_suppressed_after_one_second() {
+        let in_flight = Some((500, Instant::now() - Duration::from_secs(2)));
+        assert!(same_history_fetch_pack_is_suppressed(in_flight, 500));
+        assert!(!same_history_fetch_pack_is_suppressed(in_flight, 499));
     }
 
     #[test]

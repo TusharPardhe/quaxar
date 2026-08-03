@@ -140,6 +140,13 @@ pub(crate) type AcquisitionPeerProvider =
 /// making the five-minute failure cooldown visible before the next sweep.
 pub(crate) type AcquisitionFailureRecorder = Arc<dyn Fn(Uint256) + Send + Sync + 'static>;
 
+/// Registry-owned callback invoked exactly once after a successful terminal
+/// acquisition has made its completed ledger visible. This mirrors
+/// `InboundLedger::done()` calling `touch()` before it dispatches `AcqDone`,
+/// preserving the completed entry for its normal sweep lifetime.
+pub(crate) type AcquisitionCompletionRecorder =
+    Arc<dyn Fn(Uint256, Arc<Ledger>) + Send + Sync + 'static>;
+
 #[derive(Debug)]
 struct AcquisitionStats {
     started_at: Instant,
@@ -501,6 +508,7 @@ pub struct AcquisitionState {
     pub data_buffer: Mutex<Vec<(u64, InboundLedgerPacket)>>,
     pub mutable: Mutex<AcqMutableState>,
     pub hash: SHAMapHash,
+    pub acquisition_id: u64,
     pub seq: u32,
     pub reason: AcquireReason,
     pub peer_set: overlay::SimplePeerSet,
@@ -511,10 +519,15 @@ pub struct AcquisitionState {
     pub shared_tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
     pub store_tx: std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     failure_recorder: AcquisitionFailureRecorder,
+    completion_recorder: AcquisitionCompletionRecorder,
     pub stopped: AtomicBool,
     pub completed: AtomicBool,
     completed_ledger: Mutex<Option<Arc<Ledger>>>,
     pub failed: AtomicBool,
+    // Mirrors rippled InboundLedger::done's signaled_ guard: terminal failure
+    // must be claimed before its registry touch/cooldown callback, but not
+    // published to poll/sweep consumers until that callback has completed.
+    failure_claimed: AtomicBool,
     // Mirrors rippled InboundLedger::done's signaled_ guard: exactly one
     // caller owns expensive successful-terminal finalization.
     finalization_claimed: AtomicBool,
@@ -737,14 +750,22 @@ impl AcquisitionState {
     }
 
     fn mark_failed(&self) {
-        if self.failed.swap(true, Ordering::AcqRel) {
+        if self
+            .failure_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return;
         }
+        // InboundLedger::done touches before dispatching AcqDone. Keep the
+        // matching registry entry alive and record its cooldown before any
+        // strand poll or sweep can observe the terminal failure flags.
+        (self.failure_recorder)(*self.hash.as_uint256());
+        self.failed.store(true, Ordering::Release);
         self.stopped.store(true, Ordering::Release);
         self.lifecycle
             .terminal_failed
             .fetch_add(1, Ordering::Relaxed);
-        (self.failure_recorder)(*self.hash.as_uint256());
     }
 
     pub(crate) fn take_buffered_packets(&self) -> Vec<ledger::InboundLedgerReceivedPacket> {
@@ -817,6 +838,7 @@ impl AcquisitionState {
 
 pub struct AcquisitionBuilder {
     pub hash: SHAMapHash,
+    pub acquisition_id: u64,
     pub seq: u32,
     pub reason: AcquireReason,
     pub node_store: SHAMapStoreNodeStore,
@@ -824,6 +846,7 @@ pub struct AcquisitionBuilder {
     pub fetch_pack: Arc<FetchPackCache>,
     pub store_tx: std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     pub failure_recorder: AcquisitionFailureRecorder,
+    pub completion_recorder: AcquisitionCompletionRecorder,
     pub full_below_generation: u32,
     pub worker_pool: Arc<WorkerPool>,
     pub initial_peers: Vec<Arc<dyn Peer>>,
@@ -853,6 +876,7 @@ impl AcquisitionBuilder {
                 },
             }),
             hash: self.hash,
+            acquisition_id: self.acquisition_id,
             seq: self.seq,
             reason: self.reason,
             peer_set: overlay::SimplePeerSet::new(self.initial_peers),
@@ -868,10 +892,12 @@ impl AcquisitionBuilder {
             shared_tree_cache: self.tree_cache,
             store_tx: self.store_tx,
             failure_recorder: self.failure_recorder,
+            completion_recorder: self.completion_recorder,
             stopped: AtomicBool::new(false),
             completed: AtomicBool::new(false),
             completed_ledger: Mutex::new(None),
             failed: AtomicBool::new(false),
+            failure_claimed: AtomicBool::new(false),
             finalization_claimed: AtomicBool::new(false),
             fetch_pack_ready: AtomicBool::new(false),
             state_scan_in_progress: AtomicBool::new(false),
@@ -1497,6 +1523,7 @@ fn finalize_terminal(state: &Arc<AcquisitionState>) {
 }
 
 fn record_completed_ledger(
+    acquisition_id: u64,
     completed: &AtomicBool,
     completed_ledger: &Mutex<Option<Arc<Ledger>>>,
     store_tx: &std::sync::mpsc::SyncSender<CompletedInboundLedger>,
@@ -1518,8 +1545,36 @@ fn record_completed_ledger(
 
     // This channel only wakes a consumer; failure must not revoke a completed
     // acquisition or make the ledger unrecoverable through the registry.
-    let _ = store_tx.try_send(CompletedInboundLedger { ledger, reason });
+    let _ = store_tx.try_send(CompletedInboundLedger {
+        ledger,
+        reason,
+        acquisition_id,
+    });
     true
+}
+
+fn publish_completed_ledger(
+    hash: Uint256,
+    acquisition_id: u64,
+    completion_recorder: &AcquisitionCompletionRecorder,
+    completed: &AtomicBool,
+    completed_ledger: &Mutex<Option<Arc<Ledger>>>,
+    store_tx: &std::sync::mpsc::SyncSender<CompletedInboundLedger>,
+    reason: AcquireReason,
+    ledger: Arc<Ledger>,
+) -> bool {
+    // Match InboundLedger::done(): terminal touch precedes both storing the
+    // completed result and dispatching AcqDone. A concurrent sweep/consumer
+    // must never observe a completed acquisition with its old idle timestamp.
+    completion_recorder(hash, Arc::clone(&ledger));
+    record_completed_ledger(
+        acquisition_id,
+        completed,
+        completed_ledger,
+        store_tx,
+        reason,
+        ledger,
+    )
 }
 
 fn finalize_acquisition(state: &Arc<AcquisitionState>) {
@@ -1628,7 +1683,10 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
     // Do not hold the acquisition state lock while publishing completion.
     // The registry/promotion path may immediately re-enter this state.
     drop(mutable);
-    if !record_completed_ledger(
+    if !publish_completed_ledger(
+        *state.hash.as_uint256(),
+        state.acquisition_id,
+        &state.completion_recorder,
         &state.completed,
         &state.completed_ledger,
         &state.store_tx,
@@ -1649,9 +1707,10 @@ mod tests {
     use super::super::registry::{AcquireReason, AcquisitionLifecycleCounters};
     use super::super::worker_pool::WorkerPool;
     use super::{
-        ACQUIRE_TIMEOUT, AcquisitionBuilder, AcquisitionState, DetachedStateScanPause,
-        detached_state_scan_pause_slot, peer_has_acquisition_target, record_completed_ledger,
-        trigger,
+        ACQUIRE_TIMEOUT, AcquisitionBuilder, AcquisitionCompletionRecorder,
+        AcquisitionFailureRecorder, AcquisitionState, DetachedStateScanPause,
+        detached_state_scan_pause_slot, peer_has_acquisition_target, publish_completed_ledger,
+        record_completed_ledger, trigger,
     };
     use basics::base_uint::Uint256;
     use basics::basic_config::BasicConfig;
@@ -1702,9 +1761,10 @@ mod tests {
         (dir, bootstrap.node_store)
     }
 
-    fn timeout_state_with_hash(
+    fn timeout_state_with_failure_recorder(
         worker_pool: Arc<WorkerPool>,
         hash: SHAMapHash,
+        failure_recorder: AcquisitionFailureRecorder,
     ) -> (
         TempDir,
         Arc<AcquisitionState>,
@@ -1715,6 +1775,7 @@ mod tests {
         let (store_tx, _store_rx) = mpsc::sync_channel(1);
         let state = AcquisitionBuilder {
             hash,
+            acquisition_id: 0,
             seq: 1,
             reason: AcquireReason::Generic,
             node_store,
@@ -1730,7 +1791,8 @@ mod tests {
                 MonotonicClock::default(),
             )),
             store_tx,
-            failure_recorder: Arc::new(|_| {}),
+            failure_recorder,
+            completion_recorder: Arc::new(|_, _| {}),
             full_below_generation: 1,
             worker_pool,
             initial_peers: Vec::new(),
@@ -1739,6 +1801,17 @@ mod tests {
         }
         .build();
         (dir, state, lifecycle)
+    }
+
+    fn timeout_state_with_hash(
+        worker_pool: Arc<WorkerPool>,
+        hash: SHAMapHash,
+    ) -> (
+        TempDir,
+        Arc<AcquisitionState>,
+        Arc<AcquisitionLifecycleCounters>,
+    ) {
+        timeout_state_with_failure_recorder(worker_pool, hash, Arc::new(|_| {}))
     }
 
     fn timeout_state(
@@ -2084,6 +2157,71 @@ mod tests {
     }
 
     #[test]
+    fn failure_touches_registry_before_failure_visibility() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let release_waiter = Arc::clone(&release_rx);
+        let recorder: AcquisitionFailureRecorder = Arc::new(move |_| {
+            entered_tx.send(()).expect("failure callback entry signal");
+            release_waiter
+                .lock()
+                .expect("failure callback release lock")
+                .recv()
+                .expect("failure callback release signal");
+        });
+        let (_dir, state, lifecycle) = timeout_state_with_failure_recorder(
+            worker_pool,
+            SHAMapHash::new(Uint256::from_array([0xD2; 32])),
+            recorder,
+        );
+        let failing_state = Arc::clone(&state);
+        let failure_thread = thread::spawn(move || failing_state.mark_failed());
+
+        entered_rx.recv().expect("failure callback must run first");
+        assert!(
+            !state.failed.load(Ordering::Acquire) && !state.stopped.load(Ordering::Acquire),
+            "poll and sweep must not observe failure before its terminal registry touch"
+        );
+        release_tx.send(()).expect("release failure callback");
+        failure_thread.join().expect("failure transition thread");
+        assert!(state.failed.load(Ordering::Acquire));
+        assert!(state.stopped.load(Ordering::Acquire));
+        assert_eq!(lifecycle.terminal_failed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn completion_touches_registry_before_notification() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let completed = AtomicBool::new(false);
+        let cache = Mutex::new(None);
+        let touched = Arc::new(AtomicBool::new(false));
+        let touch_observer = Arc::clone(&touched);
+        let recorder: AcquisitionCompletionRecorder = Arc::new(move |_, _| {
+            touch_observer.store(true, Ordering::Release);
+        });
+        let hash = Uint256::from_array([0xD1; 32]);
+        let ledger = Arc::new(Ledger::from_ledger_seq_and_close_time(1, 100, false));
+
+        assert!(publish_completed_ledger(
+            hash,
+            0,
+            &recorder,
+            &completed,
+            &cache,
+            &tx,
+            AcquireReason::Consensus,
+            ledger,
+        ));
+        let _ = rx.recv().expect("completion notification");
+        assert!(
+            touched.load(Ordering::Acquire),
+            "terminal touch must occur before a consumer can observe completion"
+        );
+    }
+
+    #[test]
     fn completed_ledger_remains_recoverable_when_notification_channel_is_closed() {
         let (tx, rx) = mpsc::sync_channel(1);
         drop(rx);
@@ -2092,6 +2230,7 @@ mod tests {
         let ledger = Arc::new(Ledger::from_ledger_seq_and_close_time(1, 100, false));
 
         assert!(record_completed_ledger(
+            0,
             &completed,
             &cache,
             &tx,

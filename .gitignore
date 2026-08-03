@@ -209,6 +209,7 @@ LOG.old
 # Ledger data and snapshots (large binary files)
 *.snapshot
 snapshots/
+peerfinder.db
 
 # =============================================================================
 # Configuration Files with Secrets

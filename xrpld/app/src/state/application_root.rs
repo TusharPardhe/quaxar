@@ -6910,19 +6910,11 @@ impl ApplicationRoot {
         self.load_fee_track
             .update_from_validated_ledger(validated.fees().base);
 
-        // Mark that we have a validated ledger (informational; progressive
-        // memory spill now handles memory bounding during acquisition).
-        if let Some(lm_rt) = self.ledger_master_runtime() {
-            if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
-                if let Some(shared) = guard.as_ref() {
-                    // Remove this ledger's entry immediately so the slot is
-                    // freed for the next acquisition. Without this, completed
-                    // entries linger for SWEEP_INTERVAL (5s), blocking new
-                    // hashes from being tracked during that window.
-                    shared.remove(ledger.header().hash.as_uint256());
-                }
-            }
-        }
+        // Keep completed inbound entries until the normal InboundLedgers
+        // sweep. Rippled leaves completed InboundLedger objects in its map,
+        // allowing direct acquire(hash) recovery to return the completed
+        // ledger during the remaining sweep lifetime. The registry's
+        // acknowledgement flag suppresses duplicate persistence work.
 
         // Rippled does NOT release ledger maps in checkAccept. The ledger
         // stays in memory with its full SHAMap so that:
