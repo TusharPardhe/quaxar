@@ -1056,9 +1056,10 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 tracing::debug!(target: "consensus", tx_id = %dispute.id(),
                     "failed to decode rejected dispute for retry");
             }
-            for tx in decoded.into_iter().map(|tx| {
-                canonicalize_consensus_transaction(self.transaction_master.as_ref(), tx)
-            }) {
+            for tx in decoded
+                .into_iter()
+                .map(|tx| canonicalize_consensus_transaction(self.transaction_master.as_ref(), tx))
+            {
                 if !matches!(
                     tx.get_txn_type(),
                     protocol::TxType::FEE
@@ -1628,10 +1629,10 @@ mod tests {
         pseudo_transaction_voting_enabled, trusted_validation_quorum_reached,
         update_operating_mode_after_accept,
     };
-    use crate::tx_queue::transaction::TransactionRelayMetadata;
     use crate::network::network_ops::{
         AppNetworkOpsModeOwner, NetworkOpsOperatingMode, SharedNetworkOpsState,
     };
+    use crate::tx_queue::transaction::TransactionRelayMetadata;
     use basics::base_uint::Uint256;
     use consensus::algorithm::types::ConsensusMode;
     use protocol::{AccountID, STAmount, STTx, TxType, get_field_by_symbol};
@@ -1810,11 +1811,37 @@ impl ConsensusRunner for AppConsensus {
         self.state.timer_entry(&self.adaptor, now);
         self.publish_consensus_mode();
         // If on_accept fired during timer_entry, pending_accept will be Some.
-        self.adaptor
+        let work = self
+            .adaptor
             .pending_accept
             .lock()
             .expect("pending_accept mutex must not be poisoned")
-            .take()
+            .take();
+        if let Some(work) = work.as_ref() {
+            let round = self.state.round_diagnostics(&work.consensus_hash);
+            tracing::info!(
+                target: "consensus_trace",
+                event = "accept_round_snapshot",
+                prev_ledger = %self.state.prev_ledger_id(),
+                closed_seq = work.closed_seq,
+                local_tx_count = work.txns.len(),
+                consensus_hash = %work.consensus_hash,
+                consensus_succeeded = work.consensus_succeeded,
+                phase = ?round.phase,
+                mode = ?round.mode,
+                prev_proposers = round.prev_proposers,
+                current_peer_positions = round.current_peer_positions,
+                acquired_tx_sets = round.acquired_tx_sets,
+                peer_positions_with_acquired_set = round.peer_positions_with_acquired_set,
+                selected_tx_set_peer_support = round.selected_tx_set_peer_support,
+                selected_tx_set_acquired = round.selected_tx_set_acquired,
+                dispute_count = round.dispute_count,
+                converge_percent = round.converge_percent,
+                consensus_state = ?round.consensus_state,
+                "CONSENSUS_TRACE accepted round snapshot"
+            );
+        }
+        work
     }
 
     fn start_round(
@@ -1875,6 +1902,17 @@ impl ConsensusRunner for AppConsensus {
             prev_ledger,
             &now_untrusted,
             actual_proposing,
+        );
+        tracing::info!(
+            target: "consensus_trace",
+            event = "round_started",
+            prev_ledger = %self.state.prev_ledger_id(),
+            requested_proposing = proposing,
+            actual_proposing,
+            validating,
+            operating_mode = ?self.adaptor.network_ops_mode_owner.operating_mode(),
+            consensus_mode = ?self.state.mode(),
+            "CONSENSUS_TRACE round start mode gate"
         );
         self.publish_consensus_mode();
     }
