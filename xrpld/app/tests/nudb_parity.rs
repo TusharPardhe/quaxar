@@ -474,7 +474,13 @@ fn replay_child_ledger_unverified(
     }
 
     let mut ters = Vec::new();
-    for (tx_data, tx_id) in tx_items {
+    for (index, (tx_data, tx_id)) in tx_items.iter().enumerate() {
+        eprintln!(
+            "replay_child_ledger_unverified: decoding tx_index={} tx_id={} raw_len={}",
+            index,
+            tx_id,
+            tx_data.len()
+        );
         let mut outer = SerialIter::new(tx_data);
         let tx_bytes = outer.get_vl();
         let mut sit = SerialIter::new(&tx_bytes);
