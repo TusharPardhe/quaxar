@@ -637,8 +637,12 @@ fn canonical_ledger_entry_is_absent(error: &str) -> bool {
 /// Print every byte-level final-state mismatch among the entries touched by a
 /// canonical ledger. This is intentionally diagnostic-only: callers retain
 /// their existing assertions and can inspect concrete SLE deltas first.
-fn diff_canonical_affected_state_sles(built: &Ledger, seq: u32) -> Result<(), String> {
-    let affected = fetch_canonical_affected_state_keys(XRPL_RPC_URL, seq)?;
+fn diff_canonical_affected_state_sles(
+    built: &Ledger,
+    seq: u32,
+    rpc_url: &str,
+) -> Result<(), String> {
+    let affected = fetch_canonical_affected_state_keys(rpc_url, seq)?;
     eprintln!(
         "mainnet_{}: diffing {} unique canonical affected state entries",
         seq,
@@ -665,9 +669,9 @@ fn diff_canonical_affected_state_sles(built: &Ledger, seq: u32) -> Result<(), St
             };
 
         let (canonical_present, canonical_hex, canonical_json, canonical_fetch_failed) =
-            match fetch_ledger_entry_binary(XRPL_RPC_URL, seq, key) {
+            match fetch_ledger_entry_binary(rpc_url, seq, key) {
                 Ok(hex) => {
-                    let json = fetch_ledger_entry_json(XRPL_RPC_URL, seq, key)
+                    let json = fetch_ledger_entry_json(rpc_url, seq, key)
                         .map(|value| value.to_string())
                         .unwrap_or_else(|error| format!("{{\"fetch_error\":{:?}}}", error));
                     (true, hex, json, false)
@@ -1339,7 +1343,11 @@ fn mainnet_ledger_106053457_replay_reproduces_offer_create_divergence() {
         eprintln!(
             "mainnet_106053457: account hash mismatch; diffing canonical affected state SLEs"
         );
-        if let Err(error) = diff_canonical_affected_state_sles(&built, child_seq) {
+        let state_diff_rpc_url =
+            std::env::var("XRPL_STATE_DIFF_RPC_URL").unwrap_or_else(|_| XRPL_RPC_URL.to_string());
+        if let Err(error) =
+            diff_canonical_affected_state_sles(&built, child_seq, &state_diff_rpc_url)
+        {
             eprintln!(
                 "mainnet_106053457: affected-state diagnostic failed: {}",
                 error
