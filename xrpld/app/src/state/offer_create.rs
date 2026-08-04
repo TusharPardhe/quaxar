@@ -262,6 +262,17 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     }
 
     let mut crossed = false;
+    let acct_k_diag = protocol::account_keylet(Uint160::from_void(account.data()));
+    let bal_before_crossing = view
+        .peek(acct_k_diag)
+        .ok()
+        .flatten()
+        .map(|sle| sle.get_field_amount(sf("sfBalance")).xrp().drops())
+        .unwrap_or(-1);
+    eprintln!(
+        "DIAG balance: account={:?} seq={} phase=before_crossing balance={}",
+        account, offer_sequence, bal_before_crossing
+    );
     let (remaining_gets, remaining_pays) = if !is_passive {
         // a payment from taker to themselves through the order book.
         // takerAmount.in = TakerGets (what taker gives), takerAmount.out = TakerPays (what taker receives)
@@ -340,6 +351,25 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
         let actual_in = flow_result.actual_in;
         let actual_out = flow_result.actual_out;
+        let bal_after_crossing = view
+            .peek(acct_k_diag)
+            .ok()
+            .flatten()
+            .map(|sle| sle.get_field_amount(sf("sfBalance")).xrp().drops())
+            .unwrap_or(-1);
+        eprintln!(
+            "DIAG balance: account={:?} seq={} phase=after_crossing balance={} delta={} actual_in_native={} actual_in_mantissa={} actual_in_exp={} actual_out_native={} actual_out_mantissa={} actual_out_exp={}",
+            account,
+            offer_sequence,
+            bal_after_crossing,
+            bal_after_crossing - bal_before_crossing,
+            actual_in.native(),
+            actual_in.mantissa(),
+            actual_in.exponent(),
+            actual_out.native(),
+            actual_out.mantissa(),
+            actual_out.exponent()
+        );
 
         // even after fee deduction), propagate that directly — do not override with tecKILLED.
         // This matches reference the reference source:359 where flowCross returns {tecUNFUNDED_OFFER, takerAmount}.
