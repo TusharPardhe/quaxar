@@ -149,7 +149,23 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     if sttx.is_field_present(sf("sfOfferSequence")) {
         let cancel_seq = sttx.get_field_u32(sf("sfOfferSequence"));
         let cancel_keylet = protocol::offer_keylet(Uint160::from_void(account.data()), cancel_seq);
-        if let Ok(Some(old_offer)) = view.peek(cancel_keylet) {
+        // `peek` consults the active transaction delta first. For an offer
+        // that only exists in the parent state tree, fall back to `read` so a
+        // backing-store/cache visibility miss cannot silently turn a valid
+        // OfferSequence cancellation into a no-op. rippled's psbCancel
+        // resolves this same preexisting SLE before deciding whether there is
+        // anything to remove. A genuine view error is ledger corruption/state
+        // unavailability, not "offer absent", and must fail rather than leave
+        // an orphaned owner-directory entry behind.
+        let old_offer = match view.peek(cancel_keylet) {
+            Ok(Some(offer)) => Some(offer),
+            Ok(None) => match view.read(cancel_keylet) {
+                Ok(offer) => offer,
+                Err(_) => return Ter::TEF_BAD_LEDGER,
+            },
+            Err(_) => return Ter::TEF_BAD_LEDGER,
+        };
+        if let Some(old_offer) = old_offer {
             let released_gets = old_offer.get_field_amount(sf("sfTakerGets"));
             result = offer_delete(view, &account, old_offer);
             if is_tes_success(result) {
