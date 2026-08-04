@@ -286,8 +286,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
         // Execute strands
         // reference: flow(deliver=TakerGets, sendMax=TakerPays)
-        let mut used_direct_book_fallback = false;
-        let mut flow_result = if !strands.is_empty() {
+        let flow_result = if !strands.is_empty() {
             ledger::flow_engine::strand_flow::execute_strands(
                 view,
                 &strands,
@@ -326,51 +325,8 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             }
         };
 
-        if !strands.is_empty()
-            && flow_result.actual_in.signum() == 0
-            && flow_result.actual_out.signum() == 0
-            && let Some((book_in, book_out)) = cross_book
-        {
-            let cross_book = ledger::ripple_calc::book_step::Book {
-                r#in: book_in,
-                out: book_out,
-                domain: None,
-            };
-            let result = ledger::ripple_calc::book_step::execute_book_step(
-                view,
-                &cross_book,
-                &taker_gets,
-                &taker_pays,
-                true,
-                Some(&account),
-                Some(quality_threshold),
-            );
-            if result.amount_in.signum() > 0 || result.amount_out.signum() > 0 {
-                used_direct_book_fallback = true;
-                flow_result = ledger::flow_engine::FlowResult {
-                    ter: result.ter,
-                    actual_in: result.amount_in,
-                    actual_out: result.amount_out,
-                };
-            }
-        }
-
         let actual_in = flow_result.actual_in;
         let actual_out = flow_result.actual_out;
-        eprintln!(
-            "DIAG crossing: account={} seq={} actual_in_mantissa={} actual_in_exp={} actual_in_native={} actual_out_mantissa={} actual_out_exp={} actual_out_native={} ter={:?} used_fallback={} strands_empty={}",
-            account,
-            offer_sequence,
-            actual_in.mantissa(),
-            actual_in.exponent(),
-            actual_in.native(),
-            actual_out.mantissa(),
-            actual_out.exponent(),
-            actual_out.native(),
-            flow_result.ter,
-            used_direct_book_fallback,
-            strands.is_empty()
-        );
 
         // even after fee deduction), propagate that directly — do not override with tecKILLED.
         // This matches reference the reference source:359 where flowCross returns {tecUNFUNDED_OFFER, takerAmount}.
@@ -388,7 +344,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             // (direct execute_book_step). When the flow engine succeeds via
             // strands, the strand execution (DirectStep/XRPEndpointStep) already
             // handles the taker's asset movement.
-            if strands.is_empty() || used_direct_book_fallback {
+            if strands.is_empty() {
                 // Fallback path: book step only handled offer owners' side.
                 // Transfer assets to/from the taker:
                 if actual_in.signum() > 0 {
