@@ -65,8 +65,8 @@ pub use types::{
 };
 
 pub use snapshot::{
-    SNAPSHOT_BOOTSTRAP_FILENAME, SnapshotBootstrap, SnapshotError, SnapshotManifest,
-    SnapshotScheduler, SnapshotSchedulerConfig, activate_snapshot_bootstrap,
+    SNAPSHOT_BOOTSTRAP_FILENAME, SnapshotBootstrap, SnapshotError, SnapshotImportProgress,
+    SnapshotManifest, SnapshotScheduler, SnapshotSchedulerConfig, activate_snapshot_bootstrap,
     export_compact_snapshot, export_snapshot, load_snapshot, load_snapshot_bootstrap,
-    read_snapshot_manifest, snapshot_bootstrap_path,
+    load_snapshot_with_progress, read_snapshot_manifest, snapshot_bootstrap_path,
 };

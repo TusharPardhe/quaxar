@@ -12,7 +12,9 @@ pub use checkpoint::{
     load_snapshot_bootstrap, snapshot_bootstrap_path,
 };
 pub use error::SnapshotError;
-pub use loader::{load_snapshot, read_snapshot_manifest};
+pub use loader::{
+    SnapshotImportProgress, load_snapshot, load_snapshot_with_progress, read_snapshot_manifest,
+};
 pub use manifest::SnapshotManifest;
 pub use scheduler::{SnapshotScheduler, SnapshotSchedulerConfig};
 pub use writer::{export_compact_snapshot, export_snapshot};

@@ -234,6 +234,24 @@ impl std::error::Error for SnapshotError {
 }
 
 impl SnapshotError {
+    /// Construct a checkpoint error whose on-disk replacement outcome cannot
+    /// be safely classified after a durability failure.
+    pub(crate) fn activation_state_uncertain(reason: impl Into<String>) -> Self {
+        Self::InvalidBootstrapRecord {
+            reason: format!("activation state uncertain: {}", reason.into()),
+        }
+    }
+
+    /// Whether this error means an activation rename occurred but rollback was
+    /// not confirmed. Operators must keep the node stopped in this case.
+    pub fn is_activation_state_uncertain(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidBootstrapRecord { reason }
+                if reason.starts_with("activation state uncertain:")
+        )
+    }
+
     /// Construct an I/O error with contextual labels.
     pub(crate) fn io(context: &'static str, source: std::io::Error) -> Self {
         Self::Io {

@@ -723,6 +723,9 @@ pub struct NuDbBackend {
     /// Prevent readers from observing a partially rewritten on-disk key bucket.
     key_bucket_io: RwLock<()>,
     default_open_args: Option<NuDbOpenArgs>,
+    /// Held for the lifetime of an open backend to exclude another node or
+    /// offline importer from the same NuDB directory.
+    access_lock: Mutex<Option<fs::File>>,
     persistent_fds: ArcSwapOption<NuDbPersistentFds>,
     /// Bucket cache matching reference NuDB's detail::cache. Clean entries
     /// avoid pread calls; only bulk-import entries remain dirty for a later
@@ -805,6 +808,7 @@ impl NuDbBackend {
             store_mutex: Mutex::new(()),
             key_bucket_io: RwLock::new(()),
             default_open_args,
+            access_lock: Mutex::new(None),
             persistent_fds: ArcSwapOption::empty(),
             bucket_cache: DashMap::new(),
             data_file_size: AtomicU64::new(0),
@@ -1186,6 +1190,28 @@ impl NuDbBackend {
         Ok(key_header)
     }
 
+    fn acquire_access_lock(&self, create_if_missing: bool) -> Result<fs::File, String> {
+        if create_if_missing {
+            fs::create_dir_all(&self.config.layout.base_path).map_err(|error| error.to_string())?;
+        }
+        let lock_path = self.config.layout.base_path.join(".quaxar-nodestore.lock");
+        let lock_file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                format!("opening NuDB access lock {}: {error}", lock_path.display())
+            })?;
+        lock_file.try_lock().map_err(|error| {
+            format!(
+                "NuDB data directory is already in use ({}): {error}",
+                self.config.layout.base_path.display()
+            )
+        })?;
+        Ok(lock_file)
+    }
+
     fn open_with_args(
         &self,
         create_if_missing: bool,
@@ -1210,6 +1236,7 @@ impl NuDbBackend {
         if runtime.open_state.is_open() {
             return Err("NuDB backend is already open".to_owned());
         }
+        let access_lock = self.acquire_access_lock(create_if_missing)?;
 
         let plan = self.config.build_open_plan(create_if_missing, open_args)?;
         let header = match plan.action {
@@ -1239,6 +1266,10 @@ impl NuDbBackend {
         self.data_file_size.store(data_size, Ordering::Relaxed);
         self.key_file_size.store(key_size, Ordering::Relaxed);
         self.persistent_fds.store(Some(Arc::new(fds)));
+        *self
+            .access_lock
+            .lock()
+            .expect("nudb access lock mutex must not be poisoned") = Some(access_lock);
 
         tracing::info!(target: "nodestore", path = %self.config.path, "Database opened");
 
@@ -2083,6 +2114,14 @@ impl Backend for NuDbBackend {
             }
         }
 
+        // Drop the OS lock only after all descriptors are closed and optional
+        // deletion has completed. This makes normal node startup and offline
+        // snapshot import mutually exclusive for NuDB.
+        self.access_lock
+            .lock()
+            .expect("nudb access lock mutex must not be poisoned")
+            .take();
+
         Ok(())
     }
 
@@ -2514,12 +2553,14 @@ impl Backend for NuDbBackend {
     }
 
     fn sync(&self) {
-        if let Err(error) = self
-            .commit_active_burst_if_needed()
-            .and_then(|()| self.sync_data_files())
-        {
+        if let Err(error) = self.sync_result() {
             self.journal.log(JournalLevel::Error, &error);
         }
+    }
+
+    fn sync_result(&self) -> Result<(), String> {
+        self.commit_active_burst_if_needed()
+            .and_then(|()| self.sync_data_files())
     }
 
     fn bulk_import_start(&self, estimated_nodes: u64) -> Result<(), String> {
@@ -3177,17 +3218,17 @@ fn read_u48_be_from_reader(reader: &mut dyn Read, field_name: &str) -> Result<u6
 mod tests {
     use super::{
         NUDB_APPNUM, NUDB_CURRENT_VERSION, NUDB_DEFAULT_BLOCK_SIZE, NUDB_KEY_FILE_HEADER_SIZE,
-        NUDB_KEY_FILE_TYPE, NUDB_TARGET_LOAD_FACTOR, NuDbBackendConfig, NuDbFileSetState,
-        NuDbKeyFileHeader, NuDbLayout, NuDbMetadataHeader, NuDbOpenAction, NuDbOpenArgs,
-        NuDbOpenState, encode_nudb_key_file_header, nudb_bucket_capacity, nudb_decode_load_factor,
-        nudb_encode_load_factor, nudb_pepper, parse_nudb_block_size, read_nudb_key_file_header,
-        validate_nudb_block_size,
+        NUDB_KEY_FILE_TYPE, NUDB_TARGET_LOAD_FACTOR, NuDbBackend, NuDbBackendConfig,
+        NuDbFileSetState, NuDbKeyFileHeader, NuDbLayout, NuDbMetadataHeader, NuDbOpenAction,
+        NuDbOpenArgs, NuDbOpenState, encode_nudb_key_file_header, nudb_bucket_capacity,
+        nudb_decode_load_factor, nudb_encode_load_factor, nudb_pepper, parse_nudb_block_size,
+        read_nudb_key_file_header, validate_nudb_block_size,
     };
-    use crate::{JournalLevel, NodeStoreJournal};
+    use crate::{Backend, JournalLevel, NodeStoreJournal, NullJournal};
     use basics::basic_config::Section;
     use dashmap::DashMap;
     use std::fs;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     #[derive(Default)]
@@ -3211,6 +3252,40 @@ mod tests {
                 .expect("recording journal mutex must not be poisoned")
                 .push((level, message.to_owned()));
         }
+    }
+
+    #[test]
+    fn nudb_open_holds_an_exclusive_interprocess_lock_until_close() {
+        let temp = TempDir::new().expect("tempdir");
+        let mut section = Section::new("node_db");
+        section.set("path", temp.path().to_string_lossy().into_owned());
+        let journal: Arc<dyn NodeStoreJournal> = Arc::new(NullJournal);
+
+        let first = NuDbBackend::new(
+            crate::NodeObject::KEY_BYTES,
+            &section,
+            32,
+            Arc::clone(&journal),
+        )
+        .expect("first backend");
+        first
+            .open_deterministic(true, NUDB_APPNUM, 7, 9)
+            .expect("first backend opens");
+
+        let second = NuDbBackend::new(crate::NodeObject::KEY_BYTES, &section, 32, journal)
+            .expect("second backend");
+        assert!(
+            second
+                .open_deterministic(false, NUDB_APPNUM, 7, 9)
+                .expect_err("concurrent backend must be rejected")
+                .contains("already in use")
+        );
+
+        first.close().expect("first backend closes");
+        second
+            .open_deterministic(false, NUDB_APPNUM, 7, 9)
+            .expect("lock is released after close");
+        second.close().expect("second backend closes");
     }
 
     #[test]

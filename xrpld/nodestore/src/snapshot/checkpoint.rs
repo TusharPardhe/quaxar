@@ -89,7 +89,30 @@ pub fn activate_snapshot_bootstrap(
         ".{SNAPSHOT_BOOTSTRAP_FILENAME}.{}.tmp",
         std::process::id()
     ));
+    let backup_path = directory.join(format!(
+        ".{SNAPSHOT_BOOTSTRAP_FILENAME}.{}.previous",
+        std::process::id()
+    ));
     let _ = fs::remove_file(&temporary_path);
+    let _ = fs::remove_file(&backup_path);
+
+    // Preserve the previous activation record before replacement. A hard link
+    // is atomic and avoids copying credentials or mutable state; it lets us
+    // restore a known-good checkpoint if the post-rename directory sync fails.
+    let had_previous_checkpoint = final_path.exists();
+    if had_previous_checkpoint {
+        fs::hard_link(&final_path, &backup_path).map_err(|error| {
+            SnapshotError::io_path("backing up active snapshot checkpoint", &backup_path, error)
+        })?;
+        if let Err(error) = sync_checkpoint_directory(directory) {
+            let _ = fs::remove_file(&backup_path);
+            return Err(SnapshotError::io_path(
+                "syncing snapshot checkpoint backup",
+                directory,
+                error,
+            ));
+        }
+    }
 
     let mut encoded = [0_u8; SNAPSHOT_BOOTSTRAP_HEADER_SIZE];
     encoded[..8].copy_from_slice(SNAPSHOT_BOOTSTRAP_MAGIC);
@@ -131,21 +154,48 @@ pub fn activate_snapshot_bootstrap(
         fs::rename(&temporary_path, &final_path).map_err(|error| {
             SnapshotError::io_path("activating snapshot checkpoint", &final_path, error)
         })?;
-        if let Err(error) = File::open(directory).and_then(|directory| directory.sync_all()) {
-            let _ = fs::remove_file(&final_path);
-            return Err(SnapshotError::io_path(
-                "syncing snapshot checkpoint directory",
-                directory,
-                error,
-            ));
+        if let Err(sync_error) = sync_checkpoint_directory(directory) {
+            let rollback_result = if had_previous_checkpoint {
+                fs::rename(&backup_path, &final_path)
+                    .and_then(|()| sync_checkpoint_directory(directory))
+            } else {
+                fs::remove_file(&final_path).and_then(|()| sync_checkpoint_directory(directory))
+            };
+            return match rollback_result {
+                Ok(()) => Err(SnapshotError::io_path(
+                    "syncing activated snapshot checkpoint",
+                    directory,
+                    sync_error,
+                )),
+                Err(rollback_error) => Err(SnapshotError::activation_state_uncertain(format!(
+                    "activation directory sync failed: {sync_error}; rollback could not be confirmed: {rollback_error}"
+                ))),
+            };
+        }
+        if had_previous_checkpoint {
+            // A leftover backup is safe but undesirable. Its deletion is
+            // best-effort because the active record is already durable.
+            let _ = fs::remove_file(&backup_path);
+            let _ = sync_checkpoint_directory(directory);
         }
         Ok(())
     })();
 
     if write_result.is_err() {
         let _ = fs::remove_file(&temporary_path);
+        if !write_result
+            .as_ref()
+            .expect_err("error branch must contain an error")
+            .is_activation_state_uncertain()
+        {
+            let _ = fs::remove_file(&backup_path);
+        }
     }
     write_result
+}
+
+fn sync_checkpoint_directory(directory: &Path) -> Result<(), std::io::Error> {
+    File::open(directory)?.sync_all()
 }
 
 /// Load the active checkpoint if and only if a complete, valid activation
@@ -288,6 +338,26 @@ mod tests {
             checkpoint.ledger_header().account_hash.as_uint256().data(),
             &manifest.account_hash
         );
+    }
+
+    #[test]
+    fn failed_replacement_preserves_the_existing_checkpoint() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let original = manifest();
+        activate_snapshot_bootstrap(directory.path(), &original, Some(21_338))
+            .expect("initial activation succeeds");
+
+        let mut replacement = original.clone();
+        replacement.ledger_hash = [0xFF; 32];
+        assert!(matches!(
+            activate_snapshot_bootstrap(directory.path(), &replacement, Some(21_338)),
+            Err(SnapshotError::LedgerHashMismatch { .. })
+        ));
+
+        let active = load_snapshot_bootstrap(directory.path())
+            .expect("existing checkpoint remains readable")
+            .expect("existing checkpoint remains active");
+        assert_eq!(active.manifest().ledger_hash, original.ledger_hash);
     }
 
     #[test]

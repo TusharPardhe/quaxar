@@ -10,9 +10,10 @@ use basics::basic_config::Section;
 use crate::database_runtime::scheduler::DummyScheduler;
 use crate::snapshot::manifest::*;
 use crate::snapshot::{
-    SnapshotError, SnapshotManifest, export_compact_snapshot, export_snapshot, load_snapshot,
+    SnapshotError, SnapshotImportProgress, SnapshotManifest, export_compact_snapshot,
+    export_snapshot, load_snapshot, load_snapshot_with_progress,
 };
-use crate::{Backend, Factory, MemoryFactory, NodeObject, NodeObjectType, NullJournal};
+use crate::{Backend, Factory, MemoryFactory, NodeObject, NodeObjectType, NullJournal, Status};
 
 fn config(path: &str) -> Section {
     let mut section = Section::new("node_db");
@@ -30,6 +31,56 @@ fn make_backend(path: &str) -> Box<dyn Backend> {
         .expect("memory backend must be created");
     backend.open(true).expect("backend must open");
     backend
+}
+
+struct FailingSyncBackend;
+
+impl Backend for FailingSyncBackend {
+    fn get_name(&self) -> String {
+        "failing-sync".to_owned()
+    }
+
+    fn open(&self, _create_if_missing: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn is_open(&self) -> bool {
+        true
+    }
+
+    fn close(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn fetch(&self, _hash: &Uint256) -> (Option<Arc<NodeObject>>, Status) {
+        (None, Status::NotFound)
+    }
+
+    fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status) {
+        (vec![None; hashes.len()], Status::NotFound)
+    }
+
+    fn store(&self, _object: Arc<NodeObject>) {}
+
+    fn store_batch(&self, _batch: &crate::Batch) {}
+
+    fn sync(&self) {}
+
+    fn sync_result(&self) -> Result<(), String> {
+        Err("simulated fsync failure".to_owned())
+    }
+
+    fn for_each(&self, _callback: &mut dyn FnMut(Arc<NodeObject>)) {}
+
+    fn get_write_load(&self) -> i32 {
+        0
+    }
+
+    fn set_delete_path(&self) {}
+
+    fn fd_required(&self) -> i32 {
+        0
+    }
 }
 
 fn test_manifest() -> SnapshotManifest {
@@ -351,6 +402,123 @@ fn compact_export_contains_only_nodes_reachable_from_checkpoint_roots() {
     );
     assert!(destination.fetch(&Uint256::from_array(tx_hash)).0.is_some());
     assert!(destination.fetch(&unrelated_hash).0.is_none());
+}
+
+#[test]
+fn snapshot_import_progress_reports_each_completed_phase_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap_path = dir.path().join("progress.xrpls");
+    let source = make_backend("progress-source");
+    source.store(Arc::new(NodeObject::new(
+        NodeObjectType::Ledger,
+        vec![1, 2, 3],
+        Uint256::from_array([0x77; 32]),
+    )));
+    export_snapshot(source.as_ref(), &test_manifest(), &snap_path).expect("export succeeds");
+
+    let destination = make_backend("progress-destination");
+    let mut events = Vec::new();
+    let manifest = load_snapshot_with_progress(destination.as_ref(), &snap_path, |event| {
+        events.push(event);
+    })
+    .expect("import succeeds");
+
+    assert_eq!(manifest.ledger_seq, 100);
+    assert!(matches!(
+        events.as_slice(),
+        [
+            SnapshotImportProgress::HeaderValidated {
+                ledger_seq: 100,
+                chunk_count: 1
+            },
+            SnapshotImportProgress::ChunkTableRead { chunk_count: 1, .. },
+            SnapshotImportProgress::BulkImportStarted { .. },
+            SnapshotImportProgress::ChunkImported {
+                chunk_index: 1,
+                chunk_count: 1,
+                nodes_loaded: 1,
+                ..
+            },
+            SnapshotImportProgress::FinalizingNodeStore,
+            SnapshotImportProgress::VerifyingFileHash,
+            SnapshotImportProgress::VerifyingShamapRoot {
+                map: "account-state"
+            },
+            SnapshotImportProgress::VerifyingShamapRoot { map: "transaction" },
+            SnapshotImportProgress::SyncingNodeStore,
+            SnapshotImportProgress::Complete {
+                ledger_seq: 100,
+                chunk_count: 1,
+                nodes_loaded: 1,
+                ..
+            }
+        ]
+    ));
+}
+
+#[test]
+fn snapshot_import_progress_never_reports_complete_after_chunk_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap_path = dir.path().join("progress-corrupt.xrpls");
+    let source = make_backend("progress-corrupt-source");
+    source.store(Arc::new(NodeObject::new(
+        NodeObjectType::Ledger,
+        vec![1, 2, 3],
+        Uint256::from_array([0x78; 32]),
+    )));
+    export_snapshot(source.as_ref(), &test_manifest(), &snap_path).expect("export succeeds");
+
+    let mut data = std::fs::read(&snap_path).expect("read snapshot");
+    let chunk_data_offset = SNAPSHOT_HEADER_SIZE + CHUNK_META_SIZE;
+    data[chunk_data_offset] ^= 0xFF;
+    std::fs::write(&snap_path, data).expect("write corruption");
+
+    let destination = make_backend("progress-corrupt-destination");
+    let mut events = Vec::new();
+    assert!(matches!(
+        load_snapshot_with_progress(destination.as_ref(), &snap_path, |event| events.push(event)),
+        Err(SnapshotError::ChunkHashMismatch { .. })
+    ));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SnapshotImportProgress::BulkImportStarted { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SnapshotImportProgress::Complete { .. }))
+    );
+}
+
+#[test]
+fn snapshot_import_progress_never_reports_complete_after_final_sync_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap_path = dir.path().join("progress-sync-failure.xrpls");
+    let source = make_backend("progress-sync-source");
+    source.store(Arc::new(NodeObject::new(
+        NodeObjectType::Ledger,
+        vec![1, 2, 3],
+        Uint256::from_array([0x79; 32]),
+    )));
+    export_snapshot(source.as_ref(), &test_manifest(), &snap_path).expect("export succeeds");
+
+    let backend = FailingSyncBackend;
+    let mut events = Vec::new();
+    assert!(matches!(
+        load_snapshot_with_progress(&backend, &snap_path, |event| events.push(event)),
+        Err(SnapshotError::BackendWriteFailed { reason }) if reason.contains("final sync")
+    ));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SnapshotImportProgress::SyncingNodeStore))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SnapshotImportProgress::Complete { .. }))
+    );
 }
 
 #[test]

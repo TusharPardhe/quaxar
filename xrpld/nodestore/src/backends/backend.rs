@@ -38,6 +38,15 @@ pub trait Backend: Send + Sync + 'static {
 
     fn sync(&self);
 
+    /// Synchronize durable storage and return any error to callers that must
+    /// not publish success or activate metadata after an incomplete flush.
+    /// Existing backends retain compatibility through the default wrapper;
+    /// durable backends should override it with their native fallible sync.
+    fn sync_result(&self) -> Result<(), String> {
+        self.sync();
+        Ok(())
+    }
+
     /// Begin bulk import mode. Optimized for loading millions of nodes sequentially.
     /// Skips existence checks, disables burst checkpoints, pre-allocates structures.
     fn bulk_import_start(&self, _estimated_nodes: u64) -> Result<(), String> {

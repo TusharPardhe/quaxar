@@ -185,13 +185,20 @@ quaxar load-snapshot --input /path/to/snapshot.xrpls --conf /etc/xrpld/xrpld.cfg
 | `--input` | Yes | Path to snapshot file |
 | `--conf` | Yes | Path to config file (determines NuDB path) |
 
+The import requires the node to be stopped. Before it opens a backend, the CLI
+acquires exclusive access to the NodeStore; if another node or import owns the
+data directory, it exits without importing and tells the operator to stop the
+other process before retrying.
+
 The import uses bulk loading mode with pre-allocated NuDB hash tables. The CLI
 preflights the snapshot's v2 network identity before opening the NodeStore,
-then reports success only after every chunk, the final file hash, both SHAMap
-roots, and the durable activation record have been verified. A normal startup
-constructs a lazy local ledger from that checkpoint and fetches only the gap to
-the current network tip. Legacy v1 snapshots without a network identity are
-rejected by this bootable import command.
+then visibly updates its spinner for NodeStore opening, every imported chunk
+with node and byte totals, index finalization, file-hash and SHAMap-root
+verification, disk sync, and checkpoint activation. It reports success only
+after all of those stages complete. A normal startup constructs a lazy local
+ledger from that checkpoint and fetches only the gap to the current network
+tip. Legacy v1 snapshots without a network identity are rejected by this
+bootable import command.
 
 ## Exit Codes
 
