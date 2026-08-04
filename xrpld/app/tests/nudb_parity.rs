@@ -9,6 +9,7 @@ use nodestore::{
     Backend, DatabaseRotatingImp, DummyScheduler, FetchType, Manager, ManagerImp, NullJournal,
     Scheduler,
 };
+use protocol::keylet::ledger_entry_type_from_name;
 use protocol::{
     ApplyFlags, JsonOptions, Keylet, LedgerEntryType, STTx, SerialIter, Serializer, StBase, Ter,
     skip_keylet,
@@ -554,6 +555,166 @@ fn diff_state_key(
         );
     }
     Ok(())
+}
+
+/// Collect the final-state keys touched by a canonical expanded ledger response.
+///
+/// AffectedNodes reports the entry type and index even when a transaction deletes
+/// the entry. This lets the replay diagnostic distinguish an expected final-state
+/// absence from a missing or byte-different built entry.
+fn fetch_canonical_affected_state_keys(
+    url: &str,
+    seq: u32,
+) -> Result<Vec<(LedgerEntryType, Uint256)>, String> {
+    let body = format!(
+        r#"{{"method":"ledger","params":[{{"ledger_index":{},"transactions":true,"expand":true}}]}}"#,
+        seq
+    );
+    let response = http_post_to(url, &body)?;
+    let transactions = response["result"]["ledger"]["transactions"]
+        .as_array()
+        .ok_or_else(|| format!("canonical ledger {} is missing expanded transactions", seq))?;
+
+    let mut affected = Vec::new();
+    for (tx_index, transaction) in transactions.iter().enumerate() {
+        let nodes = transaction["metaData"]["AffectedNodes"]
+            .as_array()
+            .ok_or_else(|| {
+                format!(
+                    "canonical ledger {} transaction {} is missing metaData.AffectedNodes",
+                    seq, tx_index
+                )
+            })?;
+
+        for (node_index, node) in nodes.iter().enumerate() {
+            for node_kind in ["CreatedNode", "ModifiedNode", "DeletedNode"] {
+                let Some(details) = node[node_kind].as_object() else {
+                    continue;
+                };
+                let ledger_index = details["LedgerIndex"].as_str().ok_or_else(|| {
+                    format!(
+                        "canonical ledger {} transaction {} affected node {} {} is missing LedgerIndex",
+                        seq, tx_index, node_index, node_kind
+                    )
+                })?;
+                let entry_type_name = details["LedgerEntryType"].as_str().ok_or_else(|| {
+                    format!(
+                        "canonical ledger {} transaction {} affected node {} {} is missing LedgerEntryType",
+                        seq, tx_index, node_index, node_kind
+                    )
+                })?;
+                let entry_type = ledger_entry_type_from_name(entry_type_name).ok_or_else(|| {
+                    format!(
+                        "canonical ledger {} transaction {} affected node {} has unsupported LedgerEntryType {}",
+                        seq, tx_index, node_index, entry_type_name
+                    )
+                })?;
+                let key = Uint256::from_hex(ledger_index).map_err(|error| {
+                    format!(
+                        "canonical ledger {} transaction {} affected node {} has invalid LedgerIndex {}: {:?}",
+                        seq, tx_index, node_index, ledger_index, error
+                    )
+                })?;
+
+                if !affected
+                    .iter()
+                    .any(|(seen_type, seen_key)| *seen_type == entry_type && *seen_key == key)
+                {
+                    affected.push((entry_type, key));
+                }
+            }
+        }
+    }
+
+    Ok(affected)
+}
+
+fn canonical_ledger_entry_is_absent(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("entrynotfound") || error.contains("objectnotfound")
+}
+
+/// Print every byte-level final-state mismatch among the entries touched by a
+/// canonical ledger. This is intentionally diagnostic-only: callers retain
+/// their existing assertions and can inspect concrete SLE deltas first.
+fn diff_canonical_affected_state_sles(built: &Ledger, seq: u32) -> Result<(), String> {
+    let affected = fetch_canonical_affected_state_keys(XRPL_RPC_URL, seq)?;
+    eprintln!(
+        "mainnet_{}: diffing {} unique canonical affected state entries",
+        seq,
+        affected.len()
+    );
+
+    let mut fetch_errors = Vec::new();
+    for (entry_type, key) in affected {
+        let (built_present, built_hex, built_json, built_read_failed) =
+            match built.read(Keylet::new(entry_type, key)) {
+                Ok(Some(sle)) => (
+                    true,
+                    serialize_sle_hex(&sle),
+                    format!("{:?}", sle.json(JsonOptions::NONE)),
+                    false,
+                ),
+                Ok(None) => (false, "<absent>".to_string(), "null".to_string(), false),
+                Err(error) => (
+                    false,
+                    "<read-error>".to_string(),
+                    format!("{{\"read_error\":{:?}}}", error),
+                    true,
+                ),
+            };
+
+        let (canonical_present, canonical_hex, canonical_json, canonical_fetch_failed) =
+            match fetch_ledger_entry_binary(XRPL_RPC_URL, seq, key) {
+                Ok(hex) => {
+                    let json = fetch_ledger_entry_json(XRPL_RPC_URL, seq, key)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|error| format!("{{\"fetch_error\":{:?}}}", error));
+                    (true, hex, json, false)
+                }
+                Err(error) if canonical_ledger_entry_is_absent(&error) => {
+                    (false, "<absent>".to_string(), "null".to_string(), false)
+                }
+                Err(error) => {
+                    fetch_errors.push(format!("{} {}: {}", key, entry_type.as_str(), error));
+                    (
+                        false,
+                        "<fetch-error>".to_string(),
+                        format!("{{\"fetch_error\":{:?}}}", error),
+                        true,
+                    )
+                }
+            };
+
+        if built_read_failed
+            || canonical_fetch_failed
+            || built_present != canonical_present
+            || (built_present && canonical_present && built_hex != canonical_hex)
+        {
+            eprintln!(
+                "mainnet_{}: state_diff index={} entry_type={} built_present={} built_hex={} built_json={} canonical_present={} canonical_hex={} canonical_json={}",
+                seq,
+                key,
+                entry_type.as_str(),
+                built_present,
+                built_hex,
+                built_json,
+                canonical_present,
+                canonical_hex,
+                canonical_json,
+            );
+        }
+    }
+
+    if fetch_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "could not fetch {} canonical affected ledger entries: {}",
+            fetch_errors.len(),
+            fetch_errors.join("; ")
+        ))
+    }
 }
 
 fn run_case(case: TxReplayCase) {
@@ -1173,6 +1334,18 @@ fn mainnet_ledger_106053457_replay_reproduces_offer_create_divergence() {
         protocol::calculate_ledger_hash(&built.header()),
         acquired_header.hash
     );
+
+    if built.header().account_hash != acquired_header.account_hash {
+        eprintln!(
+            "mainnet_106053457: account hash mismatch; diffing canonical affected state SLEs"
+        );
+        if let Err(error) = diff_canonical_affected_state_sles(&built, child_seq) {
+            eprintln!(
+                "mainnet_106053457: affected-state diagnostic failed: {}",
+                error
+            );
+        }
+    }
 
     // Targeted diagnostic: compare the target account's built AccountRoot
     // against the canonical public state to narrow down any remaining
