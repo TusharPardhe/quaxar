@@ -7,7 +7,7 @@
 
 use super::steps::execute_step_fwd;
 use super::{FlowResult, Strand};
-use crate::ApplyView;
+use crate::{ApplyView, FlowSandbox};
 use protocol::{AccountID, Quality, STAmount, Ter};
 
 const MAX_TRIES: usize = 1000;
@@ -51,7 +51,7 @@ pub fn execute_strands<V: ApplyView>(
             break;
         }
 
-        let mut best: Option<(STAmount, STAmount, usize)> = None;
+        let mut applied = false;
 
         for (pos, &strand_idx) in active_strands.iter().enumerate() {
             let strand = &strands[strand_idx];
@@ -69,14 +69,25 @@ pub fn execute_strands<V: ApplyView>(
             //     }
             // }
 
-            // Execute strand directly on the view.
-            // The caller (ripple_calculate) already wraps us in a FlowSandbox
-            // that will be discarded on failure. No need for per-strand sandboxing
-            // for single-strand cases (which is the common case on mainnet).
             let max_in = remaining_in.as_ref();
 
+            // reference: xrpl::flow(PaymentSandbox const& baseView, Strand
+            // const& strand, ...) in StrandFlow.h always executes a strand
+            // against its OWN fresh PaymentSandbox layered on the base view,
+            // and returns that sandbox only when the strand actually
+            // produced usable output; finishFlow() only calls
+            // `f.sandbox->apply(sb)` when the overall result is tesSuccess.
+            // A strand that goes dry partway through (e.g. its first step
+            // moves real XRP/IOU before a later book step finds no
+            // crossable offer) must have ALL of its intermediate mutations
+            // discarded, not just its declared amounts ignored. Without this
+            // isolation, a step's real side effects (account_send,
+            // transfer_xrp) applied directly to the shared view survive even
+            // when the strand as a whole is treated as dry, silently
+            // draining funds for zero delivered benefit.
+            let mut strand_sandbox = FlowSandbox::new(view);
             let result = execute_single_strand(
-                view,
+                &mut strand_sandbox,
                 strand,
                 max_in,
                 &remaining_out,
@@ -87,19 +98,22 @@ pub fn execute_strands<V: ApplyView>(
             if let Some((in_amt, out_amt)) = result
                 && out_amt.signum() > 0
             {
-                best = Some((in_amt, out_amt, pos));
+                let _ = strand_sandbox.apply();
+                total_in += in_amt.clone();
+                total_out += out_amt.clone();
+                remaining_out = deliver.clone() - total_out.clone();
+                if let Some(sm) = send_max {
+                    remaining_in = Some(sm.clone() - total_in.clone());
+                }
+                applied = true;
+                let _ = pos;
                 break;
             }
+            // strand_sandbox is dropped here without being applied,
+            // discarding every mutation the dry strand attempted.
         }
 
-        if let Some((in_amt, out_amt, _)) = best {
-            total_in += in_amt.clone();
-            total_out += out_amt.clone();
-            remaining_out = deliver.clone() - total_out.clone();
-            if let Some(sm) = send_max {
-                remaining_in = Some(sm.clone() - total_in.clone());
-            }
-        } else {
+        if !applied {
             break;
         }
     }
