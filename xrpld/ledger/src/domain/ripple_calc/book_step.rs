@@ -181,12 +181,14 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             }
         }
 
-        // `Quality` stores the reciprocal book price: TakerGets / TakerPays.
-        // That is the same convention as OfferCreate's
-        // `Quality{takerAmount.out, sendMax}` threshold, regardless of the
-        // executable BookStep direction.
+        // The Book stores offer fields as TakerPays/TakerGets. In this
+        // strand direction, `Quality::from_amounts` must receive that raw
+        // pair (in=TakerPays, out=TakerGets) so its encoded comparison is
+        // on the same scale as OfferCreate's `Quality{takerAmount.out,
+        // sendMax}` threshold. Swapping them makes the reciprocal quality
+        // and admits offers that are worse than the taker's limit.
         let offer_quality =
-            Quality::from_amounts(&Amounts::new(taker_gets.clone(), taker_pays.clone()));
+            Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone()));
         if let Some(first) = first_quality {
             if offer_quality != first {
                 break;
