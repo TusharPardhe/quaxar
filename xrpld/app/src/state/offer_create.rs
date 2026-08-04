@@ -506,6 +506,22 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                     Ok(amount) => amount,
                     Err(ter) => return ter,
                 };
+                eprintln!(
+                    "DIAG offer_create: rem_pays_calc account={} rem_gets_mantissa={} rem_gets_exp={} rem_gets_native={} taker_pays_mantissa={} taker_pays_exp={} taker_pays_native={} taker_gets_mantissa={} taker_gets_exp={} taker_gets_native={} product_mantissa={} product_exp={} product_native={}",
+                    account,
+                    rem_gets.mantissa(),
+                    rem_gets.exponent(),
+                    rem_gets.native(),
+                    taker_pays.mantissa(),
+                    taker_pays.exponent(),
+                    taker_pays.native(),
+                    taker_gets.mantissa(),
+                    taker_gets.exponent(),
+                    taker_gets.native(),
+                    product.mantissa(),
+                    product.exponent(),
+                    product.native()
+                );
                 match amount_or_exception(product.try_divide(&taker_gets, taker_pays.asset())) {
                     Ok(amount) => amount,
                     Err(ter) => return ter,
