@@ -611,6 +611,17 @@ fn threaded_payload(
         &mut previous_txn_id,
         &mut previous_ledger_seq,
     );
+    if threaded.get_type() == LedgerEntryType::AccountRoot
+        && !threaded.is_field_present(get_field_by_symbol("sfOwnerCount"))
+    {
+        // rippled serializes AccountRoot's required owner count even when it
+        // is zero. A transaction that touches an old/partial AccountRoot must
+        // materialize this default before hashing or it produces a different
+        // final ledger state despite the same logical owner count.
+        let mut object = threaded.clone_as_object();
+        object.set_field_u32(get_field_by_symbol("sfOwnerCount"), 0);
+        threaded = STLedgerEntry::from_stobject(object, *threaded.key());
+    }
     threaded.get_serializer().data().to_vec()
 }
 
