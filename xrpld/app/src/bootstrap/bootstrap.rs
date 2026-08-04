@@ -8,9 +8,9 @@
 use crate::state::app_registry::RelayUntrustedPolicy;
 use crate::{
     ApplicationRoot, ApplicationRootOptions, BootstrapOverlayHandoff, DescriptorLimitProvider,
-    LedgerReplay, MainRuntime, SHAMapStoreComponent, SHAMapStoreComponentRuntime,
-    SHAMapStoreHealthRuntime, SHAMapStoreOperatingMode, SHAMapStoreRuntime,
-    adjust_descriptor_limit, bootstrap_shamap_store,
+    LedgerReplay, MainRuntime, PendingReplayStartup, SHAMapStoreComponent,
+    SHAMapStoreComponentRuntime, SHAMapStoreHealthRuntime, SHAMapStoreOperatingMode,
+    SHAMapStoreRuntime, adjust_descriptor_limit, bootstrap_shamap_store,
 };
 use basics::base_uint::Uint256;
 use basics::basic_config::{BasicConfig, IniFileSections};
@@ -149,6 +149,9 @@ pub struct AppBootstrapReport {
     pub has_node_store: bool,
     pub node_store_kind: Option<String>,
     pub has_shamap_store_service: bool,
+    /// True only while replay startup is waiting for the exact incomplete
+    /// parent to finish the normal inbound History acquisition lifecycle.
+    pub replay_startup_pending: bool,
     pub fd_required: usize,
 }
 
@@ -926,6 +929,7 @@ pub fn build_bootstrap_root(
         has_node_store: node_store_kind.is_some(),
         node_store_kind,
         has_shamap_store_service: root.shamap_store_service().is_some(),
+        replay_startup_pending: root.pending_replay_startup().is_some(),
         fd_required: root.fd_required(),
     };
 
@@ -1633,6 +1637,106 @@ fn run_start_mode_consensus_loop(
             .set_proposal_notify(Box::new(move || {
                 notify_root.notify_consensus_event();
             }));
+    }
+
+    fn recover_deferred_replay_parent(
+        root: &ApplicationRoot,
+        shared_inbound: &Arc<crate::ledger::inbound_ledgers::InboundLedgers>,
+        stop: &AtomicBool,
+        sweep_interval_seconds: u64,
+    ) -> bool {
+        let Some(initial) = root.pending_replay_startup() else {
+            return true;
+        };
+
+        // The replay parent must become a normal completed inbound ledger before
+        // it can be installed as the closed ledger. Do not start a consensus
+        // strand against a synthetic or partial parent, and do not block that
+        // strand waiting for peer I/O: acquisition workers and the overlay router
+        // continue independently while this bootstrap coordinator retries.
+        root.set_network_ops_operating_mode(crate::NetworkOpsOperatingMode::Syncing);
+        tracing::info!(target: "bootstrap",
+            parent_seq = initial.parent_seq,
+            parent_hash = %initial.parent_hash,
+            "requesting incomplete replay parent through inbound history acquisition"
+        );
+
+        let mut last_sweep = std::time::Instant::now();
+        let sweep_interval = Duration::from_secs(sweep_interval_seconds.max(1));
+        while !stop.load(Ordering::Acquire) {
+            let Some(pending) = root.pending_replay_startup() else {
+                return true;
+            };
+
+            // acquire() only starts/touches an acquisition and returns immediately.
+            // Its worker-owned AccountStateSF/TransactionStateSF lifecycle writes
+            // all accepted nodes and performs the NodeStore sync before exposing a
+            // completed ledger here.
+            if shared_inbound
+                .acquire(
+                    pending.parent_hash,
+                    pending.parent_seq,
+                    crate::ledger::inbound_ledgers::AcquireReason::History,
+                )
+                .is_some()
+            {
+                match replay_startup_ledger_from_storage(
+                    root,
+                    pending.start_ledger.as_deref(),
+                    pending.trap_tx_hash,
+                ) {
+                    Ok(ReplayStartupResult::Complete) => {
+                        root.clear_pending_replay_startup(pending.parent_hash);
+                        tracing::info!(target: "bootstrap",
+                            parent_seq = pending.parent_seq,
+                            parent_hash = %pending.parent_hash,
+                            "inbound history acquisition completed replay parent; replay startup resumed"
+                        );
+                        return true;
+                    }
+                    Ok(ReplayStartupResult::ParentIncomplete(updated)) => {
+                        // A completed acquisition must normally make this false.
+                        // Retain the exact (possibly reloaded) request rather than
+                        // admitting a partial parent if a store/backend race is
+                        // observed; the existing sweep/retry lifecycle will retry.
+                        root.defer_replay_startup(updated);
+                    }
+                    Err(error) => {
+                        tracing::error!(target: "bootstrap", %error,
+                            "replay startup failed after parent acquisition"
+                        );
+                        root.signal_stop(format!(
+                            "replay startup failed after historical parent acquisition: {error}"
+                        ));
+                        return false;
+                    }
+                }
+            }
+
+            // NetworkOps normally owns this at the configured sweep cadence. It
+            // has not been started while replay is gated, so invoke the same
+            // registry lifecycle here to allow failed history requests to age out
+            // and retry without any consensus-strand work.
+            if last_sweep.elapsed() >= sweep_interval {
+                shared_inbound.sweep();
+                last_sweep = std::time::Instant::now();
+            }
+            root.wait_consensus_or_timeout(Duration::from_millis(250));
+        }
+        false
+    }
+
+    if !recover_deferred_replay_parent(
+        runtime.root(),
+        &shared_inbound,
+        stop.as_ref(),
+        configured_sweep_interval_seconds,
+    ) {
+        // The coordinator either observed shutdown or recorded a fatal replay
+        // error. In both cases no strand was started, so stop the shared
+        // acquisition workers before returning to the bootstrap owner.
+        shared_inbound.stop();
+        return;
     }
 
     // ===================================================================
@@ -3856,7 +3960,26 @@ fn initialize_startup_ledger_state(
             }
             Err(error) => Err(error),
         },
-        StartUpType::Replay => replay_startup_ledger_from_storage(root, options),
+        StartUpType::Replay => match replay_startup_ledger_from_storage(
+            root,
+            options.start_ledger.as_deref(),
+            options.trap_tx_hash,
+        )? {
+            ReplayStartupResult::Complete => Ok(()),
+            ReplayStartupResult::ParentIncomplete(pending) if root.standalone() => Err(format!(
+                "Replay parent ledger {} is incomplete in local NodeStore; standalone mode cannot acquire {}",
+                pending.parent_seq, pending.parent_hash
+            )),
+            ReplayStartupResult::ParentIncomplete(pending) => {
+                tracing::warn!(target: "bootstrap",
+                    parent_seq = pending.parent_seq,
+                    parent_hash = %pending.parent_hash,
+                    "replay parent is incomplete; deferring replay until inbound history acquisition persists it"
+                );
+                root.defer_replay_startup(pending);
+                Ok(())
+            }
+        },
         StartUpType::LoadFile => load_startup_ledger_from_file(root, options),
         StartUpType::Network => {
             if !root.config().standalone {
@@ -4037,10 +4160,17 @@ fn load_complete_ledger_from_storage(
     Ok(Some(loaded))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReplayStartupResult {
+    Complete,
+    ParentIncomplete(PendingReplayStartup),
+}
+
 fn replay_startup_ledger_from_storage(
     root: &ApplicationRoot,
-    options: &AppBootstrapOptions,
-) -> Result<(), String> {
+    start_ledger: Option<&str>,
+    trap_tx_hash: Option<Uint256>,
+) -> Result<ReplayStartupResult, String> {
     let Some(relational) = root.relational_database().as_ref().map(Arc::clone) else {
         return Err("Replay startup requires an attached relational ledger database".to_owned());
     };
@@ -4066,14 +4196,9 @@ fn replay_startup_ledger_from_storage(
     let journal = NullLedgerJournal;
     let config = LedgerConfig::default();
 
-    let mut replay_ledger = load_bootstrap_ledger(
-        options.start_ledger.as_deref(),
-        &journal,
-        &config,
-        &family,
-        &provider,
-    )?
-    .ok_or_else(|| "Requested replay ledger was not found in local storage".to_owned())?;
+    let mut replay_ledger =
+        load_bootstrap_ledger(start_ledger, &journal, &config, &family, &provider)?
+            .ok_or_else(|| "Requested replay ledger was not found in local storage".to_owned())?;
 
     if !replay_ledger.walk_ledger_with_family(&journal, false, &family) {
         return Err(format!(
@@ -4098,9 +4223,16 @@ fn replay_startup_ledger_from_storage(
     .ok_or_else(|| "Replay parent ledger was not found in local storage".to_owned())?;
 
     if !parent_ledger.walk_ledger_with_family(&journal, false, &family) {
-        return Err(format!(
-            "Replay parent ledger {} is incomplete in local NodeStore",
-            parent_ledger.header().seq
+        return Ok(ReplayStartupResult::ParentIncomplete(
+            PendingReplayStartup {
+                // Acquire by the replay header's parent hash, not by a locally
+                // reconstructed header. This keeps the request pinned to the
+                // exact immutable parent that replay is about to consume.
+                parent_hash: *replay_ledger.header().parent_hash.as_uint256(),
+                parent_seq: parent_ledger.header().seq,
+                start_ledger: start_ledger.map(str::to_owned),
+                trap_tx_hash,
+            },
         ));
     }
     parent_ledger
@@ -4114,14 +4246,8 @@ fn replay_startup_ledger_from_storage(
         Arc::clone(&parent),
         ledger_master_runtime.ledger_master(),
     )?;
-    inject_replay_transactions(
-        root,
-        parent,
-        Arc::new(replay_ledger),
-        &family,
-        options.trap_tx_hash,
-    )?;
-    Ok(())
+    inject_replay_transactions(root, parent, Arc::new(replay_ledger), &family, trap_tx_hash)?;
+    Ok(ReplayStartupResult::Complete)
 }
 
 fn load_startup_ledger_from_file(

@@ -264,10 +264,54 @@ fn persist_tree_subtree(
     }
 }
 
+fn persisted_bootstrap_incomplete_state_only_ledger(seq: u32) -> Arc<Ledger> {
+    let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+        SHAMapNodeType::AccountState,
+        persisted_bootstrap_account_root(0x10 + seq as u8),
+        0,
+    ));
+    let state_root = make_shared_intrusive(SHAMapTreeNode::new_inner(0));
+    state_root.set_child_hash(3, state_leaf.get_hash());
+    state_root.update_hash();
+
+    let mut header = LedgerHeader {
+        seq,
+        account_hash: state_root.get_hash(),
+        close_time: 500 + seq,
+        parent_close_time: 499 + seq,
+        close_time_resolution: ledger::LEDGER_DEFAULT_TIME_RESOLUTION,
+        ..LedgerHeader::default()
+    };
+    header.hash = calculate_ledger_hash(&header);
+
+    let mut ledger = Ledger::from_maps(
+        header,
+        SyncTree::from_root_with_type(
+            state_root,
+            SHAMapType::State,
+            false,
+            seq,
+            SyncState::Immutable,
+        ),
+        SyncTree::new_with_type(SHAMapType::Transaction, false, seq),
+    );
+    ledger.set_immutable(true);
+    Arc::new(ledger)
+}
+
 fn persist_bootstrap_storage(
     dir: &TempDir,
     ledgers: &[Arc<Ledger>],
     node_type: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    persist_bootstrap_storage_with_missing_state_children(dir, ledgers, node_type, None)
+}
+
+fn persist_bootstrap_storage_with_missing_state_children(
+    dir: &TempDir,
+    ledgers: &[Arc<Ledger>],
+    node_type: &str,
+    missing_state_children_for: Option<u32>,
 ) -> (PathBuf, PathBuf, PathBuf) {
     let database_path = dir.path().join("sql");
     let node_db_path = dir.path().join("node-db");
@@ -297,12 +341,26 @@ fn persist_bootstrap_storage(
     let mut persisted_roots = Vec::new();
     for ledger in ledgers {
         let state_root = ledger.state_map().root();
-        persist_tree_subtree(
-            database.as_ref(),
-            state_root.clone(),
-            NodeObjectType::AccountNode,
-            ledger.header().seq,
-        );
+        if missing_state_children_for == Some(ledger.header().seq) {
+            // Persist only the parent root. This is the production failure
+            // shape: the SQL header and root are present, but walk_ledger
+            // discovers that a reachable account-state node is absent.
+            let _ = database.store(
+                NodeObjectType::AccountNode,
+                state_root
+                    .serialize_with_prefix()
+                    .expect("state root should serialize"),
+                *state_root.get_hash().as_uint256(),
+                ledger.header().seq,
+            );
+        } else {
+            persist_tree_subtree(
+                database.as_ref(),
+                state_root.clone(),
+                NodeObjectType::AccountNode,
+                ledger.header().seq,
+            );
+        }
 
         let tx_root = ledger.tx_map().root();
         persist_tree_subtree(
@@ -857,6 +915,69 @@ path = {}
     assert_eq!(
         bootstrap.root.open_ledger().current().tx_ids(),
         vec![replay_tx.get_transaction_id()]
+    );
+}
+
+#[test]
+fn app_bootstrap_defers_replay_until_the_exact_incomplete_parent_is_acquired() {
+    let dir = TempDir::new().expect("tempdir");
+    let parent = persisted_bootstrap_incomplete_state_only_ledger(20);
+    let replay = persisted_bootstrap_replay_ledger(21, *parent.header().hash.as_uint256(), &[]);
+    let (database_path, node_db_path, config_path) =
+        persist_bootstrap_storage_with_missing_state_children(
+            &dir,
+            &[Arc::clone(&parent), Arc::clone(&replay)],
+            "RocksDB",
+            Some(parent.header().seq),
+        );
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let bootstrap = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Replay,
+            start_ledger: Some(replay.header().hash.as_uint256().to_string()),
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("incomplete replay parent should be deferred for inbound history");
+
+    assert!(bootstrap.report.replay_startup_pending);
+    assert_eq!(bootstrap.root.closed_ledger_seq(), None);
+    assert_eq!(
+        bootstrap.root.pending_replay_startup(),
+        Some(app::PendingReplayStartup {
+            parent_hash: *parent.header().hash.as_uint256(),
+            parent_seq: parent.header().seq,
+            start_ledger: Some(replay.header().hash.as_uint256().to_string()),
+            trap_tx_hash: None,
+        })
     );
 }
 

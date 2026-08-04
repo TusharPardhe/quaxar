@@ -357,6 +357,18 @@ fn queue_relay_envelope(
     }
 }
 
+/// Replay startup is parked here only when the locally persisted parent
+/// header exists but `walk_ledger` proves its SHAMap is incomplete. The
+/// runtime uses this immutable request to acquire that exact parent through
+/// `InboundLedgers`; it must not synthesize a full ledger from the header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingReplayStartup {
+    pub parent_hash: Uint256,
+    pub parent_seq: u32,
+    pub start_ledger: Option<String>,
+    pub trap_tx_hash: Option<Uint256>,
+}
+
 #[derive(Clone)]
 pub struct ApplicationRoot {
     registry: ApplicationRegistryOwners,
@@ -432,6 +444,10 @@ pub struct ApplicationRoot {
     /// the shared fetch-pack cache was populated. Workers should re-check
     /// local storage immediately (matching rippled gotFetchPack).
     fetch_pack_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// A replay request whose historical parent is known locally by header
+    /// but lacks reachable SHAMap nodes. It is consumed only after inbound
+    /// history acquisition has durably completed.
+    pending_replay_startup: Arc<Mutex<Option<PendingReplayStartup>>>,
     /// Tracks the next expected sequence for each account with pending open ledger txs.
     /// Cleared on ledger_accept. Matches rippled's persistent OpenView behavior where
     /// account sequences are updated during submit and visible to subsequent submits.
@@ -3034,6 +3050,7 @@ impl ApplicationRoot {
             shared_consensus_rt: Arc::new(std::sync::RwLock::new(None)),
             shared_network_ops_rt: Arc::new(std::sync::RwLock::new(None)),
             fetch_pack_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pending_replay_startup: Arc::new(Mutex::new(None)),
             open_ledger_account_seqs: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -3076,6 +3093,42 @@ impl ApplicationRoot {
     pub fn take_fetch_pack_ready(&self) -> bool {
         self.fetch_pack_ready
             .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Park replay startup until the exact historical parent has completed
+    /// the normal inbound `History` acquisition lifecycle.
+    pub fn defer_replay_startup(&self, pending: PendingReplayStartup) {
+        *self
+            .pending_replay_startup
+            .lock()
+            .expect("pending replay startup mutex must not be poisoned") = Some(pending);
+    }
+
+    /// Returns the replay startup request without consuming it. The recovery
+    /// coordinator retains it until replay has successfully reloaded the
+    /// fully persisted parent from NodeStore.
+    pub fn pending_replay_startup(&self) -> Option<PendingReplayStartup> {
+        self.pending_replay_startup
+            .lock()
+            .expect("pending replay startup mutex must not be poisoned")
+            .clone()
+    }
+
+    /// Clear a completed replay startup request. Matching on the exact parent
+    /// prevents a stale recovery worker from clearing a newer request.
+    pub fn clear_pending_replay_startup(&self, parent_hash: Uint256) -> bool {
+        let mut pending = self
+            .pending_replay_startup
+            .lock()
+            .expect("pending replay startup mutex must not be poisoned");
+        if pending
+            .as_ref()
+            .is_some_and(|request| request.parent_hash == parent_hash)
+        {
+            *pending = None;
+            return true;
+        }
+        false
     }
 
     /// Returns the close gate mutex. Used by on_close (adaptor) and the
