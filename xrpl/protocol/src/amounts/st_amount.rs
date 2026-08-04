@@ -403,35 +403,21 @@ impl STAmount {
             return Ok(());
         }
 
-        if self.value == 0 {
-            self.offset = IOU_ZERO_OFFSET;
-            self.is_negative = false;
-            return Ok(());
-        }
-
-        while self.value < ST_AMOUNT_MIN_MANTISSA && self.offset > ST_AMOUNT_MIN_OFFSET {
-            self.value *= 10;
-            self.offset -= 1;
-        }
-
-        while self.value > ST_AMOUNT_MAX_MANTISSA {
-            if self.offset >= ST_AMOUNT_MAX_OFFSET {
-                return Err(AmountError::IssuedOutOfRange);
-            }
-            self.value /= 10;
-            self.offset += 1;
-        }
-
-        if self.offset < ST_AMOUNT_MIN_OFFSET || self.value < ST_AMOUNT_MIN_MANTISSA {
-            self.value = 0;
-            self.is_negative = false;
-            self.offset = IOU_ZERO_OFFSET;
-            return Ok(());
-        }
-
-        if self.offset > ST_AMOUNT_MAX_OFFSET {
-            return Err(AmountError::IssuedOutOfRange);
-        }
+        // Issued amounts are canonicalized through the same Number/IOUAmount
+        // boundary as rippled's STAmount::canonicalize. Manual decimal
+        // truncation here is not protocol-equivalent: when an oversized
+        // mantissa drops a final digit >= 5, rippled rounds to nearest while
+        // truncation produces a one-unit-lower quality key and a different
+        // BookDirectory. This matters for offer quality directory placement.
+        let iou = IOUAmount::from_number(RuntimeNumber::unchecked(
+            self.is_negative,
+            self.value,
+            self.offset,
+        ))
+        .map_err(|_| AmountError::IssuedOutOfRange)?;
+        self.is_negative = iou.mantissa() < 0;
+        self.value = iou.mantissa().unsigned_abs();
+        self.offset = iou.exponent();
         Ok(())
     }
 
@@ -1081,4 +1067,23 @@ mod tests {
 
         assert!(!has_invalid_amount(&amount));
     }
+}
+
+#[test]
+fn issued_canonicalization_rounds_oversized_mantissa_to_nearest() {
+    // Mainnet ledger 106053457 OfferCreate rate path: divide(XRP
+    // 1_000_000_000_000 drops, USD 1_053_320) produces the raw
+    // mantissa 94_937_910_606_463_377 at exponent -11. rippled's
+    // IOU/Number canonicalization rounds the discarded 7 upward, rather
+    // than truncating, yielding the BookDirectory quality suffix D9C2.
+    let amount = STAmount::try_new_with_asset(
+        sf_generic(),
+        crate::no_issue(),
+        94_937_910_606_463_377,
+        -11,
+        false,
+    )
+    .expect("issued canonicalization should succeed");
+    assert_eq!(amount.mantissa(), 9_493_791_060_646_338);
+    assert_eq!(amount.exponent(), -10);
 }
