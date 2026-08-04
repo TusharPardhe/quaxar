@@ -139,7 +139,8 @@ fn decode_hex(value: &str) -> Vec<u8> {
 }
 
 fn http_post(body: &str) -> Result<serde_json::Value, String> {
-    http_post_to(XRPL_RPC_URL, body)
+    let rpc_url = std::env::var("XRPL_RPC_URL").unwrap_or_else(|_| XRPL_RPC_URL.to_string());
+    http_post_to(&rpc_url, body)
 }
 
 fn http_post_to(url: &str, body: &str) -> Result<serde_json::Value, String> {
@@ -160,7 +161,8 @@ fn http_post_to(url: &str, body: &str) -> Result<serde_json::Value, String> {
 }
 
 fn fetch_ledger_header(seq: u32) -> Result<LedgerHeader, String> {
-    fetch_ledger_header_from(XRPL_RPC_URL, seq)
+    let rpc_url = std::env::var("XRPL_RPC_URL").unwrap_or_else(|_| XRPL_RPC_URL.to_string());
+    fetch_ledger_header_from(&rpc_url, seq)
 }
 
 fn fetch_ledger_header_from(url: &str, seq: u32) -> Result<LedgerHeader, String> {
