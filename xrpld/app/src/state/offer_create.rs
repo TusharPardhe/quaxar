@@ -387,6 +387,14 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             // (direct execute_book_step). When the flow engine succeeds via
             // strands, the strand execution (DirectStep/XRPEndpointStep) already
             // handles the taker's asset movement.
+            eprintln!(
+                "DIAG manual_transfer_check: account={:?} seq={} strands_empty={} actual_in_signum={} actual_out_signum={}",
+                account,
+                offer_sequence,
+                strands.is_empty(),
+                actual_in.signum(),
+                actual_out.signum()
+            );
             if strands.is_empty() {
                 // Fallback path: book step only handled offer owners' side.
                 // Transfer assets to/from the taker:
