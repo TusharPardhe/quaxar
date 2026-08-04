@@ -7554,6 +7554,7 @@ impl ApplicationRoot {
                 } else {
                     protocol::ApplyFlags::NONE
                 };
+                let rules = view.rules();
                 let mut attempt_view = ledger::FlowSandbox::new_with_flags(&mut *view, retry_flags);
                 let (result, delivered_amount) =
                     apply_submit_transactor_shell_with_delivered_amount(
@@ -7563,7 +7564,13 @@ impl ApplicationRoot {
                     );
                 let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
                 if applied {
-                    let _ = attempt_view.apply();
+                    attempt_view
+                        .apply_with_tx_thread(transaction_id, closed_seq, &rules)
+                        .map_err(|error| {
+                            crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
+                                "failed to thread accepted transaction {transaction_id}: {error:?}"
+                            ))
+                        })?;
                 }
                 drop(view);
                 if !applied {

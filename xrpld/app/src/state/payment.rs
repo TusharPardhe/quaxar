@@ -76,6 +76,16 @@ const LSF_PASSWORD_SPENT: u32 = 0x0001_0000;
 #[allow(dead_code)]
 const LSF_REQUIRE_AUTH: u32 = 0x0004_0000;
 
+fn is_redundant_self_payment(
+    account: AccountID,
+    destination: AccountID,
+    source_amount: &STAmount,
+    destination_amount: &STAmount,
+    has_paths: bool,
+) -> bool {
+    account == destination && source_amount.asset() == destination_amount.asset() && !has_paths
+}
+
 /// Full reference Payment::doApply parity.
 ///
 /// Called from `handle_real_dispatch` with the view, transaction, and pre-fee balance.
@@ -128,12 +138,18 @@ pub fn do_payment<V: ledger::ApplyView>(
 
     let dst_keylet = protocol::account_keylet(Uint160::from_void(dst_account_id.data()));
 
-    // A ripple payment is one that uses paths, SendMax, or delivers IOU.
-    let is_ripple = has_paths || send_max.is_some() || !dst_amount.native();
-    if account == dst_account_id && is_ripple {
-        return Ter::TEC_PATH_DRY;
-    }
-    if account == dst_account_id {
+    // Match rippled Payment::preflight: a payment to self is redundant only
+    // when source and destination assets are identical and no explicit path
+    // can perform an arbitrage/conversion. Cross-currency self-payments must
+    // continue into Flow; rejecting them here as tecPATH_DRY forks valid
+    // mainnet ledger state.
+    if is_redundant_self_payment(
+        account,
+        dst_account_id,
+        &max_source_amount,
+        &dst_amount,
+        has_paths,
+    ) {
         return Ter::TEM_REDUNDANT;
     }
 
@@ -633,4 +649,45 @@ fn check_deposit_preauth<V: ledger::ApplyView>(
 
     // Not authorized
     Some(Ter::TEC_NO_PERMISSION)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_redundant_self_payment;
+    use protocol::{AccountID, Issue, STAmount, XRPAmount, get_field_by_symbol};
+
+    #[test]
+    fn cross_currency_self_payment_is_not_redundant() {
+        let account = AccountID::from_array([0x11; 20]);
+        let source_issue = Issue {
+            currency: protocol::Currency::from_array([0x22; 20]),
+            account: AccountID::from_array([0x33; 20]),
+        };
+        let destination_issue = Issue {
+            currency: protocol::Currency::from_array([0x44; 20]),
+            account: AccountID::from_array([0x55; 20]),
+        };
+        let source = STAmount::from_iou_amount(
+            get_field_by_symbol("sfSendMax"),
+            protocol::IOUAmount::from_parts(1, 0).expect("valid positive IOU amount"),
+            source_issue,
+        );
+        let destination = STAmount::from_iou_amount(
+            get_field_by_symbol("sfAmount"),
+            protocol::IOUAmount::from_parts(1, 0).expect("valid positive IOU amount"),
+            destination_issue,
+        );
+        assert!(!is_redundant_self_payment(
+            account,
+            account,
+            &source,
+            &destination,
+            false,
+        ));
+
+        let xrp = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
+        assert!(is_redundant_self_payment(
+            account, account, &xrp, &xrp, false,
+        ));
+    }
 }

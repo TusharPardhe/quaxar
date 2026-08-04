@@ -1367,6 +1367,29 @@ fn check_accept_and_advance(
     loop {
         let next_seq = lm.valid_ledger_seq() + 1;
         let Some(candidate) = lm.ledger_history().get_cached_ledger_by_seq(next_seq) else {
+            if let Some(hash) = contiguous_bridge_hash(root, &lm, shared_inbound, next_seq) {
+                tracing::info!(
+                    target: "lcl_trace",
+                    event = "try_advance_missing_successor_acquire",
+                    next_seq,
+                    %hash,
+                    last_valid = ?lm.last_valid_ledger(),
+                    "LCL trace: acquiring first missing contiguous validated successor"
+                );
+                shared_inbound.acquire_async(
+                    *hash.as_uint256(),
+                    next_seq,
+                    AcquireReason::Consensus,
+                );
+            } else {
+                tracing::debug!(
+                    target: "lcl_trace",
+                    event = "try_advance_missing_successor_unresolved",
+                    next_seq,
+                    last_valid = ?lm.last_valid_ledger(),
+                    "LCL trace: first missing contiguous successor cannot yet be resolved"
+                );
+            }
             break;
         };
         let candidate_hash = *candidate.header().hash.as_uint256();
@@ -1936,6 +1959,28 @@ fn history_hash_for_seq(
         return None;
     }
     history_hash_from_reference_or_candidate(root, shared_inbound, validated.as_ref(), seq)
+}
+
+/// Resolve the first missing contiguous successor of the active validated
+/// chain from the most recent quorum-backed ledger. This is the `doAdvance`
+/// bridge reference rippled uses when later ledger acquisition has succeeded
+/// but `validLedgerSeq_ + 1` is absent locally.
+fn contiguous_bridge_hash(
+    root: &ApplicationRoot,
+    lm: &ledger::LedgerMaster,
+    shared_inbound: &Arc<InboundLedgers>,
+    seq: u32,
+) -> Option<basics::sha_map_hash::SHAMapHash> {
+    let (reference_hash, reference_seq) = lm.last_valid_ledger()?;
+    if reference_seq < seq {
+        return None;
+    }
+    let reference = root
+        .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(reference_hash))
+        .or_else(|| {
+            shared_inbound.acquire(reference_hash, reference_seq, AcquireReason::Consensus)
+        })?;
+    history_hash_from_reference_or_candidate(root, shared_inbound, reference.as_ref(), seq)
 }
 
 /// A history fetch may be persisted as trusted full history only if a current

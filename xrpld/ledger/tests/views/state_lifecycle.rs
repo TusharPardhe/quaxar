@@ -99,20 +99,10 @@ fn sandbox_apply_with_tx_thread_updates_threaded_sles() {
             SyncState::Modifying,
         ),
     );
-    let mut built = Ledger::from_maps(
-        base.header(),
-        state_map,
-        SyncTree::from_root_with_type(
-            make_shared_intrusive(SHAMapTreeNode::new_inner(0)),
-            SHAMapType::Transaction,
-            true,
-            ledger_seq,
-            SyncState::Modifying,
-        ),
-    );
-
-    let mut sandbox = Sandbox::new(std::sync::Arc::new(base), protocol::ApplyFlags::default());
-    let checked_out = sandbox
+    let rules = base.rules().clone();
+    let mut parent = Sandbox::new(std::sync::Arc::new(base), protocol::ApplyFlags::default());
+    let mut flow = FlowSandbox::new_with_flags(&mut parent, protocol::ApplyFlags::default());
+    let checked_out = flow
         .peek(account_keylet)
         .expect("peek should succeed")
         .expect("account exists");
@@ -121,19 +111,16 @@ fn sandbox_apply_with_tx_thread_updates_threaded_sles() {
         get_field_by_symbol("sfBalance"),
         STAmount::from_xrp_amount(XRPAmount::from_drops(900)),
     );
-    sandbox
-        .update(std::sync::Arc::new(STLedgerEntry::from_stobject(
-            modified,
-            account_keylet.key,
-        )))
-        .expect("update should succeed");
+    flow.update(std::sync::Arc::new(STLedgerEntry::from_stobject(
+        modified,
+        account_keylet.key,
+    )))
+    .expect("update should succeed");
 
-    let rules = built.rules().clone();
-    sandbox
-        .apply_with_tx_thread(&mut built, current_tx, ledger_seq, &rules)
-        .expect("apply should succeed");
+    flow.apply_with_tx_thread(current_tx, ledger_seq, &rules)
+        .expect("threaded flow apply should succeed");
 
-    let threaded = built
+    let threaded = parent
         .read(account_keylet)
         .expect("read should succeed")
         .expect("account remains");

@@ -592,12 +592,12 @@ impl ApplyStateTable {
     }
 }
 
-fn threaded_payload(
+pub(crate) fn thread_sle(
     sle: &STLedgerEntry,
     tx_id: basics::base_uint::Uint256,
     ledger_seq: u32,
     rules: &Rules,
-) -> Vec<u8> {
+) -> STLedgerEntry {
     let mut threaded = sle.clone();
     if threaded.get_type() == LedgerEntryType::AccountRoot
         && !threaded.is_field_present(get_field_by_symbol("sfOwnerCount"))
@@ -610,19 +610,29 @@ fn threaded_payload(
         threaded = STLedgerEntry::from_stobject(object, *threaded.key());
     }
 
-    if !threaded.is_threaded_type(rules) {
-        return threaded.get_serializer().data().to_vec();
+    if threaded.is_threaded_type(rules) {
+        let mut previous_txn_id = basics::base_uint::Uint256::zero();
+        let mut previous_ledger_seq = 0;
+        let _ = threaded.thread(
+            tx_id,
+            ledger_seq,
+            &mut previous_txn_id,
+            &mut previous_ledger_seq,
+        );
     }
+    threaded
+}
 
-    let mut previous_txn_id = basics::base_uint::Uint256::zero();
-    let mut previous_ledger_seq = 0;
-    let _ = threaded.thread(
-        tx_id,
-        ledger_seq,
-        &mut previous_txn_id,
-        &mut previous_ledger_seq,
-    );
-    threaded.get_serializer().data().to_vec()
+fn threaded_payload(
+    sle: &STLedgerEntry,
+    tx_id: basics::base_uint::Uint256,
+    ledger_seq: u32,
+    rules: &Rules,
+) -> Vec<u8> {
+    thread_sle(sle, tx_id, ledger_seq, rules)
+        .get_serializer()
+        .data()
+        .to_vec()
 }
 
 #[cfg(test)]

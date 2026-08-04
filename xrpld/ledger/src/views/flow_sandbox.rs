@@ -69,6 +69,56 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
         self.parent.read(k)
     }
 
+    /// Apply all captured changes after threading each inserted or modified
+    /// SLE with the current transaction. This is the per-transaction
+    /// `ApplyStateTable::threadItem` equivalent used by ledger acceptance;
+    /// the parent remains the cumulative view for subsequent transactions.
+    pub fn apply_with_tx_thread(
+        self,
+        tx_id: Uint256,
+        ledger_seq: u32,
+        rules: &Rules,
+    ) -> Result<(), ViewError> {
+        for (key, entry) in self.items {
+            match entry.action {
+                Action::Insert | Action::Modify => {
+                    let threaded = Arc::new(crate::apply_state_table::thread_sle(
+                        entry.sle.as_ref(),
+                        tx_id,
+                        ledger_seq,
+                        rules,
+                    ));
+                    if entry.action == Action::Insert {
+                        self.parent.insert(threaded)?;
+                    } else {
+                        let keylet = Keylet::new(threaded.get_type(), key);
+                        if self.parent.peek(keylet)?.is_none() {
+                            return Err(ViewError::Conversion(
+                                "FlowSandbox::apply_with_tx_thread: modified parent entry disappeared"
+                                    .into(),
+                            ));
+                        }
+                        self.parent.update(threaded)?;
+                    }
+                }
+                Action::Erase => {
+                    let keylet = Keylet::new(entry.sle.get_type(), key);
+                    if self.parent.peek(keylet)?.is_none() {
+                        return Err(ViewError::Conversion(
+                            "FlowSandbox::apply_with_tx_thread: erased parent entry disappeared"
+                                .into(),
+                        ));
+                    }
+                    self.parent.erase(entry.sle)?;
+                }
+            }
+        }
+        if self.drops_destroyed.drops() > 0 {
+            self.parent.destroy_xrp(self.drops_destroyed)?;
+        }
+        Ok(())
+    }
+
     /// Apply all captured changes to the parent view. Call on tesSUCCESS.
     pub fn apply(self) -> Result<(), ViewError> {
         for (key, entry) in self.items {
