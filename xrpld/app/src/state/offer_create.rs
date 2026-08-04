@@ -310,6 +310,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         );
 
         let cross_book = Some((taker_gets.asset(), taker_pays.asset()));
+        let self_cross_cancellations = ledger::flow_engine::SelfCrossCancellation::default();
 
         // Execute strands
         // reference: flow(deliver=takerAmount.out, sendMax=takerAmount.in)
@@ -322,6 +323,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                 Some(&taker_gets), // sendMax = TakerGets
                 &account,
                 Some(quality_threshold),
+                Some(self_cross_cancellations.clone()),
             )
         } else if let Some((book_in, book_out)) = cross_book {
             let cross_book = ledger::ripple_calc::book_step::Book {
@@ -329,15 +331,21 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                 out: book_out,
                 domain: None,
             };
-            // Fallback to direct book step if strand building fails
-            let result = ledger::ripple_calc::book_step::execute_book_step(
+            // Fallback to direct book step if strand building fails. It is
+            // still the default OfferCreate stream, so it receives the same
+            // cancellation-only accumulator as the normal direct strand.
+            let result = ledger::ripple_calc::book_step::execute_book_step_with_options(
                 view,
                 &cross_book,
                 &taker_gets,
                 &taker_pays,
-                true,
-                Some(&account),
-                Some(quality_threshold),
+                ledger::ripple_calc::book_step::BookStepOptions {
+                    owner_pays_transfer_fee: true,
+                    taker: Some(&account),
+                    quality_threshold: Some(quality_threshold),
+                    remove_self_crossing: true,
+                    self_cross_cancellation: Some(self_cross_cancellations.clone()),
+                },
             );
             ledger::flow_engine::FlowResult {
                 ter: result.ter,
@@ -351,6 +359,11 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                 actual_out: taker_gets.zeroed(),
             }
         };
+
+        let cancellation_result = self_cross_cancellations.apply_to(view);
+        if cancellation_result != Ter::TES_SUCCESS {
+            return cancellation_result;
+        }
 
         let actual_in = flow_result.actual_in;
         let actual_out = flow_result.actual_out;

@@ -278,6 +278,7 @@ fn ripple_calculate_inner<V: ApplyView>(
             Some(max_source_amount),
             src_account,
             None, // payments have no quality threshold
+            None, // payments never cancel self offers
         );
 
         static FLOW_RESULT_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

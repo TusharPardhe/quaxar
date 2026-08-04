@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use crate::ApplyView;
+use crate::domain::flow_engine::SelfCrossCancellation;
 use crate::domain::ripple_state_helpers;
 use basics;
 use basics::base_uint::Uint256;
@@ -44,7 +45,7 @@ pub struct BookStepResult {
 }
 
 /// Exact execution policy supplied by a flow `BookStep`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BookStepOptions<'a> {
     pub owner_pays_transfer_fee: bool,
     pub taker: Option<&'a AccountID>,
@@ -52,6 +53,9 @@ pub struct BookStepOptions<'a> {
     /// Only direct/default OfferCreate crossing may delete a self offer at
     /// the current executable tip. Other paths leave it untouched.
     pub remove_self_crossing: bool,
+    /// Cancellation-only accumulator for eligible direct self-cross offers.
+    /// It is intentionally separate from the value-flow sandbox.
+    pub self_cross_cancellation: Option<SelfCrossCancellation>,
 }
 
 /// Execute a book step using the historical call signature. New flow code
@@ -76,6 +80,7 @@ pub fn execute_book_step<V: ApplyView>(
             taker,
             quality_threshold,
             remove_self_crossing: false,
+            self_cross_cancellation: None,
         },
     )
 }
@@ -93,6 +98,7 @@ pub fn execute_book_step_with_options<V: ApplyView>(
     let taker = options.taker;
     let quality_threshold = options.quality_threshold;
     let remove_self_crossing = options.remove_self_crossing;
+    let self_cross_cancellation = options.self_cross_cancellation;
     let mut total_in = max_in.zeroed();
     let mut total_out = max_out.zeroed();
     let mut offers_consumed: u32 = 0;
@@ -209,7 +215,12 @@ pub fn execute_book_step_with_options<V: ApplyView>(
             && offer_owner == *taker_account
         {
             if owner_pays_transfer_fee && remove_self_crossing {
-                remove_consumed_offer(view, &offer_sle);
+                // Do not remove through this value-flow sandbox. The caller
+                // applies the recorded key with offer_helpers::offer_delete
+                // even when this strand later proves dry.
+                if let Some(cancellations) = &self_cross_cancellation {
+                    cancellations.record(*offer_sle.key());
+                }
                 if !offer_attempted {
                     first_quality = None;
                 }

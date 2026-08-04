@@ -338,13 +338,90 @@ fn offer_self_crossing_removes_old() {
         Ter::TES_SUCCESS
     );
     assert_eq!(get_owner_count(&view, alice), 2);
+    let old_offer = protocol::offer_keylet(acct_id(alice), 1);
+    let trust_line_before = view
+        .read(protocol::line(alice, gw, usd))
+        .expect("read alice trust line")
+        .expect("alice trust line")
+        .get_field_amount(sf("sfBalance"));
 
-    // Alice: opposite offer (sell XRP for USD) — should remove old offer
+    // Alice: opposite offer (sell XRP for USD). There is no third-party
+    // liquidity, so the value flow is dry, but the direct self-cross rule
+    // must still cancel offer #1 before offer #2 is placed.
     let tx2 = offer_tx(alice, iou(gw, usd, 1000), xrp(1_000_000_000), 2);
     let r2 = handle_real_dispatch(&mut view, &tx2, TxType::OFFER_CREATE, None);
     assert_eq!(r2, Ter::TES_SUCCESS);
-    // Old offer removed by self-crossing, new one placed
+    assert!(
+        view.read(old_offer).expect("read old self offer").is_none(),
+        "dry self-cross must remove the old offer"
+    );
+    assert!(
+        view.read(protocol::offer_keylet(acct_id(alice), 2))
+            .expect("read replacement offer")
+            .is_some(),
+        "replacement offer must be placed"
+    );
+    assert_eq!(
+        view.read(protocol::line(alice, gw, usd))
+            .expect("read alice trust line after dry self-cross")
+            .expect("alice trust line after dry self-cross")
+            .get_field_amount(sf("sfBalance")),
+        trust_line_before,
+        "dry self-cross must not apply value transfer mutations"
+    );
     assert_eq!(get_owner_count(&view, alice), 2); // trust + new offer
+}
+
+/// A non-self offer that does not meet the crossing quality must not be
+/// deleted or transfer value while a dry OfferCreate is evaluated.
+#[test]
+fn offer_non_self_dry_cross_leaves_existing_offer_untouched() {
+    let alice = acct(0x11);
+    let bob = acct(0x22);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+    let ledger = build_ledger(vec![
+        account_root(alice, 10_000_000_000, 1, 0),
+        account_root(bob, 10_000_000_000, 1, 0),
+        account_root(gw, 10_000_000_000, 0, 0),
+        trust_line(alice, gw, usd, 1000, 10_000, 0),
+        trust_line(bob, gw, usd, 2000, 10_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    let old_offer = protocol::offer_keylet(acct_id(alice), 1);
+    let old = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1000), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &old, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+    let alice_trust_before = view
+        .read(protocol::line(alice, gw, usd))
+        .expect("read alice trust line")
+        .expect("alice trust line")
+        .get_field_amount(sf("sfBalance"));
+
+    // Bob asks for twice as much USD at the same XRP input. Alice's offer is
+    // below this quality threshold, so the crossing stream is dry.
+    let dry = offer_tx(bob, iou(gw, usd, 2000), xrp(1_000_000_000), 1);
+    assert_eq!(
+        handle_real_dispatch(&mut view, &dry, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    assert!(
+        view.read(old_offer).expect("read non-self offer").is_some(),
+        "a dry non-self candidate must remain on the book"
+    );
+    assert_eq!(
+        view.read(protocol::line(alice, gw, usd))
+            .expect("read alice trust line after dry non-self crossing")
+            .expect("alice trust line after dry non-self crossing")
+            .get_field_amount(sf("sfBalance")),
+        alice_trust_before,
+        "a dry non-self candidate must not transfer value"
+    );
+    assert_eq!(get_owner_count(&view, alice), 2); // trust + original offer
 }
 
 /// C++ Offer_test — three-way crossing: alice and carol both have offers, bob crosses both.

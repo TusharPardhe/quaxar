@@ -5,7 +5,7 @@
 //! ledger asset with the numeric amount: a SendMax in USD must never be
 //! compared with a requested XRP delivery.
 
-use super::StepKind;
+use super::{SelfCrossCancellation, StepKind};
 use crate::ApplyView;
 use crate::domain::ripple_state_helpers;
 use protocol::{
@@ -127,10 +127,13 @@ impl StepAmounts {
 }
 
 /// Immutable execution context shared by a strand's concrete steps.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StepContext<'a> {
     pub strand_src: &'a AccountID,
     pub quality_threshold: Option<Quality>,
+    /// Present only for direct/default OfferCreate crossings. It is separate
+    /// from the flow sandbox so self-offer cancellations survive a dry flow.
+    pub self_cross_cancellation: Option<SelfCrossCancellation>,
 }
 
 /// The Rust counterpart to rippled's `Step`.  Both directions mutate only the
@@ -140,7 +143,7 @@ pub trait FlowStep {
         &self,
         view: &mut V,
         requested_out: &StepAmount,
-        context: StepContext<'_>,
+        context: &StepContext<'_>,
     ) -> Result<StepAmounts, Ter>;
 
     fn fwd<V: ApplyView>(
@@ -148,7 +151,7 @@ pub trait FlowStep {
         view: &mut V,
         requested_in: &StepAmount,
         reverse_cache: &StepAmounts,
-        context: StepContext<'_>,
+        context: &StepContext<'_>,
     ) -> Result<StepAmounts, Ter>;
 }
 
@@ -157,7 +160,7 @@ impl FlowStep for StepKind {
         &self,
         view: &mut V,
         requested_out: &StepAmount,
-        context: StepContext<'_>,
+        context: &StepContext<'_>,
     ) -> Result<StepAmounts, Ter> {
         match self {
             StepKind::Direct { src, dst, currency } => {
@@ -205,6 +208,7 @@ impl FlowStep for StepKind {
                         taker: Some(context.strand_src),
                         quality_threshold: context.quality_threshold,
                         remove_self_crossing: *remove_self_crossing,
+                        self_cross_cancellation: context.self_cross_cancellation.clone(),
                     },
                 );
                 if result.ter != Ter::TES_SUCCESS {
@@ -220,7 +224,7 @@ impl FlowStep for StepKind {
         view: &mut V,
         requested_in: &StepAmount,
         reverse_cache: &StepAmounts,
-        context: StepContext<'_>,
+        context: &StepContext<'_>,
     ) -> Result<StepAmounts, Ter> {
         match self {
             StepKind::Direct { src, dst, currency } => {
@@ -268,6 +272,7 @@ impl FlowStep for StepKind {
                         taker: Some(context.strand_src),
                         quality_threshold: context.quality_threshold,
                         remove_self_crossing: *remove_self_crossing,
+                        self_cross_cancellation: context.self_cross_cancellation.clone(),
                     },
                 );
                 if result.ter != Ter::TES_SUCCESS {

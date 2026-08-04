@@ -6,7 +6,7 @@
 //! sandbox.  Only a successful chosen strand is applied to its parent view.
 
 use super::steps::{FlowStep, StepAmount, StepAmounts, StepContext};
-use super::{FlowResult, Strand};
+use super::{FlowResult, SelfCrossCancellation, Strand};
 use crate::{ApplyView, FlowSandbox};
 use protocol::{AccountID, Quality, STAmount, Ter};
 
@@ -31,6 +31,7 @@ pub fn execute_strands<V: ApplyView>(
     send_max: Option<&STAmount>,
     strand_src: &AccountID,
     quality_threshold: Option<Quality>,
+    self_cross_cancellation: Option<SelfCrossCancellation>,
 ) -> FlowResult {
     if strands.is_empty() {
         return FlowResult {
@@ -76,6 +77,7 @@ pub fn execute_strands<V: ApplyView>(
                 &remaining_out,
                 strand_src,
                 quality_threshold,
+                self_cross_cancellation.clone(),
             );
 
             let Some((amount_in, amount_out, inactive)) = result else {
@@ -145,15 +147,17 @@ fn execute_single_strand<V: ApplyView>(
     requested_out: &STAmount,
     strand_src: &AccountID,
     quality_threshold: Option<Quality>,
+    self_cross_cancellation: Option<SelfCrossCancellation>,
 ) -> Option<(STAmount, STAmount, bool)> {
     let context = StepContext {
         strand_src,
         quality_threshold,
+        self_cross_cancellation,
     };
 
     let probe = {
         let mut dry_sandbox = FlowSandbox::new(parent);
-        reverse_probe(&mut dry_sandbox, strand, max_in, requested_out, context)?
+        reverse_probe(&mut dry_sandbox, strand, max_in, requested_out, &context)?
     };
     // `dry_sandbox` was deliberately dropped without `apply`.
 
@@ -163,7 +167,7 @@ fn execute_single_strand<V: ApplyView>(
         strand,
         max_in,
         requested_out,
-        context,
+        &context,
         &probe,
     )?;
 
@@ -191,7 +195,7 @@ fn reverse_probe<V: ApplyView>(
     strand: &Strand,
     max_in: Option<&STAmount>,
     requested_out: &STAmount,
-    context: StepContext<'_>,
+    context: &StepContext<'_>,
 ) -> Option<ReverseProbe> {
     let mut cache = vec![None; strand.len()];
     let mut step_out = StepAmount::new(requested_out.clone());
@@ -249,7 +253,7 @@ fn replay_probe<V: ApplyView>(
     strand: &Strand,
     max_in: Option<&STAmount>,
     requested_out: &STAmount,
-    context: StepContext<'_>,
+    context: &StepContext<'_>,
     probe: &ReverseProbe,
 ) -> Option<Vec<Option<StepAmounts>>> {
     let mut cache = vec![None; strand.len()];
