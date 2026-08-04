@@ -105,6 +105,19 @@ pub fn execute_book_step<V: ApplyView>(
         let offer_owner = offer_sle.get_account_id(sf("sfAccount"));
         let taker_pays = offer_sle.get_field_amount(sf("sfTakerPays"));
         let taker_gets = offer_sle.get_field_amount(sf("sfTakerGets"));
+        eprintln!(
+            "DIAG book_offer: owner={:?} taker_gets_mantissa={} taker_gets_exp={} taker_gets_native={} taker_pays_mantissa={} taker_pays_exp={} taker_pays_native={} remaining_in_mantissa={} remaining_in_exp={} taker_arg={:?}",
+            offer_owner,
+            taker_gets.mantissa(),
+            taker_gets.exponent(),
+            taker_gets.native(),
+            taker_pays.mantissa(),
+            taker_pays.exponent(),
+            taker_pays.native(),
+            remaining_in.mantissa(),
+            remaining_in.exponent(),
+            taker
+        );
 
         if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
             remove_consumed_offer(view, &offer_sle);
