@@ -148,6 +148,15 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     // --- Cancel existing offer if OfferSequence present ---
     if sttx.is_field_present(sf("sfOfferSequence")) {
         let cancel_seq = sttx.get_field_u32(sf("sfOfferSequence"));
+        let trace_offer_sequence = std::env::var("XRPL_TRACE_OFFER_SEQUENCE")
+            .map(|value| value == "1")
+            .unwrap_or(false);
+        if trace_offer_sequence {
+            eprintln!(
+                "TRACE offer_sequence: account={:?} tx_seq={} cancel_seq={}",
+                account, offer_sequence, cancel_seq
+            );
+        }
         let cancel_keylet = protocol::offer_keylet(Uint160::from_void(account.data()), cancel_seq);
         // `peek` consults the active transaction delta first. For an offer
         // that only exists in the parent state tree, fall back to `read` so a
@@ -166,11 +175,25 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             Err(_) => return Ter::TEF_BAD_LEDGER,
         };
         if let Some(old_offer) = old_offer {
+            if trace_offer_sequence {
+                eprintln!(
+                    "TRACE offer_sequence: found offer_key={} owner_node={} book_node={} book_dir={}",
+                    old_offer.key(),
+                    old_offer.get_field_u64(sf("sfOwnerNode")),
+                    old_offer.get_field_u64(sf("sfBookNode")),
+                    old_offer.get_field_h256(sf("sfBookDirectory"))
+                );
+            }
             let released_gets = old_offer.get_field_amount(sf("sfTakerGets"));
             result = offer_delete(view, &account, old_offer);
+            if trace_offer_sequence {
+                eprintln!("TRACE offer_sequence: offer_delete_result={:?}", result);
+            }
             if is_tes_success(result) {
                 freed_taker_gets = Some(released_gets);
             }
+        } else if trace_offer_sequence {
+            eprintln!("TRACE offer_sequence: cancelled offer absent");
         }
     }
 

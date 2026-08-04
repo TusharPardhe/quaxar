@@ -261,17 +261,38 @@ pub fn dir_remove(
     key: Uint256,
     keep_root: bool,
 ) -> Result<bool, ViewError> {
-    // Use read fallback so NuDB-backed pages are found even if not yet in sandbox cache.
+    let trace_offer_sequence = std::env::var("XRPL_TRACE_OFFER_SEQUENCE")
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    let page_keylet = page_kl(directory, page);
     let Some(node) = view
-        .peek(page_kl(directory, page))?
-        .or_else(|| view.read(page_kl(directory, page)).ok().flatten())
+        .peek(page_keylet)?
+        .or_else(|| view.read(page_keylet).ok().flatten())
     else {
+        if trace_offer_sequence {
+            eprintln!(
+                "TRACE dir_remove: directory={} page={} key={} page_missing=true",
+                directory.key, page, key
+            );
+        }
         return Ok(false);
     };
 
     let root_page: u64 = 0;
     let mut entries = v256_to_vec(&node.get_field_v256(sf("sfIndexes")));
+    if trace_offer_sequence {
+        eprintln!(
+            "TRACE dir_remove: directory={} page={} key={} entries={:?}",
+            directory.key, page, key, entries
+        );
+    }
     let Some(pos) = entries.iter().position(|k| *k == key) else {
+        if trace_offer_sequence {
+            eprintln!(
+                "TRACE dir_remove: directory={} page={} key={} key_absent=true",
+                directory.key, page, key
+            );
+        }
         return Ok(false);
     };
     entries.remove(pos);
