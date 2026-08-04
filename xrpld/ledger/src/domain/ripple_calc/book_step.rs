@@ -9,7 +9,10 @@ use crate::ApplyView;
 use crate::domain::flow_engine::SelfCrossCancellation;
 use crate::domain::ripple_state_helpers;
 use basics;
-use basics::base_uint::Uint256;
+use basics::{
+    base_uint::Uint256,
+    number::{NumberParts as RuntimeNumber, NumberRoundModeGuard, RoundingMode},
+};
 use protocol::{
     AccountID, Amounts, Asset, MPTAmount, Quality, STAmount, STLedgerEntry, Ter,
     get_field_by_symbol as sf,
@@ -379,75 +382,139 @@ fn transfer_rate_for_asset<V: ApplyView>(
 }
 
 // ── AMM (Automated Market Maker) support ─────────────────────────────────────
-// The AMM uses the constant product formula: pool_in * pool_out = k.
-// swapAssetIn: given input amount, compute output = pool_out - (pool_in * pool_out) / (pool_in + in * (1 - fee))
-// swapAssetOut: given output amount, compute input = ((pool_in * pool_out) / (pool_out - out) - pool_in) / (1 - fee)
+// The AMM uses the constant product formula: pool_in * pool_out = k. These
+// swaps intentionally mirror rippled's AMMHelpers.h `swapAssetIn` and
+// `swapAssetOut` Number arithmetic rather than converting ledger amounts to
+// binary floating point. In particular, an output-limited trade must derive
+// its input from the requested output, with every intermediate rounding step
+// favoring the AMM.
 
-/// out = pool_out - (pool_in * pool_out) / (pool_in + assetIn * (1 - fee))
-fn amm_swap_asset_in(pool_in: f64, pool_out: f64, asset_in: f64, trading_fee: u16) -> f64 {
-    if pool_in <= 0.0 || pool_out <= 0.0 || asset_in <= 0.0 {
-        return 0.0;
-    }
-    let fee_mult = 1.0 - (trading_fee as f64) / 100_000.0;
-    let denom = pool_in + asset_in * fee_mult;
-    if denom <= 0.0 {
-        return 0.0;
-    }
-    let out = pool_out - (pool_in * pool_out) / denom;
-    if out < 0.0 { 0.0 } else { out }
+fn number_to_amount(asset: Asset, amount: RuntimeNumber, mode: RoundingMode) -> Option<STAmount> {
+    // `to_amount_from_number` installs this guard for native amounts, but IOU
+    // conversion also needs it when reducing Number's runtime precision to
+    // the 16-digit STAmount representation.
+    let _rounding = NumberRoundModeGuard::new(mode);
+    protocol::to_amount_from_number::<STAmount>(asset, amount, mode).ok()
 }
 
-/// in = ((pool_in * pool_out) / (pool_out - assetOut) - pool_in) / (1 - fee)
-fn amm_swap_asset_out(pool_in: f64, pool_out: f64, asset_out: f64, trading_fee: u16) -> f64 {
-    if pool_in <= 0.0 || pool_out <= 0.0 || asset_out <= 0.0 {
-        return 0.0;
+/// Typed equivalent of rippled `swapAssetIn`.
+///
+/// `pool_out - (pool_in * pool_out) / (pool_in + asset_in * (1 - fee))`
+fn amm_swap_asset_in(
+    pool_in: &STAmount,
+    pool_out: &STAmount,
+    asset_in: &STAmount,
+    trading_fee: u16,
+    amm_rounding_enabled: bool,
+) -> Option<STAmount> {
+    if pool_in.signum() <= 0 || pool_out.signum() <= 0 || asset_in.signum() <= 0 {
+        return None;
     }
-    if asset_out >= pool_out {
-        return f64::MAX;
-    }
-    let fee_mult = 1.0 - (trading_fee as f64) / 100_000.0;
-    if fee_mult <= 0.0 {
-        return f64::MAX;
-    }
-    let new_pool_out = pool_out - asset_out;
-    let new_pool_in = (pool_in * pool_out) / new_pool_out;
-    let asset_in = (new_pool_in - pool_in) / fee_mult;
-    if asset_in < 0.0 { 0.0 } else { asset_in }
-}
 
-/// Convert STAmount to f64 for AMM arithmetic.
-fn amount_to_f64(amount: &STAmount) -> f64 {
-    if amount.native() {
-        amount.xrp().drops() as f64
+    let pool_out_asset = pool_out.asset();
+    let pool_in = crate::domain::amm_helpers::stamount_as_number(pool_in);
+    let pool_out = crate::domain::amm_helpers::stamount_as_number(pool_out);
+    let asset_in = crate::domain::amm_helpers::stamount_as_number(asset_in);
+
+    let swap_out = if amm_rounding_enabled {
+        // fixAMMv1_1: stage the calculation with the same directions as
+        // rippled. The output is minimized, which preserves the pool product.
+        let numerator = {
+            let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
+            pool_in * pool_out
+        };
+        let fee = {
+            let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
+            protocol::get_fee(trading_fee)
+        };
+        let denominator = {
+            let _rounding = NumberRoundModeGuard::new(RoundingMode::Downward);
+            pool_in + asset_in * (RuntimeNumber::one(basics::number::get_mantissa_scale()) - fee)
+        };
+        if denominator <= RuntimeNumber::zero() {
+            return None;
+        }
+        let ratio = {
+            let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
+            numerator / denominator
+        };
+        {
+            let _rounding = NumberRoundModeGuard::new(RoundingMode::Downward);
+            pool_out - ratio
+        }
     } else {
-        amount.mantissa() as f64 * 10f64.powi(amount.exponent())
+        pool_out - (pool_in * pool_out) / (pool_in + asset_in * protocol::fee_mult(trading_fee))
+    };
+
+    if swap_out.signum() <= 0 {
+        return None;
     }
+    number_to_amount(pool_out_asset, swap_out, RoundingMode::Downward)
 }
 
-/// Convert f64 back to STAmount with the given asset.
-fn f64_to_amount(value: f64, asset: protocol::Asset) -> STAmount {
-    if value <= 0.0 {
-        return STAmount::new_with_asset(sf("sfAmount"), asset, 0, 0, false);
+/// Typed equivalent of rippled `swapAssetOut`.
+///
+/// `((pool_in * pool_out) / (pool_out - asset_out) - pool_in) / (1 - fee)`
+fn amm_swap_asset_out(
+    pool_in_amount: &STAmount,
+    pool_out_amount: &STAmount,
+    asset_out_amount: &STAmount,
+    trading_fee: u16,
+    amm_rounding_enabled: bool,
+) -> Option<STAmount> {
+    if pool_in_amount.signum() <= 0
+        || pool_out_amount.signum() <= 0
+        || asset_out_amount.signum() <= 0
+        || asset_out_amount >= pool_out_amount
+    {
+        return None;
     }
-    if asset.native() {
-        STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(value as i64))
-    } else if let Asset::MPTIssue(issue) = asset {
-        STAmount::from_mpt_amount(
-            sf("sfAmount"),
-            MPTAmount::from_value(value.floor() as i64),
-            issue,
-        )
+
+    let pool_in = crate::domain::amm_helpers::stamount_as_number(pool_in_amount);
+    let pool_out = crate::domain::amm_helpers::stamount_as_number(pool_out_amount);
+    let asset_out = crate::domain::amm_helpers::stamount_as_number(asset_out_amount);
+
+    let swap_in = if amm_rounding_enabled {
+        // fixAMMv1_1: stage the calculation with the inverse directions of
+        // swapAssetIn. The required input is maximized, protecting the AMM.
+        let numerator = {
+            let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
+            pool_in * pool_out
+        };
+        let denominator = {
+            let _rounding = NumberRoundModeGuard::new(RoundingMode::Downward);
+            pool_out - asset_out
+        };
+        if denominator <= RuntimeNumber::zero() {
+            return None;
+        }
+        let numerator2 = {
+            let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
+            numerator / denominator - pool_in
+        };
+        let fee = {
+            let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
+            protocol::get_fee(trading_fee)
+        };
+        let fee_mult = {
+            let _rounding = NumberRoundModeGuard::new(RoundingMode::Downward);
+            RuntimeNumber::one(basics::number::get_mantissa_scale()) - fee
+        };
+        if fee_mult <= RuntimeNumber::zero() {
+            return None;
+        }
+        {
+            let _rounding = NumberRoundModeGuard::new(RoundingMode::Upward);
+            numerator2 / fee_mult
+        }
     } else {
-        // Normalize to IOU range [1e15, 1e16)
-        let log10 = value.log10().floor() as i32;
-        let exponent = log10 - 15;
-        let scale = 10f64.powi(-exponent);
-        let mantissa = (value * scale).floor() as u64;
-        let mantissa = mantissa
-            .max(1_000_000_000_000_000)
-            .min(9_999_999_999_999_999);
-        STAmount::new_with_asset(sf("sfAmount"), asset, mantissa, exponent, false)
+        ((pool_in * pool_out) / (pool_out - asset_out) - pool_in) / protocol::fee_mult(trading_fee)
+    };
+
+    if swap_in.signum() <= 0 {
+        return None;
     }
+    number_to_amount(pool_in_amount.asset(), swap_in, RoundingMode::Upward)
 }
 
 /// Returns (amm_account, amm_taker_pays, amm_taker_gets, trading_fee) or None.
@@ -518,35 +585,42 @@ fn get_amm_offer<V: ApplyView>(
         ripple_state_helpers::credit_balance(view, &amm_account, &issue.account, issue.currency)
     };
 
-    let pool_in = amount_to_f64(&pool_in_amount);
-    let pool_out = amount_to_f64(&pool_out_amount);
-
-    if pool_in <= 0.0 || pool_out <= 0.0 {
+    if pool_in_amount.signum() <= 0 || pool_out_amount.signum() <= 0 {
         return None;
     }
 
-    // Compute AMM offer: given max_in, how much can we get out?
-    let in_val = amount_to_f64(max_in);
-    let out_val = amm_swap_asset_in(pool_in, pool_out, in_val, trading_fee);
-
-    if out_val <= 0.0 {
+    // First offer the largest amount permitted by the input limit. If the
+    // delivery limit binds, recompute the required input directly from that
+    // requested output (AMMOffer::limitOut / swapAssetOut parity), rather
+    // than scaling a forward result.
+    let amm_rounding_enabled = view.rules().enabled(&protocol::fix_ammv1_1());
+    let offered_out = amm_swap_asset_in(
+        &pool_in_amount,
+        &pool_out_amount,
+        max_in,
+        trading_fee,
+        amm_rounding_enabled,
+    )?;
+    if offered_out.signum() <= 0 {
         return None;
     }
 
-    // Limit by max_out
-    let actual_out = out_val.min(amount_to_f64(max_out));
-    let actual_in = if actual_out < out_val {
-        amm_swap_asset_out(pool_in, pool_out, actual_out, trading_fee)
+    let (amm_taker_pays, amm_taker_gets) = if offered_out > *max_out {
+        let required_in = amm_swap_asset_out(
+            &pool_in_amount,
+            &pool_out_amount,
+            max_out,
+            trading_fee,
+            amm_rounding_enabled,
+        )?;
+        (required_in, max_out.clone())
     } else {
-        in_val
+        (max_in.clone(), offered_out)
     };
 
-    if actual_in <= 0.0 || actual_out <= 0.0 {
+    if amm_taker_pays.signum() <= 0 || amm_taker_gets.signum() <= 0 {
         return None;
     }
-
-    let amm_taker_pays = f64_to_amount(actual_in, book.r#in);
-    let amm_taker_gets = f64_to_amount(actual_out, book.out);
 
     Some((amm_account, amm_taker_pays, amm_taker_gets, trading_fee))
 }
@@ -617,54 +691,6 @@ fn remove_consumed_offer<V: ApplyView>(view: &mut V, offer_sle: &STLedgerEntry) 
 
     // Erase the offer
     let _ = view.erase(Arc::new(offer_sle.clone()));
-}
-
-/// Get the best offer quality in a book (TakerGets/TakerPays = output/input).
-/// Returns None if the book is empty.
-pub fn get_book_best_quality<V: crate::ReadView>(view: &V, book: &Book) -> Option<f64> {
-    let proto_book = protocol::Book {
-        r#in: book.r#in,
-        out: book.out,
-        domain: book.domain,
-    };
-    let book_base = protocol::get_book_base(proto_book);
-    let book_end = protocol::get_quality_next(book_base);
-    let current_key = book_base;
-
-    // Find the first directory page in the book range
-    let next_page = view.succ(current_key, Some(book_end)).ok()??;
-    let page_keylet = protocol::Keylet::new(protocol::LedgerEntryType::DirectoryNode, next_page);
-    let dir = view.read(page_keylet).ok()??;
-
-    // Get the first offer from this page
-    let indexes = dir.get_field_v256(protocol::get_field_by_symbol("sfIndexes"));
-    let offer_key = indexes.value().first()?;
-    let offer_keylet = protocol::Keylet::new(protocol::LedgerEntryType::Offer, *offer_key);
-    let offer = view.read(offer_keylet).ok()??;
-
-    let sf = protocol::get_field_by_symbol;
-    let taker_pays = offer.get_field_amount(sf("sfTakerPays"));
-    let taker_gets = offer.get_field_amount(sf("sfTakerGets"));
-
-    if taker_pays.signum() <= 0 {
-        return None;
-    }
-
-    let tp = if taker_pays.native() {
-        taker_pays.xrp().drops() as f64
-    } else {
-        taker_pays.mantissa() as f64 * 10f64.powi(taker_pays.exponent())
-    };
-    let tg = if taker_gets.native() {
-        taker_gets.xrp().drops() as f64
-    } else {
-        taker_gets.mantissa() as f64 * 10f64.powi(taker_gets.exponent())
-    };
-
-    if tp <= 0.0 {
-        return None;
-    }
-    Some(tg / tp) // TakerGets/TakerPays = output/input quality
 }
 
 fn get_book_offers<V: ApplyView>(view: &mut V, book: &Book, max: u32) -> Vec<STLedgerEntry> {
@@ -1129,6 +1155,35 @@ pub fn execute_explicit_book_step<V: ApplyView>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::StBase;
+
+    #[test]
+    fn amm_swap_asset_out_par_xrp_regression_uses_typed_rounding() {
+        // This concrete pool has a 0.22% trading fee and is deliberately
+        // output-limited at 980 XRP. `swapAssetOut` must derive the input
+        // from the requested output, not from a float forward estimate.
+        let par = protocol::Issue::new(
+            protocol::currency_from_string("PAR"),
+            AccountID::from_array([0xA5; 20]),
+        );
+        let pool_par = STAmount::from_iou_amount(
+            sf("sfAmount"),
+            protocol::IOUAmount::from_parts(4_752_046_925_146_200, -11).expect("PAR pool amount"),
+            par,
+        );
+        let pool_xrp = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(49_980_000_000));
+        let requested_xrp = STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(980_000_000));
+
+        let required_par = amm_swap_asset_out(&pool_par, &pool_xrp, &requested_xrp, 220, true)
+            .expect("output below pool balance must be swappable");
+
+        assert_eq!(
+            required_par.iou(),
+            protocol::IOUAmount::from_parts(9_525_048_958_000_000, -13)
+                .expect("canonical required PAR")
+        );
+        assert_eq!(required_par.text(), "952.5048958");
+    }
 
     #[test]
     fn quality_threshold_rejects_worse_crossing() {
