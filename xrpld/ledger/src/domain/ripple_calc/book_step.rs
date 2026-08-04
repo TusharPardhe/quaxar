@@ -141,16 +141,6 @@ pub fn execute_book_step<V: ApplyView>(
             // So quality = get_rate(offer_TakerPays, offer_TakerGets) — what taker gets per unit given.
             let offer_quality =
                 Quality::from_amounts(&Amounts::new(taker_gets.clone(), taker_pays.clone()));
-            eprintln!(
-                "DIAG book_step: threshold_value={} offer_quality_value={} offer_owner_below={} offer_taker_gets_mantissa={} offer_taker_gets_exp={} offer_taker_pays_mantissa={} offer_taker_pays_exp={}",
-                threshold.value(),
-                offer_quality.value(),
-                offer_quality < threshold,
-                taker_gets.mantissa(),
-                taker_gets.exponent(),
-                taker_pays.mantissa(),
-                taker_pays.exponent()
-            );
             if offer_quality < threshold {
                 break;
             }
@@ -259,6 +249,16 @@ pub fn execute_book_step<V: ApplyView>(
     // If an AMM exists for this book and provides liquidity, use it.
     // The AMM uses the constant product formula (x*y=k).
     // We check AMM after CLOB: if CLOB already delivered enough, skip AMM.
+    //
+    // reference: rippled's AMMLiquidity/AMMOffer (xrpl/tx/paths/AMMLiquidity.cpp,
+    // AMMOffer.cpp) present the AMM to BookStep as a quality-bound synthetic
+    // offer subject to the SAME qualityUpperBound/threshold enforcement as a
+    // real order-book offer. An OfferCreate's quality_threshold must reject
+    // AMM liquidity whose effective quality is worse than the taker's own
+    // offer, exactly like it rejects a too-poor CLOB offer above. Without
+    // this gate, an OfferCreate that crosses nothing on a real (correctly
+    // rippled-matching) network can still drain funds against a deep AMM
+    // pool that the taker's own quality should have excluded.
     if remaining_in.signum() > 0 && total_out < *max_out {
         let remaining_out = max_out.clone() - total_out.clone();
         if let Some((amm_account, amm_pays, amm_gets, _fee)) =
@@ -266,18 +266,27 @@ pub fn execute_book_step<V: ApplyView>(
             && amm_pays.signum() > 0
             && amm_gets.signum() > 0
         {
-            // Execute AMM trade: taker sends amm_pays, receives amm_gets
-            let res = execute_amm_trade(
-                view,
-                &amm_account,
-                &book.r#in,
-                &book.out,
-                &amm_pays,
-                &amm_gets,
-            );
-            if res == Ter::TES_SUCCESS {
-                total_in += amm_pays;
-                total_out += amm_gets;
+            let amm_quality_ok = match quality_threshold {
+                Some(threshold) => {
+                    Quality::from_amounts(&Amounts::new(amm_gets.clone(), amm_pays.clone()))
+                        >= threshold
+                }
+                None => true,
+            };
+            if amm_quality_ok {
+                // Execute AMM trade: taker sends amm_pays, receives amm_gets
+                let res = execute_amm_trade(
+                    view,
+                    &amm_account,
+                    &book.r#in,
+                    &book.out,
+                    &amm_pays,
+                    &amm_gets,
+                );
+                if res == Ter::TES_SUCCESS {
+                    total_in += amm_pays;
+                    total_out += amm_gets;
+                }
             }
         }
     }
