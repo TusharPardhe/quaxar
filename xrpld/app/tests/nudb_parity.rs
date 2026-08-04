@@ -1382,3 +1382,56 @@ fn mainnet_ledger_106053457_replay_reproduces_offer_create_divergence() {
     // reproduce and observe the divergence deterministically. Once the root
     // cause is fixed, promote these to hard assertions.
 }
+
+#[test]
+#[ignore = "requires mainnet NuDB (NUDB_PATH env or default) and mainnet RPC access"]
+fn mainnet_ledger_106066101_replay_live_offer_sequence_regression() {
+    let nudb_path = std::env::var("NUDB_PATH").unwrap_or_else(|_| DEFAULT_NUDB_PATH.to_string());
+    if !Path::new(&nudb_path).exists() {
+        eprintln!("skipping live OfferSequence replay: NuDB path does not exist: {nudb_path}");
+        return;
+    }
+
+    let parent_seq = 106_066_100;
+    let child_seq = 106_066_101;
+    let target_tx = "2A6F59107625E39518F871240944F1965143C607BE284F5DDF7F16E2208B3649";
+
+    let parent = load_parent_ledger(parent_seq, &nudb_path)
+        .unwrap_or_else(|error| panic!("failed to load live-failure parent: {error}"));
+    let expected_parent = fetch_ledger_header(parent_seq).expect("fetch canonical parent header");
+    assert_eq!(parent.header().hash, expected_parent.hash);
+    assert_eq!(
+        parent.header().account_hash,
+        expected_parent.account_hash,
+        "parent state must be canonical before replay"
+    );
+
+    let header = fetch_ledger_header(child_seq).expect("fetch canonical child header");
+    let tx_items = fetch_tx_items_for_ledger(child_seq).expect("fetch canonical child tx set");
+    let (built, ters) = replay_child_ledger_unverified(&parent, header.clone(), &tx_items)
+        .expect("replay live-failure child ledger");
+
+    let mut canonical = ledger::CanonicalTXSet::new(*header.tx_hash.as_uint256());
+    for (tx_data, _) in &tx_items {
+        let mut outer = SerialIter::new(tx_data);
+        let tx_bytes = outer.get_vl();
+        let mut serial = SerialIter::new(&tx_bytes);
+        canonical.insert(Arc::new(STTx::from_serial_iter(&mut serial)));
+    }
+    let ordered = canonical.drain_ordered();
+    let target_pos = ordered
+        .iter()
+        .position(|tx| tx.get_transaction_id().to_string() == target_tx)
+        .expect("live OfferSequence transaction must be in canonical tx set");
+    assert!(
+        matches!(ters[target_pos], Ter::TES_SUCCESS) || protocol::is_tec_claim(ters[target_pos]),
+        "live OfferSequence tx {target_tx} must not regress to tef/tel/tem: {:?}",
+        ters[target_pos]
+    );
+
+    assert_eq!(built.header().account_hash, header.account_hash);
+    assert_eq!(
+        protocol::calculate_ledger_hash(&built.header()),
+        header.hash
+    );
+}
