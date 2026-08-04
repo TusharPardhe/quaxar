@@ -474,25 +474,39 @@ fn replay_child_ledger_unverified(
             .map_err(|error| format!("update_negative_unl failed: {:?}", error))?;
     }
 
-    let mut ters = Vec::new();
-    for (index, (tx_data, tx_id)) in tx_items.iter().enumerate() {
-        eprintln!(
-            "replay_child_ledger_unverified: decoding tx_index={} tx_id={} raw_len={}",
-            index,
-            tx_id,
-            tx_data.len()
-        );
+    // Decode every transaction first, then hand the whole set to a
+    // CanonicalTXSet — matching the production accept path's
+    // `decode_consensus_accept_transactions` (xrpld/app/src/consensus/
+    // rcl_consensus.rs), which canonicalizes on (account, seq_proxy, tx_id)
+    // BEFORE the apply loop ever runs. The raw `ledger` RPC `transactions`
+    // array is in SHAMap/consensus order, not account+sequence order, so
+    // applying it directly (as this harness previously did) can process one
+    // account's chained transactions out of order within a single pass.
+    let mut canonical = ledger::CanonicalTXSet::new(*acquired_header.tx_hash.as_uint256());
+    let mut tx_id_by_hash = std::collections::HashMap::new();
+    for (tx_data, tx_id) in tx_items {
         let mut outer = SerialIter::new(tx_data);
         let tx_bytes = outer.get_vl();
         let mut sit = SerialIter::new(&tx_bytes);
         let sttx = STTx::from_serial_iter(&mut sit);
+        tx_id_by_hash.insert(sttx.get_transaction_id(), *tx_id);
+        canonical.insert(Arc::new(sttx));
+    }
+    let ordered_txs = canonical.drain_ordered();
+
+    let mut ters = Vec::new();
+    for sttx in &ordered_txs {
+        let tx_id = tx_id_by_hash
+            .get(&sttx.get_transaction_id())
+            .copied()
+            .unwrap_or_else(|| sttx.get_transaction_id());
         let txn_type = sttx.get_txn_type();
         let base = Arc::new(built.clone());
         let mut view = Sandbox::new(base, ApplyFlags::default());
-        let ter = apply_submit_transactor_shell(&mut view, &sttx, txn_type);
+        let ter = apply_submit_transactor_shell(&mut view, sttx, txn_type);
         ters.push(ter);
         let rules = built.rules().clone();
-        view.apply_with_tx_thread(&mut built, *tx_id, acquired_header.seq, &rules)
+        view.apply_with_tx_thread(&mut built, tx_id, acquired_header.seq, &rules)
             .map_err(|error| format!("apply_with_tx_thread failed: {:?}", error))?;
     }
 
