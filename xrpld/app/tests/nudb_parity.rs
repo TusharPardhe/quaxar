@@ -1,9 +1,10 @@
 use app::{SHAMapStoreNodeStore, SHAMapStoreSavedStateDb, apply_submit_transactor_shell};
 use basics::base_uint::Uint256;
 use basics::basic_config::BasicConfig;
-use basics::intrusive_pointer::SharedIntrusive;
+use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
 use basics::sha_map_hash::SHAMapHash;
 use basics::str_hex::str_hex;
+use basics::tagged_cache::MonotonicClock;
 use ledger::{Ledger, LedgerHeader, Sandbox};
 use nodestore::{
     Backend, DatabaseRotatingImp, DummyScheduler, FetchType, Manager, ManagerImp, NullJournal,
@@ -14,10 +15,13 @@ use protocol::{
     ApplyFlags, JsonOptions, Keylet, LedgerEntryType, STTx, SerialIter, Serializer, StBase, Ter,
     skip_keylet,
 };
-use shamap::sync::{SHAMapType, SyncState, SyncTree};
+use shamap::family::{
+    NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
+};
 use shamap::tree_node::SHAMapTreeNode;
+use shamap::tree_node_cache::TreeNodeCache;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const DEFAULT_NUDB_PATH: &str = "/mnt/xrpl-data/mainnet/nudb";
@@ -423,38 +427,135 @@ fn load_testnet_parent_ledger(parent_seq: u32, nudb_path: &str) -> Result<Ledger
     load_parent_ledger_with_header(parent_seq, header, fetcher)
 }
 
+struct LocalParentNodeFetcher {
+    fetcher: Arc<dyn Fn(SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> + Send + Sync>,
+    first_missing: Arc<Mutex<Option<SHAMapHash>>>,
+}
+
+impl SHAMapNodeFetcher for LocalParentNodeFetcher {
+    fn fetch_node(&self, hash: SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+        let node = (self.fetcher)(hash);
+        if node.is_none() {
+            let mut missing = self
+                .first_missing
+                .lock()
+                .expect("parent completeness missing-hash lock");
+            if missing.is_none() {
+                *missing = Some(hash);
+            }
+        }
+        node
+    }
+}
+
+fn incomplete_parent_error(
+    parent_seq: u32,
+    fallback_hash: SHAMapHash,
+    first_missing: &Arc<Mutex<Option<SHAMapHash>>>,
+) -> String {
+    let missing_hash = first_missing
+        .lock()
+        .expect("parent completeness missing-hash lock")
+        .unwrap_or(fallback_hash);
+    format!(
+        "parent incomplete: ledger {} missing hash {} in local NuDB",
+        parent_seq, missing_hash
+    )
+}
+
 fn load_parent_ledger_with_header(
     parent_seq: u32,
     header: LedgerHeader,
     fetcher: Arc<dyn Fn(SHAMapHash) -> Option<SharedIntrusive<SHAMapTreeNode>> + Send + Sync>,
 ) -> Result<Ledger, String> {
-    let mut ledger = Ledger::from_header_hashes(header);
-    ledger.set_node_fetcher(fetcher.clone());
-
-    let Some(state_root) = fetcher(header.account_hash) else {
-        return Err(format!(
-            "missing state root for parent ledger {}",
-            parent_seq
+    // This offline harness deliberately has no ApplicationRoot or inbound-ledger
+    // runtime. It may only use its local NuDB fetcher, so a missing node is a
+    // deterministic incomplete-parent error rather than a peer-acquisition request.
+    let first_missing = Arc::new(Mutex::new(None));
+    let family = SHAMapFamily::new(
+        Arc::new(TreeNodeCache::new(
+            "nudb-parity-parent-loader",
+            8,
+            time::Duration::seconds(1),
+            MonotonicClock::default(),
+        )),
+        NullFullBelowCache::new(0),
+        LocalParentNodeFetcher {
+            fetcher: fetcher.clone(),
+            first_missing: Arc::clone(&first_missing),
+        },
+        NullMissingNodeReporter,
+    );
+    let journal = ledger::NullLedgerJournal;
+    let (mut ledger, roots_loaded) =
+        Ledger::load_immutable_with_family(header, false, &journal, &family);
+    if !roots_loaded {
+        return Err(incomplete_parent_error(
+            parent_seq,
+            ledger.header().account_hash,
+            &first_missing,
         ));
+    }
+
+    // Match replay_startup_ledger_from_storage: a parent becomes full only
+    // after every reachable state and transaction node is locally available.
+    if !ledger.walk_ledger_with_family(&journal, false, &family) {
+        return Err(incomplete_parent_error(
+            parent_seq,
+            ledger.header().account_hash,
+            &first_missing,
+        ));
+    }
+
+    ledger.set_node_fetcher(fetcher);
+    ledger
+        .finish_load_by_index_or_hash(&journal)
+        .map_err(|error| format!("parent ledger {} setup failed: {error:?}", parent_seq))?;
+    ledger.assert_sensible();
+    Ok(ledger)
+}
+
+fn is_incomplete_parent(error: &str) -> bool {
+    error.starts_with("parent incomplete:")
+}
+
+fn load_mainnet_parent_or_skip(fixture: &str, parent_seq: u32, nudb_path: &str) -> Option<Ledger> {
+    match load_parent_ledger(parent_seq, nudb_path) {
+        Ok(parent) => Some(parent),
+        Err(error) if is_incomplete_parent(&error) => {
+            eprintln!(
+                "{fixture}: SKIP — local historical parent is incomplete; {error}. \
+                 The offline NuDB fixture does not acquire missing nodes from peers."
+            );
+            None
+        }
+        Err(error) => panic!("{fixture}: failed to load parent ledger: {error}"),
+    }
+}
+
+#[test]
+fn root_only_parent_is_reported_incomplete() {
+    let missing_child = SHAMapHash::new(Uint256::from_array([0xA5; 32]));
+    let state_root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+    state_root.set_child_hash(7, missing_child);
+    state_root.update_hash();
+    let root_hash = state_root.get_hash();
+    let fetcher = Arc::new(move |hash| {
+        if hash == root_hash {
+            Some(state_root.clone())
+        } else {
+            None
+        }
+    });
+    let header = LedgerHeader {
+        seq: 1,
+        account_hash: root_hash,
+        ..LedgerHeader::default()
     };
 
-    let state_map = SyncTree::from_root_with_type(
-        state_root,
-        SHAMapType::State,
-        true,
-        parent_seq,
-        SyncState::Immutable,
-    );
-    state_map.set_full();
-
-    let mut ledger = Ledger::from_maps(
-        header,
-        state_map,
-        SyncTree::new_with_type(SHAMapType::Transaction, true, parent_seq),
-    );
-    ledger.set_node_fetcher(fetcher);
-    ledger.set_immutable(true);
-    Ok(ledger)
+    let error = load_parent_ledger_with_header(1, header, fetcher).unwrap_err();
+    assert!(error.contains("parent incomplete"), "{error}");
+    assert!(error.contains(&missing_child.to_string()), "{error}");
 }
 
 fn replay_child_ledger_unverified(
@@ -726,8 +827,9 @@ fn diff_canonical_affected_state_sles(
 fn run_case(case: TxReplayCase) {
     let nudb_path =
         std::env::var("XRPL_NUDB_PATH").unwrap_or_else(|_| DEFAULT_NUDB_PATH.to_string());
-    let parent = load_parent_ledger(case.parent_seq, &nudb_path)
-        .unwrap_or_else(|error| panic!("{}: failed to load parent ledger: {}", case.name, error));
+    let Some(parent) = load_mainnet_parent_or_skip(case.name, case.parent_seq, &nudb_path) else {
+        return;
+    };
     let tx_bytes = fetch_tx_bytes_from_ledger(case.parent_seq + 1, case.tx_prefix)
         .unwrap_or_else(|error| panic!("{}: failed to fetch tx bytes: {}", case.name, error));
     let mut serial = SerialIter::new(&tx_bytes);
@@ -1202,12 +1304,14 @@ fn nudb_flush_fix_enables_state_reads_across_builds() {
     // Load parent — state must be in NuDB (written by flush fix)
     let parent = match load_parent_ledger(parent_seq, &nudb_path) {
         Ok(p) => p,
-        Err(e) if e.contains("missing state root") => {
+        Err(e) if is_incomplete_parent(&e) => {
             eprintln!(
-                "flush-fix: SKIP — state root for seq={} not in NuDB yet.",
+                "flush-fix: SKIP — local historical parent for seq={} is incomplete.",
                 parent_seq
             );
-            eprintln!("flush-fix: Run the node with flush fix deployed to populate NuDB.");
+            eprintln!(
+                "flush-fix: The offline NuDB fixture does not acquire missing nodes from peers."
+            );
             eprintln!("flush-fix: Error: {}", e);
             return; // Skip test gracefully
         }
@@ -1265,8 +1369,10 @@ fn mainnet_ledger_106053457_replay_reproduces_offer_create_divergence() {
     let parent_seq = 106_053_456;
     let child_seq = 106_053_457;
 
-    let parent = load_parent_ledger(parent_seq, &nudb_path)
-        .unwrap_or_else(|error| panic!("failed to load mainnet parent ledger: {}", error));
+    let Some(parent) = load_mainnet_parent_or_skip("mainnet_106053457", parent_seq, &nudb_path)
+    else {
+        return;
+    };
     let expected_parent_header =
         fetch_ledger_header(parent_seq).expect("fetch expected parent header");
     assert_eq!(
@@ -1398,8 +1504,10 @@ fn mainnet_ledger_106066101_replay_live_offer_sequence_regression() {
     let child_seq = 106_066_101;
     let target_tx = "2A6F59107625E39518F871240944F1965143C607BE284F5DDF7F16E2208B3649";
 
-    let parent = load_parent_ledger(parent_seq, &nudb_path)
-        .unwrap_or_else(|error| panic!("failed to load live-failure parent: {error}"));
+    let Some(parent) = load_mainnet_parent_or_skip("mainnet_106066101", parent_seq, &nudb_path)
+    else {
+        return;
+    };
     let expected_parent = fetch_ledger_header(parent_seq).expect("fetch canonical parent header");
     assert_eq!(parent.header().hash, expected_parent.hash);
     assert_eq!(
