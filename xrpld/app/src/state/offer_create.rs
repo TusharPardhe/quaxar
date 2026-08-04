@@ -729,10 +729,17 @@ fn set_book_directory_fields(
                 Uint160::from_void(issue.account.data()),
             );
         }
+        protocol::Asset::Issue(_) => {
+            // rippled stores explicit all-zero currency and issuer fields for
+            // the XRP side of a BookDirectory. Leaving them absent changes
+            // the serialized directory SLE even though JSON displays the
+            // same conceptual book.
+            sle.set_field_h160(sf("sfTakerPaysCurrency"), Uint160::zero());
+            sle.set_field_h160(sf("sfTakerPaysIssuer"), Uint160::zero());
+        }
         protocol::Asset::MPTIssue(issue) => {
             sle.set_field_h192(sf("sfTakerPaysMPT"), issue.mpt_id());
         }
-        _ => {}
     }
     match taker_gets.asset() {
         protocol::Asset::Issue(issue) if !issue.native() => {
@@ -745,10 +752,13 @@ fn set_book_directory_fields(
                 Uint160::from_void(issue.account.data()),
             );
         }
+        protocol::Asset::Issue(_) => {
+            sle.set_field_h160(sf("sfTakerGetsCurrency"), Uint160::zero());
+            sle.set_field_h160(sf("sfTakerGetsIssuer"), Uint160::zero());
+        }
         protocol::Asset::MPTIssue(issue) => {
             sle.set_field_h192(sf("sfTakerGetsMPT"), issue.mpt_id());
         }
-        _ => {}
     }
     sle.set_field_u64(sf("sfExchangeRate"), rate);
     if let Some(domain_id) = domain_id {
