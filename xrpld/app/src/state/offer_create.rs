@@ -195,6 +195,10 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             // doApply to tefEXCEPTION. Preserve that result without emitting a
             // Rust unwind from the consensus strand.
             if rate_amount.signum() == 0 {
+                eprintln!(
+                    "DIAG offer_create: zero-rate TEF_EXCEPTION account={} tick_size={}",
+                    account, tick_size
+                );
                 return Ter::TEF_EXCEPTION;
             }
             // reference: saTakerGets = divide(saTakerPays, rate, saTakerGets.asset())
@@ -851,6 +855,10 @@ fn amount_or_exception(
     result: Result<STAmount, protocol::st_amount::AmountError>,
 ) -> Result<STAmount, Ter> {
     result.map_err(|error| {
+        eprintln!(
+            "DIAG offer_create: amount_or_exception rejected error={}",
+            error
+        );
         tracing::debug!(target: "tx", %error, "OfferCreate amount calculation rejected");
         Ter::TEF_EXCEPTION
     })
