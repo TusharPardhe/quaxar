@@ -634,13 +634,21 @@ fn execute_amm_trade<V: ApplyView>(
     amount_in: &STAmount,  // what taker pays (goes into AMM pool)
     amount_out: &STAmount, // what taker gets (comes out of AMM pool)
 ) -> Ter {
+    // rippled AMMOffer::send constructs each transferred STAmount with the
+    // exact Book asset (`toSTAmount(ofrAmt.in, book_.in)` / book_.out). Pool
+    // math may carry the issuer identity from a stored RippleState balance;
+    // forwarding that temporary identity to account_send can miss the
+    // canonical AMM pool line and create a new receiver-owned trust line.
+    let amount_in = normalize_amount_to_asset(amount_in, *book_in);
+    let amount_out = normalize_amount_to_asset(amount_out, *book_out);
+
     // Taker pays amount_in to AMM (AMM receives book_in)
-    let res = ripple_state_helpers::account_send(view, &book_in.issuer(), amm_account, amount_in);
+    let res = ripple_state_helpers::account_send(view, &book_in.issuer(), amm_account, &amount_in);
     if res != Ter::TES_SUCCESS {
         return res;
     }
     // AMM pays amount_out to taker (AMM sends book_out)
-    ripple_state_helpers::account_send(view, amm_account, &book_out.issuer(), amount_out)
+    ripple_state_helpers::account_send(view, amm_account, &book_out.issuer(), &amount_out)
 }
 
 /// Remove a consumed offer — reference offerDelete parity.
@@ -1240,4 +1248,20 @@ mod tests {
         assert_eq!(result_up.xrp().drops(), 1_002_000_000);
         assert_eq!(result_down.xrp().drops(), 1_002_000_000);
     }
+}
+
+/// Construct a transfer amount with the exact executable Book asset while
+/// preserving its numeric representation. Pool calculations may originate
+/// from a RippleState balance whose embedded issue is oriented differently.
+fn normalize_amount_to_asset(amount: &STAmount, asset: Asset) -> STAmount {
+    if amount.asset() == asset {
+        return amount.clone();
+    }
+    STAmount::new_with_asset(
+        sf("sfAmount"),
+        asset,
+        amount.mantissa(),
+        amount.exponent(),
+        amount.negative(),
+    )
 }
