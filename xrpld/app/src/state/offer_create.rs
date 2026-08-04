@@ -181,30 +181,12 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         let rounded_quality = round_quality(quality, tick_size);
         // Convert rounded quality back to a rate STAmount for multiply/divide
         let rate_amount = quality_to_rate_amount(rounded_quality, &taker_pays, &taker_gets);
-        eprintln!(
-            "DIAG offer_create: tick_size={} quality={} rounded_quality={} rate_mantissa={} rate_exponent={} pays_mantissa={} pays_exponent={} pays_native={} gets_mantissa={} gets_exponent={} gets_native={}",
-            tick_size,
-            quality,
-            rounded_quality,
-            rate_amount.mantissa(),
-            rate_amount.exponent(),
-            taker_pays.mantissa(),
-            taker_pays.exponent(),
-            taker_pays.native(),
-            taker_gets.mantissa(),
-            taker_gets.exponent(),
-            taker_gets.native()
-        );
 
         if is_sell {
             // reference: saTakerPays = multiply(saTakerGets, rate, saTakerPays.asset())
             taker_pays = match amount_or_exception(
                 taker_gets.try_multiply(&rate_amount, taker_pays.asset()),
-            )
-            .map_err(|ter| {
-                eprintln!("DIAG site=A(tick_sell_multiply) account={}", account);
-                ter
-            }) {
+            ) {
                 Ok(amount) => amount,
                 Err(ter) => return ter,
             };
@@ -213,22 +195,15 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             // doApply to tefEXCEPTION. Preserve that result without emitting a
             // Rust unwind from the consensus strand.
             if rate_amount.signum() == 0 {
-                eprintln!(
-                    "DIAG offer_create: zero-rate TEF_EXCEPTION account={} tick_size={}",
-                    account, tick_size
-                );
                 return Ter::TEF_EXCEPTION;
             }
             // reference: saTakerGets = divide(saTakerPays, rate, saTakerGets.asset())
-            taker_gets =
-                match amount_or_exception(taker_pays.try_divide(&rate_amount, taker_gets.asset()))
-                    .map_err(|ter| {
-                        eprintln!("DIAG site=B(tick_buy_divide) account={}", account);
-                        ter
-                    }) {
-                    Ok(amount) => amount,
-                    Err(ter) => return ter,
-                };
+            taker_gets = match amount_or_exception(
+                taker_pays.try_divide(&rate_amount, taker_gets.asset()),
+            ) {
+                Ok(amount) => amount,
+                Err(ter) => return ter,
+            };
         }
         if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
             return Ter::TES_SUCCESS; // Rounded to zero
@@ -472,12 +447,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                     -9,
                     false,
                 );
-                match amount_or_exception(actual_in.try_divide(&rate, taker_pays.asset())).map_err(
-                    |ter| {
-                        eprintln!("DIAG site=C(sell_gateway_divide) account={}", account);
-                        ter
-                    },
-                ) {
+                match amount_or_exception(actual_in.try_divide(&rate, taker_pays.asset())) {
                     Ok(amount) => amount,
                     Err(ter) => return ter,
                 }
@@ -491,24 +461,16 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             let rem_gets = if rem_pays.signum() <= 0 {
                 taker_gets.zeroed()
             } else {
-                let product = match amount_or_exception(
-                    rem_pays.try_multiply(&taker_gets, taker_gets.asset()),
-                )
-                .map_err(|ter| {
-                    eprintln!("DIAG site=D(sell_rem_multiply) account={}", account);
-                    ter
-                }) {
-                    Ok(amount) => amount,
-                    Err(ter) => return ter,
-                };
-                match amount_or_exception(product.try_divide(&taker_pays, taker_gets.asset()))
-                    .map_err(|ter| {
-                        eprintln!("DIAG site=E(sell_rem_divide) account={}", account);
-                        ter
-                    }) {
-                    Ok(amount) => amount,
-                    Err(ter) => return ter,
-                }
+                // reference: afterCross.out = divRoundStrict(afterCross.in,
+                // rate, takerAmount.out.asset(), false) in
+                // OfferCreate::flowCross. Single bounded divide of the
+                // REMAINING input by the pre-normalized Quality rate,
+                // matching the non-sell branch's mulRound fix below — see
+                // that branch's comment for why this replaces a two-step
+                // full-magnitude multiply-then-divide.
+                let quality = get_rate(&taker_gets, &taker_pays);
+                let rate_amount = quality_to_rate_amount(quality, &taker_pays, &taker_gets);
+                protocol::div_round_strict(&rem_pays, &rate_amount, taker_gets.asset(), false)
             };
             (rem_gets, rem_pays)
         } else {
@@ -520,40 +482,20 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             let rem_pays = if rem_gets.signum() <= 0 {
                 taker_pays.zeroed()
             } else {
-                let product = match amount_or_exception(
-                    rem_gets.try_multiply(&taker_pays, taker_pays.asset()),
-                )
-                .map_err(|ter| {
-                    eprintln!("DIAG site=F(nonsell_rem_multiply) account={}", account);
-                    ter
-                }) {
-                    Ok(amount) => amount,
-                    Err(ter) => return ter,
-                };
-                eprintln!(
-                    "DIAG offer_create: rem_pays_calc account={} rem_gets_mantissa={} rem_gets_exp={} rem_gets_native={} taker_pays_mantissa={} taker_pays_exp={} taker_pays_native={} taker_gets_mantissa={} taker_gets_exp={} taker_gets_native={} product_mantissa={} product_exp={} product_native={}",
-                    account,
-                    rem_gets.mantissa(),
-                    rem_gets.exponent(),
-                    rem_gets.native(),
-                    taker_pays.mantissa(),
-                    taker_pays.exponent(),
-                    taker_pays.native(),
-                    taker_gets.mantissa(),
-                    taker_gets.exponent(),
-                    taker_gets.native(),
-                    product.mantissa(),
-                    product.exponent(),
-                    product.native()
-                );
-                match amount_or_exception(product.try_divide(&taker_gets, taker_pays.asset()))
-                    .map_err(|ter| {
-                        eprintln!("DIAG site=G(nonsell_rem_divide) account={}", account);
-                        ter
-                    }) {
-                    Ok(amount) => amount,
-                    Err(ter) => return ter,
-                }
+                // reference: afterCross.in = mulRound(afterCross.out, rate,
+                // takerAmount.in.asset(), true) in OfferCreate::flowCross.
+                // `rate` is the pre-normalized Quality ratio (TakerPays /
+                // TakerGets), so this is a single bounded multiply against
+                // the REMAINING output — not a full-magnitude multiply by
+                // the original TakerPays followed by a divide by the
+                // original TakerGets. The two-step form previously used
+                // here could build an intermediate product far outside the
+                // final result's range and spuriously overflow for offers
+                // with an extreme quality ratio, even though the final
+                // (correctly-rounded) result would have been in range.
+                let quality = get_rate(&taker_gets, &taker_pays);
+                let rate_amount = quality_to_rate_amount(quality, &taker_pays, &taker_gets);
+                rem_gets.mul_round(&rate_amount, taker_pays.asset(), true)
             };
             (rem_gets, rem_pays)
         };
@@ -913,10 +855,6 @@ fn amount_or_exception(
     result: Result<STAmount, protocol::st_amount::AmountError>,
 ) -> Result<STAmount, Ter> {
     result.map_err(|error| {
-        eprintln!(
-            "DIAG offer_create: amount_or_exception rejected error={}",
-            error
-        );
         tracing::debug!(target: "tx", %error, "OfferCreate amount calculation rejected");
         Ter::TEF_EXCEPTION
     })

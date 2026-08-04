@@ -1816,12 +1816,6 @@ pub fn apply_submit_transactor_shell_with_delivered_amount<V: ledger::ApplyView>
                             .map(|message| (*message).to_owned())
                     })
                     .unwrap_or_else(|| "non-string panic payload".to_owned());
-                eprintln!(
-                    "DIAG application_root: transaction execution panicked tx_id={} txn_type={:?} message={}",
-                    tx.get_transaction_id(),
-                    txn_type,
-                    message
-                );
                 tracing::error!(
                     target: "tx",
                     tx_id = %tx.get_transaction_id(),
