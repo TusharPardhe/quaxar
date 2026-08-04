@@ -357,6 +357,20 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
         let actual_in = flow_result.actual_in;
         let actual_out = flow_result.actual_out;
+        eprintln!(
+            "DIAG crossing: account={} seq={} actual_in_mantissa={} actual_in_exp={} actual_in_native={} actual_out_mantissa={} actual_out_exp={} actual_out_native={} ter={:?} used_fallback={} strands_empty={}",
+            account,
+            offer_sequence,
+            actual_in.mantissa(),
+            actual_in.exponent(),
+            actual_in.native(),
+            actual_out.mantissa(),
+            actual_out.exponent(),
+            actual_out.native(),
+            flow_result.ter,
+            used_direct_book_fallback,
+            strands.is_empty()
+        );
 
         // even after fee deduction), propagate that directly — do not override with tecKILLED.
         // This matches reference the reference source:359 where flowCross returns {tecUNFUNDED_OFFER, takerAmount}.
