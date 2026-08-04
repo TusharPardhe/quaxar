@@ -1545,3 +1545,46 @@ fn mainnet_ledger_106066101_replay_live_offer_sequence_regression() {
         header.hash
     );
 }
+
+#[test]
+#[ignore = "requires mainnet NuDB (NUDB_PATH env or default) and mainnet RPC access"]
+fn mainnet_ledger_106066664_replay_live_xrp_payment_regression() {
+    let nudb_path = std::env::var("NUDB_PATH").unwrap_or_else(|_| DEFAULT_NUDB_PATH.to_string());
+    if !Path::new(&nudb_path).exists() {
+        eprintln!("skipping live XRP payment replay: NuDB path does not exist: {nudb_path}");
+        return;
+    }
+    let parent_seq = 106_066_663;
+    let child_seq = 106_066_664;
+    let target_tx = "5DB51F7BF4F701013481B482A46A3D0A18EB367582FF313EB8C55A5593F7ECA1";
+    let parent = load_parent_ledger(parent_seq, &nudb_path)
+        .unwrap_or_else(|error| panic!("failed to load live Payment parent: {error}"));
+    let expected_parent = fetch_ledger_header(parent_seq).expect("fetch parent header");
+    assert_eq!(parent.header().account_hash, expected_parent.account_hash);
+    let header = fetch_ledger_header(child_seq).expect("fetch child header");
+    let tx_items = fetch_tx_items_for_ledger(child_seq).expect("fetch child tx set");
+    let (built, ters) = replay_child_ledger_unverified(&parent, header.clone(), &tx_items)
+        .expect("replay live Payment child ledger");
+    let mut canonical = ledger::CanonicalTXSet::new(*header.tx_hash.as_uint256());
+    for (tx_data, _) in &tx_items {
+        let mut outer = SerialIter::new(tx_data);
+        let tx_bytes = outer.get_vl();
+        let mut serial = SerialIter::new(&tx_bytes);
+        canonical.insert(Arc::new(STTx::from_serial_iter(&mut serial)));
+    }
+    let ordered = canonical.drain_ordered();
+    let pos = ordered
+        .iter()
+        .position(|tx| tx.get_transaction_id().to_string() == target_tx)
+        .expect("live XRP Payment must be in canonical tx set");
+    assert!(
+        matches!(ters[pos], Ter::TES_SUCCESS) || protocol::is_tec_claim(ters[pos]),
+        "live XRP Payment {target_tx} regressed: {:?}",
+        ters[pos]
+    );
+    assert_eq!(built.header().account_hash, header.account_hash);
+    assert_eq!(
+        protocol::calculate_ledger_hash(&built.header()),
+        header.hash
+    );
+}
