@@ -598,11 +598,22 @@ fn threaded_payload(
     ledger_seq: u32,
     rules: &Rules,
 ) -> Vec<u8> {
-    if !sle.is_threaded_type(rules) {
-        return sle.get_serializer().data().to_vec();
+    let mut threaded = sle.clone();
+    if threaded.get_type() == LedgerEntryType::AccountRoot
+        && !threaded.is_field_present(get_field_by_symbol("sfOwnerCount"))
+    {
+        // rippled serializes AccountRoot's required owner count even when it
+        // is zero. This is a serialization invariant, independent of whether
+        // the entry is threaded by the current transaction.
+        let mut object = threaded.clone_as_object();
+        object.set_field_u32(get_field_by_symbol("sfOwnerCount"), 0);
+        threaded = STLedgerEntry::from_stobject(object, *threaded.key());
     }
 
-    let mut threaded = sle.clone();
+    if !threaded.is_threaded_type(rules) {
+        return threaded.get_serializer().data().to_vec();
+    }
+
     let mut previous_txn_id = basics::base_uint::Uint256::zero();
     let mut previous_ledger_seq = 0;
     let _ = threaded.thread(
@@ -611,17 +622,6 @@ fn threaded_payload(
         &mut previous_txn_id,
         &mut previous_ledger_seq,
     );
-    if threaded.get_type() == LedgerEntryType::AccountRoot
-        && !threaded.is_field_present(get_field_by_symbol("sfOwnerCount"))
-    {
-        // rippled serializes AccountRoot's required owner count even when it
-        // is zero. A transaction that touches an old/partial AccountRoot must
-        // materialize this default before hashing or it produces a different
-        // final ledger state despite the same logical owner count.
-        let mut object = threaded.clone_as_object();
-        object.set_field_u32(get_field_by_symbol("sfOwnerCount"), 0);
-        threaded = STLedgerEntry::from_stobject(object, *threaded.key());
-    }
     threaded.get_serializer().data().to_vec()
 }
 
