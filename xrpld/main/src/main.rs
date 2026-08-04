@@ -2354,6 +2354,74 @@ fn snapshot_spinner(message: impl Into<String>) -> ProgressBar {
     spinner
 }
 
+fn format_snapshot_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn snapshot_import_progress_message(progress: &nodestore::SnapshotImportProgress) -> String {
+    use nodestore::SnapshotImportProgress;
+
+    match progress {
+        SnapshotImportProgress::HeaderValidated {
+            ledger_seq,
+            chunk_count,
+        } => format!(
+            "Validated snapshot header for ledger {ledger_seq}; reading {chunk_count} chunks..."
+        ),
+        SnapshotImportProgress::ChunkTableRead {
+            chunk_count,
+            compressed_bytes,
+        } => format!(
+            "Prepared {chunk_count} chunks ({} compressed); starting bulk import...",
+            format_snapshot_bytes(*compressed_bytes)
+        ),
+        SnapshotImportProgress::BulkImportStarted { estimated_nodes } => {
+            format!("Bulk import started; estimating up to {estimated_nodes} nodes...")
+        }
+        SnapshotImportProgress::ChunkImported {
+            chunk_index,
+            chunk_count,
+            nodes_loaded,
+            compressed_bytes_loaded,
+        } => format!(
+            "Imported chunk {chunk_index}/{chunk_count}: {nodes_loaded} nodes, {} read",
+            format_snapshot_bytes(*compressed_bytes_loaded)
+        ),
+        SnapshotImportProgress::FinalizingNodeStore => {
+            "Finalizing NodeStore bulk index...".to_owned()
+        }
+        SnapshotImportProgress::VerifyingFileHash => {
+            "Verifying complete snapshot file hash...".to_owned()
+        }
+        SnapshotImportProgress::VerifyingShamapRoot { map } => {
+            format!("Verifying {map} SHAMap root...")
+        }
+        SnapshotImportProgress::SyncingNodeStore => {
+            "Syncing verified NodeStore data to disk...".to_owned()
+        }
+        SnapshotImportProgress::Complete {
+            ledger_seq,
+            chunk_count,
+            nodes_loaded,
+            elapsed_ms,
+        } => format!(
+            "Verified ledger {ledger_seq}: {nodes_loaded} nodes across {chunk_count} chunks in {:.1}s",
+            *elapsed_ms as f64 / 1_000.0
+        ),
+    }
+}
+
 fn snapshot_status_request(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -2504,72 +2572,191 @@ fn run_export_snapshot(url: &str, output: &str) -> bool {
 }
 
 fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
-    use nodestore::{DummyScheduler, Manager, ManagerImp, NullJournal, snapshot::load_snapshot};
-    use std::path::Path;
+    use nodestore::{
+        DummyScheduler, ManagerImp, NullJournal,
+        snapshot::{
+            activate_snapshot_bootstrap, load_snapshot_with_progress, read_snapshot_manifest,
+        },
+    };
+    use std::path::{Path, PathBuf};
 
     let config = match load_config_for_snapshot(conf) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error loading config: {e}");
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Error loading config: {error}");
             return false;
         }
     };
 
+    let input_path = Path::new(input);
+    let spinner = snapshot_spinner(format!(
+        "Checking snapshot header and network identity for {}...",
+        input_path.display()
+    ));
+
     let node_db = match config.section("node_db") {
-        s if s.exists("path") => s.clone(),
+        section if section.exists("path") => section.clone(),
         _ => {
+            spinner.finish_and_clear();
             eprintln!("Error: [node_db] section with 'path' not found in config");
             return false;
         }
     };
-
-    // Resolve sharded NuDB layout: actual files live in xrpldb.NNNN subdirectories.
-    let mut node_db = node_db;
-    if let Ok(Some(base_path)) = node_db.get::<String>("path") {
-        let writable_path = Path::new(&base_path).join("xrpldb.0000");
-        if writable_path.join("nudb.dat").exists() {
-            node_db.set("path", writable_path.to_string_lossy().into_owned());
-        }
-    }
-
-    let manager = ManagerImp::instance();
-    let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
-    let journal: Arc<dyn nodestore::NodeStoreJournal> = Arc::new(NullJournal);
-
-    let backend = match manager.make_backend(&node_db, 0, scheduler, journal) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Error creating backend: {e}");
+    let checkpoint_root = match node_db.get::<String>("path") {
+        Ok(Some(path)) => PathBuf::from(path),
+        _ => {
+            spinner.finish_and_clear();
+            eprintln!("Error: [node_db] path is not a valid snapshot checkpoint location");
             return false;
         }
     };
 
-    if let Err(e) = backend.open(true) {
-        eprintln!("Error opening backend: {e}");
+    let preflight_manifest = match read_snapshot_manifest(input_path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            spinner.finish_and_clear();
+            eprintln!("Snapshot import failed during preflight: {error}");
+            eprintln!("No NodeStore data or boot checkpoint was modified.");
+            return false;
+        }
+    };
+    let configured_network_id = match app::parse_network_id(&config) {
+        Ok(network_id) => network_id.unwrap_or(0),
+        Err(error) => {
+            spinner.finish_and_clear();
+            eprintln!("Invalid [network_id] configuration: {error}");
+            return false;
+        }
+    };
+    let Some(snapshot_network_id) = preflight_manifest.network_id else {
+        spinner.finish_and_clear();
+        eprintln!("Snapshot was not imported: it lacks the required v2 network identity");
+        return false;
+    };
+    if snapshot_network_id != configured_network_id {
+        spinner.finish_and_clear();
+        eprintln!(
+            "Snapshot network id {snapshot_network_id} does not match configured network id {configured_network_id}"
+        );
+        eprintln!("No NodeStore data or boot checkpoint was modified.");
         return false;
     }
 
-    let input_path = Path::new(input);
-    let spinner = snapshot_spinner(format!(
-        "Importing snapshot from {}...",
-        input_path.display()
-    ));
+    // Use the same bootstrap path as normal startup. In particular,
+    // online-delete uses a rotating writable/archive pair whose active paths
+    // live in StateDb; opening [node_db].path directly could import into a
+    // detached backend that startup later rotates away.
+    spinner.set_message("Acquiring exclusive offline NodeStore access...".to_owned());
+    // Backend opening is the lock acquisition point: RocksDB and NuDB reject
+    // a concurrent owner before any mutable import work starts.
+    let ledger_history = config
+        .legacy("ledger_history")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let manager = ManagerImp::new();
+    let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
+    let journal: Arc<dyn nodestore::NodeStoreJournal> = Arc::new(NullJournal);
+    let node_store_bootstrap = match app::bootstrap_shamap_store(
+        &config,
+        false,
+        ledger_history,
+        1,
+        40_000,
+        64,
+        2,
+        &manager,
+        scheduler,
+        journal,
+    ) {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            spinner.finish_and_clear();
+            eprintln!("Could not acquire exclusive offline NodeStore access: {error}");
+            eprintln!("Stop every quaxar instance using this data directory, then retry.");
+            return false;
+        }
+    };
+    let backend = match node_store_bootstrap.node_store.export_backend() {
+        Some(backend) => backend,
+        None => {
+            spinner.finish_and_clear();
+            eprintln!("Error: configured NodeStore does not expose an import backend");
+            return false;
+        }
+    };
 
-    match load_snapshot(backend.as_ref(), input_path) {
+    spinner.set_message("NodeStore ready; importing verified snapshot data...".to_owned());
+    match load_snapshot_with_progress(backend.as_ref(), input_path, |progress| {
+        spinner.set_message(snapshot_import_progress_message(&progress));
+    }) {
         Ok(manifest) => {
-            backend.sync();
-            let _ = backend.close();
-            spinner.finish_with_message("✓ Snapshot import complete and integrity verified");
+            // The loader has completed root verification and a fallible durable
+            // sync. Keep the backend open so its interprocess lock protects
+            // checkpoint activation from a concurrently starting node.
+            if manifest.network_id != Some(configured_network_id) {
+                spinner.finish_and_clear();
+                eprintln!(
+                    "Snapshot changed during import or does not match configured network id {configured_network_id}"
+                );
+                eprintln!("No new boot checkpoint was activated.");
+                let _ = backend.close();
+                return false;
+            }
+            spinner.set_message("Activating verified boot checkpoint...".to_owned());
+            if let Err(error) = activate_snapshot_bootstrap(
+                &checkpoint_root,
+                &manifest,
+                Some(configured_network_id),
+            ) {
+                spinner.finish_and_clear();
+                eprintln!("Snapshot imported but checkpoint activation failed: {error}");
+                if error.is_activation_state_uncertain() {
+                    eprintln!(
+                        "Checkpoint state is uncertain. Keep quaxar stopped and inspect or restore the checkpoint before starting it."
+                    );
+                } else {
+                    eprintln!("No new boot checkpoint was activated.");
+                }
+                if let Err(close_error) = backend.close() {
+                    eprintln!("Additionally failed to close the NodeStore: {close_error}");
+                }
+                return false;
+            }
+
+            spinner.set_message("Closing the imported NodeStore safely...".to_owned());
+            if let Err(error) = backend.close() {
+                spinner.finish_and_clear();
+                eprintln!("Snapshot checkpoint was activated, but NodeStore close failed: {error}");
+                eprintln!(
+                    "Keep quaxar stopped and verify the data directory before starting the node."
+                );
+                return false;
+            }
+            drop(backend);
+            drop(node_store_bootstrap);
+
+            spinner.finish_with_message(format!(
+                "✓ Snapshot activated: ledger {} is ready for next startup",
+                manifest.ledger_seq
+            ));
             println!(
-                "  → Ledger seq: {}, chunks: {}",
+                "  → Ledger sequence: {}, chunks: {}, network ID: {}",
                 manifest.ledger_seq,
-                manifest.chunks.len()
+                manifest.chunks.len(),
+                configured_network_id
+            );
+            println!(
+                "  → Next step: start quaxar normally; it will use this local checkpoint and catch up to the network tip."
             );
             true
         }
-        Err(e) => {
+        Err(error) => {
             spinner.finish_and_clear();
-            eprintln!("Snapshot load failed: {e}");
+            eprintln!("Snapshot import failed: {error}");
+            eprintln!(
+                "No new boot checkpoint was activated. Imported objects, if any, remain inactive until a verified import completes."
+            );
             let _ = backend.close();
             false
         }

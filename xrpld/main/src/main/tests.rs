@@ -5,13 +5,14 @@ use super::{
     candidate_ledger_for_seq, candidate_reference_hash_from_reference_ledger,
     classify_completed_ledger_acceptance, classify_publish_advance,
     cold_bootstrap_persisted_validated_target, command_suggestions, current_ledger_is_fresh,
-    first_command_like_arg, hash_for_seq_from_reference_ledger, node_store_usage_path,
-    path_size_bytes, peerfinder_canonical_ip, peerfinder_outbound_target,
+    first_command_like_arg, format_snapshot_bytes, hash_for_seq_from_reference_ledger,
+    node_store_usage_path, path_size_bytes, peerfinder_canonical_ip, peerfinder_outbound_target,
     preferred_closed_ledger_hash, preferred_closed_ledger_hash_from_hashes, promote_current_ledger,
     prune_known_endpoints, prune_recent_connect_attempts, remember_known_endpoint,
     select_autoconnect_endpoints, select_bootcache_endpoints, select_consensus_acquisition_target,
     select_post_acquisition_operating_mode, select_target_seq,
     should_attempt_completed_ledger_promotion, should_retry_publish_after_completed_history,
+    snapshot_import_progress_message,
 };
 use app::{AppBootstrapOptions, build_bootstrap_root, load_basic_config_file};
 use basics::base_uint::Uint256;
@@ -60,6 +61,30 @@ fn config(text: &str) -> basics::basic_config::BasicConfig {
     }
     config.build(&sections);
     config
+}
+
+#[test]
+fn snapshot_import_messages_explain_progress_and_verification() {
+    assert_eq!(format_snapshot_bytes(1_536), "1.5 KiB");
+    assert_eq!(format_snapshot_bytes(2 * 1024 * 1024), "2.0 MiB");
+
+    let importing =
+        snapshot_import_progress_message(&nodestore::SnapshotImportProgress::ChunkImported {
+            chunk_index: 4,
+            chunk_count: 12,
+            nodes_loaded: 98_765,
+            compressed_bytes_loaded: 5 * 1024 * 1024,
+        });
+    assert!(importing.contains("chunk 4/12"));
+    assert!(importing.contains("98765 nodes"));
+    assert!(importing.contains("5.0 MiB"));
+
+    assert_eq!(
+        snapshot_import_progress_message(&nodestore::SnapshotImportProgress::VerifyingShamapRoot {
+            map: "account-state",
+        }),
+        "Verifying account-state SHAMap root..."
+    );
 }
 
 #[test]

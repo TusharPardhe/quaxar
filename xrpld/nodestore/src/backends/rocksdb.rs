@@ -1063,7 +1063,21 @@ impl Backend for RocksDbBackend {
         write_batch_to_database(&self.database, self.key_bytes, batch, &self.journal);
     }
 
-    fn sync(&self) {}
+    fn sync(&self) {
+        if let Err(error) = self.sync_result() {
+            self.journal.log(JournalLevel::Error, &error);
+        }
+    }
+
+    fn sync_result(&self) -> Result<(), String> {
+        let database = self.open_database();
+        let db = database
+            .as_ref()
+            .ok_or_else(|| "RocksDB sync requires an open database".to_owned())?;
+        db.flush()
+            .and_then(|()| db.flush_wal(true))
+            .map_err(|error| error.to_string())
+    }
 
     fn for_each(&self, callback: &mut dyn FnMut(Arc<NodeObject>)) {
         let database = self.open_database();

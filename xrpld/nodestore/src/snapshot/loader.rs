@@ -16,6 +16,42 @@ use protocol::{LedgerHeader, calculate_ledger_hash};
 
 const MAX_SHAMAP_DEPTH: usize = 64;
 
+/// Structured, monotonic import updates for CLI and operator integrations.
+/// Events are emitted only after their named operation has completed, except
+/// for phase-start events such as `FinalizingNodeStore` and `VerifyingFileHash`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotImportProgress {
+    HeaderValidated {
+        ledger_seq: u32,
+        chunk_count: usize,
+    },
+    ChunkTableRead {
+        chunk_count: usize,
+        compressed_bytes: u64,
+    },
+    BulkImportStarted {
+        estimated_nodes: u64,
+    },
+    ChunkImported {
+        chunk_index: usize,
+        chunk_count: usize,
+        nodes_loaded: u64,
+        compressed_bytes_loaded: u64,
+    },
+    FinalizingNodeStore,
+    VerifyingFileHash,
+    VerifyingShamapRoot {
+        map: &'static str,
+    },
+    SyncingNodeStore,
+    Complete {
+        ledger_seq: u32,
+        chunk_count: usize,
+        nodes_loaded: u64,
+        elapsed_ms: u64,
+    },
+}
+
 /// Keeps a failed import fail-closed even if a backend must finalize on-disk
 /// indexes before the footer and SHAMap graph can be verified.
 struct BulkImportGuard<'a> {
@@ -44,14 +80,44 @@ impl Drop for BulkImportGuard<'_> {
     }
 }
 
-/// Load a snapshot file from `input_path` into `backend`.
+/// Read and validate the fixed snapshot manifest without importing any NodeStore
+/// objects. Callers use this preflight to reject a network-mismatched or legacy
+/// snapshot before it can modify the configured database.
+pub fn read_snapshot_manifest(input_path: &Path) -> Result<SnapshotManifest, SnapshotError> {
+    let file = File::open(input_path)
+        .map_err(|error| SnapshotError::io_path("opening snapshot header", input_path, error))?;
+    let mut reader = BufReader::new(file);
+    let mut header_buf = [0u8; SNAPSHOT_HEADER_SIZE];
+    reader
+        .read_exact(&mut header_buf)
+        .map_err(|error| SnapshotError::io("reading snapshot header", error))?;
+    let manifest = SnapshotManifest::deserialize_header(&header_buf)?;
+    verify_manifest_ledger_hash(&manifest)?;
+    Ok(manifest)
+}
+
+/// Load a snapshot file without receiving operational progress updates.
+///
+/// This compatibility wrapper is appropriate for programmatic callers that
+/// only need the verified manifest. CLI callers should use
+/// [`load_snapshot_with_progress`].
+pub fn load_snapshot(
+    backend: &dyn Backend,
+    input_path: &Path,
+) -> Result<SnapshotManifest, SnapshotError> {
+    load_snapshot_with_progress(backend, input_path, |_| {})
+}
+
+/// Load a snapshot file from `input_path` into `backend`, reporting each
+/// completed stage and every imported chunk through `on_progress`.
 ///
 /// Returns the verified manifest. A successful result proves that the manifest
 /// header is self-consistent and that both advertised SHAMap roots are complete,
 /// correctly typed, and content-addressed by their encoded bytes.
-pub fn load_snapshot(
+pub fn load_snapshot_with_progress(
     backend: &dyn Backend,
     input_path: &Path,
+    mut on_progress: impl FnMut(SnapshotImportProgress),
 ) -> Result<SnapshotManifest, SnapshotError> {
     let start = Instant::now();
     tracing::info!(
@@ -94,6 +160,10 @@ pub fn load_snapshot(
             actual: chunk_count as u64,
             limit: SNAPSHOT_MAX_CHUNKS as u64,
         })?;
+    on_progress(SnapshotImportProgress::HeaderValidated {
+        ledger_seq: manifest.ledger_seq,
+        chunk_count,
+    });
 
     tracing::info!(
         target: "snapshot",
@@ -114,6 +184,16 @@ pub fn load_snapshot(
             .push(SnapshotManifest::deserialize_chunk_meta(&entry_buf));
     }
 
+    let compressed_bytes = manifest
+        .chunks
+        .iter()
+        .map(|chunk| u64::from(chunk.compressed_len))
+        .sum();
+    on_progress(SnapshotImportProgress::ChunkTableRead {
+        chunk_count,
+        compressed_bytes,
+    });
+
     let estimated_nodes = (chunk_count as u64).saturating_mul(30_000);
     backend
         .bulk_import_start(estimated_nodes)
@@ -121,8 +201,10 @@ pub fn load_snapshot(
             reason: format!("bulk_import_start: {e}"),
         })?;
     let mut import_guard = BulkImportGuard::new(backend);
+    on_progress(SnapshotImportProgress::BulkImportStarted { estimated_nodes });
 
     let mut total_nodes = 0u64;
+    let mut compressed_bytes_loaded = 0u64;
     for (i, meta) in manifest.chunks.iter().enumerate() {
         let compressed_len = meta.compressed_len as usize;
         if compressed_len > SNAPSHOT_MAX_COMPRESSED_CHUNK_BYTES {
@@ -185,6 +267,14 @@ pub fn load_snapshot(
 
         backend.store_batch(&batch);
         total_nodes += batch.len() as u64;
+        compressed_bytes_loaded =
+            compressed_bytes_loaded.saturating_add(meta.compressed_len as u64);
+        on_progress(SnapshotImportProgress::ChunkImported {
+            chunk_index: i + 1,
+            chunk_count: manifest.chunks.len(),
+            nodes_loaded: total_nodes,
+            compressed_bytes_loaded,
+        });
         if (i + 1) % 10 == 0 || i + 1 == manifest.chunks.len() {
             tracing::info!(
                 target: "snapshot",
@@ -200,6 +290,7 @@ pub fn load_snapshot(
     // NuDB needs this to flush its bulk index before graph fetches work. The
     // guard restores its incomplete-import marker if any later verification
     // fails, so finalization is not publication.
+    on_progress(SnapshotImportProgress::FinalizingNodeStore);
     backend
         .bulk_import_finish()
         .map_err(|e| SnapshotError::BackendWriteFailed {
@@ -207,6 +298,7 @@ pub fn load_snapshot(
         })?;
 
     let mut footer = [0u8; SNAPSHOT_FOOTER_SIZE];
+    on_progress(SnapshotImportProgress::VerifyingFileHash);
     reader
         .read_exact(&mut footer)
         .map_err(|e| SnapshotError::io("reading footer", e))?;
@@ -218,10 +310,25 @@ pub fn load_snapshot(
         });
     }
 
+    on_progress(SnapshotImportProgress::VerifyingShamapRoot {
+        map: "account-state",
+    });
     verify_shamap_root(backend, "account-state", manifest.account_hash)?;
+    on_progress(SnapshotImportProgress::VerifyingShamapRoot { map: "transaction" });
     verify_shamap_root(backend, "transaction", manifest.tx_hash)?;
-    backend.sync();
+    on_progress(SnapshotImportProgress::SyncingNodeStore);
+    backend
+        .sync_result()
+        .map_err(|reason| SnapshotError::BackendWriteFailed {
+            reason: format!("final sync: {reason}"),
+        })?;
     import_guard.complete();
+    on_progress(SnapshotImportProgress::Complete {
+        ledger_seq: manifest.ledger_seq,
+        chunk_count: manifest.chunks.len(),
+        nodes_loaded: total_nodes,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+    });
 
     tracing::info!(
         target: "snapshot",

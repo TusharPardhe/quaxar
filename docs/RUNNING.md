@@ -334,12 +334,14 @@ verification.
 **On the new node (stopped):**
 
 ```bash
-quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/xrpld/xrpld.cfg
+quaxar load-snapshot --input /path/to/snapshot.xrpls --conf /etc/xrpld/xrpld.cfg
 ```
 
-The CLI displays a spinner while it imports and verifies all chunk and final
-file hashes. After it reports completion, start the node normally. It will
-resume from the snapshot state and catch up to the network tip within minutes.
+The CLI displays a spinner while it preflights the v2 network identity, imports
+and verifies all chunks, file hashes, and SHAMap roots, then atomically
+activates the checkpoint. After it reports completion, start the node normally.
+It restores a lazy local ledger from the snapshot and catches up to the network
+tip without reacquiring the snapshot tree from peers.
 
 See [CLI.md](CLI.md) for command details and [SYNCING.md](SYNCING.md) for
 alternative sync methods.

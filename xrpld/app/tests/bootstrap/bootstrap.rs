@@ -2,9 +2,15 @@ use app::{
     AppBootstrapOptions, build_bootstrap_root, build_bootstrap_runtime, load_basic_config_file,
     parse_bootstrap_args,
 };
-use basics::{base_uint::Uint256, intrusive_pointer::make_shared_intrusive, str_hex::str_hex};
+use basics::{
+    base_uint::Uint256, basic_config::Section, intrusive_pointer::make_shared_intrusive,
+    str_hex::str_hex,
+};
 use ledger::{Ledger, LedgerHeader, calculate_ledger_hash};
-use nodestore::{DummyScheduler, Manager, ManagerImp, NodeObjectType, NullJournal, Scheduler};
+use nodestore::{
+    DummyScheduler, Manager, ManagerImp, NodeObjectType, NullJournal, Scheduler,
+    activate_snapshot_bootstrap, export_compact_snapshot, load_snapshot,
+};
 use protocol::{
     AccountID, LedgerEntryType, MPTAmount, MPTIssue, STAmount, STArray, STLedgerEntry, STObject,
     STTx, TxType, account_keylet, get_field_by_symbol, make_mpt_id,
@@ -16,7 +22,7 @@ use shamap::{
     tree_node::{SHAMapNodeType, SHAMapTreeNode},
 };
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use xrpl_core::StartUpType;
@@ -370,6 +376,212 @@ fn persist_bootstrap_storage(
     }
 
     (database_path, node_db_path, dir.path().join("xrpld.cfg"))
+}
+
+fn snapshot_manifest(ledger: &Ledger, network_id: u32) -> nodestore::SnapshotManifest {
+    let header = ledger.header();
+    nodestore::SnapshotManifest {
+        version: nodestore::snapshot::manifest::SNAPSHOT_VERSION,
+        ledger_seq: header.seq,
+        ledger_hash: *header.hash.as_uint256().data(),
+        account_hash: *header.account_hash.as_uint256().data(),
+        tx_hash: *header.tx_hash.as_uint256().data(),
+        parent_hash: *header.parent_hash.as_uint256().data(),
+        drops: header.drops,
+        close_time: header.close_time,
+        parent_close_time: header.parent_close_time,
+        close_time_res: header.close_time_resolution,
+        close_flags: header.close_flags,
+        network_id: Some(network_id),
+        chunks: Vec::new(),
+    }
+}
+
+fn node_db_section(path: &Path) -> Section {
+    let mut section = Section::new("node_db");
+    section.set("type", "RocksDB");
+    section.set("path", path.to_string_lossy());
+    section
+}
+
+fn import_and_activate_snapshot(
+    source_node_db_path: &Path,
+    destination_node_db_path: &Path,
+    snapshot_path: &Path,
+    ledger: &Ledger,
+    network_id: u32,
+) {
+    let manager = ManagerImp::new();
+    let scheduler: Arc<dyn Scheduler> = Arc::new(DummyScheduler);
+    let journal: Arc<dyn nodestore::NodeStoreJournal> = Arc::new(NullJournal);
+
+    let source_config = node_db_section(source_node_db_path);
+    let source = manager
+        .make_backend(
+            &source_config,
+            0,
+            Arc::clone(&scheduler),
+            Arc::clone(&journal),
+        )
+        .expect("source backend");
+    source.open(false).expect("open source backend");
+    export_compact_snapshot(
+        source.as_ref(),
+        &snapshot_manifest(ledger, network_id),
+        snapshot_path,
+    )
+    .expect("export compact checkpoint");
+    source.close().expect("close source backend");
+
+    let destination_config = node_db_section(destination_node_db_path);
+    let destination = manager
+        .make_backend(&destination_config, 0, scheduler, journal)
+        .expect("destination backend");
+    destination.open(true).expect("open destination backend");
+    let manifest = load_snapshot(destination.as_ref(), snapshot_path).expect("import snapshot");
+    destination.sync();
+    destination.close().expect("close destination backend");
+    activate_snapshot_bootstrap(destination_node_db_path, &manifest, Some(network_id))
+        .expect("activate verified checkpoint");
+}
+
+#[test]
+fn app_bootstrap_restores_an_activated_snapshot_without_a_relational_ledger_header() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = persisted_bootstrap_state_only_ledger(77);
+    let (_source_sql, source_node_db_path, _source_config) =
+        persist_bootstrap_storage(&dir, &[Arc::clone(&ledger)], "RocksDB");
+    let destination_node_db_path = dir.path().join("snapshot-node-db");
+    let destination_database_path = dir.path().join("snapshot-sql");
+    let snapshot_path = dir.path().join("checkpoint.xrpls");
+    import_and_activate_snapshot(
+        &source_node_db_path,
+        &destination_node_db_path,
+        &snapshot_path,
+        ledger.as_ref(),
+        1,
+    );
+
+    fs::create_dir_all(&destination_database_path).expect("create empty destination SQL directory");
+    let destination_ledger_db =
+        DatabaseCon::new_at_path(&destination_database_path, "ledger.db", &[], LEDGER_DB_INIT)
+            .expect("empty destination ledger database");
+    assert_eq!(count_rows(&destination_ledger_db, "Ledgers"), 0);
+
+    let config_path = dir.path().join("snapshot-xrpld.cfg");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[network_id]
+testnet
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+"#,
+            destination_database_path.display(),
+            destination_node_db_path.display(),
+        ),
+    )
+    .expect("write config");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let bootstrap = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Normal,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("snapshot-backed bootstrap");
+
+    assert_eq!(bootstrap.root.closed_ledger_seq(), Some(77));
+    assert_eq!(bootstrap.root.validated_ledger_seq(), Some(77));
+    assert_eq!(bootstrap.root.published_ledger_seq(), Some(77));
+    assert_eq!(bootstrap.root.live_current_ledger_index(), Some(78));
+    assert_eq!(
+        bootstrap
+            .root
+            .closed_ledger()
+            .expect("restored closed ledger")
+            .header()
+            .hash,
+        ledger.header().hash
+    );
+    // Startup has a usable local base but still requires normal peer catch-up
+    // before it can advertise itself as fully current.
+    assert!(bootstrap.root.need_network_ledger());
+}
+
+#[test]
+fn app_bootstrap_ignores_a_network_mismatched_checkpoint_and_falls_back_to_genesis() {
+    let dir = TempDir::new().expect("tempdir");
+    let ledger = persisted_bootstrap_state_only_ledger(78);
+    let (_source_sql, source_node_db_path, _source_config) =
+        persist_bootstrap_storage(&dir, &[Arc::clone(&ledger)], "RocksDB");
+    let destination_node_db_path = dir.path().join("mismatch-node-db");
+    let destination_database_path = dir.path().join("mismatch-sql");
+    let snapshot_path = dir.path().join("mismatch.xrpls");
+    import_and_activate_snapshot(
+        &source_node_db_path,
+        &destination_node_db_path,
+        &snapshot_path,
+        ledger.as_ref(),
+        21_338,
+    );
+
+    let config_path = dir.path().join("mismatch-xrpld.cfg");
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+"#,
+            destination_database_path.display(),
+            destination_node_db_path.display(),
+        ),
+    )
+    .expect("write config");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let bootstrap = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Normal,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect("safe fallback bootstrap");
+
+    assert_eq!(bootstrap.root.closed_ledger_seq(), Some(1));
+    assert_ne!(bootstrap.root.closed_ledger_seq(), Some(78));
 }
 
 #[test]

@@ -63,7 +63,7 @@ Features:
 | `benchmark` | Run internal performance benchmarks |
 | `validator-keys` | Key management (see below) |
 | `export-snapshot` | Export node store to snapshot file (admin RPC) |
-| `load-snapshot` | Import snapshot into node store (offline) |
+| `load-snapshot` | Import and activate a bootable snapshot checkpoint (offline) |
 | `doctor` | Diagnose common configuration issues |
 | `stop` | Graceful shutdown |
 | `version` | Build version, commit hash, and build time |
@@ -172,11 +172,12 @@ node's snapshot logs. See [RPC.md](RPC.md) for the RPC details.
 
 ### load-snapshot
 
-Import a snapshot file into the node store. The node must be stopped before
-running this command.
+Import a snapshot file into the node store and atomically activate it as the
+next startup's bootable checkpoint. The node must be stopped before running
+this command.
 
 ```bash
-quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/xrpld/xrpld.cfg
+quaxar load-snapshot --input /path/to/snapshot.xrpls --conf /etc/xrpld/xrpld.cfg
 ```
 
 | Flag | Required | Description |
@@ -184,10 +185,20 @@ quaxar load-snapshot --input /path/to/snapshot.lz4 --conf /etc/xrpld/xrpld.cfg
 | `--input` | Yes | Path to snapshot file |
 | `--conf` | Yes | Path to config file (determines NuDB path) |
 
+The import requires the node to be stopped. Before it opens a backend, the CLI
+acquires exclusive access to the NodeStore; if another node or import owns the
+data directory, it exits without importing and tells the operator to stop the
+other process before retrying.
+
 The import uses bulk loading mode with pre-allocated NuDB hash tables. The CLI
-shows a spinner throughout the synchronous import and reports success only
-after the loader has verified every chunk and the final file hash. On NVMe,
-26.5M nodes load in approximately 3 minutes.
+preflights the snapshot's v2 network identity before opening the NodeStore,
+then visibly updates its spinner for NodeStore opening, every imported chunk
+with node and byte totals, index finalization, file-hash and SHAMap-root
+verification, disk sync, and checkpoint activation. It reports success only
+after all of those stages complete. A normal startup constructs a lazy local
+ledger from that checkpoint and fetches only the gap to the current network
+tip. Legacy v1 snapshots without a network identity are rejected by this
+bootable import command.
 
 ## Exit Codes
 

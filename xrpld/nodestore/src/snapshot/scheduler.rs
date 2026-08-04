@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 
 use super::manifest::{SNAPSHOT_VERSION, SnapshotManifest};
-use super::writer::export_snapshot;
+use super::writer::export_compact_snapshot;
 use crate::Backend;
 
 /// Configuration for automatic snapshot production.
@@ -119,6 +119,7 @@ impl SnapshotScheduler {
             parent_close_time: header.parent_close_time,
             close_time_res: header.close_time_resolution,
             close_flags: header.close_flags,
+            network_id: None,
             chunks: Vec::new(),
         };
 
@@ -134,7 +135,7 @@ impl SnapshotScheduler {
                 let filename = format!("snapshot-{ledger_seq}-{hash_hex}.xrpls");
                 let output_path = output_dir.join(&filename);
 
-                match export_snapshot(backend.as_ref(), &manifest, &output_path) {
+                match export_compact_snapshot(backend.as_ref(), &manifest, &output_path) {
                     Ok(()) => {
                         tracing::info!(
                             target: "snapshot",

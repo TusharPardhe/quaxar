@@ -23,6 +23,9 @@ pub enum SnapshotError {
     /// The snapshot format version is not supported by this binary.
     UnsupportedVersion { found: u16, max_supported: u16 },
 
+    /// A fixed-width snapshot header contained an invalid field or reserved bytes.
+    MalformedHeader { reason: String },
+
     /// A compressed chunk failed LZ4 decompression.
     DecompressionFailed { chunk_index: usize, reason: String },
 
@@ -74,6 +77,9 @@ pub enum SnapshotError {
         reason: String,
     },
 
+    /// A snapshot activation record was incomplete, malformed, or unsupported.
+    InvalidBootstrapRecord { reason: String },
+
     /// The backend refused a write.
     BackendWriteFailed { reason: String },
 
@@ -119,6 +125,9 @@ impl fmt::Display for SnapshotError {
                     f,
                     "snapshot version {found} is not supported (max supported: {max_supported})"
                 )
+            }
+            Self::MalformedHeader { reason } => {
+                write!(f, "snapshot header is malformed: {reason}")
             }
             Self::DecompressionFailed {
                 chunk_index,
@@ -194,6 +203,9 @@ impl fmt::Display for SnapshotError {
                     "snapshot chunk {chunk_index} contains malformed node record at offset {offset}: {reason}"
                 )
             }
+            Self::InvalidBootstrapRecord { reason } => {
+                write!(f, "snapshot checkpoint is invalid: {reason}")
+            }
             Self::BackendWriteFailed { reason } => {
                 write!(f, "snapshot loader: backend write failed: {reason}")
             }
@@ -222,6 +234,24 @@ impl std::error::Error for SnapshotError {
 }
 
 impl SnapshotError {
+    /// Construct a checkpoint error whose on-disk replacement outcome cannot
+    /// be safely classified after a durability failure.
+    pub(crate) fn activation_state_uncertain(reason: impl Into<String>) -> Self {
+        Self::InvalidBootstrapRecord {
+            reason: format!("activation state uncertain: {}", reason.into()),
+        }
+    }
+
+    /// Whether this error means an activation rename occurred but rollback was
+    /// not confirmed. Operators must keep the node stopped in this case.
+    pub fn is_activation_state_uncertain(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidBootstrapRecord { reason }
+                if reason.starts_with("activation state uncertain:")
+        )
+    }
+
     /// Construct an I/O error with contextual labels.
     pub(crate) fn io(context: &'static str, source: std::io::Error) -> Self {
         Self::Io {

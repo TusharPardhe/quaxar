@@ -19,7 +19,9 @@ use ledger::{
     Ledger, LedgerConfig, LedgerHeader, LedgerInfoProvider, NullLedgerJournal,
     NullOrderBookDBJournal, NullOrderBookDBRuntime, load_by_hash, load_by_index,
 };
-use nodestore::{FetchType, ManagerImp, NodeObjectType as NodeStoreObjectType};
+use nodestore::{
+    FetchType, ManagerImp, NodeObjectType as NodeStoreObjectType, load_snapshot_bootstrap,
+};
 use protocol::{
     JsonValue, REGISTERED_FEATURES, STLedgerEntry, STParsedJSONObject, STTx, SerialIter, TxMeta,
     feature_id,
@@ -2377,7 +2379,7 @@ fn initialize_startup_ledger_state(
     config: &BasicConfig,
 ) -> Result<(), String> {
     match options.start_type {
-        StartUpType::Load => load_startup_ledger_from_storage(root, options),
+        StartUpType::Load => load_startup_ledger_from_checkpoint_or_storage(root, options, config),
         StartUpType::Replay => replay_startup_ledger_from_storage(root, options),
         StartUpType::LoadFile => load_startup_ledger_from_file(root, options),
         StartUpType::Network => {
@@ -2388,13 +2390,12 @@ fn initialize_startup_ledger_state(
         }
         StartUpType::Normal => {
             if !root.config().standalone {
-                // Start from the newest durable local ledger just as rippled's
-                // getLastFullLedger() does, then let switchLCL catch up to the
-                // network.  Falling back to genesis is only correct when this
-                // is genuinely the first startup or the local store is empty.
+                // A checkpoint is a validated local base, not proof that it is
+                // current. Keep the normal network-ledger requirement so the
+                // node catches up and does not advertise Full prematurely.
                 root.set_need_network_ledger(true);
             }
-            match load_startup_ledger_from_storage(root, options) {
+            match load_startup_ledger_from_checkpoint_or_storage(root, options, config) {
                 Ok(()) => {
                     let history_depth = config_legacy_u32(config, "ledger_history").unwrap_or(0);
                     rehydrate_configured_history(root, history_depth)
@@ -2406,12 +2407,131 @@ fn initialize_startup_ledger_state(
                 }
             }
         }
-        StartUpType::Fresh | StartUpType::Snapshot => {
-            // Rippled parity: --start (Fresh) does NOT set need_network_ledger.
-            // Only Network and Normal modes require network ledger acquisition.
+        StartUpType::Snapshot => {
+            if !root.config().standalone {
+                root.set_need_network_ledger(true);
+            }
+            match load_startup_ledger_from_snapshot_checkpoint(root, options, config) {
+                Ok(true) => Ok(()),
+                Ok(false) => seed_startup_ledger_state(root, options, config),
+                Err(error) => {
+                    tracing::warn!(target: "bootstrap", %error,
+                        "Snapshot checkpoint is unusable; falling back to genesis startup");
+                    seed_startup_ledger_state(root, options, config)
+                }
+            }
+        }
+        StartUpType::Fresh => {
+            // Rippled parity: --start (Fresh) does not require network-ledger acquisition.
             seed_startup_ledger_state(root, options, config)
         }
     }
+}
+
+fn load_startup_ledger_from_checkpoint_or_storage(
+    root: &ApplicationRoot,
+    options: &AppBootstrapOptions,
+    config: &BasicConfig,
+) -> Result<(), String> {
+    match load_startup_ledger_from_snapshot_checkpoint(root, options, config) {
+        Ok(true) => Ok(()),
+        Ok(false) => load_startup_ledger_from_storage(root, options),
+        Err(error) => {
+            // A checkpoint is an optimization. Never make a malformed,
+            // interrupted, or network-mismatched import block ordinary local
+            // recovery or network bootstrap.
+            tracing::warn!(target: "bootstrap", %error,
+                "Ignoring unusable snapshot checkpoint and trying normal local storage");
+            load_startup_ledger_from_storage(root, options)
+        }
+    }
+}
+
+fn configured_snapshot_network_id(config: &BasicConfig) -> Result<u32, String> {
+    crate::parse_network_id(config)
+        .map(|network_id| network_id.unwrap_or(0))
+        .map_err(|error| format!("invalid [network_id] configuration: {error}"))
+}
+
+fn load_startup_ledger_from_snapshot_checkpoint(
+    root: &ApplicationRoot,
+    options: &AppBootstrapOptions,
+    config: &BasicConfig,
+) -> Result<bool, String> {
+    // An explicit --ledger selector must retain its existing relational
+    // storage semantics. `latest` and no selector may use the activated
+    // snapshot checkpoint.
+    if options
+        .start_ledger
+        .as_deref()
+        .is_some_and(|requested| !requested.trim().is_empty() && requested.trim() != "latest")
+    {
+        return Ok(false);
+    }
+
+    let Some(node_store_path) = config
+        .section("node_db")
+        .get::<String>("path")
+        .map_err(|error| format!("invalid [node_db] path: {error}"))?
+        .map(PathBuf::from)
+    else {
+        return Ok(false);
+    };
+    let Some(checkpoint) = load_snapshot_bootstrap(&node_store_path)
+        .map_err(|error| format!("reading snapshot checkpoint failed: {error}"))?
+    else {
+        return Ok(false);
+    };
+
+    let configured_network_id = configured_snapshot_network_id(config)?;
+    if checkpoint.network_id() != Some(configured_network_id) {
+        return Err(format!(
+            "snapshot checkpoint network id {:?} does not match configured network id {configured_network_id}",
+            checkpoint.network_id()
+        ));
+    }
+
+    let Some(node_store) = root.node_store().clone() else {
+        return Err("Snapshot startup requires an attached NodeStore".to_owned());
+    };
+    let Some(ledger_master_runtime) = root.ledger_master_runtime() else {
+        return Err("Snapshot startup requires an attached LedgerMaster runtime".to_owned());
+    };
+
+    let family = SHAMapFamily::new(
+        Arc::new(TreeNodeCache::new(
+            "app-bootstrap-snapshot-loader",
+            8,
+            time::Duration::seconds(1),
+            MonotonicClock::default(),
+        )),
+        NullFullBelowCache::new(0),
+        BootstrapNodeStoreFetcher::new(node_store),
+        NullMissingNodeReporter,
+    );
+    let journal = NullLedgerJournal;
+    let ledger = Ledger::load_finished_with_family_and_config_or_none(
+        checkpoint.ledger_header(),
+        false,
+        &journal,
+        &LedgerConfig::default(),
+        &family,
+    )
+    .map_err(|error| format!("snapshot ledger setup failed: {error:?}"))?;
+    let Some(ledger) = ledger else {
+        return Err("snapshot checkpoint roots are incomplete in the local NodeStore".to_owned());
+    };
+
+    let seq = ledger.header().seq;
+    let hash = ledger.header().hash;
+    hydrate_loaded_ledger(
+        root,
+        Arc::new(ledger),
+        ledger_master_runtime.ledger_master(),
+    )?;
+    tracing::info!(target: "bootstrap", seq, %hash,
+        "Bootstrapped lazy ledger state from verified snapshot checkpoint");
+    Ok(true)
 }
 
 fn rehydrate_configured_history(root: &ApplicationRoot, history_depth: u32) -> Result<(), String> {

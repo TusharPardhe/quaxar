@@ -17,10 +17,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use basics::base_uint::Uint256;
+use basics::sha_map_hash::SHAMapHash;
 use sha2::{Digest, Sha256};
+use shamap::nodes::tree_node::{BRANCH_FACTOR, SHAMapNodeType, SHAMapTreeNode};
 
 use super::{SnapshotError, manifest::*};
-use crate::{Backend, NodeObject};
+use crate::{Backend, NodeObject, NodeObjectType};
 
 /// Maximum `NodeObjectType` discriminant value that fits in a u8.
 /// The snapshot format stores node type as a single byte.
@@ -44,6 +47,34 @@ pub fn export_snapshot(
     manifest: &SnapshotManifest,
     output_path: &Path,
 ) -> Result<(), SnapshotError> {
+    export_snapshot_with_visitor(manifest, output_path, |callback| {
+        backend.for_each(callback);
+        Ok(())
+    })
+}
+
+/// Export only the account-state and transaction-tree nodes reachable from the
+/// manifest roots. This is the bootable checkpoint format used by the live
+/// node export path: unrelated retained history and stale NodeStore objects do
+/// not inflate the archive or import time.
+pub fn export_compact_snapshot(
+    backend: &dyn Backend,
+    manifest: &SnapshotManifest,
+    output_path: &Path,
+) -> Result<(), SnapshotError> {
+    export_snapshot_with_visitor(manifest, output_path, |callback| {
+        visit_reachable_snapshot_nodes(backend, manifest, callback)
+    })
+}
+
+fn export_snapshot_with_visitor<F>(
+    manifest: &SnapshotManifest,
+    output_path: &Path,
+    mut visit_nodes: F,
+) -> Result<(), SnapshotError>
+where
+    F: FnMut(&mut dyn FnMut(Arc<NodeObject>)) -> Result<(), SnapshotError>,
+{
     let start = Instant::now();
     tracing::info!(
         target: "snapshot",
@@ -95,13 +126,10 @@ pub fn export_snapshot(
         Ok(())
     };
 
-    // We need to propagate errors out of the for_each closure.
-    // Since for_each takes FnMut (no Result return), we capture errors.
     let mut export_error: Option<SnapshotError> = None;
-
-    backend.for_each(&mut |node: Arc<NodeObject>| {
+    let visit_result = visit_nodes(&mut |node: Arc<NodeObject>| {
         if export_error.is_some() {
-            return; // Skip remaining nodes after an error
+            return;
         }
 
         let obj_type_u32 = node.object_type() as u32;
@@ -126,13 +154,13 @@ pub fn export_snapshot(
         node_count += 1;
 
         if current_buf.len() >= SNAPSHOT_CHUNK_UNCOMPRESSED_TARGET {
-            if let Err(e) = flush_chunk(
+            if let Err(error) = flush_chunk(
                 &mut current_buf,
                 &mut chunk_metas,
                 &mut chunks_writer,
                 &mut total_compressed,
             ) {
-                export_error = Some(e);
+                export_error = Some(error);
                 return;
             }
             tracing::debug!(
@@ -143,11 +171,13 @@ pub fn export_snapshot(
             );
         }
     });
-
-    // Check for errors captured during iteration
-    if let Some(e) = export_error {
+    if let Err(error) = visit_result {
         let _ = fs::remove_file(&tmp_chunks_path);
-        return Err(e);
+        return Err(error);
+    }
+    if let Some(error) = export_error {
+        let _ = fs::remove_file(&tmp_chunks_path);
+        return Err(error);
     }
 
     // Flush remaining buffer
@@ -253,4 +283,138 @@ pub fn export_snapshot(
     );
 
     Ok(())
+}
+
+const MAX_SHAMAP_DEPTH: usize = 64;
+/// Bound reachable-node traversal even for malformed shared-child graphs. A
+/// valid SHAMap has vastly fewer nodes than this and is streamed without a
+/// global visited set, preserving bounded memory.
+const MAX_COMPACT_SNAPSHOT_NODES: u64 = 100_000_000;
+
+fn visit_reachable_snapshot_nodes(
+    backend: &dyn Backend,
+    manifest: &SnapshotManifest,
+    callback: &mut dyn FnMut(Arc<NodeObject>),
+) -> Result<(), SnapshotError> {
+    let mut emitted = 0_u64;
+    visit_reachable_tree(
+        backend,
+        "account-state",
+        NodeObjectType::AccountNode,
+        Uint256::from_array(manifest.account_hash),
+        &mut emitted,
+        callback,
+    )?;
+    visit_reachable_tree(
+        backend,
+        "transaction",
+        NodeObjectType::TransactionNode,
+        Uint256::from_array(manifest.tx_hash),
+        &mut emitted,
+        callback,
+    )
+}
+
+fn visit_reachable_tree(
+    backend: &dyn Backend,
+    map: &'static str,
+    expected_type: NodeObjectType,
+    root: Uint256,
+    emitted: &mut u64,
+    callback: &mut dyn FnMut(Arc<NodeObject>),
+) -> Result<(), SnapshotError> {
+    if root.is_zero() {
+        return Ok(());
+    }
+
+    let mut stack = vec![(root, 0_usize)];
+    while let Some((hash, depth)) = stack.pop() {
+        *emitted = (*emitted).saturating_add(1);
+        if *emitted > MAX_COMPACT_SNAPSHOT_NODES {
+            return Err(SnapshotError::ResourceLimitExceeded {
+                resource: "compact snapshot reachable nodes",
+                actual: *emitted,
+                limit: MAX_COMPACT_SNAPSHOT_NODES,
+            });
+        }
+        // A SHAMap is expected to be a tree. We deliberately permit repeated
+        // content-addressed nodes here rather than retaining one hash per node:
+        // duplicate records are harmless to import, while a global visited set
+        // would make a purportedly streaming export consume unbounded RAM.
+        // The fixed depth limit still rejects cycles.
+        if depth > MAX_SHAMAP_DEPTH {
+            return Err(snapshot_tree_error(
+                map,
+                hash,
+                "tree exceeds maximum SHAMap depth",
+            ));
+        }
+        let (object, status) = backend.fetch(&hash);
+        let object = object.ok_or_else(|| {
+            snapshot_tree_error(
+                map,
+                hash,
+                &format!("node is missing from NodeStore ({status:?})"),
+            )
+        })?;
+        if object.hash() != &hash {
+            return Err(snapshot_tree_error(
+                map,
+                hash,
+                "backend returned a mismatched key",
+            ));
+        }
+        if object.object_type() != expected_type {
+            return Err(snapshot_tree_error(
+                map,
+                hash,
+                "reachable node has an incompatible type",
+            ));
+        }
+
+        let node = SHAMapTreeNode::make_from_prefix(object.data(), SHAMapHash::new(hash)).map_err(
+            |error| snapshot_tree_error(map, hash, format!("invalid encoded node: {error:?}")),
+        )?;
+        node.update_hash();
+        if node.get_hash().as_uint256() != &hash {
+            return Err(snapshot_tree_error(
+                map,
+                hash,
+                "encoded node body does not match its hash",
+            ));
+        }
+        let expected_leaf_type = match map {
+            "account-state" => SHAMapNodeType::AccountState,
+            "transaction" => SHAMapNodeType::TransactionMd,
+            _ => unreachable!("only known snapshot maps are exported"),
+        };
+        if node.is_leaf() && node.get_type() != expected_leaf_type {
+            return Err(snapshot_tree_error(
+                map,
+                hash,
+                "leaf type belongs to the other SHAMap",
+            ));
+        }
+        if node.is_inner() {
+            for branch in 0..BRANCH_FACTOR {
+                if !node.is_empty_branch(branch) {
+                    stack.push((*node.get_child_hash(branch).as_uint256(), depth + 1));
+                }
+            }
+        }
+        callback(object);
+    }
+    Ok(())
+}
+
+fn snapshot_tree_error(
+    map: &'static str,
+    hash: Uint256,
+    reason: impl Into<String>,
+) -> SnapshotError {
+    SnapshotError::ShamapVerificationFailed {
+        map,
+        hash_hex: hash.to_string(),
+        reason: reason.into(),
+    }
 }
