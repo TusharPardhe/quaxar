@@ -259,3 +259,28 @@ impl<'a, V: ApplyView + ?Sized> ApplyView for FlowSandbox<'a, V> {
         self.raw_destroy_xrp(fee)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Ledger, Sandbox};
+    use basics::base_uint::Uint256;
+    use protocol::{ApplyFlags, LedgerEntryType};
+    use std::sync::Arc;
+
+    #[test]
+    fn dropped_sandbox_never_mutates_parent() {
+        let base = Arc::new(Ledger::new(LedgerHeader::default(), false));
+        let mut parent = Sandbox::new(base, ApplyFlags::default());
+        let keylet = Keylet::new(LedgerEntryType::AccountRoot, Uint256::from_u64(77));
+        let entry = Arc::new(STLedgerEntry::new(keylet));
+
+        {
+            let mut dry = FlowSandbox::new(&mut parent);
+            dry.insert(entry).expect("stage dry mutation");
+            assert!(dry.exists(keylet).expect("read dry sandbox"));
+        }
+
+        assert!(!parent.exists(keylet).expect("parent stays unchanged"));
+    }
+}

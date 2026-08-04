@@ -10,8 +10,8 @@ pub fn to_strand(
     deliver: &Asset,
     send_max_asset: Option<&Asset>,
     path: &STPath,
-    _owner_pays_transfer_fee: bool,
-    _offer_crossing: bool,
+    owner_pays_transfer_fee: bool,
+    offer_crossing: bool,
 ) -> (Ter, Strand) {
     if src.is_zero() || dst.is_zero() {
         return (Ter::TEM_BAD_PATH, Vec::new());
@@ -172,6 +172,8 @@ pub fn to_strand(
                 strand.push(StepKind::Book {
                     book_in: in_issue,
                     book_out: out_issue,
+                    owner_pays_transfer_fee,
+                    remove_self_crossing: offer_crossing && path.size() == 0,
                 });
                 cur_currency = out_issue.currency;
                 cur_issuer = out_issue.account;
@@ -210,6 +212,8 @@ pub fn to_strand(
                 strand.push(StepKind::Book {
                     book_in: in_issue,
                     book_out: out_issue,
+                    owner_pays_transfer_fee,
+                    remove_self_crossing: offer_crossing && path.size() == 0,
                 });
                 cur_currency = out_issue.currency;
                 cur_issuer = out_issue.account;

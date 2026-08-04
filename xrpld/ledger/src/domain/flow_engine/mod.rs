@@ -24,6 +24,12 @@ pub enum StepKind {
     Book {
         book_in: Issue,
         book_out: Issue,
+        /// Offer crossing charges the offer owner; payments charge the path
+        /// sender according to the surrounding step rules.
+        owner_pays_transfer_fee: bool,
+        /// rippled only removes a taker's own tip offer for direct/default
+        /// offer crossing.  Explicit paths skip self offers instead.
+        remove_self_crossing: bool,
     },
 }
 

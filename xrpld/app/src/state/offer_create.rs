@@ -262,25 +262,12 @@ pub fn do_offer_create<V: ledger::ApplyView>(
     }
 
     let mut crossed = false;
-    let acct_k_diag = protocol::account_keylet(Uint160::from_void(account.data()));
-    let bal_before_crossing = view
-        .peek(acct_k_diag)
-        .ok()
-        .flatten()
-        .map(|sle| sle.get_field_amount(sf("sfBalance")).xrp().drops())
-        .unwrap_or(-1);
-    eprintln!(
-        "DIAG balance: account={:?} seq={} phase=before_crossing balance={}",
-        account, offer_sequence, bal_before_crossing
-    );
     let (remaining_gets, remaining_pays) = if !is_passive {
-        // a payment from taker to themselves through the order book.
-        // takerAmount.in = TakerGets (what taker gives), takerAmount.out = TakerPays (what taker receives)
-        // The taker pays TakerPays (what they give) and receives TakerGets (what they get).
-        // deliver = TakerGets (what the taker wants to receive)
-        // sendMax = TakerPays (what the taker is willing to pay)
-        let deliver_asset = taker_gets.asset(); // deliver = takerAmount.out
-        let send_max_asset = taker_pays.asset(); // sendMax = takerAmount.in
+        // Cross as a payment from the offer creator back to themselves.
+        // rippled's takerAmount.in is TakerGets (what the creator supplies)
+        // and takerAmount.out is TakerPays (what the creator receives).
+        let deliver_asset = taker_pays.asset();
+        let send_max_asset = taker_gets.asset();
 
         let mut cross_paths = protocol::STPathSet::new(sf("sfPaths"));
         if !taker_gets.native() && !taker_pays.native() {
@@ -309,14 +296,14 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         let cross_book = Some((taker_gets.asset(), taker_pays.asset()));
 
         // Execute strands
-        // reference: flow(deliver=TakerGets, sendMax=TakerPays)
+        // reference: flow(deliver=takerAmount.out, sendMax=takerAmount.in)
         let flow_result = if !strands.is_empty() {
             ledger::flow_engine::strand_flow::execute_strands(
                 view,
                 &strands,
-                &taker_gets, // deliver = TakerGets
+                &taker_pays, // deliver = TakerPays
                 (tx_flags & TF_FILL_OR_KILL) == 0,
-                Some(&taker_pays), // sendMax = TakerPays
+                Some(&taker_gets), // sendMax = TakerGets
                 &account,
                 Some(quality_threshold),
             )
@@ -351,25 +338,6 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
         let actual_in = flow_result.actual_in;
         let actual_out = flow_result.actual_out;
-        let bal_after_crossing = view
-            .peek(acct_k_diag)
-            .ok()
-            .flatten()
-            .map(|sle| sle.get_field_amount(sf("sfBalance")).xrp().drops())
-            .unwrap_or(-1);
-        eprintln!(
-            "DIAG balance: account={:?} seq={} phase=after_crossing balance={} delta={} actual_in_native={} actual_in_mantissa={} actual_in_exp={} actual_out_native={} actual_out_mantissa={} actual_out_exp={}",
-            account,
-            offer_sequence,
-            bal_after_crossing,
-            bal_after_crossing - bal_before_crossing,
-            actual_in.native(),
-            actual_in.mantissa(),
-            actual_in.exponent(),
-            actual_out.native(),
-            actual_out.mantissa(),
-            actual_out.exponent()
-        );
 
         // even after fee deduction), propagate that directly — do not override with tecKILLED.
         // This matches reference the reference source:359 where flowCross returns {tecUNFUNDED_OFFER, takerAmount}.
@@ -387,14 +355,6 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             // (direct execute_book_step). When the flow engine succeeds via
             // strands, the strand execution (DirectStep/XRPEndpointStep) already
             // handles the taker's asset movement.
-            eprintln!(
-                "DIAG manual_transfer_check: account={:?} seq={} strands_empty={} actual_in_signum={} actual_out_signum={}",
-                account,
-                offer_sequence,
-                strands.is_empty(),
-                actual_in.signum(),
-                actual_out.signum()
-            );
             if strands.is_empty() {
                 // Fallback path: book step only handled offer owners' side.
                 // Transfer assets to/from the taker:
@@ -451,12 +411,17 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             }
         }
 
-        // Compute remaining offer after crossing — reference flowCross afterCross computation.
-        // After swap: actual_in = TakerPays consumed (IOU), actual_out = TakerGets consumed (XRP)
-        let (rem_gets, rem_pays) = if is_sell {
-            // tfSell: remaining from INPUT side (TakerPays/IOU)
-            let gateway_rate = if !taker_pays.native() && account != taker_pays.issue().account {
-                ledger::ripple_state_helpers::transfer_rate(view, &taker_pays.issue().account)
+        // Compute the residual offer using rippled's flow result convention:
+        // actual_in is TakerGets consumed and actual_out is TakerPays delivered.
+        // A dry flow leaves the offer unchanged. Besides matching rippled's
+        // post-cross result, this avoids converting an otherwise unused
+        // encoded rate back into an amount.
+        let (rem_gets, rem_pays) = if actual_in.signum() <= 0 && actual_out.signum() <= 0 {
+            (taker_gets.clone(), taker_pays.clone())
+        } else if is_sell {
+            // tfSell reduces the input side, TakerGets.
+            let gateway_rate = if !taker_gets.native() && account != taker_gets.issue().account {
+                ledger::ripple_state_helpers::transfer_rate(view, &taker_gets.issue().account)
             } else {
                 1_000_000_000u32
             };
@@ -468,55 +433,50 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                     -9,
                     false,
                 );
-                match amount_or_exception(actual_in.try_divide(&rate, taker_pays.asset())) {
+                match amount_or_exception(actual_in.try_divide(&rate, taker_gets.asset())) {
                     Ok(amount) => amount,
                     Err(ter) => return ter,
                 }
             } else {
                 actual_in
             };
-            let mut rem_pays = taker_pays.clone() - non_gateway_in;
-            if rem_pays.signum() < 0 {
-                rem_pays.clear();
-            }
-            let rem_gets = if rem_pays.signum() <= 0 {
-                taker_gets.zeroed()
-            } else {
-                // reference: afterCross.out = divRoundStrict(afterCross.in,
-                // rate, takerAmount.out.asset(), false) in
-                // OfferCreate::flowCross. Single bounded divide of the
-                // REMAINING input by the pre-normalized Quality rate,
-                // matching the non-sell branch's mulRound fix below — see
-                // that branch's comment for why this replaces a two-step
-                // full-magnitude multiply-then-divide.
-                let quality = get_rate(&taker_gets, &taker_pays);
-                let rate_amount = quality_to_rate_amount(quality, &taker_pays, &taker_gets);
-                protocol::div_round_strict(&rem_pays, &rate_amount, taker_gets.asset(), false)
-            };
-            (rem_gets, rem_pays)
-        } else {
-            // Non-sell: remaining from OUTPUT side (TakerGets/XRP)
-            let mut rem_gets = taker_gets.clone() - actual_out;
+            let mut rem_gets = taker_gets.clone() - non_gateway_in;
             if rem_gets.signum() < 0 {
                 rem_gets.clear();
             }
             let rem_pays = if rem_gets.signum() <= 0 {
                 taker_pays.zeroed()
             } else {
-                // reference: afterCross.in = mulRound(afterCross.out, rate,
-                // takerAmount.in.asset(), true) in OfferCreate::flowCross.
-                // `rate` is the pre-normalized Quality ratio (TakerPays /
-                // TakerGets), so this is a single bounded multiply against
-                // the REMAINING output — not a full-magnitude multiply by
-                // the original TakerPays followed by a divide by the
-                // original TakerGets. The two-step form previously used
-                // here could build an intermediate product far outside the
-                // final result's range and spuriously overflow for offers
-                // with an extreme quality ratio, even though the final
-                // (correctly-rounded) result would have been in range.
-                let quality = get_rate(&taker_gets, &taker_pays);
-                let rate_amount = quality_to_rate_amount(quality, &taker_pays, &taker_gets);
+                // get_rate is TakerPays / TakerGets, so recover the output
+                // side by multiplying the remaining input side.
+                let rate_amount = match amount_or_exception(
+                    taker_pays.try_divide(&taker_gets, protocol::no_issue()),
+                ) {
+                    Ok(rate) => rate,
+                    Err(ter) => return ter,
+                };
                 rem_gets.mul_round(&rate_amount, taker_pays.asset(), true)
+            };
+            (rem_gets, rem_pays)
+        } else {
+            // Non-sell reduces the output side, TakerPays, then recomputes
+            // TakerGets at the original offer quality.
+            let mut rem_pays = taker_pays.clone() - actual_out;
+            if rem_pays.signum() < 0 {
+                rem_pays.clear();
+            }
+            let rem_gets = if rem_pays.signum() <= 0 {
+                taker_gets.zeroed()
+            } else {
+                // get_rate is TakerPays / TakerGets, so recover the input
+                // side by dividing the remaining output side.
+                let rate_amount = match amount_or_exception(
+                    taker_pays.try_divide(&taker_gets, protocol::no_issue()),
+                ) {
+                    Ok(rate) => rate,
+                    Err(ter) => return ter,
+                };
+                protocol::div_round_strict(&rem_pays, &rate_amount, taker_gets.asset(), false)
             };
             (rem_gets, rem_pays)
         };

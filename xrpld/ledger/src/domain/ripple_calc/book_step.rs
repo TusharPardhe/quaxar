@@ -25,6 +25,15 @@ pub struct Book {
     pub domain: Option<Uint256>,
 }
 
+/// Quality uses XRPL's reversed stored-rate ordering; `>=` means an offer is
+/// at least as favorable to the taker as the requested threshold.
+pub(crate) fn quality_satisfies_threshold(
+    offer_quality: Quality,
+    threshold: Option<Quality>,
+) -> bool {
+    threshold.is_none_or(|minimum| offer_quality >= minimum)
+}
+
 /// Result of consuming offers from a book
 #[derive(Debug, Clone)]
 pub struct BookStepResult {
@@ -34,7 +43,20 @@ pub struct BookStepResult {
     pub ter: Ter,
 }
 
-/// Execute a book step: consume offers from the order book.
+/// Exact execution policy supplied by a flow `BookStep`.
+#[derive(Debug, Clone, Copy)]
+pub struct BookStepOptions<'a> {
+    pub owner_pays_transfer_fee: bool,
+    pub taker: Option<&'a AccountID>,
+    pub quality_threshold: Option<Quality>,
+    /// Only direct/default OfferCreate crossing may delete a self offer at
+    /// the current executable tip. Other paths leave it untouched.
+    pub remove_self_crossing: bool,
+}
+
+/// Execute a book step using the historical call signature. New flow code
+/// should use `execute_book_step_with_options` so self-crossing policy is
+/// explicit rather than inferred from a non-null taker.
 pub fn execute_book_step<V: ApplyView>(
     view: &mut V,
     book: &Book,
@@ -42,10 +64,35 @@ pub fn execute_book_step<V: ApplyView>(
     max_out: &STAmount,
     owner_pays_transfer_fee: bool,
     taker: Option<&AccountID>,
-    // For OfferCreate: minimum quality (TakerGets/TakerPays) offers must meet.
-    // Offers with quality < threshold are skipped. None = no threshold (payments).
     quality_threshold: Option<Quality>,
 ) -> BookStepResult {
+    execute_book_step_with_options(
+        view,
+        book,
+        max_in,
+        max_out,
+        BookStepOptions {
+            owner_pays_transfer_fee,
+            taker,
+            quality_threshold,
+            remove_self_crossing: false,
+        },
+    )
+}
+
+/// Execute a book step: consume the best same-quality CLOB liquidity and an
+/// AMM synthetic offer only when it satisfies the same threshold.
+pub fn execute_book_step_with_options<V: ApplyView>(
+    view: &mut V,
+    book: &Book,
+    max_in: &STAmount,
+    max_out: &STAmount,
+    options: BookStepOptions<'_>,
+) -> BookStepResult {
+    let owner_pays_transfer_fee = options.owner_pays_transfer_fee;
+    let taker = options.taker;
+    let quality_threshold = options.quality_threshold;
+    let remove_self_crossing = options.remove_self_crossing;
     let mut total_in = max_in.zeroed();
     let mut total_out = max_out.zeroed();
     let mut offers_consumed: u32 = 0;
@@ -94,8 +141,10 @@ pub fn execute_book_step<V: ApplyView>(
     // We use get_book_offers which reads from the offer directory.
     let offers = get_book_offers(view, book, MAX_OFFERS_TO_CONSUME);
 
-    // (only crosses offers at the best available quality).
-    let mut first_quality: Option<u64> = None;
+    // A BookStep consumes one quality directory per call, as in rippled's
+    // FlowOfferStream. This applies to payments as well as OfferCreate.
+    let mut first_quality: Option<Quality> = None;
+    let mut offer_attempted = false;
 
     for offer_sle in offers {
         if offers_consumed >= MAX_OFFERS_TO_CONSUME || remaining_in.signum() <= 0 {
@@ -132,44 +181,39 @@ pub fn execute_book_step<V: ApplyView>(
             }
         }
 
-        // For OfferCreate, skip offers whose quality is worse than the taker's threshold.
-        // offer quality = TakerGets/TakerPays (what the offer gives per unit it wants).
-        // threshold = taker's TakerGets/TakerPays.
-        // Only cross if offer_quality >= threshold.
-        if let Some(threshold) = quality_threshold {
-            // The taker receives offer's TakerPays and gives offer's TakerGets.
-            // So quality = get_rate(offer_TakerPays, offer_TakerGets) — what taker gets per unit given.
-            let offer_quality =
-                Quality::from_amounts(&Amounts::new(taker_gets.clone(), taker_pays.clone()));
-            if offer_quality < threshold {
+        // `Quality` stores the reciprocal book price: TakerGets / TakerPays.
+        // That is the same convention as OfferCreate's
+        // `Quality{takerAmount.out, sendMax}` threshold, regardless of the
+        // executable BookStep direction.
+        let offer_quality =
+            Quality::from_amounts(&Amounts::new(taker_gets.clone(), taker_pays.clone()));
+        if let Some(first) = first_quality {
+            if offer_quality != first {
                 break;
             }
+        } else {
+            first_quality = Some(offer_quality);
+        }
+        if !quality_satisfies_threshold(offer_quality, quality_threshold) {
+            break;
         }
 
-        if owner_pays_transfer_fee {
-            let offer_quality = if taker_gets.signum() > 0 {
-                let no_issue = protocol::Issue::default();
-                let q = taker_pays.divide(&taker_gets, no_issue);
-                if q.signum() > 0 {
-                    let exp = q.exponent() + 100;
-                    if (0..=255).contains(&exp) {
-                        ((exp as u64) << 56) | q.mantissa()
-                    } else {
-                        0
-                    }
-                } else {
-                    0
+        // A direct OfferCreate crossing deletes the taker's own executable
+        // tip offer. Explicit paths and normal payments merely skip it. If no
+        // real offer has been attempted yet, deleting the self offer allows
+        // the stream to advance to the next quality directory, matching
+        // BookOfferCrossingStep::limitSelfCrossQuality.
+        if let Some(taker_account) = taker
+            && offer_owner == *taker_account
+        {
+            if owner_pays_transfer_fee && remove_self_crossing {
+                remove_consumed_offer(view, &offer_sle);
+                if !offer_attempted {
+                    first_quality = None;
                 }
-            } else {
-                0
-            };
-            if let Some(fq) = first_quality {
-                if offer_quality != fq {
-                    break;
-                }
-            } else {
-                first_quality = Some(offer_quality);
             }
+            offers_consumed += 1;
+            continue;
         }
 
         // Check offer owner's funding
@@ -180,19 +224,7 @@ pub fn execute_book_step<V: ApplyView>(
             continue;
         }
 
-        // BookPaymentStep: skip sender's own offers (don't trade with yourself)
-        // BookOfferCrossingStep: remove taker's own offers without trading
-        if let Some(taker_account) = taker
-            && offer_owner == *taker_account
-        {
-            if owner_pays_transfer_fee {
-                // OfferCreate context: remove own offer without trading
-                remove_consumed_offer(view, &offer_sle);
-            }
-            // Payment context: just skip
-            offers_consumed += 1;
-            continue;
-        }
+        offer_attempted = true;
 
         // Compute consumption amounts with transfer rates (reference forEachOffer parity)
         let consumption = compute_offer_consumption(
@@ -617,6 +649,8 @@ pub fn get_book_best_quality<V: crate::ReadView>(view: &V, book: &Book) -> Optio
 fn get_book_offers<V: ApplyView>(view: &mut V, book: &Book, max: u32) -> Vec<STLedgerEntry> {
     let mut offers = Vec::new();
 
+    // Offers are stored under their executable TakerPays -> TakerGets book,
+    // the same orientation a BookStep receives as `book.in -> book.out`.
     let proto_book = protocol::Book {
         r#in: book.r#in,
         out: book.out,
@@ -1075,6 +1109,24 @@ pub fn execute_explicit_book_step<V: ApplyView>(
 mod tests {
     use super::*;
 
+    #[test]
+    fn quality_threshold_rejects_worse_crossing() {
+        let threshold = Quality::from_amounts(&Amounts::new(
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(100)),
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(100)),
+        ));
+        let better = Quality::from_amounts(&Amounts::new(
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(100)),
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(200)),
+        ));
+        let worse = Quality::from_amounts(&Amounts::new(
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(100)),
+            STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(50)),
+        ));
+
+        assert!(quality_satisfies_threshold(better, Some(threshold)));
+        assert!(!quality_satisfies_threshold(worse, Some(threshold)));
+    }
     #[test]
     fn test_mul_ratio_amount_xrp_round_up() {
         // 100 drops * 1002000000 / 1000000000 = 100.2 → rounds UP to 101
