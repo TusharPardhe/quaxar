@@ -2766,7 +2766,9 @@ impl RpcRuntime for ApplicationRoot {
     }
 
     fn export_snapshot(&self, output_path: &str) -> Result<JsonValue, String> {
-        use nodestore::snapshot::{SnapshotManifest, export_snapshot, manifest::SNAPSHOT_VERSION};
+        use nodestore::snapshot::{
+            SnapshotManifest, export_compact_snapshot, manifest::SNAPSHOT_VERSION,
+        };
         use std::path::Path;
 
         let validated = self
@@ -2794,6 +2796,7 @@ impl RpcRuntime for ApplicationRoot {
             parent_close_time: header.parent_close_time,
             close_time_res: header.close_time_resolution,
             close_flags: header.close_flags,
+            network_id: Some(self.network_id()),
             chunks: Vec::new(),
         };
 
@@ -2816,7 +2819,7 @@ impl RpcRuntime for ApplicationRoot {
                     path = %path.display(),
                     "Background snapshot export started"
                 );
-                match export_snapshot(backend.as_ref(), &manifest, path) {
+                match export_compact_snapshot(backend.as_ref(), &manifest, path) {
                     Ok(()) => {
                         let file_size = std::fs::metadata(path)
                             .map(|metadata| metadata.len())

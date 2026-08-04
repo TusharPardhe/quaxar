@@ -44,6 +44,22 @@ impl Drop for BulkImportGuard<'_> {
     }
 }
 
+/// Read and validate the fixed snapshot manifest without importing any NodeStore
+/// objects. Callers use this preflight to reject a network-mismatched or legacy
+/// snapshot before it can modify the configured database.
+pub fn read_snapshot_manifest(input_path: &Path) -> Result<SnapshotManifest, SnapshotError> {
+    let file = File::open(input_path)
+        .map_err(|error| SnapshotError::io_path("opening snapshot header", input_path, error))?;
+    let mut reader = BufReader::new(file);
+    let mut header_buf = [0u8; SNAPSHOT_HEADER_SIZE];
+    reader
+        .read_exact(&mut header_buf)
+        .map_err(|error| SnapshotError::io("reading snapshot header", error))?;
+    let manifest = SnapshotManifest::deserialize_header(&header_buf)?;
+    verify_manifest_ledger_hash(&manifest)?;
+    Ok(manifest)
+}
+
 /// Load a snapshot file from `input_path` into `backend`.
 ///
 /// Returns the verified manifest. A successful result proves that the manifest

@@ -17,9 +17,12 @@ Sync progresses through three phases:
 | Snapshot import | ~3 minutes | Snapshot file from existing node |
 | Network sync | 4–36 hours | Peers, bandwidth, RAM |
 
-**Snapshot import** is the fastest path. Load a snapshot exported from another
+**Snapshot import** is the fastest path. Load a v2 snapshot exported from another
 node using `quaxar load-snapshot --input <file> --conf <config>`. The node must
-be stopped during import. See [RUNNING.md](RUNNING.md) for the full workflow.
+be stopped during import. The importer verifies and activates the checkpoint;
+the next normal startup builds a local lazy ledger immediately, then catches up
+only from that ledger to the network tip. The snapshot network identity must
+match the configured network. See [RUNNING.md](RUNNING.md) for the full workflow.
 
 If no snapshot is available, the node syncs from the network as described below.
 

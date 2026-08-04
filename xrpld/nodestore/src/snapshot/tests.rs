@@ -9,7 +9,9 @@ use basics::basic_config::Section;
 
 use crate::database_runtime::scheduler::DummyScheduler;
 use crate::snapshot::manifest::*;
-use crate::snapshot::{SnapshotError, SnapshotManifest, export_snapshot, load_snapshot};
+use crate::snapshot::{
+    SnapshotError, SnapshotManifest, export_compact_snapshot, export_snapshot, load_snapshot,
+};
 use crate::{Backend, Factory, MemoryFactory, NodeObject, NodeObjectType, NullJournal};
 
 fn config(path: &str) -> Section {
@@ -43,6 +45,7 @@ fn test_manifest() -> SnapshotManifest {
         parent_close_time: 749_999_990,
         close_time_res: 10,
         close_flags: 0,
+        network_id: None,
         chunks: Vec::new(),
     };
     refresh_manifest_ledger_hash(&mut manifest);
@@ -106,6 +109,27 @@ fn shamap_inner_with_child(child_hash: [u8; 32]) -> (Arc<NodeObject>, [u8; 32]) 
         Arc::new(NodeObject::new(NodeObjectType::AccountNode, data, hash)),
         hash_bytes,
     )
+}
+
+#[test]
+fn v2_network_identity_round_trips_in_the_snapshot_header() {
+    let mut manifest = test_manifest();
+    manifest.network_id = Some(21_338);
+    let decoded = SnapshotManifest::deserialize_header(&manifest.serialize_header())
+        .expect("v2 header parses");
+    assert_eq!(decoded.version, SNAPSHOT_VERSION);
+    assert_eq!(decoded.network_id, Some(21_338));
+}
+
+#[test]
+fn v1_snapshot_header_remains_readable_without_network_identity() {
+    let mut manifest = test_manifest();
+    manifest.version = 1;
+    manifest.network_id = None;
+    let decoded = SnapshotManifest::deserialize_header(&manifest.serialize_header())
+        .expect("v1 header parses");
+    assert_eq!(decoded.version, 1);
+    assert_eq!(decoded.network_id, None);
 }
 
 #[test]
@@ -260,6 +284,73 @@ fn snapshot_loader_rejects_excessive_chunk_count_before_allocation() {
             ..
         })
     ));
+}
+
+#[test]
+fn compact_export_rejects_leaf_from_the_wrong_shamap() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap_path = dir.path().join("wrong-map.xrpls");
+    let source = make_backend("compact-wrong-map");
+    let (transaction_node, tx_hash) = shamap_leaf(
+        NodeObjectType::TransactionNode,
+        SHAMapNodeType::TransactionMd,
+        0xC3,
+    );
+    source.store(transaction_node);
+
+    let mut manifest = test_manifest();
+    manifest.account_hash = tx_hash;
+    refresh_manifest_ledger_hash(&mut manifest);
+    assert!(matches!(
+        export_compact_snapshot(source.as_ref(), &manifest, &snap_path),
+        Err(SnapshotError::ShamapVerificationFailed {
+            map: "account-state",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn compact_export_contains_only_nodes_reachable_from_checkpoint_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let snap_path = dir.path().join("compact.xrpls");
+    let source = make_backend("compact-source");
+    let (account_node, account_hash) = shamap_leaf(
+        NodeObjectType::AccountNode,
+        SHAMapNodeType::AccountState,
+        0xC1,
+    );
+    let (transaction_node, tx_hash) = shamap_leaf(
+        NodeObjectType::TransactionNode,
+        SHAMapNodeType::TransactionMd,
+        0xC2,
+    );
+    let unrelated_hash = Uint256::from_array([0xEF; 32]);
+    source.store(account_node);
+    source.store(transaction_node);
+    source.store(Arc::new(NodeObject::new(
+        NodeObjectType::Ledger,
+        vec![0xDE, 0xAD],
+        unrelated_hash,
+    )));
+
+    let mut manifest = test_manifest();
+    manifest.account_hash = account_hash;
+    manifest.tx_hash = tx_hash;
+    refresh_manifest_ledger_hash(&mut manifest);
+    export_compact_snapshot(source.as_ref(), &manifest, &snap_path)
+        .expect("compact export succeeds");
+
+    let destination = make_backend("compact-destination");
+    load_snapshot(destination.as_ref(), &snap_path).expect("compact snapshot imports");
+    assert!(
+        destination
+            .fetch(&Uint256::from_array(account_hash))
+            .0
+            .is_some()
+    );
+    assert!(destination.fetch(&Uint256::from_array(tx_hash)).0.is_some());
+    assert!(destination.fetch(&unrelated_hash).0.is_none());
 }
 
 #[test]

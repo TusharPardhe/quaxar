@@ -43,10 +43,11 @@
 pub const SNAPSHOT_MAGIC: &[u8; 8] = b"xrpls\x00\x01\x00";
 
 /// Highest snapshot format version this binary can read.
-pub const SNAPSHOT_MAX_VERSION: u16 = 1;
+pub const SNAPSHOT_MAX_VERSION: u16 = 2;
 
-/// Current format version written by this binary.
-pub const SNAPSHOT_VERSION: u16 = 1;
+/// Current format version written by this binary. Version 2 dedicates the
+/// former reserved header bytes to the snapshot's source network identity.
+pub const SNAPSHOT_VERSION: u16 = 2;
 
 /// Target uncompressed size of each data chunk (8 MiB).
 /// The last chunk may be smaller.
@@ -77,7 +78,10 @@ pub const SNAPSHOT_HEADER_SIZE: usize = 8  // magic
     + 1  // close_time_res
     + 1  // close_flags
     + 4  // chunk_count
-    + 6; // _reserved (padding)
+    + 6; // v1 reserved; v2: network_id (u32) + flags (u16)
+
+/// Version-2 header flag indicating that `network_id` is meaningful.
+const NETWORK_ID_PRESENT: u16 = 1;
 
 /// Size of each chunk metadata entry in the chunk table.
 /// Layout: [compressed_len: u32 BE] [sha256: 32 bytes]
@@ -128,6 +132,11 @@ pub struct SnapshotManifest {
     pub close_time_res: u8,
     /// Close flags (SLCF_NO_CONSENSUS_TIME = 0x01).
     pub close_flags: u8,
+    /// Network identity declared by a version-2 snapshot. `None` denotes a
+    /// legacy v1 archive or an intentionally generic export, neither of which
+    /// may become an automatically bootable checkpoint under a configured
+    /// network.
+    pub network_id: Option<u32>,
     /// Per-chunk metadata, in order.
     pub chunks: Vec<ChunkMeta>,
 }
@@ -188,8 +197,17 @@ impl SnapshotManifest {
         buf[pos..pos + 4].copy_from_slice(&chunk_count.to_be_bytes());
         pos += 4;
 
-        // _reserved — 6 bytes, already zero
-        let _ = pos;
+        // v1 reserved bytes remain zero. Version 2 binds the archive to its
+        // source network without changing the fixed header size.
+        if self.version >= 2 {
+            buf[pos..pos + 4].copy_from_slice(&self.network_id.unwrap_or_default().to_be_bytes());
+            let flags = if self.network_id.is_some() {
+                NETWORK_ID_PRESENT
+            } else {
+                0
+            };
+            buf[pos + 4..pos + 6].copy_from_slice(&flags.to_be_bytes());
+        }
 
         buf
     }
@@ -232,7 +250,7 @@ impl SnapshotManifest {
 
         // Version
         let version = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap());
-        if version > SNAPSHOT_MAX_VERSION {
+        if version == 0 || version > SNAPSHOT_MAX_VERSION {
             return Err(SnapshotError::UnsupportedVersion {
                 found: version,
                 max_supported: SNAPSHOT_MAX_VERSION,
@@ -282,7 +300,28 @@ impl SnapshotManifest {
 
         // chunk_count
         let _chunk_count = u32::from_be_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        let _ = pos;
+        pos += 4;
+        // Version 1 required all six padding bytes to be zero. Version 2
+        // repurposes them as network_id:u32 followed by flags:u16.
+        let reserved = &buf[pos..pos + 6];
+        let network_id = if version == 1 {
+            if reserved.iter().any(|byte| *byte != 0) {
+                return Err(SnapshotError::MalformedHeader {
+                    reason: "v1 reserved header bytes must be zero".to_owned(),
+                });
+            }
+            None
+        } else {
+            let declared_network =
+                u32::from_be_bytes(reserved[..4].try_into().expect("fixed width"));
+            let flags = u16::from_be_bytes(reserved[4..].try_into().expect("fixed width"));
+            if flags & !NETWORK_ID_PRESENT != 0 {
+                return Err(SnapshotError::MalformedHeader {
+                    reason: "v2 snapshot declares unknown network flags".to_owned(),
+                });
+            }
+            (flags & NETWORK_ID_PRESENT != 0).then_some(declared_network)
+        };
 
         Ok(Self {
             version,
@@ -296,6 +335,7 @@ impl SnapshotManifest {
             parent_close_time,
             close_time_res,
             close_flags,
+            network_id,
             chunks: Vec::new(),
         })
     }

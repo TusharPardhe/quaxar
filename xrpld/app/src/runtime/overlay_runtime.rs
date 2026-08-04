@@ -934,7 +934,7 @@ fn parse_reduce_relay_section(section: &Section, setup: &mut Setup) -> Result<()
     Ok(())
 }
 
-fn parse_network_id(config: &BasicConfig) -> Result<Option<u32>, String> {
+pub fn parse_network_id(config: &BasicConfig) -> Result<Option<u32>, String> {
     let id = config.legacy("network_id").unwrap_or_default();
     if id.is_empty() {
         return Ok(None);

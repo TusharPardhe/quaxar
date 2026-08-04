@@ -2504,8 +2504,11 @@ fn run_export_snapshot(url: &str, output: &str) -> bool {
 }
 
 fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
-    use nodestore::{DummyScheduler, Manager, ManagerImp, NullJournal, snapshot::load_snapshot};
-    use std::path::Path;
+    use nodestore::{
+        DummyScheduler, ManagerImp, NullJournal,
+        snapshot::{activate_snapshot_bootstrap, load_snapshot, read_snapshot_manifest},
+    };
+    use std::path::{Path, PathBuf};
 
     let config = match load_config_for_snapshot(conf) {
         Ok(c) => c,
@@ -2522,34 +2525,78 @@ fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
             return false;
         }
     };
-
-    // Resolve sharded NuDB layout: actual files live in xrpldb.NNNN subdirectories.
-    let mut node_db = node_db;
-    if let Ok(Some(base_path)) = node_db.get::<String>("path") {
-        let writable_path = Path::new(&base_path).join("xrpldb.0000");
-        if writable_path.join("nudb.dat").exists() {
-            node_db.set("path", writable_path.to_string_lossy().into_owned());
-        }
-    }
-
-    let manager = ManagerImp::instance();
-    let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
-    let journal: Arc<dyn nodestore::NodeStoreJournal> = Arc::new(NullJournal);
-
-    let backend = match manager.make_backend(&node_db, 0, scheduler, journal) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Error creating backend: {e}");
+    let checkpoint_root = match node_db.get::<String>("path") {
+        Ok(Some(path)) => PathBuf::from(path),
+        _ => {
+            eprintln!("Error: [node_db] path is not a valid snapshot checkpoint location");
             return false;
         }
     };
 
-    if let Err(e) = backend.open(true) {
-        eprintln!("Error opening backend: {e}");
+    let input_path = Path::new(input);
+    let preflight_manifest = match read_snapshot_manifest(input_path) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("Snapshot preflight failed: {error}");
+            return false;
+        }
+    };
+    let configured_network_id = match app::parse_network_id(&config) {
+        Ok(network_id) => network_id.unwrap_or(0),
+        Err(error) => {
+            eprintln!("Invalid [network_id] configuration: {error}");
+            return false;
+        }
+    };
+    let Some(snapshot_network_id) = preflight_manifest.network_id else {
+        eprintln!("Snapshot was not imported: it lacks the required v2 network identity");
+        return false;
+    };
+    if snapshot_network_id != configured_network_id {
+        eprintln!(
+            "Snapshot network id {snapshot_network_id} does not match configured network id {configured_network_id}"
+        );
         return false;
     }
 
-    let input_path = Path::new(input);
+    // Use the same bootstrap path as normal startup. In particular,
+    // online-delete uses a rotating writable/archive pair whose active paths
+    // live in StateDb; opening [node_db].path directly could import into a
+    // detached backend that startup later rotates away.
+    let ledger_history = config
+        .legacy("ledger_history")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    let manager = ManagerImp::new();
+    let scheduler: Arc<dyn nodestore::Scheduler> = Arc::new(DummyScheduler);
+    let journal: Arc<dyn nodestore::NodeStoreJournal> = Arc::new(NullJournal);
+    let node_store_bootstrap = match app::bootstrap_shamap_store(
+        &config,
+        false,
+        ledger_history,
+        1,
+        40_000,
+        64,
+        2,
+        &manager,
+        scheduler,
+        journal,
+    ) {
+        Ok(bootstrap) => bootstrap,
+        Err(error) => {
+            eprintln!("Error opening configured NodeStore for snapshot import: {error}");
+            return false;
+        }
+    };
+    let backend = match node_store_bootstrap.node_store.export_backend() {
+        Some(backend) => backend,
+        None => {
+            eprintln!("Error: configured NodeStore does not expose an import backend");
+            return false;
+        }
+    };
+
     let spinner = snapshot_spinner(format!(
         "Importing snapshot from {}...",
         input_path.display()
@@ -2557,9 +2604,36 @@ fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
 
     match load_snapshot(backend.as_ref(), input_path) {
         Ok(manifest) => {
-            backend.sync();
-            let _ = backend.close();
-            spinner.finish_with_message("✓ Snapshot import complete and integrity verified");
+            // `load_snapshot` has completed root verification and final sync.
+            // Do not publish the checkpoint marker until the configured active
+            // backend has also closed successfully.
+            if let Err(error) = backend.close() {
+                spinner.finish_and_clear();
+                eprintln!("Snapshot imported but NodeStore close failed: {error}");
+                return false;
+            }
+            drop(backend);
+            drop(node_store_bootstrap);
+
+            if manifest.network_id != Some(configured_network_id) {
+                spinner.finish_and_clear();
+                eprintln!(
+                    "Snapshot changed during import or does not match configured network id {configured_network_id}"
+                );
+                return false;
+            }
+            if let Err(error) = activate_snapshot_bootstrap(
+                &checkpoint_root,
+                &manifest,
+                Some(configured_network_id),
+            ) {
+                spinner.finish_and_clear();
+                eprintln!("Snapshot imported but checkpoint activation failed: {error}");
+                return false;
+            }
+            spinner.finish_with_message(
+                "✓ Snapshot import complete, verified, and activated for startup",
+            );
             println!(
                 "  → Ledger seq: {}, chunks: {}",
                 manifest.ledger_seq,
@@ -2567,9 +2641,9 @@ fn run_load_snapshot(input: &str, conf: Option<&str>) -> bool {
             );
             true
         }
-        Err(e) => {
+        Err(error) => {
             spinner.finish_and_clear();
-            eprintln!("Snapshot load failed: {e}");
+            eprintln!("Snapshot load failed: {error}");
             let _ = backend.close();
             false
         }
