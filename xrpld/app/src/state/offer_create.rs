@@ -200,7 +200,11 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             // reference: saTakerPays = multiply(saTakerGets, rate, saTakerPays.asset())
             taker_pays = match amount_or_exception(
                 taker_gets.try_multiply(&rate_amount, taker_pays.asset()),
-            ) {
+            )
+            .map_err(|ter| {
+                eprintln!("DIAG site=A(tick_sell_multiply) account={}", account);
+                ter
+            }) {
                 Ok(amount) => amount,
                 Err(ter) => return ter,
             };
@@ -216,12 +220,15 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                 return Ter::TEF_EXCEPTION;
             }
             // reference: saTakerGets = divide(saTakerPays, rate, saTakerGets.asset())
-            taker_gets = match amount_or_exception(
-                taker_pays.try_divide(&rate_amount, taker_gets.asset()),
-            ) {
-                Ok(amount) => amount,
-                Err(ter) => return ter,
-            };
+            taker_gets =
+                match amount_or_exception(taker_pays.try_divide(&rate_amount, taker_gets.asset()))
+                    .map_err(|ter| {
+                        eprintln!("DIAG site=B(tick_buy_divide) account={}", account);
+                        ter
+                    }) {
+                    Ok(amount) => amount,
+                    Err(ter) => return ter,
+                };
         }
         if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
             return Ter::TES_SUCCESS; // Rounded to zero
@@ -465,7 +472,12 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                     -9,
                     false,
                 );
-                match amount_or_exception(actual_in.try_divide(&rate, taker_pays.asset())) {
+                match amount_or_exception(actual_in.try_divide(&rate, taker_pays.asset())).map_err(
+                    |ter| {
+                        eprintln!("DIAG site=C(sell_gateway_divide) account={}", account);
+                        ter
+                    },
+                ) {
                     Ok(amount) => amount,
                     Err(ter) => return ter,
                 }
@@ -481,11 +493,19 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             } else {
                 let product = match amount_or_exception(
                     rem_pays.try_multiply(&taker_gets, taker_gets.asset()),
-                ) {
+                )
+                .map_err(|ter| {
+                    eprintln!("DIAG site=D(sell_rem_multiply) account={}", account);
+                    ter
+                }) {
                     Ok(amount) => amount,
                     Err(ter) => return ter,
                 };
-                match amount_or_exception(product.try_divide(&taker_pays, taker_gets.asset())) {
+                match amount_or_exception(product.try_divide(&taker_pays, taker_gets.asset()))
+                    .map_err(|ter| {
+                        eprintln!("DIAG site=E(sell_rem_divide) account={}", account);
+                        ter
+                    }) {
                     Ok(amount) => amount,
                     Err(ter) => return ter,
                 }
@@ -502,7 +522,11 @@ pub fn do_offer_create<V: ledger::ApplyView>(
             } else {
                 let product = match amount_or_exception(
                     rem_gets.try_multiply(&taker_pays, taker_pays.asset()),
-                ) {
+                )
+                .map_err(|ter| {
+                    eprintln!("DIAG site=F(nonsell_rem_multiply) account={}", account);
+                    ter
+                }) {
                     Ok(amount) => amount,
                     Err(ter) => return ter,
                 };
@@ -522,7 +546,11 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                     product.exponent(),
                     product.native()
                 );
-                match amount_or_exception(product.try_divide(&taker_gets, taker_pays.asset())) {
+                match amount_or_exception(product.try_divide(&taker_gets, taker_pays.asset()))
+                    .map_err(|ter| {
+                        eprintln!("DIAG site=G(nonsell_rem_divide) account={}", account);
+                        ter
+                    }) {
                     Ok(amount) => amount,
                     Err(ter) => return ter,
                 }
