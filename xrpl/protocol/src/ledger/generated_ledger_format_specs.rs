@@ -295,7 +295,7 @@ pub(crate) const LEDGER_FORMAT_SPECS: &[LedgerFormatSpecInit] = &[
             },
             LedgerFormatFieldSpec {
                 field_symbol: "sfOwnerCount",
-                style: SOEStyle::Default,
+                style: SOEStyle::Required,
             },
             LedgerFormatFieldSpec {
                 field_symbol: "sfPreviousTxnID",
