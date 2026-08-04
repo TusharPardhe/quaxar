@@ -181,6 +181,20 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         let rounded_quality = round_quality(quality, tick_size);
         // Convert rounded quality back to a rate STAmount for multiply/divide
         let rate_amount = quality_to_rate_amount(rounded_quality, &taker_pays, &taker_gets);
+        eprintln!(
+            "DIAG offer_create: tick_size={} quality={} rounded_quality={} rate_mantissa={} rate_exponent={} pays_mantissa={} pays_exponent={} pays_native={} gets_mantissa={} gets_exponent={} gets_native={}",
+            tick_size,
+            quality,
+            rounded_quality,
+            rate_amount.mantissa(),
+            rate_amount.exponent(),
+            taker_pays.mantissa(),
+            taker_pays.exponent(),
+            taker_pays.native(),
+            taker_gets.mantissa(),
+            taker_gets.exponent(),
+            taker_gets.native()
+        );
 
         if is_sell {
             // reference: saTakerPays = multiply(saTakerGets, rate, saTakerPays.asset())
