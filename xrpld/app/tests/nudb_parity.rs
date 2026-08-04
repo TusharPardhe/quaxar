@@ -1121,20 +1121,34 @@ fn mainnet_ledger_106053457_replay_reproduces_offer_create_divergence() {
     let (built, ters) = replay_child_ledger_unverified(&parent, acquired_header.clone(), &tx_items)
         .expect("replay child ledger");
 
-    // Print every non-tesSUCCESS/non-tecCLAIM result with its account+sequence
-    // so the exact failing transaction(s) and TER codes are visible without
-    // grepping production logs.
-    for ((tx_data, tx_id), ter) in tx_items.iter().zip(ters.iter()) {
+    // `replay_child_ledger_unverified` applies CanonicalTXSet order, while
+    // `ledger` RPC returns raw SHAMap order. Reconstruct the same canonical
+    // order before pairing TERs with transactions; zipping `tx_items` here
+    // misattributes failures to unrelated transactions.
+    let mut canonical = ledger::CanonicalTXSet::new(*acquired_header.tx_hash.as_uint256());
+    for (tx_data, _) in &tx_items {
         let mut outer = SerialIter::new(tx_data);
         let tx_bytes = outer.get_vl();
         let mut sit = SerialIter::new(&tx_bytes);
-        let sttx = STTx::from_serial_iter(&mut sit);
+        canonical.insert(Arc::new(STTx::from_serial_iter(&mut sit)));
+    }
+    let ordered_txs = canonical.drain_ordered();
+    assert_eq!(ordered_txs.len(), ters.len());
+
+    // Print every non-tesSUCCESS/non-tecCLAIM result with its account+sequence
+    // so the exact failing transaction(s) and TER codes are visible without
+    // grepping production logs.
+    for (sttx, ter) in ordered_txs.iter().zip(ters.iter()) {
         let account = sttx.get_account_id(protocol::get_field_by_symbol("sfAccount"));
         let seq = sttx.get_field_u32(protocol::get_field_by_symbol("sfSequence"));
         let is_success = matches!(*ter, Ter::TES_SUCCESS) || protocol::is_tec_claim(*ter);
         eprintln!(
             "mainnet_106053457: tx_id={} account={} seq={} ter={:?} ok={}",
-            tx_id, account, seq, ter, is_success
+            sttx.get_transaction_id(),
+            account,
+            seq,
+            ter,
+            is_success
         );
     }
 

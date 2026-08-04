@@ -897,6 +897,153 @@ fn submit_direct_apply_ticket_use_clears_ticket_tracking() {
 }
 
 #[test]
+fn submit_ticketed_offer_cancel_replays_canonical_ticket_preamble() {
+    // Mainnet ledger 106053457, tx
+    // 2CE664B532583AD41B24BB61AFC0E56382F8B1C619FF22CC5DA2A0A6F52ACD8C:
+    // OfferCancel is a no-op, but its TicketSequence consumes a ticket from
+    // owner-directory page 0xd2a while preserving AccountRoot.Sequence.
+    let source = protocol::parse_base58_account_id("rMsXVzCug7nUsMYFGPXBTWY732fRZqxgfY")
+        .expect("canonical account should parse");
+    let ticket_sequence = 83_432_963;
+    let owner_page = 0xd2a;
+    let offer_sequence = 83_432_938;
+    let retained_directory_key = Uint256::from_u64(1);
+    let mut parent = ledger_view_with_balance_and_owner_count(
+        106_053_456,
+        source,
+        83_433_003,
+        365_990_743,
+        68,
+        &[],
+    );
+
+    let mut seed = Sandbox::new(Arc::new(parent.clone()), ApplyFlags::NONE);
+    let account_keylet = account_keylet(raw_account_id(source));
+    let account_root = seed
+        .peek(account_keylet)
+        .expect("parent account lookup should succeed")
+        .expect("parent account should exist");
+    let mut account_object = account_root.clone_as_object();
+    account_object.set_field_u32(get_field_by_symbol("sfTicketCount"), 42);
+    seed.update(Arc::new(STLedgerEntry::from_stobject(
+        account_object,
+        *account_root.key(),
+    )))
+    .expect("parent account ticket count should update");
+
+    let ticket_keylet = protocol::ticket_keylet(raw_account_id(source), ticket_sequence);
+    assert_eq!(
+        ticket_keylet.key,
+        Uint256::from_hex("6AC24AC49A5F4F5C9FFE6F014D2E797037C51D07B1A8B58CB6C6157FE7D672AB")
+            .expect("canonical ticket key should parse")
+    );
+    let mut ticket = STLedgerEntry::new(ticket_keylet);
+    ticket.set_account_id(get_field_by_symbol("sfAccount"), source);
+    ticket.set_field_u32(get_field_by_symbol("sfTicketSequence"), ticket_sequence);
+    ticket.set_field_u64(get_field_by_symbol("sfOwnerNode"), owner_page);
+    seed.insert(Arc::new(ticket))
+        .expect("parent ticket should insert");
+
+    let owner_directory = protocol::owner_dir_keylet(raw_account_id(source));
+    assert_eq!(
+        owner_directory.key,
+        Uint256::from_hex("0A824FE4651E6709A9B7D46DBA2F938C7508B286F4083F614374249359A0381D")
+            .expect("canonical owner-directory root should parse")
+    );
+    let mut root = STLedgerEntry::new(owner_directory);
+    root.set_field_h256(get_field_by_symbol("sfRootIndex"), owner_directory.key);
+    root.set_account_id(get_field_by_symbol("sfOwner"), source);
+    root.set_field_u64(get_field_by_symbol("sfIndexNext"), owner_page);
+    root.set_field_u64(get_field_by_symbol("sfIndexPrevious"), owner_page);
+    seed.insert(Arc::new(root))
+        .expect("parent owner-directory root should insert");
+
+    let owner_page_keylet = protocol::page_keylet(owner_directory, owner_page);
+    assert_eq!(
+        owner_page_keylet.key,
+        Uint256::from_hex("BCF3866ABAC2AEA5015D5EE108F915840CD2FAF753311F2BACE72B51590AEB99")
+            .expect("canonical owner-directory page should parse")
+    );
+    let mut page = STLedgerEntry::new(owner_page_keylet);
+    page.set_field_h256(get_field_by_symbol("sfRootIndex"), owner_directory.key);
+    page.set_account_id(get_field_by_symbol("sfOwner"), source);
+    page.set_field_v256(
+        get_field_by_symbol("sfIndexes"),
+        protocol::STVector256::from_values(
+            get_field_by_symbol("sfIndexes"),
+            vec![ticket_keylet.key, retained_directory_key],
+        ),
+    );
+    seed.insert(Arc::new(page))
+        .expect("parent owner-directory page should insert");
+    seed.apply(&mut parent)
+        .expect("seeded parent state should apply");
+
+    let tx_bytes = basics::string_utilities::str_unhex(
+        "12000822000000002400000000201904F915EA201B06523F62202904F9160368400000000000000A7321ED2639E0869A74D7F5FEC402C343FABB29BF58754926DFFDA2C1338F9CFF8C85F774401A92A69C8E19C136C6EF5F39BC179173045D0847EDD73EC0713D040A2A749F644B55E94182F7785264E6892F9DE17EE97A2F0D427A33242275279F23B053260F8114DBDCCEC12FA9F832CB83A099B28B39B00CBB0C11",
+    )
+    .expect("canonical OfferCancel blob should decode");
+    let mut serial = protocol::SerialIter::new(&tx_bytes);
+    let tx = STTx::from_serial_iter(&mut serial);
+    assert!(
+        serial.empty(),
+        "canonical OfferCancel blob should fully parse"
+    );
+    assert_eq!(tx.get_account_id(get_field_by_symbol("sfAccount")), source);
+    assert_eq!(tx.get_seq_proxy(), SeqProxy::ticket(ticket_sequence));
+    assert_eq!(
+        tx.get_field_u32(get_field_by_symbol("sfOfferSequence")),
+        offer_sequence
+    );
+
+    let mut replay = Sandbox::new(Arc::new(parent), ApplyFlags::NONE);
+    assert_eq!(
+        apply_submit_transactor_shell(&mut replay, &tx, TxType::OFFER_CANCEL),
+        Ter::TES_SUCCESS
+    );
+
+    let account_root = replay
+        .read(account_keylet)
+        .expect("replayed account lookup should succeed")
+        .expect("replayed account should exist");
+    assert_eq!(
+        account_root.get_field_u32(get_field_by_symbol("sfSequence")),
+        83_433_003,
+        "ticketed OfferCancel must not advance AccountRoot.Sequence"
+    );
+    assert_eq!(
+        account_root.get_field_u32(get_field_by_symbol("sfOwnerCount")),
+        67
+    );
+    assert_eq!(
+        account_root.get_field_u32(get_field_by_symbol("sfTicketCount")),
+        41
+    );
+    assert_eq!(
+        account_root
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops(),
+        365_990_733
+    );
+    assert!(
+        !replay
+            .exists(ticket_keylet)
+            .expect("consumed ticket lookup should succeed")
+    );
+
+    let page = replay
+        .read(owner_page_keylet)
+        .expect("owner-directory page lookup should succeed")
+        .expect("the populated owner-directory page should remain");
+    assert_eq!(
+        page.get_field_v256(get_field_by_symbol("sfIndexes"))
+            .value(),
+        &[retained_directory_key]
+    );
+}
+
+#[test]
 fn submit_ticketed_escrow_create_consumes_ticket_preserves_sequence_and_rejects_reuse() {
     let destination = account("F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1F1");
     let (source, ticket_create) = signed_ticket_create_tx(0x63, 1, 1, 10);
