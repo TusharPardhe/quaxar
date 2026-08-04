@@ -200,13 +200,23 @@ impl<'a, V: ApplyView + ?Sized> ReadView for FlowSandbox<'a, V> {
 
 impl<'a, V: ApplyView + ?Sized> RawView for FlowSandbox<'a, V> {
     fn raw_insert(&mut self, sle: Arc<STLedgerEntry>) -> Result<(), ViewError> {
-        self.items.insert(
-            *sle.key(),
-            Entry {
-                action: Action::Insert,
-                sle,
-            },
-        );
+        let key = *sle.key();
+        // An erase followed by insert of the same key is a replacement of an
+        // SLE that exists in the parent view (directory root/page recreation
+        // after removing its final index is the canonical example). Propagate
+        // it as Modify; treating it as Insert makes the parent ApplyStateTable
+        // see an already-existing key and loses the replacement, leaving an
+        // Offer SLE pointing at stale book-directory membership.
+        let action = if self
+            .items
+            .get(&key)
+            .is_some_and(|existing| existing.action == Action::Erase)
+        {
+            Action::Modify
+        } else {
+            Action::Insert
+        };
+        self.items.insert(key, Entry { action, sle });
         Ok(())
     }
     fn raw_replace(&mut self, sle: Arc<STLedgerEntry>) -> Result<(), ViewError> {
