@@ -240,8 +240,21 @@ pub fn do_offer_create<V: ledger::ApplyView>(
 
     // --- DEX crossing via flow engine (reference flowCross calls flow()) ---
     // For passive offers, reference increments threshold so only strictly better offers are crossed.
+    // reference: Quality threshold{takerAmount.out, sendMax} in
+    // OfferCreate::flowCross (OfferCreate.cpp), where takerAmount.in =
+    // TakerGets, takerAmount.out = TakerPays, and sendMax defaults to
+    // takerAmount.in (TakerGets, absent a gateway transfer rate). That
+    // reduces to getRate(TakerPays, TakerGets) = TakerGets / TakerPays --
+    // the SAME quality formula book_step.rs uses for each candidate offer
+    // (`Quality::from_amounts(&Amounts::new(offer_taker_gets,
+    // offer_taker_pays))`). Amounts::new takes (in, out) positionally, so
+    // this must be (taker_gets, taker_pays) here too, not (taker_pays,
+    // taker_gets) -- the previous ordering computed the reciprocal
+    // (TakerPays / TakerGets), comparing against candidate offer qualities
+    // on the wrong scale and letting through offers that should have been
+    // rejected as worse than this offer's own quality.
     let mut quality_threshold =
-        Quality::from_amounts(&Amounts::new(taker_pays.clone(), taker_gets.clone()));
+        Quality::from_amounts(&Amounts::new(taker_gets.clone(), taker_pays.clone()));
     if is_passive {
         // offers do not cross. Quality::increment preserves stored XRPL
         // quality ordering instead of approximating with floating point.
