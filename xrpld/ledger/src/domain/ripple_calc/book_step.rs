@@ -141,6 +141,16 @@ pub fn execute_book_step<V: ApplyView>(
             // So quality = get_rate(offer_TakerPays, offer_TakerGets) — what taker gets per unit given.
             let offer_quality =
                 Quality::from_amounts(&Amounts::new(taker_gets.clone(), taker_pays.clone()));
+            eprintln!(
+                "DIAG book_step: threshold_value={} offer_quality_value={} offer_owner_below={} offer_taker_gets_mantissa={} offer_taker_gets_exp={} offer_taker_pays_mantissa={} offer_taker_pays_exp={}",
+                threshold.value(),
+                offer_quality.value(),
+                offer_quality < threshold,
+                taker_gets.mantissa(),
+                taker_gets.exponent(),
+                taker_pays.mantissa(),
+                taker_pays.exponent()
+            );
             if offer_quality < threshold {
                 break;
             }
