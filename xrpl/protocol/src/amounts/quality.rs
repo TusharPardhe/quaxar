@@ -345,12 +345,19 @@ pub fn try_multiply(
     asset: impl Into<Asset>,
 ) -> Result<STAmount, AmountError> {
     let asset = asset.into();
+    eprintln!(
+        "DIAG try_multiply ENTRY: v1_native={} v1_mantissa={} v1_exp={} v2_native={} v2_mantissa={} v2_exp={} asset_native={}",
+        v1.native(), v1.mantissa(), v1.exponent(),
+        v2.native(), v2.mantissa(), v2.exponent(),
+        asset.native()
+    );
 
     if v1.signum() == 0 || v2.signum() == 0 {
         return STAmount::try_new_with_asset(sf_generic(), asset, 0, 0, false);
     }
 
     if v1.native() && v2.native() && asset.native() {
+        eprintln!("DIAG try_multiply: taking native*native*native branch");
         let min_v = signed_native_value(v1).min(signed_native_value(v2));
         let max_v = signed_native_value(v1).max(signed_native_value(v2));
 
