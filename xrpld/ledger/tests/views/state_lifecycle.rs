@@ -2,18 +2,20 @@ use basics::base_uint::Uint256;
 use basics::intrusive_pointer::make_shared_intrusive;
 use basics::sha_map_hash::SHAMapHash;
 use ledger::{
-    ApplyView, Fees, FlowSandbox, Ledger, LedgerHeader, SLCF_NO_CONSENSUS_TIME, Sandbox,
-    amendments_key, calculate_ledger_hash, encode_amendments_entry, encode_fee_settings_entry,
-    fees_key,
+    ApplyView, Fees, FlowSandbox, Ledger, LedgerHeader, OpenView, ReadView, SLCF_NO_CONSENSUS_TIME,
+    Sandbox, adjust_owner_count, amendments_key, calculate_ledger_hash, dir_append, dir_insert,
+    encode_amendments_entry, encode_fee_settings_entry, fees_key,
 };
 use protocol::{
-    AccountID, ApplyFlags, STAmount, STLedgerEntry, XRPAmount, account_keylet, feature_xrp_fees,
-    get_field_by_symbol,
+    AccountID, ApplyFlags, LedgerEntryType, STAmount, STLedgerEntry, Ter, XRPAmount,
+    account_keylet, directory_node_keylet, feature_xrp_fees, get_field_by_symbol, offer_keylet,
+    owner_dir_keylet, page_keylet,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
 use shamap::sync::{SHAMapType, SyncState, SyncTree};
 use shamap::tree_node::{SHAMapNodeType, SHAMapTreeNode};
+use std::sync::Arc;
 
 #[test]
 fn flow_sandbox_explicit_flags_override_parent_flags() {
@@ -149,6 +151,253 @@ fn sandbox_apply_with_tx_thread_updates_threaded_sles() {
             .xrp()
             .drops(),
         900
+    );
+}
+
+#[test]
+fn same_ledger_offer_sequence_cancel_sees_committed_owner_directory_page() {
+    let ledger_seq = 106_053_457;
+    let owner = account(0x44);
+    let owner_id = basics::base_uint::Uint160::from_slice(owner.data()).expect("account width");
+    let account_keylet = account_keylet(owner_id);
+    let owner_dir = owner_dir_keylet(owner_id);
+    let offer_a_keylet = offer_keylet(owner_id, 765);
+    let successor_offer_keylet = offer_keylet(owner_id, 766);
+    let book_directory = Uint256::from_array([0xB7; 32]);
+    let book_dir = directory_node_keylet(book_directory);
+
+    let mut account_root =
+        STLedgerEntry::from_type_and_key(LedgerEntryType::AccountRoot, account_keylet.key);
+    account_root.set_account_id(get_field_by_symbol("sfAccount"), owner);
+    account_root.set_field_amount(
+        get_field_by_symbol("sfBalance"),
+        STAmount::from_xrp_amount(XRPAmount::from_drops(10_000_000_000)),
+    );
+    account_root.set_field_u32(get_field_by_symbol("sfSequence"), 765);
+    account_root.set_field_u32(get_field_by_symbol("sfOwnerCount"), 0);
+
+    let state_map = build_state_map_with_items(
+        &[(
+            account_keylet.key,
+            account_root.get_serializer().data().to_vec(),
+        )],
+        // An acquired ledger root is shareable (cowid 0). Use a smaller
+        // fixture COW id than Ledger's first global mutable-tree id so this
+        // test exercises directory propagation rather than fixture setup.
+        1,
+    );
+    let mut built = Ledger::from_maps(
+        LedgerHeader {
+            seq: ledger_seq,
+            ..LedgerHeader::default()
+        },
+        state_map,
+        SyncTree::new_with_type(SHAMapType::Transaction, false, ledger_seq),
+    );
+
+    // Fill the owner root before the transaction so OfferCreate A must land on
+    // page 1, matching the production failure where that page was lost between
+    // two transactions in ledger 106053457.
+    let mut seed = Sandbox::new(Arc::new(built.clone()), ApplyFlags::NONE);
+    for key in (1..=32).map(Uint256::from_u64) {
+        assert_eq!(
+            dir_insert(&mut seed, &owner_dir, key, &|_| {}).expect("seed owner directory"),
+            Some(0)
+        );
+    }
+    seed.apply(&mut built)
+        .expect("commit seeded owner directory");
+
+    // Accepted-ledger construction accumulates each transaction in OpenView;
+    // every subsequent transaction receives a clone of this live accumulator.
+    let mut accumulated = OpenView::new_closed(Arc::new(built.clone()));
+
+    // Transaction A: create an offer through the same nested FlowSandbox that
+    // the transaction shell uses, then commit its sandbox to the built ledger.
+    let mut create_tx = Sandbox::new(Arc::new(accumulated.clone()), ApplyFlags::NONE);
+    {
+        let mut tx_view = FlowSandbox::new(&mut create_tx);
+        let owner_page = dir_insert(&mut tx_view, &owner_dir, offer_a_keylet.key, &|_| {})
+            .expect("insert offer into owner directory")
+            .expect("owner directory has another page");
+        assert_eq!(owner_page, 1);
+        let book_page = dir_append(&mut tx_view, &book_dir, offer_a_keylet.key, &|_| {})
+            .expect("insert offer into book directory")
+            .expect("book directory has a page");
+
+        let mut offer =
+            STLedgerEntry::from_type_and_key(LedgerEntryType::Offer, offer_a_keylet.key);
+        offer.set_account_id(get_field_by_symbol("sfAccount"), owner);
+        offer.set_field_h256(get_field_by_symbol("sfBookDirectory"), book_directory);
+        offer.set_field_u64(get_field_by_symbol("sfOwnerNode"), owner_page);
+        offer.set_field_u64(get_field_by_symbol("sfBookNode"), book_page);
+        tx_view.insert(Arc::new(offer)).expect("insert offer SLE");
+        let account = tx_view
+            .peek(account_keylet)
+            .expect("read owner account")
+            .expect("owner account exists");
+        adjust_owner_count(&mut tx_view, &account, 1).expect("increment owner count");
+        tx_view.apply().expect("apply transaction sandbox");
+    }
+    let rules = built.rules().clone();
+    create_tx
+        .apply_with_tx_thread(
+            &mut accumulated,
+            Uint256::from_array([0x76; 32]),
+            ledger_seq,
+            &rules,
+        )
+        .expect("commit offer transaction");
+
+    let owner_page_keylet = page_keylet(owner_dir, 1);
+    let owner_root_after_create = accumulated
+        .read(owner_dir)
+        .expect("read committed owner root")
+        .expect("owner root must propagate to the next transaction");
+    assert_eq!(
+        owner_root_after_create.get_field_u64(get_field_by_symbol("sfIndexNext")),
+        1,
+        "the root forward link must retain canonical owner page 1"
+    );
+    assert_eq!(
+        owner_root_after_create.get_field_u64(get_field_by_symbol("sfIndexPrevious")),
+        1,
+        "the root backward link must retain canonical owner page 1"
+    );
+    let page_after_create = accumulated
+        .read(owner_page_keylet)
+        .expect("read committed owner page")
+        .expect("owner page 1 must propagate to the next transaction");
+    assert!(
+        page_after_create
+            .get_field_v256(get_field_by_symbol("sfIndexes"))
+            .value()
+            .contains(&offer_a_keylet.key),
+        "the committed owner page must contain OfferCreate A before OfferSequence cancellation"
+    );
+
+    // Transaction B creates the successor offer in the same ledger and on the
+    // same owner-directory page. It must observe A's committed page entry
+    // instead of recreating page 1 from a stale transaction base.
+    let mut successor_tx = Sandbox::new(Arc::new(accumulated.clone()), ApplyFlags::NONE);
+    {
+        let mut tx_view = FlowSandbox::new(&mut successor_tx);
+        let owner_page = dir_insert(
+            &mut tx_view,
+            &owner_dir,
+            successor_offer_keylet.key,
+            &|_| {},
+        )
+        .expect("insert successor offer into owner directory")
+        .expect("owner directory page exists");
+        assert_eq!(owner_page, 1);
+        let book_page = dir_append(&mut tx_view, &book_dir, successor_offer_keylet.key, &|_| {})
+            .expect("insert successor offer into book directory")
+            .expect("book directory has a page");
+
+        let mut offer =
+            STLedgerEntry::from_type_and_key(LedgerEntryType::Offer, successor_offer_keylet.key);
+        offer.set_account_id(get_field_by_symbol("sfAccount"), owner);
+        offer.set_field_h256(get_field_by_symbol("sfBookDirectory"), book_directory);
+        offer.set_field_u64(get_field_by_symbol("sfOwnerNode"), owner_page);
+        offer.set_field_u64(get_field_by_symbol("sfBookNode"), book_page);
+        tx_view
+            .insert(Arc::new(offer))
+            .expect("insert successor offer SLE");
+        let account = tx_view
+            .peek(account_keylet)
+            .expect("read owner account")
+            .expect("owner account exists");
+        adjust_owner_count(&mut tx_view, &account, 1).expect("increment owner count");
+        tx_view
+            .apply()
+            .expect("apply successor transaction sandbox");
+    }
+    let rules = built.rules().clone();
+    successor_tx
+        .apply_with_tx_thread(
+            &mut accumulated,
+            Uint256::from_array([0x78; 32]),
+            ledger_seq,
+            &rules,
+        )
+        .expect("commit successor offer transaction");
+    let page_after_successor = accumulated
+        .read(owner_page_keylet)
+        .expect("read owner page after successor")
+        .expect("owner page 1 must persist after successor offer");
+    let successor_indexes = page_after_successor.get_field_v256(get_field_by_symbol("sfIndexes"));
+    assert!(successor_indexes.value().contains(&offer_a_keylet.key));
+    assert!(
+        successor_indexes
+            .value()
+            .contains(&successor_offer_keylet.key)
+    );
+
+    // Transaction C: resolve A exactly as OfferSequence cancellation does,
+    // then use the production offer_delete helper for directory cleanup.
+    let mut cancel_tx = Sandbox::new(Arc::new(accumulated.clone()), ApplyFlags::NONE);
+    let offer_a = cancel_tx
+        .peek(offer_a_keylet)
+        .expect("resolve OfferSequence target")
+        .expect("OfferCreate A must be visible in the next transaction");
+    let page_before_cancel = cancel_tx
+        .read(owner_page_keylet)
+        .expect("read owner page before cancel")
+        .expect("owner page must be visible before cancel");
+    assert!(
+        page_before_cancel
+            .get_field_v256(get_field_by_symbol("sfIndexes"))
+            .value()
+            .contains(&offer_a_keylet.key)
+    );
+    assert_eq!(
+        ledger::offer_helpers::offer_delete(&mut cancel_tx, offer_a).expect("delete offer"),
+        Ter::TES_SUCCESS,
+        "owner-directory removal must not be weakened into a tefBAD_LEDGER bypass"
+    );
+    assert_eq!(
+        cancel_tx
+            .read(account_keylet)
+            .expect("read decremented account")
+            .expect("account remains")
+            .get_field_u32(get_field_by_symbol("sfOwnerCount")),
+        1
+    );
+
+    let rules = built.rules().clone();
+    cancel_tx
+        .apply_with_tx_thread(
+            &mut accumulated,
+            Uint256::from_array([0x77; 32]),
+            ledger_seq,
+            &rules,
+        )
+        .expect("commit cancellation transaction");
+    accumulated
+        .apply_state_only(&mut built)
+        .expect("publish accumulated state");
+    assert!(
+        built
+            .read(offer_a_keylet)
+            .expect("read removed offer")
+            .is_none(),
+        "OfferCreate A must be removed after cancellation"
+    );
+    let final_owner_page = built
+        .read(owner_page_keylet)
+        .expect("read surviving owner page")
+        .expect("owner page 1 must remain for the successor offer");
+    let final_indexes = final_owner_page.get_field_v256(get_field_by_symbol("sfIndexes"));
+    assert!(!final_indexes.value().contains(&offer_a_keylet.key));
+    assert!(final_indexes.value().contains(&successor_offer_keylet.key));
+    assert_eq!(
+        built
+            .read(account_keylet)
+            .expect("read final account")
+            .expect("account remains")
+            .get_field_u32(get_field_by_symbol("sfOwnerCount")),
+        1
     );
 }
 

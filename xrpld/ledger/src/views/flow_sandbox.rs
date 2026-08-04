@@ -71,15 +71,37 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
 
     /// Apply all captured changes to the parent view. Call on tesSUCCESS.
     pub fn apply(self) -> Result<(), ViewError> {
-        for (_key, entry) in self.items {
+        for (key, entry) in self.items {
             match entry.action {
                 Action::Insert => {
                     self.parent.insert(entry.sle)?;
                 }
                 Action::Modify => {
+                    // A FlowSandbox may have obtained this SLE through `read`,
+                    // which deliberately does not populate the parent's
+                    // ApplyStateTable. `ApplyView::update` requires that
+                    // checkout, so make it explicit before forwarding the
+                    // child modification. This is essential for directory
+                    // pages changed by one transaction to remain visible to
+                    // later transactions in the same ledger build.
+                    let keylet = Keylet::new(entry.sle.get_type(), key);
+                    if self.parent.peek(keylet)?.is_none() {
+                        return Err(ViewError::Conversion(
+                            "FlowSandbox::apply: modified parent entry disappeared".into(),
+                        ));
+                    }
                     self.parent.update(entry.sle)?;
                 }
                 Action::Erase => {
+                    // As with Modify, erase must first establish the parent's
+                    // checkout. Otherwise an owner-directory removal can be
+                    // rejected despite the child having resolved the page.
+                    let keylet = Keylet::new(entry.sle.get_type(), key);
+                    if self.parent.peek(keylet)?.is_none() {
+                        return Err(ViewError::Conversion(
+                            "FlowSandbox::apply: erased parent entry disappeared".into(),
+                        ));
+                    }
                     self.parent.erase(entry.sle)?;
                 }
             }
@@ -267,6 +289,45 @@ mod tests {
     use basics::base_uint::Uint256;
     use protocol::{ApplyFlags, LedgerEntryType};
     use std::sync::Arc;
+
+    #[test]
+    fn apply_checks_out_parent_directory_page_before_propagating_replace() {
+        let page_keylet = Keylet::new(LedgerEntryType::DirectoryNode, Uint256::from_u64(88));
+        let mut page = STLedgerEntry::new(page_keylet);
+        page.set_field_u64(protocol::get_field_by_symbol("sfIndexNext"), 0);
+
+        let mut base = Ledger::new(LedgerHeader::default(), false);
+        base.raw_insert(Arc::new(page.clone()))
+            .expect("seed parent directory page");
+        let mut parent = Sandbox::new(Arc::new(base), ApplyFlags::default());
+
+        {
+            let mut child = FlowSandbox::new(&mut parent);
+            // Read intentionally bypasses the parent ApplyStateTable checkout.
+            let read_page = child
+                .read(page_keylet)
+                .expect("child read")
+                .expect("directory page exists");
+            let mut replacement = read_page.clone_as_object();
+            replacement.set_field_u64(protocol::get_field_by_symbol("sfIndexNext"), 1);
+            child
+                .raw_replace(Arc::new(STLedgerEntry::from_stobject(
+                    replacement,
+                    page_keylet.key,
+                )))
+                .expect("stage page replacement");
+            child.apply().expect("propagate directory page replacement");
+        }
+
+        assert_eq!(
+            parent
+                .read(page_keylet)
+                .expect("read propagated page")
+                .expect("directory page remains")
+                .get_field_u64(protocol::get_field_by_symbol("sfIndexNext")),
+            1
+        );
+    }
 
     #[test]
     fn dropped_sandbox_never_mutates_parent() {

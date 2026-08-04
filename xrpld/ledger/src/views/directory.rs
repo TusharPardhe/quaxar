@@ -156,13 +156,24 @@ fn insert_page(
         return Ok(None);
     }
 
-    view.raw_replace(sle_update(node, |obj| {
-        obj.set_field_u64(sf("sfIndexNext"), new_page);
-    }))?;
+    if node.key() == next.key() {
+        // The first overflow page links the root to itself. Both link fields
+        // must be written from one SLE snapshot: issuing two replacements from
+        // the same original root drops whichever field the second write does
+        // not set.
+        view.raw_replace(sle_update(node, |obj| {
+            obj.set_field_u64(sf("sfIndexNext"), new_page);
+            obj.set_field_u64(sf("sfIndexPrevious"), new_page);
+        }))?;
+    } else {
+        view.raw_replace(sle_update(node, |obj| {
+            obj.set_field_u64(sf("sfIndexNext"), new_page);
+        }))?;
 
-    view.raw_replace(sle_update(next, |obj| {
-        obj.set_field_u64(sf("sfIndexPrevious"), new_page);
-    }))?;
+        view.raw_replace(sle_update(next, |obj| {
+            obj.set_field_u64(sf("sfIndexPrevious"), new_page);
+        }))?;
+    }
 
     let pk = page_kl(directory, new_page);
     let mut new_node = STLedgerEntry::new(pk);
