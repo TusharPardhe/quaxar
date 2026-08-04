@@ -1146,6 +1146,29 @@ fn mainnet_ledger_106053457_replay_reproduces_offer_create_divergence() {
         acquired_header.hash
     );
 
+    // Targeted diagnostic: compare the target account's built AccountRoot
+    // against the canonical public state to narrow down any remaining
+    // discrepancy once all transactions apply successfully.
+    if let Ok(target_uint160) =
+        basics::base_uint::Uint160::from_hex("72A3DE6B0973062D5F2FE77383EF02F0C17901AB")
+    {
+        let keylet = protocol::account_keylet(target_uint160);
+        if let Ok(Some(sle)) = built.read(keylet) {
+            eprintln!(
+                "mainnet_106053457: built target AccountRoot json={:?}",
+                sle.json(JsonOptions::NONE)
+            );
+        } else {
+            eprintln!("mainnet_106053457: built target AccountRoot MISSING");
+        }
+        if let Ok(public_entry) = fetch_ledger_entry_json(XRPL_RPC_URL, child_seq, keylet.key) {
+            eprintln!(
+                "mainnet_106053457: public target AccountRoot json={}",
+                public_entry
+            );
+        }
+    }
+
     // Intentionally not asserting equality yet — this test exists to
     // reproduce and observe the divergence deterministically. Once the root
     // cause is fixed, promote these to hard assertions.
