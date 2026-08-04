@@ -418,6 +418,12 @@ pub fn try_multiply(
     let amount =
         muldiv(value1, value2, TEN_TO_14).map_err(|_| AmountError::ArithmeticOverflow)? + 7;
 
+    eprintln!(
+        "DIAG try_multiply: value1={} value2={} offset1={} offset2={} amount={} final_offset={} asset_native={} asset_integral={}",
+        value1, value2, offset1, offset2, amount, offset1 + offset2 + 14,
+        asset.native(), asset.integral()
+    );
+
     STAmount::try_new_with_asset(
         sf_generic(),
         asset,
