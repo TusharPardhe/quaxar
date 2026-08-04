@@ -124,11 +124,34 @@ fn adjust_owner_count<V: ApplyView>(view: &mut V, account_sle: &STLedgerEntry, a
 fn trust_delete<V: ApplyView>(
     view: &mut V,
     state: &STLedgerEntry,
-    _low_account: &AccountID,
-    _high_account: &AccountID,
+    low_account: &AccountID,
+    high_account: &AccountID,
 ) -> Ter {
-    // Remove from both owner directories and delete the entry
-    let _ = view.erase(Arc::new(state.clone()));
+    // Payment-path trust line deletion must mirror the canonical TrustSet
+    // deletion lifecycle: a zeroed RippleState is removed from both owners'
+    // directories before its SLE is erased. Previously this helper only erased
+    // the line itself, leaving stale directory entries unmodified and thus
+    // unthreaded in the accepted ledger.
+    let line_key = *state.key();
+    let low_node = state.get_field_u64(sf("sfLowNode"));
+    let low_dir =
+        protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(low_account.data()));
+    if !crate::dir_remove(view, &low_dir, low_node, line_key, false).unwrap_or(false) {
+        return Ter::TEF_BAD_LEDGER;
+    }
+
+    let high_node = state.get_field_u64(sf("sfHighNode"));
+    let high_dir =
+        protocol::owner_dir_keylet(basics::base_uint::Uint160::from_void(high_account.data()));
+    if !crate::dir_remove(view, &high_dir, high_node, line_key, false).unwrap_or(false) {
+        return Ter::TEF_BAD_LEDGER;
+    }
+
+    // update_trust_line already released the applicable reserve/owner count
+    // before selecting this delete path. Do not decrement it a second time.
+    if view.erase(Arc::new(state.clone())).is_err() {
+        return Ter::TEF_BAD_LEDGER;
+    }
     Ter::TES_SUCCESS
 }
 
