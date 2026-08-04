@@ -302,7 +302,15 @@ pub fn execute_book_step_with_options<V: ApplyView>(
         {
             let amm_quality_ok = match quality_threshold {
                 Some(threshold) => {
-                    Quality::from_amounts(&Amounts::new(amm_gets.clone(), amm_pays.clone()))
+                    // `amm_pays` is what the taker sends (Book input) and
+                    // `amm_gets` is what the taker receives (Book output).
+                    // This must use the same raw (input, output) orientation
+                    // as the CLOB offer-quality comparison above. Reversing
+                    // these operands takes the reciprocal quality and can
+                    // admit an AMM whose effective rate is far worse than an
+                    // OfferCreate limit; reverse probing then attempts an
+                    // oversized native-asset trade.
+                    Quality::from_amounts(&Amounts::new(amm_pays.clone(), amm_gets.clone()))
                         >= threshold
                 }
                 None => true,
