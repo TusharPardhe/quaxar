@@ -8,7 +8,7 @@ use protocol::{
 };
 
 use crate::apply_state_table::ApplyStateTable;
-use crate::raw_view::RawView;
+use crate::raw_view::{RawView, ReadRawView};
 use crate::read_view::{ReadView, ReadViewTx, ViewError};
 use crate::{ApplyView, Fees, LedgerHeader};
 
@@ -37,7 +37,7 @@ where
 
     pub fn apply_with_tx_thread(
         &self,
-        to: &mut dyn RawView,
+        to: &mut dyn ReadRawView,
         tx_id: Uint256,
         ledger_seq: u32,
         rules: &Rules,

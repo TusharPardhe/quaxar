@@ -200,7 +200,7 @@ pub use protocol::{
     serialize_prefixed_ledger_header,
 };
 pub use raw_state_table::RawStateTable;
-pub use raw_view::{RawView, TxsRawView, TypedRawViewExt};
+pub use raw_view::{RawView, ReadRawView, TxsRawView, TypedRawViewExt};
 pub use read_view::{
     DigestAwareReadView, ReadView, ReadViewTx, TypedLedgerEntryRef, TypedReadViewExt, ViewError,
     after, are_compatible, compatibility_reason, has_expired, make_rules_given_ledger,

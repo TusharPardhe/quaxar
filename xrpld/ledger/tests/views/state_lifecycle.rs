@@ -7,9 +7,9 @@ use ledger::{
     encode_amendments_entry, encode_fee_settings_entry, fees_key,
 };
 use protocol::{
-    AccountID, ApplyFlags, LedgerEntryType, STAmount, STLedgerEntry, Ter, XRPAmount,
-    account_keylet, directory_node_keylet, feature_xrp_fees, get_field_by_symbol, offer_keylet,
-    owner_dir_keylet, page_keylet,
+    AccountID, ApplyFlags, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry, Ter,
+    XRPAmount, account_keylet, currency_from_string, directory_node_keylet, feature_xrp_fees,
+    get_field_by_symbol, line, offer_keylet, owner_dir_keylet, page_keylet, sf_generic,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -152,6 +152,140 @@ fn sandbox_apply_with_tx_thread_updates_threaded_sles() {
             .drops(),
         900
     );
+}
+
+#[test]
+fn erased_ripple_state_threads_untouched_owners_after_nested_flow_sandbox() {
+    let ledger_seq = 106_053_457;
+    let low = account(0x44);
+    let high = account(0x55);
+    let low_keylet = account_keylet(
+        basics::base_uint::Uint160::from_slice(low.data()).expect("low account width"),
+    );
+    let high_keylet = account_keylet(
+        basics::base_uint::Uint160::from_slice(high.data()).expect("high account width"),
+    );
+    let currency = currency_from_string("USD");
+    let ripple_state_keylet = line(low, high, currency);
+    let previous_low_tx = sample_uint256(0xA1);
+    let previous_high_tx = sample_uint256(0xA2);
+    let current_tx = sample_uint256(0xB2);
+
+    let account_root =
+        |owner: AccountID, keylet: protocol::Keylet, balance, sequence, previous_tx| {
+            let mut root =
+                STLedgerEntry::from_type_and_key(LedgerEntryType::AccountRoot, keylet.key);
+            root.set_account_id(get_field_by_symbol("sfAccount"), owner);
+            root.set_field_amount(
+                get_field_by_symbol("sfBalance"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(balance)),
+            );
+            root.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+            root.set_field_u32(get_field_by_symbol("sfOwnerCount"), 7);
+            root.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), previous_tx);
+            root.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), ledger_seq - 1);
+            root
+        };
+    let low_root = account_root(low, low_keylet, 1_000, 10, previous_low_tx);
+    let high_root = account_root(high, high_keylet, 2_000, 20, previous_high_tx);
+
+    let iou = |value, issuer| {
+        STAmount::from_iou_amount(
+            sf_generic(),
+            IOUAmount::from_parts(value, 0).expect("canonical IOU amount"),
+            Issue::new(currency, issuer),
+        )
+    };
+    let mut ripple_state =
+        STLedgerEntry::from_type_and_key(LedgerEntryType::RippleState, ripple_state_keylet.key);
+    ripple_state.set_field_amount(get_field_by_symbol("sfBalance"), iou(0, low));
+    ripple_state.set_field_amount(get_field_by_symbol("sfLowLimit"), iou(100, low));
+    ripple_state.set_field_amount(get_field_by_symbol("sfHighLimit"), iou(200, high));
+    ripple_state.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), sample_uint256(0xA3));
+    ripple_state.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), ledger_seq - 1);
+
+    let state_map = build_state_map_with_items(
+        &[
+            (low_keylet.key, low_root.get_serializer().data().to_vec()),
+            (high_keylet.key, high_root.get_serializer().data().to_vec()),
+            (
+                ripple_state_keylet.key,
+                ripple_state.get_serializer().data().to_vec(),
+            ),
+        ],
+        // Keep fixture COW ownership below Ledger's mutable-tree allocation,
+        // while the LedgerHeader below retains the transaction ledger sequence.
+        1,
+    );
+    let base = Ledger::from_maps(
+        LedgerHeader {
+            seq: ledger_seq,
+            ..LedgerHeader::default()
+        },
+        state_map.clone(),
+        SyncTree::new_with_type(SHAMapType::Transaction, true, ledger_seq),
+    );
+    let mut built = Ledger::from_maps(
+        base.header(),
+        state_map,
+        SyncTree::new_with_type(SHAMapType::Transaction, true, ledger_seq),
+    );
+
+    let mut sandbox = Sandbox::new(Arc::new(base), ApplyFlags::NONE);
+    {
+        let mut flow = FlowSandbox::new(&mut sandbox);
+        let line = flow
+            .peek(ripple_state_keylet)
+            .expect("peek RippleState")
+            .expect("RippleState exists");
+        flow.erase(line).expect("erase RippleState in flow sandbox");
+        flow.apply()
+            .expect("propagate RippleState erase to parent sandbox");
+    }
+
+    let rules = built.rules().clone();
+    sandbox
+        .apply_with_tx_thread(&mut built, current_tx, ledger_seq, &rules)
+        .expect("commit threaded RippleState deletion");
+
+    assert!(
+        built
+            .read(ripple_state_keylet)
+            .expect("read deleted RippleState")
+            .is_none()
+    );
+    for (keylet, balance, sequence) in [(low_keylet, 1_000, 10), (high_keylet, 2_000, 20)] {
+        let owner = built
+            .read(keylet)
+            .expect("read threaded owner")
+            .expect("owner AccountRoot remains");
+        assert_eq!(
+            owner.get_field_h256(get_field_by_symbol("sfPreviousTxnID")),
+            current_tx
+        );
+        assert_eq!(
+            owner.get_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq")),
+            ledger_seq
+        );
+        assert_eq!(
+            owner
+                .get_field_amount(get_field_by_symbol("sfBalance"))
+                .xrp()
+                .drops(),
+            balance,
+            "owner business balance must remain unchanged"
+        );
+        assert_eq!(
+            owner.get_field_u32(get_field_by_symbol("sfSequence")),
+            sequence,
+            "owner business sequence must remain unchanged"
+        );
+        assert_eq!(
+            owner.get_field_u32(get_field_by_symbol("sfOwnerCount")),
+            7,
+            "owner business owner count must remain unchanged"
+        );
+    }
 }
 
 #[test]

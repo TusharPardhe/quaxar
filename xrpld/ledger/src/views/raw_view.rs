@@ -6,7 +6,7 @@ use basics::base_uint::Uint256;
 use protocol::{STLedgerEntry, Serializer, XRPAmount};
 
 use crate::Ledger;
-use crate::read_view::{TypedLedgerEntryRef, ViewError};
+use crate::read_view::{ReadView, TypedLedgerEntryRef, ViewError};
 
 fn decode_batch_sle(payload: &[u8], key: Uint256) -> Result<Arc<STLedgerEntry>, ViewError> {
     if payload.is_empty() {
@@ -30,6 +30,14 @@ fn decode_batch_sle(payload: &[u8], key: Uint256) -> Result<Arc<STLedgerEntry>, 
         ))
     })
 }
+
+/// A mutable view that can also resolve its current ledger state.
+///
+/// Transaction threading uses this to add AccountRoot modifications for owners
+/// of deleted ledger entries that were not otherwise changed by the transaction.
+pub trait ReadRawView: ReadView + RawView {}
+
+impl<T> ReadRawView for T where T: ReadView + RawView + ?Sized {}
 
 pub trait RawView {
     fn raw_erase(&mut self, sle: Arc<STLedgerEntry>) -> Result<(), ViewError>;
