@@ -974,6 +974,8 @@ fn reconcile_preferred_lcl(
         selected_trusted_validation_count = root.validations().num_trusted_for_ledger(preferred_hash),
         selected_peer_lcl_support = peer_counts.get(&preferred_hash).copied().unwrap_or_default(),
         validation_selection_source = ?preference_diagnostic.selection_source,
+        validation_acquired_recovery_candidate = ?preference_diagnostic.acquired_recovery_candidate,
+        validation_acquired_recovery_peer_support = ?preference_diagnostic.acquired_recovery_peer_support,
         validation_working_source = ?preference_diagnostic.working_source,
         "LCL trace: preferred-LCL selection evaluated"
     );
@@ -998,6 +1000,8 @@ fn reconcile_preferred_lcl(
             selected_peer_lcl_support = peer_counts.get(&preferred_hash).copied().unwrap_or_default(),
             validation_working_source = ?preference_diagnostic.working_source,
             validation_selection_source = ?preference_diagnostic.selection_source,
+            validation_acquired_recovery_candidate = ?preference_diagnostic.acquired_recovery_candidate,
+            validation_acquired_recovery_peer_support = ?preference_diagnostic.acquired_recovery_peer_support,
             validation_trie_preferred = ?preference_diagnostic.trie_preferred,
             validation_acquiring_preferred = ?preference_diagnostic.acquiring_preferred,
             validation_working_preferred = ?preference_diagnostic.working_preferred,
@@ -1039,6 +1043,10 @@ fn reconcile_preferred_lcl(
         return PreferredLclReconciliation::NoChange;
     }
 
+    // An `AcquiredRecoveryCandidate` can override a stale below-minimum trie
+    // preference, but it is only a verified target selection. The resolver,
+    // completeness, currentness, and compatibility checks below remain the
+    // sole authority for promoting it to the local closed ledger.
     let candidate = root
         .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash))
         // `checkLastClosedLedger` immediately asks InboundLedgers for a

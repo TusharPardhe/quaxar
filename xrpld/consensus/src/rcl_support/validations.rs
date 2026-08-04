@@ -81,6 +81,11 @@ pub enum PreferredLclWorkingSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreferredLclSelectionSource {
     WorkingPreferred,
+    /// A stale validation-trie preference was below `min_seq`, but a
+    /// separately acquired ledger has current trusted full validation support
+    /// and a strict peer-LCL majority. NetworkOPs must still admit the
+    /// resolved ledger before switching the local LCL.
+    AcquiredRecoveryCandidate,
     LocalBelowMinSeq,
     PeerFallback,
     LocalNoPreference,
@@ -95,6 +100,11 @@ pub struct PreferredLclDiagnostic<Seq, Id> {
     pub trie_preferred: Option<(Seq, Id)>,
     pub acquiring_preferred: Option<(Seq, Id)>,
     pub working_preferred: Option<(Seq, Id)>,
+    /// A verified, acquired recovery target considered only when the trie
+    /// preference is stale. The final switch remains subject to NetworkOPs'
+    /// completeness and compatibility admission checks.
+    pub acquired_recovery_candidate: Option<(Seq, Id)>,
+    pub acquired_recovery_peer_support: Option<u32>,
     pub working_source: PreferredLclWorkingSource,
     pub selection_source: PreferredLclSelectionSource,
     pub selected: Id,
@@ -831,11 +841,46 @@ impl<A: ValidationsAdaptor> Validations<A> {
             .iter()
             .max_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)))
             .map(|(id, count)| (*id, *count));
+
+        // A stale trie can remain preferred after a node has acquired the
+        // current network ledger. Do not let that stale preference force the
+        // local LCL when an independently acquired candidate has both a
+        // current trusted full validation and a strict majority of the peer
+        // LCL reports. `last_ledger` is populated only after adaptor.acquire
+        // succeeds, so this never promotes a merely requested ledger.
+        let acquired_recovery_candidate = match working_preferred {
+            Some((seq, _)) if seq < min_seq => {
+                let peer_total = peer_counts
+                    .values()
+                    .fold(0_u32, |total, count| total.saturating_add(*count));
+                inner
+                    .last_ledger
+                    .values()
+                    .filter_map(|ledger| {
+                        let seq = ledger.seq();
+                        let id = ledger.id();
+                        let has_current_trusted_full_validation = inner.current.values().any(|v| {
+                            v.trusted() && v.full() && v.seq() == seq && v.ledger_id() == id
+                        });
+                        let peer_support = peer_counts.get(&id).copied().unwrap_or_default();
+                        (seq >= min_seq
+                            && has_current_trusted_full_validation
+                            && peer_support > peer_total / 2)
+                            .then_some((seq, id, peer_support))
+                    })
+                    .max_by(|a, b| (a.2, a.0, a.1).cmp(&(b.2, b.0, b.1)))
+            }
+            _ => None,
+        };
+
         let (selected, selection_source) = match working_preferred {
             Some((seq, id)) if seq >= min_seq => {
                 (id, PreferredLclSelectionSource::WorkingPreferred)
             }
-            Some(_) => (lcl.id(), PreferredLclSelectionSource::LocalBelowMinSeq),
+            Some(_) => match acquired_recovery_candidate {
+                Some((_, id, _)) => (id, PreferredLclSelectionSource::AcquiredRecoveryCandidate),
+                None => (lcl.id(), PreferredLclSelectionSource::LocalBelowMinSeq),
+            },
             None => match peer_preferred {
                 Some((id, _)) => (id, PreferredLclSelectionSource::PeerFallback),
                 None => (lcl.id(), PreferredLclSelectionSource::LocalNoPreference),
@@ -846,6 +891,9 @@ impl<A: ValidationsAdaptor> Validations<A> {
             trie_preferred: trie_preferred_info,
             acquiring_preferred,
             working_preferred,
+            acquired_recovery_candidate: acquired_recovery_candidate.map(|(seq, id, _)| (seq, id)),
+            acquired_recovery_peer_support: acquired_recovery_candidate
+                .map(|(_, _, peer_support)| peer_support),
             working_source,
             selection_source,
             selected,
@@ -1161,6 +1209,51 @@ mod tests {
             full: true,
             cookie: 0,
         }
+    }
+
+    fn ledger_at(seq: u32, id: LedgerId) -> MockLedger {
+        let mut history = vec![0; seq as usize];
+        history.push(id);
+        MockLedger { history }
+    }
+
+    #[test]
+    fn preferred_lcl_recovers_quorum_backed_acquired_candidate_from_stale_trie() {
+        let adaptor = MockAdaptor::new(1000);
+        let local_lcl = ledger_at(911, 11);
+        let stale_trie_ledger = ledger_at(910, 10);
+        let acquired_candidate = ledger_at(942, 42);
+        adaptor.register_ledger(stale_trie_ledger.clone());
+        adaptor.register_ledger(acquired_candidate.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        // The stale branch has enough historical validation support to remain
+        // trie-preferred even though it is below the validated anchor.
+        for node_id in 1..=3 {
+            assert_eq!(
+                validations.add(node_id, val(10, 910, 1000, node_id, node_id)),
+                ValStatus::Current
+            );
+        }
+        // This current trusted full validation was already acquired, and the
+        // candidate has the canonical peer-LCL quorum (34 of 34 reports).
+        assert_eq!(
+            validations.add(4, val(42, 942, 1000, 4, 4)),
+            ValStatus::Current
+        );
+
+        let peer_counts = BTreeMap::from([(42, 34)]);
+        let diagnostic = validations.get_preferred_lcl_diagnostic(&local_lcl, 936, &peer_counts);
+
+        assert_eq!(diagnostic.trie_preferred, Some((910, 10)));
+        assert_eq!(diagnostic.working_preferred, Some((910, 10)));
+        assert_eq!(diagnostic.acquired_recovery_candidate, Some((942, 42)));
+        assert_eq!(diagnostic.acquired_recovery_peer_support, Some(34));
+        assert_eq!(
+            diagnostic.selection_source,
+            PreferredLclSelectionSource::AcquiredRecoveryCandidate
+        );
+        assert_eq!(diagnostic.selected, 42);
     }
 
     #[test]
