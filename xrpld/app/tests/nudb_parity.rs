@@ -95,22 +95,8 @@ fn fetch_tx_items_for_ledger(
 
         // Build the VL-encoded item: [vl(tx_bytes)][vl(meta_bytes)]
         let mut item = Vec::new();
-        let tx_len = tx_bytes.len();
-        if tx_len < 128 {
-            item.push(tx_len as u8);
-        } else {
-            item.push(0x80 | ((tx_len >> 8) as u8));
-            item.push((tx_len & 0xff) as u8);
-        }
-        item.extend_from_slice(&tx_bytes);
-        let meta_len = meta_bytes.len();
-        if meta_len < 128 {
-            item.push(meta_len as u8);
-        } else {
-            item.push(0x80 | ((meta_len >> 8) as u8));
-            item.push((meta_len & 0xff) as u8);
-        }
-        item.extend_from_slice(&meta_bytes);
+        encode_vl(&mut item, &tx_bytes);
+        encode_vl(&mut item, &meta_bytes);
 
         // Parse tx to get its hash
         let mut sit = SerialIter::new(&tx_bytes);
@@ -246,13 +232,28 @@ fn fetch_tx_items_for_ledger_from(
     Ok(items)
 }
 
+/// Encode a variable-length field using the real XRPL VL length-prefix
+/// scheme (see `Serializer::decode_length_length`/`decode_vl_length_1/2/3`):
+/// lengths 0..=192 use a single byte equal to the length; lengths
+/// 193..=12480 use two bytes where `b1 = 193 + ((len-193) >> 8)` and
+/// `b2 = (len-193) & 0xff`; lengths 12481..=918744 use three bytes where
+/// `b1 = 241 + ((len-12481) >> 16)`, `b2 = ((len-12481) >> 8) & 0xff`, and
+/// `b3 = (len-12481) & 0xff`.
 fn encode_vl(out: &mut Vec<u8>, bytes: &[u8]) {
     let len = bytes.len();
-    if len < 128 {
+    if len <= 192 {
         out.push(len as u8);
+    } else if len <= 12480 {
+        let adjusted = len - 193;
+        out.push(193 + (adjusted >> 8) as u8);
+        out.push((adjusted & 0xff) as u8);
+    } else if len <= 918_744 {
+        let adjusted = len - 12481;
+        out.push(241 + (adjusted >> 16) as u8);
+        out.push(((adjusted >> 8) & 0xff) as u8);
+        out.push((adjusted & 0xff) as u8);
     } else {
-        out.push(0x80 | ((len >> 8) as u8));
-        out.push((len & 0xff) as u8);
+        panic!("encode_vl: length {len} exceeds maximum VL field size");
     }
     out.extend_from_slice(bytes);
 }
