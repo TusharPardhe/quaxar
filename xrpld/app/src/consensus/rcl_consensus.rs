@@ -1344,11 +1344,7 @@ impl AppConsensus {
 
         let current_hash = *current_lcl.header().hash.as_uint256();
         root.process_closed_ledger_txq(current_lcl.as_ref(), true);
-        root.rebuild_open_ledger_after_consensus(
-            current_lcl.header().seq.saturating_add(1),
-            current_lcl.fees().base,
-            current_hash,
-        );
+        root.rebuild_open_ledger_after_consensus(current_lcl.as_ref());
         root.set_status_rpc_current_ledger_index(Some(current_lcl.header().seq.saturating_add(1)));
         root.set_status_rpc_queue_report(Some(root.tx_q_rpc_report()));
         if let Some(inbound_tx) = root.inbound_transactions().lock().ok().as_mut() {

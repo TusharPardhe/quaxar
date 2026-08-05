@@ -3389,17 +3389,21 @@ impl ApplicationRoot {
         );
     }
 
-    pub(crate) fn rebuild_open_ledger_after_consensus(
-        &self,
-        next_open_index: u32,
-        base_fee_drops: u64,
-        parent_hash: Uint256,
-    ) {
+    /// Rebuild the open ledger on a newly selected closed parent.
+    ///
+    /// This mirrors rippled `OpenLedger::apply`: transactions already included
+    /// in the parent must be discarded rather than carried into the next
+    /// proposal. This matters especially when switching to an acquired LCL,
+    /// whose transaction map can overlap the old local open ledger.
+    pub(crate) fn rebuild_open_ledger_after_consensus(&self, parent: &Ledger) {
+        let next_open_index = parent.header().seq.saturating_add(1);
+        let base_fee_drops = parent.fees().base;
+        let parent_hash = *parent.header().hash.as_uint256();
         let local_txs = self.local_open_ledger_records();
         let mut retries = Vec::<AppOpenLedgerTxRecord>::new();
         self.open_ledger().accept(
             || AppOpenLedgerView::with_parent_hash(next_open_index, base_fee_drops, parent_hash),
-            &|_: &Uint256| false,
+            &|tx_id: &Uint256| parent.tx_exists(*tx_id),
             local_txs,
             false,
             &mut retries,
@@ -3505,12 +3509,7 @@ impl ApplicationRoot {
         let _ = self.update_local_tx(ledger.as_ref());
 
         let next_open_index = ledger.header().seq.saturating_add(1);
-        let next_open_parent_hash = *ledger.header().hash.as_uint256();
-        self.rebuild_open_ledger_after_consensus(
-            next_open_index,
-            ledger.fees().base,
-            next_open_parent_hash,
-        );
+        self.rebuild_open_ledger_after_consensus(ledger.as_ref());
 
         if let Some(runtime) = self.ledger_master_runtime() {
             // `record_consensus_built_ledger` already inserted this built

@@ -21,7 +21,7 @@ use basics::base_uint::{Uint160, Uint256};
 use basics::sha_map_hash::SHAMapHash;
 use ledger::{
     ApplyView, Fees, LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader, ReadView, Sandbox,
-    calculate_ledger_hash, encode_fee_settings_entry,
+    TxsRawView, calculate_ledger_hash, encode_fee_settings_entry,
 };
 use protocol::{
     AccountID, BatchTransactionFlags, INNER_BATCH_TRANSACTION_FLAG, KeyType, LedgerEntryType,
@@ -2618,6 +2618,47 @@ fn live_consensus_accept_runs_consensus_built_lifecycle_before_next_round() {
     app.install_consensus_child(Arc::clone(&built));
     let closed = app.closed_ledger().expect("built LCL should install last");
     assert_eq!(closed.header().hash, built.header().hash);
+}
+
+#[test]
+fn acquired_lcl_rebase_discards_transactions_already_in_parent() {
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let source = account("0000000000000000000000000000000000000088");
+    let destination = account("0000000000000000000000000000000000000099");
+    let current_tx = payment_tx(source, destination, 1, None, 10);
+    let tx_id = current_tx.get_transaction_id();
+
+    let mut acquired_lcl = Ledger::from_ledger_seq_and_close_time(11, 1_010, false);
+    acquired_lcl
+        .raw_tx_insert(
+            tx_id,
+            Arc::new(protocol::Serializer::from_bytes(
+                current_tx.get_serializer().data(),
+            )),
+            Some(Arc::new(protocol::Serializer::new(0))),
+        )
+        .expect("acquired parent should contain the transaction");
+    acquired_lcl.set_immutable(true);
+    assert!(acquired_lcl.tx_exists(tx_id));
+
+    let _ = app.open_ledger().modify(|view| {
+        *view = AppOpenLedgerView::with_parent_hash(
+            12,
+            acquired_lcl.fees().base,
+            *acquired_lcl.header().hash.as_uint256(),
+        );
+        view.push_transaction(Arc::clone(&current_tx));
+        true
+    });
+
+    app.rebuild_open_ledger_after_consensus(&acquired_lcl);
+
+    let current = app.open_ledger().current();
+    assert_eq!(current.parent_hash, *acquired_lcl.header().hash.as_uint256());
+    assert!(
+        !current.tx_ids().contains(&tx_id),
+        "an acquired parent must filter transactions it already contains"
+    );
 }
 
 #[test]
