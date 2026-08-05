@@ -589,7 +589,12 @@ fn apply_submit_tx_for_test(
     current_ledger_index: u32,
 ) -> ApplyResult {
     let rules = submit_view.rules().clone();
-    let preclaim_ter = queue_apply_preclaim_ter(submit_view, tx.as_ref(), current_ledger_index);
+    let preclaim_ter = queue_apply_preclaim_ter(
+        submit_view,
+        tx.as_ref(),
+        current_ledger_index,
+        ApplyFlags::NONE,
+    );
     let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
         open_ledger,
         submit_view,
@@ -1287,7 +1292,6 @@ fn application_root_accept_ledger_runs_closed_ledger_txq_maintenance() {
 #[test]
 fn application_root_accept_ledger_rebuilds_next_open_with_queued_txs() {
     let mut app = ApplicationRoot::new(0).expect("root shell should build");
-    let current_account = AccountID::from_array([0x11; 20]);
     let queued_account_id = AccountID::from_array([0x22; 20]);
     let destination = AccountID::from_array([0x99; 20]);
     let queued_tx = payment_tx(queued_account_id, destination, 1, None, 12);
@@ -1295,7 +1299,7 @@ fn application_root_accept_ledger_rebuilds_next_open_with_queued_txs() {
     let queued_id = queued_tx.get_transaction_id();
     let consequences = TxConsequences::with_potential_spend(12, queued_seq, 100);
 
-    let mut parent = ledger_view(1, current_account, 1, &[]);
+    let mut parent = ledger_view(1, queued_account_id, 1, &[]);
     parent.set_accepted(1_111, ledger::LEDGER_DEFAULT_TIME_RESOLUTION, true);
     let parent = Arc::new(parent);
     app.on_closed_ledger(Arc::clone(&parent));
@@ -2651,13 +2655,42 @@ fn acquired_lcl_rebase_discards_transactions_already_in_parent() {
         true
     });
 
-    app.rebuild_open_ledger_after_consensus(&acquired_lcl);
+    let acquired_lcl = Arc::new(acquired_lcl);
+    app.rebuild_open_ledger_after_consensus(Arc::clone(&acquired_lcl));
 
     let current = app.open_ledger().current();
     assert_eq!(current.parent_hash, *acquired_lcl.header().hash.as_uint256());
     assert!(
         !current.tx_ids().contains(&tx_id),
         "an acquired parent must filter transactions it already contains"
+    );
+}
+
+#[test]
+fn consensus_rebase_discards_transaction_with_consumed_parent_sequence() {
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let destination = account("00000000000000000000000000000000000000AA");
+    let (source, stale_tx) = signed_payment_tx(42, destination, 1, 10);
+    let parent = Arc::new(ledger_view(11, source, 2, &[]));
+
+    let _ = app.open_ledger().modify(|view| {
+        *view = AppOpenLedgerView::with_parent_hash(
+            12,
+            parent.fees().base,
+            *parent.header().hash.as_uint256(),
+        );
+        view.push_transaction(Arc::clone(&stale_tx));
+        true
+    });
+
+    app.rebuild_open_ledger_after_consensus(Arc::clone(&parent));
+
+    assert!(
+        !app.open_ledger()
+            .current()
+            .tx_ids()
+            .contains(&stale_tx.get_transaction_id()),
+        "a transaction consumed by an ancestor account sequence must not be reproposed"
     );
 }
 
@@ -2721,9 +2754,10 @@ fn consensus_built_switches_lcl_without_promoting_validated_or_published() {
     assert_eq!(current.ledger_current_index, 12);
     assert_eq!(current.parent_hash, *built.header().hash.as_uint256());
     let tx_ids = current.tx_ids();
-    assert_eq!(tx_ids.len(), 2);
-    assert!(tx_ids.contains(&current_tx.get_transaction_id()));
-    assert!(tx_ids.contains(&local_tx.get_transaction_id()));
+    assert!(
+        tx_ids.is_empty(),
+        "terminally invalid carried transactions must be discarded during rebase"
+    );
     assert_eq!(app.status_rpc_current_ledger_index(), Some(12));
 }
 
@@ -2935,7 +2969,12 @@ fn live_batch_preclaim_authorizes_master_and_enforces_aggregate_fee_validity() {
     let expected_fee = ledger.fees().base * 5;
     assert_eq!(batch_base_fee(&ledger, &authorized), expected_fee);
     assert_eq!(
-        queue_apply_preclaim_ter(&ledger, &authorized, ledger.header().seq),
+        queue_apply_preclaim_ter(
+            &ledger,
+            &authorized,
+            ledger.header().seq,
+            ApplyFlags::NONE,
+        ),
         Ter::TES_SUCCESS
     );
 
@@ -2947,7 +2986,12 @@ fn live_batch_preclaim_authorizes_master_and_enforces_aggregate_fee_validity() {
     );
     assert_eq!(batch_base_fee(&ledger, &oversized), INVALID_BATCH_BASE_FEE);
     assert_eq!(
-        queue_apply_preclaim_ter(&ledger, &oversized, ledger.header().seq),
+        queue_apply_preclaim_ter(
+            &ledger,
+            &oversized,
+            ledger.header().seq,
+            ApplyFlags::NONE,
+        ),
         Ter::TEC_INSUFF_FEE
     );
 }

@@ -1256,7 +1256,11 @@ impl QueueAcceptLedgerViewSource for AppOpenLedgerTxQAcceptView {
 }
 
 struct AppOpenLedgerTxQAcceptRuntime<'a> {
+    root: &'a ApplicationRoot,
     view: &'a mut AppOpenLedgerView,
+    rebase_view: &'a mut Sandbox<Ledger>,
+    applied_ids: &'a mut std::collections::HashSet<Uint256>,
+    flags: ApplyFlags,
 }
 
 impl
@@ -1276,8 +1280,13 @@ impl
             AppTxQParentBatchId,
         >,
     ) -> ApplyResult {
-        self.view.push_transaction(Arc::clone(&queued.pf_result.tx));
-        ApplyResult::new(Ter::TES_SUCCESS, true, false)
+        self.root.reapply_open_ledger_record(
+            self.view,
+            self.rebase_view,
+            self.applied_ids,
+            &AppOpenLedgerTxRecord::new(Arc::clone(&queued.pf_result.tx)),
+            self.flags,
+        )
     }
 }
 
@@ -1507,7 +1516,12 @@ impl AcceptLedgerPendingRuntime {
     }
 }
 
-fn queue_apply_preclaim_ter(view: &impl ReadView, tx: &STTx, current_ledger_seq: u32) -> Ter {
+fn queue_apply_preclaim_ter(
+    view: &impl ReadView,
+    tx: &STTx,
+    current_ledger_seq: u32,
+    flags: ApplyFlags,
+) -> Ter {
     if tx.get_txn_type() != TxType::BATCH
         && AcceptLedgerPendingRuntime::is_system_transaction(tx.get_txn_type())
     {
@@ -1561,7 +1575,7 @@ fn queue_apply_preclaim_ter(view: &impl ReadView, tx: &STTx, current_ledger_seq:
         return prior_tx_check;
     }
 
-    batch_preclaim_ter(view, tx, ApplyFlags::NONE)
+    batch_preclaim_ter(view, tx, flags)
 }
 
 struct SubmitOracleSetReserveSink {
@@ -1771,7 +1785,16 @@ pub fn apply_submit_transactor_shell<V: ledger::ApplyView>(
     tx: &STTx,
     txn_type: TxType,
 ) -> Ter {
-    apply_submit_transactor_shell_with_delivered_amount(view, tx, txn_type).0
+    apply_submit_transactor_shell_with_flags(view, tx, txn_type, ApplyFlags::NONE)
+}
+
+pub fn apply_submit_transactor_shell_with_flags<V: ledger::ApplyView>(
+    view: &mut V,
+    tx: &STTx,
+    txn_type: TxType,
+    flags: ApplyFlags,
+) -> Ter {
+    apply_submit_transactor_shell_with_flags_and_delivered_amount(view, tx, txn_type, flags).0
 }
 
 /// Applies a transaction and returns the actual MPT payment delivery recorded
@@ -1780,6 +1803,20 @@ pub fn apply_submit_transactor_shell_with_delivered_amount<V: ledger::ApplyView>
     view: &mut V,
     tx: &STTx,
     txn_type: TxType,
+) -> (Ter, Option<STAmount>) {
+    apply_submit_transactor_shell_with_flags_and_delivered_amount(
+        view,
+        tx,
+        txn_type,
+        ApplyFlags::NONE,
+    )
+}
+
+fn apply_submit_transactor_shell_with_flags_and_delivered_amount<V: ledger::ApplyView>(
+    view: &mut V,
+    tx: &STTx,
+    txn_type: TxType,
+    flags: ApplyFlags,
 ) -> (Ter, Option<STAmount>) {
     // An inner Batch transaction is valid only while its parent Batch applies
     // it through apply_submit_batch_followup. Never allow one through the
@@ -1798,7 +1835,7 @@ pub fn apply_submit_transactor_shell_with_delivered_amount<V: ledger::ApplyView>
             return (preflight, None);
         }
 
-        let preclaim = batch_preclaim_ter(view, tx, ApplyFlags::NONE);
+        let preclaim = batch_preclaim_ter(view, tx, flags);
         if !is_tes_success(preclaim) {
             return (preclaim, None);
         }
@@ -1817,7 +1854,7 @@ pub fn apply_submit_transactor_shell_with_delivered_amount<V: ledger::ApplyView>
         // Transactor/BuildLedger catches arithmetic exceptions at this
         // transaction boundary; retain the same atomicity here by dropping the
         // unapplied FlowSandbox and reporting tefEXCEPTION.
-        let mut tx_view = ledger::FlowSandbox::new(view);
+        let mut tx_view = ledger::FlowSandbox::new_with_flags(view, flags);
         let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             apply_submit_transactor_shell_impl(&mut tx_view, tx, txn_type, true)
         })) {
@@ -3336,48 +3373,55 @@ impl ApplicationRoot {
         )
     }
 
-    fn rebuild_open_ledger_after_close(
-        &self,
-        next_open_index: u32,
-        base_fee_drops: u64,
-        parent_hash: Uint256,
-    ) {
+    fn rebuild_open_ledger_after_close(&self, parent: Arc<Ledger>) {
+        let next_open_index = parent.header().seq.saturating_add(1);
+        let base_fee_drops = parent.fees().base;
+        let parent_hash = *parent.header().hash.as_uint256();
         let local_txs = self.local_open_ledger_records();
         let mut retries = Vec::<AppOpenLedgerTxRecord>::new();
+        let rebase_view = std::cell::RefCell::new(Sandbox::new(
+            Arc::clone(&parent),
+            ApplyFlags::NONE,
+        ));
+        let applied_ids = std::cell::RefCell::new(std::collections::HashSet::new());
 
-        let transaction_master = &self.transaction_master;
         self.open_ledger().accept(
             || AppOpenLedgerView::with_parent_hash(next_open_index, base_fee_drops, parent_hash),
-            &|tx_id: &Uint256| {
-                // Return true if this transaction is already in a closed ledger
-                // (i.e., it should NOT be re-applied to the new open ledger).
-                if let Some(txn) = transaction_master.fetch_from_cache(tx_id) {
-                    let status = txn
-                        .lock()
-                        .expect("transaction mutex must not be poisoned")
-                        .get_status();
-                    status == crate::tx_queue::transaction::TransStatus::COMMITTED
-                } else {
-                    false
-                }
-            },
+            &|tx_id: &Uint256| parent.tx_exists(*tx_id),
             local_txs,
             false,
             &mut retries,
             ApplyFlags::NONE,
-            &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, _flags| {
-                view.push_transaction(Arc::clone(&tx.tx));
-                ApplyResult::new(Ter::TES_SUCCESS, true, false)
+            &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, flags| {
+                self.reapply_open_ledger_record(
+                    view,
+                    &mut rebase_view.borrow_mut(),
+                    &mut applied_ids.borrow_mut(),
+                    tx,
+                    flags,
+                )
             },
-            &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, _flags| {
-                view.push_transaction(Arc::clone(&tx.tx));
+            &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, flags| {
+                let _ = self.reapply_open_ledger_record(
+                    view,
+                    &mut rebase_view.borrow_mut(),
+                    &mut applied_ids.borrow_mut(),
+                    tx,
+                    flags,
+                );
             },
             Some(|view: &mut AppOpenLedgerView| {
                 let snapshot = AppOpenLedgerTxQAcceptView {
                     open_ledger_tx_count: view.tx_ids().len(),
                     parent_hash: view.parent_hash,
                 };
-                let mut runtime = AppOpenLedgerTxQAcceptRuntime { view };
+                let mut runtime = AppOpenLedgerTxQAcceptRuntime {
+                    root: self,
+                    view,
+                    rebase_view: &mut rebase_view.borrow_mut(),
+                    applied_ids: &mut applied_ids.borrow_mut(),
+                    flags: ApplyFlags::NONE,
+                };
                 let mut lock = AppTxQLock;
                 self.registry
                     .tx_q
@@ -3387,6 +3431,45 @@ impl ApplicationRoot {
             &mut |_tx_id: &Uint256| false,
             &mut |_tx: &AppOpenLedgerTxRecord| {},
         );
+        *self.open_ledger_sandbox.lock().expect("sandbox mutex") = Some(rebase_view.into_inner());
+    }
+
+    fn reapply_open_ledger_record(
+        &self,
+        open_ledger: &mut AppOpenLedgerView,
+        rebase_view: &mut Sandbox<Ledger>,
+        applied_ids: &mut std::collections::HashSet<Uint256>,
+        record: &AppOpenLedgerTxRecord,
+        flags: ApplyFlags,
+    ) -> ApplyResult {
+        let tx = Arc::clone(&record.tx);
+        let tx_id = tx.get_transaction_id();
+        if applied_ids.contains(&tx_id) {
+            return ApplyResult::new(Ter::TEF_ALREADY, false, false);
+        }
+
+        let preclaim = queue_apply_preclaim_ter(
+            rebase_view,
+            tx.as_ref(),
+            open_ledger.ledger_current_index,
+            flags,
+        );
+        let ter = if is_tes_success(preclaim) {
+            apply_submit_transactor_shell_with_flags(
+                rebase_view,
+                tx.as_ref(),
+                tx.get_txn_type(),
+                flags,
+            )
+        } else {
+            preclaim
+        };
+        let applied = is_tes_success(ter) || is_tec_claim(ter);
+        if applied {
+            applied_ids.insert(tx_id);
+            open_ledger.push_transaction(tx);
+        }
+        ApplyResult::new(ter, applied, false)
     }
 
     /// Rebuild the open ledger on a newly selected closed parent.
@@ -3395,12 +3478,17 @@ impl ApplicationRoot {
     /// in the parent must be discarded rather than carried into the next
     /// proposal. This matters especially when switching to an acquired LCL,
     /// whose transaction map can overlap the old local open ledger.
-    pub(crate) fn rebuild_open_ledger_after_consensus(&self, parent: &Ledger) {
+    pub(crate) fn rebuild_open_ledger_after_consensus(&self, parent: Arc<Ledger>) {
         let next_open_index = parent.header().seq.saturating_add(1);
         let base_fee_drops = parent.fees().base;
         let parent_hash = *parent.header().hash.as_uint256();
         let local_txs = self.local_open_ledger_records();
         let mut retries = Vec::<AppOpenLedgerTxRecord>::new();
+        let rebase_view = std::cell::RefCell::new(Sandbox::new(
+            Arc::clone(&parent),
+            ApplyFlags::NONE,
+        ));
+        let applied_ids = std::cell::RefCell::new(std::collections::HashSet::new());
         self.open_ledger().accept(
             || AppOpenLedgerView::with_parent_hash(next_open_index, base_fee_drops, parent_hash),
             &|tx_id: &Uint256| parent.tx_exists(*tx_id),
@@ -3408,19 +3496,36 @@ impl ApplicationRoot {
             false,
             &mut retries,
             ApplyFlags::NONE,
-            &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, _flags| {
-                view.push_transaction(Arc::clone(&tx.tx));
-                ApplyResult::new(Ter::TES_SUCCESS, true, false)
+            &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, flags| {
+                self.reapply_open_ledger_record(
+                    view,
+                    &mut rebase_view.borrow_mut(),
+                    &mut applied_ids.borrow_mut(),
+                    tx,
+                    flags,
+                )
             },
-            &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, _flags| {
-                view.push_transaction(Arc::clone(&tx.tx));
+            &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, flags| {
+                let _ = self.reapply_open_ledger_record(
+                    view,
+                    &mut rebase_view.borrow_mut(),
+                    &mut applied_ids.borrow_mut(),
+                    tx,
+                    flags,
+                );
             },
             Some(|view: &mut AppOpenLedgerView| {
                 let snapshot = AppOpenLedgerTxQAcceptView {
                     open_ledger_tx_count: view.tx_ids().len(),
                     parent_hash: view.parent_hash,
                 };
-                let mut runtime = AppOpenLedgerTxQAcceptRuntime { view };
+                let mut runtime = AppOpenLedgerTxQAcceptRuntime {
+                    root: self,
+                    view,
+                    rebase_view: &mut rebase_view.borrow_mut(),
+                    applied_ids: &mut applied_ids.borrow_mut(),
+                    flags: ApplyFlags::NONE,
+                };
                 let mut lock = AppTxQLock;
                 self.registry
                     .tx_q
@@ -3430,6 +3535,7 @@ impl ApplicationRoot {
             &mut |_tx_id: &Uint256| false,
             &mut |_tx: &AppOpenLedgerTxRecord| {},
         );
+        *self.open_ledger_sandbox.lock().expect("sandbox mutex") = Some(rebase_view.into_inner());
     }
 
     fn local_open_ledger_records(&self) -> Vec<AppOpenLedgerTxRecord> {
@@ -3509,7 +3615,7 @@ impl ApplicationRoot {
         let _ = self.update_local_tx(ledger.as_ref());
 
         let next_open_index = ledger.header().seq.saturating_add(1);
-        self.rebuild_open_ledger_after_consensus(ledger.as_ref());
+        self.rebuild_open_ledger_after_consensus(Arc::clone(&ledger));
 
         if let Some(runtime) = self.ledger_master_runtime() {
             // `record_consensus_built_ledger` already inserted this built
@@ -4965,7 +5071,12 @@ impl ApplicationRoot {
                         );
                         let submit_rules = submit_view.rules().clone();
                         let mut preclaim_ter =
-                            queue_apply_preclaim_ter(&submit_view, tx.as_ref(), current_ledger_index);
+                            queue_apply_preclaim_ter(
+                                &submit_view,
+                                tx.as_ref(),
+                                current_ledger_index,
+                                networkops_apply_flags(entry.admin, entry.fail_hard),
+                            );
                         // If preclaim says terPRE_SEQ but our open ledger tracker shows
                         // this sequence IS the next expected one, override to TES_SUCCESS.
                         // This matches rippled where the persistent OpenView already has
@@ -7073,7 +7184,6 @@ impl ApplicationRoot {
             .max(validated_s.saturating_add(1))
             .max(1);
         let close_time = self.current_close_time_seconds();
-        let base_fee_drops = current.base_fee_drops;
 
         // In standalone mode, transactions are already applied to the open ledger
         // during submit. We take those transactions and re-apply them against the
@@ -7128,11 +7238,7 @@ impl ApplicationRoot {
                 .pend_save_validated(Arc::clone(&closed), true, true);
             let next_open_index = closed_seq.saturating_add(1);
             self.clear_open_ledger_account_seqs();
-            self.rebuild_open_ledger_after_close(
-                next_open_index,
-                base_fee_drops,
-                *closed.header().hash.as_uint256(),
-            );
+            self.rebuild_open_ledger_after_close(Arc::clone(&closed));
             self.set_status_rpc_current_ledger_index(Some(next_open_index));
             self.set_status_rpc_queue_report(Some(self.tx_q_rpc_report()));
             return Ok(next_open_index);
@@ -7239,11 +7345,7 @@ impl ApplicationRoot {
 
         let next_open_index = closed_seq.saturating_add(1);
         self.clear_open_ledger_account_seqs();
-        self.rebuild_open_ledger_after_close(
-            next_open_index,
-            base_fee_drops,
-            *closed.header().hash.as_uint256(),
-        );
+        self.rebuild_open_ledger_after_close(Arc::clone(&closed));
         self.set_status_rpc_current_ledger_index(Some(next_open_index));
         self.set_status_rpc_queue_report(Some(self.tx_q_rpc_report()));
 
@@ -7305,11 +7407,7 @@ impl ApplicationRoot {
         let closed = self
             .closed_ledger()
             .ok_or_else(|| "accepted ledger missing after build".to_owned())?;
-        self.rebuild_open_ledger_after_close(
-            outcome.next_open_index,
-            base_fee_drops,
-            *closed.header().hash.as_uint256(),
-        );
+        self.rebuild_open_ledger_after_close(Arc::clone(&closed));
         self.set_status_rpc_current_ledger_index(Some(outcome.next_open_index));
         self.set_status_rpc_queue_report(Some(self.tx_q_rpc_report()));
         Ok(outcome.next_open_index)
