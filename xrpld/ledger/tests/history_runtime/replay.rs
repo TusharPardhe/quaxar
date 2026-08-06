@@ -155,6 +155,37 @@ fn replay_task_parameter_update_and_merge_match_cpp() {
 }
 
 #[test]
+fn replayer_initializes_new_skip_list_through_the_real_trigger() {
+    // ../rippled/src/xrpld/app/ledger/detail/LedgerReplayer.cpp::replay
+    // initializes a newly-created SkipListAcquire immediately, before the
+    // replay task waits for its timer. A missing local ledger must therefore
+    // reach the normal fallback acquisition path at replay admission time.
+    let finish_hash = Uint256::from_array([0xE1; 32]);
+    let mut replayer = LedgerReplayer::new(Arc::new(SimplePeerSetBuilder::new(Vec::new())));
+    let fallback = std::cell::RefCell::new(Vec::new());
+
+    let task = replayer
+        .replay_and_init(
+            InboundLedgerReason::Generic,
+            finish_hash,
+            1,
+            1,
+            |_| None,
+            |hash, seq, reason| fallback.borrow_mut().push((hash, seq, reason)),
+        )
+        .expect("new replay task should be accepted and initialized");
+
+    assert_eq!(replayer.tasks_len(), 1);
+    assert_eq!(replayer.skip_lists_len(), 1);
+    assert!(!task.lock().expect("task lock").parameter().full);
+    assert_eq!(
+        fallback.into_inner(),
+        vec![(finish_hash, 0, InboundLedgerReason::Generic)],
+        "the initial SkipListAcquire must immediately request the real finish ledger fallback"
+    );
+}
+
+#[test]
 fn replayer_reuses_skip_lists_and_creates_delta_slots() {
     let cfg = config();
     let genesis = Ledger::create_genesis(false, &cfg, []).expect("genesis should build");

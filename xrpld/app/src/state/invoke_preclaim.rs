@@ -14,8 +14,8 @@ use tx::{
     TransactorCheckFeeTx, TransactorCheckPermissionTx, TransactorCheckPriorTxAndLastLedgerTx,
     TransactorCheckSeqProxyTx, TransactorMultiSignAccountSigner, TransactorMultiSignSignerList,
     TransactorMultiSignTxSigner, TransactorSignMultiSignObject, TransactorSignObject,
-    TransactorSignTx, TransactorSingleSignAccountState, run_check_tx_permission,
-    run_transactor_check_fee, run_transactor_check_permission,
+    TransactorSignTx, TransactorSingleSignAccountState, run_batch_check_sign,
+    run_check_tx_permission, run_transactor_check_fee, run_transactor_check_permission,
     run_transactor_check_prior_tx_and_last_ledger, run_transactor_check_seq_proxy,
     run_transactor_invoke_preclaim, run_transactor_preclaim_check_sign,
 };
@@ -68,6 +68,7 @@ where
         current_ledger_seq,
         flags,
         None,
+        || Ter::TES_SUCCESS,
         calculate_base_fee,
         minimum_fee,
         typed_preclaim_tail,
@@ -88,6 +89,7 @@ pub(crate) fn invoke_preclaim_with_parent_batch_id<
     current_ledger_seq: u32,
     flags: ApplyFlags,
     parent_batch_id: Option<Uint256>,
+    check_batch_sign: impl FnOnce() -> NotTec,
     calculate_base_fee: CalculateBaseFee,
     minimum_fee: MinimumFee,
     typed_preclaim_tail: TypedPreclaimTail,
@@ -139,12 +141,24 @@ where
         },
         || typed_check_permission(view, tx, &adapted),
         || {
-            if tx.get_txn_type() == protocol::TxType::LOAN_SET {
-                check_loan_set_counterparty_sign(view, tx, flags, || {
+            let check_standard_sign = || {
+                if tx.get_txn_type() == protocol::TxType::LOAN_SET {
+                    check_loan_set_counterparty_sign(view, tx, flags, || {
+                        check_ledger_signer_authorization(view, &adapted, flags, parent_batch_id)
+                    })
+                } else {
                     check_ledger_signer_authorization(view, &adapted, flags, parent_batch_id)
-                })
+                }
+            };
+
+            if tx.get_txn_type() == protocol::TxType::BATCH {
+                // Parity: ../rippled/src/libxrpl/tx/transactors/system/Batch.cpp::
+                // Batch::checkSign calls Transactor::checkSign before
+                // Transactor::checkBatchSign, and applySteps.cpp runs both
+                // before calculateBaseFee/checkFee.
+                run_batch_check_sign(check_standard_sign, check_batch_sign)
             } else {
-                check_ledger_signer_authorization(view, &adapted, flags, parent_batch_id)
+                check_standard_sign()
             }
         },
         calculate_base_fee,
@@ -494,9 +508,19 @@ impl TransactorCheckFeeTx for LedgerPreclaimTx<'_> {
     }
 
     fn fee_payer(&self) -> Self::AccountId {
+        // `../rippled/src/libxrpl/protocol/STTx.cpp::STTx::getFeePayer`
+        // selects sfDelegate when present. Once `checkSign` selected that
+        // delegate, checking sfAccount again here would reject legitimate
+        // delegated fee-claim (tec) outcomes before apply can charge the
+        // delegate. A sponsor remains the explicit higher-priority payer.
         self.tx
             .is_field_present(sf("sfSponsor"))
             .then(|| self.tx.get_account_id(sf("sfSponsor")))
+            .or_else(|| {
+                self.tx
+                    .is_field_present(sf("sfDelegate"))
+                    .then(|| self.tx.get_account_id(sf("sfDelegate")))
+            })
             .unwrap_or_else(|| self.tx.get_account_id(sf("sfAccount")))
     }
 }
@@ -830,22 +854,12 @@ fn check_ledger_signer_authorization<V: ReadView>(
     flags: ApplyFlags,
     parent_batch_id: Option<Uint256>,
 ) -> NotTec {
-    // Batch owns a distinct ledger-backed BatchSigners authorization tail.
-    // Do not feed its intentionally empty outer SigningPubKey through the
-    // ordinary account-signature checker before that tail runs.
-    if tx.tx.get_txn_type() == protocol::TxType::BATCH {
-        return Ter::TES_SUCCESS;
-    }
-
-    // `applySteps.cpp::preclaim` carries parentBatchId into PreclaimContext.
-    // Its inner Batch signer path rejects any embedded signature fields and
-    // otherwise bypasses ordinary transaction-signature verification.
-    if parent_batch_id.is_none() && tx.tx.check_sign(&view.rules()).is_err() {
-        return Ter::TEM_BAD_SIGNATURE;
-    }
-
+    // The shared helper selects sfDelegate over sfAccount for delegated
+    // transactions and the regular account otherwise, exactly like
+    // Transactor::checkSign(PreclaimContext). `Batch::checkSign` then runs
+    // its BatchSigners tail before `invokePreclaim` reaches checkFee.
     let signature = LedgerSignatureObject { tx: tx.tx };
-    run_transactor_preclaim_check_sign(
+    let standard_result = run_transactor_preclaim_check_sign(
         flags,
         parent_batch_id.is_some(),
         view.rules().enabled(&feature_batch()),
@@ -874,7 +888,9 @@ fn check_ledger_signer_authorization<V: ReadView>(
                 .expect("public-key type was checked before account derivation");
             calc_account_id(key.as_bytes())
         },
-    )
+    );
+
+    standard_result
 }
 
 #[cfg(test)]
@@ -889,6 +905,7 @@ mod tests {
     };
 
     use super::{LedgerPreclaimTx, scale_fee_load, typed_check_permission};
+    use tx::TransactorCheckFeeTx;
 
     fn insert_delegate(
         view: &mut ledger::Sandbox<ledger::Ledger>,
@@ -1001,6 +1018,37 @@ mod tests {
     }
 
     use super::check_loan_set_counterparty_sign;
+
+    #[test]
+    fn delegated_preclaim_uses_delegate_as_fee_payer_without_rechecking_sfaccount() {
+        // ../rippled/src/libxrpl/tx/Transactor.cpp::Transactor::checkSign
+        // selects sfDelegate over sfAccount, and
+        // ../rippled/src/libxrpl/protocol/STTx.cpp::STTx::getFeePayer keeps
+        // that selected delegate responsible for fee-claiming tec outcomes.
+        let account = AccountID::from_array([0xD1; 20]);
+        let delegate = AccountID::from_array([0xD2; 20]);
+        let sponsor = AccountID::from_array([0xD3; 20]);
+        let delegated = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+            tx.set_account_id(get_field_by_symbol("sfDelegate"), delegate);
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+        });
+        assert_eq!(LedgerPreclaimTx { tx: &delegated }.fee_payer(), delegate);
+
+        let sponsored = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+            tx.set_account_id(get_field_by_symbol("sfDelegate"), delegate);
+            tx.set_account_id(get_field_by_symbol("sfSponsor"), sponsor);
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+        });
+        assert_eq!(LedgerPreclaimTx { tx: &sponsored }.fee_payer(), sponsor);
+    }
 
     #[test]
     fn loan_set_check_sign_requires_a_counter_signer_before_optional_signature_success() {

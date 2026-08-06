@@ -1044,17 +1044,11 @@ fn batch_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
     )
 }
 
-fn batch_preclaim_ter(view: &impl ReadView, tx: &STTx, flags: ApplyFlags) -> Ter {
-    if tx.get_txn_type() != TxType::BATCH {
-        return Ter::TES_SUCCESS;
-    }
-
-    // `Batch::calculateBaseFee` returns a payable placeholder on failure, but
-    // `Batch::preclaim` rejects that same invalid calculation.
-    if batch_base_fee(view, tx) == INVALID_BATCH_BASE_FEE {
-        return Ter::TEC_INSUFF_FEE;
-    }
-
+/// `../rippled/src/libxrpl/tx/transactors/system/Batch.cpp::Batch::checkSign`
+/// runs the ordinary outer-transaction signer check before this BatchSigners
+/// tail. Keep this separate from the fee-specific preclaim tail so callers
+/// can preserve `applySteps.cpp::invokePreclaim`'s pre-sign-before-fee order.
+pub(crate) fn batch_check_sign_ter(view: &impl ReadView, tx: &STTx, flags: ApplyFlags) -> Ter {
     let batch_signers_field = get_field_by_symbol("sfBatchSigners");
     if !tx.is_field_present(batch_signers_field) {
         return Ter::TES_SUCCESS;
@@ -1139,6 +1133,21 @@ fn batch_preclaim_ter(view: &impl ReadView, tx: &STTx, flags: ApplyFlags) -> Ter
             calc_account_id(key.as_bytes())
         },
     )
+}
+
+fn batch_preclaim_ter(view: &impl ReadView, tx: &STTx, _flags: ApplyFlags) -> Ter {
+    if tx.get_txn_type() != TxType::BATCH {
+        return Ter::TES_SUCCESS;
+    }
+
+    // `Batch::calculateBaseFee` returns a payable placeholder on failure, but
+    // Batch's typed preclaim rejects that same invalid calculation after the
+    // shared signature and fee gates have run.
+    if batch_base_fee(view, tx) == INVALID_BATCH_BASE_FEE {
+        Ter::TEC_INSUFF_FEE
+    } else {
+        Ter::TES_SUCCESS
+    }
 }
 
 #[derive(Debug)]
@@ -1261,6 +1270,9 @@ struct AppOpenLedgerTxQApplyRuntime<'a> {
     preflight_result:
         PreflightResult<AppTxQTransaction, TxConsequences, AppTxQJournalTag, AppTxQParentBatchId>,
     preclaim_result: PreclaimResult<AppTxQTransaction, AppTxQJournalTag, AppTxQParentBatchId>,
+    current_ledger_seq: u32,
+    load_fee_track: &'a SharedLoadFeeTrack,
+    multi_txn_adjustment: Option<tx::QueueApplyViewAdjustment>,
 }
 
 impl<'a> AppOpenLedgerTxQApplyRuntime<'a> {
@@ -1323,6 +1335,9 @@ impl<'a> AppOpenLedgerTxQApplyRuntime<'a> {
             account_seqs,
             preflight_result,
             preclaim_result,
+            current_ledger_seq,
+            load_fee_track,
+            multi_txn_adjustment: None,
         }
     }
 }
@@ -1342,7 +1357,11 @@ impl QueueApplyExecutionRuntime<AppTxQTransaction, AppTxQJournalTag, AppTxQParen
     fn direct_apply(&mut self) -> ApplyResult {
         let txn_type = self.tx.get_txn_type();
         let preclaim = self.preclaim_result.ter;
-        let ter = if is_tes_success(preclaim) {
+        // `doApply` runs for fee-claiming `tec` results too. This is
+        // essential for delegated transactions: the selected delegate pays
+        // the fee and the source sequence is consumed even when the typed
+        // apply result is a claimable failure.
+        let ter = if is_tes_success(preclaim) || is_tec_claim(preclaim) {
             apply_submit_transactor_shell(self.submit_view, self.tx.as_ref(), txn_type)
         } else {
             preclaim
@@ -1370,15 +1389,83 @@ impl QueueApplyExecutionRuntime<AppTxQTransaction, AppTxQJournalTag, AppTxQParen
         ApplyResult::new(ter, applied, false)
     }
 
-    fn prepare_multitxn(&mut self, _adjustment: tx::QueueApplyViewAdjustment) -> bool {
-        false
+    fn prepare_multitxn(&mut self, adjustment: tx::QueueApplyViewAdjustment) -> bool {
+        // Parity: ../rippled/src/xrpld/app/misc/detail/TxQ.cpp::TxQ::apply
+        // materializes a temporary ApplyViewImpl/OpenView, reduces its
+        // account balance by queued commitments, and adjusts its sequence
+        // before running preclaim. Keep this child uncommitted: it is an
+        // admission-only view, never a mutation of the live submit sandbox.
+        self.multi_txn_adjustment = Some(adjustment);
+        true
     }
 
     fn run_preclaim(
         &mut self,
-        _view_source: tx::QueueApplyPreclaimViewSource,
+        view_source: tx::QueueApplyPreclaimViewSource,
     ) -> PreclaimResult<AppTxQTransaction, AppTxQJournalTag, AppTxQParentBatchId> {
-        self.preclaim_result.clone()
+        if view_source == tx::QueueApplyPreclaimViewSource::CurrentView {
+            return self.preclaim_result.clone();
+        }
+
+        let Some(adjustment) = self.multi_txn_adjustment else {
+            return PreclaimResult::new(
+                self.current_ledger_seq,
+                Arc::clone(&self.tx),
+                None,
+                self.preflight_result.flags,
+                self.preflight_result.journal.clone(),
+                Ter::TEF_INTERNAL,
+            );
+        };
+
+        let account = self.tx.get_account_id(get_field_by_symbol("sfAccount"));
+        let account_key = account_keylet(Uint160::from_void(account.data()));
+        let mut multi_txn = ledger::FlowSandbox::new(&mut *self.submit_view);
+        let Some(account_root) = multi_txn.peek(account_key).ok().flatten() else {
+            return PreclaimResult::new(
+                self.current_ledger_seq,
+                Arc::clone(&self.tx),
+                None,
+                self.preflight_result.flags,
+                self.preflight_result.journal.clone(),
+                Ter::TEF_INTERNAL,
+            );
+        };
+        let mut adjusted =
+            STLedgerEntry::from_stobject(account_root.clone_as_object(), *account_root.key());
+        adjusted.set_field_amount(
+            get_field_by_symbol("sfBalance"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(adjustment.adjusted_balance_drops)),
+        );
+        adjusted.set_field_u32(
+            get_field_by_symbol("sfSequence"),
+            adjustment.applied_sequence_value,
+        );
+        if multi_txn.update(Arc::new(adjusted)).is_err() {
+            return PreclaimResult::new(
+                self.current_ledger_seq,
+                Arc::clone(&self.tx),
+                None,
+                self.preflight_result.flags,
+                self.preflight_result.journal.clone(),
+                Ter::TEF_INTERNAL,
+            );
+        }
+
+        PreclaimResult::new(
+            self.current_ledger_seq,
+            Arc::clone(&self.tx),
+            None,
+            self.preflight_result.flags,
+            self.preflight_result.journal.clone(),
+            queue_apply_preclaim_ter_with_load_fee(
+                &multi_txn,
+                self.tx.as_ref(),
+                self.current_ledger_seq,
+                self.preflight_result.flags,
+                self.load_fee_track,
+            ),
+        )
     }
 
     fn run_try_clear(&mut self) -> ApplyResult {
@@ -1787,6 +1874,7 @@ fn queue_apply_preclaim_ter_with_parent_batch_id(
         current_ledger_seq,
         flags,
         parent_batch_id,
+        || batch_check_sign_ter(view, tx, flags),
         || fee_drops_as_i64(calculate_sttx_base_fee(view, tx)),
         |base_fee| base_fee,
         || {
@@ -1812,11 +1900,13 @@ pub(crate) fn queue_apply_preclaim_ter_with_load_fee(
     load_fee_track: &SharedLoadFeeTrack,
 ) -> Ter {
     let (fee_factor, remote_fee_factor) = load_fee_track.scaling_factors();
-    crate::state::invoke_preclaim::invoke_preclaim(
+    crate::state::invoke_preclaim::invoke_preclaim_with_parent_batch_id(
         view,
         tx,
         current_ledger_seq,
         flags,
+        None,
+        || batch_check_sign_ter(view, tx, flags),
         || fee_drops_as_i64(calculate_sttx_base_fee(view, tx)),
         |base_fee| {
             crate::state::invoke_preclaim::scale_fee_load(
@@ -2290,8 +2380,12 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
     // semantic preflight and immutable preclaim before entering this shell.
     // The public TxQ apply path already owns the same facts, so only Batch's
     // outer-only validation belongs here before its sandbox is opened.
+    // Public/consensus paths reach this shell only after shared preflight and
+    // invokePreclaim. Keep the direct Batch guard structural so test and
+    // builder callers retain Batch::preflight's inner validation without
+    // duplicating the outer raw-signature gate that shared preclaim owns.
     if txn_type == TxType::BATCH {
-        let preflight = transaction_preflight_ter(tx, &rules);
+        let preflight = tx::validate_sttx_batch_preflight_with_rules(tx, &rules);
         if !is_tes_success(preflight) {
             return SubmitApplyOutcome {
                 result: preflight,
@@ -2364,7 +2458,13 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
         }
 
         if is_tes_success(result) || is_tec_claim(result) {
-            let _ = tx_view.apply();
+            // A commit failure means the parent changed underneath this
+            // transaction. Never report an applied result after discarding a
+            // `FlowSandbox::apply` error.
+            if tx_view.apply().is_err() {
+                result = Ter::TEF_INTERNAL;
+                applied_batch_inner_transactions.clear();
+            }
         } else {
             applied_batch_inner_transactions.clear();
         }
@@ -2731,8 +2831,12 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             result = crate::state::invariants::check_invariants_for_tx(view, tx, result, fee_amt);
         } else if !do_offers && !do_lines_or_mpts && !do_nf_token_offers && !do_credentials {
             if result != Ter::TEC_KILLED {
-                // Apply inner sandbox changes to outer view (normal path)
-                let _ = inner.apply();
+                // Apply inner sandbox changes to outer view (normal path).
+                // A failed commit is an internal application failure, never a
+                // successful transaction with silently lost mutations.
+                if inner.apply().is_err() {
+                    result = Ter::TEF_INTERNAL;
+                }
             }
         } else {
             // Cleanup path
@@ -2954,21 +3058,35 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
         } else {
             preflight
         };
-        let result = if is_tes_success(preclaim) {
-            // Each inner transaction has its own ApplyContext metadata in
-            // rippled. Keep delivery capture local to this inner, never the
-            // outer Batch, before the whole-batch view is committed.
-            let delivered_amount_capture = (inner_tx.get_txn_type() == TxType::PAYMENT)
-                .then(crate::state::payment::MptDeliveredAmountCapture::new);
-            let result = apply_submit_transactor_shell_impl(
-                &mut per_tx_batch_view,
-                &inner_tx,
-                inner_tx.get_txn_type(),
-            );
-            let delivered_amount = delivered_amount_capture
-                .map(crate::state::payment::MptDeliveredAmountCapture::finish)
-                .flatten();
-            (result, delivered_amount)
+        let result = if is_tes_success(preclaim) || is_tec_claim(preclaim) {
+            // `apply.cpp::applyBatchTransactions` invokes the normal
+            // per-transaction lifecycle. Contain a malformed inner handler
+            // at that boundary so a panic cannot unwind and partially expose
+            // the whole Batch view.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let delivered_amount_capture = (inner_tx.get_txn_type() == TxType::PAYMENT)
+                    .then(crate::state::payment::MptDeliveredAmountCapture::new);
+                let result = apply_submit_transactor_shell_impl(
+                    &mut per_tx_batch_view,
+                    &inner_tx,
+                    inner_tx.get_txn_type(),
+                );
+                let delivered_amount = delivered_amount_capture
+                    .map(crate::state::payment::MptDeliveredAmountCapture::finish)
+                    .flatten();
+                (result, delivered_amount)
+            })) {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::error!(
+                        target: "tx",
+                        parent_batch_id = %parent_batch_id,
+                        inner_tx_id = %inner_tx.get_transaction_id(),
+                        "inner Batch transaction panicked; mapped to tefEXCEPTION"
+                    );
+                    (Ter::TEF_EXCEPTION, None)
+                }
+            }
         } else {
             (preclaim, None)
         };
@@ -6826,10 +6944,25 @@ impl ApplicationRoot {
                             total_ledgers = replay.total_ledgers,
                             "tryAdvance: scheduling publication-gap ledger replay"
                         );
-                        let _ = replayer.replay(
+                        let root = self.clone();
+                        let inbound_ledgers = Arc::clone(&lm_rt.inbound_ledgers);
+                        let _ = replayer.replay_and_init(
                             ledger::InboundLedgerReason::Generic,
                             replay.finish_hash,
                             replay.total_ledgers,
+                            1,
+                            move |hash| root.resolve_ledger_by_hash(SHAMapHash::new(hash)),
+                            move |hash, seq, _reason| {
+                                if let Ok(guard) = inbound_ledgers.lock()
+                                    && let Some(shared) = guard.as_ref()
+                                {
+                                    shared.acquire_async(
+                                        hash,
+                                        seq,
+                                        crate::ledger::inbound_ledgers::AcquireReason::Generic,
+                                    );
+                                }
+                            },
                         );
                     } else {
                         tracing::error!(target: "ledger",
@@ -8223,7 +8356,9 @@ impl ApplicationRoot {
                 };
                 let (result, delivered_amount, applied_batch_inner_transactions) = if is_tes_success(
                     preclaim,
-                ) {
+                )
+                    || is_tec_claim(preclaim)
+                {
                     let mut attempt_view =
                         ledger::FlowSandbox::new_with_flags(&mut *view, retry_flags);
                     let SubmitApplyOutcome {

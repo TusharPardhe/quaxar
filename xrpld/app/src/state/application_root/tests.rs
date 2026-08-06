@@ -45,7 +45,8 @@ use tx::{
     QueueAcceptOwnerState, QueueAdvanceCandidate, QueueApplyExecutionRuntime,
     QueueApplyHoldPreflightTxSource, QueueApplyObservedAccountLookup,
     QueueApplyObservedTicketLookup, QueueApplyObservedTxSource, QueueApplyObservedViewSource,
-    QueueFeeMetricsSnapshot, QueueViews, TxConsequences, TxQAccount, TxQSetup,
+    QueueApplyPreclaimViewSource, QueueApplyViewAdjustment, QueueFeeMetricsSnapshot, QueueViews,
+    TxConsequences, TxQAccount, TxQSetup,
 };
 
 #[derive(Default)]
@@ -3015,6 +3016,8 @@ fn batch_base_fee_uses_account_delete_owner_reserve_increment() {
 
 #[test]
 fn live_batch_preclaim_authorizes_master_and_enforces_aggregate_fee_validity() {
+    // ../rippled/src/libxrpl/tx/transactors/system/Batch.cpp::Batch::checkSign
+    // requires the normal outer signature before BatchSigners and checkFee.
     let secret = SecretKey::from_bytes([0x51; 32]);
     let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
     let outer = calc_account_id(public.as_bytes());
@@ -3031,6 +3034,10 @@ fn live_batch_preclaim_authorizes_master_and_enforces_aggregate_fee_validity() {
     signer.set_field_vl(get_field_by_symbol("sfTxnSignature"), &[0x01]);
     batch_signers.push_back(signer);
     authorized.set_field_array(get_field_by_symbol("sfBatchSigners"), batch_signers);
+    authorized.set_field_vl(get_field_by_symbol("sfSigningPubKey"), public.as_bytes());
+    authorized
+        .sign(&public, &secret, None)
+        .expect("outer Batch signature should be valid");
 
     let expected_fee = ledger.fees().base * 5;
     assert_eq!(batch_base_fee(&ledger, &authorized), expected_fee);
@@ -3039,12 +3046,16 @@ fn live_batch_preclaim_authorizes_master_and_enforces_aggregate_fee_validity() {
         Ter::TES_SUCCESS
     );
 
-    let oversized = batch_policy_batch(
+    let mut oversized = batch_policy_batch(
         outer,
         &(0..=tx::MAX_BATCH_TX_COUNT)
             .map(|sequence| batch_policy_inner(outer, sequence as u32 + 1))
             .collect::<Vec<_>>(),
     );
+    oversized.set_field_vl(get_field_by_symbol("sfSigningPubKey"), public.as_bytes());
+    // `STTx::sign` rejects this deliberately malformed oversized Batch before
+    // preclaim. The ledger-backed signer gate still sees the master public
+    // key; this assertion isolates Batch::calculateBaseFee's sentinel path.
     assert_eq!(batch_base_fee(&ledger, &oversized), INVALID_BATCH_BASE_FEE);
     assert_eq!(
         queue_apply_preclaim_ter(&ledger, &oversized, ledger.header().seq, ApplyFlags::NONE,),
@@ -3484,6 +3495,52 @@ fn closed_ledger_txq_fee_metrics_use_specialized_and_default_base_fees() {
 
     // Parity: ../rippled/src/xrpld/app/misc/detail/TxQ.cpp::getFeeLevelPaid and TxQ::FeeMetrics::update.
     assert_eq!(levels, vec![tx::TXQ_BASE_LEVEL, tx::TXQ_BASE_LEVEL]);
+}
+
+#[test]
+fn txq_multitxn_preclaim_uses_an_uncommitted_adjusted_sandbox() {
+    // ../rippled/src/xrpld/app/misc/detail/TxQ.cpp::TxQ::apply creates a
+    // MultiTxn ApplyView/OpenView, adjusts balance and sequence, and preclaims
+    // against it. The adjustment is admission-only and must not commit.
+    let destination = AccountID::from_array([0x92; 20]);
+    let (source, tx) = signed_payment_tx(0x92, destination, 2, 10);
+    let base = Arc::new(ledger_view(10, source, 1, &[]));
+    let mut open_ledger =
+        AppOpenLedgerView::with_parent_hash(11, 10, *base.header().hash.as_uint256());
+    let mut submit_view = Sandbox::new(Arc::clone(&base), ApplyFlags::NONE);
+    let fee_track = crate::load::load_fee_track::SharedLoadFeeTrack::new();
+    let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
+        &mut open_ledger,
+        &mut submit_view,
+        tx,
+        ApplyFlags::NONE,
+        11,
+        &fee_track,
+        Arc::new(Mutex::new(std::collections::HashMap::new())),
+    );
+
+    assert!(runtime.prepare_multitxn(QueueApplyViewAdjustment {
+        potential_total_spend_drops: 10,
+        adjusted_balance_drops: 999_990,
+        applied_sequence_value: 2,
+    }));
+    let preclaim = runtime.run_preclaim(QueueApplyPreclaimViewSource::MultiTxnOpenView);
+    assert_eq!(preclaim.ter, Ter::TES_SUCCESS);
+    drop(runtime);
+
+    let account = submit_view
+        .read(account_keylet(raw_account_id(source)))
+        .expect("source read")
+        .expect("source exists");
+    assert_eq!(account.get_field_u32(get_field_by_symbol("sfSequence")), 1);
+    assert_eq!(
+        account
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops(),
+        1_000_000_000,
+        "MultiTxn preclaim must not commit its temporary balance adjustment"
+    );
 }
 
 #[test]

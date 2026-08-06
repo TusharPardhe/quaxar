@@ -2,7 +2,7 @@
 //! sub-owners.
 
 use crate::{
-    InboundLedgerReason, LedgerConfig, LedgerDeltaAcquire, LedgerHeader, LedgerReplayTask,
+    InboundLedgerReason, Ledger, LedgerConfig, LedgerDeltaAcquire, LedgerHeader, LedgerReplayTask,
     LedgerReplayTaskParameter, SkipListAcquire,
 };
 use basics::base_uint::Uint256;
@@ -32,6 +32,13 @@ impl LedgerReplayer {
             peer_set_builder,
             stopping: false,
         }
+    }
+
+    /// Replaces the registry's bootstrap-only peer set builder once the live
+    /// overlay exists. Newly created replay acquisitions then discover active
+    /// peers at request time, as rippled does through `makePeerSetBuilder`.
+    pub fn set_peer_set_builder(&mut self, peer_set_builder: Arc<dyn PeerSetBuilder>) {
+        self.peer_set_builder = peer_set_builder;
     }
 
     pub fn replay(
@@ -86,6 +93,60 @@ impl LedgerReplayer {
             if task_ref.update_skip_list(finish_hash, data.ledger_seq, &data.skip_list) {
                 drop(task_ref);
                 self.create_deltas(&task);
+            }
+        }
+
+        Some(task)
+    }
+
+    /// Start a replay task and immediately trigger the exact first skip-list
+    /// acquisition. This mirrors `LedgerReplayer::replay`: it creates the
+    /// task under the owner lock, then calls `skipList->init(1)` before the
+    /// task can wait for its first timer
+    /// (`../rippled/src/xrpld/app/ledger/detail/LedgerReplayer.cpp::replay`).
+    pub fn replay_and_init<LookupLedger, FallbackAcquire>(
+        &mut self,
+        reason: InboundLedgerReason,
+        finish_hash: Uint256,
+        total_ledgers: u32,
+        num_peers: usize,
+        mut lookup_ledger: LookupLedger,
+        mut fallback_acquire: FallbackAcquire,
+    ) -> Option<Arc<Mutex<LedgerReplayTask>>>
+    where
+        LookupLedger: FnMut(Uint256) -> Option<Arc<Ledger>>,
+        FallbackAcquire: FnMut(Uint256, u32, InboundLedgerReason),
+    {
+        let had_live_skip_list = self
+            .skip_lists
+            .get(&finish_hash)
+            .and_then(Weak::upgrade)
+            .is_some();
+        let task = self.replay(reason, finish_hash, total_ledgers)?;
+
+        // Only a newly-created acquisition receives an initial trigger. A
+        // shared live skip-list is already owned and driven by its original
+        // task, just as the C++ owner only initializes `newSkipList`.
+        if !had_live_skip_list
+            && let Some(skip_list) = self.skip_lists.get(&finish_hash).and_then(Weak::upgrade)
+        {
+            // The peer replay request and normal inbound acquisition begin
+            // together. This prevents a new replay task from waiting idle
+            // when its first peer set is empty, while a replay-capable peer
+            // can still satisfy the narrower proof-path request.
+            let mut found_local = false;
+            let mut no_op_fallback = |_, _, _| {};
+            skip_list.lock().expect("skip list lock").init(
+                num_peers,
+                &mut |hash| {
+                    let ledger = lookup_ledger(hash);
+                    found_local = ledger.is_some();
+                    ledger
+                },
+                &mut no_op_fallback,
+            );
+            if !found_local {
+                fallback_acquire(finish_hash, 0, reason);
             }
         }
 
