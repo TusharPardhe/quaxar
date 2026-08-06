@@ -3,8 +3,8 @@ mod manifest;
 
 use basics::base64::base64_encode;
 use manifest::{
-    Manifest, ManifestCache, ManifestDisposition, ManifestRateLimitCapPolicy,
-    MAX_UNTRUSTED_MANIFESTS, deserialize_manifest, load_validator_token,
+    MAX_UNTRUSTED_MANIFESTS, Manifest, ManifestCache, ManifestDisposition,
+    ManifestRateLimitCapPolicy, deserialize_manifest, load_validator_token,
 };
 use protocol::{
     HashPrefix, KeyType, PublicKey, SField, STObject, SecretKey, Serializer, derive_public_key,
@@ -244,8 +244,14 @@ fn manifest_cache_wallet_round_trip_preserves_validator_and_publisher_entries() 
     let publisher = build_manifest(KeyType::Secp256k1, 72, KeyType::Ed25519, 82, 2, None);
 
     let cache = ManifestCache::new();
-    assert_eq!(cache.apply_manifest(validator.clone()), ManifestDisposition::Accepted);
-    assert_eq!(cache.apply_manifest(publisher.clone()), ManifestDisposition::Accepted);
+    assert_eq!(
+        cache.apply_manifest(validator.clone()),
+        ManifestDisposition::Accepted
+    );
+    assert_eq!(
+        cache.apply_manifest(publisher.clone()),
+        ManifestDisposition::Accepted
+    );
     cache
         .save_to_wallet(&wallet, "ValidatorManifests", |public_key| {
             *public_key == validator.master_key
@@ -266,7 +272,10 @@ fn manifest_cache_wallet_round_trip_preserves_validator_and_publisher_entries() 
         .expect("load publisher manifests");
 
     for manifest in [&validator, &publisher] {
-        assert_eq!(restored.get_sequence(&manifest.master_key), Some(manifest.sequence));
+        assert_eq!(
+            restored.get_sequence(&manifest.master_key),
+            Some(manifest.sequence)
+        );
         assert_eq!(
             restored.get_master_key(&manifest.signing_key.expect("signing key")),
             manifest.master_key
@@ -386,7 +395,10 @@ fn manifest_cache_known_master_snapshot_excludes_a_key_first_admitted_in_message
     let known = build_manifest(KeyType::Ed25519, 70, KeyType::Secp256k1, 80, 1, None);
     let first_seen = build_manifest(KeyType::Ed25519, 71, KeyType::Secp256k1, 81, 1, None);
 
-    assert_eq!(cache.apply_manifest(known.clone()), ManifestDisposition::Accepted);
+    assert_eq!(
+        cache.apply_manifest(known.clone()),
+        ManifestDisposition::Accepted
+    );
     let before_message = cache.known_master_keys();
     assert!(before_message.contains(&known.master_key));
     assert!(!before_message.contains(&first_seen.master_key));

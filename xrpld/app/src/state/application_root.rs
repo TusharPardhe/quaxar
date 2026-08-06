@@ -1429,6 +1429,7 @@ struct StandaloneAcceptedTx {
     transaction_id: Uint256,
     txn: Arc<Serializer>,
     metadata: Arc<Serializer>,
+    delta_meta_nodes: protocol::JsonValue,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1516,6 +1517,22 @@ impl AcceptLedgerPendingRuntime {
     }
 }
 
+fn consensus_transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
+    let semantic_preflight = if tx.get_txn_type() == TxType::BATCH {
+        tx::validate_sttx_batch_preflight_with_rules(tx, rules)
+    } else {
+        tx::validate_sttx_transaction_preflight_with_rules(tx, rules)
+    };
+    if !is_tes_success(semantic_preflight) {
+        return semantic_preflight;
+    }
+
+    match tx.check_sign(rules) {
+        Ok(()) => Ter::TES_SUCCESS,
+        Err(_) => Ter::TEM_BAD_SIGNATURE,
+    }
+}
+
 fn queue_apply_preclaim_ter(
     view: &impl ReadView,
     tx: &STTx,
@@ -1575,7 +1592,47 @@ fn queue_apply_preclaim_ter(
         return prior_tx_check;
     }
 
+    let typed_preclaim = typed_preclaim_ter(view, tx, flags);
+    if !is_tes_success(typed_preclaim) {
+        return typed_preclaim;
+    }
+
     batch_preclaim_ter(view, tx, flags)
+}
+
+fn typed_preclaim_ter(view: &impl ReadView, tx: &STTx, _flags: ApplyFlags) -> Ter {
+    match tx.get_txn_type() {
+        TxType::PAYMENT => {
+            tx::run_payment_preclaim_with_read_view(view, tx).unwrap_or(Ter::TEF_BAD_LEDGER)
+        }
+        TxType::PAYCHAN_CREATE => tx::run_payment_channel_create_preclaim_with_read_view(view, tx)
+            .unwrap_or(Ter::TEF_BAD_LEDGER),
+        TxType::CREDENTIAL_CREATE => ledger::credential_helpers::credential_create_preclaim(
+            view,
+            tx.get_account_id(get_field_by_symbol("sfSubject")),
+            tx.get_account_id(get_field_by_symbol("sfAccount")),
+            &tx.get_field_vl(get_field_by_symbol("sfCredentialType")),
+        )
+        .unwrap_or(Ter::TEF_BAD_LEDGER),
+        TxType::CREDENTIAL_ACCEPT => ledger::credential_helpers::credential_accept_preclaim(
+            view,
+            tx.get_account_id(get_field_by_symbol("sfAccount")),
+            tx.get_account_id(get_field_by_symbol("sfIssuer")),
+            &tx.get_field_vl(get_field_by_symbol("sfCredentialType")),
+        )
+        .unwrap_or(Ter::TEF_BAD_LEDGER),
+        TxType::CREDENTIAL_DELETE => ledger::credential_helpers::credential_delete_preclaim(
+            view,
+            tx.get_account_id(get_field_by_symbol("sfAccount")),
+            tx.is_field_present(get_field_by_symbol("sfSubject"))
+                .then(|| tx.get_account_id(get_field_by_symbol("sfSubject"))),
+            tx.is_field_present(get_field_by_symbol("sfIssuer"))
+                .then(|| tx.get_account_id(get_field_by_symbol("sfIssuer"))),
+            &tx.get_field_vl(get_field_by_symbol("sfCredentialType")),
+        )
+        .unwrap_or(Ter::TEF_BAD_LEDGER),
+        _ => Ter::TES_SUCCESS,
+    }
 }
 
 struct SubmitOracleSetReserveSink {
@@ -3379,10 +3436,8 @@ impl ApplicationRoot {
         let parent_hash = *parent.header().hash.as_uint256();
         let local_txs = self.local_open_ledger_records();
         let mut retries = Vec::<AppOpenLedgerTxRecord>::new();
-        let rebase_view = std::cell::RefCell::new(Sandbox::new(
-            Arc::clone(&parent),
-            ApplyFlags::NONE,
-        ));
+        let rebase_view =
+            std::cell::RefCell::new(Sandbox::new(Arc::clone(&parent), ApplyFlags::NONE));
         let applied_ids = std::cell::RefCell::new(std::collections::HashSet::new());
 
         self.open_ledger().accept(
@@ -3484,10 +3539,8 @@ impl ApplicationRoot {
         let parent_hash = *parent.header().hash.as_uint256();
         let local_txs = self.local_open_ledger_records();
         let mut retries = Vec::<AppOpenLedgerTxRecord>::new();
-        let rebase_view = std::cell::RefCell::new(Sandbox::new(
-            Arc::clone(&parent),
-            ApplyFlags::NONE,
-        ));
+        let rebase_view =
+            std::cell::RefCell::new(Sandbox::new(Arc::clone(&parent), ApplyFlags::NONE));
         let applied_ids = std::cell::RefCell::new(std::collections::HashSet::new());
         self.open_ledger().accept(
             || AppOpenLedgerView::with_parent_hash(next_open_index, base_fee_drops, parent_hash),
@@ -7273,6 +7326,7 @@ impl ApplicationRoot {
             if applied {
                 let mut meta = protocol::TxMeta::new(st_tx.get_transaction_id(), closed_seq);
                 meta.set_delivered_amount(delivered_amount);
+                let delta_meta_nodes = meta.get_nodes().json(protocol::JsonOptions::NONE);
                 let mut serializer = protocol::Serializer::default();
                 meta.add_raw(&mut serializer, result, accepted_entries.len() as u32);
 
@@ -7289,6 +7343,7 @@ impl ApplicationRoot {
                         st_tx.get_serializer().data(),
                     )),
                     metadata: Arc::new(serializer),
+                    delta_meta_nodes,
                 });
             }
         }
@@ -7652,23 +7707,36 @@ impl ApplicationRoot {
                     protocol::ApplyFlags::NONE
                 };
                 let rules = view.rules();
-                let mut attempt_view = ledger::FlowSandbox::new_with_flags(&mut *view, retry_flags);
-                let (result, delivered_amount) =
-                    apply_submit_transactor_shell_with_delivered_amount(
-                        &mut attempt_view,
-                        &sttx,
-                        txn_type,
-                    );
+                let preflight = consensus_transaction_preflight_ter(&sttx, &rules);
+                let preclaim = if is_tes_success(preflight) {
+                    queue_apply_preclaim_ter(&*view, &sttx, closed_seq, retry_flags)
+                } else {
+                    preflight
+                };
+                let (result, delivered_amount) = if is_tes_success(preclaim) {
+                    let mut attempt_view =
+                        ledger::FlowSandbox::new_with_flags(&mut *view, retry_flags);
+                    let (result, delivered_amount) =
+                        apply_submit_transactor_shell_with_flags_and_delivered_amount(
+                            &mut attempt_view,
+                            &sttx,
+                            txn_type,
+                            retry_flags,
+                        );
+                    if protocol::is_tes_success(result) || protocol::is_tec_claim(result) {
+                        attempt_view
+                            .apply_with_tx_thread(transaction_id, closed_seq, &rules)
+                            .map_err(|error| {
+                                crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
+                                    "failed to thread accepted transaction {transaction_id}: {error:?}"
+                                ))
+                            })?;
+                    }
+                    (result, delivered_amount)
+                } else {
+                    (preclaim, None)
+                };
                 let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
-                if applied {
-                    attempt_view
-                        .apply_with_tx_thread(transaction_id, closed_seq, &rules)
-                        .map_err(|error| {
-                            crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
-                                "failed to thread accepted transaction {transaction_id}: {error:?}"
-                            ))
-                        })?;
-                }
                 drop(view);
                 if !applied {
                     if protocol::is_ter_retry(result) {
@@ -7694,47 +7762,11 @@ impl ApplicationRoot {
                 completed_transaction_ids.insert(transaction_id);
 
                 let index = accepted_entries.len();
-                let _ = self.transaction_master.in_ledger(
-                    transaction_id,
-                    closed_seq,
-                    Some(index as u32),
-                    Some(self.registry.network_id_service.get_network_id()),
-                );
-
                 let mut meta = protocol::TxMeta::new(transaction_id, closed_seq);
                 meta.set_delivered_amount(delivered_amount);
+                let delta_meta_nodes = meta.get_nodes().json(protocol::JsonOptions::NONE);
                 let mut serializer = protocol::Serializer::default();
                 meta.add_raw(&mut serializer, result, index as u32);
-
-                use protocol::StBase;
-                if let Some(publisher) = &self.ledger_delta_publisher {
-                    let mut tx_json =
-                        protocol::JsonValue::Object(std::collections::BTreeMap::new());
-                    if let protocol::JsonValue::Object(map) = &mut tx_json {
-                        map.insert(
-                            "transaction".to_string(),
-                            protocol::JsonValue::String(transaction_id.to_string()),
-                        );
-                        map.insert(
-                            "meta".to_string(),
-                            meta.get_nodes().json(protocol::JsonOptions::NONE),
-                        );
-                    }
-                    let mut delta_msg =
-                        protocol::JsonValue::Object(std::collections::BTreeMap::new());
-                    if let protocol::JsonValue::Object(map) = &mut delta_msg {
-                        map.insert(
-                            "type".to_string(),
-                            protocol::JsonValue::String("ledgerDelta".to_string()),
-                        );
-                        map.insert(
-                            "ledger_index".to_string(),
-                            protocol::JsonValue::Unsigned(closed_seq as u64),
-                        );
-                        map.insert("transaction".to_string(), tx_json);
-                    }
-                    publisher(delta_msg);
-                }
 
                 accepted_entries.push(StandaloneAcceptedTx {
                     transaction_id,
@@ -7742,6 +7774,7 @@ impl ApplicationRoot {
                         sttx.get_serializer().data(),
                     )),
                     metadata: Arc::new(serializer),
+                    delta_meta_nodes,
                 });
             }
 
@@ -7837,6 +7870,58 @@ impl ApplicationRoot {
                 Arc::new(closed)
             }
         };
+
+        for (index, entry) in accepted_entries.iter().enumerate() {
+            let _ = self.transaction_master.in_ledger(
+                entry.transaction_id,
+                closed_seq,
+                Some(index as u32),
+                Some(self.registry.network_id_service.get_network_id()),
+            );
+
+            if let Some(publisher) = &self.ledger_delta_publisher {
+                let mut tx_json = protocol::JsonValue::Object(std::collections::BTreeMap::new());
+                if let protocol::JsonValue::Object(map) = &mut tx_json {
+                    map.insert(
+                        "transaction".to_string(),
+                        protocol::JsonValue::String(entry.transaction_id.to_string()),
+                    );
+                    map.insert("meta".to_string(), entry.delta_meta_nodes.clone());
+                }
+                let mut delta_msg = protocol::JsonValue::Object(std::collections::BTreeMap::new());
+                if let protocol::JsonValue::Object(map) = &mut delta_msg {
+                    map.insert(
+                        "type".to_string(),
+                        protocol::JsonValue::String("ledgerDelta".to_string()),
+                    );
+                    map.insert(
+                        "ledger_index".to_string(),
+                        protocol::JsonValue::Unsigned(closed_seq as u64),
+                    );
+                    map.insert("transaction".to_string(), tx_json);
+                }
+                if let Err(payload) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| publisher(delta_msg)))
+                {
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| {
+                            payload
+                                .downcast_ref::<&str>()
+                                .map(|message| (*message).to_owned())
+                        })
+                        .unwrap_or_else(|| "non-string panic payload".to_owned());
+                    tracing::error!(
+                        target: "ledger",
+                        closed_seq,
+                        tx_id = %entry.transaction_id,
+                        %message,
+                        "ledger delta publisher panicked after candidate ledger materialization"
+                    );
+                }
+            }
+        }
 
         let tx_count = accepted_entries.len();
         tracing::info!(target: "app", seq = closed_seq, tx_count, close_time, "Ledger closed");

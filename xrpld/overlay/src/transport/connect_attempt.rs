@@ -192,15 +192,11 @@ impl ConnectAttempt {
         self.ensure_not_stopping(&stop_requested)?;
         tracing::debug!(target: "overlay", ip = %self.remote_endpoint, "TCP connect starting");
         let tcp_stream = self
-            .await_phase(
-                ConnectionStep::TcpConnect,
-                &mut stop_requested,
-                async {
-                    TcpStream::connect(self.remote_endpoint)
-                        .await
-                        .map_err(ConnectAttemptError::Io)
-                },
-            )
+            .await_phase(ConnectionStep::TcpConnect, &mut stop_requested, async {
+                TcpStream::connect(self.remote_endpoint)
+                    .await
+                    .map_err(ConnectAttemptError::Io)
+            })
             .await?;
 
         // Disable Nagle's algorithm for low-latency request-response pipelining.
@@ -213,16 +209,12 @@ impl ConnectAttempt {
         let mut tls_stream = SslStream::new(ssl, tcp_stream)
             .map_err(|error| ConnectAttemptError::Protocol(error.to_string()))?;
         self.ensure_not_stopping(&stop_requested)?;
-        self.await_phase(
-            ConnectionStep::TlsHandshake,
-            &mut stop_requested,
-            async {
-                std::pin::Pin::new(&mut tls_stream)
-                    .connect()
-                    .await
-                    .map_err(|error| ConnectAttemptError::Protocol(error.to_string()))
-            },
-        )
+        self.await_phase(ConnectionStep::TlsHandshake, &mut stop_requested, async {
+            std::pin::Pin::new(&mut tls_stream)
+                .connect()
+                .await
+                .map_err(|error| ConnectAttemptError::Protocol(error.to_string()))
+        })
         .await?;
 
         let shared_value = make_shared_value(&tls_stream)?;
@@ -244,32 +236,26 @@ impl ConnectAttempt {
 
         let wire_request = serialize_request(&request);
         self.ensure_not_stopping(&stop_requested)?;
-        self.await_phase(
-            ConnectionStep::HttpWrite,
-            &mut stop_requested,
-            async {
-                tls_stream
-                    .write_all(&wire_request)
-                    .await
-                    .map_err(ConnectAttemptError::Io)
-            },
-        )
+        self.await_phase(ConnectionStep::HttpWrite, &mut stop_requested, async {
+            tls_stream
+                .write_all(&wire_request)
+                .await
+                .map_err(ConnectAttemptError::Io)
+        })
         .await?;
         self.ensure_not_stopping(&stop_requested)?;
-        self.await_phase(
-            ConnectionStep::HttpWrite,
-            &mut stop_requested,
-            async { tls_stream.flush().await.map_err(ConnectAttemptError::Io) },
-        )
+        self.await_phase(ConnectionStep::HttpWrite, &mut stop_requested, async {
+            tls_stream.flush().await.map_err(ConnectAttemptError::Io)
+        })
         .await?;
 
         self.ensure_not_stopping(&stop_requested)?;
         let wire_response = self
-            .await_phase(
-                ConnectionStep::HttpRead,
-                &mut stop_requested,
-                async { read_http_response(&mut tls_stream).await.map_err(ConnectAttemptError::Io) },
-            )
+            .await_phase(ConnectionStep::HttpRead, &mut stop_requested, async {
+                read_http_response(&mut tls_stream)
+                    .await
+                    .map_err(ConnectAttemptError::Io)
+            })
             .await?;
         let response =
             parse_http_response(&wire_response).map_err(ConnectAttemptError::InvalidHttp)?;

@@ -2,7 +2,7 @@ use super::{
     AcceptLedgerPendingRuntime, AcceptLedgerPendingTransaction, AppOpenLedgerTxQApplyRuntime,
     ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, apply_submit_transactor_shell,
     batch_base_fee, consensus_status_event, preferred_lcl_matches_local_or_parent,
-    queue_apply_preclaim_ter,
+    queue_apply_preclaim_ter, typed_preclaim_ter,
 };
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::network::network_ops_runtime::AppNetworkOpsApplyHeldOutcome;
@@ -1366,10 +1366,7 @@ fn application_root_accept_ledger_rebuilds_next_open_with_queued_txs() {
             .hash
             .as_uint256()
     );
-    assert_eq!(
-        rebuilt.tx_ids(),
-        vec![queued_tx.get_transaction_id()]
-    );
+    assert_eq!(rebuilt.tx_ids(), vec![queued_tx.get_transaction_id()]);
     assert!(app.tx_q_account_txs(queued_account_id).is_empty());
 }
 
@@ -1794,8 +1791,14 @@ fn application_root_configures_fee_voting_targets() {
 
 #[test]
 fn median_validation_sign_time_matches_rippled_even_odd_and_fallback_rules() {
-    assert_eq!(super::median_validation_sign_time(vec![30, 10, 20], 3, 99), 20);
-    assert_eq!(super::median_validation_sign_time(vec![40, 10, 30, 20], 4, 99), 25);
+    assert_eq!(
+        super::median_validation_sign_time(vec![30, 10, 20], 3, 99),
+        20
+    );
+    assert_eq!(
+        super::median_validation_sign_time(vec![40, 10, 30, 20], 4, 99),
+        25
+    );
     assert_eq!(super::median_validation_sign_time(vec![10, 20], 3, 99), 99);
 }
 
@@ -1830,7 +1833,9 @@ fn application_root_published_ledger_emits_canonical_ledger_closed_event() {
     );
     assert_eq!(
         payload.get("ledger_hash"),
-        Some(&protocol::JsonValue::String(ledger.header().hash.to_string()))
+        Some(&protocol::JsonValue::String(
+            ledger.header().hash.to_string()
+        ))
     );
     assert_eq!(
         payload.get("ledger_time"),
@@ -1854,7 +1859,11 @@ fn application_root_queue_relay_envelope_replaces_hostile_inbound_metadata() {
 
     assert_eq!(message.status, 2, "queue relay must emit tsCURRENT");
     assert_eq!(message.receive_timestamp, Some(42_424));
-    assert_eq!(message.deferred, Some(true), "only local terQUEUED may defer");
+    assert_eq!(
+        message.deferred,
+        Some(true),
+        "only local terQUEUED may defer"
+    );
     assert_ne!(message.status, hostile.status);
     assert_ne!(message.receive_timestamp, hostile.receive_timestamp);
     assert_ne!(message.deferred, hostile.deferred);
@@ -1892,7 +1901,10 @@ fn application_root_proposed_transaction_payload_matches_rippled_parity_fields()
     let protocol::JsonValue::Object(payload) = &events[0].1 else {
         panic!("proposed transaction payload should be an object");
     };
-    assert_eq!(payload.get("validated"), Some(&protocol::JsonValue::Bool(false)));
+    assert_eq!(
+        payload.get("validated"),
+        Some(&protocol::JsonValue::Bool(false))
+    );
     assert_eq!(
         payload.get("engine_result"),
         Some(&protocol::JsonValue::String("tesSUCCESS".to_owned()))
@@ -2046,7 +2058,10 @@ fn application_root_load_manager_fee_change_publishes_server_subscription_event(
         "queue overload",
         || {},
     ));
-    assert!(app.job_queue().is_overloaded(), "JQ should drive fee raising");
+    assert!(
+        app.job_queue().is_overloaded(),
+        "JQ should drive fee raising"
+    );
 
     // FeeTrack requires one sustained-overload observation before changing the
     // local fee; the LoadManager invocation below performs the changing one.
@@ -2310,7 +2325,10 @@ fn refresh_validator_trust_propagates_unl_block_and_clear_to_network_ops() {
 
     let publisher_secret = SecretKey::from_bytes([0x5A; 32]);
     let publisher = derive_public_key(KeyType::Ed25519, &publisher_secret).expect("publisher key");
-    assert!(app.validators().load(None, &[], &[publisher.to_hex()], None));
+    assert!(
+        app.validators()
+            .load(None, &[], &[publisher.to_hex()], None)
+    );
     app.refresh_validator_trust_for_consensus(&lcl);
     assert!(app.validators().unl_blocked());
     assert!(app.unl_blocked());
@@ -2659,11 +2677,66 @@ fn acquired_lcl_rebase_discards_transactions_already_in_parent() {
     app.rebuild_open_ledger_after_consensus(Arc::clone(&acquired_lcl));
 
     let current = app.open_ledger().current();
-    assert_eq!(current.parent_hash, *acquired_lcl.header().hash.as_uint256());
+    assert_eq!(
+        current.parent_hash,
+        *acquired_lcl.header().hash.as_uint256()
+    );
     assert!(
         !current.tx_ids().contains(&tx_id),
         "an acquired parent must filter transactions it already contains"
     );
+}
+
+#[test]
+fn consensus_build_discards_transaction_with_consumed_parent_sequence() {
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let destination = account("00000000000000000000000000000000000000AB");
+    let (source, stale_tx) = signed_payment_tx(43, destination, 1, 10);
+    let parent = Arc::new(ledger_view(11, source, 2, &[]));
+    let stale_id = stale_tx.get_transaction_id();
+
+    let outcome = app
+        .accept_ledger_with_txns_outcome_from_consensus_parent(
+            Arc::clone(&parent),
+            12,
+            1_012,
+            LEDGER_DEFAULT_TIME_RESOLUTION,
+            true,
+            parent.fees().base,
+            vec![stale_tx],
+        )
+        .expect("stale consensus transaction must not abort the candidate ledger build");
+
+    assert!(
+        !outcome.closed.tx_exists(stale_id),
+        "an ancestor-consumed transaction must be rejected before consensus threading"
+    );
+    assert!(outcome.completed_transaction_ids.contains(&stale_id));
+}
+
+#[test]
+fn consensus_build_rejects_invalid_signature_before_mutation() {
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    let source = account("00000000000000000000000000000000000000AC");
+    let destination = account("00000000000000000000000000000000000000AD");
+    let unsigned_tx = payment_tx(source, destination, 1, None, 10);
+    let tx_id = unsigned_tx.get_transaction_id();
+    let parent = Arc::new(ledger_view(11, source, 1, &[]));
+
+    let outcome = app
+        .accept_ledger_with_txns_outcome_from_consensus_parent(
+            Arc::clone(&parent),
+            12,
+            1_012,
+            LEDGER_DEFAULT_TIME_RESOLUTION,
+            true,
+            parent.fees().base,
+            vec![unsigned_tx],
+        )
+        .expect("invalid transaction must not abort the candidate ledger build");
+
+    assert!(!outcome.closed.tx_exists(tx_id));
+    assert!(outcome.completed_transaction_ids.contains(&tx_id));
 }
 
 #[test]
@@ -2969,12 +3042,7 @@ fn live_batch_preclaim_authorizes_master_and_enforces_aggregate_fee_validity() {
     let expected_fee = ledger.fees().base * 5;
     assert_eq!(batch_base_fee(&ledger, &authorized), expected_fee);
     assert_eq!(
-        queue_apply_preclaim_ter(
-            &ledger,
-            &authorized,
-            ledger.header().seq,
-            ApplyFlags::NONE,
-        ),
+        queue_apply_preclaim_ter(&ledger, &authorized, ledger.header().seq, ApplyFlags::NONE,),
         Ter::TES_SUCCESS
     );
 
@@ -2986,13 +3054,182 @@ fn live_batch_preclaim_authorizes_master_and_enforces_aggregate_fee_validity() {
     );
     assert_eq!(batch_base_fee(&ledger, &oversized), INVALID_BATCH_BASE_FEE);
     assert_eq!(
-        queue_apply_preclaim_ter(
-            &ledger,
-            &oversized,
-            ledger.header().seq,
-            ApplyFlags::NONE,
-        ),
+        queue_apply_preclaim_ter(&ledger, &oversized, ledger.header().seq, ApplyFlags::NONE,),
         Ter::TEC_INSUFF_FEE
+    );
+}
+
+#[test]
+fn typed_preclaim_routes_credential_types_through_read_view_helpers() {
+    let issuer = AccountID::from_array([0x7A; 20]);
+    let subject = AccountID::from_array([0x7B; 20]);
+    let credential_type = b"kyc";
+    let create = STTx::new(TxType::CREDENTIAL_CREATE, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), issuer);
+        tx.set_account_id(get_field_by_symbol("sfSubject"), subject);
+        tx.set_field_vl(get_field_by_symbol("sfCredentialType"), credential_type);
+    });
+    let accept = STTx::new(TxType::CREDENTIAL_ACCEPT, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), subject);
+        tx.set_account_id(get_field_by_symbol("sfIssuer"), issuer);
+        tx.set_field_vl(get_field_by_symbol("sfCredentialType"), credential_type);
+    });
+    let delete = STTx::new(TxType::CREDENTIAL_DELETE, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), issuer);
+        tx.set_account_id(get_field_by_symbol("sfSubject"), subject);
+        tx.set_field_vl(get_field_by_symbol("sfCredentialType"), credential_type);
+    });
+    let mut view = Sandbox::new(Arc::new(ledger_view(1, subject, 1, &[])), ApplyFlags::NONE);
+
+    assert_eq!(
+        typed_preclaim_ter(&view, &create, ApplyFlags::NONE),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        typed_preclaim_ter(&view, &accept, ApplyFlags::NONE),
+        Ter::TEC_NO_ISSUER
+    );
+    assert_eq!(
+        typed_preclaim_ter(&view, &delete, ApplyFlags::NONE),
+        Ter::TEC_NO_ENTRY
+    );
+
+    let mut issuer_root = STLedgerEntry::from_type_and_key(
+        LedgerEntryType::AccountRoot,
+        account_keylet(raw_account_id(issuer)).key,
+    );
+    issuer_root.set_account_id(get_field_by_symbol("sfAccount"), issuer);
+    issuer_root.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+    issuer_root.set_field_amount(
+        get_field_by_symbol("sfBalance"),
+        STAmount::new_native(1_000_000, false),
+    );
+    view.insert(Arc::new(issuer_root))
+        .expect("issuer account should insert");
+    assert_eq!(
+        typed_preclaim_ter(&view, &accept, ApplyFlags::NONE),
+        Ter::TEC_NO_ENTRY
+    );
+
+    let keylet = protocol::credential_keylet(
+        raw_account_id(subject),
+        raw_account_id(issuer),
+        credential_type,
+    );
+    let mut credential = STLedgerEntry::new(keylet);
+    credential.set_account_id(get_field_by_symbol("sfSubject"), subject);
+    credential.set_account_id(get_field_by_symbol("sfIssuer"), issuer);
+    credential.set_field_vl(get_field_by_symbol("sfCredentialType"), credential_type);
+    view.insert(Arc::new(credential))
+        .expect("credential should insert");
+
+    assert_eq!(
+        typed_preclaim_ter(&view, &create, ApplyFlags::NONE),
+        Ter::TEC_DUPLICATE
+    );
+    assert_eq!(
+        typed_preclaim_ter(&view, &accept, ApplyFlags::NONE),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        typed_preclaim_ter(&view, &delete, ApplyFlags::NONE),
+        Ter::TES_SUCCESS
+    );
+}
+
+#[test]
+fn typed_preclaim_routes_payment_and_paychan_create_through_read_only_helpers() {
+    let source = AccountID::from_array([0x71; 20]);
+    let destination = AccountID::from_array([0x72; 20]);
+    let mut ledger = ledger_view(1, source, 1, &[]);
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 1_000_000,
+        increment: 200_000,
+    });
+    let mut view = Sandbox::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let payment = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+        tx.set_account_id(get_field_by_symbol("sfDestination"), destination);
+        tx.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::new_native(999_999, false),
+        );
+    });
+    let create = STTx::new(TxType::PAYCHAN_CREATE, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+        tx.set_account_id(get_field_by_symbol("sfDestination"), destination);
+        tx.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::new_native(1_000, false),
+        );
+    });
+
+    assert_eq!(
+        typed_preclaim_ter(&view, &payment, ApplyFlags::NONE),
+        Ter::TEC_NO_DST_INSUF_XRP
+    );
+    assert_eq!(
+        typed_preclaim_ter(&view, &create, ApplyFlags::NONE),
+        Ter::TEC_NO_DST
+    );
+
+    let mut destination_root = STLedgerEntry::from_type_and_key(
+        LedgerEntryType::AccountRoot,
+        account_keylet(raw_account_id(destination)).key,
+    );
+    destination_root.set_account_id(get_field_by_symbol("sfAccount"), destination);
+    destination_root.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+    destination_root.set_field_amount(
+        get_field_by_symbol("sfBalance"),
+        STAmount::new_native(1_000_000, false),
+    );
+    destination_root.set_field_u32(get_field_by_symbol("sfFlags"), protocol::lsfRequireDestTag);
+    view.insert(Arc::new(destination_root))
+        .expect("destination account should insert");
+
+    assert_eq!(
+        typed_preclaim_ter(&view, &payment, ApplyFlags::NONE),
+        Ter::TEC_DST_TAG_NEEDED
+    );
+    assert_eq!(
+        typed_preclaim_ter(&view, &create, ApplyFlags::NONE),
+        Ter::TEC_DST_TAG_NEEDED
+    );
+
+    let mut tagged_create = create.clone();
+    tagged_create.set_field_u32(get_field_by_symbol("sfDestinationTag"), 7);
+    assert_eq!(
+        typed_preclaim_ter(&view, &tagged_create, ApplyFlags::NONE),
+        Ter::TES_SUCCESS
+    );
+
+    let source_after = view
+        .read(account_keylet(raw_account_id(source)))
+        .expect("source lookup should succeed")
+        .expect("source account should remain present");
+    let destination_after = view
+        .read(account_keylet(raw_account_id(destination)))
+        .expect("destination lookup should succeed")
+        .expect("destination account should remain present");
+    assert_eq!(
+        source_after.get_field_u32(get_field_by_symbol("sfSequence")),
+        1,
+        "typed preclaim must not consume the source sequence"
+    );
+    assert_eq!(
+        source_after
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops(),
+        1_000_000_000,
+        "typed preclaim must not debit the source balance"
+    );
+    assert_eq!(
+        destination_after.get_field_u32(get_field_by_symbol("sfFlags")),
+        protocol::lsfRequireDestTag,
+        "typed preclaim must not mutate destination flags"
     );
 }
 

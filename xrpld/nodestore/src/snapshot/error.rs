@@ -133,7 +133,9 @@ impl fmt::Display for SnapshotError {
                 )
             }
             Self::MalformedHeader { reason } => write!(f, "snapshot header is malformed: {reason}"),
-            Self::TrailingData => write!(f, "snapshot contains data after its authenticated footer"),
+            Self::TrailingData => {
+                write!(f, "snapshot contains data after its authenticated footer")
+            }
             Self::DecompressionFailed {
                 chunk_index,
                 reason,

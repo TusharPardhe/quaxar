@@ -7,7 +7,12 @@
 
 use crate::TxConsequences;
 use crate::consequences::{TxConsequencesShape, build_tx_consequences};
-use protocol::{NotTec, SeqProxy, Ter};
+use basics::base_uint::Uint160;
+use ledger::{ReadView, ViewError};
+use protocol::{
+    NotTec, STTx, SeqProxy, Ter, account_keylet, get_field_by_symbol, lsfDisallowIncomingPayChan,
+    lsfRequireDestTag,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaymentChannelCreatePreflightFacts {
@@ -113,6 +118,73 @@ pub fn run_payment_channel_create_preclaim(facts: PaymentChannelCreatePreclaimFa
     }
 
     Ter::TES_SUCCESS
+}
+
+/// Build `PaymentChannelCreatePreclaimFacts` from immutable ledger state and
+/// run the existing payment-channel-create preclaim decision table. This
+/// helper is intentionally limited to creation; Fund and Claim do not have
+/// equivalent complete read-only fact runners yet.
+pub fn run_payment_channel_create_preclaim_with_read_view(
+    view: &impl ReadView,
+    tx: &STTx,
+) -> Result<Ter, ViewError> {
+    let account_field = get_field_by_symbol("sfAccount");
+    let destination_field = get_field_by_symbol("sfDestination");
+    let amount_field = get_field_by_symbol("sfAmount");
+    let destination_tag_field = get_field_by_symbol("sfDestinationTag");
+    let account = tx.get_account_id(account_field);
+    let destination = tx.get_account_id(destination_field);
+    let amount = tx.get_field_amount(amount_field);
+    let source = view.read(account_keylet(Uint160::from_void(account.data())))?;
+    let destination_sle = view.read(account_keylet(Uint160::from_void(destination.data())))?;
+
+    let (source_balance_covers_reserve, source_balance_covers_reserve_plus_amount) = source
+        .as_ref()
+        .map(|source| {
+            let balance = source
+                .get_field_amount(get_field_by_symbol("sfBalance"))
+                .xrp()
+                .drops();
+            let reserve = i64::try_from(view.fees().account_reserve(
+                source.get_field_u32(get_field_by_symbol("sfOwnerCount")) as usize + 1,
+            ))
+            .unwrap_or(i64::MAX);
+            (
+                balance >= reserve,
+                amount.native()
+                    && amount
+                        .xrp()
+                        .drops()
+                        .checked_add(reserve)
+                        .is_some_and(|required| balance >= required),
+            )
+        })
+        .unwrap_or((false, false));
+
+    let destination_disallow_incoming_pay_chan = destination_sle
+        .as_ref()
+        .is_some_and(|sle| sle.is_flag(lsfDisallowIncomingPayChan));
+    let destination_requires_dest_tag = destination_sle
+        .as_ref()
+        .is_some_and(|sle| sle.is_flag(lsfRequireDestTag));
+    let destination_is_pseudo_account = destination_sle.as_ref().is_some_and(|sle| {
+        ["sfAMMID", "sfVaultID", "sfLoanBrokerID"]
+            .into_iter()
+            .any(|field| sle.is_field_present(get_field_by_symbol(field)))
+    });
+
+    Ok(run_payment_channel_create_preclaim(
+        PaymentChannelCreatePreclaimFacts {
+            source_account_exists: source.is_some(),
+            source_balance_covers_reserve,
+            source_balance_covers_reserve_plus_amount,
+            destination_exists: destination_sle.is_some(),
+            destination_disallow_incoming_pay_chan,
+            destination_requires_dest_tag,
+            destination_has_dest_tag: tx.is_field_present(destination_tag_field),
+            destination_is_pseudo_account,
+        },
+    ))
 }
 
 pub fn build_payment_channel_create_prepared_apply_facts(

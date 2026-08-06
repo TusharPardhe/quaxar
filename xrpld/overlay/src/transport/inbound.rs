@@ -1093,17 +1093,46 @@ mod tests {
         }
 
         let (manifests, lists, collections) = handler.take_validator_messages();
-        assert_eq!(manifests.iter().map(|message| message.peer_id).collect::<Vec<_>>(), vec![1]);
-        assert_eq!(lists.iter().map(|message| message.peer_id).collect::<Vec<_>>(), vec![2]);
-        assert_eq!(collections.iter().map(|message| message.peer_id).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(
+            manifests
+                .iter()
+                .map(|message| message.peer_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            lists
+                .iter()
+                .map(|message| message.peer_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(
+            collections
+                .iter()
+                .map(|message| message.peer_id)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
 
-        handler.inner.lock().expect("overlay inbound lock").validator_list_collections.push(PeerMessage {
-            peer_id: 4,
-            message: TmValidatorListCollection::default(),
-        });
+        handler
+            .inner
+            .lock()
+            .expect("overlay inbound lock")
+            .validator_list_collections
+            .push(PeerMessage {
+                peer_id: 4,
+                message: TmValidatorListCollection::default(),
+            });
         let (_, lists, collections) = handler.take_validator_messages();
         assert!(lists.is_empty());
-        assert_eq!(collections.iter().map(|message| message.peer_id).collect::<Vec<_>>(), vec![4]);
+        assert_eq!(
+            collections
+                .iter()
+                .map(|message| message.peer_id)
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
     }
 
     #[test]

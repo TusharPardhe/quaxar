@@ -93,8 +93,7 @@ impl SntpClient {
                     }
                 };
                 runtime.block_on(client.query_loop(servers, stop_rx, on_offset));
-            })
-        {
+            }) {
             Ok(handle) => {
                 *worker = Some(handle);
                 Ok(())
@@ -128,10 +127,7 @@ impl SntpClient {
         self.offset_secs.load(Ordering::Acquire)
     }
 
-    async fn wait_or_stop(
-        delay: Duration,
-        stop: &mut watch::Receiver<bool>,
-    ) -> bool {
+    async fn wait_or_stop(delay: Duration, stop: &mut watch::Receiver<bool>) -> bool {
         tokio::select! {
             biased;
             changed = stop.changed() => {
@@ -158,8 +154,11 @@ impl SntpClient {
 
         let mut offsets = VecDeque::with_capacity(NTP_SAMPLE_WINDOW);
         let mut last_update: Option<Instant> = None;
-        let mut server_state: Vec<(usize, Option<Instant>)> =
-            servers.iter().enumerate().map(|(index, _)| (index, None)).collect();
+        let mut server_state: Vec<(usize, Option<Instant>)> = servers
+            .iter()
+            .enumerate()
+            .map(|(index, _)| (index, None))
+            .collect();
 
         while !*stop.borrow() {
             let target = server_state
@@ -262,10 +261,12 @@ impl SntpClient {
         if response_nonce != nonce || buffer[1] == 0 || buffer[1] > 14 || (buffer[0] >> 6) == 3 {
             return None;
         }
-        let t2 = i64::from(u32::from_be_bytes([buffer[32], buffer[33], buffer[34], buffer[35]]))
-            - NTP_UNIX_OFFSET;
-        let t3 = i64::from(u32::from_be_bytes([buffer[40], buffer[41], buffer[42], buffer[43]]))
-            - NTP_UNIX_OFFSET;
+        let t2 = i64::from(u32::from_be_bytes([
+            buffer[32], buffer[33], buffer[34], buffer[35],
+        ])) - NTP_UNIX_OFFSET;
+        let t3 = i64::from(u32::from_be_bytes([
+            buffer[40], buffer[41], buffer[42], buffer[43],
+        ])) - NTP_UNIX_OFFSET;
         Some(((t2 - t1) + (t3 - t4)) / 2)
     }
 }

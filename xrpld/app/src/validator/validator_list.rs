@@ -14,9 +14,7 @@ use protocol::{
 use time::OffsetDateTime;
 
 use crate::consensus::rcl_validations::RclValidationTrustSource;
-use crate::state::manifest::{
-    Manifest, ManifestCache, ManifestDisposition, deserialize_manifest,
-};
+use crate::state::manifest::{Manifest, ManifestCache, ManifestDisposition, deserialize_manifest};
 
 pub const MAX_SUPPORTED_BLOBS: usize = 5;
 /// `xrpl::kMaxManifestBytes`: reject oversized encoded manifests before
@@ -1302,7 +1300,9 @@ pub fn deserialize_manifest_base64_bounded(encoded: &str) -> Option<Manifest> {
 }
 
 fn clamp_stale_lcl_close_time(close_time: u32, now: u32) -> u32 {
-    (now > close_time.saturating_add(30)).then_some(now).unwrap_or(close_time)
+    (now > close_time.saturating_add(30))
+        .then_some(now)
+        .unwrap_or(close_time)
 }
 
 fn decrement_listing(key_listings: &mut HashMap<PublicKey, usize>, public_key: PublicKey) {
@@ -1527,9 +1527,9 @@ mod tests {
     use crate::state::manifest::ManifestCache;
 
     use super::{
-        ListDisposition, PublisherStatus, SystemValidatorListClock, ValidatorBlobInfo,
-        ValidatorList, ValidatorListClock, ValidatorListExpiration, ValidatorListStatus,
-        MAX_MANIFEST_BASE64_BYTES, MAX_MANIFEST_BYTES, clamp_stale_lcl_close_time,
+        ListDisposition, MAX_MANIFEST_BASE64_BYTES, MAX_MANIFEST_BYTES, PublisherStatus,
+        SystemValidatorListClock, ValidatorBlobInfo, ValidatorList, ValidatorListClock,
+        ValidatorListExpiration, ValidatorListStatus, clamp_stale_lcl_close_time,
         deserialize_manifest_base64_bounded, validator_list_collection_hash,
     };
     use protocol::JsonValue;
@@ -1603,7 +1603,10 @@ mod tests {
     fn stale_lcl_close_time_is_clamped_to_local_time_after_thirty_seconds() {
         assert_eq!(clamp_stale_lcl_close_time(100, 130), 100);
         assert_eq!(clamp_stale_lcl_close_time(100, 131), 131);
-        assert_eq!(clamp_stale_lcl_close_time(u32::MAX - 10, u32::MAX), u32::MAX - 10);
+        assert_eq!(
+            clamp_stale_lcl_close_time(u32::MAX - 10, u32::MAX),
+            u32::MAX - 10
+        );
     }
 
     #[test]

@@ -575,7 +575,6 @@ fn truncated_file_detected() {
     assert!(result.is_err());
 }
 
-
 #[test]
 fn snapshot_manifest_rejects_noncanonical_header_fields() {
     let manifest = test_manifest();
@@ -722,5 +721,9 @@ fn snapshot_loader_propagates_batch_write_failure_and_aborts_import() {
         Err(SnapshotError::BackendWriteFailed { ref reason })
             if reason.contains("injected batch write failure")
     ));
-    assert!(destination.aborted.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        destination
+            .aborted
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
 }

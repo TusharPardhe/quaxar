@@ -567,7 +567,8 @@ fn invariant_recovery_preserves_fee_claim_or_escalates_repeated_failure() {
         let mut dir = STLedgerEntry::from_type_and_key(LedgerEntryType::DirectoryNode, key);
         dir.set_field_h256(sf("sfRootIndex"), key);
         dir.set_field_u64(sf("sfExchangeRate"), 7);
-        flow.insert(Arc::new(dir)).expect("insert malformed directory");
+        flow.insert(Arc::new(dir))
+            .expect("insert malformed directory");
 
         assert_eq!(
             check_invariants(

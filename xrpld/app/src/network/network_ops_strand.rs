@@ -270,8 +270,6 @@ pub struct NetworkOpsStrandDeps {
     pub configured_ledger_history: u32,
     /// rippled `SizedItem::LedgerFetch` for the configured node-size profile.
     pub configured_ledger_fetch_size: u32,
-    /// Consensus event channel sender for LedgerDone events from storeLedger drain.
-    pub event_tx: Option<std::sync::mpsc::SyncSender<crate::consensus::driver::ConsensusEvent>>,
     /// Receiver for completed ledgers from shared_inbound acquisition.
     pub shared_completed_rx:
         Option<std::sync::mpsc::Receiver<crate::ledger::inbound_ledgers::CompletedInboundLedger>>,
@@ -373,7 +371,6 @@ fn strand_loop(
         shared_inbound,
         configured_ledger_history,
         configured_ledger_fetch_size,
-        event_tx,
         shared_completed_rx,
     } = deps;
 
@@ -679,13 +676,6 @@ fn strand_loop(
                 // be in LedgerHistory but absent from the adaptor's local map,
                 // which would leave check_acquired unable to resolve it.
                 root.validations().register_ledger(&ledger);
-                if persisted.inserted {
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx.try_send(crate::consensus::driver::ConsensusEvent::LedgerDone(
-                            Arc::clone(&ledger),
-                        ));
-                    }
-                }
             }
         }
 

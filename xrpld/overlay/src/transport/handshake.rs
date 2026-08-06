@@ -651,9 +651,9 @@ mod tests {
         HandshakeContext, HandshakeVerificationContext, X_PROTOCOL_CTL, build_handshake,
         feature_enabled, get_feature_value, is_feature_value, is_public_ip,
         make_features_request_header, make_features_response_header, make_request, make_response,
-        make_shared_value_from_finished_messages, negotiate_inbound_peer_upgrade, parse_http_request,
-        parse_http_response, serialize_request, serialize_response, validate_outbound_peer_upgrade,
-        verify_handshake,
+        make_shared_value_from_finished_messages, negotiate_inbound_peer_upgrade,
+        parse_http_request, parse_http_response, serialize_request, serialize_response,
+        validate_outbound_peer_upgrade, verify_handshake,
     };
 
     #[test]
@@ -717,7 +717,9 @@ mod tests {
             Some(crate::protocol_version::ProtocolVersion::new(2, 2))
         );
 
-        request.headers_mut().insert("Connect-As", HeaderValue::from_static("Client"));
+        request
+            .headers_mut()
+            .insert("Connect-As", HeaderValue::from_static("Client"));
         assert_eq!(negotiate_inbound_peer_upgrade(&request), None);
 
         let response = Response::builder()

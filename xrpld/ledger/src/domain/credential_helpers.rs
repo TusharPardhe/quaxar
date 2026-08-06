@@ -28,6 +28,94 @@ pub const MAX_CREDENTIALS_ARRAY_SIZE: usize = 8;
 /// Maximum credential type length in bytes.
 pub const MAX_CREDENTIAL_TYPE_LENGTH: usize = 64;
 
+/// Run CredentialCreate's ledger-backed preclaim checks.
+///
+/// The caller owns transaction-shape validation. This helper only reads the
+/// subject AccountRoot and deterministic Credential key, and deliberately
+/// propagates read failures instead of treating them as absent entries.
+pub fn credential_create_preclaim(
+    view: &impl ReadView,
+    subject: AccountID,
+    issuer: AccountID,
+    credential_type: &[u8],
+) -> Result<Ter, ViewError> {
+    if view.read(account_keylet(to_uint160(subject)))?.is_none() {
+        return Ok(Ter::TEC_NO_TARGET);
+    }
+
+    if view
+        .read(credential_keylet(
+            to_uint160(subject),
+            to_uint160(issuer),
+            credential_type,
+        ))?
+        .is_some()
+    {
+        return Ok(Ter::TEC_DUPLICATE);
+    }
+
+    Ok(Ter::TES_SUCCESS)
+}
+
+/// Run CredentialAccept's ledger-backed preclaim checks.
+///
+/// This preserves the reference ordering: missing issuer takes precedence over
+/// a missing credential, which in turn takes precedence over duplicate accept.
+pub fn credential_accept_preclaim(
+    view: &impl ReadView,
+    subject: AccountID,
+    issuer: AccountID,
+    credential_type: &[u8],
+) -> Result<Ter, ViewError> {
+    if view.read(account_keylet(to_uint160(issuer)))?.is_none() {
+        return Ok(Ter::TEC_NO_ISSUER);
+    }
+
+    let Some(credential) = view.read(credential_keylet(
+        to_uint160(subject),
+        to_uint160(issuer),
+        credential_type,
+    ))?
+    else {
+        return Ok(Ter::TEC_NO_ENTRY);
+    };
+
+    if credential.is_flag(lsfAccepted) {
+        return Ok(Ter::TEC_DUPLICATE);
+    }
+
+    Ok(Ter::TES_SUCCESS)
+}
+
+/// Run CredentialDelete's ledger-backed preclaim check after participant
+/// defaulting. Transaction-shape validation remains the caller's preflight
+/// responsibility.
+pub fn credential_delete_preclaim(
+    view: &impl ReadView,
+    actor: AccountID,
+    subject: Option<AccountID>,
+    issuer: Option<AccountID>,
+    credential_type: &[u8],
+) -> Result<Ter, ViewError> {
+    let subject = subject.unwrap_or(actor);
+    let issuer = issuer.unwrap_or(actor);
+
+    Ok(
+        if view
+            .read(credential_keylet(
+                to_uint160(subject),
+                to_uint160(issuer),
+                credential_type,
+            ))?
+            .is_some()
+        {
+            Ter::TES_SUCCESS
+        } else {
+            Ter::TEC_NO_ENTRY
+        },
+    )
+}
+
 /// Checks if a credential has expired relative to the given close time.
 ///
 pub fn check_expired(sle_credential: &STLedgerEntry, close_time: u32) -> bool {

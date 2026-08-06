@@ -368,8 +368,14 @@ mod tests {
             panic!("subscription event should be an object");
         };
         assert_eq!(event.get("validated"), Some(&JsonValue::Bool(true)));
-        assert_eq!(event.get("status"), Some(&JsonValue::String("closed".to_owned())));
-        assert_eq!(event.get("engine_result"), Some(&JsonValue::String("tesSUCCESS".to_owned())));
+        assert_eq!(
+            event.get("status"),
+            Some(&JsonValue::String("closed".to_owned()))
+        );
+        assert_eq!(
+            event.get("engine_result"),
+            Some(&JsonValue::String("tesSUCCESS".to_owned()))
+        );
         assert!(event.contains_key("engine_result_code"));
         assert!(event.contains_key("engine_result_message"));
         assert!(event.contains_key("hash"));

@@ -265,30 +265,33 @@ impl ValidatorSite {
             };
 
             match response.status {
-                200 => match Self::parse_json_response(sites, site_index, &response.body, sink, now) {
-                    Ok(()) => {
-                        tracing::info!(target: "validator_site", uri = %active.uri, "Loaded validator list");
-                        return;
-                    }
-                    Err(message) => {
-                        tracing::warn!(target: "validator_site", uri = %active.uri, %message, "Parse failed");
-                        self.record_error(sites, site_index, now, &message, false, sink);
-                        return;
-                    }
-                },
-                301 | 302 | 307 | 308 => match Self::process_redirect(sites, site_index, response.location)
-                {
-                    Ok(new_resource) => {
-                        if matches!(response.status, 301 | 308) {
-                            sites[site_index].starting_resource = new_resource.clone();
+                200 => {
+                    match Self::parse_json_response(sites, site_index, &response.body, sink, now) {
+                        Ok(()) => {
+                            tracing::info!(target: "validator_site", uri = %active.uri, "Loaded validator list");
+                            return;
                         }
-                        sites[site_index].active_resource = Some(new_resource);
+                        Err(message) => {
+                            tracing::warn!(target: "validator_site", uri = %active.uri, %message, "Parse failed");
+                            self.record_error(sites, site_index, now, &message, false, sink);
+                            return;
+                        }
                     }
-                    Err(message) => {
-                        self.record_error(sites, site_index, now, &message, false, sink);
-                        return;
+                }
+                301 | 302 | 307 | 308 => {
+                    match Self::process_redirect(sites, site_index, response.location) {
+                        Ok(new_resource) => {
+                            if matches!(response.status, 301 | 308) {
+                                sites[site_index].starting_resource = new_resource.clone();
+                            }
+                            sites[site_index].active_resource = Some(new_resource);
+                        }
+                        Err(message) => {
+                            self.record_error(sites, site_index, now, &message, false, sink);
+                            return;
+                        }
                     }
-                },
+                }
                 status => {
                     self.record_error(
                         sites,
@@ -647,6 +650,10 @@ mod tests {
         site.refresh_due(&mut sink, &transport, now);
         site.refresh_due(&mut sink, &transport, now + Duration::from_secs(30));
 
-        assert_eq!(sink.calls.len(), 1, "cached list should be applied after failure");
+        assert_eq!(
+            sink.calls.len(),
+            1,
+            "cached list should be applied after failure"
+        );
     }
 }

@@ -166,10 +166,7 @@ fn tx_sttx_batch_preflight_rejects_typed_check_cash_without_amount_or_deliver_mi
     let outer = account(0x10);
     let malformed_check_cash = STTx::new(TxType::CHECK_CASH, |tx| {
         tx.set_account_id(get_field_by_symbol("sfAccount"), outer);
-        tx.set_field_h256(
-            get_field_by_symbol("sfCheckID"),
-            Uint256::from_u64(1),
-        );
+        tx.set_field_h256(get_field_by_symbol("sfCheckID"), Uint256::from_u64(1));
         tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(0, false));
         tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
         tx.set_field_u32(get_field_by_symbol("sfFlags"), INNER_BATCH_TRANSACTION_FLAG);

@@ -32,7 +32,10 @@ use vault::*;
 /// recovering a prior invariant failure is a hard failure and must not enter
 /// the ledger as a fee-claim transaction.
 fn invariant_failure_result(result: Ter) -> Ter {
-    if matches!(result, Ter::TEC_INVARIANT_FAILED | Ter::TEF_INVARIANT_FAILED) {
+    if matches!(
+        result,
+        Ter::TEC_INVARIANT_FAILED | Ter::TEF_INVARIANT_FAILED
+    ) {
         Ter::TEF_INVARIANT_FAILED
     } else {
         Ter::TEC_INVARIANT_FAILED

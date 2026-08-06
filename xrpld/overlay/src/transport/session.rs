@@ -248,7 +248,8 @@ impl PeerSession {
         // Pending messages remain in the queue depth until their socket write
         // completes, matching rippled's sendQueue_ ownership.
         for message in self.pending_outbound.drain(..) {
-            let write_result = write_message_with_deadline(&mut writer, &message, compression).await;
+            let write_result =
+                write_message_with_deadline(&mut writer, &message, compression).await;
             self.outbound_queue_depth
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             write_result?;

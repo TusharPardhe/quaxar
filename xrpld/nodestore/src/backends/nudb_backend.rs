@@ -1640,10 +1640,7 @@ impl NuDbBackend {
         runtime.split_threshold = nudb_split_threshold(header);
         runtime.split_fraction = runtime.split_threshold / 2;
         #[cfg(test)]
-        nudb_test_crash_if_requested(
-            NuDbTestCrashPoint::PrimaryBucket,
-            "primary bucket creation",
-        );
+        nudb_test_crash_if_requested(NuDbTestCrashPoint::PrimaryBucket, "primary bucket creation");
         Ok(())
     }
 
@@ -3331,13 +3328,12 @@ fn read_u48_be_from_reader(reader: &mut dyn Read, field_name: &str) -> Result<u6
 mod tests {
     use super::{
         NUDB_APPNUM, NUDB_CURRENT_VERSION, NUDB_DATA_FILE_HEADER_SIZE, NUDB_DEFAULT_BLOCK_SIZE,
-        NUDB_KEY_FILE_HEADER_SIZE, NUDB_KEY_FILE_TYPE, NUDB_TARGET_LOAD_FACTOR,
-        NuDbBackendConfig,
+        NUDB_KEY_FILE_HEADER_SIZE, NUDB_KEY_FILE_TYPE, NUDB_TARGET_LOAD_FACTOR, NuDbBackendConfig,
         NuDbFileSetState, NuDbKeyFileHeader, NuDbLayout, NuDbMetadataHeader, NuDbOpenAction,
         NuDbOpenArgs, NuDbOpenState, NuDbTestCrashPoint, encode_nudb_key_file_header,
-        nudb_bucket_capacity, set_nudb_test_crash,
-        nudb_decode_load_factor, nudb_encode_load_factor, nudb_pepper, parse_nudb_block_size,
-        read_nudb_key_file_header, read_nudb_log_file_header, validate_nudb_block_size,
+        nudb_bucket_capacity, nudb_decode_load_factor, nudb_encode_load_factor, nudb_pepper,
+        parse_nudb_block_size, read_nudb_key_file_header, read_nudb_log_file_header,
+        set_nudb_test_crash, validate_nudb_block_size,
     };
     use crate::{
         Backend, JournalLevel, NodeObject, NodeObjectType, NodeStoreJournal, NuDbBackend, Status,
@@ -3401,7 +3397,9 @@ mod tests {
             .open_deterministic(true, NUDB_APPNUM, 91_001, 92_001)
             .expect("open");
 
-        let initial_header = backend.key_file_header().expect("initial zero-bucket header");
+        let initial_header = backend
+            .key_file_header()
+            .expect("initial zero-bucket header");
         assert_eq!(initial_header.buckets, 0);
         let block_size = usize::from(initial_header.block_size);
         assert_eq!(

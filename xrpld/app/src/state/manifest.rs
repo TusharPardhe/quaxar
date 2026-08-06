@@ -290,7 +290,9 @@ impl ManifestCache {
             .map(|(_, manifest)| manifest.serialized.clone())
             .collect::<Vec<_>>();
         let mut connection = wallet_db.get_session();
-        let transaction = connection.transaction().map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
         transaction
             .execute(&format!("DELETE FROM {table}"), [])
             .map_err(|error| error.to_string())?;

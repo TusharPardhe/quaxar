@@ -1209,7 +1209,10 @@ mod tests {
 
         peer.notify_outbound_failure();
         assert_eq!(
-            observed.lock().expect("observed failure callback").as_slice(),
+            observed
+                .lock()
+                .expect("observed failure callback")
+                .as_slice(),
             &[(endpoint, true)]
         );
     }
@@ -1238,7 +1241,8 @@ mod tests {
             None,
         ));
         assert_eq!(peer.send_queue_size(), 1);
-        let peer_view: std::sync::Arc<dyn Peer> = std::sync::Arc::clone(&peer) as std::sync::Arc<dyn Peer>;
+        let peer_view: std::sync::Arc<dyn Peer> =
+            std::sync::Arc::clone(&peer) as std::sync::Arc<dyn Peer>;
         assert_eq!(peer_view.send_queue_size(), 1);
     }
 

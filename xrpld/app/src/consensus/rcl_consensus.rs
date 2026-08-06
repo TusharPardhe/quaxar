@@ -63,7 +63,6 @@ use crate::tx_queue::transaction_master::TransactionMaster;
 use crate::validator::validator_keys::ValidatorKeys;
 use crate::validator::validator_list::ValidatorList;
 use ledger::CanonicalTXSet;
-use overlay::Overlay;
 
 pub type RclCxTx = consensus::RclCxTx;
 pub type RclCxLedger = consensus::RclCxLedger;
@@ -1329,50 +1328,56 @@ impl AppConsensus {
         (combined_untrusted, now_trusted)
     }
 
-    fn restart_stale_accept_on_current_lcl(
+    /// Leave the accepted phase after an accepted-ledger candidate could not
+    /// be built. The work's parent is the generic consensus engine's exact
+    /// `prevLedger`; never replace it with a concurrently-changing global LCL.
+    ///
+    /// `execute_accept` is invoked only by the strand after `on_accept` has
+    /// placed generic consensus in `Accepted`. Starting a round from this
+    /// captured parent is therefore the runner-contract-compatible way to
+    /// release that phase and keep the NetworkOps loop making progress.
+    fn restart_after_failed_candidate_build(
         &mut self,
         now: NetClockTimePoint,
-        captured_parent: &ledger::Ledger,
+        work: &PendingAcceptWork,
     ) -> bool {
-        let root = self.adaptor.app_root.clone();
-        let Some(current_lcl) = root.closed_ledger() else {
-            return false;
-        };
-        if current_lcl.header().hash == captured_parent.header().hash {
+        if self.state.phase() != consensus::algorithm::ConsensusPhase::Accepted {
+            tracing::warn!(
+                target: "consensus",
+                phase = ?self.state.phase(),
+                parent_hash = %work.parent_ledger.header().hash,
+                parent_seq = work.parent_ledger.header().seq,
+                "candidate-build recovery rejected outside the accepted runner phase"
+            );
             return false;
         }
 
-        let current_hash = *current_lcl.header().hash.as_uint256();
-        root.process_closed_ledger_txq(current_lcl.as_ref(), true);
-        root.rebuild_open_ledger_after_consensus(Arc::clone(&current_lcl));
-        root.set_status_rpc_current_ledger_index(Some(current_lcl.header().seq.saturating_add(1)));
-        root.set_status_rpc_queue_report(Some(root.tx_q_rpc_report()));
-        if let Some(inbound_tx) = root.inbound_transactions().lock().ok().as_mut() {
-            inbound_tx.new_round(current_lcl.header().seq);
-        }
+        // `timer_tick` normally took this slot before the JtAccept handoff.
+        // Clear it defensively so a failed candidate cannot retain stale
+        // accept scheduling state if a caller ever aborts that normal path.
+        let discarded_pending = self
+            .adaptor
+            .pending_accept
+            .lock()
+            .expect("pending_accept mutex must not be poisoned")
+            .take()
+            .is_some();
+        let parent_hash = *work.parent_ledger.header().hash.as_uint256();
+        let parent = crate::consensus_ledger_from_ledger(&work.parent_ledger);
         let proposing = self.adaptor.is_validator()
             && !self.adaptor.options.standalone
             && self.adaptor.network_ops_mode_owner.operating_mode()
                 == crate::network::network_ops::NetworkOpsOperatingMode::Full;
-        let prev_cx = crate::consensus_ledger_from_ledger(&current_lcl);
-        self.start_round(now, current_hash, prev_cx, proposing);
-        tracing::info!(
-            target: "consensus",
-            captured_parent = %captured_parent.header().hash,
-            current_parent = %current_hash,
-            current_seq = current_lcl.header().seq,
-            "synchronous accept: discarded stale work and restarted on current LCL"
-        );
+
+        self.start_round(now, parent_hash, parent, proposing);
         tracing::warn!(
-            target: "lcl_audit",
-            captured_parent_hash = %captured_parent.header().hash,
-            captured_parent_seq = captured_parent.header().seq,
-            current_lcl_hash = %current_hash,
-            current_lcl_seq = current_lcl.header().seq,
+            target: "consensus",
+            parent_hash = %parent_hash,
+            parent_seq = work.parent_ledger.header().seq,
+            discarded_pending,
             requested_proposing = proposing,
-            operating_mode = ?self.adaptor.network_ops_mode_owner.operating_mode(),
-            need_network_ledger = root.need_network_ledger(),
-            "LCL_AUDIT stale consensus accept restarted on a different local parent"
+            resulting_phase = ?self.state.phase(),
+            "accepted-ledger candidate build failed; restarted consensus on captured parent"
         );
         true
     }
@@ -1483,7 +1488,7 @@ impl AppConsensus {
     /// matching rippled's single-threaded flow:
     ///   doAccept (build ledger) → endConsensus (checkLastClosedLedger) →
     ///   beginConsensus (start_round)
-    fn do_accept_and_start_next_round(&mut self, _now: NetClockTimePoint, work: PendingAcceptWork) {
+    fn do_accept_and_start_next_round(&mut self, now: NetClockTimePoint, work: PendingAcceptWork) {
         let closed_seq = work.closed_seq;
         let root = self.adaptor.app_root.clone();
         // Quaxar's on_closed_ledger schedules a JtBatch that can otherwise
@@ -1503,16 +1508,19 @@ impl AppConsensus {
             "LCL_AUDIT consensus accept work entered"
         );
 
-        match root.accept_ledger_with_txns_outcome_from_consensus_parent(
-            Arc::clone(&work.parent_ledger),
-            work.closed_seq,
-            work.close_time,
-            work.close_resolution,
-            work.correct_close_time,
-            work.base_fee_drops,
-            work.txns.clone(),
-        ) {
-            Ok(outcome) => {
+        let build_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            root.accept_ledger_with_txns_outcome_from_consensus_parent(
+                Arc::clone(&work.parent_ledger),
+                work.closed_seq,
+                work.close_time,
+                work.close_resolution,
+                work.correct_close_time,
+                work.base_fee_drops,
+                work.txns.clone(),
+            )
+        }));
+        match build_result {
+            Ok(Ok(outcome)) => {
                 // Carry the exact child that atomically replaced the captured
                 // parent through all post-accept processing. Re-reading the
                 // mutable LCL here could attach this consensus result to a
@@ -1604,15 +1612,20 @@ impl AppConsensus {
                 // Accepted so that owner observes this exact accepted LCL.
                 root.notify_consensus_event();
             }
-            Err(err) => {
-                // Rippld has no build-wide Result/restart branch: an exception
-                // from buildLCL escapes the JtAccept worker, skips
-                // endConsensus, and terminates. Do not silently rebuild a new
-                // round on a different LCL after a typed persistence/mutation/
-                // traversal failure; that abandons accepted work and diverges.
+            Ok(Err(err)) => {
                 tracing::error!(target: "consensus", closed_seq, ?err,
-                    "fatal accepted-ledger build failure; aborting before endConsensus");
-                std::process::abort();
+                    "accepted-ledger candidate build failed; discarding uninstalled candidate");
+                let _ = self.restart_after_failed_candidate_build(now, &work);
+            }
+            Err(payload) => {
+                let message = panic_payload_message(payload);
+                tracing::error!(
+                    target: "consensus",
+                    closed_seq,
+                    %message,
+                    "accepted-ledger candidate build panicked; discarding uninstalled candidate and preserving NetworkOps strand"
+                );
+                let _ = self.restart_after_failed_candidate_build(now, &work);
             }
         }
     }
@@ -1621,19 +1634,117 @@ impl AppConsensus {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppRclConsensusOptions, decode_consensus_accept_transactions, disputed_relay_envelope,
+        AppConsensus, AppRclConsensusAdaptor, AppRclConsensusOptions, AppRclConsensusRelay,
+        ConsensusRunner, NullRclConsensusJournal, PendingAcceptWork,
+        decode_consensus_accept_transactions, disputed_relay_envelope,
         pseudo_transaction_voting_enabled, trusted_validation_quorum_reached,
         update_operating_mode_after_accept,
     };
     use crate::network::network_ops::{
         AppNetworkOpsModeOwner, NetworkOpsOperatingMode, SharedNetworkOpsState,
     };
+    use crate::state::application_root::ApplicationRoot;
     use crate::tx_queue::transaction::TransactionRelayMetadata;
+    use crate::validator::validator_keys::ValidatorKeys;
     use basics::base_uint::Uint256;
+    use basics::chrono::NetClockTimePoint;
+    use consensus::ConsensusParms;
+    use consensus::algorithm::ConsensusPhase;
     use consensus::algorithm::types::ConsensusMode;
+    use ledger::Ledger;
     use protocol::{AccountID, STAmount, STTx, TxType, get_field_by_symbol};
     use std::sync::Arc;
     use std::time::Duration;
+
+    fn failed_candidate_test_runner(root: &mut ApplicationRoot) -> AppConsensus {
+        let ledger_master_runtime = root.attach_default_ledger_master_runtime();
+        let relay = AppRclConsensusRelay::from_application_root(
+            root,
+            root.inbound_transactions().clone(),
+            ValidatorKeys::default(),
+            NullRclConsensusJournal,
+        );
+        let adaptor = AppRclConsensusAdaptor::new(
+            AppRclConsensusOptions::default(),
+            root.shared_time_keeper(),
+            ledger_master_runtime,
+            root.open_ledger().clone(),
+            root.validations().clone(),
+            root.validators(),
+            root.network_ops_mode_owner(),
+            root.clone_ledger_acceptor(),
+            root.inbound_transactions().clone(),
+            root.transaction_master(),
+            relay,
+            NullRclConsensusJournal,
+            ValidatorKeys::default(),
+            None,
+            None,
+            None,
+            None,
+            root.clone(),
+        );
+        AppConsensus::new(adaptor, ConsensusParms::default())
+    }
+
+    fn failed_candidate_work(parent_ledger: Arc<Ledger>) -> PendingAcceptWork {
+        PendingAcceptWork {
+            parent_ledger,
+            closed_seq: 11,
+            close_time: 1_010,
+            close_resolution: 30,
+            correct_close_time: true,
+            close_time_adjustment_seconds: None,
+            consensus_hash: Uint256::from_u64(0xBAD),
+            have_correct_lcl: true,
+            consensus_succeeded: true,
+            base_fee_drops: 10,
+            rejected_dispute_retries: Vec::new(),
+            txns: Vec::new(),
+            validation: None,
+        }
+    }
+
+    #[test]
+    fn failed_candidate_build_keeps_parent_and_restarts_from_accepted() {
+        let mut root = ApplicationRoot::new(0).expect("root should build");
+        let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(10, 1_000, false));
+        let parent_hash = *parent.header().hash.as_uint256();
+        root.on_closed_ledger(Arc::clone(&parent));
+        let mut runner = failed_candidate_test_runner(&mut root);
+        let before = root
+            .closed_ledger()
+            .expect("parent should remain installed");
+
+        // `Consensus::new` is in Accepted, exactly as it is immediately after
+        // `on_accept`; retain a stale work item to prove recovery clears it.
+        assert_eq!(runner.phase(), ConsensusPhase::Accepted);
+        *runner
+            .adaptor
+            .pending_accept
+            .lock()
+            .expect("pending accept lock") = Some(failed_candidate_work(Arc::clone(&parent)));
+
+        let work = failed_candidate_work(Arc::clone(&parent));
+        assert!(runner.restart_after_failed_candidate_build(NetClockTimePoint::new(1_020), &work,));
+
+        let after = root
+            .closed_ledger()
+            .expect("failed candidate must not install a child");
+        assert_eq!(after.header().hash, before.header().hash);
+        assert_eq!(after.header().seq, 10);
+        assert_eq!(runner.prev_ledger_id(), parent_hash);
+        assert_eq!(runner.phase(), ConsensusPhase::Open);
+        assert!(
+            runner
+                .adaptor
+                .pending_accept
+                .lock()
+                .expect("pending accept lock")
+                .is_none(),
+            "failed candidate must not leave accept work scheduled"
+        );
+    }
 
     #[test]
     fn round_validation_eligibility_matches_rippled_pre_start_round() {

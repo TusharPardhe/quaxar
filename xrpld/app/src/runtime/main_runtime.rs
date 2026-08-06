@@ -636,12 +636,14 @@ mod tests {
         let runtime = MainRuntime::new(root);
         runtime.start().expect("runtime should start");
         runtime.shutdown();
-        assert!(runtime
-            .entropy_timer
-            .worker
-            .lock()
-            .expect("entropy worker mutex")
-            .is_none());
+        assert!(
+            runtime
+                .entropy_timer
+                .worker
+                .lock()
+                .expect("entropy worker mutex")
+                .is_none()
+        );
 
         assert_eq!(
             events.lock().expect("events mutex").as_slice(),

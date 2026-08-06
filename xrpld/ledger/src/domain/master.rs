@@ -1053,9 +1053,7 @@ where
         + Fn(
             SHAMapHash,
         ) -> Option<
-            basics::memory::intrusive_pointer::SharedIntrusive<
-                shamap::tree_node::SHAMapTreeNode,
-            >,
+            basics::memory::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
         >,
 {
     debug_assert_ne!(limit, 0);

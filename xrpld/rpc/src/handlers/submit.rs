@@ -724,7 +724,7 @@ use protocol::{
     AccountID, Asset, CurrentTransactionRulesGuard, JsonOptions, JsonValue, Keylet,
     LedgerEntryType, Permission, Rules, STLedgerEntry, STTx, STXChainBridge, Ter, TxType,
     XRPAmount, account_keylet, bridge_keylet_from_door_issue, check_keylet_from_key,
-    credential_keylet, deposit_preauth_keylet, did_keylet, escrow_keylet, feature_amm, feature_id,
+    deposit_preauth_keylet, did_keylet, escrow_keylet, feature_amm, feature_id,
     feature_single_asset_vault, get_field_by_symbol, is_tec_claim, is_tes_success, jss, line,
     mpt_issuance_keylet_from_mptid, mptoken_keylet_from_mptid, nft_offer_keylet_from_key,
     nft_page_keylet, nft_page_max_keylet, nft_page_min_keylet, oracle_keylet,
@@ -1643,19 +1643,13 @@ fn submit_semantic_preflight_with_ledger(
             }
 
             if let Some(ledger) = ledger {
-                let subject = st_tx.get_account_id(subject_field);
-                let issuer = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-                let subject_u160 = account_to_uint160(subject);
-                let issuer_u160 = account_to_uint160(issuer);
-                let credential_type = st_tx.get_field_vl(credential_type_field);
-                let preclaim =
-                    tx::run_credential_create_preclaim(tx::CredentialCreatePreclaimFacts {
-                        subject_exists: ledger_account_exists(ledger, subject),
-                        credential_exists: ledger_keylet_exists(
-                            ledger,
-                            credential_keylet(subject_u160, issuer_u160, &credential_type),
-                        ),
-                    });
+                let preclaim = ledger::credential_helpers::credential_create_preclaim(
+                    ledger,
+                    st_tx.get_account_id(subject_field),
+                    st_tx.get_account_id(get_field_by_symbol("sfAccount")),
+                    &st_tx.get_field_vl(credential_type_field),
+                )
+                .unwrap_or(Ter::TEF_BAD_LEDGER);
                 if preclaim != Ter::TES_SUCCESS {
                     return preclaim;
                 }
@@ -1676,30 +1670,13 @@ fn submit_semantic_preflight_with_ledger(
             }
 
             if let Some(ledger) = ledger {
-                let subject = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-                let issuer = st_tx.get_account_id(issuer_field);
-                let subject_u160 = account_to_uint160(subject);
-                let issuer_u160 = account_to_uint160(issuer);
-                let credential_type = st_tx.get_field_vl(credential_type_field);
-                let credential = ledger_read_keylet(
+                let preclaim = ledger::credential_helpers::credential_accept_preclaim(
                     ledger,
-                    credential_keylet(subject_u160, issuer_u160, &credential_type),
-                );
-                let accepted_flag_field = get_field_by_symbol("sfFlags");
-                let preclaim =
-                    tx::run_credential_accept_preclaim(tx::CredentialAcceptPreclaimFacts {
-                        issuer_exists: ledger_account_exists(ledger, issuer),
-                        credential_exists: credential.is_some(),
-                        credential_accepted: credential
-                            .as_ref()
-                            .map(|sle| {
-                                sle.is_field_present(accepted_flag_field)
-                                    && (sle.get_field_u32(accepted_flag_field)
-                                        & tx::CREDENTIAL_ACCEPTED_FLAG)
-                                        != 0
-                            })
-                            .unwrap_or(false),
-                    });
+                    st_tx.get_account_id(get_field_by_symbol("sfAccount")),
+                    st_tx.get_account_id(issuer_field),
+                    &st_tx.get_field_vl(credential_type_field),
+                )
+                .unwrap_or(Ter::TEF_BAD_LEDGER);
                 if preclaim != Ter::TES_SUCCESS {
                     return preclaim;
                 }
@@ -1711,23 +1688,44 @@ fn submit_semantic_preflight_with_ledger(
             let subject_field = get_field_by_symbol("sfSubject");
             let issuer_field = get_field_by_symbol("sfIssuer");
             let credential_type_field = get_field_by_symbol("sfCredentialType");
-            tx::run_credential_delete_preflight(tx::CredentialDeletePreflightFacts {
-                subject: if !st_tx.is_field_present(subject_field) {
-                    tx::CredentialOptionalAccountField::Missing
-                } else if st_tx.get_account_id(subject_field).is_zero() {
-                    tx::CredentialOptionalAccountField::Zero
-                } else {
-                    tx::CredentialOptionalAccountField::Present
-                },
-                issuer: if !st_tx.is_field_present(issuer_field) {
-                    tx::CredentialOptionalAccountField::Missing
-                } else if st_tx.get_account_id(issuer_field).is_zero() {
-                    tx::CredentialOptionalAccountField::Zero
-                } else {
-                    tx::CredentialOptionalAccountField::Present
-                },
-                credential_type_len: st_tx.get_field_vl(credential_type_field).len(),
-            })
+            let preflight =
+                tx::run_credential_delete_preflight(tx::CredentialDeletePreflightFacts {
+                    subject: if !st_tx.is_field_present(subject_field) {
+                        tx::CredentialOptionalAccountField::Missing
+                    } else if st_tx.get_account_id(subject_field).is_zero() {
+                        tx::CredentialOptionalAccountField::Zero
+                    } else {
+                        tx::CredentialOptionalAccountField::Present
+                    },
+                    issuer: if !st_tx.is_field_present(issuer_field) {
+                        tx::CredentialOptionalAccountField::Missing
+                    } else if st_tx.get_account_id(issuer_field).is_zero() {
+                        tx::CredentialOptionalAccountField::Zero
+                    } else {
+                        tx::CredentialOptionalAccountField::Present
+                    },
+                    credential_type_len: st_tx.get_field_vl(credential_type_field).len(),
+                });
+            if preflight != Ter::TES_SUCCESS {
+                return preflight;
+            }
+
+            if let Some(ledger) = ledger {
+                return ledger::credential_helpers::credential_delete_preclaim(
+                    ledger,
+                    st_tx.get_account_id(get_field_by_symbol("sfAccount")),
+                    st_tx
+                        .is_field_present(subject_field)
+                        .then(|| st_tx.get_account_id(subject_field)),
+                    st_tx
+                        .is_field_present(issuer_field)
+                        .then(|| st_tx.get_account_id(issuer_field)),
+                    &st_tx.get_field_vl(credential_type_field),
+                )
+                .unwrap_or(Ter::TEF_BAD_LEDGER);
+            }
+
+            Ter::TES_SUCCESS
         }
         TxType::NFTOKEN_CREATE_OFFER => {
             let amount_field = get_field_by_symbol("sfAmount");

@@ -167,20 +167,26 @@ fn accepted_collection_is_persisted_and_discoverable_as_a_cached_site() {
             1,
             &blobs,
             "https://vl.example/list".to_owned(),
-            Some(validator_list_collection_hash(&publisher_manifest, 1, &blobs)),
+            Some(validator_list_collection_hash(
+                &publisher_manifest,
+                1,
+                &blobs
+            )),
         )
         .best_disposition(),
         ListDisposition::Accepted
     );
 
     let cache_file = data_path.join(format!("cache.{}", publisher_master.to_hex()));
-    let cached_json: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&cache_file).expect("cached list file"),
-    )
-    .expect("cached list json");
+    let cached_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cache_file).expect("cached list file"))
+            .expect("cached list json");
     assert_eq!(cached_json["refresh_interval"], serde_json::json!(24 * 60));
     assert_eq!(cached_json["version"], serde_json::json!(1));
-    assert_eq!(cached_json["manifest"], serde_json::json!(publisher_manifest));
+    assert_eq!(
+        cached_json["manifest"],
+        serde_json::json!(publisher_manifest)
+    );
 
     let restored = ValidatorList::new(
         ManifestCache::new(),
@@ -234,10 +240,8 @@ fn listing_a_capped_manifest_releases_its_untrusted_capacity_slot() {
         let manifest = deserialize_manifest(&basics::base64::base64_decode(&encoded))
             .expect("capped manifest should deserialize");
         assert_eq!(
-            validator_manifests.apply_manifest_with_policy(
-                manifest,
-                ManifestRateLimitCapPolicy::Capped,
-            ),
+            validator_manifests
+                .apply_manifest_with_policy(manifest, ManifestRateLimitCapPolicy::Capped,),
             ManifestDisposition::Accepted
         );
         if fill == 1 {
@@ -258,10 +262,8 @@ fn listing_a_capped_manifest_releases_its_untrusted_capacity_slot() {
     let overflow = deserialize_manifest(&basics::base64::base64_decode(&overflow_encoded))
         .expect("overflow manifest should deserialize");
     assert_eq!(
-        validator_manifests.apply_manifest_with_policy(
-            overflow.clone(),
-            ManifestRateLimitCapPolicy::Capped,
-        ),
+        validator_manifests
+            .apply_manifest_with_policy(overflow.clone(), ManifestRateLimitCapPolicy::Capped,),
         ManifestDisposition::UntrustedCapacity
     );
 
@@ -290,7 +292,8 @@ fn listing_a_capped_manifest_releases_its_untrusted_capacity_slot() {
         ListDisposition::Accepted
     );
     assert_eq!(
-        validator_manifests.apply_manifest_with_policy(overflow, ManifestRateLimitCapPolicy::Capped),
+        validator_manifests
+            .apply_manifest_with_policy(overflow, ManifestRateLimitCapPolicy::Capped),
         ManifestDisposition::Accepted,
         "a listed master key must no longer consume an untrusted capacity slot"
     );
