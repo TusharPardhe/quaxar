@@ -987,11 +987,10 @@ path = {}
 }
 
 #[test]
-fn app_bootstrap_replay_rejects_semantically_invalid_transactions_before_open_ledger_injection() {
-    // Parity: ../rippled/src/libxrpl/tx/applySteps.cpp executes preflight and
-    // immutable preclaim before doApply. The unsigned fixture must fail at
-    // that admission boundary rather than being pushed into the open-ledger
-    // shell for a later standalone close.
+fn app_bootstrap_replay_raw_inserts_historical_transactions_before_later_replay() {
+    // ../rippled/src/xrpld/app/main/Application.cpp::
+    // ApplicationImp::loadOldLedger calls OpenView::rawTxInsert for replay
+    // data before the later cumulative replay build applies it.
     let dir = TempDir::new().expect("tempdir");
     let parent = persisted_bootstrap_state_only_ledger(20);
     let rejected = payment_tx(1, 0x11, 0x21);
@@ -1039,22 +1038,19 @@ path = {}
             ..AppBootstrapOptions::default()
         },
     )
-    .expect_err("invalid replay transaction must not reach open-ledger injection");
+    .expect("raw replay transaction must reach the open-ledger shell");
 
-    assert!(
-        error.contains("failed shared semantic preflight"),
-        "unexpected replay admission error: {error}"
+    assert_eq!(
+        error.root.open_ledger().current().tx_ids(),
+        vec![rejected.get_transaction_id()]
     );
 }
 
 #[test]
-fn app_bootstrap_replay_rejects_signed_transaction_at_immutable_parent_preclaim() {
-    // Parity: ../rippled/src/xrpld/app/ledger/detail/BuildLedger.cpp::buildLedger
-    // invokes applyTransaction, whose preflight and immutable-parent preclaim
-    // finish before doApply. This transaction has a valid signature but a
-    // future sequence, so it proves the startup shell does not treat
-    // preflight success as permission to mutate the open-ledger transaction
-    // list.
+fn app_bootstrap_replay_raw_inserts_future_sequence_for_cumulative_build() {
+    // ../rippled/src/xrpld/app/main/Application.cpp::
+    // ApplicationImp::loadOldLedger performs rawTxInsert instead of applying
+    // immutable-parent preclaim to each historical transaction.
     let dir = TempDir::new().expect("tempdir");
     let destination = account(0x21);
     let (rejected, source) = signed_payment_tx(2, 0x11, destination);
@@ -1104,20 +1100,19 @@ path = {}
             ..AppBootstrapOptions::default()
         },
     )
-    .expect_err("future-sequence replay transaction must not reach shell injection");
+    .expect("raw replay transaction must not be rejected by immutable-parent preclaim");
 
-    assert!(
-        error.contains("failed immutable parent preclaim"),
-        "unexpected replay admission error: {error}"
+    assert_eq!(
+        error.root.open_ledger().current().tx_ids(),
+        vec![rejected.get_transaction_id()]
     );
 }
 
 #[test]
-fn app_bootstrap_replay_rejects_stale_sequence_before_open_ledger_injection() {
-    // The transaction is otherwise valid and signed, so this exercises the
-    // immutable parent preclaim rather than the stateless preflight gate.
-    // Parity: ../rippled/src/libxrpl/tx/applySteps.cpp::preclaim builds its
-    // `PreclaimContext` from a read-only OpenView before `doApply` mutates it.
+fn app_bootstrap_replay_raw_inserts_stale_sequence_for_cumulative_build() {
+    // ../rippled/src/xrpld/app/main/Application.cpp::
+    // ApplicationImp::loadOldLedger restores the ordered transaction map with
+    // rawTxInsert and does not run applySteps.cpp::preclaim at startup.
     let dir = TempDir::new().expect("tempdir");
     let destination = account(0x31);
     let (stale, source) = signed_payment_tx(2, 0x12, destination);
@@ -1167,11 +1162,11 @@ path = {}
             ..AppBootstrapOptions::default()
         },
     )
-    .expect_err("stale replay transaction must not reach open-ledger injection");
+    .expect("raw replay transaction must not be rejected by immutable-parent preclaim");
 
-    assert!(
-        error.contains("failed immutable parent preclaim"),
-        "unexpected replay admission error: {error}"
+    assert_eq!(
+        error.root.open_ledger().current().tx_ids(),
+        vec![stale.get_transaction_id()]
     );
 }
 

@@ -4044,10 +4044,13 @@ impl ApplicationRoot {
     /// ../rippled/src/xrpld/rpc/handlers/transaction/Simulate.cpp::simulateTxn,
     /// which copies the current OpenView before invoking TxQ::apply(TapDryRun).
     pub fn simulate_transaction(&self, ledger: Arc<Ledger>, tx: Arc<STTx>) -> SimulationOutcome {
+        let mut open_view = (*self.open_ledger().current()).clone();
+        // The cloned OpenLedger below owns current queue size and fee state.
+        // `AppOpenLedgerTxQApplyRuntime` still applies against its immutable
+        // parent ledger, so keep this sequence aligned with that parent.
         let ledger_seq = ledger.header().seq;
         let close_time = ledger.header().close_time;
         let mut apply_view = ledger::ApplyViewImpl::new(Arc::clone(&ledger), ApplyFlags::DRY_RUN);
-        let mut open_view = (*self.open_ledger().current()).clone();
         if open_view.ledger_current_index == 0 {
             open_view.ledger_current_index = ledger_seq;
             open_view.base_fee_drops = ledger.fees().base;
@@ -8092,13 +8095,6 @@ impl ApplicationRoot {
                 let mut serializer = protocol::Serializer::default();
                 meta.add_raw(&mut serializer, result, accepted_entries.len() as u32);
 
-                let _ = self.transaction_master.in_ledger(
-                    st_tx.get_transaction_id(),
-                    closed_seq,
-                    Some(accepted_entries.len() as u32),
-                    Some(self.registry.network_id_service.get_network_id()),
-                );
-
                 accepted_entries.push(StandaloneAcceptedTx {
                     transaction_id: st_tx.get_transaction_id(),
                     txn: Arc::new(protocol::Serializer::from_bytes(
@@ -8149,6 +8145,20 @@ impl ApplicationRoot {
             ledger.state_map_mut().set_unbacked();
             Arc::new(ledger)
         };
+
+        // Parity: ../rippled/src/xrpld/app/ledger/detail/TransactionMaster.cpp::
+        // TransactionMaster::inLedger is a post-commit observation. Every
+        // state-table and raw transaction-map commit above is fallible, so do
+        // not promote a transaction or publish an accepted ledger prefix until
+        // the closed ledger has been completely materialized.
+        for (index, entry) in accepted_entries.iter().enumerate() {
+            let _ = self.transaction_master.in_ledger(
+                entry.transaction_id,
+                closed_seq,
+                Some(index as u32),
+                Some(self.registry.network_id_service.get_network_id()),
+            );
+        }
 
         let tx_count = accepted_entries.len();
         tracing::info!(target: "app", seq = closed_seq, tx_count, close_time, "Standalone ledger closed");

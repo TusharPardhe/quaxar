@@ -474,29 +474,26 @@ pub fn autofill_tx<Runtime: RpcRuntime>(
         return Ok(());
     };
     if !map.contains_key(jss::Fee) {
-        map.insert(jss::Fee.to_string(), JsonValue::String("10".to_string()));
+        // Parity: ../rippled/src/xrpld/rpc/handlers/transaction/Simulate.cpp::
+        // simulateTxn copies OpenLedger and uses TxQ's live fee context.
+        let fee = _ctx
+            .runtime
+            .app()
+            .map(|app| app.open_ledger().current().base_fee_drops)
+            .unwrap_or(10);
+        map.insert(jss::Fee.to_string(), JsonValue::String(fee.to_string()));
     }
     if !map.contains_key(jss::Sequence) {
-        // Try to auto-fill from the account's current sequence.
-        let seq = if let Some(app) = _ctx.runtime.app() {
-            if let Some(JsonValue::String(acct_str)) = map.get("Account") {
-                let base_ledger = app.closed_ledger().or_else(|| app.validated_ledger());
-                base_ledger
-                    .and_then(|ledger| {
-                        let account_id = protocol::parse_base58_account_id(acct_str)?;
-                        let keylet = protocol::account_keylet(
-                            basics::base_uint::Uint160::from_void(account_id.data()),
-                        );
-                        ledger.read(keylet).ok().flatten()
-                    })
-                    .map(|sle| sle.get_field_u32(get_field_by_symbol("sfSequence")) as u64)
-                    .unwrap_or(1)
-            } else {
-                1
-            }
-        } else {
-            1
-        };
+        let seq = _ctx
+            .runtime
+            .app()
+            .and_then(|app| match map.get("Account") {
+                Some(JsonValue::String(account)) => protocol::parse_base58_account_id(account)
+                    .and_then(|account| app.network_ops_current_account_seq(&account))
+                    .map(u64::from),
+                _ => None,
+            })
+            .unwrap_or(1);
         map.insert(jss::Sequence.to_string(), JsonValue::Unsigned(seq));
     }
     Ok(())
@@ -523,11 +520,30 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
     // simulation through that canonical admission boundary instead of calling
     // the transactor shell directly. Parity: ../rippled/src/xrpld/rpc/handlers/
     // transaction/Simulate.cpp::simulateTxn invokes TxQ::apply(TapDryRun).
-    if let (Some(app), Some(ledger)) = (
-        ctx.runtime.app(),
-        ctx.runtime.current_ledger_for_simulation(),
-    ) {
-        let outcome = app.simulate_transaction(Arc::clone(&ledger), Arc::new(tx.clone()));
+    if let Some(app) = ctx.runtime.app() {
+        let open_view = app.open_ledger().current();
+        let ledger = if open_view.ledger_current_index != 0 && !open_view.parent_hash.is_zero() {
+            // A live OpenLedger pins simulation to its own parent. Do not
+            // fall back to a different closed/validated ledger. Materialize
+            // its header/state overlay so transaction application and TxQ see
+            // the same open sequence and fee.
+            let parent = app
+                .closed_ledger()
+                .filter(|ledger| *ledger.header().hash.as_uint256() == open_view.parent_hash)
+                .ok_or_else(|| Status::new(RpcErrorCode::NotSynced))?;
+            let mut open =
+                ledger::Ledger::from_previous(parent.as_ref(), parent.header().close_time);
+            open.set_total_drops(parent.header().drops);
+            let mut fees = open.fees();
+            fees.base = open_view.base_fee_drops;
+            open.set_fees(fees);
+            Arc::new(open)
+        } else {
+            ctx.runtime
+                .current_ledger_for_simulation()
+                .ok_or_else(|| Status::new(RpcErrorCode::NotSynced))?
+        };
+        let outcome = app.simulate_transaction(ledger, Arc::new(tx.clone()));
         ret.insert(
             jss::applied.to_string(),
             JsonValue::Bool(outcome.result.applied),

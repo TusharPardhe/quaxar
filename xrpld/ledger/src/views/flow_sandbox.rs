@@ -74,11 +74,18 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
     /// `ApplyStateTable::threadItem` equivalent used by ledger acceptance;
     /// the parent remains the cumulative view for subsequent transactions.
     pub fn apply_with_tx_thread(
-        self,
+        mut self,
         tx_id: Uint256,
         ledger_seq: u32,
         rules: &Rules,
     ) -> Result<(), ViewError> {
+        self.validate_parent_commit("FlowSandbox::apply_with_tx_thread")?;
+        // `TapDryRun` must not burn the immutable ledger's XRP total.
+        if self.drops_destroyed.drops() > 0
+            && !protocol::any_apply_flags(self.flags() & ApplyFlags::DRY_RUN)
+        {
+            self.parent.destroy_xrp(self.drops_destroyed)?;
+        }
         for (key, entry) in self.items {
             match entry.action {
                 Action::Insert | Action::Modify => {
@@ -113,14 +120,18 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
                 }
             }
         }
-        if self.drops_destroyed.drops() > 0 {
-            self.parent.destroy_xrp(self.drops_destroyed)?;
-        }
         Ok(())
     }
 
     /// Apply all captured changes to the parent view. Call on tesSUCCESS.
-    pub fn apply(self) -> Result<(), ViewError> {
+    pub fn apply(mut self) -> Result<(), ViewError> {
+        self.validate_parent_commit("FlowSandbox::apply")?;
+        // `TapDryRun` must not burn the immutable ledger's XRP total.
+        if self.drops_destroyed.drops() > 0
+            && !protocol::any_apply_flags(self.flags() & ApplyFlags::DRY_RUN)
+        {
+            self.parent.destroy_xrp(self.drops_destroyed)?;
+        }
         for (key, entry) in self.items {
             match entry.action {
                 Action::Insert => {
@@ -156,8 +167,36 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
                 }
             }
         }
-        if self.drops_destroyed.drops() > 0 {
-            self.parent.destroy_xrp(self.drops_destroyed)?;
+        Ok(())
+    }
+
+    /// Validate all parent-side preconditions before the first child mutation.
+    /// This gives FlowSandbox the same all-or-nothing transaction boundary as
+    /// ../rippled/src/libxrpl/ledger/ApplyViewImpl.cpp::ApplyViewImpl::apply:
+    /// a missing later entry is reported while the parent remains unchanged.
+    fn validate_parent_commit(&mut self, operation: &str) -> Result<(), ViewError> {
+        for (key, entry) in &self.items {
+            let keylet = Keylet::new(entry.sle.get_type(), *key);
+            let existing = self.parent.read(keylet)?;
+            match entry.action {
+                Action::Insert if existing.is_some() => {
+                    return Err(ViewError::Conversion(format!(
+                        "{operation}: inserted parent entry already exists"
+                    )));
+                }
+                Action::Modify | Action::Erase if existing.is_none() => {
+                    return Err(ViewError::Conversion(format!(
+                        "{operation}: parent entry disappeared"
+                    )));
+                }
+                Action::Modify | Action::Erase => {
+                    // Establish ApplyStateTable checkout without exposing a
+                    // mutation, so the later update/erase cannot fail solely
+                    // because the child read through a non-checking path.
+                    let _ = self.parent.peek(keylet)?;
+                }
+                Action::Insert => {}
+            }
         }
         Ok(())
     }
@@ -386,6 +425,35 @@ mod tests {
                 .expect("directory page remains")
                 .get_field_u64(protocol::get_field_by_symbol("sfIndexNext")),
             1
+        );
+    }
+
+    #[test]
+    fn failed_commit_leaves_parent_without_earlier_child_insert() {
+        // ../rippled/src/libxrpl/tx/apply.cpp::applyTransaction exposes a
+        // child view only after it passes all parent preconditions.
+        let base = Arc::new(Ledger::new(LedgerHeader::default(), false));
+        let mut parent = Sandbox::new(base, ApplyFlags::default());
+        let inserted_key = Keylet::new(LedgerEntryType::AccountRoot, Uint256::from_u64(1));
+        let missing_key = Keylet::new(LedgerEntryType::AccountRoot, Uint256::from_u64(2));
+
+        let result = {
+            let mut child = FlowSandbox::new(&mut parent);
+            child
+                .insert(Arc::new(STLedgerEntry::new(inserted_key)))
+                .expect("stage insert");
+            child
+                .raw_replace(Arc::new(STLedgerEntry::new(missing_key)))
+                .expect("stage invalid replacement");
+            child.apply()
+        };
+
+        assert!(result.is_err());
+        assert!(
+            !parent
+                .exists(inserted_key)
+                .expect("read parent after failed commit"),
+            "a failed FlowSandbox commit must not expose an earlier insert"
         );
     }
 

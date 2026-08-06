@@ -83,15 +83,17 @@ impl LedgerReplayer {
         )));
         self.tasks.push(Arc::clone(&task));
 
+        // A caller with initialization dependencies (`replay_and_init` or
+        // `got_skip_list`) owns the first trigger for newly allocated deltas.
+        // Do not create them here: this synchronous-data branch has no lookup
+        // or inbound-acquisition callbacks with which to call `init`.
         if let Some(data) = skip_list
             .lock()
             .expect("skip list lock")
             .get_data()
             .cloned()
         {
-            if self.update_task_from_skip_list(&task, finish_hash, data) {
-                let _ = self.create_deltas(&task);
-            }
+            let _ = self.update_task_from_skip_list(&task, finish_hash, data);
         }
 
         Some(task)
@@ -269,7 +271,23 @@ impl LedgerReplayer {
         new_deltas
     }
 
-    pub fn got_skip_list(&mut self, info: LedgerHeader, item: &SHAMapItem) {
+    /// Delivers an asynchronously acquired skip-list item and immediately
+    /// starts every delta allocated by the resulting task update. This is the
+    /// same `newDelta->init(1)` branch in
+    /// `../rippled/src/xrpld/app/ledger/detail/LedgerReplayer.cpp::
+    /// LedgerReplayer::createDeltas`; without it a task accepted before its
+    /// skip-list response can retain dormant delta owners indefinitely.
+    pub fn got_skip_list<LookupLedger, FallbackAcquire>(
+        &mut self,
+        info: LedgerHeader,
+        item: &SHAMapItem,
+        num_peers: usize,
+        mut lookup_ledger: LookupLedger,
+        mut fallback_acquire: FallbackAcquire,
+    ) where
+        LookupLedger: FnMut(Uint256) -> Option<Arc<Ledger>>,
+        FallbackAcquire: FnMut(Uint256, u32, InboundLedgerReason),
+    {
         let Some(skip_list) = self
             .skip_lists
             .get(info.hash.as_uint256())
@@ -296,7 +314,12 @@ impl LedgerReplayer {
             if task.lock().expect("task lock").parameter().finish_hash == *info.hash.as_uint256()
                 && self.update_task_from_skip_list(&task, *info.hash.as_uint256(), data.clone())
             {
-                let _ = self.create_deltas(&task);
+                self.trigger_task_and_init_deltas(
+                    &task,
+                    num_peers,
+                    &mut lookup_ledger,
+                    &mut fallback_acquire,
+                );
             }
         }
     }

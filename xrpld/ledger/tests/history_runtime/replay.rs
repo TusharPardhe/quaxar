@@ -243,7 +243,26 @@ fn replayer_reuses_skip_lists_and_creates_delta_slots() {
         .replay(InboundLedgerReason::Generic, finish_hash, 2)
         .expect("new replay task should be accepted");
 
-    replayer.got_skip_list(finish.header(), &skip_item);
+    let lookup_hashes = std::cell::RefCell::new(Vec::new());
+    // `LedgerReplayer::createDeltas` in
+    // ../rippled/src/xrpld/app/ledger/detail/LedgerReplayer.cpp initializes
+    // each new delta immediately. The async skip-list callback must trigger
+    // the same parent and delta acquire paths, not a no-op placeholder.
+    replayer.got_skip_list(
+        finish.header(),
+        &skip_item,
+        1,
+        |hash| {
+            lookup_hashes.borrow_mut().push(hash);
+            None
+        },
+        |_, _, _| {},
+    );
+
+    assert!(
+        lookup_hashes.borrow().contains(&finish_hash),
+        "the newly created delta must run its init trigger immediately"
+    );
 
     assert_eq!(replayer.tasks_len(), 1);
     assert_eq!(replayer.skip_lists_len(), 1);

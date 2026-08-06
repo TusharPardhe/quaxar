@@ -4357,53 +4357,12 @@ fn hydrate_loaded_ledger(
     Ok(())
 }
 
-/// Admit every replay transaction against the exact immutable parent before
-/// touching the open-ledger shell. The startup replay path has no mutable
-/// `OpenView` accumulator yet, so its preclaim must deliberately read only
-/// the parent captured from the replay header.
-///
-/// This preserves the ordering of rippled's transaction pipeline:
-/// `preflight` then `preclaim`, before `doApply` can mutate a view
-/// (`../rippled/src/libxrpl/tx/applySteps.cpp`, `preclaim` and `doApply`).
-/// Rippled's startup loader inserts decoded replay transactions directly into
-/// `OpenLedger` (`../rippled/src/xrpld/app/main/Application.cpp::loadOldLedger`);
-/// Quaxar makes that shell insertion conditional on the shared, fail-closed
-/// admission path because a later standalone close would otherwise be the
-/// first semantic validation boundary.
-fn admit_replay_open_ledger_transactions(
-    parent: &Ledger,
-    replay_data: &LedgerReplay,
-) -> Result<Vec<Arc<STTx>>, String> {
-    let rules = parent.rules();
-    let current_ledger_seq = parent.header().seq.saturating_add(1);
-    let mut admitted = Vec::with_capacity(replay_data.ordered_txs().len());
-
-    for (transaction_index, tx) in replay_data.ordered_txs() {
-        let transaction_id = tx.get_transaction_id();
-        let preflight =
-            crate::state::application_root::transaction_preflight_ter(tx.as_ref(), &rules);
-        if !protocol::is_tes_success(preflight) {
-            return Err(format!(
-                "Replay transaction {transaction_id} at index {transaction_index} failed shared semantic preflight: {preflight:?}"
-            ));
-        }
-
-        let preclaim = crate::state::application_root::queue_apply_preclaim_ter(
-            parent,
-            tx.as_ref(),
-            current_ledger_seq,
-            protocol::ApplyFlags::NONE,
-        );
-        if !protocol::is_tes_success(preclaim) {
-            return Err(format!(
-                "Replay transaction {transaction_id} at index {transaction_index} failed immutable parent preclaim: {preclaim:?}"
-            ));
-        }
-
-        admitted.push(Arc::clone(tx));
-    }
-
-    Ok(admitted)
+/// Preserve the replay ledger's metadata ordering for startup injection. Unlike
+/// normal admission, replay startup does not independently preflight or apply
+/// historical transactions: it restores the transaction set that the later
+/// replay build will process cumulatively.
+fn ordered_replay_open_ledger_transactions(replay_data: &LedgerReplay) -> Vec<Arc<STTx>> {
+    replay_data.ordered_txs().values().cloned().collect()
 }
 
 fn inject_replay_transactions<CLOCK, S, FB, F, MR, NS>(
@@ -4422,10 +4381,12 @@ where
 {
     let replay_data = build_replay_data_with_family(parent, replay, family)?;
 
-    // Complete all immutable admission before the one `OpenLedger::modify`
-    // call below. This prevents a rejected later transaction (or a missing
-    // trap) from leaving an accepted prefix in the open-ledger shell.
-    let admitted = admit_replay_open_ledger_transactions(replay_data.parent(), &replay_data)?;
+    // Parity: ../rippled/src/xrpld/app/main/Application.cpp::
+    // ApplicationImp::loadOldLedger iterates LedgerReplay::orderedTxns and
+    // calls OpenView::rawTxInsert. Startup must keep that raw, ordered set
+    // intact: dependent sequence transactions are applied by the later
+    // cumulative replay build, not preclaimed independently against parent.
+    let admitted = ordered_replay_open_ledger_transactions(&replay_data);
     let found_trap = trap_tx_hash.is_none()
         || admitted
             .iter()
