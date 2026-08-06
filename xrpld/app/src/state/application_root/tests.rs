@@ -21,8 +21,8 @@ use crate::{
 use basics::base_uint::{Uint160, Uint256};
 use basics::sha_map_hash::SHAMapHash;
 use ledger::{
-    ApplyView, Fees, LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader, ReadView, Sandbox,
-    TxsRawView, calculate_ledger_hash, encode_fee_settings_entry,
+    ApplyView, Fees, LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader, OpenView, ReadView,
+    Sandbox, TxsRawView, calculate_ledger_hash, encode_fee_settings_entry,
 };
 use protocol::{
     AccountID, BatchTransactionFlags, INNER_BATCH_TRANSACTION_FLAG, KeyType, LedgerEntryType,
@@ -3057,6 +3057,123 @@ fn live_batch_preclaim_authorizes_master_and_enforces_aggregate_fee_validity() {
     assert_eq!(
         queue_apply_preclaim_ter(&ledger, &oversized, ledger.header().seq, ApplyFlags::NONE,),
         Ter::TEC_INSUFF_FEE
+    );
+}
+
+#[test]
+fn shared_preclaim_gates_reject_before_consensus_sandbox_mutation() {
+    let destination = AccountID::from_array([0xD1; 20]);
+
+    // Permission is a pre-sign guard. The absent delegate object must stop the
+    // typed tail and leave the consensus/apply sandbox unchanged.
+    let (source, delegated) = signed_payment_tx(0xA1, destination, 1, 10);
+    let mut delegated = (*delegated).clone();
+    delegated.set_account_id(
+        get_field_by_symbol("sfDelegate"),
+        AccountID::from_array([0xD2; 20]),
+    );
+    let parent = Arc::new(ledger_view(10, source, 1, &[]));
+    let view = Sandbox::new(Arc::clone(&parent), ApplyFlags::NONE);
+    assert_eq!(
+        queue_apply_preclaim_ter(&view, &delegated, 10, ApplyFlags::NONE),
+        Ter::TER_NO_DELEGATE_PERMISSION
+    );
+    assert_eq!(
+        view.read(account_keylet(raw_account_id(source)))
+            .expect("read source")
+            .expect("source exists")
+            .get_field_u32(get_field_by_symbol("sfSequence")),
+        1,
+        "permission rejection must precede consensus mutation"
+    );
+
+    // A cryptographically valid signature from a key other than the account
+    // master/regular key reaches the ledger signer authorization gate.
+    let owner_secret = SecretKey::from_bytes([0xA2; 32]);
+    let owner_public = derive_public_key(KeyType::Secp256k1, &owner_secret).expect("owner key");
+    let owner = calc_account_id(owner_public.as_bytes());
+    let signer_secret = SecretKey::from_bytes([0xA3; 32]);
+    let signer_public = derive_public_key(KeyType::Secp256k1, &signer_secret).expect("signer key");
+    let mut unauthorized = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), owner);
+        tx.set_account_id(get_field_by_symbol("sfDestination"), destination);
+        tx.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::new_native(1, false),
+        );
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(10, false),
+        );
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        tx.set_field_vl(
+            get_field_by_symbol("sfSigningPubKey"),
+            signer_public.as_bytes(),
+        );
+    });
+    unauthorized
+        .sign(&signer_public, &signer_secret, None)
+        .expect("signature should be cryptographically valid");
+    let parent = Arc::new(ledger_view(10, owner, 1, &[]));
+    let view = Sandbox::new(Arc::clone(&parent), ApplyFlags::NONE);
+    assert_eq!(
+        queue_apply_preclaim_ter(&view, &unauthorized, 10, ApplyFlags::NONE),
+        Ter::TEF_BAD_AUTH
+    );
+    assert_eq!(
+        view.read(account_keylet(raw_account_id(owner)))
+            .expect("read source")
+            .expect("source exists")
+            .get_field_u32(get_field_by_symbol("sfSequence")),
+        1,
+        "ledger signer rejection must precede consensus mutation"
+    );
+
+    // Minimum fee is enforced only by an open view, exactly as checkFee does.
+    let (source, low_fee) = signed_payment_tx(0xA4, destination, 1, 9);
+    let mut ledger = ledger_view(10, source, 1, &[]);
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 1_000_000,
+        increment: 200_000,
+    });
+    let parent = Arc::new(ledger);
+    let open = OpenView::new_open(Arc::clone(&parent), parent.rules().clone());
+    assert_eq!(
+        queue_apply_preclaim_ter(&open, low_fee.as_ref(), 11, ApplyFlags::NONE),
+        Ter::TEL_INSUF_FEE_P
+    );
+    assert_eq!(
+        open.read(account_keylet(raw_account_id(source)))
+            .expect("read source")
+            .expect("source exists")
+            .get_field_u32(get_field_by_symbol("sfSequence")),
+        1,
+        "minimum-fee rejection must precede consensus mutation"
+    );
+
+    // The typed read-only tail is last. Its destination failure therefore
+    // cannot consume the sequence or fee in the consensus sandbox.
+    let (source, typed_tail) = signed_payment_tx(0xA5, destination, 1, 10);
+    let mut ledger = ledger_view(10, source, 1, &[]);
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 1_000_001,
+        increment: 200_000,
+    });
+    let parent = Arc::new(ledger);
+    let view = Sandbox::new(Arc::clone(&parent), ApplyFlags::NONE);
+    assert_eq!(
+        queue_apply_preclaim_ter(&view, typed_tail.as_ref(), 10, ApplyFlags::NONE),
+        Ter::TEC_NO_DST_INSUF_XRP
+    );
+    assert_eq!(
+        view.read(account_keylet(raw_account_id(source)))
+            .expect("read source")
+            .expect("source exists")
+            .get_field_u32(get_field_by_symbol("sfSequence")),
+        1,
+        "typed tail rejection must precede consensus mutation"
     );
 }
 

@@ -1163,69 +1163,10 @@ fn batch_preclaim_ter(view: &impl ReadView, tx: &STTx, flags: ApplyFlags) -> Ter
     )
 }
 
-#[derive(Clone, Copy)]
-struct QueueApplyPreclaimTx<'a> {
-    tx: &'a STTx,
-}
-
 #[derive(Debug, Clone)]
 struct SubmitConsumedTicket {
     sle: Arc<STLedgerEntry>,
     owner_page: u64,
-}
-
-impl HasTxnType for QueueApplyPreclaimTx<'_> {
-    fn txn_type(&self) -> TxType {
-        self.tx.get_txn_type()
-    }
-}
-
-impl tx::TransactorCheckSeqProxyTx for QueueApplyPreclaimTx<'_> {
-    type AccountId = AccountID;
-
-    fn account_id(&self) -> Self::AccountId {
-        self.tx.get_account_id(get_field_by_symbol("sfAccount"))
-    }
-
-    fn seq_proxy(&self) -> SeqProxy {
-        self.tx.get_seq_proxy()
-    }
-
-    fn ticket_sequence_present(&self) -> bool {
-        self.tx
-            .is_field_present(get_field_by_symbol("sfTicketSequence"))
-    }
-}
-
-impl tx::TransactorCheckPriorTxAndLastLedgerTx for QueueApplyPreclaimTx<'_> {
-    type AccountId = AccountID;
-    type TxId = Uint256;
-
-    fn account_id(&self) -> Self::AccountId {
-        self.tx.get_account_id(get_field_by_symbol("sfAccount"))
-    }
-
-    fn account_txn_id(&self) -> Option<Self::TxId> {
-        self.tx
-            .is_field_present(get_field_by_symbol("sfAccountTxnID"))
-            .then(|| {
-                self.tx
-                    .get_field_h256(get_field_by_symbol("sfAccountTxnID"))
-            })
-    }
-
-    fn last_ledger_sequence(&self) -> Option<u32> {
-        self.tx
-            .is_field_present(get_field_by_symbol("sfLastLedgerSequence"))
-            .then(|| {
-                self.tx
-                    .get_field_u32(get_field_by_symbol("sfLastLedgerSequence"))
-            })
-    }
-
-    fn transaction_id(&self) -> Self::TxId {
-        self.tx.get_transaction_id()
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -1533,71 +1474,41 @@ fn consensus_transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
     }
 }
 
-fn queue_apply_preclaim_ter(
+pub(crate) fn queue_apply_preclaim_ter(
     view: &impl ReadView,
     tx: &STTx,
     current_ledger_seq: u32,
     flags: ApplyFlags,
 ) -> Ter {
-    // Do not bypass the shared typed dispatcher for system types. Any routed
-    // type without a verified immutable helper must fail closed below.
-    let preclaim_tx = QueueApplyPreclaimTx { tx };
-
-    let seq_check = tx::run_transactor_check_seq_proxy(
-        &preclaim_tx,
-        |account| {
-            view.read(account_keylet(
-                Uint160::from_slice(account.data()).expect("account width should match Uint160"),
-            ))
-            .ok()
-            .flatten()
-        },
-        |account_root| account_root.get_field_u32(get_field_by_symbol("sfSequence")),
-        |account, tx_seq_proxy| {
-            view.exists(protocol::ticket_keylet_from_seq_proxy(
-                Uint160::from_slice(account.data()).expect("account width should match Uint160"),
-                tx_seq_proxy,
-            ))
-            .unwrap_or(false)
-        },
-    );
-    if !is_tes_success(seq_check) {
-        return seq_check;
-    }
-
-    let prior_tx_check = tx::run_transactor_check_prior_tx_and_last_ledger(
+    crate::state::invoke_preclaim::invoke_preclaim(
+        view,
+        tx,
         current_ledger_seq,
-        &preclaim_tx,
-        |account| {
-            view.read(account_keylet(
-                Uint160::from_slice(account.data()).expect("account width should match Uint160"),
-            ))
-            .ok()
-            .flatten()
-        },
-        |account_root| {
-            if account_root.is_field_present(get_field_by_symbol("sfAccountTxnID")) {
-                account_root.get_field_h256(get_field_by_symbol("sfAccountTxnID"))
+        flags,
+        || {
+            let base_fee = if tx.get_txn_type() == TxType::BATCH {
+                // Batch's aggregate calculation is also validated by its tail.
+                // Keep the generic fee check payable here on a malformed
+                // aggregate so the tail returns rippled's tecINSUFF_FEE.
+                batch_base_fee(view, tx).min(i64::MAX as u64) as i64
             } else {
-                Uint256::zero()
+                view.fees().base.min(i64::MAX as u64) as i64
+            };
+            base_fee
+        },
+        || {
+            let typed_preclaim = typed_preclaim_ter(view, tx, flags);
+            if !is_tes_success(typed_preclaim) {
+                return typed_preclaim;
+            }
+
+            if tx.get_txn_type() == TxType::BATCH {
+                batch_preclaim_ter(view, tx, flags)
+            } else {
+                Ter::TES_SUCCESS
             }
         },
-        |tx_id| view.tx_exists(*tx_id).unwrap_or(false),
-    );
-    if !is_tes_success(prior_tx_check) {
-        return prior_tx_check;
-    }
-
-    let typed_preclaim = typed_preclaim_ter(view, tx, flags);
-    if !is_tes_success(typed_preclaim) {
-        return typed_preclaim;
-    }
-
-    if tx.get_txn_type() == TxType::BATCH {
-        batch_preclaim_ter(view, tx, flags)
-    } else {
-        Ter::TES_SUCCESS
-    }
+    )
 }
 
 /// Explicit classification for every routed Quaxar transaction type's typed
@@ -2769,53 +2680,18 @@ impl
             Arc<crate::state::app_registry::AppJournal>,
             AppPlaceholder,
         >,
-        txn_type: TxType,
+        _txn_type: TxType,
     ) -> Result<Ter, Self::PreclaimError> {
         let Some(view) = ctx.view.as_ref() else {
             return Ok(Ter::TER_NO_ACCOUNT);
         };
-
         let sttx = Self::read_sttx(&ctx.tx);
-        let account_field = get_field_by_symbol("sfAccount");
-        let sequence_field = get_field_by_symbol("sfSequence");
-        let account_id = sttx.get_account_id(account_field);
-        let Some(account_root) = view
-            .read(account_keylet(
-                Uint160::from_slice(account_id.data()).expect("account width"),
-            ))
-            .ok()
-            .flatten()
-        else {
-            return Ok(Ter::TER_NO_ACCOUNT);
-        };
-
-        let sequence_ter = if sttx.is_field_present(sequence_field) {
-            let tx_sequence = sttx.get_field_u32(sequence_field);
-            let account_sequence = account_root.get_field_u32(sequence_field);
-            if tx_sequence < account_sequence {
-                Ter::TEF_PAST_SEQ
-            } else if tx_sequence > account_sequence {
-                Ter::TER_PRE_SEQ
-            } else {
-                Ter::TES_SUCCESS
-            }
-        } else {
-            Ter::TES_SUCCESS
-        };
-        if !is_tes_success(sequence_ter) {
-            return Ok(sequence_ter);
-        }
-
-        let typed_preclaim = typed_preclaim_ter(view.as_ref(), &sttx, ctx.flags);
-        if !is_tes_success(typed_preclaim) {
-            return Ok(typed_preclaim);
-        }
-
-        Ok(if txn_type == TxType::BATCH {
-            batch_preclaim_ter(view.as_ref(), &sttx, ctx.flags)
-        } else {
-            Ter::TES_SUCCESS
-        })
+        Ok(queue_apply_preclaim_ter(
+            view.as_ref(),
+            sttx.as_ref(),
+            view.header().seq,
+            ctx.flags,
+        ))
     }
 
     fn calculate_base_fee(

@@ -6,6 +6,7 @@ pub mod basic_app;
 pub mod batch;
 pub mod collector_manager;
 pub mod invariants;
+pub mod invoke_preclaim;
 pub mod lending;
 pub mod manifest;
 pub mod new_features;

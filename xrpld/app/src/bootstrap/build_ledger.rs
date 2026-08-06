@@ -504,7 +504,13 @@ fn parallel_sig_precheck(
 ) -> std::collections::HashSet<Uint256> {
     txs.par_iter()
         .filter_map(|tx| {
-            if tx.check_sign(rules).is_err() {
+            // `applySteps.cpp::invokePreclaim` skips the complete generic
+            // signature block for the zero-account pseudo transactions.
+            if !tx
+                .get_account_id(protocol::get_field_by_symbol("sfAccount"))
+                .is_zero()
+                && tx.check_sign(rules).is_err()
+            {
                 Some(tx.get_transaction_id())
             } else {
                 None
@@ -518,7 +524,7 @@ pub fn build_ledger_from_acquired_tx(
     acquired_header: protocol::LedgerHeader,
     tx_items: &[(Vec<u8>, basics::base_uint::Uint256)],
 ) -> Option<ledger::Ledger> {
-    use crate::state::application_root::apply_submit_transactor_shell;
+    use crate::state::application_root::{apply_submit_transactor_shell, queue_apply_preclaim_ter};
     use std::sync::Arc;
 
     let build_num = BUILD_DETAIL_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -642,7 +648,17 @@ pub fn build_ledger_from_acquired_tx(
             built.header().drops
         );
         let apply_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_submit_transactor_shell(&mut view, sttx, txn_type)
+            let preclaim = queue_apply_preclaim_ter(
+                &view,
+                sttx,
+                acquired_header.seq,
+                protocol::ApplyFlags::NONE,
+            );
+            if protocol::is_tes_success(preclaim) {
+                apply_submit_transactor_shell(&mut view, sttx, txn_type)
+            } else {
+                preclaim
+            }
         }));
 
         match apply_result {
@@ -953,7 +969,7 @@ pub fn build_ledger_from_consensus(
         >,
     >,
 ) -> Option<ledger::Ledger> {
-    use crate::state::application_root::apply_submit_transactor_shell;
+    use crate::state::application_root::{apply_submit_transactor_shell, queue_apply_preclaim_ter};
     use std::sync::Arc;
 
     let mut built = ledger::Ledger::from_previous(parent, header.close_time);
@@ -1004,7 +1020,13 @@ pub fn build_ledger_from_consensus(
         let mut view = ledger::Sandbox::new(base, protocol::ApplyFlags::default());
 
         let apply_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_submit_transactor_shell(&mut view, &sttx, txn_type)
+            let preclaim =
+                queue_apply_preclaim_ter(&view, &sttx, header.seq, protocol::ApplyFlags::NONE);
+            if protocol::is_tes_success(preclaim) {
+                apply_submit_transactor_shell(&mut view, &sttx, txn_type)
+            } else {
+                preclaim
+            }
         }));
 
         match apply_result {
