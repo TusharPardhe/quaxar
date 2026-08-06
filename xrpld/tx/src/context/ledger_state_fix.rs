@@ -9,7 +9,12 @@
 //! - and mapping the repair callback result to `tesSUCCESS` versus
 //!   `tecFAILED_PROCESSING` in `doApply()`.
 
-use protocol::{NotTec, Ter};
+use basics::base_uint::Uint160;
+use ledger::ReadView;
+use protocol::{
+    AccountID, Keylet, LedgerEntryType, NotTec, STTx, Ter, TxType, get_field_by_symbol,
+    quality_from_key,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerStateFixType {
@@ -106,6 +111,73 @@ pub fn run_ledger_state_fix_preclaim(fix_type: LedgerStateFixType, owner_exists:
         book_directory_has_exchange_rate: false,
         book_directory_exchange_rate_matches_key: false,
     })
+}
+
+fn ledger_state_fix_account_keylet(account: AccountID) -> Keylet {
+    protocol::account_keylet(Uint160::from_void(account.data()))
+}
+
+/// Runs LedgerStateFix's immutable, transaction-type-owned `preclaim(...)` tail.
+///
+/// `None` deliberately leaves unowned transaction types for their own family;
+/// no default success or apply path is used here.
+pub fn run_ledger_state_fix_read_view_preclaim<V: ReadView>(
+    view: &V,
+    tx: &STTx,
+    txn_type: TxType,
+) -> Option<Ter> {
+    if txn_type != TxType::LEDGER_STATE_FIX {
+        return None;
+    }
+
+    let fix_type =
+        LedgerStateFixType::from(tx.get_field_u16(get_field_by_symbol("sfLedgerFixType")));
+    let result = match fix_type {
+        // rippled's NFT link repair reads only the supplied owner account.
+        LedgerStateFixType::NfTokenPageLink => {
+            let owner = tx.get_account_id(get_field_by_symbol("sfOwner"));
+            let owner_exists = match view.read(ledger_state_fix_account_keylet(owner)) {
+                Ok(owner) => owner.is_some(),
+                Err(_) => return Some(Ter::TEF_BAD_LEDGER),
+            };
+            run_ledger_state_fix_preclaim_facts(LedgerStateFixPreclaimFacts {
+                fix_type,
+                owner_exists,
+                book_directory_exists: false,
+                book_directory_has_exchange_rate: false,
+                book_directory_exchange_rate_matches_key: false,
+            })
+        }
+        // rippled reads the directory first, then preserves the two
+        // tecNO_PERMISSION branches in their source order.
+        LedgerStateFixType::BookExchangeRate => {
+            let directory = match view.read(Keylet::new(
+                LedgerEntryType::DirectoryNode,
+                tx.get_field_h256(get_field_by_symbol("sfBookDirectory")),
+            )) {
+                Ok(directory) => directory,
+                Err(_) => return Some(Ter::TEF_BAD_LEDGER),
+            };
+            run_ledger_state_fix_preclaim_facts(LedgerStateFixPreclaimFacts {
+                fix_type,
+                owner_exists: false,
+                book_directory_exists: directory.is_some(),
+                book_directory_has_exchange_rate: directory.as_ref().is_some_and(|entry| {
+                    entry.is_field_present(get_field_by_symbol("sfExchangeRate"))
+                }),
+                book_directory_exchange_rate_matches_key: directory.as_ref().is_some_and(|entry| {
+                    entry.is_field_present(get_field_by_symbol("sfExchangeRate"))
+                        && entry.get_field_u64(get_field_by_symbol("sfExchangeRate"))
+                            == quality_from_key(*entry.key())
+                }),
+            })
+        }
+        // Canonical preflight rejects this; the C++ preclaim fallback is
+        // tecINTERNAL and performs no ledger read.
+        LedgerStateFixType::Unknown(_) => Ter::TEC_INTERNAL,
+    };
+
+    Some(result)
 }
 
 pub fn run_ledger_state_fix_do_apply_with_book(

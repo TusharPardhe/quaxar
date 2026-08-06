@@ -3268,8 +3268,9 @@ fn open_ledger_batch_preflight_rejects_sponsorship_before_direct_apply() {
 fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
     use TypedPreclaimRoute::{
         AppAuditedNoop, AppReadViewHelper, BatchSpecialPreclaim, BridgeDomainAuditedNoop,
-        BridgeDomainReadViewHelper, DexReadViewHelper, FailClosed, LoanReadViewHelper,
-        NfTokenReadViewHelper, TokenAuditedNoop, TokenReadViewHelper, VaultReadViewHelper,
+        BridgeDomainReadViewHelper, ChangeReadViewHelper, DexReadViewHelper, FailClosed,
+        LoanReadViewHelper, NfTokenReadViewHelper, TokenAuditedNoop, TokenReadViewHelper,
+        VaultReadViewHelper,
     };
 
     // Keep this table in protocol dispatch order. It is deliberately explicit:
@@ -3364,9 +3365,9 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
         (TxType::CONFIDENTIAL_MPT_CONVERT_BACK, FailClosed),
         (TxType::CONFIDENTIAL_MPT_SEND, FailClosed),
         (TxType::CONFIDENTIAL_MPT_CLAWBACK, FailClosed),
-        (TxType::AMENDMENT, FailClosed),
-        (TxType::FEE, FailClosed),
-        (TxType::UNL_MODIFY, FailClosed),
+        (TxType::AMENDMENT, ChangeReadViewHelper),
+        (TxType::FEE, ChangeReadViewHelper),
+        (TxType::UNL_MODIFY, ChangeReadViewHelper),
     ];
 
     assert_eq!(
@@ -3413,9 +3414,6 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
             TxType::CONFIDENTIAL_MPT_CONVERT_BACK,
             TxType::CONFIDENTIAL_MPT_SEND,
             TxType::CONFIDENTIAL_MPT_CLAWBACK,
-            TxType::AMENDMENT,
-            TxType::FEE,
-            TxType::UNL_MODIFY,
         ],
         "the explicit fail-closed set must remain auditable"
     );
@@ -3430,6 +3428,19 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
         typed_preclaim_ter(&view, &tx, ApplyFlags::NONE),
         UNVERIFIED_TYPED_PRECLAIM_TER,
         "AMMDeposit must fail closed rather than defaulting to tesSUCCESS"
+    );
+
+    let amendment = STTx::new(TxType::AMENDMENT, |_| {});
+    let malformed_fee = STTx::new(TxType::FEE, |_| {});
+    assert_eq!(
+        typed_preclaim_ter(&view, &amendment, ApplyFlags::NONE),
+        Ter::TES_SUCCESS,
+        "Amendment must use its explicit Change-family immutable preclaim"
+    );
+    assert_eq!(
+        typed_preclaim_ter(&view, &malformed_fee, ApplyFlags::NONE),
+        Ter::TEM_MALFORMED,
+        "Fee must use its exact Change-family field-shape preclaim"
     );
 }
 

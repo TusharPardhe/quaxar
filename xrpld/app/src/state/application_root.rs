@@ -1607,6 +1607,7 @@ fn queue_apply_preclaim_ter(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TypedPreclaimRoute {
     AppReadViewHelper,
+    ChangeReadViewHelper,
     AppAuditedNoop,
     DexReadViewHelper,
     LoanReadViewHelper,
@@ -1700,6 +1701,9 @@ fn typed_preclaim_route(txn_type: TxType) -> TypedPreclaimRoute {
         // Batch has its own existing immutable preclaim below, after the
         // family-tail dispatch has succeeded.
         TxType::BATCH => TypedPreclaimRoute::BatchSpecialPreclaim,
+        TxType::AMENDMENT | TxType::FEE | TxType::UNL_MODIFY => {
+            TypedPreclaimRoute::ChangeReadViewHelper
+        }
         // No compiled immutable ReadView helper is registered for these
         // routed types. Never silently promote them to tesSUCCESS.
         TxType::AMM_DEPOSIT
@@ -1710,10 +1714,7 @@ fn typed_preclaim_route(txn_type: TxType) -> TypedPreclaimRoute {
         | TxType::CONFIDENTIAL_MPT_MERGE_INBOX
         | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
         | TxType::CONFIDENTIAL_MPT_SEND
-        | TxType::CONFIDENTIAL_MPT_CLAWBACK
-        | TxType::AMENDMENT
-        | TxType::FEE
-        | TxType::UNL_MODIFY => TypedPreclaimRoute::FailClosed,
+        | TxType::CONFIDENTIAL_MPT_CLAWBACK => TypedPreclaimRoute::FailClosed,
         // Unknown and non-dispatchable protocol values are likewise closed.
         _ => TypedPreclaimRoute::FailClosed,
     }
@@ -1732,6 +1733,10 @@ fn typed_preclaim_ter(view: &impl ReadView, tx: &STTx, flags: ApplyFlags) -> Ter
                 flags,
             )
             .unwrap_or(UNVERIFIED_TYPED_PRECLAIM_TER)
+        }
+        TypedPreclaimRoute::ChangeReadViewHelper => {
+            tx::run_change_read_view_preclaim(view, tx, tx.get_txn_type())
+                .unwrap_or(UNVERIFIED_TYPED_PRECLAIM_TER)
         }
         TypedPreclaimRoute::DexReadViewHelper => {
             tx::run_dex_read_view_preclaim_with_flags(view, tx, tx.get_txn_type(), flags)

@@ -1,13 +1,18 @@
 //! Integration tests that pin the narrowed Rust `TicketCreate.cpp` shells to
 //! the current C++ behavior.
 
-use std::{cell::Cell, collections::BTreeMap};
+use std::{cell::Cell, collections::BTreeMap, sync::Arc};
 
-use protocol::{SeqProxy, Ter, trans_token};
+use basics::base_uint::{Uint160, Uint256};
+use ledger::{Fees, LedgerHeader, ReadView, ReadViewTx, Rules, ViewError};
+use protocol::{
+    AccountID, LedgerEntryType, STLedgerEntry, STTx, SeqProxy, Ter, TxType, get_field_by_symbol,
+    trans_token,
+};
 use tx::{
     TicketCreateDoApplySink, TicketCreatePreclaimFacts, run_ticket_create_do_apply,
     run_ticket_create_make_tx_consequences, run_ticket_create_preclaim,
-    run_ticket_create_preflight,
+    run_ticket_create_preflight, run_ticket_create_read_view_preclaim,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +28,153 @@ struct TestDoApplySink {
     owner_count_delta: Option<u32>,
     final_account_sequence: Option<u32>,
     owner_nodes: Vec<(u32, u64)>,
+}
+
+#[derive(Debug, Default)]
+struct TestReadView {
+    entries: BTreeMap<Uint256, Arc<STLedgerEntry>>,
+    fail_reads: bool,
+}
+
+impl TestReadView {
+    fn insert(&mut self, entry: STLedgerEntry) {
+        self.entries.insert(*entry.key(), Arc::new(entry));
+    }
+}
+
+impl ReadView for TestReadView {
+    fn open(&self) -> bool {
+        false
+    }
+
+    fn header(&self) -> LedgerHeader {
+        LedgerHeader::default()
+    }
+
+    fn fees(&self) -> Fees {
+        Fees::default()
+    }
+
+    fn rules(&self) -> Rules {
+        Rules::default()
+    }
+
+    fn exists(&self, keylet: protocol::Keylet) -> Result<bool, ViewError> {
+        Ok(self.entries.contains_key(&keylet.key))
+    }
+
+    fn succ(&self, _: Uint256, _: Option<Uint256>) -> Result<Option<Uint256>, ViewError> {
+        Ok(None)
+    }
+
+    fn read(&self, keylet: protocol::Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
+        if self.fail_reads {
+            return Err(ViewError::Conversion("test read failure".to_owned()));
+        }
+        Ok(self.entries.get(&keylet.key).cloned())
+    }
+
+    fn sles(&self) -> Result<Vec<Arc<STLedgerEntry>>, ViewError> {
+        Ok(self.entries.values().cloned().collect())
+    }
+
+    fn tx_exists(&self, _: Uint256) -> Result<bool, ViewError> {
+        Ok(false)
+    }
+
+    fn tx_read(&self, _: Uint256) -> Result<Option<ReadViewTx>, ViewError> {
+        Ok(None)
+    }
+
+    fn txs(&self) -> Result<Vec<ReadViewTx>, ViewError> {
+        Ok(Vec::new())
+    }
+}
+
+fn sf(name: &str) -> &'static protocol::SField {
+    get_field_by_symbol(name)
+}
+
+fn account(fill: u8) -> AccountID {
+    AccountID::from_array([fill; 20])
+}
+
+fn account_root(account: AccountID, ticket_count: Option<u32>) -> STLedgerEntry {
+    let mut entry = STLedgerEntry::from_type_and_key(
+        LedgerEntryType::AccountRoot,
+        protocol::account_keylet(Uint160::from_void(account.data())).key,
+    );
+    entry.set_account_id(sf("sfAccount"), account);
+    if let Some(ticket_count) = ticket_count {
+        entry.set_field_u32(sf("sfTicketCount"), ticket_count);
+    }
+    entry
+}
+
+fn ticket_create_tx(account: AccountID, ticket_count: u32, consumes_ticket: bool) -> STTx {
+    STTx::new(TxType::TICKET_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_u32(sf("sfTicketCount"), ticket_count);
+        tx.set_field_u32(sf("sfSequence"), if consumes_ticket { 0 } else { 1 });
+        if consumes_ticket {
+            tx.set_field_u32(sf("sfTicketSequence"), 7);
+        }
+    })
+}
+
+#[test]
+fn ticket_create_read_view_preclaim_matches_canonical_read_and_threshold_order() {
+    let owner = account(1);
+    let missing = ticket_create_tx(owner, 1, false);
+    let mut view = TestReadView::default();
+
+    assert_eq!(
+        run_ticket_create_read_view_preclaim(&view, &missing, TxType::TICKET_CREATE),
+        Some(Ter::TER_NO_ACCOUNT)
+    );
+
+    view.insert(account_root(owner, Some(250)));
+    assert_eq!(
+        run_ticket_create_read_view_preclaim(&view, &missing, TxType::TICKET_CREATE),
+        Some(Ter::TEC_DIR_FULL),
+        "a sequence-based ticket creation does not consume an existing ticket"
+    );
+
+    let consumed_ticket = ticket_create_tx(owner, 1, true);
+    assert_eq!(
+        run_ticket_create_read_view_preclaim(&view, &consumed_ticket, TxType::TICKET_CREATE),
+        Some(Ter::TES_SUCCESS),
+        "the consumed ticket is subtracted only after the account read succeeds"
+    );
+    assert_eq!(
+        view.entries.len(),
+        1,
+        "preclaim must not mutate the ReadView"
+    );
+}
+
+#[test]
+fn ticket_create_read_view_preclaim_has_no_default_success_or_read_error_fallback() {
+    let owner = account(2);
+    let tx = ticket_create_tx(owner, 1, false);
+    let error_view = TestReadView {
+        fail_reads: true,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        run_ticket_create_read_view_preclaim(&error_view, &tx, TxType::TICKET_CREATE),
+        Some(Ter::TEF_BAD_LEDGER)
+    );
+    assert_eq!(
+        run_ticket_create_read_view_preclaim(
+            &TestReadView::default(),
+            &STTx::new(TxType::PAYMENT, |_| {}),
+            TxType::PAYMENT,
+        ),
+        None,
+        "unowned transaction types must never receive a permissive success"
+    );
 }
 
 impl TestDoApplySink {
