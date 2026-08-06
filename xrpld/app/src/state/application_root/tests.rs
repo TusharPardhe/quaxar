@@ -3729,12 +3729,12 @@ fn txq_try_clear_applies_predecessors_repreclaims_current_and_reports_cleanup() 
 }
 
 #[test]
-fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
+fn typed_preclaim_dispatcher_covers_all_75_routed_quaxar_types() {
     use TypedPreclaimRoute::{
         AppAuditedNoop, AppReadViewHelper, BatchSpecialPreclaim, BridgeDomainAuditedNoop,
-        BridgeDomainReadViewHelper, ChangeReadViewHelper, DexReadViewHelper, FailClosed,
-        LoanReadViewHelper, NfTokenReadViewHelper, SystemReadViewHelper, TokenAuditedNoop,
-        TokenReadViewHelper, VaultReadViewHelper,
+        BridgeDomainReadViewHelper, ChangeReadViewHelper, DexReadViewHelper, LoanReadViewHelper,
+        NfTokenReadViewHelper, SystemReadViewHelper, TokenAuditedNoop, TokenReadViewHelper,
+        VaultReadViewHelper,
     };
 
     // Keep this table in protocol dispatch order. It is deliberately explicit:
@@ -3824,11 +3824,6 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
         (TxType::LOAN_DELETE, LoanReadViewHelper),
         (TxType::LOAN_MANAGE, LoanReadViewHelper),
         (TxType::LOAN_PAY, LoanReadViewHelper),
-        (TxType::CONFIDENTIAL_MPT_CONVERT, FailClosed),
-        (TxType::CONFIDENTIAL_MPT_MERGE_INBOX, FailClosed),
-        (TxType::CONFIDENTIAL_MPT_CONVERT_BACK, FailClosed),
-        (TxType::CONFIDENTIAL_MPT_SEND, FailClosed),
-        (TxType::CONFIDENTIAL_MPT_CLAWBACK, FailClosed),
         (TxType::AMENDMENT, ChangeReadViewHelper),
         (TxType::FEE, ChangeReadViewHelper),
         (TxType::UNL_MODIFY, ChangeReadViewHelper),
@@ -3836,7 +3831,7 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
 
     assert_eq!(
         cases.len(),
-        80,
+        75,
         "coverage table must enumerate all routed types"
     );
     let routed = cases
@@ -3845,7 +3840,7 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         routed.len(),
-        80,
+        75,
         "each routed type must appear exactly once"
     );
     assert!(
@@ -3862,25 +3857,9 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
         );
     }
 
-    let uncovered = cases
-        .iter()
-        .filter_map(|(txn_type, route)| (*route == FailClosed).then_some(*txn_type))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        uncovered,
-        vec![
-            TxType::CONFIDENTIAL_MPT_CONVERT,
-            TxType::CONFIDENTIAL_MPT_MERGE_INBOX,
-            TxType::CONFIDENTIAL_MPT_CONVERT_BACK,
-            TxType::CONFIDENTIAL_MPT_SEND,
-            TxType::CONFIDENTIAL_MPT_CLAWBACK,
-        ],
-        "the explicit fail-closed set must remain auditable"
-    );
-
-    // Confidential-MPT remains fail-closed because those types do not yet
-    // have compiled immutable ReadView helpers. The newly routed types must
-    // delegate to their exact existing helper rather than a permissive path.
+    // Every listed route is an upstream transaction type with a concrete
+    // helper, audited inherited no-op, or Batch special preclaim. Unknown
+    // numeric transaction types remain fail-closed through the default arm.
     let view = Ledger::from_ledger_seq_and_close_time(1, 0, false);
     for txn_type in [
         TxType::AMM_DEPOSIT,

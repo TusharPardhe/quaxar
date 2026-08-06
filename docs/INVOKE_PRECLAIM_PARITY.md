@@ -39,7 +39,7 @@ The result must retain rippled's `Success` / `Fail` / `Retry` classification. A 
 | Candidate cache/delta effects before successful candidate materialization | TransactionMaster and publisher side effects occurred inside build loop | Deferred locally until candidate materialization |
 
 ## Current coverage inventory
-Rippled macro-dispatches 75 transaction types. Quaxar routes those plus 5 Confidential-MPT types, for 80 dispatched types.
+Rippled macro-dispatches 75 transaction types; Quaxar routes the same upstream transaction catalog.
 
 ### Generic infrastructure that must be concrete
 | Requirement | Existing primitive | Missing production adapter |
@@ -62,7 +62,7 @@ Every routed type must be explicitly covered; no default `tesSUCCESS` placeholde
 | Account | AccountSet, AccountDelete, SetRegularKey, DepositPreauth, CheckCreate/Cash/Cancel | Permission and typed facts incomplete |
 | Payment | Payment, PaymentChannelCreate/Fund/Claim, EscrowCreate/Finish/Cancel, CheckCash | Permission and typed preclaim must be dispatched before apply |
 | DEX/AMM | OfferCreate/Cancel, AMMCreate/Deposit/Withdraw/Vote/Bid/Delete/Clawback | Several helpers are placeholders or apply-adjacent |
-| Trust/token | TrustSet, IssuedCurrency/Clawback, MPToken*, MPT*, Confidential MPT* | MPTokenIssuanceSet is partial; remaining paths need concrete facts |
+| Trust/token | TrustSet, IssuedCurrency/Clawback, MPToken*, MPT* | MPTokenIssuanceSet is partial; remaining paths need concrete facts |
 | NFT | NFTokenMint/Burn/CreateOffer/AcceptOffer/CancelOffer/Modify | Typed tails must be read-only and explicit |
 | Bridge/XChain | Bridge create/modify, XChain claim/commit/claim-ID/attestations | Missing typed preclaim fact builders |
 | Permission/delegate/domain | DelegateSet, PermissionedDomainSet/Delete, DIDSet/Delete, Credential* | Delegate and typed permission paths missing |
@@ -77,7 +77,7 @@ The midway independent audit found that the current dispatcher is still incomple
 - The system-transaction shortcut bypasses generic preclaim for non-Batch system transactions, including TicketCreate and LedgerStateFix.
 - Type-specific permission overrides are unregistered for AccountSet, Payment, TrustSet, MPTokenIssuanceSet, and LoanSet signer override.
 - Generic fee preclaim lacks multisign increments and intentionally bypasses sponsor and specialized fee owners.
-- Missing/unregistered typed tails span Change/Ticket/LedgerStateFix, Account, Payment/Escrow/Check, DEX/AMM, Token/Confidential-MPT, NFT, XChain, Identity/Domain/Credential, Vault, and remaining Lending families.
+- Missing/unregistered typed tails span Change/Ticket/LedgerStateFix, Account, Payment/Escrow/Check, DEX/AMM, Token, NFT, XChain, Identity/Domain/Credential, Vault, and remaining Lending families.
 
 Implementation rule: replace the typed dispatcher default-success branch only when every routed TxType has an explicit implementation or an auditable rippled-equivalent no-op preclaim. Add system-family dispatch before removing the system shortcut.
 

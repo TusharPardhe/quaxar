@@ -141,9 +141,6 @@ flowchart TD
 | completion receiver ownership | NetworkOps strand only | MATCH target |
 | sweep full-ledger release | `inbound_ledgers/registry.rs` | MATCH target |
 
-## Quaxar-only fail-closed extension: Confidential-MPT
-
-`ConfidentialMPTConvert`, `ConfidentialMPTMergeInbox`, `ConfidentialMPTConvertBack`, `ConfidentialMPTSend`, and `ConfidentialMPTClawback` are Quaxar-only typed dispatch extensions. The audited local `../rippled` tree has no corresponding transactors. They are therefore deliberately fail-closed as `TEM_UNKNOWN`, never promoted to `tesSUCCESS` and never directly applied. Source check: Quaxar `xrpld/app/src/state/application_root.rs::typed_preclaim_route` and `xrpld/app/src/state/transactor_dispatcher.rs::confidential_mpt_direct_apply_ter`; reference comparison: no Confidential-MPT implementation under `../rippled/src/libxrpl/tx/transactors`.
 
 ### Read-only audit rule
 

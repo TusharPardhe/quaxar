@@ -2295,13 +2295,6 @@ fn typed_preclaim_route(txn_type: TxType) -> TypedPreclaimRoute {
         TxType::TICKET_CREATE | TxType::LEDGER_STATE_FIX => {
             TypedPreclaimRoute::SystemReadViewHelper
         }
-        // No compiled immutable ReadView helper is registered for these
-        // routed types. Never silently promote them to tesSUCCESS.
-        TxType::CONFIDENTIAL_MPT_CONVERT
-        | TxType::CONFIDENTIAL_MPT_MERGE_INBOX
-        | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
-        | TxType::CONFIDENTIAL_MPT_SEND
-        | TxType::CONFIDENTIAL_MPT_CLAWBACK => TypedPreclaimRoute::FailClosed,
         // Unknown and non-dispatchable protocol values are likewise closed.
         _ => TypedPreclaimRoute::FailClosed,
     }

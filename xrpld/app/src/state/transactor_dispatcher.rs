@@ -1770,10 +1770,6 @@ pub fn handle_real_dispatch<V: ledger::ApplyView>(
     txn_type: TxType,
     pre_fee_balance_drops: Option<i64>,
 ) -> Ter {
-    if let Some(result) = confidential_mpt_direct_apply_ter(txn_type) {
-        return result;
-    }
-
     let tx_hash = sttx.get_hash(protocol::HashPrefix::TransactionId);
     tracing::trace!(target: "tx", tx_type = %format!("{:?}", txn_type), hash = %tx_hash, "Transaction preflight");
     let result = handle_real_dispatch_inner(view, sttx, txn_type, pre_fee_balance_drops);
@@ -6098,17 +6094,6 @@ fn do_xrp_payment<V: ledger::ApplyView>(
     Ter::TES_SUCCESS
 }
 
-fn confidential_mpt_direct_apply_ter(txn_type: TxType) -> Option<Ter> {
-    match txn_type {
-        TxType::CONFIDENTIAL_MPT_CONVERT
-        | TxType::CONFIDENTIAL_MPT_MERGE_INBOX
-        | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
-        | TxType::CONFIDENTIAL_MPT_SEND
-        | TxType::CONFIDENTIAL_MPT_CLAWBACK => Some(tx::UNKNOWN_TRANSACTION_TYPE_TER),
-        _ => None,
-    }
-}
-
 fn close_channel<V: ledger::ApplyView>(view: &mut V, chan: &STLedgerEntry, key: Uint256) -> Ter {
     let src = chan.get_account_id(sf("sfAccount"));
 
@@ -6148,30 +6133,6 @@ fn close_channel<V: ledger::ApplyView>(view: &mut V, chan: &STLedgerEntry, key: 
     // Erase the channel
     let _ = view.erase(Arc::new(chan.clone()));
     Ter::TES_SUCCESS
-}
-
-#[cfg(test)]
-mod confidential_mpt_direct_apply_tests {
-    use super::confidential_mpt_direct_apply_ter;
-    use protocol::TxType;
-
-    #[test]
-    fn confidential_mpt_direct_apply_routes_match_typed_preclaim_fail_closed_result() {
-        // ../rippled/src/libxrpl/tx/transactors/token/MPTokenIssuanceSet.cpp::preflight is the nearest local MPT transactor; no local Confidential-MPT transactor exists.
-        for txn_type in [
-            TxType::CONFIDENTIAL_MPT_CONVERT,
-            TxType::CONFIDENTIAL_MPT_MERGE_INBOX,
-            TxType::CONFIDENTIAL_MPT_CONVERT_BACK,
-            TxType::CONFIDENTIAL_MPT_SEND,
-            TxType::CONFIDENTIAL_MPT_CLAWBACK,
-        ] {
-            assert_eq!(
-                confidential_mpt_direct_apply_ter(txn_type),
-                Some(tx::UNKNOWN_TRANSACTION_TYPE_TER)
-            );
-        }
-        assert_eq!(confidential_mpt_direct_apply_ter(TxType::PAYMENT), None);
-    }
 }
 
 fn asf_to_lsf(asf: u32) -> u32 {
