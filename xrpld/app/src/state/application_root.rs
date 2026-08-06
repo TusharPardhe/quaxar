@@ -2677,6 +2677,15 @@ impl
             return Ok(sequence_ter);
         }
 
+        if let Some(ter) = crate::state::read_view_preclaim::run_read_view_preclaim(
+            view.as_ref(),
+            &sttx,
+            txn_type,
+            ctx.flags,
+        ) {
+            return Ok(ter);
+        }
+
         Ok(batch_preclaim_ter(view.as_ref(), &sttx, ctx.flags))
     }
 
