@@ -1,4 +1,5 @@
 // utility module
+pub mod bridge_domain_read_view_preclaim;
 pub mod clawback;
 pub mod consequences;
 pub mod maybe_tx;
@@ -152,6 +153,7 @@ pub mod vault_make_tx_consequences;
 pub mod vault_preclaim_entrypoint;
 pub mod vault_preflight_dispatch;
 pub mod vault_preflight_entrypoint;
+pub mod vault_read_view_preclaim;
 pub mod vault_set_do_apply;
 pub mod vault_set_metadata;
 pub mod vault_set_preclaim;
@@ -168,6 +170,7 @@ pub mod vault_withdraw_preflight;
 pub mod x_chain_bridge;
 
 // Re-export all from submodules
+pub use bridge_domain_read_view_preclaim::*;
 pub use clawback::*;
 pub use consequences::*;
 pub use maybe_tx::*;
@@ -321,6 +324,7 @@ pub use vault_make_tx_consequences::*;
 pub use vault_preclaim_entrypoint::*;
 pub use vault_preflight_dispatch::*;
 pub use vault_preflight_entrypoint::*;
+pub use vault_read_view_preclaim::*;
 pub use vault_set_do_apply::*;
 pub use vault_set_metadata::*;
 pub use vault_set_preclaim::*;

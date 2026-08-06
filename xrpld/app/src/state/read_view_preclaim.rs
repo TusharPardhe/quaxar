@@ -19,16 +19,17 @@ use tx::{
     AccountDeleteDirectoryEntryDisposition, AccountDeletePreclaimFrontFacts,
     AccountDeletePreclaimNftAndSequenceFacts, AccountDeletePreclaimScanState,
     AccountSetPreclaimFacts, CheckCancelPreclaimFacts, CheckCashPreclaimFacts,
-    CheckCreatePreclaimFacts, DepositPreauthCredentialPreclaimFact, DepositPreauthPreclaimFacts,
-    EscrowCancelIssuePreclaimFacts, EscrowCancelMptPreclaimFacts, EscrowCancelPreclaimFacts,
-    EscrowCreateAmountKind, EscrowCreateIssuePreclaimFacts, EscrowCreateMptPreclaimFacts,
-    EscrowCreatePreclaimFacts, PaymentChannelCreatePreclaimFacts, PaymentPreclaimFacts,
-    run_account_delete_preclaim_directory_scan, run_account_delete_preclaim_front,
-    run_account_delete_preclaim_nft_and_sequence, run_account_set_preclaim,
-    run_check_cancel_preclaim, run_check_cash_preclaim, run_check_create_preclaim,
-    run_deposit_preauth_preclaim, run_escrow_cancel_issue_preclaim, run_escrow_cancel_mpt_preclaim,
-    run_escrow_cancel_preclaim, run_escrow_create_issue_preclaim, run_escrow_create_mpt_preclaim,
-    run_escrow_create_preclaim, run_payment_channel_create_preclaim,
+    CheckCreatePreclaimFacts, DelegateSetPreclaimFacts, DepositPreauthCredentialPreclaimFact,
+    DepositPreauthPreclaimFacts, EscrowCancelIssuePreclaimFacts, EscrowCancelMptPreclaimFacts,
+    EscrowCancelPreclaimFacts, EscrowCreateAmountKind, EscrowCreateIssuePreclaimFacts,
+    EscrowCreateMptPreclaimFacts, EscrowCreatePreclaimFacts, PaymentChannelCreatePreclaimFacts,
+    PaymentPreclaimFacts, run_account_delete_preclaim_directory_scan,
+    run_account_delete_preclaim_front, run_account_delete_preclaim_nft_and_sequence,
+    run_account_set_preclaim, run_check_cancel_preclaim, run_check_cash_preclaim,
+    run_check_create_preclaim, run_delegate_set_preclaim, run_deposit_preauth_preclaim,
+    run_escrow_cancel_issue_preclaim, run_escrow_cancel_mpt_preclaim, run_escrow_cancel_preclaim,
+    run_escrow_create_issue_preclaim, run_escrow_create_mpt_preclaim, run_escrow_create_preclaim,
+    run_payment_channel_claim_preclaim, run_payment_channel_create_preclaim,
     run_payment_preclaim_with_facts,
 };
 
@@ -284,9 +285,14 @@ pub fn run_read_view_preclaim<V: ReadView>(
     let result = match txn_type {
         TxType::ACCOUNT_SET => preclaim_account_set(view, tx, apply_flags),
         TxType::ACCOUNT_DELETE => preclaim_account_delete(view, tx),
+        TxType::DELEGATE_SET => preclaim_delegate_set(view, tx),
+        TxType::REGULAR_KEY_SET => preclaim_set_regular_key(),
+        TxType::SIGNER_LIST_SET => preclaim_signer_list_set(),
         TxType::DEPOSIT_PREAUTH => preclaim_deposit_preauth(view, tx),
         TxType::PAYMENT => preclaim_payment(view, tx, apply_flags),
         TxType::PAYCHAN_CREATE => preclaim_payment_channel_create(view, tx),
+        TxType::PAYCHAN_FUND => preclaim_payment_channel_fund(),
+        TxType::PAYCHAN_CLAIM => preclaim_payment_channel_claim(view, tx),
         TxType::CHECK_CREATE => preclaim_check_create(view, tx),
         TxType::CHECK_CASH => preclaim_check_cash(view, tx),
         TxType::CHECK_CANCEL => preclaim_check_cancel(view, tx),
@@ -402,6 +408,33 @@ fn preclaim_account_delete<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter>
             ))
         }
     }
+}
+
+fn preclaim_delegate_set<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
+    let account = tx.get_account_id(sf("sfAccount"));
+    let authorize = tx.get_account_id(sf("sfAuthorize"));
+    Ok(run_delegate_set_preclaim(DelegateSetPreclaimFacts {
+        account_exists: read_account(view, account)?.is_some(),
+        authorize_exists: read_account(view, authorize)?.is_some(),
+        permissions_empty: tx.get_field_array(sf("sfPermissions")).is_empty(),
+        delegate_exists: view
+            .exists(protocol::delegate_keylet(
+                Uint160::from_void(account.data()),
+                Uint160::from_void(authorize.data()),
+            ))
+            .map_err(|_| view_error())?,
+    }))
+}
+
+// rippled SetRegularKey and SignerListSet inherit Transactor::preclaim without
+// a family override. These explicit, family-local no-op adapters prevent their
+// treatment as an out-of-scope dispatcher default and perform no view reads.
+fn preclaim_set_regular_key() -> Result<Ter, Ter> {
+    Ok(Ter::TES_SUCCESS)
+}
+
+fn preclaim_signer_list_set() -> Result<Ter, Ter> {
+    Ok(Ter::TES_SUCCESS)
 }
 
 fn preclaim_deposit_preauth<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
@@ -584,6 +617,32 @@ fn preclaim_payment_channel_create<V: ReadView>(view: &V, tx: &STTx) -> Result<T
                 .as_ref()
                 .is_some_and(|sle| account_is_pseudo(sle)),
         },
+    ))
+}
+
+// rippled PaymentChannelFund inherits Transactor::preclaim without a family
+// override. Keep that exact no-op explicit rather than relying on a fallback.
+fn preclaim_payment_channel_fund() -> Result<Ter, Ter> {
+    Ok(Ter::TES_SUCCESS)
+}
+
+fn preclaim_payment_channel_claim<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
+    let credentials_enabled = view.rules().enabled(&protocol::feature_id("Credentials"));
+    if !credentials_enabled {
+        return Ok(run_payment_channel_claim_preclaim(
+            false,
+            || Ter::TES_SUCCESS,
+            || unreachable!("rippled skips credential validation before Credentials"),
+        ));
+    }
+
+    let account = tx.get_account_id(sf("sfAccount"));
+    let credentials =
+        ledger::credential_helpers::valid(view, tx, &account).map_err(|_| view_error())?;
+    Ok(run_payment_channel_claim_preclaim(
+        true,
+        || unreachable!("rippled bypasses Transactor::preclaim with Credentials"),
+        || credentials,
     ))
 }
 
@@ -1089,6 +1148,28 @@ mod tests {
                 Ter::TEC_NO_DST,
             ),
             (
+                TxType::DELEGATE_SET,
+                STTx::new(TxType::DELEGATE_SET, move |tx| {
+                    tx.set_account_id(sf("sfAccount"), source);
+                    tx.set_account_id(sf("sfAuthorize"), destination);
+                }),
+                Ter::TER_NO_ACCOUNT,
+            ),
+            (
+                TxType::REGULAR_KEY_SET,
+                STTx::new(TxType::REGULAR_KEY_SET, move |tx| {
+                    tx.set_account_id(sf("sfAccount"), source);
+                }),
+                Ter::TES_SUCCESS,
+            ),
+            (
+                TxType::SIGNER_LIST_SET,
+                STTx::new(TxType::SIGNER_LIST_SET, move |tx| {
+                    tx.set_account_id(sf("sfAccount"), source);
+                }),
+                Ter::TES_SUCCESS,
+            ),
+            (
                 TxType::DEPOSIT_PREAUTH,
                 STTx::new(TxType::DEPOSIT_PREAUTH, move |tx| {
                     tx.set_account_id(sf("sfAccount"), source);
@@ -1116,6 +1197,20 @@ mod tests {
                     );
                 }),
                 Ter::TER_NO_ACCOUNT,
+            ),
+            (
+                TxType::PAYCHAN_FUND,
+                STTx::new(TxType::PAYCHAN_FUND, move |tx| {
+                    tx.set_account_id(sf("sfAccount"), source);
+                }),
+                Ter::TES_SUCCESS,
+            ),
+            (
+                TxType::PAYCHAN_CLAIM,
+                STTx::new(TxType::PAYCHAN_CLAIM, move |tx| {
+                    tx.set_account_id(sf("sfAccount"), source);
+                }),
+                Ter::TES_SUCCESS,
             ),
             (
                 TxType::CHECK_CREATE,
