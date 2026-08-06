@@ -8,7 +8,7 @@ use basics::base_uint::{Uint160, Uint256};
 use ledger::ReadView;
 use protocol::{
     AccountID, ApplyFlags, NotTec, PublicKey, STLedgerEntry, STObject, STTx, Ter, calc_account_id,
-    feature_batch, feature_lending_protocol, get_field_by_symbol, lsfDisableMaster,
+    feature_batch, feature_lending_protocol, get_field_by_symbol, is_tes_success, lsfDisableMaster,
 };
 use tx::{
     TransactorCheckFeeTx, TransactorCheckPermissionTx, TransactorCheckPriorTxAndLastLedgerTx,
@@ -47,17 +47,19 @@ fn is_pseudo_account(account: Option<&LedgerSignAccountState>) -> bool {
 /// every generic guard succeeds. A zero account preserves rippled's pseudo
 /// transaction exception by skipping the complete generic block.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn invoke_preclaim<V, CalculateBaseFee, TypedPreclaimTail>(
+pub(crate) fn invoke_preclaim<V, CalculateBaseFee, MinimumFee, TypedPreclaimTail>(
     view: &V,
     tx: &STTx,
     current_ledger_seq: u32,
     flags: ApplyFlags,
     calculate_base_fee: CalculateBaseFee,
+    minimum_fee: MinimumFee,
     typed_preclaim_tail: TypedPreclaimTail,
 ) -> Ter
 where
     V: ReadView,
     CalculateBaseFee: FnOnce() -> i64,
+    MinimumFee: FnOnce(i64) -> i64,
     TypedPreclaimTail: FnOnce() -> Ter,
 {
     let adapted = LedgerPreclaimTx { tx };
@@ -94,26 +96,7 @@ where
                 |tx_id| view.tx_exists(*tx_id).unwrap_or(false),
             )
         },
-        || {
-            run_transactor_check_permission(
-                &adapted,
-                |account, delegate| {
-                    view.read(protocol::delegate_keylet(
-                        Uint160::from_void(account.data()),
-                        Uint160::from_void(delegate.data()),
-                    ))
-                    .ok()
-                    .flatten()
-                    .map(LedgerDelegatePermissions::from_entry)
-                },
-                |delegate, delegated_tx| {
-                    run_check_tx_permission(
-                        Some(&delegate.permissions),
-                        u16::from(delegated_tx.tx.get_txn_type()),
-                    )
-                },
-            )
-        },
+        || typed_check_permission(view, tx, &adapted),
         || {
             if tx.get_txn_type() == protocol::TxType::LOAN_SET {
                 check_loan_set_counterparty_sign(view, tx, flags, || {
@@ -132,7 +115,7 @@ where
                 base_fee,
                 0_i64,
                 |_| true,
-                |base_fee| base_fee,
+                minimum_fee,
                 |payer| read_account(view, payer).map(LedgerSignAccountState::from),
                 |account| account.balance,
             )
@@ -144,6 +127,259 @@ where
 #[derive(Clone, Copy)]
 struct LedgerPreclaimTx<'a> {
     tx: &'a STTx,
+}
+
+pub(crate) fn scale_fee_load(
+    fee: i64,
+    mut fee_factor: u32,
+    remote_fee_factor: u32,
+    load_base: u32,
+    unlimited: bool,
+) -> i64 {
+    if fee == 0 {
+        return fee;
+    }
+
+    if unlimited
+        && fee_factor > remote_fee_factor
+        && u64::from(fee_factor) < 4_u64.saturating_mul(u64::from(remote_fee_factor))
+    {
+        fee_factor = remote_fee_factor;
+    }
+
+    let denominator = u128::from(load_base);
+    if denominator == 0 {
+        return i64::MAX;
+    }
+    let Some(scaled) = u128::try_from(fee)
+        .ok()
+        .and_then(|fee| fee.checked_mul(u128::from(fee_factor)))
+        .map(|numerator| numerator / denominator)
+    else {
+        return i64::MAX;
+    };
+
+    i64::try_from(scaled).unwrap_or(i64::MAX)
+}
+
+fn read_delegate_permissions<V: ReadView>(
+    view: &V,
+    account: AccountID,
+    delegate: AccountID,
+) -> Option<LedgerDelegatePermissions> {
+    view.read(protocol::delegate_keylet(
+        Uint160::from_void(account.data()),
+        Uint160::from_void(delegate.data()),
+    ))
+    .ok()
+    .flatten()
+    .map(LedgerDelegatePermissions::from_entry)
+}
+
+fn tx_permission_result(delegate: &LedgerDelegatePermissions, tx: &STTx) -> NotTec {
+    run_check_tx_permission(Some(&delegate.permissions), u16::from(tx.get_txn_type()))
+}
+
+fn typed_check_permission<V: ReadView>(
+    view: &V,
+    tx: &STTx,
+    adapted: &LedgerPreclaimTx<'_>,
+) -> NotTec {
+    let account = tx.get_account_id(sf("sfAccount"));
+    let delegate = tx
+        .is_field_present(sf("sfDelegate"))
+        .then(|| tx.get_account_id(sf("sfDelegate")));
+    let delegate_permissions =
+        delegate.and_then(|delegate| read_delegate_permissions(view, account, delegate));
+
+    match tx.get_txn_type() {
+        protocol::TxType::ACCOUNT_SET => tx::run_account_set_check_permission(
+            adapted,
+            |account, delegate| read_delegate_permissions(view, *account, *delegate),
+            |permissions, permission| permissions.permissions.contains(&(permission as u32)),
+        ),
+        protocol::TxType::PAYMENT => {
+            let amount = tx.get_field_amount(sf("sfAmount"));
+            let asset = amount.asset();
+            let issuer = asset.issuer();
+            tx::run_payment_check_permission(tx::PaymentCheckPermissionFacts {
+                delegate_present: delegate.is_some(),
+                delegate_entry_exists: delegate_permissions.is_some(),
+                check_tx_permission_result: delegate_permissions
+                    .as_ref()
+                    .map_or(Ter::TER_NO_DELEGATE_PERMISSION, |permissions| {
+                        tx_permission_result(permissions, tx)
+                    }),
+                send_max_present: tx.is_field_present(sf("sfSendMax")),
+                send_max_asset_matches_amount: !tx.is_field_present(sf("sfSendMax"))
+                    || tx.get_field_amount(sf("sfSendMax")).asset() == asset,
+                paths_present: tx.is_field_present(sf("sfPaths")),
+                payment_mint_permission: delegate_permissions.as_ref().is_some_and(|permissions| {
+                    permissions
+                        .permissions
+                        .contains(&(protocol::GranularPermissionType::PaymentMint as u32))
+                }),
+                payment_burn_permission: delegate_permissions.as_ref().is_some_and(|permissions| {
+                    permissions
+                        .permissions
+                        .contains(&(protocol::GranularPermissionType::PaymentBurn as u32))
+                }),
+                amount_is_xrp: amount.native(),
+                is_mpt: matches!(asset, protocol::Asset::MPTIssue(_)),
+                amount_issuer_is_source: !amount.native() && issuer == account,
+                amount_issuer_is_destination: !amount.native()
+                    && issuer == tx.get_account_id(sf("sfDestination")),
+                trustline_exists: match asset {
+                    protocol::Asset::Issue(issue) if !issue.native() => view
+                        .read(protocol::line(account, issuer, issue.currency))
+                        .ok()
+                        .flatten()
+                        .is_some(),
+                    _ => false,
+                },
+                account_is_holder: None,
+                dest_limit_positive: None,
+            })
+        }
+        protocol::TxType::TRUST_SET => {
+            let limit = tx.get_field_amount(sf("sfLimitAmount"));
+            let issuer = limit.issue().account;
+            let trustline = view
+                .read(protocol::line(account, issuer, limit.issue().currency))
+                .ok()
+                .flatten();
+            let current_limit_equals_proposed_limit = trustline.as_ref().is_some_and(|line| {
+                let current = line.get_field_amount(if account > issuer {
+                    sf("sfHighLimit")
+                } else {
+                    sf("sfLowLimit")
+                });
+                let mut proposed = limit.clone();
+                proposed.set_issuer(account);
+                current == proposed
+            });
+            tx::run_trust_set_check_permission(tx::TrustSetCheckPermissionFacts {
+                delegate_present: delegate.is_some(),
+                delegate_entry_exists: delegate_permissions.is_some(),
+                check_tx_permission_result: delegate_permissions
+                    .as_ref()
+                    .map_or(Ter::TER_NO_DELEGATE_PERMISSION, |permissions| {
+                        tx_permission_result(permissions, tx)
+                    }),
+                tx_flags: tx.get_flags(),
+                quality_in_present: tx.is_field_present(sf("sfQualityIn")),
+                quality_out_present: tx.is_field_present(sf("sfQualityOut")),
+                trustline_exists: trustline.is_some(),
+                granular_trustline_authorize: delegate_permissions.as_ref().is_some_and(
+                    |permissions| {
+                        permissions.permissions.contains(
+                            &(protocol::GranularPermissionType::TrustlineAuthorize as u32),
+                        )
+                    },
+                ),
+                granular_trustline_freeze: delegate_permissions.as_ref().is_some_and(
+                    |permissions| {
+                        permissions
+                            .permissions
+                            .contains(&(protocol::GranularPermissionType::TrustlineFreeze as u32))
+                    },
+                ),
+                granular_trustline_unfreeze: delegate_permissions.as_ref().is_some_and(
+                    |permissions| {
+                        permissions
+                            .permissions
+                            .contains(&(protocol::GranularPermissionType::TrustlineUnfreeze as u32))
+                    },
+                ),
+                current_limit_equals_proposed_limit,
+            })
+        }
+        protocol::TxType::MPTOKEN_ISSUANCE_SET => {
+            let mut granular_permissions = std::collections::BTreeSet::new();
+            if delegate_permissions.as_ref().is_some_and(|permissions| {
+                permissions
+                    .permissions
+                    .contains(&(protocol::GranularPermissionType::MPTokenIssuanceLock as u32))
+            }) {
+                granular_permissions.insert(tx::MPTokenIssuanceSetGranularPermission::Lock);
+            }
+            if delegate_permissions.as_ref().is_some_and(|permissions| {
+                permissions
+                    .permissions
+                    .contains(&(protocol::GranularPermissionType::MPTokenIssuanceUnlock as u32))
+            }) {
+                granular_permissions.insert(tx::MPTokenIssuanceSetGranularPermission::Unlock);
+            }
+            tx::run_mp_token_issuance_set_check_permission(tx::MPTokenIssuanceSetPermissionFacts {
+                delegate_present: delegate.is_some(),
+                delegate_entry_exists: delegate_permissions.is_some(),
+                broad_permission_granted: delegate_permissions.as_ref().is_some_and(
+                    |permissions| is_tes_success(tx_permission_result(permissions, tx)),
+                ),
+                tx_flags: tx.get_flags(),
+                granular_permissions,
+            })
+        }
+        _ => run_transactor_check_permission(
+            adapted,
+            |account, delegate| read_delegate_permissions(view, *account, *delegate),
+            |permissions, delegated_tx| tx_permission_result(&permissions, delegated_tx.tx),
+        ),
+    }
+}
+
+impl tx::AccountSetPermissionTx for LedgerPreclaimTx<'_> {
+    type AccountId = AccountID;
+
+    fn account_id(&self) -> Self::AccountId {
+        self.tx.get_account_id(sf("sfAccount"))
+    }
+
+    fn delegate(&self) -> Option<Self::AccountId> {
+        self.tx
+            .is_field_present(sf("sfDelegate"))
+            .then(|| self.tx.get_account_id(sf("sfDelegate")))
+    }
+
+    fn set_flag(&self) -> u32 {
+        self.tx.get_field_u32(sf("sfSetFlag"))
+    }
+
+    fn clear_flag(&self) -> u32 {
+        self.tx.get_field_u32(sf("sfClearFlag"))
+    }
+
+    fn flags(&self) -> u32 {
+        self.tx.get_flags()
+    }
+
+    fn email_hash_present(&self) -> bool {
+        self.tx.is_field_present(sf("sfEmailHash"))
+    }
+
+    fn wallet_locator_present(&self) -> bool {
+        self.tx.is_field_present(sf("sfWalletLocator"))
+    }
+
+    fn nftoken_minter_present(&self) -> bool {
+        self.tx.is_field_present(sf("sfNFTokenMinter"))
+    }
+
+    fn message_key_present(&self) -> bool {
+        self.tx.is_field_present(sf("sfMessageKey"))
+    }
+
+    fn domain_present(&self) -> bool {
+        self.tx.is_field_present(sf("sfDomain"))
+    }
+
+    fn transfer_rate_present(&self) -> bool {
+        self.tx.is_field_present(sf("sfTransferRate"))
+    }
+
+    fn tick_size_present(&self) -> bool {
+        self.tx.is_field_present(sf("sfTickSize"))
+    }
 }
 
 impl TransactorCheckSeqProxyTx for LedgerPreclaimTx<'_> {
@@ -601,8 +837,126 @@ fn check_ledger_signer_authorization<V: ReadView>(
 
 #[cfg(test)]
 mod tests {
-    use ledger::Ledger;
-    use protocol::{AccountID, ApplyFlags, STTx, Ter, TxType, get_field_by_symbol};
+    use std::sync::Arc;
+
+    use basics::base_uint::Uint160;
+    use ledger::{ApplyView, Ledger};
+    use protocol::{
+        AccountID, ApplyFlags, LedgerEntryType, STAmount, STArray, STLedgerEntry, STObject, STTx,
+        Ter, TxType, get_field_by_symbol,
+    };
+
+    use super::{LedgerPreclaimTx, scale_fee_load, typed_check_permission};
+
+    fn insert_delegate(
+        view: &mut ledger::Sandbox<ledger::Ledger>,
+        account: AccountID,
+        delegate: AccountID,
+        permissions: &[u32],
+    ) {
+        let keylet = protocol::delegate_keylet(
+            Uint160::from_void(account.data()),
+            Uint160::from_void(delegate.data()),
+        );
+        let mut permission_entries = STArray::new(get_field_by_symbol("sfPermissions"));
+        for permission in permissions {
+            let mut entry = STObject::make_inner_object(get_field_by_symbol("sfPermission"));
+            entry.set_field_u32(get_field_by_symbol("sfPermissionValue"), *permission);
+            permission_entries.push_back(entry);
+        }
+        let mut entry = STLedgerEntry::from_type_and_key(LedgerEntryType::Delegate, keylet.key);
+        entry.set_account_id(get_field_by_symbol("sfAccount"), account);
+        entry.set_account_id(get_field_by_symbol("sfAuthorize"), delegate);
+        entry.set_field_array(get_field_by_symbol("sfPermissions"), permission_entries);
+        view.insert(Arc::new(entry))
+            .expect("delegate entry should insert into the preclaim view");
+    }
+
+    #[test]
+    fn shared_preclaim_dispatches_account_payment_trust_and_mpt_permissions_polymorphically() {
+        // ../rippled/src/libxrpl/tx/transactors/account/AccountSet.cpp::AccountSet::checkPermission (lines 173-217); ../rippled/src/libxrpl/tx/transactors/payment/Payment.cpp::Payment::checkPermission (lines 276-312); ../rippled/src/libxrpl/tx/transactors/token/TrustSet.cpp::TrustSet::checkPermission (lines 128-184); ../rippled/src/libxrpl/tx/transactors/token/MPTokenIssuanceSet.cpp::MPTokenIssuanceSet::checkPermission (lines 143-172).
+        let account = AccountID::from_array([0xA1; 20]);
+        let broad_delegate = AccountID::from_array([0xA2; 20]);
+        let granular_delegate = AccountID::from_array([0xA3; 20]);
+        let mut view = ledger::Sandbox::new(
+            Arc::new(ledger::Ledger::from_ledger_seq_and_close_time(1, 0, false)),
+            ApplyFlags::NONE,
+        );
+        insert_delegate(
+            &mut view,
+            account,
+            broad_delegate,
+            &[
+                protocol::Permission::tx_to_permission_type(TxType::ACCOUNT_SET),
+                protocol::Permission::tx_to_permission_type(TxType::PAYMENT),
+                protocol::Permission::tx_to_permission_type(TxType::TRUST_SET),
+            ],
+        );
+        insert_delegate(
+            &mut view,
+            account,
+            granular_delegate,
+            &[protocol::GranularPermissionType::MPTokenIssuanceLock as u32],
+        );
+
+        let account_set = STTx::new(TxType::ACCOUNT_SET, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+            tx.set_account_id(get_field_by_symbol("sfDelegate"), broad_delegate);
+            tx.set_field_vl(get_field_by_symbol("sfDomain"), b"example.org");
+        });
+        let payment = STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+            tx.set_account_id(get_field_by_symbol("sfDelegate"), broad_delegate);
+            tx.set_account_id(
+                get_field_by_symbol("sfDestination"),
+                AccountID::from_array([0xB1; 20]),
+            );
+            tx.set_field_amount(
+                get_field_by_symbol("sfAmount"),
+                STAmount::new_native(1, false),
+            );
+        });
+        let trust_set = STTx::new(TxType::TRUST_SET, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+            tx.set_account_id(get_field_by_symbol("sfDelegate"), broad_delegate);
+            tx.set_field_amount(
+                get_field_by_symbol("sfLimitAmount"),
+                STAmount::new_native(1, false),
+            );
+        });
+        let mpt_set = STTx::new(TxType::MPTOKEN_ISSUANCE_SET, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+            tx.set_account_id(get_field_by_symbol("sfDelegate"), granular_delegate);
+            tx.set_field_u32(get_field_by_symbol("sfFlags"), protocol::tfMPTLock);
+        });
+
+        assert_eq!(
+            typed_check_permission(&view, &account_set, &LedgerPreclaimTx { tx: &account_set }),
+            Ter::TER_NO_DELEGATE_PERMISSION,
+            "AccountSet must not accept a transaction-level permission"
+        );
+        assert_eq!(
+            typed_check_permission(&view, &payment, &LedgerPreclaimTx { tx: &payment }),
+            Ter::TES_SUCCESS
+        );
+        assert_eq!(
+            typed_check_permission(&view, &trust_set, &LedgerPreclaimTx { tx: &trust_set }),
+            Ter::TES_SUCCESS
+        );
+        assert_eq!(
+            typed_check_permission(&view, &mpt_set, &LedgerPreclaimTx { tx: &mpt_set }),
+            Ter::TES_SUCCESS,
+            "MPTokenIssuanceSet must accept its lock granular permission"
+        );
+    }
+
+    #[test]
+    fn shared_preclaim_scales_minimum_fee_and_honors_unlimited_load_window() {
+        // ../rippled/src/libxrpl/tx/Transactor.cpp::Transactor::minimumFee (lines 354-362) and ../rippled/src/libxrpl/server/LoadFeeTrack.cpp::scaleFeeLoad (lines 62-85).
+        assert_eq!(scale_fee_load(10, 512, 256, 256, false), 20);
+        assert_eq!(scale_fee_load(10, 512, 256, 256, true), 10);
+        assert_eq!(scale_fee_load(10, 1_024, 256, 256, true), 40);
+    }
 
     use super::check_loan_set_counterparty_sign;
 

@@ -590,21 +590,14 @@ fn apply_submit_tx_for_test(
     tx: Arc<STTx>,
     current_ledger_index: u32,
 ) -> ApplyResult {
-    let rules = submit_view.rules().clone();
-    let preclaim_ter = queue_apply_preclaim_ter(
-        submit_view,
-        tx.as_ref(),
-        current_ledger_index,
-        ApplyFlags::NONE,
-    );
+    let fee_track = crate::load::load_fee_track::SharedLoadFeeTrack::new();
     let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
         open_ledger,
         submit_view,
         tx,
-        rules,
         ApplyFlags::NONE,
         current_ledger_index,
-        preclaim_ter,
+        &fee_track,
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     );
     runtime.direct_apply()
@@ -2939,15 +2932,14 @@ fn open_ledger_batch_preflight_result(sttx: STTx) -> Ter {
     let mut open_ledger =
         AppOpenLedgerView::with_parent_hash(2, 10, *base.header().hash.as_uint256());
     let mut submit_view = Sandbox::new(Arc::clone(&base), ApplyFlags::NONE);
-    let rules = submit_view.rules().clone();
+    let fee_track = crate::load::load_fee_track::SharedLoadFeeTrack::new();
     let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
         &mut open_ledger,
         &mut submit_view,
         Arc::new(sttx),
-        rules,
         ApplyFlags::NONE,
         2,
-        Ter::TES_SUCCESS,
+        &fee_track,
         Arc::new(Mutex::new(std::collections::HashMap::new())),
     );
 
@@ -3495,29 +3487,36 @@ fn closed_ledger_txq_fee_metrics_use_specialized_and_default_base_fees() {
 }
 
 #[test]
-fn txq_direct_apply_does_not_mutate_when_shared_preclaim_fails() {
+fn txq_direct_apply_uses_canonical_shared_preclaim_instead_of_caller_ter() {
+    // ../rippled/src/libxrpl/tx/applySteps.cpp::invokePreclaim (lines 177-200): shared admission runs before any application mutation.
     let destination = AccountID::from_array([0x91; 20]);
-    let (source, tx) = signed_payment_tx(0x91, destination, 1, 10);
+    let (source, tx) = signed_payment_tx(0x91, destination, 2, 10);
     let base = Arc::new(ledger_view(10, source, 1, &[]));
     let mut open_ledger =
         AppOpenLedgerView::with_parent_hash(11, 10, *base.header().hash.as_uint256());
     let mut submit_view = Sandbox::new(Arc::clone(&base), ApplyFlags::NONE);
-    let rules = submit_view.rules().clone();
+    let fee_track = crate::load::load_fee_track::SharedLoadFeeTrack::new();
     let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
         &mut open_ledger,
         &mut submit_view,
         tx,
-        rules,
         ApplyFlags::NONE,
         11,
-        Ter::TER_PRE_SEQ,
+        &fee_track,
         Arc::new(Mutex::new(std::collections::HashMap::new())),
     );
 
     let result = runtime.direct_apply();
-    assert_eq!(result, ApplyResult::new(Ter::TER_PRE_SEQ, false, false));
+    assert_eq!(
+        result,
+        ApplyResult::new(Ter::TER_PRE_SEQ, false, false),
+        "the runtime must derive the shared preclaim from the live view"
+    );
     drop(runtime);
-    assert!(open_ledger.tx_ids().is_empty());
+    assert!(
+        open_ledger.tx_ids().is_empty(),
+        "a rejected canonical preclaim must not be recorded by direct apply"
+    );
     assert_eq!(
         submit_view
             .read(account_keylet(raw_account_id(source)))

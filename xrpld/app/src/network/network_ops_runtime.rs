@@ -670,24 +670,28 @@ impl AppNetworkOpsRuntime {
         &self,
         transactions: &[NetworkOpsApplyBatchEntry<SharedTransaction>],
     ) {
-        // User callbacks run without the NetworkOps state lock. Recover a
-        // poisoned transaction or state lock here so cleanup itself cannot
-        // turn this caught panic into an abort.
+        // ../rippled/src/xrpld/app/misc/NetworkOPs.cpp::NetworkOPsImp::transactionBatch (lines 1514-1524) retains batch work until the queue drain completes.
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        state.finish_apply_batch(
-            transactions,
-            || {},
-            |tx| {
-                let mut transaction = tx.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                transaction.clear_applying();
-                drop(transaction);
-                tx.clear_poison();
-            },
-            || {},
-        );
+        let mut requeued = transactions.to_vec();
+        for entry in &mut requeued {
+            entry.applied = false;
+            entry.result = None;
+            let mut transaction = entry
+                .transaction
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            transaction.clear_applying();
+            drop(transaction);
+            entry.transaction.clear_poison();
+        }
+        let empty: &[NetworkOpsApplyBatchEntry<SharedTransaction>] = &[];
+        let _ = state.finish_apply_batch(empty, || {}, |_tx| {}, || {});
+        let mut pending = std::mem::take(state.pending_transactions_mut());
+        requeued.append(&mut pending);
+        *state.pending_transactions_mut() = requeued;
         drop(state);
         self.state.clear_poison();
     }
@@ -774,13 +778,9 @@ impl AppNetworkOpsRuntime {
                     target: "network",
                     %message,
                     batch_size = transactions.len(),
-                    "NetworkOps batch panicked; clearing in-flight transactions and resetting dispatch state"
+                    "NetworkOps batch panicked; requeued in-flight transactions and reset dispatch state"
                 );
-                // A panic can occur after an included transaction has staged
-                // account-following work in `submit_held`. Always run the
-                // normal tail: it clears every in-flight applying flag,
-                // merges that held work into pending, and returns dispatch to
-                // `None` before the JobQueue suppresses this panic.
+                // ../rippled/src/xrpld/app/misc/NetworkOPs.cpp::NetworkOPsImp::transactionBatch (lines 1514-1524): preserve the drained batch and schedule another guarded drain after recovery.
                 self.abort_apply_batch_after_panic(&transactions);
                 self.pending_batch_panic_recovery
                     .store(true, Ordering::Release);
@@ -1589,7 +1589,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_panic_cleanup_clears_inflight_state_and_merges_submit_held() {
+    fn runtime_panic_cleanup_requeues_inflight_work_and_merges_submit_held() {
+        // ../rippled/src/xrpld/app/misc/NetworkOPs.cpp::NetworkOPsImp::doTransactionAsync (lines 1378-1398) and NetworkOPsImp::transactionBatch (lines 1514-1524): applying work remains queued for a batch drain.
         let ledger_master_runtime = Arc::new(AppLedgerMasterRuntime::default());
         let runtime = runtime(
             NetworkOpsOperatingMode::Full,
@@ -1651,7 +1652,7 @@ mod tests {
         assert_eq!(
             runtime.snapshot(),
             AppNetworkOpsRuntimeSnapshot {
-                pending_transactions: 1,
+                pending_transactions: 2,
                 submit_held: 0,
                 dispatch_state: NetworkOpsDispatchState::None,
             }
@@ -1662,9 +1663,25 @@ mod tests {
         );
 
         assert!(
+            !read_transaction(&included, |transaction| transaction.get_applying()),
+            "all restored entries must clear their in-flight applying bit"
+        );
+        assert!(
             runtime.take_pending_batch_panic_recovery(),
             "a caught batch panic must request a fresh guarded recovery batch"
         );
+        let scheduled = std::cell::Cell::new(0usize);
+        assert!(runtime.schedule_pending_transaction_batch(|| {
+            scheduled.set(scheduled.get() + 1);
+            true
+        }));
+        assert_eq!(
+            scheduled.get(),
+            1,
+            "recovered work must schedule exactly one batch"
+        );
+        assert_eq!(runtime.dispatch_state(), NetworkOpsDispatchState::Scheduled);
+        assert!(runtime.release_scheduled_transaction_batch_for_retry());
         assert!(
             !runtime.take_pending_batch_panic_recovery(),
             "the recovery request must be consumed exactly once"
@@ -1672,11 +1689,16 @@ mod tests {
 
         let (pending, start) = runtime.begin_apply_batch();
         assert_eq!(start.dispatch_state, NetworkOpsDispatchState::Running);
-        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.len(), 2);
         assert_eq!(
             read_transaction(&pending[0].transaction, |transaction| transaction.get_id()),
+            read_transaction(&failing, |transaction| transaction.get_id()),
+            "the interrupted in-flight transaction must be restored first"
+        );
+        assert_eq!(
+            read_transaction(&pending[1].transaction, |transaction| transaction.get_id()),
             promoted.get_transaction_id(),
-            "submit-held work must be merged into the next pending batch"
+            "submit-held work must follow the restored in-flight transaction"
         );
         let tail = runtime.finish_apply_batch(&pending);
         assert_eq!(tail.dispatch_state, NetworkOpsDispatchState::None);

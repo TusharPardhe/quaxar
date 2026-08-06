@@ -1268,10 +1268,9 @@ impl<'a> AppOpenLedgerTxQApplyRuntime<'a> {
         view: &'a mut AppOpenLedgerView,
         submit_view: &'a mut Sandbox<Ledger>,
         tx: Arc<STTx>,
-        rules: Rules,
         flags: ApplyFlags,
         current_ledger_seq: u32,
-        preclaim_ter: Ter,
+        load_fee_track: &'a SharedLoadFeeTrack,
         account_seqs: Arc<std::sync::Mutex<std::collections::HashMap<protocol::AccountID, u32>>>,
     ) -> Self {
         let fee_field = get_field_by_symbol("sfFee");
@@ -1280,7 +1279,19 @@ impl<'a> AppOpenLedgerTxQApplyRuntime<'a> {
         } else {
             0
         };
+        let rules = submit_view.rules().clone();
         let result = transaction_preflight_ter(&tx, &rules);
+        let preclaim_ter = if is_tes_success(result) {
+            queue_apply_preclaim_ter_with_load_fee(
+                submit_view,
+                tx.as_ref(),
+                current_ledger_seq,
+                flags,
+                load_fee_track,
+            )
+        } else {
+            result
+        };
         let consequences = if is_tes_success(result) {
             TxConsequences::new(fee_drops, tx.get_seq_proxy())
         } else {
@@ -1721,6 +1732,7 @@ pub(crate) fn queue_apply_preclaim_ter(
         current_ledger_seq,
         flags,
         || fee_drops_as_i64(calculate_sttx_base_fee(view, tx)),
+        |base_fee| base_fee,
         || {
             let typed_preclaim = typed_preclaim_ter(view, tx, flags);
             if !is_tes_success(typed_preclaim) {
@@ -1736,8 +1748,46 @@ pub(crate) fn queue_apply_preclaim_ter(
     )
 }
 
+pub(crate) fn queue_apply_preclaim_ter_with_load_fee(
+    view: &impl ReadView,
+    tx: &STTx,
+    current_ledger_seq: u32,
+    flags: ApplyFlags,
+    load_fee_track: &SharedLoadFeeTrack,
+) -> Ter {
+    let (fee_factor, remote_fee_factor) = load_fee_track.scaling_factors();
+    crate::state::invoke_preclaim::invoke_preclaim(
+        view,
+        tx,
+        current_ledger_seq,
+        flags,
+        || fee_drops_as_i64(calculate_sttx_base_fee(view, tx)),
+        |base_fee| {
+            crate::state::invoke_preclaim::scale_fee_load(
+                base_fee,
+                fee_factor,
+                remote_fee_factor,
+                load_fee_track.load_base(),
+                tx::any_apply_flags(flags & ApplyFlags::UNLIMITED),
+            )
+        },
+        || {
+            let typed_preclaim = typed_preclaim_ter(view, tx, flags);
+            if !is_tes_success(typed_preclaim) {
+                return typed_preclaim;
+            }
+
+            if tx.get_txn_type() == TxType::BATCH {
+                batch_preclaim_ter(view, tx, flags)
+            } else {
+                Ter::TES_SUCCESS
+            }
+        },
+    )
+}
+/// ../rippled/src/libxrpl/tx/applySteps.cpp::invokePreclaim (lines 162-201).
 /// Explicit classification for every routed Quaxar transaction type's typed
-/// preclaim tail.  A route may only name an already-compiled immutable
+/// preclaim tail. A route may only name an already-compiled immutable
 /// ReadView helper, an audited rippled inherited no-op owned by such a helper,
 /// the existing Batch special preclaim, or the fail-closed result below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3732,11 +3782,12 @@ impl ApplicationRoot {
             return ApplyResult::new(Ter::TEF_ALREADY, false, false);
         }
 
-        let preclaim = queue_apply_preclaim_ter(
+        let preclaim = queue_apply_preclaim_ter_with_load_fee(
             rebase_view,
             tx.as_ref(),
             open_ledger.ledger_current_index,
             flags,
+            self.load_fee_track.as_ref(),
         );
         let ter = if is_tes_success(preclaim) {
             apply_submit_transactor_shell_with_flags(
@@ -5350,21 +5401,13 @@ impl ApplicationRoot {
                             &live_queue_view,
                             metrics_snapshot,
                         );
-                        let submit_rules = submit_view.view_mut().rules().clone();
-                        let preclaim_ter = queue_apply_preclaim_ter(
-                            submit_view.view_mut(),
-                            tx.as_ref(),
-                            current_ledger_index,
-                            networkops_apply_flags(entry.admin, entry.fail_hard),
-                        );
                         let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
                             view,
                             submit_view.view_mut(),
                             Arc::clone(&tx),
-                            submit_rules,
                             networkops_apply_flags(entry.admin, entry.fail_hard),
                             current_ledger_index,
-                            preclaim_ter,
+                            self.load_fee_track.as_ref(),
                             Arc::clone(&account_seqs),
                         );
                         let result = tx_q
@@ -7919,7 +7962,13 @@ impl ApplicationRoot {
                 let rules = view.rules();
                 let preflight = consensus_transaction_preflight_ter(&sttx, &rules);
                 let preclaim = if is_tes_success(preflight) {
-                    queue_apply_preclaim_ter(&*view, &sttx, closed_seq, retry_flags)
+                    queue_apply_preclaim_ter_with_load_fee(
+                        &*view,
+                        &sttx,
+                        closed_seq,
+                        retry_flags,
+                        self.load_fee_track.as_ref(),
+                    )
                 } else {
                     preflight
                 };
