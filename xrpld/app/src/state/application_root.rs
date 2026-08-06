@@ -1260,7 +1260,10 @@ impl
             self.rebase_view,
             self.applied_ids,
             &AppOpenLedgerTxRecord::new(Arc::clone(&queued.pf_result.tx)),
-            self.flags,
+            // `TxQ::MaybeTx::apply` reuses its stored flags and re-preflights
+            // if they differ from the retained preflight result. Do not
+            // substitute the enclosing accept pass's flags here.
+            queued.flags,
         )
     }
 }
@@ -1645,7 +1648,9 @@ where
                 load_fee_track,
                 &mut sandbox,
                 &queued.tx,
-                ApplyFlags::NONE,
+                // A clear-ahead predecessor is a persisted MaybeTx. TxQ.cpp
+                // invokes MaybeTx::apply, which retains that entry's flags.
+                queued.flags,
             );
             self.clear_ahead_attempts
                 .push((queued.seq_proxy, result.clone()));
@@ -4254,17 +4259,25 @@ impl ApplicationRoot {
     /// which copies the current OpenView before invoking TxQ::apply(TapDryRun).
     pub fn simulate_transaction(&self, ledger: Arc<Ledger>, tx: Arc<STTx>) -> SimulationOutcome {
         let mut open_view = (*self.open_ledger().current()).clone();
-        // The cloned OpenLedger below owns current queue size and fee state.
-        // `AppOpenLedgerTxQApplyRuntime` still applies against its immutable
-        // parent ledger, so keep this sequence aligned with that parent.
-        let ledger_seq = ledger.header().seq;
-        let close_time = ledger.header().close_time;
-        let mut apply_view = ledger::ApplyViewImpl::new(Arc::clone(&ledger), ApplyFlags::DRY_RUN);
         if open_view.ledger_current_index == 0 {
-            open_view.ledger_current_index = ledger_seq;
+            open_view.ledger_current_index = ledger.header().seq;
             open_view.base_fee_drops = ledger.fees().base;
             open_view.parent_hash = *ledger.header().hash.as_uint256();
         }
+        // Simulate.cpp copies OpenLedger::current(), not its closed parent.
+        // The persistent submit sandbox is Quaxar's concrete OpenView state:
+        // it contains sequence, balance, and all prior open-ledger mutations.
+        // Clone it for dry-run isolation so the simulation never publishes
+        // changes back to the live open ledger.
+        let mut apply_view = self
+            .open_ledger_sandbox
+            .lock()
+            .expect("sandbox mutex")
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| Sandbox::new(Arc::clone(&ledger), ApplyFlags::DRY_RUN));
+        let ledger_seq = open_view.ledger_current_index;
+        let close_time = apply_view.header().close_time;
         let tx_source = AppQueueApplyTxSource::new(tx.as_ref());
         let account_seqs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let result = self.registry.tx_q.simulate_with(|tx_q| {
@@ -4437,13 +4450,19 @@ impl ApplicationRoot {
             return ApplyResult::new(Ter::TEF_ALREADY, false, false);
         }
 
-        let preclaim = queue_apply_preclaim_ter_with_load_fee(
-            rebase_view,
-            tx.as_ref(),
-            open_ledger.ledger_current_index,
-            flags,
-            self.load_fee_track.as_ref(),
-        );
+        let preflight =
+            transaction_preflight_ter_with_flags(tx.as_ref(), &rebase_view.rules(), flags);
+        let preclaim = if is_tes_success(preflight) {
+            queue_apply_preclaim_ter_with_load_fee(
+                rebase_view,
+                tx.as_ref(),
+                open_ledger.ledger_current_index,
+                flags,
+                self.load_fee_track.as_ref(),
+            )
+        } else {
+            preflight
+        };
         let ter = if is_tes_success(preclaim) || is_tec_claim(preclaim) {
             apply_submit_transactor_shell_with_flags(
                 rebase_view,

@@ -23,6 +23,10 @@ pub struct TxDetails<Tx, Account> {
     pub seq_proxy: SeqProxy,
     pub tx: Tx,
     pub retries_remaining: i32,
+    /// Flags retained by `TxQ::MaybeTx`; clear-ahead must replay the queued
+    /// transaction under these exact flags, not under the incoming tx's flags.
+    /// Parity: ../rippled/src/xrpld/app/misc/detail/TxQ.cpp::MaybeTx::apply.
+    pub flags: ApplyFlags,
     pub preflight_result: Ter,
     pub last_result: Option<Ter>,
 }
@@ -162,6 +166,7 @@ impl<Tx: Clone, Account: Clone, Journal, ParentBatchId>
             seq_proxy: self.seq_proxy,
             tx: self.pf_result.tx.clone(),
             retries_remaining: self.retries_remaining,
+            flags: self.flags,
             preflight_result: self.pf_result.ter,
             last_result: self.last_result,
         }
@@ -267,7 +272,7 @@ mod tests {
             "acct",
             Some(120),
             SeqProxy::sequence(5),
-            ApplyFlags::NONE,
+            ApplyFlags::FAIL_HARD,
             pf_result,
         );
         queued.set_last_result(Ter::TER_RETRY);
@@ -280,6 +285,7 @@ mod tests {
         assert_eq!(details.seq_proxy, SeqProxy::sequence(5));
         assert_eq!(details.tx, "tx");
         assert_eq!(details.retries_remaining, MAYBE_TX_RETRIES_ALLOWED - 1);
+        assert_eq!(details.flags, ApplyFlags::FAIL_HARD);
         assert_eq!(details.preflight_result, Ter::TER_PRE_SEQ);
         assert_eq!(details.last_result, Some(Ter::TER_RETRY));
         assert_eq!(details.consequences.potential_spend(), 77);

@@ -521,28 +521,16 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
     // the transactor shell directly. Parity: ../rippled/src/xrpld/rpc/handlers/
     // transaction/Simulate.cpp::simulateTxn invokes TxQ::apply(TapDryRun).
     if let Some(app) = ctx.runtime.app() {
-        let open_view = app.open_ledger().current();
-        let ledger = if open_view.ledger_current_index != 0 && !open_view.parent_hash.is_zero() {
-            // A live OpenLedger pins simulation to its own parent. Do not
-            // fall back to a different closed/validated ledger. Materialize
-            // its header/state overlay so transaction application and TxQ see
-            // the same open sequence and fee.
-            let parent = app
-                .closed_ledger()
-                .filter(|ledger| *ledger.header().hash.as_uint256() == open_view.parent_hash)
-                .ok_or_else(|| Status::new(RpcErrorCode::NotSynced))?;
-            let mut open =
-                ledger::Ledger::from_previous(parent.as_ref(), parent.header().close_time);
-            open.set_total_drops(parent.header().drops);
-            let mut fees = open.fees();
-            fees.base = open_view.base_fee_drops;
-            open.set_fees(fees);
-            Arc::new(open)
-        } else {
-            ctx.runtime
-                .current_ledger_for_simulation()
-                .ok_or_else(|| Status::new(RpcErrorCode::NotSynced))?
-        };
+        // ApplicationRoot::simulate_transaction clones its persistent OpenView
+        // sandbox. The runtime ledger is only the immutable fallback for a
+        // node that has not accepted any open-ledger mutations yet; rebuilding
+        // `Ledger::from_previous` here would discard sequence/balance changes.
+        // Parity: ../rippled/src/xrpld/rpc/handlers/transaction/Simulate.cpp::
+        // simulateTxn copies OpenLedger::current() before TxQ::apply(TapDryRun).
+        let ledger = ctx
+            .runtime
+            .current_ledger_for_simulation()
+            .ok_or_else(|| Status::new(RpcErrorCode::NotSynced))?;
         let outcome = app.simulate_transaction(ledger, Arc::new(tx.clone()));
         ret.insert(
             jss::applied.to_string(),

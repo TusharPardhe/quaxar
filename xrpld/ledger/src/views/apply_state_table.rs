@@ -29,7 +29,7 @@ pub struct StateEntry {
     pub sle: Arc<STLedgerEntry>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ApplyStateTable {
     items: BTreeMap<Uint256, StateEntry>,
     drops_destroyed: XRPAmount,

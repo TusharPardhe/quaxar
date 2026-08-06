@@ -178,6 +178,11 @@ pub struct QueuedOverlayInboundHandler {
     #[allow(clippy::type_complexity)]
     replay_delta_response_router:
         Mutex<Option<Arc<dyn Fn(PeerId, TmReplayDeltaResponse) + Send + Sync>>>,
+    proof_path_request_router: Mutex<Option<Arc<dyn Fn(PeerId, TmProofPathRequest) + Send + Sync>>>,
+    proof_path_response_router:
+        Mutex<Option<Arc<dyn Fn(PeerId, TmProofPathResponse) + Send + Sync>>>,
+    replay_delta_request_router:
+        Mutex<Option<Arc<dyn Fn(PeerId, TmReplayDeltaRequest) + Send + Sync>>>,
     /// Direct routing callback for inbound transactions — dispatches
     /// immediately to a JobQueue worker on receipt, matching reference
     /// PeerImp::handleTransaction -> JobQueue::addJob(JtTransaction,
@@ -223,6 +228,9 @@ impl Default for QueuedOverlayInboundHandler {
             ledger_data_router: Mutex::new(None),
             ledger_data_delivery_gate: Mutex::new(()),
             replay_delta_response_router: Mutex::new(None),
+            proof_path_request_router: Mutex::new(None),
+            proof_path_response_router: Mutex::new(None),
+            replay_delta_request_router: Mutex::new(None),
             transaction_router: Mutex::new(None),
             validation_router: Mutex::new(None),
             validation_notify_tx: Mutex::new(None),
@@ -329,6 +337,63 @@ impl QueuedOverlayInboundHandler {
             router(packet.peer_id, packet.message);
         }
         count
+    }
+
+    pub fn set_proof_path_request_router(
+        &self,
+        router: Box<dyn Fn(PeerId, TmProofPathRequest) + Send + Sync>,
+    ) {
+        let router: Arc<dyn Fn(PeerId, TmProofPathRequest) + Send + Sync> = Arc::from(router);
+        let queued = {
+            let mut router_guard = self
+                .proof_path_request_router
+                .lock()
+                .expect("proof_path_request_router lock");
+            let mut inbound = self.inner.lock().expect("overlay inbound lock");
+            *router_guard = Some(Arc::clone(&router));
+            std::mem::take(&mut inbound.proof_path_requests)
+        };
+        for request in queued {
+            router(request.peer_id, request.message);
+        }
+    }
+
+    pub fn set_proof_path_response_router(
+        &self,
+        router: Box<dyn Fn(PeerId, TmProofPathResponse) + Send + Sync>,
+    ) {
+        let router: Arc<dyn Fn(PeerId, TmProofPathResponse) + Send + Sync> = Arc::from(router);
+        let queued = {
+            let mut router_guard = self
+                .proof_path_response_router
+                .lock()
+                .expect("proof_path_response_router lock");
+            let mut inbound = self.inner.lock().expect("overlay inbound lock");
+            *router_guard = Some(Arc::clone(&router));
+            std::mem::take(&mut inbound.proof_path_responses)
+        };
+        for response in queued {
+            router(response.peer_id, response.message);
+        }
+    }
+
+    pub fn set_replay_delta_request_router(
+        &self,
+        router: Box<dyn Fn(PeerId, TmReplayDeltaRequest) + Send + Sync>,
+    ) {
+        let router: Arc<dyn Fn(PeerId, TmReplayDeltaRequest) + Send + Sync> = Arc::from(router);
+        let queued = {
+            let mut router_guard = self
+                .replay_delta_request_router
+                .lock()
+                .expect("replay_delta_request_router lock");
+            let mut inbound = self.inner.lock().expect("overlay inbound lock");
+            *router_guard = Some(Arc::clone(&router));
+            std::mem::take(&mut inbound.replay_delta_requests)
+        };
+        for request in queued {
+            router(request.peer_id, request.message);
+        }
     }
 
     /// Register an immediate replay-delta response route. This mirrors
@@ -896,6 +961,16 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     }
 
     fn on_proof_path_request(&self, peer: &Arc<PeerImp>, message: TmProofPathRequest) {
+        if let Some(router) = self
+            .proof_path_request_router
+            .lock()
+            .expect("proof_path_request_router lock")
+            .as_ref()
+            .map(Arc::clone)
+        {
+            router(peer.id(), message);
+            return;
+        }
         let mut inner = self.inner.lock().expect("overlay inbound lock");
         push_bounded(
             &mut inner.proof_path_requests,
@@ -908,6 +983,16 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     }
 
     fn on_proof_path_response(&self, peer: &Arc<PeerImp>, message: TmProofPathResponse) {
+        if let Some(router) = self
+            .proof_path_response_router
+            .lock()
+            .expect("proof_path_response_router lock")
+            .as_ref()
+            .map(Arc::clone)
+        {
+            router(peer.id(), message);
+            return;
+        }
         let mut inner = self.inner.lock().expect("overlay inbound lock");
         push_bounded(
             &mut inner.proof_path_responses,
@@ -920,6 +1005,16 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     }
 
     fn on_replay_delta_request(&self, peer: &Arc<PeerImp>, message: TmReplayDeltaRequest) {
+        if let Some(router) = self
+            .replay_delta_request_router
+            .lock()
+            .expect("replay_delta_request_router lock")
+            .as_ref()
+            .map(Arc::clone)
+        {
+            router(peer.id(), message);
+            return;
+        }
         let mut inner = self.inner.lock().expect("overlay inbound lock");
         push_bounded(
             &mut inner.replay_delta_requests,
@@ -1025,6 +1120,18 @@ mod tests {
                 batch: false,
                 message: TmTransaction::default(),
             });
+            snapshot.proof_path_requests.push(PeerMessage {
+                peer_id: 17,
+                message: TmProofPathRequest::default(),
+            });
+            snapshot.proof_path_responses.push(PeerMessage {
+                peer_id: 18,
+                message: TmProofPathResponse::default(),
+            });
+            snapshot.replay_delta_requests.push(PeerMessage {
+                peer_id: 19,
+                message: TmReplayDeltaRequest::default(),
+            });
         }
 
         let proposals = Arc::new(Mutex::new(Vec::new()));
@@ -1033,6 +1140,9 @@ mod tests {
         let ledger_data = Arc::new(Mutex::new(Vec::new()));
         let get_objects = Arc::new(Mutex::new(Vec::new()));
         let transactions = Arc::new(Mutex::new(Vec::new()));
+        let proof_path_requests = Arc::new(Mutex::new(Vec::new()));
+        let proof_path_responses = Arc::new(Mutex::new(Vec::new()));
+        let replay_delta_requests = Arc::new(Mutex::new(Vec::new()));
         handler.set_transaction_router(Box::new({
             let received = Arc::clone(&transactions);
             move |peer_id, _| {
@@ -1087,6 +1197,33 @@ mod tests {
                     .push(peer_id)
             }
         }));
+        handler.set_proof_path_request_router(Box::new({
+            let received = Arc::clone(&proof_path_requests);
+            move |peer_id, _| {
+                received
+                    .lock()
+                    .expect("proof request replay lock")
+                    .push(peer_id)
+            }
+        }));
+        handler.set_proof_path_response_router(Box::new({
+            let received = Arc::clone(&proof_path_responses);
+            move |peer_id, _| {
+                received
+                    .lock()
+                    .expect("proof response replay lock")
+                    .push(peer_id)
+            }
+        }));
+        handler.set_replay_delta_request_router(Box::new({
+            let received = Arc::clone(&replay_delta_requests);
+            move |peer_id, _| {
+                received
+                    .lock()
+                    .expect("replay request replay lock")
+                    .push(peer_id)
+            }
+        }));
 
         assert_eq!(*proposals.lock().expect("proposal replay lock"), vec![11]);
         assert_eq!(
@@ -1108,6 +1245,24 @@ mod tests {
         assert_eq!(
             *transactions.lock().expect("transaction replay lock"),
             vec![16]
+        );
+        assert_eq!(
+            *proof_path_requests
+                .lock()
+                .expect("proof request replay lock"),
+            vec![17]
+        );
+        assert_eq!(
+            *proof_path_responses
+                .lock()
+                .expect("proof response replay lock"),
+            vec![18]
+        );
+        assert_eq!(
+            *replay_delta_requests
+                .lock()
+                .expect("replay request replay lock"),
+            vec![19]
         );
         let snapshot = handler.snapshot();
         assert!(snapshot.proposals.is_empty());
@@ -1200,4 +1355,77 @@ mod tests {
         }]);
         assert_eq!(handler.take_validations().len(), 1_026);
     }
+}
+
+#[test]
+fn replay_and_proof_fallbacks_replay_to_direct_routes() {
+    // LedgerReplayMsgHandler.cpp processes these four message families on
+    // receipt. The Rust startup queue may delay them briefly, but must
+    // drain every packet once the equivalent app callback is installed.
+    let handler = QueuedOverlayInboundHandler::default();
+    {
+        let mut snapshot = handler.inner.lock().expect("overlay inbound lock");
+        snapshot.proof_path_requests.push(PeerMessage {
+            peer_id: 21,
+            message: TmProofPathRequest {
+                key: Uint256::from_u64(1).data().to_vec(),
+                ledger_hash: Uint256::from_u64(2).data().to_vec(),
+                r#type: 2,
+            },
+        });
+        snapshot.proof_path_responses.push(PeerMessage {
+            peer_id: 22,
+            message: TmProofPathResponse {
+                key: Uint256::from_u64(3).data().to_vec(),
+                ledger_hash: Uint256::from_u64(4).data().to_vec(),
+                r#type: 2,
+                ledger_header: Some(vec![5]),
+                path: vec![vec![6]],
+                error: None,
+            },
+        });
+        snapshot.replay_delta_requests.push(PeerMessage {
+            peer_id: 23,
+            message: TmReplayDeltaRequest {
+                ledger_hash: Uint256::from_u64(7).data().to_vec(),
+            },
+        });
+        snapshot.replay_delta_responses.push(PeerMessage {
+            peer_id: 24,
+            message: TmReplayDeltaResponse {
+                ledger_hash: Uint256::from_u64(8).data().to_vec(),
+                ledger_header: None,
+                transaction: Vec::new(),
+                error: Some(1),
+            },
+        });
+    }
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    handler.set_proof_path_request_router(Box::new({
+        let received = Arc::clone(&received);
+        move |peer_id, _| received.lock().expect("received lock").push(peer_id)
+    }));
+    handler.set_proof_path_response_router(Box::new({
+        let received = Arc::clone(&received);
+        move |peer_id, _| received.lock().expect("received lock").push(peer_id)
+    }));
+    handler.set_replay_delta_request_router(Box::new({
+        let received = Arc::clone(&received);
+        move |peer_id, _| received.lock().expect("received lock").push(peer_id)
+    }));
+    handler.set_replay_delta_response_router(Box::new({
+        let received = Arc::clone(&received);
+        move |peer_id, _| received.lock().expect("received lock").push(peer_id)
+    }));
+
+    assert_eq!(
+        *received.lock().expect("received lock"),
+        vec![21, 22, 23, 24]
+    );
+    let snapshot = handler.snapshot();
+    assert!(snapshot.proof_path_requests.is_empty());
+    assert!(snapshot.proof_path_responses.is_empty());
+    assert!(snapshot.replay_delta_requests.is_empty());
+    assert!(snapshot.replay_delta_responses.is_empty());
 }

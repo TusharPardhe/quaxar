@@ -370,7 +370,7 @@ fn build_ledger_finalizes_skiplist_flush_unshare_and_accept_in() {
 }
 
 #[test]
-fn build_ledger_replay_applies_ordered_txns_in_input_order_with_replay_flags() {
+fn build_ledger_replay_preserves_transaction_index_order_for_dependent_transactions() {
     let parent = Arc::new(sample_parent_ledger(40));
     let mut replay_ledger = Ledger::from_previous(&parent, 100);
     replay_ledger.set_accepted(111, 20, true);
@@ -398,6 +398,13 @@ fn build_ledger_replay_applies_ordered_txns_in_input_order_with_replay_flags() {
         |_built| StubBuildView::closed(Rc::new(RefCell::new(Vec::new()))),
         |_, _, _| Ter::TES_SUCCESS,
         |view, tx, flags| {
+            // `BuildLedger.cpp::buildLedger(LedgerReplay const&)` iterates
+            // `orderedTxns()` (TransactionMd::TransactionIndex order). Treat
+            // the second transaction as sequence-dependent on the first: a
+            // canonical-TX-set or SHAMap-leaf reorder would fail here.
+            if tx.get_transaction_id() == second.get_transaction_id() {
+                assert_eq!(view.applied, vec![first.get_transaction_id()]);
+            }
             view.applied.push(tx.get_transaction_id());
             seen.borrow_mut()
                 .push((tx.get_transaction_id(), flags.bits()));

@@ -12,7 +12,7 @@ use crate::raw_view::{RawView, ReadRawView};
 use crate::read_view::{ReadView, ReadViewTx, ViewError};
 use crate::{ApplyView, Fees, LedgerHeader};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Sandbox<B> {
     base: Arc<B>,
     table: ApplyStateTable,

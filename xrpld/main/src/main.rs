@@ -375,10 +375,37 @@ fn spawn_overlay_timer(deps: OverlayTimerDeps) -> thread::JoinHandle<()> {
                 let snapshot = overlay_runtime.overlay().take_queued_inbound_snapshot();
                 overlay_runtime.overlay().requeue_validations(snapshot.validations);
 
-                // `LedgerReplayMsgHandler::processReplayDeltaResponse` runs
-                // on the overlay handoff path in rippled. Keep the response
-                // in this single snapshot owner, validate it in app state,
-                // then let LedgerReplayer wake the matching delta/task.
+                // `LedgerReplayMsgHandler.cpp` handles all four replay
+                // messages: serve requests from immutable ledgers, validate
+                // proof responses before they reach `got_skip_list`, and route
+                // replay deltas to the owning acquisition. Keep them in the
+                // single snapshot owner so request/response ordering remains
+                // explicit and malformed proofs never mutate replay state.
+                for request in &snapshot.replay_delta_requests {
+                    let response = deps.app.replay_delta_response_for(&request.message);
+                    if let Some(peer) = peers.iter().find(|peer| peer.id() == request.peer_id) {
+                        peer.send(overlay::Message::new(
+                            overlay::ProtocolMessage::new(
+                                overlay::ProtocolPayload::ReplayDeltaResponse(response),
+                            ),
+                            None,
+                        ));
+                    }
+                }
+                for request in &snapshot.proof_path_requests {
+                    let response = deps.app.proof_path_response_for(&request.message);
+                    if let Some(peer) = peers.iter().find(|peer| peer.id() == request.peer_id) {
+                        peer.send(overlay::Message::new(
+                            overlay::ProtocolMessage::new(
+                                overlay::ProtocolPayload::ProofPathResponse(response),
+                            ),
+                            None,
+                        ));
+                    }
+                }
+                for response in &snapshot.proof_path_responses {
+                    let _ = deps.app.on_proof_path_response(&response.message);
+                }
                 for response in &snapshot.replay_delta_responses {
                     let _ = deps.app.on_replay_delta_response(&response.message);
                 }

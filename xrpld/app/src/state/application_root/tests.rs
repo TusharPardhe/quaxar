@@ -605,6 +605,82 @@ fn apply_submit_tx_for_test(
 }
 
 #[test]
+fn simulate_clones_persistent_open_view_sequence_and_balance() {
+    // Simulate.cpp::simulateTxn copies OpenLedger::current() before
+    // TxQ::apply(TapDryRun). The Rust persistent submit sandbox is that live
+    // OpenView: this regression fails with the old closed-parent-only base,
+    // because `second` then sees sequence 1 rather than the live sequence 2.
+    let destination = AccountID::from_array([0xC1; 20]);
+    let (source, first) = signed_payment_tx(0xC1, destination, 1, 10);
+    let (_, second) = signed_payment_tx(0xC1, destination, 2, 10);
+    let base = Arc::new(ledger_view(10, source, 1, &[]));
+    let mut live = Sandbox::new(Arc::clone(&base), ApplyFlags::NONE);
+    let mut open =
+        AppOpenLedgerView::with_parent_hash(11, base.fees().base, *base.header().hash.as_uint256());
+
+    assert_eq!(
+        apply_submit_tx_for_test(&mut open, &mut live, Arc::clone(&first), 11),
+        ApplyResult::new(Ter::TES_SUCCESS, true, false),
+    );
+    let live_account = live
+        .read(account_keylet(raw_account_id(source)))
+        .expect("live account read")
+        .expect("live source account");
+    let live_balance = live_account
+        .get_field_amount(get_field_by_symbol("sfBalance"))
+        .xrp()
+        .drops();
+    assert_eq!(
+        live_account.get_field_u32(get_field_by_symbol("sfSequence")),
+        2
+    );
+    assert!(
+        live_balance
+            < base
+                .read(account_keylet(raw_account_id(source)))
+                .expect("base account read")
+                .expect("base source account")
+                .get_field_amount(get_field_by_symbol("sfBalance"))
+                .xrp()
+                .drops(),
+        "the persistent open view must include the first transaction's fee/balance state"
+    );
+
+    let root = ApplicationRoot::new(0).expect("application root should build");
+    root.open_ledger().modify(|current| {
+        *current = open;
+        true
+    });
+    *root.open_ledger_sandbox.lock().expect("sandbox mutex") = Some(live);
+
+    let outcome = root.simulate_transaction(Arc::clone(&base), Arc::clone(&second));
+    assert_eq!(outcome.result.ter, Ter::TES_SUCCESS);
+    assert!(
+        !outcome.result.applied,
+        "TapDryRun must report a non-published simulation"
+    );
+
+    let retained = root
+        .open_ledger_sandbox
+        .lock()
+        .expect("sandbox mutex")
+        .as_ref()
+        .expect("persistent open view must remain installed")
+        .read(account_keylet(raw_account_id(source)))
+        .expect("retained account read")
+        .expect("retained source account");
+    assert_eq!(retained.get_field_u32(get_field_by_symbol("sfSequence")), 2);
+    assert_eq!(
+        retained
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops(),
+        live_balance,
+        "simulation must clone, never mutate, the persistent open view"
+    );
+}
+
+#[test]
 fn direct_shell_rejects_standalone_inner_batch_and_preclaim_ordering_guards() {
     let source = account("ABABABABABABABABABABABABABABABABABABABAB");
     let destination = account("CDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCD");
@@ -3612,6 +3688,7 @@ fn txq_try_clear_applies_predecessors_repreclaims_current_and_reports_cleanup() 
         seq_proxy: SeqProxy::sequence(1),
         tx: Arc::clone(&predecessor),
         retries_remaining: tx::MAYBE_TX_RETRIES_ALLOWED,
+        flags: ApplyFlags::FAIL_HARD,
         preflight_result: Ter::TES_SUCCESS,
         last_result: None,
     };

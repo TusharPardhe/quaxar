@@ -1,7 +1,8 @@
-//! Overlay replay-delta callback implementation.
+//! Overlay replay callback implementation.
 //!
-//! This is the explicit bridge for the parity-flow edge
-//! `peer replay response -> LedgerReplayer::got_replay_delta`.
+//! This is the explicit bridge for the parity-flow edges
+//! `peer replay response -> LedgerReplayer::got_replay_delta` and
+//! `peer skip-list proof -> LedgerReplayer::got_skip_list`.
 
 use std::{
     collections::{BTreeMap, btree_map::Entry},
@@ -11,15 +12,31 @@ use std::{
 
 use basics::{base_uint::Uint256, sha_map_hash::SHAMapHash};
 use ledger::LedgerHeader;
-use overlay::TmReplayDeltaResponse;
-use protocol::{STTx, SerialIter, TxMeta, calculate_ledger_hash, deserialize_ledger_header};
-use shamap::{item::SHAMapItem, mutation::MutableTree, tree_node::SHAMapNodeType};
+use overlay::{
+    TmProofPathRequest, TmProofPathResponse, TmReplayDeltaRequest, TmReplayDeltaResponse,
+};
+use protocol::{
+    STTx, SerialIter, Serializer, TxMeta, calculate_ledger_hash, deserialize_ledger_header,
+    serialize_ledger_header, skip_keylet,
+};
+use shamap::{
+    item::SHAMapItem,
+    mutation::MutableTree,
+    proof_path::verify_proof_path,
+    tree_node::{SHAMapNodeType, SHAMapTreeNode},
+};
 
 use super::ApplicationRoot;
 
+const RE_NO_LEDGER: i32 = 1;
+const RE_NO_NODE: i32 = 2;
+const RE_BAD_REQUEST: i32 = 3;
+const LM_TRANSACTION: i32 = 1;
+const LM_ACCOUNT_STATE: i32 = 2;
+
 /// Decode and verify `TMReplayDeltaResponse` exactly before it can reach the
 /// replay owner. This is the Rust equivalent of
-/// `LedgerReplayMsgHandler.cpp::processReplayDeltaResponse` (lines 214-277):
+/// `LedgerReplayMsgHandler.cpp::processReplayDeltaResponse` (lines 214-282):
 /// validate the header hash, decode TransactionMd payloads, preserve each
 /// transaction metadata index, and prove the transaction SHAMap root.
 fn decode_replay_delta_response(
@@ -78,7 +95,186 @@ fn decode_replay_delta_response(
     Ok((info, ordered_txs))
 }
 
+fn replay_error_response(ledger_hash: Vec<u8>, error: i32) -> TmReplayDeltaResponse {
+    TmReplayDeltaResponse {
+        ledger_hash,
+        ledger_header: None,
+        transaction: Vec::new(),
+        error: Some(error),
+    }
+}
+
+fn proof_error_response(request: &TmProofPathRequest, error: i32) -> TmProofPathResponse {
+    TmProofPathResponse {
+        key: request.key.clone(),
+        ledger_hash: request.ledger_hash.clone(),
+        r#type: request.r#type,
+        ledger_header: None,
+        path: Vec::new(),
+        error: Some(error),
+    }
+}
+
 impl ApplicationRoot {
+    /// Serve `TMReplayDeltaRequest` only from an immutable, exact-hash ledger.
+    /// This mirrors `LedgerReplayMsgHandler.cpp::processReplayDeltaRequest`:
+    /// each TransactionMd payload is rebuilt as `STTx VL | TxMeta VL`, so the
+    /// receiver can recover `sfTransactionIndex` before `BuildLedger.cpp`
+    /// replays dependent transactions.
+    pub fn replay_delta_response_for(
+        &self,
+        request: &TmReplayDeltaRequest,
+    ) -> TmReplayDeltaResponse {
+        let Some(hash) = Uint256::from_slice(&request.ledger_hash) else {
+            return replay_error_response(request.ledger_hash.clone(), RE_BAD_REQUEST);
+        };
+        let ledger = self
+            .resolve_ledger_by_hash(SHAMapHash::new(hash))
+            .or_else(|| {
+                self.closed_ledger()
+                    .filter(|ledger| *ledger.header().hash.as_uint256() == hash)
+            })
+            .or_else(|| {
+                self.validated_ledger()
+                    .filter(|ledger| *ledger.header().hash.as_uint256() == hash)
+            });
+        let Some(ledger) = ledger.filter(|ledger| ledger.is_immutable()) else {
+            return replay_error_response(request.ledger_hash.clone(), RE_NO_LEDGER);
+        };
+
+        let transaction = match ledger.tx_snapshot() {
+            Ok(entries) => entries
+                .into_iter()
+                .map(|(tx, mut meta)| {
+                    let mut payload = Serializer::default();
+                    payload.add_vl(tx.get_serializer().data());
+                    let mut raw_meta = Serializer::default();
+                    meta.add_raw(&mut raw_meta, meta.get_result_ter(), meta.get_index());
+                    payload.add_vl(raw_meta.data());
+                    payload.data().to_vec()
+                })
+                .collect(),
+            Err(_) => return replay_error_response(request.ledger_hash.clone(), RE_NO_NODE),
+        };
+        TmReplayDeltaResponse {
+            ledger_hash: request.ledger_hash.clone(),
+            ledger_header: Some(serialize_ledger_header(&ledger.header(), false)),
+            transaction,
+            error: None,
+        }
+    }
+
+    /// Serve a proof from the exact requested ledger. Error categories and
+    /// response shape follow `LedgerReplayMsgHandler.cpp::processProofPathRequest`.
+    pub fn proof_path_response_for(&self, request: &TmProofPathRequest) -> TmProofPathResponse {
+        let Some(key) = Uint256::from_slice(&request.key) else {
+            return proof_error_response(request, RE_BAD_REQUEST);
+        };
+        let Some(hash) = Uint256::from_slice(&request.ledger_hash) else {
+            return proof_error_response(request, RE_BAD_REQUEST);
+        };
+        if !matches!(request.r#type, LM_TRANSACTION | LM_ACCOUNT_STATE) {
+            return proof_error_response(request, RE_BAD_REQUEST);
+        }
+        let ledger = self
+            .resolve_ledger_by_hash(SHAMapHash::new(hash))
+            .or_else(|| {
+                self.closed_ledger()
+                    .filter(|ledger| *ledger.header().hash.as_uint256() == hash)
+            })
+            .or_else(|| {
+                self.validated_ledger()
+                    .filter(|ledger| *ledger.header().hash.as_uint256() == hash)
+            });
+        let Some(ledger) = ledger else {
+            return proof_error_response(request, RE_NO_LEDGER);
+        };
+        let path = match request.r#type {
+            LM_ACCOUNT_STATE => ledger.state_map().get_proof_path(key, &mut |_| None),
+            LM_TRANSACTION => ledger.tx_map().get_proof_path(key, &mut |_| None),
+            _ => unreachable!("validated ledger-map type"),
+        };
+        let Ok(Some(path)) = path else {
+            return proof_error_response(request, RE_NO_NODE);
+        };
+        TmProofPathResponse {
+            key: request.key.clone(),
+            ledger_hash: request.ledger_hash.clone(),
+            r#type: request.r#type,
+            ledger_header: Some(serialize_ledger_header(&ledger.header(), false)),
+            path,
+            error: None,
+        }
+    }
+
+    /// Validate a short-skip-list proof and route the resulting `SHAMapItem`
+    /// to `LedgerReplayer::got_skip_list`. This is the proof counterpart of
+    /// `LedgerReplayMsgHandler.cpp::processProofPathResponse`; `got_skip_list`
+    /// starts newly-created deltas and wakes `LedgerReplayTask` progress.
+    pub fn on_proof_path_response(&self, response: &TmProofPathResponse) -> bool {
+        if response.error.is_some()
+            || response.r#type != LM_ACCOUNT_STATE
+            || response.path.is_empty()
+        {
+            return false;
+        }
+        let (Some(key), Some(reply_hash), Some(header_bytes)) = (
+            Uint256::from_slice(&response.key),
+            Uint256::from_slice(&response.ledger_hash),
+            response.ledger_header.as_deref(),
+        ) else {
+            return false;
+        };
+        if key != skip_keylet().key {
+            return false;
+        }
+        let Ok(mut info) = deserialize_ledger_header(header_bytes, false) else {
+            return false;
+        };
+        if calculate_ledger_hash(&info) != SHAMapHash::new(reply_hash)
+            || !verify_proof_path(*info.account_hash.as_uint256(), key, &response.path)
+        {
+            return false;
+        }
+        info.hash = SHAMapHash::new(reply_hash);
+        let Ok(Some(node)) = SHAMapTreeNode::make_from_wire(&response.path[0]) else {
+            return false;
+        };
+        let Some(item) = node.is_leaf().then(|| node.peek_item()).flatten() else {
+            return false;
+        };
+        if item.key() != key {
+            return false;
+        }
+
+        let Some(runtime) = self.ledger_master_runtime() else {
+            return false;
+        };
+        let root = self.clone();
+        let inbound_ledgers = Arc::clone(&runtime.inbound_ledgers);
+        let Ok(mut replayer) = self.registry.ledger_replayer.lock() else {
+            return false;
+        };
+        replayer.got_skip_list(
+            info,
+            &item,
+            1,
+            move |hash| root.resolve_ledger_by_hash(SHAMapHash::new(hash)),
+            move |hash, seq, _reason| {
+                if let Ok(guard) = inbound_ledgers.lock()
+                    && let Some(shared) = guard.as_ref()
+                {
+                    shared.acquire_async(
+                        hash,
+                        seq,
+                        crate::ledger::inbound_ledgers::AcquireReason::Generic,
+                    );
+                }
+            },
+        );
+        true
+    }
+
     /// Receive a peer `TMReplayDeltaResponse`, validate it, wake its acquired
     /// delta, and synchronously drive the owning replay task. Newly rebuilt
     /// ledgers are stored before publication advancement, matching
@@ -139,6 +335,8 @@ mod tests {
 
     #[test]
     fn replay_response_requires_a_matching_header_and_transaction_root() {
+        // LedgerReplayMsgHandler.cpp::processReplayDeltaResponse rejects a
+        // response before LedgerReplayer sees it unless both commitments hold.
         let tx_hash = MutableTree::new(1).root().get_hash();
         let mut header = LedgerHeader {
             seq: 1,

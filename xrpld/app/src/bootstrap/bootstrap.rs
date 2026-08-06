@@ -1504,6 +1504,53 @@ fn run_start_mode_consensus_loop(
             }));
     }
 
+    // Ledger-replay request/response routing. These are the peer-facing
+    // counterparts of LedgerReplayMsgHandler.cpp's four message methods.
+    if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+        let overlay = overlay_rt.overlay();
+        let inbound = overlay.queued_inbound();
+        let request_root = runtime.root().clone();
+        let request_overlay = Arc::clone(&overlay);
+        inbound.set_proof_path_request_router(Box::new(move |peer_id, request| {
+            let response = request_root.proof_path_response_for(&request);
+            if let Some(peer) = request_overlay.find_peer_by_short_id(peer_id) {
+                peer.send(overlay::Message::new(
+                    overlay::ProtocolMessage::new(overlay::ProtocolPayload::ProofPathResponse(
+                        response,
+                    )),
+                    None,
+                ));
+            }
+        }));
+
+        let proof_root = runtime.root().clone();
+        let proof_overlay = Arc::clone(&overlay);
+        inbound.set_proof_path_response_router(Box::new(move |peer_id, response| {
+            if !proof_root.on_proof_path_response(&response)
+                && let Some(peer) = proof_overlay.find_peer_by_short_id(peer_id)
+            {
+                peer.charge(
+                    (*resource::FEE_INVALID_DATA).clone(),
+                    "proof_path_response".to_owned(),
+                );
+            }
+        }));
+
+        let delta_root = runtime.root().clone();
+        let delta_overlay = Arc::clone(&overlay);
+        inbound.set_replay_delta_request_router(Box::new(move |peer_id, request| {
+            let response = delta_root.replay_delta_response_for(&request);
+            if let Some(peer) = delta_overlay.find_peer_by_short_id(peer_id) {
+                peer.send(overlay::Message::new(
+                    overlay::ProtocolMessage::new(overlay::ProtocolPayload::ReplayDeltaResponse(
+                        response,
+                    )),
+                    None,
+                ));
+            }
+        }));
+    }
+
     // LedgerData router
     if let Some(overlay_rt) = runtime.root().overlay_runtime() {
         let router_root = runtime.root().clone();

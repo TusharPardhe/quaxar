@@ -461,29 +461,23 @@ fn parallel_preflight_precheck(
         .collect()
 }
 
+fn replay_transactions_for_reconstruction(replay: &LedgerReplay) -> Vec<Arc<STTx>> {
+    // LedgerReplayMsgHandler.cpp::processReplayDeltaResponse builds this map
+    // from sfTransactionIndex, and BuildLedger.cpp iterates it directly.
+    replay.ordered_txs().values().cloned().collect()
+}
+
 pub fn build_ledger_from_replay_delta(
     replay: &LedgerReplay,
 ) -> Result<Arc<ledger::Ledger>, String> {
-    // `LedgerReplay` has already preserved the remote TransactionIndex order.
-    // `build_ledger_from_acquired_tx` only needs the TransactionMd envelope to
-    // recover its STTx inputs; metadata is not consumed a second time there.
-    // Supplying an empty metadata VL therefore keeps the replay ordering at
-    // this boundary while retaining the established application build and
-    // hash-verification path.
-    let tx_items = replay
-        .ordered_txs()
-        .values()
-        .map(|tx| {
-            let mut item = Serializer::default();
-            item.add_vl(tx.get_serializer().data());
-            item.add_vl(&[]);
-            (item.data().to_vec(), tx.get_transaction_id())
-        })
-        .collect::<Vec<_>>();
-    build_ledger_from_acquired_tx(
+    // Do not send verified replay transactions through CanonicalTXSet:
+    // dependent transactions require their TransactionMd ordering.
+    let ordered = replay_transactions_for_reconstruction(replay);
+    build_ledger_from_acquired_tx_with_order(
         replay.parent().as_ref(),
         replay.replay().header(),
-        &tx_items,
+        &[],
+        Some(ordered),
     )
     .map(Arc::new)
     .ok_or_else(|| "replay ledger build did not match its verified header".to_owned())
@@ -493,6 +487,15 @@ pub fn build_ledger_from_acquired_tx(
     parent: &ledger::Ledger,
     acquired_header: protocol::LedgerHeader,
     tx_items: &[(Vec<u8>, basics::base_uint::Uint256)],
+) -> Option<ledger::Ledger> {
+    build_ledger_from_acquired_tx_with_order(parent, acquired_header, tx_items, None)
+}
+
+fn build_ledger_from_acquired_tx_with_order(
+    parent: &ledger::Ledger,
+    acquired_header: protocol::LedgerHeader,
+    tx_items: &[(Vec<u8>, basics::base_uint::Uint256)],
+    replay_order: Option<Vec<Arc<STTx>>>,
 ) -> Option<ledger::Ledger> {
     use crate::state::application_root::{apply_submit_transactor_shell, queue_apply_preclaim_ter};
     use std::sync::Arc;
@@ -534,13 +537,16 @@ pub fn build_ledger_from_acquired_tx(
     header.tx_hash = acquired_header.tx_hash;
     built.set_ledger_info(header);
 
-    // Apply transactions from the acquired TX map in the reference CanonicalTXSet order.
-    // The acquired ledger's tx_map stores TransactionMd (tx + metadata) leaves.
-    let ordered_txs = decode_acquired_tx_set(
-        tx_items,
-        *acquired_header.tx_hash.as_uint256(),
-        shamap::tree_node::SHAMapNodeType::TransactionMd,
-    );
+    // Acquisition builds use CanonicalTXSet ordering. Replay builds are
+    // different: their verified TransactionMd metadata explicitly defines the
+    // order (BuildLedger.cpp::buildLedger(LedgerReplay const&)).
+    let ordered_txs = replay_order.unwrap_or_else(|| {
+        decode_acquired_tx_set(
+            tx_items,
+            *acquired_header.tx_hash.as_uint256(),
+            shamap::tree_node::SHAMapNodeType::TransactionMd,
+        )
+    });
     let tx_count = ordered_txs.len();
 
     // Parallel semantic + signature preflight: reject invalid transactions
@@ -1053,4 +1059,50 @@ pub fn build_ledger_from_consensus(
     built.set_immutable(true);
 
     Some(built)
+}
+
+#[cfg(test)]
+mod replay_reconstruction_tests {
+    use std::{collections::BTreeMap, sync::Arc};
+
+    use basics::base_uint::Uint256;
+    use ledger::Ledger;
+    use protocol::{AccountID, STTx, TxType, get_field_by_symbol};
+
+    use super::{LedgerReplay, replay_transactions_for_reconstruction};
+
+    fn transaction(sequence: u32) -> Arc<STTx> {
+        Arc::new(STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(
+                get_field_by_symbol("sfAccount"),
+                AccountID::from_array([1; 20]),
+            );
+            tx.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+        }))
+    }
+
+    #[test]
+    fn reconstructed_replay_keeps_transaction_md_dependency_order() {
+        // ../rippled/src/xrpld/app/ledger/detail/LedgerReplayMsgHandler.cpp::
+        // processReplayDeltaResponse keys orderedTxns by sfTransactionIndex;
+        // BuildLedger.cpp::buildLedger(LedgerReplay const&) applies that map
+        // directly. Sequence 2 must therefore remain after sequence 1 even
+        // when their transaction IDs would sort differently canonically.
+        let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(10, 100, false));
+        let replay = Arc::new(Ledger::from_previous(&parent, 110));
+        let first = transaction(1);
+        let dependent = transaction(2);
+        let replay = LedgerReplay::new(
+            parent,
+            replay,
+            BTreeMap::from([(9, Arc::clone(&dependent)), (4, Arc::clone(&first))]),
+        );
+
+        let sequences = replay_transactions_for_reconstruction(&replay)
+            .into_iter()
+            .map(|tx| tx.get_field_u32(get_field_by_symbol("sfSequence")))
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2]);
+        assert_ne!(first.get_transaction_id(), Uint256::zero());
+    }
 }
