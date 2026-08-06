@@ -89,10 +89,8 @@ impl LedgerReplayer {
             .get_data()
             .cloned()
         {
-            let mut task_ref = task.lock().expect("task lock");
-            if task_ref.update_skip_list(finish_hash, data.ledger_seq, &data.skip_list) {
-                drop(task_ref);
-                self.create_deltas(&task);
+            if self.update_task_from_skip_list(&task, finish_hash, data) {
+                let _ = self.create_deltas(&task);
             }
         }
 
@@ -148,15 +146,84 @@ impl LedgerReplayer {
             if !found_local {
                 fallback_acquire(finish_hash, 0, reason);
             }
+
+            // `LedgerReplayer::replay` calls `skipList->init(1)` before
+            // `task->init()`. When that synchronous trigger finds the ledger
+            // locally, `SkipListAcquire` already has its proof here; consume
+            // it now rather than waiting forever for an overlay response that
+            // will never arrive. This is the Rust equivalent of the
+            // `LedgerReplayTask::init` data callback in
+            // ../rippled/src/xrpld/app/ledger/detail/LedgerReplayTask.cpp.
+            if let Some(data) = skip_list
+                .lock()
+                .expect("skip list lock")
+                .get_data()
+                .cloned()
+            {
+                let _ = self.update_task_from_skip_list(&task, finish_hash, data);
+            }
         }
+
+        self.trigger_task_and_init_deltas(
+            &task,
+            num_peers,
+            &mut lookup_ledger,
+            &mut fallback_acquire,
+        );
 
         Some(task)
     }
 
-    pub fn create_deltas(&mut self, task: &Arc<Mutex<LedgerReplayTask>>) {
+    /// Mirrors LedgerReplayTask::init's immediate parent trigger and
+    /// LedgerReplayer::createDeltas' `newDelta->init(1)` branch. Local or
+    /// synchronous skip-list completion must not leave a replay task's parent
+    /// or deltas dormant until an unrelated timer tick. See
+    /// ../rippled/src/xrpld/app/ledger/detail/LedgerReplayer.cpp and
+    /// ../rippled/src/xrpld/app/ledger/detail/LedgerReplayTask.cpp.
+    fn trigger_task_and_init_deltas<LookupLedger, FallbackAcquire>(
+        &mut self,
+        task: &Arc<Mutex<LedgerReplayTask>>,
+        num_peers: usize,
+        lookup_ledger: &mut LookupLedger,
+        fallback_acquire: &mut FallbackAcquire,
+    ) where
+        LookupLedger: FnMut(Uint256) -> Option<Arc<Ledger>>,
+        FallbackAcquire: FnMut(Uint256, u32, InboundLedgerReason),
+    {
+        let parameter = task.lock().expect("task lock").parameter().clone();
+        if parameter.full && lookup_ledger(parameter.start_hash).is_none() {
+            fallback_acquire(parameter.start_hash, parameter.start_seq, parameter.reason);
+        }
+
+        for delta in self.create_deltas(task) {
+            delta.lock().expect("delta lock").init(
+                num_peers,
+                &mut |hash| lookup_ledger(hash),
+                fallback_acquire,
+            );
+        }
+    }
+
+    fn update_task_from_skip_list(
+        &mut self,
+        task: &Arc<Mutex<LedgerReplayTask>>,
+        finish_hash: Uint256,
+        data: crate::SkipListData,
+    ) -> bool {
+        let mut task_ref = task.lock().expect("task lock");
+        task_ref.update_skip_list(finish_hash, data.ledger_seq, &data.skip_list)
+    }
+
+    /// Creates all delta owners and returns only newly allocated deltas. A
+    /// caller that owns an initial trigger must invoke it only for these
+    /// fresh owners; shared deltas are already live.
+    pub fn create_deltas(
+        &mut self,
+        task: &Arc<Mutex<LedgerReplayTask>>,
+    ) -> Vec<Arc<Mutex<LedgerDeltaAcquire>>> {
         let parameter = task.lock().expect("task lock").parameter().clone();
         if parameter.total_ledgers <= 1 {
-            return;
+            return Vec::new();
         }
 
         let Some(mut index) = parameter
@@ -164,35 +231,42 @@ impl LedgerReplayer {
             .iter()
             .position(|hash| *hash == parameter.start_hash)
         else {
-            return;
+            return Vec::new();
         };
         index += 1;
         if index >= parameter.skip_list.len() {
-            return;
+            return Vec::new();
         }
 
+        let mut new_deltas = Vec::new();
         for seq in parameter.start_seq + 1..=parameter.finish_seq {
             let Some(hash) = parameter.skip_list.get(index).copied() else {
                 break;
             };
             index += 1;
 
-            let delta = self
-                .deltas
-                .get(&hash)
-                .and_then(Weak::upgrade)
-                .unwrap_or_else(|| {
+            let existing = self.deltas.get(&hash).and_then(Weak::upgrade);
+            let (delta, is_new) = match existing {
+                Some(delta) => (delta, false),
+                None => {
                     let created = Arc::new(Mutex::new(LedgerDeltaAcquire::new(
                         hash,
                         seq,
                         self.peer_set_builder.build(),
                     )));
                     self.deltas.insert(hash, Arc::downgrade(&created));
-                    created
-                });
+                    (created, true)
+                }
+            };
 
-            task.lock().expect("task lock").add_delta(delta);
+            task.lock()
+                .expect("task lock")
+                .add_delta(Arc::clone(&delta));
+            if is_new {
+                new_deltas.push(delta);
+            }
         }
+        new_deltas
     }
 
     pub fn got_skip_list(&mut self, info: LedgerHeader, item: &SHAMapItem) {
@@ -219,16 +293,10 @@ impl LedgerReplayer {
 
         let tasks = self.tasks.clone();
         for task in tasks {
-            let mut task_ref = task.lock().expect("task lock");
-            if task_ref.parameter().finish_hash == *info.hash.as_uint256()
-                && task_ref.update_skip_list(
-                    *info.hash.as_uint256(),
-                    data.ledger_seq,
-                    &data.skip_list,
-                )
+            if task.lock().expect("task lock").parameter().finish_hash == *info.hash.as_uint256()
+                && self.update_task_from_skip_list(&task, *info.hash.as_uint256(), data.clone())
             {
-                drop(task_ref);
-                self.create_deltas(&task);
+                let _ = self.create_deltas(&task);
             }
         }
     }

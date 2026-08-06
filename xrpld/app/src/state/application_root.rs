@@ -1262,9 +1262,9 @@ impl
     }
 }
 
-struct AppOpenLedgerTxQApplyRuntime<'a> {
+struct AppOpenLedgerTxQApplyRuntime<'a, V> {
     view: &'a mut AppOpenLedgerView,
-    submit_view: &'a mut Sandbox<Ledger>,
+    submit_view: &'a mut V,
     tx: Arc<STTx>,
     account_seqs: Arc<std::sync::Mutex<std::collections::HashMap<protocol::AccountID, u32>>>,
     preflight_result:
@@ -1273,12 +1273,16 @@ struct AppOpenLedgerTxQApplyRuntime<'a> {
     current_ledger_seq: u32,
     load_fee_track: &'a SharedLoadFeeTrack,
     multi_txn_adjustment: Option<tx::QueueApplyViewAdjustment>,
+    delivered_amount: Option<STAmount>,
 }
 
-impl<'a> AppOpenLedgerTxQApplyRuntime<'a> {
+impl<'a, V> AppOpenLedgerTxQApplyRuntime<'a, V>
+where
+    V: ledger::ApplyView,
+{
     fn new(
         view: &'a mut AppOpenLedgerView,
-        submit_view: &'a mut Sandbox<Ledger>,
+        submit_view: &'a mut V,
         tx: Arc<STTx>,
         flags: ApplyFlags,
         current_ledger_seq: u32,
@@ -1292,7 +1296,7 @@ impl<'a> AppOpenLedgerTxQApplyRuntime<'a> {
             0
         };
         let rules = submit_view.rules().clone();
-        let result = transaction_preflight_ter(&tx, &rules);
+        let result = transaction_preflight_ter_with_flags(&tx, &rules, flags);
         let preclaim_ter = if is_tes_success(result) {
             queue_apply_preclaim_ter_with_load_fee(
                 submit_view,
@@ -1338,12 +1342,15 @@ impl<'a> AppOpenLedgerTxQApplyRuntime<'a> {
             current_ledger_seq,
             load_fee_track,
             multi_txn_adjustment: None,
+            delivered_amount: None,
         }
     }
 }
 
-impl QueueApplyExecutionRuntime<AppTxQTransaction, AppTxQJournalTag, AppTxQParentBatchId>
-    for AppOpenLedgerTxQApplyRuntime<'_>
+impl<V> QueueApplyExecutionRuntime<AppTxQTransaction, AppTxQJournalTag, AppTxQParentBatchId>
+    for AppOpenLedgerTxQApplyRuntime<'_, V>
+where
+    V: ledger::ApplyView,
 {
     fn run_preflight(
         &mut self,
@@ -1361,12 +1368,19 @@ impl QueueApplyExecutionRuntime<AppTxQTransaction, AppTxQJournalTag, AppTxQParen
         // essential for delegated transactions: the selected delegate pays
         // the fee and the source sequence is consumed even when the typed
         // apply result is a claimable failure.
-        let ter = if is_tes_success(preclaim) || is_tec_claim(preclaim) {
-            apply_submit_transactor_shell(self.submit_view, self.tx.as_ref(), txn_type)
+        let (ter, delivered_amount) = if is_tes_success(preclaim) || is_tec_claim(preclaim) {
+            apply_submit_transactor_shell_with_flags_and_delivered_amount(
+                self.submit_view,
+                self.tx.as_ref(),
+                txn_type,
+                self.preflight_result.flags,
+            )
         } else {
-            preclaim
+            (preclaim, None)
         };
-        let applied = is_tes_success(ter) || is_tec_claim(ter);
+        self.delivered_amount = delivered_amount;
+        let applied = (is_tes_success(ter) || is_tec_claim(ter))
+            && !protocol::any_apply_flags(self.preflight_result.flags & ApplyFlags::DRY_RUN);
         if applied {
             self.view.push_transaction(Arc::clone(&self.tx));
             tracing::debug!(
@@ -1497,6 +1511,16 @@ struct SubmitApplyOutcome {
     result: Ter,
     delivered_amount: Option<STAmount>,
     applied_batch_inner_transactions: Vec<AppliedBatchInnerTransaction>,
+}
+
+/// Result of a TxQ-admitted dry run. The state delta is retained only as
+/// metadata; the cloned TxQ and ApplyView never publish or mutate live state.
+#[derive(Clone)]
+pub struct SimulationOutcome {
+    pub result: ApplyResult,
+    pub ledger_seq: u32,
+    pub close_time: u32,
+    pub metadata: Option<protocol::TxMeta>,
 }
 
 struct BatchFollowupOutcome {
@@ -1705,7 +1729,14 @@ fn loan_set_counterparty_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
 }
 
 pub(crate) fn transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
-    transaction_preflight_ter_with_parent_batch_id(tx, rules, None)
+    transaction_preflight_ter_with_flags(tx, rules, ApplyFlags::NONE)
+}
+
+/// Shared semantic preflight with explicit application flags. `simulate`
+/// supplies `DRY_RUN`, which is how rippled lets unsigned simulated
+/// transactions pass the signing boundary before TxQ admission.
+pub fn transaction_preflight_ter_with_flags(tx: &STTx, rules: &Rules, flags: ApplyFlags) -> Ter {
+    transaction_preflight_ter_with_parent_batch_id(tx, rules, None, flags)
 }
 
 /// Shared semantic preflight with the `parentBatchId` supplied by
@@ -1714,6 +1745,7 @@ fn transaction_preflight_ter_with_parent_batch_id(
     tx: &STTx,
     rules: &Rules,
     parent_batch_id: Option<Uint256>,
+    flags: ApplyFlags,
 ) -> Ter {
     if is_change_pseudo_transaction(tx.get_txn_type()) {
         return change_pseudo_transaction_preflight_ter(tx, rules);
@@ -1745,6 +1777,13 @@ fn transaction_preflight_ter_with_parent_batch_id(
         } else {
             Ter::TEM_INVALID_INNER_BATCH
         };
+    }
+
+    if tx::any_apply_flags(flags & ApplyFlags::DRY_RUN) {
+        // Parity: ../rippled/src/libxrpl/tx/Transactor.cpp::
+        // preflightCheckSimulateKeys. Immutable preclaim remains responsible
+        // for rejecting supplied malformed signature material.
+        return Ter::TES_SUCCESS;
     }
 
     match tx.check_sign(rules) {
@@ -2313,6 +2352,35 @@ fn delete_submit_ticket<V: ledger::ApplyView>(
 
     let _ = view.erase(ticket.sle);
     Ter::TES_SUCCESS
+}
+
+/// Apply exactly the canonical admission prefix used by `simulate`: semantic
+/// preflight, immutable preclaim, then the dry-run transaction shell. This
+/// mirrors ../rippled/src/xrpld/rpc/handlers/transaction/Simulate.cpp, which
+/// invokes `TxQ::apply(..., TapDryRun)` rather than dispatching a transactor
+/// directly.
+pub fn apply_simulated_transaction<V: ledger::ApplyView>(
+    view: &mut V,
+    tx: &STTx,
+) -> (Ter, Option<STAmount>) {
+    let flags = ApplyFlags::DRY_RUN;
+    let preflight = transaction_preflight_ter_with_flags(tx, &view.rules(), flags);
+    let preclaim = if is_tes_success(preflight) {
+        queue_apply_preclaim_ter(view, tx, view.seq(), flags)
+    } else {
+        preflight
+    };
+
+    if is_tes_success(preclaim) || is_tec_claim(preclaim) {
+        apply_submit_transactor_shell_with_flags_and_delivered_amount(
+            view,
+            tx,
+            tx.get_txn_type(),
+            flags,
+        )
+    } else {
+        (preclaim, None)
+    }
 }
 
 pub fn apply_submit_transactor_shell<V: ledger::ApplyView>(
@@ -3046,6 +3114,7 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
             &inner_tx,
             &rules,
             Some(parent_batch_id),
+            ApplyFlags::BATCH,
         );
         let preclaim = if is_tes_success(preflight) {
             queue_apply_preclaim_ter_with_parent_batch_id(
@@ -3970,6 +4039,69 @@ impl ApplicationRoot {
             .get_rpc_fee_report(&mut lock, current.as_ref())
     }
 
+    /// Runs simulate through TxQ's canonical admission and direct-apply path
+    /// against cloned queue/view state. This follows
+    /// ../rippled/src/xrpld/rpc/handlers/transaction/Simulate.cpp::simulateTxn,
+    /// which copies the current OpenView before invoking TxQ::apply(TapDryRun).
+    pub fn simulate_transaction(&self, ledger: Arc<Ledger>, tx: Arc<STTx>) -> SimulationOutcome {
+        let ledger_seq = ledger.header().seq;
+        let close_time = ledger.header().close_time;
+        let mut apply_view = ledger::ApplyViewImpl::new(Arc::clone(&ledger), ApplyFlags::DRY_RUN);
+        let mut open_view = (*self.open_ledger().current()).clone();
+        if open_view.ledger_current_index == 0 {
+            open_view.ledger_current_index = ledger_seq;
+            open_view.base_fee_drops = ledger.fees().base;
+            open_view.parent_hash = *ledger.header().hash.as_uint256();
+        }
+        let tx_source = AppQueueApplyTxSource::new(tx.as_ref());
+        let account_seqs = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let result = self.registry.tx_q.simulate_with(|tx_q| {
+            let metrics_snapshot = tx_q.metrics_snapshot();
+            let live_queue_view =
+                open_view.queue_apply_view(&apply_view, tx.as_ref(), metrics_snapshot);
+            let queue_view = snapshot_queue_apply_app_view_with_metrics(
+                &tx_source,
+                &live_queue_view,
+                metrics_snapshot,
+            );
+            let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
+                &mut open_view,
+                &mut apply_view,
+                Arc::clone(&tx),
+                ApplyFlags::DRY_RUN,
+                ledger_seq,
+                self.load_fee_track.as_ref(),
+                Arc::clone(&account_seqs),
+            );
+            let mut lock = AppTxQLock;
+            let result = tx_q
+                .apply_with_owned_metrics_and_derived_preflight_facts_and_hold_admission(
+                    &mut lock,
+                    &mut runtime,
+                    &queue_view,
+                    &tx_source,
+                )
+                .apply_result();
+            (result, runtime.delivered_amount.clone())
+        });
+        let metadata = (is_tes_success(result.0.ter) || is_tec_claim(result.0.ter)).then(|| {
+            let mut metadata =
+                apply_view
+                    .table()
+                    .to_tx_meta(tx.get_transaction_id(), ledger_seq, result.1);
+            let mut serialized = Serializer::default();
+            metadata.add_raw(&mut serialized, result.0.ter, 0);
+            metadata
+        });
+
+        SimulationOutcome {
+            result: result.0,
+            ledger_seq,
+            close_time,
+            metadata,
+        }
+    }
+
     fn validated_fee_levels_for_closed_ledger(&self, ledger: &Ledger) -> Vec<u64> {
         let fee_field = get_field_by_symbol("sfFee");
 
@@ -4095,7 +4227,7 @@ impl ApplicationRoot {
             flags,
             self.load_fee_track.as_ref(),
         );
-        let ter = if is_tes_success(preclaim) {
+        let ter = if is_tes_success(preclaim) || is_tec_claim(preclaim) {
             apply_submit_transactor_shell_with_flags(
                 rebase_view,
                 tx.as_ref(),
@@ -7930,7 +8062,7 @@ impl ApplicationRoot {
             } else {
                 preflight
             };
-            if !is_tes_success(preclaim) {
+            if !is_tes_success(preclaim) && !is_tec_claim(preclaim) {
                 tracing::debug!(
                     target: "ledger",
                     closed_seq,
@@ -7987,15 +8119,28 @@ impl ApplicationRoot {
         // from_previous creates a new ledger sharing the parent's state map (CoW).
         let closed = {
             let mut ledger = Ledger::from_previous(&parent, close_time);
-            // Apply state modifications from the transactor (new accounts, balance changes)
-            let _ = state_view.table().apply(&mut ledger);
-            // Insert accepted transactions into the tx map
+            // `OpenView::apply` is the final state commit before publication.
+            // Do not expose a ledger whose state table or transaction map was
+            // only partially committed. Parity:
+            // ../rippled/src/xrpld/app/ledger/detail/BuildLedger.cpp::
+            // buildLedgerImpl applies the accumulator before setAccepted.
+            state_view
+                .table()
+                .apply(&mut ledger)
+                .map_err(|error| format!("standalone accepted state commit failed: {error:?}"))?;
             for entry in &accepted_entries {
-                let _ = ledger.raw_tx_insert(
-                    entry.transaction_id,
-                    Arc::clone(&entry.txn),
-                    Some(Arc::clone(&entry.metadata)),
-                );
+                ledger
+                    .raw_tx_insert(
+                        entry.transaction_id,
+                        Arc::clone(&entry.txn),
+                        Some(Arc::clone(&entry.metadata)),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "standalone accepted transaction {} insert failed: {error:?}",
+                            entry.transaction_id
+                        )
+                    })?;
             }
             ledger.set_accepted(close_time, 0, true);
             // Mark state_map unbacked: all nodes are in memory (never flushed to NuDB

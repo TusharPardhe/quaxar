@@ -2243,6 +2243,10 @@ fn application_root_accepts_a_standalone_ledger_and_promotes_live_state() {
         10,
     );
     let mut parent = ledger_view(1, source, 1, &[]);
+    // A fee-claiming state commit destroys drops from the ledger header.
+    // ../rippled/src/libxrpl/ledger/ApplyViewImpl.cpp applies that fee against
+    // a real nonzero total supply; this focused fixture must do the same.
+    parent.set_total_drops(1_000_000_000);
     parent.set_accepted(1_111, ledger::LEDGER_DEFAULT_TIME_RESOLUTION, true);
     let parent = Arc::new(parent);
     app.on_closed_ledger(Arc::clone(&parent));

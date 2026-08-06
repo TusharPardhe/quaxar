@@ -378,7 +378,8 @@ where
                 // Replay may only enter the mutation callback after the same
                 // semantic-preflight-plus-ledger-preclaim gate used by the
                 // consensus and acquired-ledger builders.
-                if is_tes_success(preflight_and_preclaim(view, tx, apply_flags)) {
+                let admission = preflight_and_preclaim(view, tx, apply_flags);
+                if is_tes_success(admission) || protocol::is_tec_claim(admission) {
                     apply_transaction(view, tx, apply_flags);
                 }
             }
@@ -597,7 +598,11 @@ pub fn build_ledger_from_acquired_tx(
             "[build] FLAG_LEDGER seq={} — calling update_negative_unl",
             acquired_header.seq
         );
-        let _ = built.update_negative_unl();
+        if let Err(error) = built.update_negative_unl() {
+            tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+                "[build] negative-UNL commit failed; refusing to publish acquired ledger");
+            return None;
+        }
     }
 
     // Each tx gets a Sandbox wrapping a snapshot of the accumulator (cheap:
@@ -633,7 +638,7 @@ pub fn build_ledger_from_acquired_tx(
             acquired_header.seq,
             protocol::ApplyFlags::NONE,
         );
-        if !protocol::is_tes_success(preclaim) {
+        if !protocol::is_tes_success(preclaim) && !protocol::is_tec_claim(preclaim) {
             tracing::debug!(target: "ledger",
                 "[build] SKIP preclaim tx_index={}/{} type={} ter={:?}",
                 tx_index, tx_count, txn_type, preclaim
@@ -700,13 +705,13 @@ pub fn build_ledger_from_acquired_tx(
                 }
 
                 let rules = built.rules().clone();
-                if let Err(e) =
+                if let Err(error) =
                     view.apply_with_tx_thread(&mut accum, tx_id, acquired_header.seq, &rules)
                 {
-                    tracing::debug!(target: "ledger",
-                        "[build] APPLY ERROR seq={} tx={}/{} type={} error={:?}",
-                        acquired_header.seq, tx_index, tx_count, tx_type_name, e
-                    );
+                    tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+                        tx = %tx_id,
+                        "[build] transaction commit failed; refusing to publish acquired ledger");
+                    return None;
                 }
 
                 // Log TX result (without computing state hash — that's destructive
@@ -781,15 +786,18 @@ pub fn build_ledger_from_acquired_tx(
     }
 
     // tx changes from the OpenView into the built ledger's SHAMap at once.
-    if let Err(e) = accum.apply_state_only(&mut built) {
-        tracing::debug!(target: "ledger",
-            "[build] ACCUM APPLY ERROR seq={} error={:?}",
-            acquired_header.seq, e
-        );
+    if let Err(error) = accum.apply_state_only(&mut built) {
+        tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+            "[build] accumulator commit failed; refusing to publish acquired ledger");
+        return None;
     }
 
     // Update skip list (reference does this after applying all txs)
-    let _ = built.update_skip_list();
+    if let Err(error) = built.update_skip_list() {
+        tracing::error!(target: "ledger", ?error, seq = acquired_header.seq,
+            "[build] skip-list commit failed; refusing to publish acquired ledger");
+        return None;
+    }
 
     // Must flush BEFORE set_immutable so state_map.hash() reflects all mutations.
     // apply_state_batch writes to mutable_state; flush_state_map_to_store
@@ -995,8 +1003,12 @@ pub fn build_ledger_from_consensus(
     built.set_ledger_info(h);
 
     // reference: updateNegativeUNL on flag ledgers
-    if ledger::is_flag_ledger(header.seq) {
-        let _ = built.update_negative_unl();
+    if ledger::is_flag_ledger(header.seq)
+        && let Err(error) = built.update_negative_unl()
+    {
+        tracing::error!(target: "consensus", ?error, seq = header.seq,
+            "[build] negative-UNL commit failed; refusing consensus ledger");
+        return None;
     }
 
     // Apply transactions using OpenView accumulator (reference buildLedgerImpl parity)
@@ -1025,7 +1037,7 @@ pub fn build_ledger_from_consensus(
 
         let preclaim =
             queue_apply_preclaim_ter(&accum, &sttx, header.seq, protocol::ApplyFlags::NONE);
-        if !protocol::is_tes_success(preclaim) {
+        if !protocol::is_tes_success(preclaim) && !protocol::is_tec_claim(preclaim) {
             tracing::debug!(target: "consensus", "SKIP preclaim replay tx={} ter={:?}", tx_id, preclaim);
             continue;
         }
@@ -1040,8 +1052,11 @@ pub fn build_ledger_from_consensus(
         match apply_result {
             Ok(ter) if protocol::is_tes_success(ter) || protocol::is_tec_claim(ter) => {
                 let rules = built.rules().clone();
-                if let Err(e) = view.apply_with_tx_thread(&mut accum, tx_id, header.seq, &rules) {
-                    tracing::info!(target: "consensus", "APPLY ERROR tx={} error={:?}", tx_id, e);
+                if let Err(error) = view.apply_with_tx_thread(&mut accum, tx_id, header.seq, &rules)
+                {
+                    tracing::error!(target: "consensus", ?error, tx = %tx_id,
+                        "[build] transaction commit failed; refusing consensus ledger");
+                    return None;
                 }
             }
             Ok(ter) => {
@@ -1053,12 +1068,18 @@ pub fn build_ledger_from_consensus(
         }
     }
 
-    if let Err(e) = accum.apply_state_only(&mut built) {
-        tracing::info!(target: "consensus", "ACCUM APPLY ERROR error={:?}", e);
+    if let Err(error) = accum.apply_state_only(&mut built) {
+        tracing::error!(target: "consensus", ?error,
+            "[build] accumulator commit failed; refusing consensus ledger");
+        return None;
     }
 
     // Update skip list and finalize
-    let _ = built.update_skip_list();
+    if let Err(error) = built.update_skip_list() {
+        tracing::error!(target: "consensus", ?error,
+            "[build] skip-list commit failed; refusing consensus ledger");
+        return None;
+    }
     built.flush_state_map_to_store();
     built.flush_tx_map_to_store();
     built.set_immutable(true);

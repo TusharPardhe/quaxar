@@ -186,6 +186,45 @@ fn replayer_initializes_new_skip_list_through_the_real_trigger() {
 }
 
 #[test]
+fn replayer_consumes_locally_available_skip_list_before_waiting_for_overlay() {
+    // Parity: ../rippled/src/xrpld/app/ledger/detail/LedgerReplayer.cpp::
+    // replay calls skipList->init(1), then LedgerReplayTask::init consumes a
+    // synchronous completion through its data callback before timer-driven
+    // overlay work begins.
+    let cfg = config();
+    let parent = Arc::new(Ledger::create_genesis(false, &cfg, []).expect("genesis should build"));
+    let mut finish = Ledger::from_previous(parent.as_ref(), 10);
+    finish.update_skip_list().expect("skip list should update");
+    let finish = Arc::new(finish);
+    let finish_hash = *finish.header().hash.as_uint256();
+
+    let mut replayer = LedgerReplayer::new(Arc::new(SimplePeerSetBuilder::new(Vec::new())));
+    let fallback = std::cell::RefCell::new(Vec::new());
+    let task = replayer
+        .replay_and_init(
+            InboundLedgerReason::Generic,
+            finish_hash,
+            2,
+            1,
+            |hash| {
+                if hash == finish_hash {
+                    Some(Arc::clone(&finish))
+                } else if hash == *parent.header().hash.as_uint256() {
+                    Some(Arc::clone(&parent))
+                } else {
+                    None
+                }
+            },
+            |hash, seq, reason| fallback.borrow_mut().push((hash, seq, reason)),
+        )
+        .expect("local replay task should initialize");
+
+    assert!(task.lock().expect("task lock").parameter().full);
+    assert_eq!(replayer.deltas_len(), 1);
+    assert!(fallback.into_inner().is_empty());
+}
+
+#[test]
 fn replayer_reuses_skip_lists_and_creates_delta_slots() {
     let cfg = config();
     let genesis = Ledger::create_genesis(false, &cfg, []).expect("genesis should build");

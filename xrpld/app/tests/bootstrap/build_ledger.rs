@@ -437,6 +437,53 @@ fn build_ledger_replay_applies_ordered_txns_in_input_order_with_replay_flags() {
 }
 
 #[test]
+fn build_ledger_replay_applies_fee_claiming_tec_in_order() {
+    // ../rippled/src/xrpld/app/ledger/detail/BuildLedger.cpp applies every
+    // tes or fee-claiming tec replay result to the cumulative accumulator.
+    // A later replay transaction must observe that committed prefix.
+    let parent = Arc::new(sample_parent_ledger(41));
+    let mut replay_ledger = Ledger::from_previous(&parent, 101);
+    replay_ledger.set_accepted(112, 20, true);
+    let replay_ledger = Arc::new(replay_ledger);
+    let claimed = sample_tx(1);
+    let next = sample_tx(2);
+    let replay = LedgerReplay::new(
+        parent,
+        replay_ledger,
+        std::collections::BTreeMap::from([(1, Arc::clone(&claimed)), (2, Arc::clone(&next))]),
+    );
+    let seen = RefCell::new(Vec::new());
+
+    build_ledger_replay(
+        &replay,
+        ApplyFlags::NONE,
+        &RecordingJournal::default(),
+        |_built| StubBuildView::closed(Rc::new(RefCell::new(Vec::new()))),
+        |_, tx, _| {
+            if tx.get_transaction_id() == claimed.get_transaction_id() {
+                Ter::TEC_CLAIM
+            } else {
+                Ter::TES_SUCCESS
+            }
+        },
+        |view, tx, _| {
+            assert_eq!(view.applied.len(), seen.borrow().len());
+            view.applied.push(tx.get_transaction_id());
+            seen.borrow_mut().push(tx.get_transaction_id());
+        },
+        |_ledger| Ok::<_, BuildLedgerError>(0),
+        |_ledger| Ok::<_, BuildLedgerError>(0),
+        |_ledger| {},
+    )
+    .expect("fee-claiming replay should build");
+
+    assert_eq!(
+        seen.into_inner(),
+        vec![claimed.get_transaction_id(), next.get_transaction_id()]
+    );
+}
+
+#[test]
 fn acquired_tx_set_uses_canonical_order_not_tx_map_leaf_order() {
     let later = sample_tx(17264169);
     let earlier = sample_tx(17264168);

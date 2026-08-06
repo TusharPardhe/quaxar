@@ -35,6 +35,12 @@ where
         self.table.apply(to)
     }
 
+    /// Exposes the isolated state delta for dry-run metadata generation. The
+    /// caller still owns whether this sandbox is ever committed.
+    pub fn table(&self) -> &ApplyStateTable {
+        &self.table
+    }
+
     pub fn apply_with_tx_thread(
         &self,
         to: &mut dyn ReadRawView,

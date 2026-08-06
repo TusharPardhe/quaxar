@@ -2,14 +2,14 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use basics::{base_uint::Uint256, str_hex::str_hex, string_utilities::to_uint64};
 use protocol::{
     JsonOptions, JsonValue, KeyType, LedgerEntryType, LedgerFormats, PublicKey, STArray, STObject,
     STParsedJSONObject, STTx, SecretKey, Seed, SerialIter, Serializer, StBase,
     build_multi_signing_data, derive_public_key, generate_secret_key, get_field_by_name,
-    get_field_by_symbol, is_tes_success, jss, parse_base58_account_id,
+    get_field_by_symbol, is_tec_claim, is_tes_success, jss, parse_base58_account_id,
     serialize_pay_chan_authorization, sf_generic, sign,
 };
 
@@ -519,29 +519,103 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
     let mut simulation_meta_blob = None;
     ret.insert(jss::applied.to_string(), JsonValue::Bool(false));
 
-    // If a ledger is available, run the real transactor and capture metadata
+    // The real application owns TxQ and its open-ledger/fee state. Route
+    // simulation through that canonical admission boundary instead of calling
+    // the transactor shell directly. Parity: ../rippled/src/xrpld/rpc/handlers/
+    // transaction/Simulate.cpp::simulateTxn invokes TxQ::apply(TapDryRun).
+    if let (Some(app), Some(ledger)) = (
+        ctx.runtime.app(),
+        ctx.runtime.current_ledger_for_simulation(),
+    ) {
+        let outcome = app.simulate_transaction(Arc::clone(&ledger), Arc::new(tx.clone()));
+        ret.insert(
+            jss::applied.to_string(),
+            JsonValue::Bool(outcome.result.applied),
+        );
+        ret.insert(
+            jss::engine_result.to_string(),
+            JsonValue::String(protocol::trans_token(outcome.result.ter).to_owned()),
+        );
+        ret.insert(
+            jss::engine_result_code.to_string(),
+            JsonValue::Signed(outcome.result.ter.to_int() as i64),
+        );
+        ret.insert(
+            "engine_result_message".to_string(),
+            JsonValue::String(protocol::trans_human(outcome.result.ter).to_owned()),
+        );
+        ret.insert(
+            jss::ledger_index.to_string(),
+            JsonValue::Unsigned(u64::from(outcome.ledger_seq)),
+        );
+
+        if let Some(mut metadata) = outcome.metadata {
+            if binary {
+                let mut serializer = Serializer::default();
+                metadata.add_raw(&mut serializer, outcome.result.ter, 0);
+                ret.insert(
+                    "meta_blob".to_string(),
+                    JsonValue::String(hex::encode(serializer.data())),
+                );
+            } else {
+                let mut meta = metadata.get_json(JsonOptions::new(0));
+                if is_tes_success(outcome.result.ter) {
+                    crate::handlers::delivered_amount::insert_delivered_amount(
+                        &mut meta,
+                        outcome.ledger_seq,
+                        Some(outcome.close_time),
+                        tx,
+                        &metadata,
+                    );
+                }
+                ret.insert("meta".to_string(), meta);
+            }
+        } else {
+            ret.insert(
+                "meta".to_string(),
+                JsonValue::Object(BTreeMap::from([
+                    ("AffectedNodes".to_owned(), JsonValue::Array(Vec::new())),
+                    (
+                        "TransactionResult".to_owned(),
+                        JsonValue::String(protocol::trans_token(outcome.result.ter).to_owned()),
+                    ),
+                ])),
+            );
+        }
+
+        if binary {
+            ret.insert(
+                jss::tx_blob.to_string(),
+                JsonValue::String(hex::encode(tx.get_serializer().data())),
+            );
+        } else {
+            ret.insert(jss::tx_json.to_string(), tx.json(JsonOptions::new(0)));
+        }
+        return Ok(JsonValue::Object(ret));
+    }
+
+    // Keep the generic fallback for lightweight RPC runtimes that do not own
+    // an ApplicationRoot/TxQ (unit harnesses and isolated handler tests).
     if let Some(ledger) = ctx.runtime.current_ledger_for_simulation() {
         let ledger_seq = ledger.header().seq;
         let close_time = ledger.header().close_time;
-        let mut view = ledger::ApplyViewImpl::new(ledger, tx::ApplyFlags::NONE);
-        let txn_type = tx.get_txn_type();
-        // C++ catches std::runtime_error from transactor apply and returns
-        // an RPC error. Match this by catching panics (e.g., STAmount overflow)
-        // to prevent mutex poisoning and server crash.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            app::apply_submit_transactor_shell_with_delivered_amount(&mut view, tx, txn_type)
-        }));
-        let (result, delivered_amount) = match result {
-            Ok((ter, delivered_amount)) => (ter, delivered_amount),
-            Err(_) => {
-                ret.insert(
-                    jss::engine_result.to_string(),
-                    JsonValue::String("telLOCAL_ERROR".to_string()),
-                );
-                ret.insert(jss::engine_result_code.to_string(), JsonValue::Signed(-399));
-                return Ok(JsonValue::Object(ret));
-            }
-        };
+        let mut view = ledger::ApplyViewImpl::new(Arc::clone(&ledger), tx::ApplyFlags::NONE);
+        // Minimal RPC runtimes have no ApplicationRoot/TxQ owner. Keep their
+        // fallback on the app-level canonical dry-run boundary.
+        let (result, delivered_amount) =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                app::apply_simulated_transaction(&mut view, tx)
+            })) {
+                Ok((result, delivered_amount)) => (result, delivered_amount),
+                Err(_) => {
+                    ret.insert(
+                        jss::engine_result.to_string(),
+                        JsonValue::String("telLOCAL_ERROR".to_string()),
+                    );
+                    ret.insert(jss::engine_result_code.to_string(), JsonValue::Signed(-399));
+                    return Ok(JsonValue::Object(ret));
+                }
+            };
 
         ret.insert(
             jss::engine_result.to_string(),

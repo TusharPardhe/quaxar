@@ -696,6 +696,15 @@ impl SharedAppTxQ {
         self.lock().metrics_snapshot()
     }
 
+    /// Execute an admission attempt against a cloned TxQ. `simulate` must use
+    /// the canonical queue rules but must not enqueue, evict, or consume retry
+    /// state in the live owner. Parity: ../rippled/src/xrpld/rpc/handlers/
+    /// transaction/Simulate.cpp copies the current OpenView before TxQ::apply.
+    pub fn simulate_with<R>(&self, run: impl FnOnce(&mut AppTxQ) -> R) -> R {
+        let mut isolated = self.lock().clone();
+        run(&mut isolated)
+    }
+
     pub fn get_account_txs<Lock>(
         &self,
         lock: &mut Lock,
