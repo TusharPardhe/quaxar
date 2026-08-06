@@ -35,6 +35,7 @@ use ledger::CanonicalTXSet;
 use protocol::{
     Rules, STTx, Ter, XRPAmount, get_field_by_symbol, passes_local_checks, tfInnerBatchTxn,
 };
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tx::{
@@ -652,6 +653,32 @@ impl AppNetworkOpsRuntime {
         )
     }
 
+    fn abort_apply_batch_after_panic(
+        &self,
+        transactions: &[NetworkOpsApplyBatchEntry<SharedTransaction>],
+    ) {
+        // User callbacks run without the NetworkOps state lock. Recover a
+        // poisoned transaction or state lock here so cleanup itself cannot
+        // turn this caught panic into an abort.
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.finish_apply_batch(
+            transactions,
+            || {},
+            |tx| {
+                let mut transaction = tx.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                transaction.clear_applying();
+                drop(transaction);
+                tx.clear_poison();
+            },
+            || {},
+        );
+        drop(state);
+        self.state.clear_poison();
+    }
+
     pub fn apply_pending_with<RelaySkip>(
         &self,
         current_ledger_index: u32,
@@ -702,32 +729,54 @@ impl AppNetworkOpsRuntime {
         }
 
         let (mut transactions, start) = self.begin_apply_batch();
-        let changed = apply_batch(&mut transactions);
-        let fee_change_reported = if changed {
-            report_fee_change();
-            true
-        } else {
-            false
-        };
-        Some(self.finish_applied_pending_batch(
-            transactions,
-            start,
-            changed,
-            fee_change_reported,
-            current_ledger_index,
-            validated_ledger_index,
-            publish_proposed,
-            set_bad_flag,
-            set_held_flag,
-            should_relay,
-            relay,
-            current_ledger_state,
-        ))
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let changed = apply_batch(&mut transactions);
+            let fee_change_reported = if changed {
+                report_fee_change();
+                true
+            } else {
+                false
+            };
+            self.finish_applied_pending_batch(
+                &mut transactions,
+                start,
+                changed,
+                fee_change_reported,
+                current_ledger_index,
+                validated_ledger_index,
+                publish_proposed,
+                set_bad_flag,
+                set_held_flag,
+                should_relay,
+                relay,
+                current_ledger_state,
+            )
+        }));
+
+        match outcome {
+            Ok(report) => Some(report),
+            Err(payload) => {
+                let message = panic_message(payload.as_ref());
+                tracing::error!(
+                    target: "network",
+                    %message,
+                    batch_size = transactions.len(),
+                    "NetworkOps batch panicked; clearing in-flight transactions and resetting dispatch state"
+                );
+                // A panic can occur after an included transaction has staged
+                // account-following work in `submit_held`. Always run the
+                // normal tail: it clears every in-flight applying flag,
+                // merges that held work into pending, and returns dispatch to
+                // `None` before the JobQueue suppresses this panic.
+                let _ = self.abort_apply_batch_after_panic(&transactions);
+                None
+            }
+        }
     }
 
     fn finish_applied_pending_batch<RelaySkip>(
         &self,
-        mut transactions: Vec<AppNetworkOpsPendingTransaction>,
+        transactions: &mut [AppNetworkOpsPendingTransaction],
         start: NetworkOpsApplyBatchStart,
         changed: bool,
         fee_change_reported: bool,
@@ -863,7 +912,7 @@ impl AppNetworkOpsRuntime {
             }));
         }
 
-        let tail = self.finish_apply_batch(&transactions);
+        let tail = self.finish_apply_batch(transactions);
         AppNetworkOpsApplyReport {
             start,
             changed,
@@ -935,6 +984,18 @@ impl AppNetworkOpsRuntime {
         ));
         NetworkOpsSyncDispatch::Staged
     }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+        })
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
 fn shared_transaction(transaction: Arc<STTx>) -> SharedTransaction {
@@ -1510,6 +1571,91 @@ mod tests {
         assert_eq!(report.entries[1].final_status, TransStatus::HELD);
         assert_eq!(runtime.pending_transaction_count(), 0);
         assert_eq!(ledger_master_runtime.held_transaction_count(), 1);
+    }
+
+    #[test]
+    fn runtime_panic_cleanup_clears_inflight_state_and_merges_submit_held() {
+        let ledger_master_runtime = Arc::new(AppLedgerMasterRuntime::default());
+        let runtime = runtime(
+            NetworkOpsOperatingMode::Full,
+            Arc::clone(&ledger_master_runtime),
+        );
+        let source = account("ABABABABABABABABABABABABABABABABABABABAB");
+        let included = shared_transaction(payment_tx(
+            source,
+            account("ACACACACACACACACACACACACACACACACACACACAC"),
+            1,
+            None,
+            10,
+        ));
+        let promoted = payment_tx(
+            source,
+            account("ADADADADADADADADADADADADADADADADADADADAD"),
+            2,
+            None,
+            11,
+        );
+        let failing = shared_transaction(payment_tx(
+            source,
+            account("AEAEAEAEAEAEAEAEAEAEAEAEAEAEAEAEAEAEAEAE"),
+            3,
+            None,
+            12,
+        ));
+
+        ledger_master_runtime.add_held_sttx(Arc::clone(&promoted));
+        assert_eq!(runtime.promote_included_transaction(&included), 1);
+        assert!(runtime.stage_transaction(Arc::clone(&failing), false, false, false));
+
+        let report = runtime.apply_pending_with(
+            700,
+            Some(701),
+            |tx, _flags| -> ApplyResult {
+                let _transaction = tx
+                    .lock()
+                    .expect("test transaction mutex should be available");
+                panic!("apply failure")
+            },
+            || {},
+            |_tx, _result| {},
+            |_tx| {},
+            |_tx| false,
+            |_tx| None::<u8>,
+            |_tx, _deferred, _skip| {},
+            |_tx| NetworkOpsCurrentLedgerState {
+                fee: XRPAmount::from_drops(10),
+                account_seq: 2,
+                available_seq: 2,
+            },
+        );
+
+        assert!(
+            report.is_none(),
+            "a panicking batch must not publish a report"
+        );
+        assert_eq!(
+            runtime.snapshot(),
+            AppNetworkOpsRuntimeSnapshot {
+                pending_transactions: 1,
+                submit_held: 0,
+                dispatch_state: NetworkOpsDispatchState::None,
+            }
+        );
+        assert!(
+            !read_transaction(&failing, |transaction| transaction.get_applying()),
+            "the in-flight transaction must be released after panic"
+        );
+
+        let (pending, start) = runtime.begin_apply_batch();
+        assert_eq!(start.dispatch_state, NetworkOpsDispatchState::Running);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            read_transaction(&pending[0].transaction, |transaction| transaction.get_id()),
+            promoted.get_transaction_id(),
+            "submit-held work must be merged into the next pending batch"
+        );
+        let tail = runtime.finish_apply_batch(&pending);
+        assert_eq!(tail.dispatch_state, NetworkOpsDispatchState::None);
     }
 
     #[test]

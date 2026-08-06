@@ -1528,6 +1528,7 @@ enum TypedPreclaimRoute {
     VaultReadViewHelper,
     BridgeDomainReadViewHelper,
     BridgeDomainAuditedNoop,
+    SystemReadViewHelper,
     BatchSpecialPreclaim,
     FailClosed,
 }
@@ -1558,6 +1559,8 @@ fn typed_preclaim_route(txn_type: TxType) -> TypedPreclaimRoute {
         TxType::OFFER_CREATE
         | TxType::OFFER_CANCEL
         | TxType::AMM_CREATE
+        | TxType::AMM_DEPOSIT
+        | TxType::AMM_WITHDRAW
         | TxType::AMM_VOTE
         | TxType::AMM_BID
         | TxType::AMM_DELETE
@@ -1615,13 +1618,12 @@ fn typed_preclaim_route(txn_type: TxType) -> TypedPreclaimRoute {
         TxType::AMENDMENT | TxType::FEE | TxType::UNL_MODIFY => {
             TypedPreclaimRoute::ChangeReadViewHelper
         }
+        TxType::TICKET_CREATE | TxType::LEDGER_STATE_FIX => {
+            TypedPreclaimRoute::SystemReadViewHelper
+        }
         // No compiled immutable ReadView helper is registered for these
         // routed types. Never silently promote them to tesSUCCESS.
-        TxType::AMM_DEPOSIT
-        | TxType::AMM_WITHDRAW
-        | TxType::TICKET_CREATE
-        | TxType::LEDGER_STATE_FIX
-        | TxType::CONFIDENTIAL_MPT_CONVERT
+        TxType::CONFIDENTIAL_MPT_CONVERT
         | TxType::CONFIDENTIAL_MPT_MERGE_INBOX
         | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
         | TxType::CONFIDENTIAL_MPT_SEND
@@ -1674,6 +1676,17 @@ fn typed_preclaim_ter(view: &impl ReadView, tx: &STTx, flags: ApplyFlags) -> Ter
             tx::run_bridge_domain_read_view_preclaim(view, tx, tx.get_txn_type())
                 .unwrap_or(UNVERIFIED_TYPED_PRECLAIM_TER)
         }
+        TypedPreclaimRoute::SystemReadViewHelper => match tx.get_txn_type() {
+            TxType::TICKET_CREATE => {
+                tx::run_ticket_create_read_view_preclaim(view, tx, TxType::TICKET_CREATE)
+                    .unwrap_or(UNVERIFIED_TYPED_PRECLAIM_TER)
+            }
+            TxType::LEDGER_STATE_FIX => {
+                tx::run_ledger_state_fix_read_view_preclaim(view, tx, TxType::LEDGER_STATE_FIX)
+                    .unwrap_or(UNVERIFIED_TYPED_PRECLAIM_TER)
+            }
+            _ => UNVERIFIED_TYPED_PRECLAIM_TER,
+        },
         TypedPreclaimRoute::BatchSpecialPreclaim => Ter::TES_SUCCESS,
         TypedPreclaimRoute::FailClosed => UNVERIFIED_TYPED_PRECLAIM_TER,
     }

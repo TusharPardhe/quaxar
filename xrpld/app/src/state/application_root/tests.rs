@@ -1,9 +1,9 @@
 use super::{
     AcceptLedgerPendingRuntime, AcceptLedgerPendingTransaction, AppOpenLedgerTxQApplyRuntime,
     ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, TypedPreclaimRoute,
-    UNVERIFIED_TYPED_PRECLAIM_TER, apply_submit_transactor_shell, batch_base_fee,
-    consensus_status_event, preferred_lcl_matches_local_or_parent, queue_apply_preclaim_ter,
-    typed_preclaim_route, typed_preclaim_ter,
+    apply_submit_transactor_shell, batch_base_fee, consensus_status_event,
+    preferred_lcl_matches_local_or_parent, queue_apply_preclaim_ter, typed_preclaim_route,
+    typed_preclaim_ter,
 };
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::network::network_ops_runtime::AppNetworkOpsApplyHeldOutcome;
@@ -3386,8 +3386,8 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
     use TypedPreclaimRoute::{
         AppAuditedNoop, AppReadViewHelper, BatchSpecialPreclaim, BridgeDomainAuditedNoop,
         BridgeDomainReadViewHelper, ChangeReadViewHelper, DexReadViewHelper, FailClosed,
-        LoanReadViewHelper, NfTokenReadViewHelper, TokenAuditedNoop, TokenReadViewHelper,
-        VaultReadViewHelper,
+        LoanReadViewHelper, NfTokenReadViewHelper, SystemReadViewHelper, TokenAuditedNoop,
+        TokenReadViewHelper, VaultReadViewHelper,
     };
 
     // Keep this table in protocol dispatch order. It is deliberately explicit:
@@ -3401,7 +3401,7 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
         (TxType::REGULAR_KEY_SET, AppAuditedNoop),
         (TxType::OFFER_CREATE, DexReadViewHelper),
         (TxType::OFFER_CANCEL, DexReadViewHelper),
-        (TxType::TICKET_CREATE, FailClosed),
+        (TxType::TICKET_CREATE, SystemReadViewHelper),
         (TxType::SIGNER_LIST_SET, AppAuditedNoop),
         (TxType::PAYCHAN_CREATE, AppReadViewHelper),
         (TxType::PAYCHAN_FUND, AppAuditedNoop),
@@ -3420,8 +3420,8 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
         (TxType::CLAWBACK, TokenReadViewHelper),
         (TxType::AMM_CLAWBACK, DexReadViewHelper),
         (TxType::AMM_CREATE, DexReadViewHelper),
-        (TxType::AMM_DEPOSIT, FailClosed),
-        (TxType::AMM_WITHDRAW, FailClosed),
+        (TxType::AMM_DEPOSIT, DexReadViewHelper),
+        (TxType::AMM_WITHDRAW, DexReadViewHelper),
         (TxType::AMM_VOTE, DexReadViewHelper),
         (TxType::AMM_BID, DexReadViewHelper),
         (TxType::AMM_DELETE, DexReadViewHelper),
@@ -3446,7 +3446,7 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
         (TxType::DID_DELETE, BridgeDomainAuditedNoop),
         (TxType::ORACLE_SET, BridgeDomainReadViewHelper),
         (TxType::ORACLE_DELETE, BridgeDomainReadViewHelper),
-        (TxType::LEDGER_STATE_FIX, FailClosed),
+        (TxType::LEDGER_STATE_FIX, SystemReadViewHelper),
         (TxType::MPTOKEN_ISSUANCE_CREATE, TokenAuditedNoop),
         (TxType::MPTOKEN_ISSUANCE_DESTROY, TokenReadViewHelper),
         (TxType::MPTOKEN_ISSUANCE_SET, TokenReadViewHelper),
@@ -3522,10 +3522,6 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
     assert_eq!(
         uncovered,
         vec![
-            TxType::TICKET_CREATE,
-            TxType::AMM_DEPOSIT,
-            TxType::AMM_WITHDRAW,
-            TxType::LEDGER_STATE_FIX,
             TxType::CONFIDENTIAL_MPT_CONVERT,
             TxType::CONFIDENTIAL_MPT_MERGE_INBOX,
             TxType::CONFIDENTIAL_MPT_CONVERT_BACK,
@@ -3535,17 +3531,36 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
         "the explicit fail-closed set must remain auditable"
     );
 
-    // Some fail-closed protocol routes have no STTx format yet (the
-    // Confidential-MPT family), so route coverage above is the construction-
-    // independent guard. Verify the shared dispatcher result on a constructible
-    // routed type that lacks a registered immutable helper.
+    // Confidential-MPT remains fail-closed because those types do not yet
+    // have compiled immutable ReadView helpers. The newly routed types must
+    // delegate to their exact existing helper rather than a permissive path.
     let view = Ledger::from_ledger_seq_and_close_time(1, 0, false);
-    let tx = STTx::new(TxType::AMM_DEPOSIT, |_| {});
-    assert_eq!(
-        typed_preclaim_ter(&view, &tx, ApplyFlags::NONE),
-        UNVERIFIED_TYPED_PRECLAIM_TER,
-        "AMMDeposit must fail closed rather than defaulting to tesSUCCESS"
-    );
+    for txn_type in [
+        TxType::AMM_DEPOSIT,
+        TxType::AMM_WITHDRAW,
+        TxType::TICKET_CREATE,
+        TxType::LEDGER_STATE_FIX,
+    ] {
+        let tx = STTx::new(txn_type, |_| {});
+        let expected = match txn_type {
+            TxType::AMM_DEPOSIT | TxType::AMM_WITHDRAW => {
+                tx::run_dex_read_view_preclaim_with_flags(&view, &tx, txn_type, ApplyFlags::NONE)
+                    .expect("AMM typed helper must own its route")
+            }
+            TxType::TICKET_CREATE => tx::run_ticket_create_read_view_preclaim(&view, &tx, txn_type)
+                .expect("TicketCreate typed helper must own its route"),
+            TxType::LEDGER_STATE_FIX => {
+                tx::run_ledger_state_fix_read_view_preclaim(&view, &tx, txn_type)
+                    .expect("LedgerStateFix typed helper must own its route")
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            typed_preclaim_ter(&view, &tx, ApplyFlags::NONE),
+            expected,
+            "{txn_type:?} must use its immutable ReadView helper"
+        );
+    }
 
     let amendment = STTx::new(TxType::AMENDMENT, |_| {});
     let malformed_fee = STTx::new(TxType::FEE, |_| {});
