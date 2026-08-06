@@ -23,8 +23,8 @@ use basics::base_uint::Uint256;
 use basics::str_hex::str_hex;
 use ledger::{CanonicalTXSet, Ledger, LedgerTxReadError, OpenView, XRP_LEDGER_EARLIEST_FEES};
 use protocol::{
-    JsonOptions, Keylet, LedgerEntryType, STTx, Serializer, StBase, fee_settings_keylet,
-    skip_keylet,
+    JsonOptions, Keylet, LedgerEntryType, STTx, Serializer, StBase, Ter, fee_settings_keylet,
+    is_tes_success, skip_keylet,
 };
 use rayon::prelude::*;
 use shamap::{mutation::MutationError, traversal::TraversalError};
@@ -336,11 +336,12 @@ where
     )
 }
 
-pub fn build_ledger_replay<V, J, CreateView, Apply, FlushState, FlushTx, Unshare>(
+pub fn build_ledger_replay<V, J, CreateView, Preflight, Apply, FlushState, FlushTx, Unshare>(
     replay_data: &LedgerReplay,
     apply_flags: ApplyFlags,
     journal: &J,
     create_view: CreateView,
+    mut preflight_and_preclaim: Preflight,
     mut apply_transaction: Apply,
     flush_state: FlushState,
     flush_tx: FlushTx,
@@ -350,6 +351,7 @@ where
     V: BuildLedgerView,
     J: BuildLedgerJournal,
     CreateView: FnOnce(&Ledger) -> V,
+    Preflight: FnMut(&V, &Arc<STTx>, ApplyFlags) -> Ter,
     Apply: FnMut(&mut V, &Arc<STTx>, ApplyFlags),
     FlushState: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
     FlushTx: FnMut(&mut Ledger) -> Result<usize, BuildLedgerError>,
@@ -373,7 +375,12 @@ where
         unshare,
         |view, _built, _ledger_journal| {
             for tx in replay_data.ordered_txs().values() {
-                apply_transaction(view, tx, apply_flags);
+                // Replay may only enter the mutation callback after the same
+                // semantic-preflight-plus-ledger-preclaim gate used by the
+                // consensus and acquired-ledger builders.
+                if is_tes_success(preflight_and_preclaim(view, tx, apply_flags)) {
+                    apply_transaction(view, tx, apply_flags);
+                }
             }
         },
     )
@@ -495,26 +502,20 @@ pub fn decode_acquired_tx_set(
     txns.drain_ordered()
 }
 
-/// Parallel signature pre-validation using rayon.
-/// Returns the set of transaction IDs with invalid signatures so the
-/// sequential apply loop can skip them without calling check_sign again.
-fn parallel_sig_precheck(
+/// Parallel canonical preflight validates the same semantic and signature
+/// conditions as the sequential application path. It intentionally does not
+/// treat raw signature validity as admission: Change pseudo-transactions have
+/// no signature and all transaction families require typed semantic preflight.
+fn parallel_preflight_precheck(
     txs: &[Arc<STTx>],
     rules: &protocol::Rules,
 ) -> std::collections::HashSet<Uint256> {
     txs.par_iter()
         .filter_map(|tx| {
-            // `applySteps.cpp::invokePreclaim` skips the complete generic
-            // signature block for the zero-account pseudo transactions.
-            if !tx
-                .get_account_id(protocol::get_field_by_symbol("sfAccount"))
-                .is_zero()
-                && tx.check_sign(rules).is_err()
-            {
-                Some(tx.get_transaction_id())
-            } else {
-                None
-            }
+            (!protocol::is_tes_success(crate::state::application_root::transaction_preflight_ter(
+                tx, rules,
+            )))
+            .then(|| tx.get_transaction_id())
         })
         .collect()
 }
@@ -573,12 +574,13 @@ pub fn build_ledger_from_acquired_tx(
     );
     let tx_count = ordered_txs.len();
 
-    // Parallel signature pre-validation: reject bad sigs early using rayon
-    let bad_sigs = parallel_sig_precheck(&ordered_txs, built.rules());
-    if !bad_sigs.is_empty() {
+    // Parallel semantic + signature preflight: reject invalid transactions
+    // before the sequential immutable preclaim and sandbox stages.
+    let bad_preflights = parallel_preflight_precheck(&ordered_txs, built.rules());
+    if !bad_preflights.is_empty() {
         tracing::debug!(target: "ledger",
             "[build] parallel sig precheck rejected {} of {} txs in seq={}",
-            bad_sigs.len(), tx_count, acquired_header.seq
+            bad_preflights.len(), tx_count, acquired_header.seq
         );
     }
 
@@ -608,7 +610,7 @@ pub fn build_ledger_from_acquired_tx(
         let tx_id = sttx.get_transaction_id();
 
         // Skip transactions with bad signatures (already rejected in parallel)
-        if bad_sigs.contains(&tx_id) {
+        if bad_preflights.contains(&tx_id) {
             tracing::debug!(target: "ledger",
                 "[build] SKIP bad sig tx_index={} txid={} seq={}",
                 tx_index, tx_id, acquired_header.seq
@@ -624,6 +626,20 @@ pub fn build_ledger_from_acquired_tx(
         } else {
             0
         };
+
+        let preclaim = queue_apply_preclaim_ter(
+            &accum,
+            sttx,
+            acquired_header.seq,
+            protocol::ApplyFlags::NONE,
+        );
+        if !protocol::is_tes_success(preclaim) {
+            tracing::debug!(target: "ledger",
+                "[build] SKIP preclaim tx_index={}/{} type={} ter={:?}",
+                tx_index, tx_count, txn_type, preclaim
+            );
+            continue;
+        }
 
         // Sandbox wraps a snapshot of the accumulator — reads see all prior
         // tx changes via the accumulator's delta table, then fall through to
@@ -648,17 +664,7 @@ pub fn build_ledger_from_acquired_tx(
             built.header().drops
         );
         let apply_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let preclaim = queue_apply_preclaim_ter(
-                &view,
-                sttx,
-                acquired_header.seq,
-                protocol::ApplyFlags::NONE,
-            );
-            if protocol::is_tes_success(preclaim) {
-                apply_submit_transactor_shell(&mut view, sttx, txn_type)
-            } else {
-                preclaim
-            }
+            apply_submit_transactor_shell(&mut view, sttx, txn_type)
         }));
 
         match apply_result {
@@ -1003,30 +1009,32 @@ pub fn build_ledger_from_consensus(
         shamap::tree_node::SHAMapNodeType::TransactionNm,
     );
 
-    // Parallel signature pre-validation: reject bad sigs early using rayon
-    let bad_sigs = parallel_sig_precheck(&ordered_txs, built.rules());
+    // Parallel semantic + signature preflight; this is not a raw-signature
+    // admission shortcut.
+    let bad_preflights = parallel_preflight_precheck(&ordered_txs, built.rules());
 
     for sttx in ordered_txs {
         let tx_id = sttx.get_transaction_id();
 
         // Skip transactions with bad signatures (already rejected in parallel)
-        if bad_sigs.contains(&tx_id) {
+        if bad_preflights.contains(&tx_id) {
             continue;
         }
 
         let txn_type = sttx.get_txn_type();
 
+        let preclaim =
+            queue_apply_preclaim_ter(&accum, &sttx, header.seq, protocol::ApplyFlags::NONE);
+        if !protocol::is_tes_success(preclaim) {
+            tracing::debug!(target: "consensus", "SKIP preclaim replay tx={} ter={:?}", tx_id, preclaim);
+            continue;
+        }
+
         let base = Arc::new(accum.clone());
         let mut view = ledger::Sandbox::new(base, protocol::ApplyFlags::default());
 
         let apply_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let preclaim =
-                queue_apply_preclaim_ter(&view, &sttx, header.seq, protocol::ApplyFlags::NONE);
-            if protocol::is_tes_success(preclaim) {
-                apply_submit_transactor_shell(&mut view, &sttx, txn_type)
-            } else {
-                preclaim
-            }
+            apply_submit_transactor_shell(&mut view, &sttx, txn_type)
         }));
 
         match apply_result {

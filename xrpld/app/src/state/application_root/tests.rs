@@ -1,9 +1,10 @@
 use super::{
     AcceptLedgerPendingRuntime, AcceptLedgerPendingTransaction, AppOpenLedgerTxQApplyRuntime,
-    ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, TypedPreclaimRoute,
-    apply_submit_transactor_shell, batch_base_fee, consensus_status_event,
-    preferred_lcl_matches_local_or_parent, queue_apply_preclaim_ter, typed_preclaim_route,
-    typed_preclaim_ter,
+    ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, PersistentSubmitSandbox,
+    TypedPreclaimRoute, apply_submit_transactor_shell, batch_base_fee,
+    calculate_default_sttx_base_fee, calculate_sttx_base_fee, consensus_status_event,
+    preferred_lcl_matches_local_or_parent, queue_apply_preclaim_ter, transaction_preflight_ter,
+    typed_preclaim_route, typed_preclaim_ter,
 };
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::network::network_ops_runtime::AppNetworkOpsApplyHeldOutcome;
@@ -1293,9 +1294,8 @@ fn application_root_accept_ledger_runs_closed_ledger_txq_maintenance() {
 #[test]
 fn application_root_accept_ledger_rebuilds_next_open_with_queued_txs() {
     let mut app = ApplicationRoot::new(0).expect("root shell should build");
-    let queued_account_id = AccountID::from_array([0x22; 20]);
     let destination = AccountID::from_array([0x99; 20]);
-    let queued_tx = payment_tx(queued_account_id, destination, 1, None, 12);
+    let (queued_account_id, queued_tx) = signed_payment_tx(0x22, destination, 1, 12);
     let queued_seq = SeqProxy::sequence(1);
     let queued_id = queued_tx.get_transaction_id();
     let consequences = TxConsequences::with_potential_spend(12, queued_seq, 100);
@@ -3382,6 +3382,87 @@ fn open_ledger_batch_preflight_rejects_sponsorship_before_direct_apply() {
 }
 
 #[test]
+fn change_pseudo_preflight_and_fee_dispatch_are_typed_and_zero_cost() {
+    let pseudo = STTx::new(TxType::AMENDMENT, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), AccountID::zero());
+        tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(0, false));
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 0);
+        tx.set_field_vl(get_field_by_symbol("sfSigningPubKey"), &[]);
+    });
+    let source = AccountID::from_array([0x81; 20]);
+    let mut ledger = ledger_view(10, source, 1, &[]);
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 1_000_000,
+        increment: 2_000,
+    });
+
+    assert_eq!(
+        transaction_preflight_ter(&pseudo, &ledger.rules()),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(calculate_sttx_base_fee(&ledger, &pseudo), 0);
+    assert_eq!(
+        queue_apply_preclaim_ter(&ledger, &pseudo, ledger.header().seq, ApplyFlags::NONE),
+        Ter::TES_SUCCESS,
+        "zero-account Change transactions must reach the typed preclaim tail"
+    );
+
+    let mut multisigned =
+        (*payment_tx(source, AccountID::from_array([0x82; 20]), 1, None, 10)).clone();
+    let mut signers = STArray::new(get_field_by_symbol("sfSigners"));
+    signers.push_back(STObject::make_inner_object(get_field_by_symbol("sfSigner")));
+    signers.push_back(STObject::make_inner_object(get_field_by_symbol("sfSigner")));
+    multisigned.set_field_array(get_field_by_symbol("sfSigners"), signers);
+    assert_eq!(calculate_sttx_base_fee(&ledger, &multisigned), 30);
+
+    let mut escrow_finish = STTx::new(TxType::ESCROW_FINISH, |_| {});
+    escrow_finish.set_field_vl(get_field_by_symbol("sfFulfillment"), &[0_u8; 16]);
+    assert_eq!(calculate_sttx_base_fee(&ledger, &escrow_finish), 340);
+
+    let account_delete = STTx::new(TxType::ACCOUNT_DELETE, |_| {});
+    let amm_create = STTx::new(TxType::AMM_CREATE, |_| {});
+    let ledger_state_fix = STTx::new(TxType::LEDGER_STATE_FIX, |_| {});
+    assert_eq!(calculate_sttx_base_fee(&ledger, &account_delete), 2_000);
+    assert_eq!(calculate_sttx_base_fee(&ledger, &amm_create), 2_000);
+    assert_eq!(calculate_sttx_base_fee(&ledger, &ledger_state_fix), 2_000);
+}
+
+#[test]
+fn txq_direct_apply_does_not_mutate_when_shared_preclaim_fails() {
+    let destination = AccountID::from_array([0x91; 20]);
+    let (source, tx) = signed_payment_tx(0x91, destination, 1, 10);
+    let base = Arc::new(ledger_view(10, source, 1, &[]));
+    let mut open_ledger =
+        AppOpenLedgerView::with_parent_hash(11, 10, *base.header().hash.as_uint256());
+    let mut submit_view = Sandbox::new(Arc::clone(&base), ApplyFlags::NONE);
+    let rules = submit_view.rules().clone();
+    let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
+        &mut open_ledger,
+        &mut submit_view,
+        tx,
+        rules,
+        ApplyFlags::NONE,
+        11,
+        Ter::TER_PRE_SEQ,
+        Arc::new(Mutex::new(std::collections::HashMap::new())),
+    );
+
+    let result = runtime.direct_apply();
+    assert_eq!(result, ApplyResult::new(Ter::TER_PRE_SEQ, false, false));
+    drop(runtime);
+    assert!(open_ledger.tx_ids().is_empty());
+    assert_eq!(
+        submit_view
+            .read(account_keylet(raw_account_id(source)))
+            .expect("source read")
+            .expect("source exists")
+            .get_field_u32(get_field_by_symbol("sfSequence")),
+        1,
+    );
+}
+
+#[test]
 fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
     use TypedPreclaimRoute::{
         AppAuditedNoop, AppReadViewHelper, BatchSpecialPreclaim, BridgeDomainAuditedNoop,
@@ -3580,4 +3661,135 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
 fn consensus_status_event_uses_lost_sync_for_a_wrong_lcl() {
     assert_eq!(consensus_status_event(2, true), 2); // neACCEPTED_LEDGER
     assert_eq!(consensus_status_event(1, false), 4); // neLOST_SYNC
+}
+
+#[test]
+fn live_base_fee_dispatch_includes_multisign_and_specialized_owners() {
+    let source = AccountID::from_array([0xC1; 20]);
+    let mut ledger = ledger_view(10, source, 1, &[]);
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 1_000_000,
+        increment: 200_000,
+    });
+    let mut multisigned = STTx::new(TxType::ESCROW_FINISH, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+        tx.set_field_vl(get_field_by_symbol("sfFulfillment"), &[0; 16]);
+    });
+    let mut signers = STArray::new(get_field_by_symbol("sfSigners"));
+    signers.push_back(STObject::make_inner_object(get_field_by_symbol("sfSigner")));
+    signers.push_back(STObject::make_inner_object(get_field_by_symbol("sfSigner")));
+    multisigned.set_field_array(get_field_by_symbol("sfSigners"), signers);
+
+    assert_eq!(calculate_default_sttx_base_fee(&ledger, &multisigned), 30);
+    assert_eq!(
+        calculate_sttx_base_fee(&ledger, &multisigned),
+        30 + ledger.fees().base * 33,
+        "EscrowFinish extends the generic two-multisigner fee"
+    );
+
+    for txn_type in [
+        TxType::ACCOUNT_DELETE,
+        TxType::AMM_CREATE,
+        TxType::LEDGER_STATE_FIX,
+    ] {
+        let tx = STTx::new(txn_type, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+        });
+        assert_eq!(
+            calculate_sttx_base_fee(&ledger, &tx),
+            ledger.fees().increment,
+            "{txn_type:?} replaces the generic fee with the owner reserve"
+        );
+    }
+
+    let mut loan_set = STTx::new(TxType::LOAN_SET, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+    });
+    let mut counterparty =
+        STObject::make_inner_object(get_field_by_symbol("sfCounterpartySignature"));
+    counterparty.set_field_vl(get_field_by_symbol("sfTxnSignature"), &[1]);
+    loan_set.set_field_object(get_field_by_symbol("sfCounterpartySignature"), counterparty);
+    assert_eq!(
+        calculate_sttx_base_fee(&ledger, &loan_set),
+        ledger.fees().base * 2,
+        "LoanSet charges the generic fee plus its counterparty signature"
+    );
+}
+
+#[test]
+fn zero_account_change_transactions_reach_their_typed_preclaim_tail() {
+    let source = AccountID::from_array([0xC2; 20]);
+    let ledger = ledger_view(10, source, 1, &[]);
+    let zero = AccountID::from_array([0; 20]);
+    let mut amendment = STTx::new(TxType::AMENDMENT, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), zero);
+        tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(0, false));
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 0);
+    });
+    amendment.set_field_h256(get_field_by_symbol("sfAmendment"), Uint256::from_u64(1));
+
+    assert_eq!(
+        transaction_preflight_ter(&amendment, &ledger.rules()),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        queue_apply_preclaim_ter(&ledger, &amendment, ledger.header().seq, ApplyFlags::NONE),
+        Ter::TES_SUCCESS
+    );
+
+    let fee = STTx::new(TxType::FEE, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), zero);
+        tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(0, false));
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 0);
+    });
+    assert_eq!(
+        transaction_preflight_ter(&fee, &ledger.rules()),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        queue_apply_preclaim_ter(&ledger, &fee, ledger.header().seq, ApplyFlags::NONE),
+        Ter::TEM_MALFORMED,
+        "the zero account must reach Change::preclaim rather than generic rejection"
+    );
+
+    let unl_modify = STTx::new(TxType::UNL_MODIFY, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), zero);
+        tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(0, false));
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), 0);
+    });
+    assert_eq!(
+        transaction_preflight_ter(&unl_modify, &ledger.rules()),
+        Ter::TES_SUCCESS
+    );
+    assert_eq!(
+        queue_apply_preclaim_ter(&ledger, &unl_modify, ledger.header().seq, ApplyFlags::NONE),
+        Ter::TES_SUCCESS,
+        "UNLModify must use its Change-family typed preclaim tail"
+    );
+}
+
+#[test]
+fn persistent_submit_sandbox_is_restored_during_unwind() {
+    let source = AccountID::from_array([0xC3; 20]);
+    let base = Arc::new(ledger_view(10, source, 1, &[]));
+    let holder = Arc::new(Mutex::new(Some(Sandbox::new(
+        Arc::clone(&base),
+        ApplyFlags::NONE,
+    ))));
+
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+        let holder = Arc::clone(&holder);
+        let base = Arc::clone(&base);
+        move || {
+            let _guard = PersistentSubmitSandbox::take_or_new(holder, base);
+            panic!("forced submit batch panic");
+        }
+    }));
+
+    assert!(unwind.is_err());
+    assert!(
+        holder.lock().expect("sandbox holder mutex").is_some(),
+        "a caught batch panic must not discard the persistent open-ledger sandbox"
+    );
 }

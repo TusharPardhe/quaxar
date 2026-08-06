@@ -120,6 +120,10 @@ pub struct AppNetworkOpsRuntime {
     transaction_master: Arc<TransactionMaster>,
     ledger_master_state: Arc<SharedLedgerMasterState>,
     consensus_bootstrap_started: AtomicBool,
+    /// Set after a caught batch panic has restored in-flight work to pending.
+    /// The application consumes this one-shot request to enqueue a fresh
+    /// guarded batch instead of leaving recovered work dormant.
+    pending_batch_panic_recovery: AtomicBool,
     time_keeper: Arc<TimeKeeper<SystemTimeKeeperClock>>,
 }
 
@@ -181,6 +185,7 @@ impl AppNetworkOpsRuntime {
             transaction_master,
             ledger_master_state,
             consensus_bootstrap_started: AtomicBool::new(false),
+            pending_batch_panic_recovery: AtomicBool::new(false),
             time_keeper,
         }
     }
@@ -286,6 +291,14 @@ impl AppNetworkOpsRuntime {
             .lock()
             .expect("network ops runtime state mutex must not be poisoned");
         state.release_scheduled_transaction_batch_for_retry()
+    }
+
+    /// Returns whether a caught batch panic restored pending work that needs
+    /// a fresh guarded scheduling attempt. The request is one-shot so polling
+    /// callers cannot enqueue duplicate recovery jobs.
+    pub fn take_pending_batch_panic_recovery(&self) -> bool {
+        self.pending_batch_panic_recovery
+            .swap(false, Ordering::AcqRel)
     }
 
     pub fn reset_consensus_bootstrap(&self) {
@@ -768,7 +781,9 @@ impl AppNetworkOpsRuntime {
                 // normal tail: it clears every in-flight applying flag,
                 // merges that held work into pending, and returns dispatch to
                 // `None` before the JobQueue suppresses this panic.
-                let _ = self.abort_apply_batch_after_panic(&transactions);
+                self.abort_apply_batch_after_panic(&transactions);
+                self.pending_batch_panic_recovery
+                    .store(true, Ordering::Release);
                 None
             }
         }
@@ -1644,6 +1659,15 @@ mod tests {
         assert!(
             !read_transaction(&failing, |transaction| transaction.get_applying()),
             "the in-flight transaction must be released after panic"
+        );
+
+        assert!(
+            runtime.take_pending_batch_panic_recovery(),
+            "a caught batch panic must request a fresh guarded recovery batch"
+        );
+        assert!(
+            !runtime.take_pending_batch_panic_recovery(),
+            "the recovery request must be consumed exactly once"
         );
 
         let (pending, start) = runtime.begin_apply_batch();

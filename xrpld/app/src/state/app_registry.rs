@@ -373,7 +373,9 @@ where
         tx: &'a protocol::STTx,
         metrics_snapshot: QueueFeeMetricsSnapshot,
     ) -> Self {
-        let base_fee_drops = read_view.fees().base;
+        let base_fee_drops = crate::state::application_root::calculate_sttx_base_fee(read_view, tx);
+        let default_base_fee_drops =
+            crate::state::application_root::calculate_default_sttx_base_fee(read_view, tx);
         let fee_field = protocol::get_field_by_symbol("sfFee");
         let fee_paid_drops = if tx.is_field_present(fee_field) {
             tx.get_field_amount(fee_field).xrp().drops()
@@ -385,9 +387,13 @@ where
             open_ledger,
             read_view,
             rules: read_view.rules(),
-            calculated_base_fee_drops: i64::try_from(base_fee_drops).unwrap_or(i64::MAX),
+            calculated_base_fee_drops: crate::state::application_root::fee_drops_as_i64(
+                base_fee_drops,
+            ),
             fee_paid_drops,
-            default_base_fee_drops: i64::try_from(base_fee_drops).unwrap_or(i64::MAX),
+            default_base_fee_drops: crate::state::application_root::fee_drops_as_i64(
+                default_base_fee_drops,
+            ),
             metrics_snapshot,
             reserve_drops: read_view.fees().account_reserve(0),
             base_fee_drops,

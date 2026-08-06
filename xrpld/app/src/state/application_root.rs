@@ -1020,11 +1020,16 @@ fn batch_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
             .collect::<Vec<_>>()
     });
     let ledger_base_fee = view.fees().base;
-    let owner_reserve_fee = view.fees().increment;
+    let outer_signer_count = tx
+        .is_field_present(get_field_by_symbol("sfSigners"))
+        .then(|| tx.get_field_array(get_field_by_symbol("sfSigners")).len())
+        .unwrap_or(0);
+    let transactor_base_fee =
+        tx::run_transactor_calculate_base_fee(ledger_base_fee, outer_signer_count);
 
     tx::run_batch_calculate_base_fee(
         INVALID_BATCH_BASE_FEE,
-        ledger_base_fee,
+        transactor_base_fee,
         ledger_base_fee,
         Some(
             inner_transactions
@@ -1033,34 +1038,7 @@ fn batch_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
                 .collect::<Vec<_>>(),
         ),
         batch_signers,
-        |inner| match inner.0.get_txn_type() {
-            TxType::ACCOUNT_DELETE => {
-                tx::run_account_delete_calculate_base_fee(ledger_base_fee, owner_reserve_fee)
-            }
-            TxType::AMM_CREATE => {
-                tx::run_amm_create_calculate_base_fee(ledger_base_fee, owner_reserve_fee)
-            }
-            TxType::ESCROW_FINISH => tx::run_escrow_finish_calculate_base_fee(
-                ledger_base_fee,
-                ledger_base_fee,
-                inner
-                    .0
-                    .is_field_present(get_field_by_symbol("sfFulfillment"))
-                    .then(|| {
-                        inner
-                            .0
-                            .get_field_vl(get_field_by_symbol("sfFulfillment"))
-                            .len()
-                    }),
-            ),
-            TxType::LEDGER_STATE_FIX => {
-                tx::run_ledger_state_fix_calculate_base_fee(ledger_base_fee, owner_reserve_fee)
-            }
-            // Nested Batch and loan fee owners are rejected from RawTransactions;
-            // the remaining specialized fee owners require account state that
-            // Batch does not have at this aggregate-fee boundary.
-            _ => ledger_base_fee,
-        },
+        |inner| calculate_sttx_base_fee(view, inner.0),
         u64::checked_add,
         |fee, count| fee.checked_mul(u64::try_from(count).ok()?),
     )
@@ -1163,6 +1141,50 @@ fn batch_preclaim_ter(view: &impl ReadView, tx: &STTx, flags: ApplyFlags) -> Ter
     )
 }
 
+#[derive(Debug)]
+struct PersistentSubmitSandbox {
+    holder: Arc<std::sync::Mutex<Option<Sandbox<Ledger>>>>,
+    sandbox: Option<Sandbox<Ledger>>,
+}
+
+impl PersistentSubmitSandbox {
+    fn take_or_new(
+        holder: Arc<std::sync::Mutex<Option<Sandbox<Ledger>>>>,
+        base: Arc<Ledger>,
+    ) -> Self {
+        let sandbox = holder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .unwrap_or_else(|| Sandbox::new(base, ApplyFlags::NONE));
+        Self {
+            holder,
+            sandbox: Some(sandbox),
+        }
+    }
+
+    fn view_mut(&mut self) -> &mut Sandbox<Ledger> {
+        self.sandbox
+            .as_mut()
+            .expect("persistent submit sandbox must be present while applying")
+    }
+}
+
+impl Drop for PersistentSubmitSandbox {
+    fn drop(&mut self) {
+        let Some(sandbox) = self.sandbox.take() else {
+            return;
+        };
+        let mut holder = self
+            .holder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *holder = Some(sandbox);
+        drop(holder);
+        self.holder.clear_poison();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SubmitConsumedTicket {
     sle: Arc<STLedgerEntry>,
@@ -1258,26 +1280,11 @@ impl<'a> AppOpenLedgerTxQApplyRuntime<'a> {
         } else {
             0
         };
-        let preflight_ter = if tx.get_txn_type() == TxType::BATCH {
-            let batch_preflight = tx::validate_sttx_batch_preflight_with_rules(tx.as_ref(), &rules);
-            if !is_tes_success(batch_preflight) {
-                batch_preflight
-            } else {
-                match tx.check_sign(&rules) {
-                    Ok(()) => Ter::TES_SUCCESS,
-                    Err(_) => Ter::TEM_BAD_SIGNATURE,
-                }
-            }
-        } else {
-            match tx.check_sign(&rules) {
-                Ok(()) => Ter::TES_SUCCESS,
-                Err(_) => Ter::TEM_BAD_SIGNATURE,
-            }
-        };
-        let consequences = if is_tes_success(preflight_ter) {
+        let result = transaction_preflight_ter(&tx, &rules);
+        let consequences = if is_tes_success(result) {
             TxConsequences::new(fee_drops, tx.get_seq_proxy())
         } else {
-            TxConsequences::from_preflight_result(preflight_ter)
+            TxConsequences::from_preflight_result(result)
         };
         let journal = "app_txq_submit".to_owned();
         let preflight_result = PreflightResult::new(
@@ -1287,7 +1294,7 @@ impl<'a> AppOpenLedgerTxQApplyRuntime<'a> {
             consequences,
             flags,
             journal.clone(),
-            preflight_ter,
+            result,
         );
         let preclaim_result = PreclaimResult::new(
             current_ledger_seq,
@@ -1323,7 +1330,12 @@ impl QueueApplyExecutionRuntime<AppTxQTransaction, AppTxQJournalTag, AppTxQParen
 
     fn direct_apply(&mut self) -> ApplyResult {
         let txn_type = self.tx.get_txn_type();
-        let ter = apply_submit_transactor_shell(self.submit_view, self.tx.as_ref(), txn_type);
+        let preclaim = self.preclaim_result.ter;
+        let ter = if is_tes_success(preclaim) {
+            apply_submit_transactor_shell(self.submit_view, self.tx.as_ref(), txn_type)
+        } else {
+            preclaim
+        };
         let applied = is_tes_success(ter) || is_tec_claim(ter);
         if applied {
             self.view.push_transaction(Arc::clone(&self.tx));
@@ -1458,19 +1470,186 @@ impl AcceptLedgerPendingRuntime {
     }
 }
 
-fn consensus_transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
-    let semantic_preflight = if tx.get_txn_type() == TxType::BATCH {
+fn is_change_pseudo_transaction(txn_type: TxType) -> bool {
+    matches!(
+        txn_type,
+        TxType::AMENDMENT | TxType::FEE | TxType::UNL_MODIFY
+    )
+}
+
+/// Runs Change's distinct pseudo-transaction preflight. Change does not
+/// inherit the ordinary preflight1 account rule: it requires a zero account,
+/// zero fee, empty signature fields, and zero sequence instead.
+fn change_pseudo_transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
+    let account = get_field_by_symbol("sfAccount");
+    let fee = get_field_by_symbol("sfFee");
+    let signing_pub_key = get_field_by_symbol("sfSigningPubKey");
+    let txn_signature = get_field_by_symbol("sfTxnSignature");
+    let signers = get_field_by_symbol("sfSigners");
+    let sequence = get_field_by_symbol("sfSequence");
+    let previous_txn_id = get_field_by_symbol("sfPreviousTxnID");
+    let network_id = get_field_by_symbol("sfNetworkID");
+    let lending_protocol_enabled = rules.enabled(&protocol::feature_lending_protocol());
+
+    tx::run_change_invoke_preflight_for_txn_type(
+        tx.get_txn_type(),
+        lending_protocol_enabled,
+        || tx::run_change_preflight_flag_mask(lending_protocol_enabled),
+        |flag_mask| {
+            tx::run_transactor_preflight0(
+                tx::TransactorPreflight0Facts {
+                    is_pseudo_tx: true,
+                    inner_batch_flag_set: tx.is_flag(tfInnerBatchTxn),
+                    network_id_present: tx.is_field_present(network_id),
+                    node_network_id: 0,
+                    tx_network_id: tx
+                        .is_field_present(network_id)
+                        .then(|| tx.get_field_u32(network_id)),
+                    tx_id_is_zero: tx.get_transaction_id().is_zero(),
+                    tx_flags: tx.get_flags(),
+                },
+                flag_mask,
+            )
+        },
+        || {
+            tx::run_change_preflight(
+                Ter::TES_SUCCESS,
+                tx::ChangePreflightFacts {
+                    account_is_zero: tx.get_account_id(account).is_zero(),
+                    fee_is_native_and_zero: tx.get_field_amount(fee).native()
+                        && tx.get_field_amount(fee).xrp().drops() == 0,
+                    signing_pub_key_empty: !tx.is_field_present(signing_pub_key)
+                        || tx.get_field_vl(signing_pub_key).is_empty(),
+                    signature_empty: !tx.is_field_present(txn_signature)
+                        || tx.get_field_vl(txn_signature).is_empty(),
+                    signers_present: tx.is_field_present(signers),
+                    sequence_is_zero: !tx.is_field_present(sequence)
+                        || tx.get_field_u32(sequence) == 0,
+                    previous_txn_id_present: tx.is_field_present(previous_txn_id),
+                },
+            )
+        },
+    )
+    .unwrap_or(Ter::TEM_UNKNOWN)
+}
+
+/// Shared canonical admission used before any queue or ledger-builder sandbox
+/// is created. Signature checking belongs to shared preclaim, after typed
+/// preflight, exactly as in rippled's `invokePreclaim`.
+pub(crate) fn transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
+    if is_change_pseudo_transaction(tx.get_txn_type()) {
+        return change_pseudo_transaction_preflight_ter(tx, rules);
+    }
+
+    let semantic = if tx.get_txn_type() == TxType::BATCH {
         tx::validate_sttx_batch_preflight_with_rules(tx, rules)
     } else {
         tx::validate_sttx_transaction_preflight_with_rules(tx, rules)
     };
-    if !is_tes_success(semantic_preflight) {
-        return semantic_preflight;
+    if !is_tes_success(semantic) {
+        return semantic;
     }
 
     match tx.check_sign(rules) {
         Ok(()) => Ter::TES_SUCCESS,
         Err(_) => Ter::TEM_BAD_SIGNATURE,
+    }
+}
+
+pub(crate) fn calculate_default_sttx_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
+    let signer_count = tx
+        .is_field_present(get_field_by_symbol("sfSigners"))
+        .then(|| tx.get_field_array(get_field_by_symbol("sfSigners")).len())
+        .unwrap_or(0);
+    tx::run_transactor_calculate_base_fee(view.fees().base, signer_count)
+}
+
+/// Shared exact base-fee dispatch for TxQ, replay, consensus, and direct
+/// ledger construction. It starts with Transactor's multisign amount and then
+/// applies only rippled's known specialized fee owners.
+pub(crate) fn calculate_sttx_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
+    let ledger_base_fee = view.fees().base;
+    let transactor_base_fee = calculate_default_sttx_base_fee(view, tx);
+    let owner_reserve_fee = view.fees().increment;
+
+    match tx.get_txn_type() {
+        TxType::AMENDMENT | TxType::FEE | TxType::UNL_MODIFY => {
+            tx::run_change_calculate_base_fee(0_u64)
+        }
+        TxType::BATCH => batch_base_fee(view, tx),
+        TxType::REGULAR_KEY_SET => {
+            let signing_key =
+                PublicKey::from_slice(&tx.get_field_vl(get_field_by_symbol("sfSigningPubKey")));
+            let signing_key_matches = signing_key.as_ref().is_ok_and(|key| {
+                calc_account_id(key.as_bytes())
+                    == tx.get_account_id(get_field_by_symbol("sfAccount"))
+            });
+            let account_state = view
+                .read(account_keylet(Uint160::from_void(
+                    tx.get_account_id(get_field_by_symbol("sfAccount")).data(),
+                )))
+                .ok()
+                .flatten();
+            let password_spent = account_state.as_ref().is_some_and(|account| {
+                account.get_field_u32(get_field_by_symbol("sfFlags")) & protocol::lsfPasswordSpent
+                    != 0
+            });
+            if signing_key_matches && account_state.is_some() && !password_spent {
+                0
+            } else {
+                transactor_base_fee
+            }
+        }
+        TxType::ACCOUNT_DELETE => {
+            tx::run_account_delete_calculate_base_fee(ledger_base_fee, owner_reserve_fee)
+        }
+        TxType::AMM_CREATE => {
+            tx::run_amm_create_calculate_base_fee(ledger_base_fee, owner_reserve_fee)
+        }
+        TxType::ESCROW_FINISH => tx::run_escrow_finish_calculate_base_fee(
+            transactor_base_fee,
+            ledger_base_fee,
+            tx.is_field_present(get_field_by_symbol("sfFulfillment"))
+                .then(|| tx.get_field_vl(get_field_by_symbol("sfFulfillment")).len()),
+        ),
+        TxType::LOAN_SET => {
+            let counterparty = tx.get_field_object(get_field_by_symbol("sfCounterpartySignature"));
+            let counterparty_signers =
+                if counterparty.is_field_present(get_field_by_symbol("sfSigners")) {
+                    counterparty
+                        .get_field_array(get_field_by_symbol("sfSigners"))
+                        .len()
+                } else if counterparty.is_field_present(get_field_by_symbol("sfTxnSignature")) {
+                    1
+                } else {
+                    0
+                };
+            transactor_base_fee
+                + ledger_base_fee
+                    * u64::try_from(counterparty_signers)
+                        .expect("counterparty signer count must fit into u64")
+        }
+        TxType::LOAN_PAY => {
+            crate::state::lending::calculate_loan_pay_base_fee(view, tx, transactor_base_fee)
+        }
+        TxType::LEDGER_STATE_FIX => {
+            tx::run_ledger_state_fix_calculate_base_fee(ledger_base_fee, owner_reserve_fee)
+        }
+        _ => transactor_base_fee,
+    }
+}
+
+fn consensus_transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
+    transaction_preflight_ter(tx, rules)
+}
+
+/// Batch's invalid calculation is a documented sentinel consumed by its typed
+/// preclaim. Every other fee must be representable at this signed TxQ boundary.
+pub(crate) fn fee_drops_as_i64(fee: u64) -> i64 {
+    if fee == INVALID_BATCH_BASE_FEE {
+        i64::MAX
+    } else {
+        i64::try_from(fee).expect("validated XRPL fee must fit into i64")
     }
 }
 
@@ -1485,17 +1664,7 @@ pub(crate) fn queue_apply_preclaim_ter(
         tx,
         current_ledger_seq,
         flags,
-        || {
-            let base_fee = if tx.get_txn_type() == TxType::BATCH {
-                // Batch's aggregate calculation is also validated by its tail.
-                // Keep the generic fee check payable here on a malformed
-                // aggregate so the tail returns rippled's tecINSUFF_FEE.
-                batch_base_fee(view, tx).min(i64::MAX as u64) as i64
-            } else {
-                view.fees().base.min(i64::MAX as u64) as i64
-            };
-            base_fee
-        },
+        || fee_drops_as_i64(calculate_sttx_base_fee(view, tx)),
         || {
             let typed_preclaim = typed_preclaim_ter(view, tx, flags);
             if !is_tes_success(typed_preclaim) {
@@ -1940,15 +2109,15 @@ fn apply_submit_transactor_shell_with_flags_and_delivered_amount<V: ledger::Appl
     }
 
     let rules = view.rules();
-    // Accepted-ledger replay and BuildLedger call this public shell directly,
-    // bypassing the open-ledger TxQ gates. Validate an outer Batch before
-    // opening a sandbox or touching sequence, fee, or ledger state.
+    // Consensus, acquired-ledger, and replay builders call the shared
+    // semantic preflight and immutable preclaim before entering this shell.
+    // The public TxQ apply path already owns the same facts, so only Batch's
+    // outer-only validation belongs here before its sandbox is opened.
     if txn_type == TxType::BATCH {
-        let preflight = tx::validate_sttx_batch_preflight_with_rules(tx, &rules);
+        let preflight = transaction_preflight_ter(tx, &rules);
         if !is_tes_success(preflight) {
             return (preflight, None);
         }
-
         let preclaim = batch_preclaim_ter(view, tx, flags);
         if !is_tes_success(preclaim) {
             return (preclaim, None);
@@ -2011,6 +2180,15 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
 ) -> Ter {
     let account_field = get_field_by_symbol("sfAccount");
 
+    let is_pseudo = is_change_pseudo_transaction(txn_type);
+    if is_pseudo {
+        let preflight = tx::validate_sttx_transaction_preflight_with_rules(tx, &view.rules());
+        if !is_tes_success(preflight) {
+            return preflight;
+        }
+        return handle_real_dispatch(view, tx, txn_type, None);
+    }
+
     // --- reference preflight1 checks ---
     // Bad account ID
     if tx.is_field_present(account_field) {
@@ -2046,14 +2224,8 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
         return handle_real_dispatch(view, tx, txn_type, None);
     }
 
-    // Pseudo-transactions (Fee, Amendment, UNL_Modify) skip fee/sequence
-    let is_pseudo = matches!(
-        txn_type,
-        TxType::FEE | TxType::AMENDMENT | TxType::UNL_MODIFY
-    );
-    if is_pseudo {
-        return handle_real_dispatch(view, tx, txn_type, None);
-    }
+    // Change pseudo-transactions were dispatched above after their typed
+    // preflight; all remaining transaction types use the regular preamble.
 
     let sequence_field = get_field_by_symbol("sfSequence");
     let balance_field = get_field_by_symbol("sfBalance");
@@ -2625,28 +2797,7 @@ impl
                 0
             }),
         );
-        let result = if sttx.get_txn_type() == TxType::BATCH {
-            let batch_preflight = tx::validate_sttx_batch_preflight_with_rules(&sttx, &ctx.rules);
-            if !is_tes_success(batch_preflight) {
-                batch_preflight
-            } else {
-                match sttx.check_sign(&ctx.rules) {
-                    Ok(()) => Ter::TES_SUCCESS,
-                    Err(_) => Ter::TEM_BAD_SIGNATURE,
-                }
-            }
-        } else {
-            let semantic_preflight =
-                tx::validate_sttx_transaction_preflight_with_rules(&sttx, &ctx.rules);
-            if !is_tes_success(semantic_preflight) {
-                semantic_preflight
-            } else {
-                match sttx.check_sign(&ctx.rules) {
-                    Ok(()) => Ter::TES_SUCCESS,
-                    Err(_) => Ter::TEM_BAD_SIGNATURE,
-                }
-            }
-        };
+        let result = transaction_preflight_ter(sttx.as_ref(), &ctx.rules);
 
         Ok((
             result,
@@ -2716,28 +2867,13 @@ impl
         let Some(ledger) = base.as_ref() else {
             return 0;
         };
-        let normal_cost = ledger.fees().base;
-        if txn_type == TxType::BATCH {
-            let sttx = Self::read_sttx(tx);
-            let calculated = batch_base_fee(ledger.as_ref(), sttx.as_ref());
-            // Match Batch::calculateBaseFee: its public calculation provides a
-            // payable placeholder while preclaim returns tecINSUFF_FEE for an
-            // invalid aggregate fee.
-            return if calculated == INVALID_BATCH_BASE_FEE {
-                normal_cost
-            } else {
-                calculated
-            };
+        let sttx = Self::read_sttx(tx);
+        let calculated = calculate_sttx_base_fee(ledger.as_ref(), sttx.as_ref());
+        if calculated == INVALID_BATCH_BASE_FEE {
+            ledger.fees().base
+        } else {
+            calculated
         }
-        if txn_type == TxType::LOAN_PAY {
-            let sttx = Self::read_sttx(tx);
-            return crate::state::lending::calculate_loan_pay_base_fee(
-                ledger.as_ref(),
-                sttx.as_ref(),
-                normal_cost,
-            );
-        }
-        normal_cost
     }
 
     fn zero_fee(&mut self) -> Self::Fee {
@@ -3307,12 +3443,18 @@ impl ApplicationRoot {
                 .lock()
                 .expect("close_gate mutex must not be poisoned");
             if self.apply_network_ops_pending_to_open_ledger().is_none() {
-                // `apply` has not swapped the queue when no base ledger is
-                // available. Return to `None` so the next ingress or closed
-                // ledger transition can schedule a fresh JtBatch rather than
-                // stranding transactions in `Scheduled`.
                 if let Some(runtime) = self.network_ops_runtime() {
-                    let _ = runtime.release_scheduled_transaction_batch_for_retry();
+                    if runtime.take_pending_batch_panic_recovery() {
+                        // A caught panic restored TxQ and NetworkOps state.
+                        // Schedule exactly one fresh guarded batch for that
+                        // recovered pending work.
+                        let _ = self.schedule_network_ops_transaction_batch();
+                    } else {
+                        // `apply` has not swapped the queue when no base ledger
+                        // is available. Return to `None` so the next ingress or
+                        // closed ledger transition can schedule a fresh JtBatch.
+                        let _ = runtime.release_scheduled_transaction_batch_for_retry();
+                    }
                 }
                 break;
             }
@@ -5122,11 +5264,10 @@ impl ApplicationRoot {
                 let mut lock = AppTxQLock;
                 // Use the persistent sandbox (matching rippled's persistent OpenView).
                 // This ensures subsequent submits see state from prior ones.
-                let mut submit_view = sandbox_holder
-                    .lock()
-                    .expect("sandbox mutex")
-                    .take()
-                    .unwrap_or_else(|| Sandbox::new(Arc::clone(&base_ledger), ApplyFlags::NONE));
+                let mut submit_view = PersistentSubmitSandbox::take_or_new(
+                    Arc::clone(&sandbox_holder),
+                    Arc::clone(&base_ledger),
+                );
                 let _ = open_ledger.modify(|view| {
                     for entry in transactions.iter_mut() {
                         let tx = Arc::clone(
@@ -5140,7 +5281,7 @@ impl ApplicationRoot {
                         let metrics_snapshot = tx_q.metrics_snapshot();
                         let view_snapshot = view.clone();
                         let live_queue_view = view_snapshot.queue_apply_view(
-                            &submit_view,
+                            submit_view.view_mut(),
                             tx.as_ref(),
                             metrics_snapshot,
                         );
@@ -5149,32 +5290,16 @@ impl ApplicationRoot {
                             &live_queue_view,
                             metrics_snapshot,
                         );
-                        let submit_rules = submit_view.rules().clone();
-                        let mut preclaim_ter =
-                            queue_apply_preclaim_ter(
-                                &submit_view,
-                                tx.as_ref(),
-                                current_ledger_index,
-                                networkops_apply_flags(entry.admin, entry.fail_hard),
-                            );
-                        // If preclaim says terPRE_SEQ but our open ledger tracker shows
-                        // this sequence IS the next expected one, override to TES_SUCCESS.
-                        // This matches rippled where the persistent OpenView already has
-                        // the updated sequence from prior submissions.
-                        if preclaim_ter == Ter::TER_PRE_SEQ {
-                            let account = tx.get_account_id(get_field_by_symbol("sfAccount"));
-                            let tx_seq = tx.get_seq_proxy().value();
-                            if let Ok(seqs) = account_seqs.lock() {
-                                if let Some(&expected) = seqs.get(&account) {
-                                    if tx_seq == expected {
-                                        preclaim_ter = Ter::TES_SUCCESS;
-                                    }
-                                }
-                            }
-                        }
+                        let submit_rules = submit_view.view_mut().rules().clone();
+                        let preclaim_ter = queue_apply_preclaim_ter(
+                            submit_view.view_mut(),
+                            tx.as_ref(),
+                            current_ledger_index,
+                            networkops_apply_flags(entry.admin, entry.fail_hard),
+                        );
                         let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
                             view,
-                            &mut submit_view,
+                            submit_view.view_mut(),
                             Arc::clone(&tx),
                             submit_rules,
                             networkops_apply_flags(entry.admin, entry.fail_hard),
@@ -5197,8 +5322,6 @@ impl ApplicationRoot {
                     }
                     changed
                 });
-                // Store the sandbox back for reuse by the next submit call
-                *sandbox_holder.lock().expect("sandbox mutex") = Some(submit_view);
                 changed
             },
             || {

@@ -5,12 +5,27 @@
 //! helpers, so callers such as Batch can validate canonical inner transactions
 //! without depending on the higher-level RPC crate.
 
-use protocol::{NotTec, Permission, Rules, STTx, Ter, TxType, get_field_by_symbol, is_tes_success};
+use protocol::{
+    INNER_BATCH_TRANSACTION_FLAG, NotTec, Permission, Rules, STTx, Ter, TxType,
+    feature_lending_protocol, get_field_by_symbol, is_tes_success,
+};
+
+use crate::{
+    ChangePreflightFacts, TransactorPreflight0Facts, run_change_invoke_preflight_for_txn_type,
+    run_change_preflight, run_change_preflight_flag_mask, run_transactor_preflight0,
+};
 
 /// Runs the common, amendment-aware, stateless preflight portion for a
 /// canonical transaction. Signature validation and ledger-dependent preclaim
 /// remain the responsibility of the caller's normal transaction pipeline.
 pub fn validate_sttx_transaction_preflight_with_rules(tx: &STTx, rules: &Rules) -> NotTec {
+    // Change does not inherit Transactor::preflight1 or the normal account
+    // validation path: its own typed preflight validates the canonical zero
+    // account, zero fee, signature-free pseudo form.
+    if is_change_transaction(tx.get_txn_type()) {
+        return validate_sttx_change_preflight(tx, rules);
+    }
+
     if protocol::passes_local_checks(tx).is_err() {
         return Ter::TEM_INVALID;
     }
@@ -98,6 +113,60 @@ fn validate_sttx_sponsor_preflight(tx: &STTx, rules: &Rules) -> NotTec {
         return Ter::TEM_MALFORMED;
     }
     Ter::TES_SUCCESS
+}
+
+fn is_change_transaction(txn_type: TxType) -> bool {
+    matches!(
+        txn_type,
+        TxType::AMENDMENT | TxType::FEE | TxType::UNL_MODIFY
+    )
+}
+
+/// `Change::invokePreflight` is deliberately outside the normal
+/// `Transactor::preflight1` account/fee/signature path: Change requires the
+/// all-zero source account, zero native fee, no signature material, and zero
+/// sequence.  Keep the reference's `preflight0` then Change ordering here so
+/// every canonical STTx admission path shares it.
+fn validate_sttx_change_preflight(tx: &STTx, rules: &Rules) -> NotTec {
+    let field = get_field_by_symbol;
+    let account = tx.get_account_id(field("sfAccount"));
+    let fee = tx.get_field_amount(field("sfFee"));
+    let result = run_change_invoke_preflight_for_txn_type(
+        tx.get_txn_type(),
+        rules.enabled(&feature_lending_protocol()),
+        || run_change_preflight_flag_mask(true),
+        |flag_mask| {
+            run_transactor_preflight0(
+                TransactorPreflight0Facts {
+                    is_pseudo_tx: true,
+                    inner_batch_flag_set: tx.get_flags() & INNER_BATCH_TRANSACTION_FLAG != 0,
+                    // The application-level canonical preflight has no node
+                    // network-id service. Match its existing local-check
+                    // boundary and preserve Change-specific preflight0 checks.
+                    tx_id_is_zero: tx.get_transaction_id().is_zero(),
+                    tx_flags: tx.get_flags(),
+                    ..TransactorPreflight0Facts::default()
+                },
+                flag_mask,
+            )
+        },
+        || {
+            run_change_preflight(
+                Ter::TES_SUCCESS,
+                ChangePreflightFacts {
+                    account_is_zero: account.is_zero(),
+                    fee_is_native_and_zero: fee.native() && fee.xrp().drops() == 0,
+                    signing_pub_key_empty: tx.get_field_vl(field("sfSigningPubKey")).is_empty(),
+                    signature_empty: STTx::get_signature(tx).is_empty(),
+                    signers_present: tx.is_field_present(field("sfSigners")),
+                    sequence_is_zero: tx.get_field_u32(field("sfSequence")) == 0,
+                    previous_txn_id_present: tx.is_field_present(field("sfPreviousTxnID")),
+                },
+            )
+        },
+    );
+
+    result.unwrap_or(Ter::TEM_UNKNOWN)
 }
 
 fn validate_sttx_common_transactor_preflight(tx: &STTx) -> NotTec {
@@ -411,4 +480,45 @@ fn validate_account_set_preflight(tx: &STTx) -> NotTec {
         nftoken_minter_present: tx.is_field_present(get_field_by_symbol("sfNFTokenMinter")),
         ..crate::AccountSetPreflightFacts::default()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use basics::base_uint::Uint256;
+    use protocol::{Rules, STAmount, STTx, Ter, TxType, XRPAmount, get_field_by_symbol};
+
+    use super::validate_sttx_transaction_preflight_with_rules;
+
+    fn sf(name: &str) -> &'static protocol::SField {
+        get_field_by_symbol(name)
+    }
+
+    fn change_amendment() -> STTx {
+        STTx::new(TxType::AMENDMENT, |tx| {
+            tx.set_field_amount(sf("sfFee"), STAmount::from_xrp_amount(XRPAmount::new()));
+            tx.set_field_h256(sf("sfAmendment"), Uint256::from_u64(1));
+        })
+    }
+
+    #[test]
+    fn change_pseudo_preflight_accepts_zero_account_without_signature() {
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &change_amendment(),
+                &Rules::new(std::iter::empty()),
+            ),
+            Ter::TES_SUCCESS,
+        );
+    }
+
+    #[test]
+    fn change_pseudo_preflight_rejects_signature_material_before_admission() {
+        let mut tx = change_amendment();
+        tx.set_field_vl(sf("sfTxnSignature"), &[1]);
+
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(&tx, &Rules::new(std::iter::empty())),
+            Ter::TEM_BAD_SIGNATURE,
+        );
+    }
 }

@@ -7,8 +7,8 @@ use app::{
 use basics::{base_uint::Uint256, intrusive_pointer::make_shared_intrusive};
 use ledger::{CanonicalTXSet, Ledger, LedgerHeader};
 use protocol::{
-    STAmount, STArray, STObject, STTx, TxType, decode_ledger_hashes_entry, get_field_by_symbol,
-    skip_keylet,
+    STAmount, STArray, STObject, STTx, Ter, TxType, decode_ledger_hashes_entry,
+    get_field_by_symbol, skip_keylet,
 };
 use shamap::{
     item::SHAMapItem,
@@ -396,6 +396,7 @@ fn build_ledger_replay_applies_ordered_txns_in_input_order_with_replay_flags() {
         ApplyFlags::FAIL_HARD | ApplyFlags::RETRY,
         &journal,
         |_built| StubBuildView::closed(Rc::new(RefCell::new(Vec::new()))),
+        |_, _, _| Ter::TES_SUCCESS,
         |view, tx, flags| {
             view.applied.push(tx.get_transaction_id());
             seen.borrow_mut()
@@ -507,6 +508,7 @@ fn ledger_replay_from_replay_ledger_sorts_by_metadata_index() {
         ApplyFlags::FAIL_HARD,
         &RecordingJournal::default(),
         |_built| StubBuildView::closed(Rc::new(RefCell::new(Vec::new()))),
+        |_, _, _| Ter::TES_SUCCESS,
         |view, tx, flags| {
             view.applied.push(tx.get_transaction_id());
             seen.borrow_mut()
