@@ -11080,10 +11080,64 @@ fn signed_payment_full_pipeline() {
     assert_eq!(result, Ter::TES_SUCCESS);
 }
 
+/// Parity: `../rippled/src/libxrpl/tx/apply.cpp::apply` executes
+/// `preclaim(preflight(...), ...)` before `doApply`; an invalid signature must
+/// therefore reject without consuming sequence, fee, or payment balance.
 #[test]
-fn signed_payment_bad_signature_rejected() {
+#[ignore = "requires shared semantic preflight before direct mutation"]
+fn signed_payment_bad_signature_rejected_before_mutation() {
     let (_, public, alice_id) = make_keypair("alice");
     let (_, _, bob_id) = make_keypair("bob");
+    let ledger = build_ledger(vec![
+        account_root(alice_id, 5_000_000_000, 0, 0),
+        account_root(bob_id, 1_000_000_000, 0, 0),
+    ]);
+    let mut view = new_view(ledger);
+
+    let tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice_id);
+        tx.set_account_id(sf("sfDestination"), bob_id);
+        tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_vl(sf("sfSigningPubKey"), public.as_bytes());
+        tx.set_field_vl(sf("sfTxnSignature"), &[0xDE; 72]);
+    });
+
+    let result = app::state::application_root::apply_submit_transactor_shell(
+        &mut view,
+        &tx,
+        TxType::PAYMENT,
+    );
+
+    assert_eq!(result, Ter::TEM_BAD_SIGNATURE);
+    let source = view
+        .read(account_keylet(acct_id(alice_id)))
+        .expect("source read should succeed")
+        .expect("source should exist");
+    let destination = view
+        .read(account_keylet(acct_id(bob_id)))
+        .expect("destination read should succeed")
+        .expect("destination should exist");
+    assert_eq!(source.get_field_u32(sf("sfSequence")), 1);
+    assert_eq!(
+        source.get_field_amount(sf("sfBalance")).xrp().drops(),
+        5_000_000_000
+    );
+    assert_eq!(
+        destination.get_field_amount(sf("sfBalance")).xrp().drops(),
+        1_000_000_000
+    );
+}
+
+/// Parity: `../rippled/src/libxrpl/tx/Transactor.cpp::Transactor::checkSeqProxy`
+/// runs before `Transactor::apply`; stale standalone sequence numbers must not
+/// mutate the account or destination.
+#[test]
+#[ignore = "requires shared semantic preclaim before direct mutation"]
+fn signed_payment_stale_sequence_rejected_before_mutation() {
+    let (secret, public, alice_id) = make_keypair("stale-sequence-alice");
+    let (_, _, bob_id) = make_keypair("stale-sequence-bob");
     let ledger = build_ledger(vec![
         account_root(alice_id, 5_000_000_000, 0, 0),
         account_root(bob_id, 1_000_000_000, 0, 0),
@@ -11095,28 +11149,33 @@ fn signed_payment_bad_signature_rejected() {
         tx.set_account_id(sf("sfDestination"), bob_id);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
         tx.set_field_amount(sf("sfFee"), xrp(10));
-        tx.set_field_u32(sf("sfSequence"), 1);
-        // Set pub key but garbage signature
-        tx.set_field_vl(sf("sfSigningPubKey"), public.as_bytes());
-        tx.set_field_vl(sf("sfTxnSignature"), &[0xDE; 72]);
+        tx.set_field_u32(sf("sfSequence"), 0);
     });
+    sign_tx(&mut tx, &secret, &public);
 
     let result = app::state::application_root::apply_submit_transactor_shell(
         &mut view,
         &tx,
         TxType::PAYMENT,
     );
-    // Known gap: apply_submit_transactor_shell does NOT call check_sign().
-    // Signature verification happens at a higher layer (RPC/NetworkOPs).
-    // The shell only validates fee, sequence, and account existence.
-    // This test documents that gap — in production, bad signatures are
-    // rejected before reaching the shell.
-    assert!(
-        result == Ter::TEF_BAD_SIGNATURE
-            || result == Ter::TEF_BAD_AUTH
-            || result == Ter::TES_SUCCESS,
-        "Got {:?}",
-        result
+
+    assert_eq!(result, Ter::TEF_PAST_SEQ);
+    let source = view
+        .read(account_keylet(acct_id(alice_id)))
+        .expect("source read should succeed")
+        .expect("source should exist");
+    let destination = view
+        .read(account_keylet(acct_id(bob_id)))
+        .expect("destination read should succeed")
+        .expect("destination should exist");
+    assert_eq!(source.get_field_u32(sf("sfSequence")), 1);
+    assert_eq!(
+        source.get_field_amount(sf("sfBalance")).xrp().drops(),
+        5_000_000_000
+    );
+    assert_eq!(
+        destination.get_field_amount(sf("sfBalance")).xrp().drops(),
+        1_000_000_000
     );
 }
 

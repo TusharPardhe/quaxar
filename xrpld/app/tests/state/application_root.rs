@@ -454,6 +454,66 @@ fn application_root_binds_runtime_components_under_one_shell() {
     );
 }
 
+/// Parity: `../rippled/src/xrpld/app/ledger/detail/LedgerMaster.cpp::LedgerMaster::findNewLedgersToPublish`
+/// narrows a publish gap and calls `app_.getLedgerReplayer().replay(...)` for
+/// the unretrieved range. The replay task is bounded and leaves the published
+/// ledger unchanged until a verified replay finishes.
+#[test]
+#[ignore = "requires LedgerReplayer publication-gap routing"]
+fn application_root_routes_missing_publication_gap_to_owned_ledger_replayer() {
+    let mut root = ApplicationRoot::new(0).expect("root shell should build");
+    let runtime = root.attach_default_ledger_master_runtime();
+
+    let mut first_header = LedgerHeader {
+        seq: 1,
+        close_time: 500,
+        close_time_resolution: LEDGER_DEFAULT_TIME_RESOLUTION,
+        ..LedgerHeader::default()
+    };
+    first_header.hash = basics::sha_map_hash::SHAMapHash::new(Uint256::from_array([0x10; 32]));
+    let mut first = Ledger::new(first_header, false);
+    first.set_immutable(true);
+    let first = Arc::new(first);
+
+    let mut second = Ledger::from_previous(first.as_ref(), 600);
+    second
+        .update_skip_list()
+        .expect("linked gap ledger should have a skip list");
+    second.set_immutable(true);
+    let second = Arc::new(second);
+
+    let mut validated = Ledger::from_previous(second.as_ref(), 700);
+    validated
+        .update_skip_list()
+        .expect("validated gap ledger should have a skip list");
+    validated.set_immutable(true);
+    let validated = Arc::new(validated);
+
+    runtime.ledger_master().set_pub_ledger(Arc::clone(&first));
+    runtime
+        .ledger_master()
+        .set_valid_ledger(Arc::clone(&validated), None, None)
+        .expect("validated ledger should install");
+
+    root.try_advance_publication();
+
+    assert_eq!(
+        runtime
+            .ledger_master()
+            .published_ledger()
+            .map(|ledger| ledger.header().seq),
+        Some(1)
+    );
+    assert_eq!(
+        root.get_ledger_replayer()
+            .lock()
+            .expect("ledger replayer lock")
+            .tasks_len(),
+        1,
+        "a bounded replay task must be scheduled for the missing seq=2 ledger"
+    );
+}
+
 #[test]
 fn application_root_can_be_built_with_runtime_bindings_and_report_fd_budget() {
     let events = Arc::new(Mutex::new(Vec::new()));

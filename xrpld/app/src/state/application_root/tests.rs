@@ -3723,6 +3723,237 @@ fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
 }
 
 #[test]
+fn batch_inner_transactions_retain_parent_context_and_metadata() {
+    // ../rippled/src/libxrpl/tx/transactors/system/Batch.cpp::Batch::preflight
+    // (lines 203-382) sends each inner through `preflight(..., parentBatchId,
+    // stx, TapBatch, ...)`; ../rippled/src/libxrpl/tx/apply.cpp::applyBatchTransactions
+    // (lines 162-191) applies that same parent and TapBatch context in its own
+    // per-transaction view. ../rippled/src/test/app/Batch_test.cpp::validateInnerTxn
+    // (lines 116-122) then requires `sfParentBatchID` in every inner metadata.
+    let secret = SecretKey::from_bytes([0xB1; 32]);
+    let public = derive_public_key(KeyType::Secp256k1, &secret).expect("batch outer public key");
+    let source = calc_account_id(public.as_bytes());
+    let mut parent = ledger_view(10, source, 1, &[]);
+    parent.set_rules(Rules::new([protocol::feature_batch()]));
+    let parent = Arc::new(parent);
+    let app = ApplicationRoot::new(0).expect("application root should build");
+
+    let inners = [batch_policy_inner(source, 2), batch_policy_inner(source, 3)];
+    let mut batch = batch_policy_batch(source, &inners);
+    let batch_fee = batch_base_fee(parent.as_ref(), &batch);
+    batch.set_field_amount(
+        get_field_by_symbol("sfFee"),
+        STAmount::new_native(batch_fee, false),
+    );
+    batch.set_field_vl(get_field_by_symbol("sfSigningPubKey"), public.as_bytes());
+    batch
+        .sign(&public, &secret, None)
+        .expect("outer Batch signature should be valid");
+    let batch = Arc::new(batch);
+    let batch_id = batch.get_transaction_id();
+
+    let outcome = app
+        .accept_ledger_with_txns_outcome_from_consensus_parent(
+            Arc::clone(&parent),
+            11,
+            1_010,
+            LEDGER_DEFAULT_TIME_RESOLUTION,
+            true,
+            parent.fees().base,
+            vec![Arc::clone(&batch)],
+        )
+        .expect("Batch candidate construction should complete");
+    let transactions = outcome
+        .closed
+        .tx_snapshot()
+        .expect("closed Batch ledger metadata should decode");
+
+    assert_eq!(
+        transactions.len(),
+        3,
+        "the outer Batch and both successfully applied inner transactions must be recorded"
+    );
+    for inner in inners {
+        let (_, metadata) = transactions
+            .iter()
+            .find(|(transaction, _)| transaction.get_transaction_id() == inner.get_transaction_id())
+            .expect("applied inner transaction must retain its own ledger metadata");
+        assert_eq!(
+            metadata
+                .get_as_object()
+                .get_field_h256(get_field_by_symbol("sfParentBatchID")),
+            batch_id,
+            "inner metadata must retain the canonical parent Batch id"
+        );
+    }
+}
+
+#[test]
+fn batch_all_or_nothing_discards_inner_metadata_with_the_whole_batch_view() {
+    // ../rippled/src/libxrpl/tx/apply.cpp::applyBatchTransactions applies each
+    // eligible inner view to `wholeBatchView`, but returns false for
+    // tfAllOrNothing on the first non-tes result and never applies that whole
+    // view. ../rippled/src/libxrpl/tx/applySteps.cpp::preclaim is the required
+    // shared admission step for the second, pre-sequence inner transaction.
+    let secret = SecretKey::from_bytes([0xB4; 32]);
+    let public = derive_public_key(KeyType::Secp256k1, &secret).expect("batch outer public key");
+    let source = calc_account_id(public.as_bytes());
+    let mut parent = ledger_view(10, source, 1, &[]);
+    parent.set_rules(Rules::new([protocol::feature_batch()]));
+    let parent = Arc::new(parent);
+    let app = ApplicationRoot::new(0).expect("application root should build");
+
+    // The outer Batch consumes sequence 1. The first inner can apply at 2,
+    // while the second is a shared-preclaim terPRE_SEQ at 5, forcing the
+    // all-or-nothing whole-batch view to be discarded.
+    let inners = [batch_policy_inner(source, 2), batch_policy_inner(source, 5)];
+    let mut batch = batch_policy_batch(source, &inners);
+    let batch_fee = batch_base_fee(parent.as_ref(), &batch);
+    batch.set_field_amount(
+        get_field_by_symbol("sfFee"),
+        STAmount::new_native(batch_fee, false),
+    );
+    batch.set_field_vl(get_field_by_symbol("sfSigningPubKey"), public.as_bytes());
+    batch
+        .sign(&public, &secret, None)
+        .expect("outer Batch signature should be valid");
+
+    let outcome = app
+        .accept_ledger_with_txns_outcome_from_consensus_parent(
+            Arc::clone(&parent),
+            11,
+            1_010,
+            LEDGER_DEFAULT_TIME_RESOLUTION,
+            true,
+            parent.fees().base,
+            vec![Arc::new(batch)],
+        )
+        .expect("Batch candidate construction should complete");
+    let transactions = outcome
+        .closed
+        .tx_snapshot()
+        .expect("closed Batch ledger metadata should decode");
+
+    assert_eq!(
+        transactions.len(),
+        1,
+        "only the outer Batch may remain when its all-or-nothing inner view is discarded"
+    );
+    for inner in inners {
+        assert!(
+            transactions
+                .iter()
+                .all(|(transaction, _)| transaction.get_transaction_id()
+                    != inner.get_transaction_id()),
+            "discarded inner Batch transactions must not receive metadata entries"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires standalone shared preflight and preclaim before mutation"]
+fn standalone_accept_rejects_bad_signature_and_pre_sequence_before_mutation() {
+    // ../rippled/src/libxrpl/tx/apply.cpp::apply (lines 132-158) always
+    // executes preflight and preclaim before doApply. The standalone close
+    // path must retain that ordering so rejected input produces neither a
+    // transaction record nor an account-sequence mutation.
+    let mut app = ApplicationRoot::with_options(super::ApplicationRootOptions {
+        standalone: true,
+        ..super::ApplicationRootOptions::default()
+    })
+    .expect("standalone root shell should build");
+    let _runtime = app.attach_default_network_ops_runtime();
+
+    let destination = AccountID::from_array([0xD2; 20]);
+    let (source, signed_first) = signed_payment_tx(0xB2, destination, 1, 10);
+    let mut bad_signature = (*signed_first).clone();
+    bad_signature.set_field_vl(get_field_by_symbol("sfTxnSignature"), &[0x00]);
+    let bad_signature = Arc::new(bad_signature);
+    let (_, pre_sequence) = signed_payment_tx(0xB2, destination, 2, 10);
+    let parent = Arc::new(ledger_view(10, source, 1, &[]));
+    app.on_closed_ledger(Arc::clone(&parent));
+    let _ = app.open_ledger().modify(|view| {
+        *view = AppOpenLedgerView::with_parent_hash(
+            11,
+            parent.fees().base,
+            *parent.header().hash.as_uint256(),
+        );
+        view.push_transaction(Arc::clone(&bad_signature));
+        view.push_transaction(Arc::clone(&pre_sequence));
+        true
+    });
+
+    app.accept_standalone_ledger()
+        .expect("invalid standalone input must not abort ledger closure");
+    let closed = app.closed_ledger().expect("standalone child should close");
+    assert!(
+        !closed.tx_exists(bad_signature.get_transaction_id()),
+        "an invalid signature must be rejected before standalone metadata insertion"
+    );
+    assert!(
+        !closed.tx_exists(pre_sequence.get_transaction_id()),
+        "a sequence that is only valid after rejected input must remain a preclaim failure"
+    );
+    let source_after = closed
+        .read(account_keylet(raw_account_id(source)))
+        .expect("source lookup should succeed")
+        .expect("source account should remain present");
+    assert_eq!(
+        source_after.get_field_u32(get_field_by_symbol("sfSequence")),
+        1,
+        "rejected standalone transactions must not consume the source sequence"
+    );
+}
+
+#[test]
+#[ignore = "requires publication-gap routing into LedgerReplayer"]
+fn publication_gap_routes_to_owned_ledger_replayer() {
+    // ../rippled/src/xrpld/app/ledger/detail/LedgerMaster.cpp::findNewLedgersToPublish
+    // (lines 1307-1335) narrows a contiguous publication gap and calls
+    // `app_.getLedgerReplayer().replay(InboundLedger::Reason::GENERIC, ...)`.
+    // It must supplement, not replace, normal contiguous publication/history
+    // acquisition; the bounded replayer owns its own duplicate and shutdown
+    // safety checks in ../rippled/src/xrpld/app/ledger/detail/LedgerReplayer.cpp::replay.
+    let mut app = ApplicationRoot::new(0).expect("application root should build");
+    let runtime = Arc::new(AppLedgerMasterRuntime::default());
+    let _ = app.attach_ledger_master_runtime(Arc::clone(&runtime));
+
+    let source = AccountID::from_array([0xB3; 20]);
+    let mut first = ledger_view(1, source, 1, &[]);
+    first.set_immutable(true);
+    let first = Arc::new(first);
+    let mut second = Ledger::from_previous(&first, 900);
+    second.set_immutable(true);
+    let second = Arc::new(second);
+    let mut third = Ledger::from_previous(&second, 930);
+    third.set_immutable(true);
+    let third = Arc::new(third);
+
+    runtime.ledger_master().set_pub_ledger(Arc::clone(&first));
+    runtime
+        .ledger_master()
+        .set_valid_ledger(Arc::clone(&third), None, None)
+        .expect("validated child should establish the publication gap");
+    let report = runtime.plan_advance_publication();
+    assert_eq!(
+        report.missing.map(|missing| (missing.seq, missing.hash)),
+        Some((2, *second.header().hash.as_uint256())),
+        "the gap must be narrowed to the first missing contiguous ledger"
+    );
+
+    app.try_advance_publication();
+    assert_eq!(
+        app.registry
+            .ledger_replayer
+            .lock()
+            .expect("ledger replayer lock")
+            .tasks_len(),
+        1,
+        "a bounded replay task must be scheduled for the narrowed history gap"
+    );
+}
+
+#[test]
 fn consensus_status_event_uses_lost_sync_for_a_wrong_lcl() {
     assert_eq!(consensus_status_event(2, true), 2); // neACCEPTED_LEDGER
     assert_eq!(consensus_status_event(1, false), 4); // neLOST_SYNC

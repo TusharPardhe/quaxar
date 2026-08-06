@@ -1396,6 +1396,27 @@ struct StandaloneAcceptedTx {
     delta_meta_nodes: protocol::JsonValue,
 }
 
+/// An inner transaction that reached the applied (`tes*` or `tec*`) state in
+/// the isolated Batch view. It is staged until the entire Batch policy decides
+/// whether that view can be committed.
+struct AppliedBatchInnerTransaction {
+    transaction: STTx,
+    result: Ter,
+    delivered_amount: Option<STAmount>,
+    parent_batch_id: Uint256,
+}
+
+struct SubmitApplyOutcome {
+    result: Ter,
+    delivered_amount: Option<STAmount>,
+    applied_batch_inner_transactions: Vec<AppliedBatchInnerTransaction>,
+}
+
+struct BatchFollowupOutcome {
+    result: Ter,
+    applied_inner_transactions: Vec<AppliedBatchInnerTransaction>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AcceptedLedgerLclInstall {
     /// Legacy/non-consensus callers install the built child immediately.
@@ -1597,6 +1618,16 @@ fn loan_set_counterparty_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
 }
 
 pub(crate) fn transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
+    transaction_preflight_ter_with_parent_batch_id(tx, rules, None)
+}
+
+/// Shared semantic preflight with the `parentBatchId` supplied by
+/// `rippled::preflight(..., parentBatchId, ..., TapBatch, ...)`.
+fn transaction_preflight_ter_with_parent_batch_id(
+    tx: &STTx,
+    rules: &Rules,
+    parent_batch_id: Option<Uint256>,
+) -> Ter {
     if is_change_pseudo_transaction(tx.get_txn_type()) {
         return change_pseudo_transaction_preflight_ter(tx, rules);
     }
@@ -1615,6 +1646,18 @@ pub(crate) fn transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
         if !is_tes_success(counterparty_preflight) {
             return counterparty_preflight;
         }
+    }
+
+    // `applySteps.cpp::preflight` constructs a context with parentBatchId for
+    // inner transactions. Its signer gate is deliberately deferred to the
+    // matching parent-aware shared preclaim path below; an inner transaction
+    // has no standalone signature to validate here.
+    if parent_batch_id.is_some() {
+        return if tx.is_flag(tfInnerBatchTxn) {
+            Ter::TES_SUCCESS
+        } else {
+            Ter::TEM_INVALID_INNER_BATCH
+        };
     }
 
     match tx.check_sign(rules) {
@@ -1726,11 +1769,24 @@ pub(crate) fn queue_apply_preclaim_ter(
     current_ledger_seq: u32,
     flags: ApplyFlags,
 ) -> Ter {
-    crate::state::invoke_preclaim::invoke_preclaim(
+    queue_apply_preclaim_ter_with_parent_batch_id(view, tx, current_ledger_seq, flags, None)
+}
+
+/// Shared immutable preclaim with the same parent Batch context passed by
+/// `rippled::applySteps.cpp::preclaim` into `PreclaimContext`.
+fn queue_apply_preclaim_ter_with_parent_batch_id(
+    view: &impl ReadView,
+    tx: &STTx,
+    current_ledger_seq: u32,
+    flags: ApplyFlags,
+    parent_batch_id: Option<Uint256>,
+) -> Ter {
+    crate::state::invoke_preclaim::invoke_preclaim_with_parent_batch_id(
         view,
         tx,
         current_ledger_seq,
         flags,
+        parent_batch_id,
         || fee_drops_as_i64(calculate_sttx_base_fee(view, tx)),
         |base_fee| base_fee,
         || {
@@ -2207,11 +2263,26 @@ fn apply_submit_transactor_shell_with_flags_and_delivered_amount<V: ledger::Appl
     txn_type: TxType,
     flags: ApplyFlags,
 ) -> (Ter, Option<STAmount>) {
+    let outcome =
+        apply_submit_transactor_shell_with_flags_and_batch_outcome(view, tx, txn_type, flags);
+    (outcome.result, outcome.delivered_amount)
+}
+
+fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyView>(
+    view: &mut V,
+    tx: &STTx,
+    txn_type: TxType,
+    flags: ApplyFlags,
+) -> SubmitApplyOutcome {
     // An inner Batch transaction is valid only while its parent Batch applies
     // it through apply_submit_batch_followup. Never allow one through the
     // standalone transaction entry point.
     if txn_type != TxType::BATCH && tx.is_flag(tfInnerBatchTxn) {
-        return (Ter::TEM_INVALID_INNER_BATCH, None);
+        return SubmitApplyOutcome {
+            result: Ter::TEM_INVALID_INNER_BATCH,
+            delivered_amount: None,
+            applied_batch_inner_transactions: Vec::new(),
+        };
     }
 
     let rules = view.rules();
@@ -2222,11 +2293,19 @@ fn apply_submit_transactor_shell_with_flags_and_delivered_amount<V: ledger::Appl
     if txn_type == TxType::BATCH {
         let preflight = transaction_preflight_ter(tx, &rules);
         if !is_tes_success(preflight) {
-            return (preflight, None);
+            return SubmitApplyOutcome {
+                result: preflight,
+                delivered_amount: None,
+                applied_batch_inner_transactions: Vec::new(),
+            };
         }
         let preclaim = batch_preclaim_ter(view, tx, flags);
         if !is_tes_success(preclaim) {
-            return (preclaim, None);
+            return SubmitApplyOutcome {
+                result: preclaim,
+                delivered_amount: None,
+                applied_batch_inner_transactions: Vec::new(),
+            };
         }
     }
 
@@ -2244,8 +2323,8 @@ fn apply_submit_transactor_shell_with_flags_and_delivered_amount<V: ledger::Appl
         // transaction boundary; retain the same atomicity here by dropping the
         // unapplied FlowSandbox and reporting tefEXCEPTION.
         let mut tx_view = ledger::FlowSandbox::new_with_flags(view, flags);
-        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_submit_transactor_shell_impl(&mut tx_view, tx, txn_type, true)
+        let mut result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            apply_submit_transactor_shell_impl(&mut tx_view, tx, txn_type)
         })) {
             Ok(result) => result,
             Err(payload) => {
@@ -2265,16 +2344,38 @@ fn apply_submit_transactor_shell_with_flags_and_delivered_amount<V: ledger::Appl
                     %message,
                     "transaction execution panicked; mapped to tefEXCEPTION"
                 );
-                return (Ter::TEF_EXCEPTION, None);
+                return SubmitApplyOutcome {
+                    result: Ter::TEF_EXCEPTION,
+                    delivered_amount: None,
+                    applied_batch_inner_transactions: Vec::new(),
+                };
             }
         };
+
+        // `rippled::applyTransaction` applies the outer Batch first, then
+        // `applyBatchTransactions` performs the inner shared lifecycle in a
+        // whole-batch view. Keep that outcome separate until outer application
+        // has succeeded and acceptance can serialize all metadata together.
+        let mut applied_batch_inner_transactions = Vec::new();
+        if is_tes_success(result) && txn_type == TxType::BATCH {
+            let followup = apply_submit_batch_followup(&mut tx_view, tx);
+            result = followup.result;
+            applied_batch_inner_transactions = followup.applied_inner_transactions;
+        }
+
         if is_tes_success(result) || is_tec_claim(result) {
             let _ = tx_view.apply();
+        } else {
+            applied_batch_inner_transactions.clear();
         }
         let delivered_amount = delivered_amount_capture
             .map(crate::state::payment::MptDeliveredAmountCapture::finish)
             .flatten();
-        (result, delivered_amount)
+        SubmitApplyOutcome {
+            result,
+            delivered_amount,
+            applied_batch_inner_transactions,
+        }
     })
 }
 
@@ -2282,7 +2383,6 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
     view: &mut ledger::FlowSandbox<'_, V>,
     tx: &STTx,
     txn_type: TxType,
-    run_batch_followup: bool,
 ) -> Ter {
     let account_field = get_field_by_symbol("sfAccount");
 
@@ -2580,7 +2680,7 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             let _ = view.destroy_xrp(XRPAmount::from_drops(fee_drops));
         }
     }
-    let mut ter = {
+    let ter = {
         // that failed to fully cross), discard all transactor state changes but keep the
         // fee deduction and sequence consumption that were already applied above.
         // We achieve this by running handle_real_dispatch in a nested FlowSandbox and
@@ -2804,47 +2904,100 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
         result
     };
 
-    if run_batch_followup && is_tes_success(ter) && txn_type == TxType::BATCH {
-        ter = apply_submit_batch_followup(view, tx);
-    }
-
     ter
 }
 
+/// Implements `rippled/src/libxrpl/tx/apply.cpp::applyBatchTransactions`.
+/// Each inner transaction must use the same semantic preflight and immutable
+/// preclaim admission path as a standalone transaction, but with the parent
+/// batch ID and TapBatch context carried through both phases.
 fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
     view: &mut ledger::FlowSandbox<'_, V>,
     batch_tx: &STTx,
-) -> Ter {
+) -> BatchFollowupOutcome {
     let batch_mode = BatchTransactionFlags::from_bits(batch_tx.get_flags());
+    let parent_batch_id = batch_tx.get_transaction_id();
     let mut whole_batch = ledger::FlowSandbox::new(view);
-    let mut applied = 0_usize;
+    let mut applied_inner_transactions = Vec::new();
 
     let inner_transactions = match tx::canonical_batch_inner_transactions(batch_tx) {
         Ok(inner_transactions) => inner_transactions,
-        Err(error) => return error,
+        Err(error) => {
+            return BatchFollowupOutcome {
+                result: error,
+                applied_inner_transactions,
+            };
+        }
     };
 
     for inner_tx in inner_transactions {
         let whole_batch_view: &mut dyn ledger::ApplyView = &mut whole_batch;
-        let mut per_tx_batch_view = ledger::FlowSandbox::new(whole_batch_view);
-        let result = apply_submit_transactor_shell_impl(
-            &mut per_tx_batch_view,
+        // This is rippled's `OpenView(kBatchView, batchView)` followed by
+        // `apply(..., parentBatchId, tx, TapBatch, ...)`, not a dry-run or a
+        // direct transactor dispatch substitute.
+        let mut per_tx_batch_view =
+            ledger::FlowSandbox::new_with_flags(whole_batch_view, ApplyFlags::BATCH);
+        let rules = per_tx_batch_view.rules();
+        let preflight = transaction_preflight_ter_with_parent_batch_id(
             &inner_tx,
-            inner_tx.get_txn_type(),
-            false,
+            &rules,
+            Some(parent_batch_id),
         );
+        let preclaim = if is_tes_success(preflight) {
+            queue_apply_preclaim_ter_with_parent_batch_id(
+                &per_tx_batch_view,
+                &inner_tx,
+                per_tx_batch_view.seq(),
+                ApplyFlags::BATCH,
+                Some(parent_batch_id),
+            )
+        } else {
+            preflight
+        };
+        let result = if is_tes_success(preclaim) {
+            // Each inner transaction has its own ApplyContext metadata in
+            // rippled. Keep delivery capture local to this inner, never the
+            // outer Batch, before the whole-batch view is committed.
+            let delivered_amount_capture = (inner_tx.get_txn_type() == TxType::PAYMENT)
+                .then(crate::state::payment::MptDeliveredAmountCapture::new);
+            let result = apply_submit_transactor_shell_impl(
+                &mut per_tx_batch_view,
+                &inner_tx,
+                inner_tx.get_txn_type(),
+            );
+            let delivered_amount = delivered_amount_capture
+                .map(crate::state::payment::MptDeliveredAmountCapture::finish)
+                .flatten();
+            (result, delivered_amount)
+        } else {
+            (preclaim, None)
+        };
+        let (result, delivered_amount) = result;
         let inner_applied = is_tes_success(result) || is_tec_claim(result);
 
         if inner_applied {
             if per_tx_batch_view.apply().is_err() {
-                return Ter::TEF_INTERNAL;
+                return BatchFollowupOutcome {
+                    result: Ter::TEF_INTERNAL,
+                    applied_inner_transactions: Vec::new(),
+                };
             }
-            applied += 1;
+            applied_inner_transactions.push(AppliedBatchInnerTransaction {
+                transaction: inner_tx,
+                result,
+                delivered_amount,
+                parent_batch_id,
+            });
         }
 
         if !is_tes_success(result) {
             if batch_mode.contains(BatchTransactionFlags::ALL_OR_NOTHING) {
-                return Ter::TES_SUCCESS;
+                // Do not expose any individually-applied result: dropping the
+                // whole-batch view atomically discards every inner mutation.
+                return BatchFollowupOutcome {
+                    result: Ter::TES_SUCCESS,
+                    applied_inner_transactions: Vec::new(),
+                };
             }
 
             if batch_mode.contains(BatchTransactionFlags::UNTIL_FAILURE) {
@@ -2855,11 +3008,46 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
         }
     }
 
-    if applied != 0 && whole_batch.apply().is_err() {
-        return Ter::TEF_INTERNAL;
+    if !applied_inner_transactions.is_empty() && whole_batch.apply().is_err() {
+        return BatchFollowupOutcome {
+            result: Ter::TEF_INTERNAL,
+            applied_inner_transactions: Vec::new(),
+        };
     }
 
-    Ter::TES_SUCCESS
+    BatchFollowupOutcome {
+        result: Ter::TES_SUCCESS,
+        applied_inner_transactions,
+    }
+}
+
+/// Serializes every applied inner transaction only after its whole-batch view
+/// is committed. This is the `TxMeta::setParentBatchID(parentBatchId)` effect
+/// from rippled's `ApplyStateTable::apply` for each independently applied inner.
+fn stage_accepted_batch_inner_transactions(
+    accepted_entries: &mut Vec<StandaloneAcceptedTx>,
+    inner_transactions: Vec<AppliedBatchInnerTransaction>,
+    closed_seq: u32,
+) {
+    for inner in inner_transactions {
+        let index = accepted_entries.len() as u32;
+        let transaction_id = inner.transaction.get_transaction_id();
+        let mut meta = protocol::TxMeta::new(transaction_id, closed_seq);
+        meta.set_delivered_amount(inner.delivered_amount);
+        meta.set_parent_batch_id(Some(inner.parent_batch_id));
+        let delta_meta_nodes = meta.get_nodes().json(protocol::JsonOptions::NONE);
+        let mut serializer = protocol::Serializer::default();
+        meta.add_raw(&mut serializer, inner.result, index);
+
+        accepted_entries.push(StandaloneAcceptedTx {
+            transaction_id,
+            txn: Arc::new(protocol::Serializer::from_bytes(
+                inner.transaction.get_serializer().data(),
+            )),
+            metadata: Arc::new(serializer),
+            delta_meta_nodes,
+        });
+    }
 }
 
 impl
@@ -7570,10 +7758,15 @@ impl ApplicationRoot {
             let txn_type = st_tx.get_txn_type();
             // Use the full transactor lifecycle (preflight + sequence + fee + doApply)
             // matching what the open ledger does during submit.
-            let (result, delivered_amount) = apply_submit_transactor_shell_with_delivered_amount(
+            let SubmitApplyOutcome {
+                result,
+                delivered_amount,
+                applied_batch_inner_transactions,
+            } = apply_submit_transactor_shell_with_flags_and_batch_outcome(
                 &mut state_view,
                 st_tx,
                 txn_type,
+                ApplyFlags::NONE,
             );
             let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
             if applied {
@@ -7598,6 +7791,11 @@ impl ApplicationRoot {
                     metadata: Arc::new(serializer),
                     delta_meta_nodes,
                 });
+                stage_accepted_batch_inner_transactions(
+                    &mut accepted_entries,
+                    applied_batch_inner_transactions,
+                    closed_seq,
+                );
             }
         }
 
@@ -7972,28 +8170,33 @@ impl ApplicationRoot {
                 } else {
                     preflight
                 };
-                let (result, delivered_amount) = if is_tes_success(preclaim) {
+                let (result, delivered_amount, applied_batch_inner_transactions) = if is_tes_success(
+                    preclaim,
+                ) {
                     let mut attempt_view =
                         ledger::FlowSandbox::new_with_flags(&mut *view, retry_flags);
-                    let (result, delivered_amount) =
-                        apply_submit_transactor_shell_with_flags_and_delivered_amount(
-                            &mut attempt_view,
-                            &sttx,
-                            txn_type,
-                            retry_flags,
-                        );
+                    let SubmitApplyOutcome {
+                        result,
+                        delivered_amount,
+                        applied_batch_inner_transactions,
+                    } = apply_submit_transactor_shell_with_flags_and_batch_outcome(
+                        &mut attempt_view,
+                        &sttx,
+                        txn_type,
+                        retry_flags,
+                    );
                     if protocol::is_tes_success(result) || protocol::is_tec_claim(result) {
                         attempt_view
-                            .apply_with_tx_thread(transaction_id, closed_seq, &rules)
-                            .map_err(|error| {
-                                crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
-                                    "failed to thread accepted transaction {transaction_id}: {error:?}"
-                                ))
-                            })?;
+                                .apply_with_tx_thread(transaction_id, closed_seq, &rules)
+                                .map_err(|error| {
+                                    crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
+                                        "failed to thread accepted transaction {transaction_id}: {error:?}"
+                                    ))
+                                })?;
                     }
-                    (result, delivered_amount)
+                    (result, delivered_amount, applied_batch_inner_transactions)
                 } else {
-                    (preclaim, None)
+                    (preclaim, None, Vec::new())
                 };
                 let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
                 drop(view);
@@ -8035,6 +8238,11 @@ impl ApplicationRoot {
                     metadata: Arc::new(serializer),
                     delta_meta_nodes,
                 });
+                stage_accepted_batch_inner_transactions(
+                    &mut accepted_entries,
+                    applied_batch_inner_transactions,
+                    closed_seq,
+                );
             }
 
             tracing::debug!(

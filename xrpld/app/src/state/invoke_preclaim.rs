@@ -62,6 +62,47 @@ where
     MinimumFee: FnOnce(i64) -> i64,
     TypedPreclaimTail: FnOnce() -> Ter,
 {
+    invoke_preclaim_with_parent_batch_id(
+        view,
+        tx,
+        current_ledger_seq,
+        flags,
+        None,
+        calculate_base_fee,
+        minimum_fee,
+        typed_preclaim_tail,
+    )
+}
+
+/// Shared `invokePreclaim` with the `parentBatchId` carried by
+/// `applySteps.cpp::preclaim` into `PreclaimContext`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn invoke_preclaim_with_parent_batch_id<
+    V,
+    CalculateBaseFee,
+    MinimumFee,
+    TypedPreclaimTail,
+>(
+    view: &V,
+    tx: &STTx,
+    current_ledger_seq: u32,
+    flags: ApplyFlags,
+    parent_batch_id: Option<Uint256>,
+    calculate_base_fee: CalculateBaseFee,
+    minimum_fee: MinimumFee,
+    typed_preclaim_tail: TypedPreclaimTail,
+) -> Ter
+where
+    V: ReadView,
+    CalculateBaseFee: FnOnce() -> i64,
+    MinimumFee: FnOnce(i64) -> i64,
+    TypedPreclaimTail: FnOnce() -> Ter,
+{
+    debug_assert!(
+        parent_batch_id.is_none() || (flags & ApplyFlags::BATCH) == ApplyFlags::BATCH,
+        "rippled applySteps.cpp::preclaim requires TapBatch whenever parentBatchId is present"
+    );
+
     let adapted = LedgerPreclaimTx { tx };
     let account_is_zero = tx.get_account_id(sf("sfAccount")).is_zero();
 
@@ -100,10 +141,10 @@ where
         || {
             if tx.get_txn_type() == protocol::TxType::LOAN_SET {
                 check_loan_set_counterparty_sign(view, tx, flags, || {
-                    check_ledger_signer_authorization(view, &adapted, flags)
+                    check_ledger_signer_authorization(view, &adapted, flags, parent_batch_id)
                 })
             } else {
-                check_ledger_signer_authorization(view, &adapted, flags)
+                check_ledger_signer_authorization(view, &adapted, flags, parent_batch_id)
             }
         },
         calculate_base_fee,
@@ -787,6 +828,7 @@ fn check_ledger_signer_authorization<V: ReadView>(
     view: &V,
     tx: &LedgerPreclaimTx<'_>,
     flags: ApplyFlags,
+    parent_batch_id: Option<Uint256>,
 ) -> NotTec {
     // Batch owns a distinct ledger-backed BatchSigners authorization tail.
     // Do not feed its intentionally empty outer SigningPubKey through the
@@ -795,17 +837,17 @@ fn check_ledger_signer_authorization<V: ReadView>(
         return Ter::TES_SUCCESS;
     }
 
-    // The preflight caller validates cryptographic signatures. This step is
-    // deliberately separate: it validates that those keys are authorized by
-    // the current ledger's account root or signer list.
-    if tx.tx.check_sign(&view.rules()).is_err() {
+    // `applySteps.cpp::preclaim` carries parentBatchId into PreclaimContext.
+    // Its inner Batch signer path rejects any embedded signature fields and
+    // otherwise bypasses ordinary transaction-signature verification.
+    if parent_batch_id.is_none() && tx.tx.check_sign(&view.rules()).is_err() {
         return Ter::TEM_BAD_SIGNATURE;
     }
 
     let signature = LedgerSignatureObject { tx: tx.tx };
     run_transactor_preclaim_check_sign(
         flags,
-        false,
+        parent_batch_id.is_some(),
         view.rules().enabled(&feature_batch()),
         view.rules().enabled(&feature_lending_protocol()),
         tx,

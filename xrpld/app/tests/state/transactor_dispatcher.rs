@@ -5816,6 +5816,53 @@ fn batch_submit_shell_applies_all_successful_inner_transactions() {
     );
 }
 
+/// Parity: `../rippled/src/libxrpl/tx/transactors/system/Batch.cpp::Batch::preflight`
+/// rejects non-empty inner `SigningPubKey`, and
+/// `../rippled/src/libxrpl/tx/apply.cpp::applyBatchTransactions` reaches each
+/// inner through `apply(..., parentBatchId, tx, TapBatch, ...)` before mutation.
+#[test]
+fn batch_submit_shell_rejects_invalid_inner_signature_before_mutating_batch_state() {
+    let account = sample_account(0x63);
+    let destination = sample_account(0x64);
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(account, 0, 0, 1_000_000),
+        account_root_with_balance(destination, 0, 0, 1_000_000),
+    ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("Batch")]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let first = inner_batch_payment_tx(account, destination, 2, 100);
+    let mut invalid_inner = inner_batch_payment_tx(account, destination, 3, 200);
+    invalid_inner.set_field_vl(get_field_by_symbol("sfSigningPubKey"), &[0x02; 33]);
+    let batch = batch_tx_with_inner(account, protocol::tfAllOrNothing, &[first, invalid_inner]);
+
+    let result = apply_submit_transactor_shell(&mut view, &batch, TxType::BATCH);
+
+    assert_eq!(result, Ter::TEM_BAD_REGKEY);
+    let source = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("source read should succeed")
+        .expect("source should exist");
+    let destination = view
+        .read(account_keylet(raw_account_id(destination)))
+        .expect("destination read should succeed")
+        .expect("destination should exist");
+    assert_eq!(source.get_field_u32(get_field_by_symbol("sfSequence")), 1);
+    assert_eq!(
+        source
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops(),
+        1_000_000
+    );
+    assert_eq!(
+        destination
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops(),
+        1_000_000
+    );
+}
+
 #[test]
 fn batch_submit_shell_discards_inner_changes_in_all_or_nothing_mode() {
     let account = sample_account(0x63);

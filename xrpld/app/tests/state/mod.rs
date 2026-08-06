@@ -1,3 +1,6 @@
+#[path = "accept_ledger_pending_apply.rs"]
+mod accept_ledger_pending_apply;
+
 #[path = "application_open_ledger_txq.rs"]
 mod application_open_ledger_txq;
 

@@ -187,6 +187,42 @@ fn replayer_reuses_skip_lists_and_creates_delta_slots() {
 }
 
 #[test]
+fn replayer_routes_a_publication_gap_once_and_rejects_it_after_shutdown() {
+    // Parity: ../rippled/src/xrpld/app/ledger/detail/LedgerMaster.cpp::
+    // findNewLedgersToPublish routes an unrecoverable publication gap to
+    // LedgerReplayer::replay(InboundLedger::Reason::GENERIC, finishHash, count).
+    // LedgerReplayer.cpp::LedgerReplayer::replay then merges a nested request
+    // and rejects new work while the application is stopping.
+    let cfg = config();
+    let genesis = Ledger::create_genesis(false, &cfg, []).expect("genesis should build");
+    let mut finish = Ledger::from_previous(&genesis, 10);
+    finish.update_skip_list().expect("skip list should update");
+    let finish_hash = *finish.header().hash.as_uint256();
+    let mut replayer = LedgerReplayer::new(Arc::new(SimplePeerSetBuilder::new(Vec::new())));
+
+    let first = replayer
+        .replay(InboundLedgerReason::Generic, finish_hash, 2)
+        .expect("the publication gap should create one replay task");
+    assert_eq!(replayer.tasks_len(), 1);
+    assert!(
+        replayer
+            .replay(InboundLedgerReason::Generic, finish_hash, 1)
+            .is_none(),
+        "a nested gap must merge into the active task instead of duplicating acquisition"
+    );
+
+    replayer.stop();
+
+    assert!(first.lock().expect("task lock").is_stopped());
+    assert!(
+        replayer
+            .replay(InboundLedgerReason::Generic, finish_hash, 2)
+            .is_none(),
+        "publication advancement must not create replay work after shutdown begins"
+    );
+}
+
+#[test]
 fn replayer_stop_propagates_to_active_tasks_shutdown() {
     let cfg = config();
     let genesis = Ledger::create_genesis(false, &cfg, []).expect("genesis should build");
