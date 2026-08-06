@@ -1,8 +1,9 @@
 use super::{
     AcceptLedgerPendingRuntime, AcceptLedgerPendingTransaction, AppOpenLedgerTxQApplyRuntime,
-    ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, apply_submit_transactor_shell,
-    batch_base_fee, consensus_status_event, preferred_lcl_matches_local_or_parent,
-    queue_apply_preclaim_ter, typed_preclaim_ter,
+    ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, TypedPreclaimRoute,
+    UNVERIFIED_TYPED_PRECLAIM_TER, apply_submit_transactor_shell, batch_base_fee,
+    consensus_status_event, preferred_lcl_matches_local_or_parent, queue_apply_preclaim_ter,
+    typed_preclaim_route, typed_preclaim_ter,
 };
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::network::network_ops_runtime::AppNetworkOpsApplyHeldOutcome;
@@ -3260,6 +3261,175 @@ fn open_ledger_batch_preflight_rejects_sponsorship_before_direct_apply() {
     assert_eq!(
         open_ledger_batch_preflight_result(fee_sponsored),
         Ter::TEM_INVALID_FLAG
+    );
+}
+
+#[test]
+fn typed_preclaim_dispatcher_covers_all_80_routed_quaxar_types() {
+    use TypedPreclaimRoute::{
+        AppAuditedNoop, AppReadViewHelper, BatchSpecialPreclaim, BridgeDomainAuditedNoop,
+        BridgeDomainReadViewHelper, DexReadViewHelper, FailClosed, LoanReadViewHelper,
+        NfTokenReadViewHelper, TokenAuditedNoop, TokenReadViewHelper, VaultReadViewHelper,
+    };
+
+    // Keep this table in protocol dispatch order. It is deliberately explicit:
+    // adding a routed TxType requires an audited helper/no-op/fail-closed route.
+    let cases = [
+        (TxType::PAYMENT, AppReadViewHelper),
+        (TxType::ESCROW_CREATE, AppReadViewHelper),
+        (TxType::ESCROW_FINISH, AppReadViewHelper),
+        (TxType::ACCOUNT_SET, AppReadViewHelper),
+        (TxType::ESCROW_CANCEL, AppReadViewHelper),
+        (TxType::REGULAR_KEY_SET, AppAuditedNoop),
+        (TxType::OFFER_CREATE, DexReadViewHelper),
+        (TxType::OFFER_CANCEL, DexReadViewHelper),
+        (TxType::TICKET_CREATE, FailClosed),
+        (TxType::SIGNER_LIST_SET, AppAuditedNoop),
+        (TxType::PAYCHAN_CREATE, AppReadViewHelper),
+        (TxType::PAYCHAN_FUND, AppAuditedNoop),
+        (TxType::PAYCHAN_CLAIM, AppReadViewHelper),
+        (TxType::CHECK_CREATE, AppReadViewHelper),
+        (TxType::CHECK_CASH, AppReadViewHelper),
+        (TxType::CHECK_CANCEL, AppReadViewHelper),
+        (TxType::DEPOSIT_PREAUTH, AppReadViewHelper),
+        (TxType::TRUST_SET, TokenReadViewHelper),
+        (TxType::ACCOUNT_DELETE, AppReadViewHelper),
+        (TxType::NFTOKEN_MINT, NfTokenReadViewHelper),
+        (TxType::NFTOKEN_BURN, NfTokenReadViewHelper),
+        (TxType::NFTOKEN_CREATE_OFFER, NfTokenReadViewHelper),
+        (TxType::NFTOKEN_CANCEL_OFFER, NfTokenReadViewHelper),
+        (TxType::NFTOKEN_ACCEPT_OFFER, NfTokenReadViewHelper),
+        (TxType::CLAWBACK, TokenReadViewHelper),
+        (TxType::AMM_CLAWBACK, DexReadViewHelper),
+        (TxType::AMM_CREATE, DexReadViewHelper),
+        (TxType::AMM_DEPOSIT, FailClosed),
+        (TxType::AMM_WITHDRAW, FailClosed),
+        (TxType::AMM_VOTE, DexReadViewHelper),
+        (TxType::AMM_BID, DexReadViewHelper),
+        (TxType::AMM_DELETE, DexReadViewHelper),
+        (TxType::XCHAIN_CREATE_CLAIM_ID, BridgeDomainReadViewHelper),
+        (TxType::XCHAIN_COMMIT, BridgeDomainReadViewHelper),
+        (TxType::XCHAIN_CLAIM, BridgeDomainReadViewHelper),
+        (
+            TxType::XCHAIN_ACCOUNT_CREATE_COMMIT,
+            BridgeDomainReadViewHelper,
+        ),
+        (
+            TxType::XCHAIN_ADD_CLAIM_ATTESTATION,
+            BridgeDomainReadViewHelper,
+        ),
+        (
+            TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION,
+            BridgeDomainReadViewHelper,
+        ),
+        (TxType::XCHAIN_MODIFY_BRIDGE, BridgeDomainReadViewHelper),
+        (TxType::XCHAIN_CREATE_BRIDGE, BridgeDomainReadViewHelper),
+        (TxType::DID_SET, BridgeDomainAuditedNoop),
+        (TxType::DID_DELETE, BridgeDomainAuditedNoop),
+        (TxType::ORACLE_SET, BridgeDomainReadViewHelper),
+        (TxType::ORACLE_DELETE, BridgeDomainReadViewHelper),
+        (TxType::LEDGER_STATE_FIX, FailClosed),
+        (TxType::MPTOKEN_ISSUANCE_CREATE, TokenAuditedNoop),
+        (TxType::MPTOKEN_ISSUANCE_DESTROY, TokenReadViewHelper),
+        (TxType::MPTOKEN_ISSUANCE_SET, TokenReadViewHelper),
+        (TxType::MPTOKEN_AUTHORIZE, TokenReadViewHelper),
+        (TxType::CREDENTIAL_CREATE, BridgeDomainReadViewHelper),
+        (TxType::CREDENTIAL_ACCEPT, BridgeDomainReadViewHelper),
+        (TxType::CREDENTIAL_DELETE, BridgeDomainReadViewHelper),
+        (TxType::NFTOKEN_MODIFY, NfTokenReadViewHelper),
+        (TxType::PERMISSIONED_DOMAIN_SET, BridgeDomainReadViewHelper),
+        (
+            TxType::PERMISSIONED_DOMAIN_DELETE,
+            BridgeDomainReadViewHelper,
+        ),
+        (TxType::DELEGATE_SET, AppReadViewHelper),
+        (TxType::VAULT_CREATE, VaultReadViewHelper),
+        (TxType::VAULT_SET, VaultReadViewHelper),
+        (TxType::VAULT_DELETE, VaultReadViewHelper),
+        (TxType::VAULT_DEPOSIT, VaultReadViewHelper),
+        (TxType::VAULT_WITHDRAW, VaultReadViewHelper),
+        (TxType::VAULT_CLAWBACK, VaultReadViewHelper),
+        (TxType::BATCH, BatchSpecialPreclaim),
+        (TxType::LOAN_BROKER_SET, LoanReadViewHelper),
+        (TxType::LOAN_BROKER_DELETE, LoanReadViewHelper),
+        (TxType::LOAN_BROKER_COVER_DEPOSIT, LoanReadViewHelper),
+        (TxType::LOAN_BROKER_COVER_WITHDRAW, LoanReadViewHelper),
+        (TxType::LOAN_BROKER_COVER_CLAWBACK, LoanReadViewHelper),
+        (TxType::LOAN_SET, LoanReadViewHelper),
+        (TxType::LOAN_DELETE, LoanReadViewHelper),
+        (TxType::LOAN_MANAGE, LoanReadViewHelper),
+        (TxType::LOAN_PAY, LoanReadViewHelper),
+        (TxType::CONFIDENTIAL_MPT_CONVERT, FailClosed),
+        (TxType::CONFIDENTIAL_MPT_MERGE_INBOX, FailClosed),
+        (TxType::CONFIDENTIAL_MPT_CONVERT_BACK, FailClosed),
+        (TxType::CONFIDENTIAL_MPT_SEND, FailClosed),
+        (TxType::CONFIDENTIAL_MPT_CLAWBACK, FailClosed),
+        (TxType::AMENDMENT, FailClosed),
+        (TxType::FEE, FailClosed),
+        (TxType::UNL_MODIFY, FailClosed),
+    ];
+
+    assert_eq!(
+        cases.len(),
+        80,
+        "coverage table must enumerate all routed types"
+    );
+    let routed = cases
+        .iter()
+        .map(|(txn_type, _)| *txn_type)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        routed.len(),
+        80,
+        "each routed type must appear exactly once"
+    );
+    assert!(
+        routed.iter().all(|txn_type| txn_type.is_dispatchable()),
+        "coverage must contain only routed protocol transaction types"
+    );
+
+    for (txn_type, expected_route) in cases {
+        assert_eq!(
+            typed_preclaim_route(txn_type),
+            expected_route,
+            "{}",
+            txn_type.format_name().unwrap_or("unknown")
+        );
+    }
+
+    let uncovered = cases
+        .iter()
+        .filter_map(|(txn_type, route)| (*route == FailClosed).then_some(*txn_type))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        uncovered,
+        vec![
+            TxType::TICKET_CREATE,
+            TxType::AMM_DEPOSIT,
+            TxType::AMM_WITHDRAW,
+            TxType::LEDGER_STATE_FIX,
+            TxType::CONFIDENTIAL_MPT_CONVERT,
+            TxType::CONFIDENTIAL_MPT_MERGE_INBOX,
+            TxType::CONFIDENTIAL_MPT_CONVERT_BACK,
+            TxType::CONFIDENTIAL_MPT_SEND,
+            TxType::CONFIDENTIAL_MPT_CLAWBACK,
+            TxType::AMENDMENT,
+            TxType::FEE,
+            TxType::UNL_MODIFY,
+        ],
+        "the explicit fail-closed set must remain auditable"
+    );
+
+    // Some fail-closed protocol routes have no STTx format yet (the
+    // Confidential-MPT family), so route coverage above is the construction-
+    // independent guard. Verify the shared dispatcher result on a constructible
+    // routed type that lacks a registered immutable helper.
+    let view = Ledger::from_ledger_seq_and_close_time(1, 0, false);
+    let tx = STTx::new(TxType::AMM_DEPOSIT, |_| {});
+    assert_eq!(
+        typed_preclaim_ter(&view, &tx, ApplyFlags::NONE),
+        UNVERIFIED_TYPED_PRECLAIM_TER,
+        "AMMDeposit must fail closed rather than defaulting to tesSUCCESS"
     );
 }
 

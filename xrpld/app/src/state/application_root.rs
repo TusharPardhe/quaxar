@@ -1539,12 +1539,8 @@ fn queue_apply_preclaim_ter(
     current_ledger_seq: u32,
     flags: ApplyFlags,
 ) -> Ter {
-    if tx.get_txn_type() != TxType::BATCH
-        && AcceptLedgerPendingRuntime::is_system_transaction(tx.get_txn_type())
-    {
-        return Ter::TES_SUCCESS;
-    }
-
+    // Do not bypass the shared typed dispatcher for system types. Any routed
+    // type without a verified immutable helper must fail closed below.
     let preclaim_tx = QueueApplyPreclaimTx { tx };
 
     let seq_check = tx::run_transactor_check_seq_proxy(
@@ -1597,41 +1593,173 @@ fn queue_apply_preclaim_ter(
         return typed_preclaim;
     }
 
-    batch_preclaim_ter(view, tx, flags)
+    if tx.get_txn_type() == TxType::BATCH {
+        batch_preclaim_ter(view, tx, flags)
+    } else {
+        Ter::TES_SUCCESS
+    }
 }
 
-fn typed_preclaim_ter(view: &impl ReadView, tx: &STTx, _flags: ApplyFlags) -> Ter {
-    match tx.get_txn_type() {
-        TxType::PAYMENT => {
-            tx::run_payment_preclaim_with_read_view(view, tx).unwrap_or(Ter::TEF_BAD_LEDGER)
+/// Explicit classification for every routed Quaxar transaction type's typed
+/// preclaim tail.  A route may only name an already-compiled immutable
+/// ReadView helper, an audited rippled inherited no-op owned by such a helper,
+/// the existing Batch special preclaim, or the fail-closed result below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypedPreclaimRoute {
+    AppReadViewHelper,
+    AppAuditedNoop,
+    DexReadViewHelper,
+    LoanReadViewHelper,
+    NfTokenReadViewHelper,
+    TokenReadViewHelper,
+    TokenAuditedNoop,
+    VaultReadViewHelper,
+    BridgeDomainReadViewHelper,
+    BridgeDomainAuditedNoop,
+    BatchSpecialPreclaim,
+    FailClosed,
+}
+
+const UNVERIFIED_TYPED_PRECLAIM_TER: Ter = tx::UNKNOWN_TRANSACTION_TYPE_TER;
+
+fn typed_preclaim_route(txn_type: TxType) -> TypedPreclaimRoute {
+    match txn_type {
+        TxType::ACCOUNT_SET
+        | TxType::ACCOUNT_DELETE
+        | TxType::DELEGATE_SET
+        | TxType::DEPOSIT_PREAUTH
+        | TxType::PAYMENT
+        | TxType::PAYCHAN_CREATE
+        | TxType::PAYCHAN_CLAIM
+        | TxType::CHECK_CREATE
+        | TxType::CHECK_CASH
+        | TxType::CHECK_CANCEL
+        | TxType::ESCROW_CREATE
+        | TxType::ESCROW_FINISH
+        | TxType::ESCROW_CANCEL => TypedPreclaimRoute::AppReadViewHelper,
+        // These are explicit no-op arms inside the existing application
+        // ReadView helper because their rippled transactors inherit
+        // Transactor::preclaim unchanged.
+        TxType::REGULAR_KEY_SET | TxType::SIGNER_LIST_SET | TxType::PAYCHAN_FUND => {
+            TypedPreclaimRoute::AppAuditedNoop
         }
-        TxType::PAYCHAN_CREATE => tx::run_payment_channel_create_preclaim_with_read_view(view, tx)
-            .unwrap_or(Ter::TEF_BAD_LEDGER),
-        TxType::CREDENTIAL_CREATE => ledger::credential_helpers::credential_create_preclaim(
-            view,
-            tx.get_account_id(get_field_by_symbol("sfSubject")),
-            tx.get_account_id(get_field_by_symbol("sfAccount")),
-            &tx.get_field_vl(get_field_by_symbol("sfCredentialType")),
-        )
-        .unwrap_or(Ter::TEF_BAD_LEDGER),
-        TxType::CREDENTIAL_ACCEPT => ledger::credential_helpers::credential_accept_preclaim(
-            view,
-            tx.get_account_id(get_field_by_symbol("sfAccount")),
-            tx.get_account_id(get_field_by_symbol("sfIssuer")),
-            &tx.get_field_vl(get_field_by_symbol("sfCredentialType")),
-        )
-        .unwrap_or(Ter::TEF_BAD_LEDGER),
-        TxType::CREDENTIAL_DELETE => ledger::credential_helpers::credential_delete_preclaim(
-            view,
-            tx.get_account_id(get_field_by_symbol("sfAccount")),
-            tx.is_field_present(get_field_by_symbol("sfSubject"))
-                .then(|| tx.get_account_id(get_field_by_symbol("sfSubject"))),
-            tx.is_field_present(get_field_by_symbol("sfIssuer"))
-                .then(|| tx.get_account_id(get_field_by_symbol("sfIssuer"))),
-            &tx.get_field_vl(get_field_by_symbol("sfCredentialType")),
-        )
-        .unwrap_or(Ter::TEF_BAD_LEDGER),
-        _ => Ter::TES_SUCCESS,
+        TxType::OFFER_CREATE
+        | TxType::OFFER_CANCEL
+        | TxType::AMM_CREATE
+        | TxType::AMM_VOTE
+        | TxType::AMM_BID
+        | TxType::AMM_DELETE
+        | TxType::AMM_CLAWBACK => TypedPreclaimRoute::DexReadViewHelper,
+        TxType::LOAN_SET
+        | TxType::LOAN_MANAGE
+        | TxType::LOAN_PAY
+        | TxType::LOAN_DELETE
+        | TxType::LOAN_BROKER_SET
+        | TxType::LOAN_BROKER_DELETE
+        | TxType::LOAN_BROKER_COVER_DEPOSIT
+        | TxType::LOAN_BROKER_COVER_WITHDRAW
+        | TxType::LOAN_BROKER_COVER_CLAWBACK => TypedPreclaimRoute::LoanReadViewHelper,
+        TxType::NFTOKEN_MINT
+        | TxType::NFTOKEN_BURN
+        | TxType::NFTOKEN_CREATE_OFFER
+        | TxType::NFTOKEN_CANCEL_OFFER
+        | TxType::NFTOKEN_ACCEPT_OFFER
+        | TxType::NFTOKEN_MODIFY => TypedPreclaimRoute::NfTokenReadViewHelper,
+        TxType::TRUST_SET
+        | TxType::CLAWBACK
+        | TxType::MPTOKEN_AUTHORIZE
+        | TxType::MPTOKEN_ISSUANCE_DESTROY
+        | TxType::MPTOKEN_ISSUANCE_SET => TypedPreclaimRoute::TokenReadViewHelper,
+        // Explicit inside token_read_view_preclaim.rs: rippled
+        // MPTokenIssuanceCreate inherits Transactor::preclaim unchanged.
+        TxType::MPTOKEN_ISSUANCE_CREATE => TypedPreclaimRoute::TokenAuditedNoop,
+        TxType::VAULT_CREATE
+        | TxType::VAULT_SET
+        | TxType::VAULT_DELETE
+        | TxType::VAULT_DEPOSIT
+        | TxType::VAULT_WITHDRAW
+        | TxType::VAULT_CLAWBACK => TypedPreclaimRoute::VaultReadViewHelper,
+        TxType::XCHAIN_CREATE_CLAIM_ID
+        | TxType::XCHAIN_COMMIT
+        | TxType::XCHAIN_CLAIM
+        | TxType::XCHAIN_ACCOUNT_CREATE_COMMIT
+        | TxType::XCHAIN_ADD_CLAIM_ATTESTATION
+        | TxType::XCHAIN_ADD_ACCOUNT_CREATE_ATTESTATION
+        | TxType::XCHAIN_MODIFY_BRIDGE
+        | TxType::XCHAIN_CREATE_BRIDGE
+        | TxType::ORACLE_SET
+        | TxType::ORACLE_DELETE
+        | TxType::PERMISSIONED_DOMAIN_SET
+        | TxType::PERMISSIONED_DOMAIN_DELETE
+        | TxType::CREDENTIAL_CREATE
+        | TxType::CREDENTIAL_ACCEPT
+        | TxType::CREDENTIAL_DELETE => TypedPreclaimRoute::BridgeDomainReadViewHelper,
+        // Explicit inside bridge_domain_read_view_preclaim.rs: DIDSet and
+        // DIDDelete inherit Transactor::preclaim unchanged in rippled.
+        TxType::DID_SET | TxType::DID_DELETE => TypedPreclaimRoute::BridgeDomainAuditedNoop,
+        // Batch has its own existing immutable preclaim below, after the
+        // family-tail dispatch has succeeded.
+        TxType::BATCH => TypedPreclaimRoute::BatchSpecialPreclaim,
+        // No compiled immutable ReadView helper is registered for these
+        // routed types. Never silently promote them to tesSUCCESS.
+        TxType::AMM_DEPOSIT
+        | TxType::AMM_WITHDRAW
+        | TxType::TICKET_CREATE
+        | TxType::LEDGER_STATE_FIX
+        | TxType::CONFIDENTIAL_MPT_CONVERT
+        | TxType::CONFIDENTIAL_MPT_MERGE_INBOX
+        | TxType::CONFIDENTIAL_MPT_CONVERT_BACK
+        | TxType::CONFIDENTIAL_MPT_SEND
+        | TxType::CONFIDENTIAL_MPT_CLAWBACK
+        | TxType::AMENDMENT
+        | TxType::FEE
+        | TxType::UNL_MODIFY => TypedPreclaimRoute::FailClosed,
+        // Unknown and non-dispatchable protocol values are likewise closed.
+        _ => TypedPreclaimRoute::FailClosed,
+    }
+}
+
+/// Shared application-owned typed preclaim dispatcher used by both TxQ and
+/// consensus BuildLedger. Every success result comes from a concrete existing
+/// helper, a documented inherited no-op, or Batch's existing special path.
+fn typed_preclaim_ter(view: &impl ReadView, tx: &STTx, flags: ApplyFlags) -> Ter {
+    match typed_preclaim_route(tx.get_txn_type()) {
+        TypedPreclaimRoute::AppReadViewHelper | TypedPreclaimRoute::AppAuditedNoop => {
+            crate::state::read_view_preclaim::run_read_view_preclaim(
+                view,
+                tx,
+                tx.get_txn_type(),
+                flags,
+            )
+            .unwrap_or(UNVERIFIED_TYPED_PRECLAIM_TER)
+        }
+        TypedPreclaimRoute::DexReadViewHelper => {
+            tx::run_dex_read_view_preclaim_with_flags(view, tx, tx.get_txn_type(), flags)
+                .unwrap_or(UNVERIFIED_TYPED_PRECLAIM_TER)
+        }
+        TypedPreclaimRoute::LoanReadViewHelper => {
+            tx::run_loan_read_view_preclaim(view, tx, tx.get_txn_type())
+                .unwrap_or(UNVERIFIED_TYPED_PRECLAIM_TER)
+        }
+        TypedPreclaimRoute::NfTokenReadViewHelper => {
+            tx::run_nftoken_read_view_preclaim(view, tx, tx.get_txn_type())
+                .unwrap_or(UNVERIFIED_TYPED_PRECLAIM_TER)
+        }
+        TypedPreclaimRoute::TokenReadViewHelper | TypedPreclaimRoute::TokenAuditedNoop => {
+            tx::run_token_read_view_preclaim(view, tx, tx.get_txn_type())
+                .unwrap_or(UNVERIFIED_TYPED_PRECLAIM_TER)
+        }
+        TypedPreclaimRoute::VaultReadViewHelper => {
+            tx::run_vault_read_view_preclaim(view, tx, tx.get_txn_type())
+                .unwrap_or(UNVERIFIED_TYPED_PRECLAIM_TER)
+        }
+        TypedPreclaimRoute::BridgeDomainReadViewHelper
+        | TypedPreclaimRoute::BridgeDomainAuditedNoop => {
+            tx::run_bridge_domain_read_view_preclaim(view, tx, tx.get_txn_type())
+                .unwrap_or(UNVERIFIED_TYPED_PRECLAIM_TER)
+        }
+        TypedPreclaimRoute::BatchSpecialPreclaim => Ter::TES_SUCCESS,
+        TypedPreclaimRoute::FailClosed => UNVERIFIED_TYPED_PRECLAIM_TER,
     }
 }
 
@@ -2638,10 +2766,6 @@ impl
         >,
         txn_type: TxType,
     ) -> Result<Ter, Self::PreclaimError> {
-        if txn_type != TxType::BATCH && Self::is_system_transaction(txn_type) {
-            return Ok(Ter::TES_SUCCESS);
-        }
-
         let Some(view) = ctx.view.as_ref() else {
             return Ok(Ter::TER_NO_ACCOUNT);
         };
@@ -2677,16 +2801,16 @@ impl
             return Ok(sequence_ter);
         }
 
-        if let Some(ter) = crate::state::read_view_preclaim::run_read_view_preclaim(
-            view.as_ref(),
-            &sttx,
-            txn_type,
-            ctx.flags,
-        ) {
-            return Ok(ter);
+        let typed_preclaim = typed_preclaim_ter(view.as_ref(), &sttx, ctx.flags);
+        if !is_tes_success(typed_preclaim) {
+            return Ok(typed_preclaim);
         }
 
-        Ok(batch_preclaim_ter(view.as_ref(), &sttx, ctx.flags))
+        Ok(if txn_type == TxType::BATCH {
+            batch_preclaim_ter(view.as_ref(), &sttx, ctx.flags)
+        } else {
+            Ter::TES_SUCCESS
+        })
     }
 
     fn calculate_base_fee(
