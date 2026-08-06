@@ -330,6 +330,22 @@ impl LedgerReplayer {
         txns: BTreeMap<u32, Arc<STTx>>,
         config: &LedgerConfig,
     ) {
+        self.got_replay_delta_with_rules(info, txns, crate::Rules::new(config.features.iter()));
+    }
+
+    /// Delivers a replay response that was verified by the overlay bridge.
+    ///
+    /// `LedgerReplayMsgHandler::processReplayDeltaResponse` in rippled hands
+    /// the active application rules to `LedgerDeltaAcquire::processData` only
+    /// after validating the response header and transaction SHAMap. The Rust
+    /// bridge preserves that split so wire validation remains outside this
+    /// owner while the delta registry remains the sole routing authority.
+    pub fn got_replay_delta_with_rules(
+        &mut self,
+        info: LedgerHeader,
+        txns: BTreeMap<u32, Arc<STTx>>,
+        rules: crate::Rules,
+    ) {
         let Some(delta) = self
             .deltas
             .get(info.hash.as_uint256())
@@ -340,7 +356,41 @@ impl LedgerReplayer {
         delta
             .lock()
             .expect("delta lock")
-            .process_data(info, txns, config);
+            .process_data_with_rules(info, txns, rules);
+    }
+
+    /// Drives every live replay task after a delta has become ready. This is
+    /// the callback progression in `LedgerReplayTask.cpp::deltaReady` and
+    /// `tryAdvance`: resolve its starting parent, build each ready consecutive
+    /// delta, and retain the reconstructed ledgers for the application owner
+    /// to store/publish.
+    pub fn advance_ready_tasks<LookupParent, BuildReplay, E>(
+        &mut self,
+        lookup_parent: &mut LookupParent,
+        build_replay: &mut BuildReplay,
+    ) -> Result<Vec<Arc<Ledger>>, crate::ReplayTaskError<E>>
+    where
+        LookupParent: FnMut(Uint256, u32) -> Option<Arc<Ledger>>,
+        BuildReplay: FnMut(&crate::LedgerReplay) -> Result<Arc<Ledger>, E>,
+    {
+        let mut advanced = Vec::new();
+        let tasks = self.tasks.clone();
+        for task in tasks {
+            task.lock()
+                .expect("task lock")
+                .trigger(lookup_parent, &mut |delta, parent| {
+                    let built = delta.try_build(parent, build_replay)?;
+                    if let Some(ledger) = &built
+                        && !advanced
+                            .iter()
+                            .any(|known: &Arc<Ledger>| known.header().hash == ledger.header().hash)
+                    {
+                        advanced.push(Arc::clone(ledger));
+                    }
+                    Ok(built)
+                })?;
+        }
+        Ok(advanced)
     }
 
     pub fn sweep(&mut self) {

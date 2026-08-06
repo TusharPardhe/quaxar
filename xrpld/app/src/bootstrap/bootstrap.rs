@@ -8,9 +8,9 @@
 use crate::state::app_registry::RelayUntrustedPolicy;
 use crate::{
     ApplicationRoot, ApplicationRootOptions, BootstrapOverlayHandoff, DescriptorLimitProvider,
-    LedgerReplay, MainRuntime, PendingReplayStartup, SHAMapStoreComponent,
-    SHAMapStoreComponentRuntime, SHAMapStoreHealthRuntime, SHAMapStoreOperatingMode,
-    SHAMapStoreRuntime, adjust_descriptor_limit, bootstrap_shamap_store,
+    MainRuntime, PendingReplayStartup, SHAMapStoreComponent, SHAMapStoreComponentRuntime,
+    SHAMapStoreHealthRuntime, SHAMapStoreOperatingMode, SHAMapStoreRuntime,
+    adjust_descriptor_limit, bootstrap_shamap_store,
 };
 use basics::base_uint::Uint256;
 use basics::basic_config::{BasicConfig, IniFileSections};
@@ -18,7 +18,7 @@ use basics::chrono::NetClockTimePoint;
 use basics::string_utilities::str_unhex;
 use basics::tagged_cache::MonotonicClock;
 use ledger::{
-    Ledger, LedgerConfig, LedgerHeader, LedgerInfoProvider, NullLedgerJournal,
+    Ledger, LedgerConfig, LedgerHeader, LedgerInfoProvider, LedgerReplay, NullLedgerJournal,
     NullOrderBookDBJournal, NullOrderBookDBRuntime, load_by_hash, load_by_index,
 };
 use nodestore::{FetchType, ManagerImp, NodeObjectType as NodeStoreObjectType};
@@ -1480,6 +1480,27 @@ fn run_start_mode_consensus_loop(
                         }
                     },
                 );
+            }));
+    }
+
+    // Replay delta router. This is the live bridge for the parity-flow edge
+    // `peer replay response -> LedgerReplayer::got_replay_delta`; malformed
+    // payloads are charged exactly where rippled rejects them in PeerImp.
+    if let Some(overlay_rt) = runtime.root().overlay_runtime() {
+        let router_root = runtime.root().clone();
+        let router_overlay = overlay_rt.overlay();
+        overlay_rt
+            .overlay()
+            .queued_inbound()
+            .set_replay_delta_response_router(Box::new(move |peer_id, response| {
+                if !router_root.on_replay_delta_response(&response)
+                    && let Some(peer) = router_overlay.find_peer_by_short_id(peer_id)
+                {
+                    peer.charge(
+                        (*resource::FEE_INVALID_DATA).clone(),
+                        "replay_delta_response".to_owned(),
+                    );
+                }
             }));
     }
 

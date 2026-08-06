@@ -175,6 +175,9 @@ pub struct QueuedOverlayInboundHandler {
     /// router installed during startup must replay older packets before any
     /// concurrent ingress can overtake them.
     ledger_data_delivery_gate: Mutex<()>,
+    #[allow(clippy::type_complexity)]
+    replay_delta_response_router:
+        Mutex<Option<Arc<dyn Fn(PeerId, TmReplayDeltaResponse) + Send + Sync>>>,
     /// Direct routing callback for inbound transactions — dispatches
     /// immediately to a JobQueue worker on receipt, matching reference
     /// PeerImp::handleTransaction -> JobQueue::addJob(JtTransaction,
@@ -219,6 +222,7 @@ impl Default for QueuedOverlayInboundHandler {
             ledger_data_tx: Mutex::new(None),
             ledger_data_router: Mutex::new(None),
             ledger_data_delivery_gate: Mutex::new(()),
+            replay_delta_response_router: Mutex::new(None),
             transaction_router: Mutex::new(None),
             validation_router: Mutex::new(None),
             validation_notify_tx: Mutex::new(None),
@@ -325,6 +329,29 @@ impl QueuedOverlayInboundHandler {
             router(packet.peer_id, packet.message);
         }
         count
+    }
+
+    /// Register an immediate replay-delta response route. This mirrors
+    /// `PeerImp::onMessage(TMReplayDeltaResponse)` handing valid data to the
+    /// application-owned `LedgerReplayMsgHandler`, while retaining packets
+    /// received before startup wiring in the fallback queue.
+    pub fn set_replay_delta_response_router(
+        &self,
+        router: Box<dyn Fn(PeerId, TmReplayDeltaResponse) + Send + Sync>,
+    ) {
+        let router: Arc<dyn Fn(PeerId, TmReplayDeltaResponse) + Send + Sync> = Arc::from(router);
+        let queued = {
+            let mut router_guard = self
+                .replay_delta_response_router
+                .lock()
+                .expect("replay_delta_response_router lock");
+            let mut inbound = self.inner.lock().expect("overlay inbound lock");
+            *router_guard = Some(Arc::clone(&router));
+            std::mem::take(&mut inbound.replay_delta_responses)
+        };
+        for response in queued {
+            router(response.peer_id, response.message);
+        }
     }
 
     /// Register the immediate transaction-dispatch callback. Matches
@@ -905,15 +932,33 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
     }
 
     fn on_replay_delta_response(&self, peer: &Arc<PeerImp>, message: TmReplayDeltaResponse) {
-        let mut inner = self.inner.lock().expect("overlay inbound lock");
-        push_bounded(
-            &mut inner.replay_delta_responses,
-            PeerMessage {
-                peer_id: peer.id(),
-                message,
-            },
-            "replay_delta_responses",
-        );
+        let mut message = Some(message);
+        let router = {
+            let router_guard = self
+                .replay_delta_response_router
+                .lock()
+                .expect("replay_delta_response_router lock");
+            if let Some(router) = router_guard.as_ref().map(Arc::clone) {
+                Some(router)
+            } else {
+                let mut inner = self.inner.lock().expect("overlay inbound lock");
+                push_bounded(
+                    &mut inner.replay_delta_responses,
+                    PeerMessage {
+                        peer_id: peer.id(),
+                        message: message.take().expect("replay delta response present"),
+                    },
+                    "replay_delta_responses",
+                );
+                None
+            }
+        };
+        if let Some(router) = router {
+            router(
+                peer.id(),
+                message.take().expect("replay delta response present"),
+            );
+        }
     }
 }
 

@@ -97,6 +97,9 @@ use xrpl_core::{
 };
 use xrpld_core::DatabaseCon;
 
+#[path = "application_root/replay_callback_impl.rs"]
+mod replay_callback_impl;
+
 fn to_nodestore_type(object_type: LedgerNodeObjectType) -> nodestore::NodeObjectType {
     match object_type {
         LedgerNodeObjectType::AccountNode => nodestore::NodeObjectType::AccountNode,
@@ -1272,6 +1275,10 @@ struct AppOpenLedgerTxQApplyRuntime<'a, V> {
     preclaim_result: PreclaimResult<AppTxQTransaction, AppTxQJournalTag, AppTxQParentBatchId>,
     current_ledger_seq: u32,
     load_fee_track: &'a SharedLoadFeeTrack,
+    clear_ahead_queue: Vec<TxDetails<AppTxQTransaction, AppTxQAccount>>,
+    clear_ahead_metrics: tx::QueueFeeMetricsSnapshot,
+    clear_ahead_attempts: Vec<(SeqProxy, ApplyResult)>,
+    clear_ahead_removed: Vec<SeqProxy>,
     multi_txn_adjustment: Option<tx::QueueApplyViewAdjustment>,
     delivered_amount: Option<STAmount>,
 }
@@ -1288,6 +1295,33 @@ where
         current_ledger_seq: u32,
         load_fee_track: &'a SharedLoadFeeTrack,
         account_seqs: Arc<std::sync::Mutex<std::collections::HashMap<protocol::AccountID, u32>>>,
+    ) -> Self {
+        Self::new_with_clear_ahead(
+            view,
+            submit_view,
+            tx,
+            flags,
+            current_ledger_seq,
+            load_fee_track,
+            account_seqs,
+            Vec::new(),
+            tx::QueueFeeMetricsSnapshot {
+                txns_expected: 0,
+                escalation_multiplier: tx::TXQ_BASE_LEVEL,
+            },
+        )
+    }
+
+    fn new_with_clear_ahead(
+        view: &'a mut AppOpenLedgerView,
+        submit_view: &'a mut V,
+        tx: Arc<STTx>,
+        flags: ApplyFlags,
+        current_ledger_seq: u32,
+        load_fee_track: &'a SharedLoadFeeTrack,
+        account_seqs: Arc<std::sync::Mutex<std::collections::HashMap<protocol::AccountID, u32>>>,
+        clear_ahead_queue: Vec<TxDetails<AppTxQTransaction, AppTxQAccount>>,
+        clear_ahead_metrics: tx::QueueFeeMetricsSnapshot,
     ) -> Self {
         let fee_field = get_field_by_symbol("sfFee");
         let fee_drops = if tx.is_field_present(fee_field) {
@@ -1341,8 +1375,82 @@ where
             preclaim_result,
             current_ledger_seq,
             load_fee_track,
+            clear_ahead_queue,
+            clear_ahead_metrics,
+            clear_ahead_attempts: Vec::new(),
+            clear_ahead_removed: Vec::new(),
             multi_txn_adjustment: None,
             delivered_amount: None,
+        }
+    }
+
+    fn take_clear_ahead_effects(&mut self) -> (Vec<(SeqProxy, ApplyResult)>, Vec<SeqProxy>) {
+        (
+            std::mem::take(&mut self.clear_ahead_attempts),
+            std::mem::take(&mut self.clear_ahead_removed),
+        )
+    }
+
+    fn clear_ahead_required_fee_level(&self, series_size: usize) -> Option<u64> {
+        // TxQ.cpp::FeeMetrics::escalatedSeriesFeeLevel (240-273):
+        // multiplier / target² * Σ(current..last)n².
+        let current = self.view.tx_ids().len() as u128;
+        let target = self.clear_ahead_metrics.txns_expected as u128;
+        if current <= target || target == 0 || series_size == 0 {
+            return None;
+        }
+        let last = current.checked_add((series_size - 1) as u128)?;
+        let sum_squares = |n: u128| {
+            n.checked_mul(n)?
+                .checked_mul(n.checked_mul(2)?.checked_add(1)?)?
+                .checked_div(6)
+        };
+        let series = sum_squares(last)?.checked_sub(sum_squares(current - 1)?)?;
+        let total = (self.clear_ahead_metrics.escalation_multiplier as u128)
+            .checked_mul(series)?
+            .checked_div(target.checked_mul(target)?)?;
+        u64::try_from(total).ok()
+    }
+
+    fn clear_ahead_apply<W: ledger::ApplyView>(
+        current_ledger_seq: u32,
+        load_fee_track: &SharedLoadFeeTrack,
+        view: &mut W,
+        tx: &Arc<STTx>,
+        flags: ApplyFlags,
+    ) -> (ApplyResult, Option<STAmount>) {
+        let preflight = transaction_preflight_ter_with_flags(tx, &view.rules(), flags);
+        let preclaim = if is_tes_success(preflight) {
+            queue_apply_preclaim_ter_with_load_fee(
+                view,
+                tx.as_ref(),
+                current_ledger_seq,
+                flags,
+                load_fee_track,
+            )
+        } else {
+            preflight
+        };
+        if !is_tes_success(preclaim) && !is_tec_claim(preclaim) {
+            return (ApplyResult::new(preclaim, false, false), None);
+        }
+        let (ter, delivered) = apply_submit_transactor_shell_with_flags_and_delivered_amount(
+            view,
+            tx.as_ref(),
+            tx.get_txn_type(),
+            flags,
+        );
+        let applied = (is_tes_success(ter) || is_tec_claim(ter))
+            && !protocol::any_apply_flags(flags & ApplyFlags::DRY_RUN);
+        (ApplyResult::new(ter, applied, false), delivered)
+    }
+
+    fn record_clear_ahead_open_ledger_tx(&self, tx: &Arc<STTx>) {
+        let account = tx.get_account_id(get_field_by_symbol("sfAccount"));
+        let next = tx.get_seq_proxy().value().saturating_add(1);
+        if let Ok(mut seqs) = self.account_seqs.lock() {
+            let entry = seqs.entry(account).or_insert(next);
+            *entry = (*entry).max(next);
         }
     }
 }
@@ -1483,10 +1591,111 @@ where
     }
 
     fn run_try_clear(&mut self) -> ApplyResult {
-        ApplyResult::new(Ter::TER_QUEUED, false, false)
+        // Graph edge `live TxQ clear-ahead` (RIPPLED_PARITY_FLOW.md §1/§3).
+        // TxQ.cpp:517-609 applies all queued predecessors into an OpenView
+        // sandbox, then repreclaims the current transaction against that
+        // changed view. Do not mutate the persistent submit view or queue
+        // until both phases have succeeded.
+        let target = self.tx.get_seq_proxy();
+        let predecessors = self
+            .clear_ahead_queue
+            .iter()
+            .filter(|queued| queued.seq_proxy < target)
+            .cloned()
+            .collect::<Vec<_>>();
+        if predecessors.is_empty() {
+            return ApplyResult::new(Ter::TER_QUEUED, false, false);
+        }
+
+        let fee_field = get_field_by_symbol("sfFee");
+        let fee_paid_drops = self.tx.get_field_amount(fee_field).xrp().drops();
+        let fee_level_paid = evaluate_fee_level_paid(QueueFeeLevelPaidInputs {
+            calculated_base_fee_drops: fee_drops_as_i64(calculate_sttx_base_fee(
+                self.submit_view,
+                self.tx.as_ref(),
+            )),
+            fee_paid_drops,
+            default_base_fee_drops: fee_drops_as_i64(calculate_default_sttx_base_fee(
+                self.submit_view,
+                self.tx.as_ref(),
+            )),
+        });
+        let Some(total_paid) = predecessors
+            .iter()
+            .try_fold(fee_level_paid, |total, queued| {
+                total.checked_add(queued.fee_level)
+            })
+        else {
+            return ApplyResult::new(Ter::TEL_INSUF_FEE_P, false, false);
+        };
+        let Some(required) = self.clear_ahead_required_fee_level(predecessors.len() + 1) else {
+            return ApplyResult::new(Ter::TEL_INSUF_FEE_P, false, false);
+        };
+        if total_paid < required {
+            return ApplyResult::new(Ter::TEL_INSUF_FEE_P, false, false);
+        }
+
+        let current_ledger_seq = self.current_ledger_seq;
+        let load_fee_track = self.load_fee_track;
+        let mut sandbox = ledger::FlowSandbox::new(&mut *self.submit_view);
+        let mut applied_predecessors = Vec::new();
+        for queued in &predecessors {
+            let (result, _) = Self::clear_ahead_apply(
+                current_ledger_seq,
+                load_fee_track,
+                &mut sandbox,
+                &queued.tx,
+                ApplyFlags::NONE,
+            );
+            self.clear_ahead_attempts
+                .push((queued.seq_proxy, result.clone()));
+            // TxQ.cpp:573-586 treats a queued ticket that was already used in
+            // the ledger as a completed predecessor so the later success
+            // cleanup can discard it.
+            if result.ter == Ter::TEF_NO_TICKET {
+                continue;
+            }
+            if !result.applied {
+                return result;
+            }
+            applied_predecessors.push(Arc::clone(&queued.tx));
+        }
+
+        let (current, delivered) = Self::clear_ahead_apply(
+            current_ledger_seq,
+            load_fee_track,
+            &mut sandbox,
+            &self.tx,
+            self.preflight_result.flags,
+        );
+        if !current.applied {
+            return current;
+        }
+        if sandbox.apply().is_err() {
+            return ApplyResult::new(Ter::TEF_INTERNAL, false, false);
+        }
+
+        for queued in &applied_predecessors {
+            self.view.push_transaction(Arc::clone(queued));
+            self.record_clear_ahead_open_ledger_tx(queued);
+        }
+        self.view.push_transaction(Arc::clone(&self.tx));
+        self.record_clear_ahead_open_ledger_tx(&self.tx);
+        self.delivered_amount = delivered;
+        self.clear_ahead_removed = predecessors.iter().map(|queued| queued.seq_proxy).collect();
+        if self
+            .clear_ahead_queue
+            .iter()
+            .any(|queued| queued.seq_proxy == target)
+        {
+            self.clear_ahead_removed.push(target);
+        }
+        current
     }
 
-    fn apply_sandbox(&mut self) {}
+    fn apply_sandbox(&mut self) {
+        // `run_try_clear` already committed its child only on complete success.
+    }
 }
 
 #[derive(Clone)]
@@ -4067,7 +4276,7 @@ impl ApplicationRoot {
                 &live_queue_view,
                 metrics_snapshot,
             );
-            let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
+            let mut runtime = AppOpenLedgerTxQApplyRuntime::new_with_clear_ahead(
                 &mut open_view,
                 &mut apply_view,
                 Arc::clone(&tx),
@@ -4075,6 +4284,11 @@ impl ApplicationRoot {
                 ledger_seq,
                 self.load_fee_track.as_ref(),
                 Arc::clone(&account_seqs),
+                tx_q.get_account_txs(
+                    &mut AppTxQLock,
+                    &tx.get_account_id(get_field_by_symbol("sfAccount")),
+                ),
+                metrics_snapshot,
             );
             let mut lock = AppTxQLock;
             let result = tx_q
@@ -5830,6 +6044,9 @@ impl ApplicationRoot {
                                 .get_s_transaction(),
                         );
                         let tx_source = AppQueueApplyTxSource::new(tx.as_ref());
+                        let clear_ahead_queue = tx_q.current_account_txs(
+                            tx.get_account_id(get_field_by_symbol("sfAccount")),
+                        );
                         let metrics_snapshot = tx_q.metrics_snapshot();
                         let view_snapshot = view.clone();
                         let live_queue_view = view_snapshot.queue_apply_view(
@@ -5842,7 +6059,7 @@ impl ApplicationRoot {
                             &live_queue_view,
                             metrics_snapshot,
                         );
-                        let mut runtime = AppOpenLedgerTxQApplyRuntime::new(
+                        let mut runtime = AppOpenLedgerTxQApplyRuntime::new_with_clear_ahead(
                             view,
                             submit_view.view_mut(),
                             Arc::clone(&tx),
@@ -5850,6 +6067,8 @@ impl ApplicationRoot {
                             current_ledger_index,
                             self.load_fee_track.as_ref(),
                             Arc::clone(&account_seqs),
+                            clear_ahead_queue,
+                            metrics_snapshot,
                         );
                         let result = tx_q
                             .apply_with_owned_metrics_and_derived_preflight_facts_and_hold_admission(
@@ -5859,6 +6078,12 @@ impl ApplicationRoot {
                                 &tx_source,
                             )
                             .apply_result();
+                        let (clear_attempts, clear_removed) = runtime.take_clear_ahead_effects();
+                        tx_q.apply_try_clear_effects(
+                            tx.get_account_id(get_field_by_symbol("sfAccount")),
+                            &clear_attempts,
+                            &clear_removed,
+                        );
 
                         entry.result = Some(result.ter);
                         entry.applied = result.applied;

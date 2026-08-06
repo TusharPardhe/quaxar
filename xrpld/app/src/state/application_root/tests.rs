@@ -46,7 +46,7 @@ use tx::{
     QueueApplyHoldPreflightTxSource, QueueApplyObservedAccountLookup,
     QueueApplyObservedTicketLookup, QueueApplyObservedTxSource, QueueApplyObservedViewSource,
     QueueApplyPreclaimViewSource, QueueApplyViewAdjustment, QueueFeeMetricsSnapshot, QueueViews,
-    TxConsequences, TxQAccount, TxQSetup,
+    TxConsequences, TxDetails, TxQAccount, TxQSetup,
 };
 
 #[derive(Default)]
@@ -3586,6 +3586,69 @@ fn txq_direct_apply_uses_canonical_shared_preclaim_instead_of_caller_ter() {
             .get_field_u32(get_field_by_symbol("sfSequence")),
         1,
     );
+}
+
+#[test]
+fn txq_try_clear_applies_predecessors_repreclaims_current_and_reports_cleanup() {
+    // Parity: TxQ.cpp:517-609 and 1181-1205. A high-fee sequence transaction
+    // clears its queued predecessor in a child sandbox, then applies itself
+    // against that advanced state and reports the queue entries to erase.
+    let destination = AccountID::from_array([0xD1; 20]);
+    let (source, predecessor) = signed_payment_tx(0x75, destination, 1, 100);
+    let (_, current) = signed_payment_tx(0x75, destination, 2, 100);
+    let base = Arc::new(ledger_view(10, source, 1, &[]));
+    let mut open_ledger =
+        AppOpenLedgerView::with_parent_hash(11, 10, *base.header().hash.as_uint256());
+    // Clear-ahead only runs above the expected open-ledger load threshold.
+    open_ledger.push_transaction(payment_tx(source, destination, 90, None, 10));
+    open_ledger.push_transaction(payment_tx(source, destination, 91, None, 10));
+    let mut submit_view = Sandbox::new(Arc::clone(&base), ApplyFlags::NONE);
+    let fee_track = crate::load::load_fee_track::SharedLoadFeeTrack::new();
+    let predecessor_details = TxDetails {
+        fee_level: tx::TXQ_BASE_LEVEL * 10,
+        last_valid: None,
+        consequences: TxConsequences::new(100, SeqProxy::sequence(1)),
+        account: source,
+        seq_proxy: SeqProxy::sequence(1),
+        tx: Arc::clone(&predecessor),
+        retries_remaining: tx::MAYBE_TX_RETRIES_ALLOWED,
+        preflight_result: Ter::TES_SUCCESS,
+        last_result: None,
+    };
+    let mut runtime = AppOpenLedgerTxQApplyRuntime::new_with_clear_ahead(
+        &mut open_ledger,
+        &mut submit_view,
+        Arc::clone(&current),
+        ApplyFlags::NONE,
+        11,
+        &fee_track,
+        Arc::new(Mutex::new(std::collections::HashMap::new())),
+        vec![predecessor_details],
+        QueueFeeMetricsSnapshot {
+            txns_expected: 1,
+            escalation_multiplier: tx::TXQ_BASE_LEVEL,
+        },
+    );
+
+    assert_eq!(
+        runtime.run_try_clear(),
+        ApplyResult::new(Ter::TES_SUCCESS, true, false)
+    );
+    let (attempts, removed) = runtime.take_clear_ahead_effects();
+    assert_eq!(
+        attempts,
+        vec![(
+            SeqProxy::sequence(1),
+            ApplyResult::new(Ter::TES_SUCCESS, true, false)
+        )]
+    );
+    assert_eq!(removed, vec![SeqProxy::sequence(1)]);
+    assert!(
+        open_ledger
+            .tx_ids()
+            .contains(&predecessor.get_transaction_id())
+    );
+    assert!(open_ledger.tx_ids().contains(&current.get_transaction_id()));
 }
 
 #[test]

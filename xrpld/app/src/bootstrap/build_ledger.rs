@@ -13,15 +13,12 @@
 //! explicit through a view trait plus flush/unshare callbacks while preserving
 //! the build ordering literally.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Display,
-    sync::Arc,
-};
+use std::{collections::BTreeSet, fmt::Display, sync::Arc};
 
 use basics::base_uint::Uint256;
 use basics::str_hex::str_hex;
-use ledger::{CanonicalTXSet, Ledger, LedgerTxReadError, OpenView, XRP_LEDGER_EARLIEST_FEES};
+pub use ledger::LedgerReplay;
+use ledger::{CanonicalTXSet, Ledger, OpenView, XRP_LEDGER_EARLIEST_FEES};
 use protocol::{
     JsonOptions, Keylet, LedgerEntryType, STTx, Serializer, StBase, Ter, fee_settings_keylet,
     is_tes_success, skip_keylet,
@@ -73,63 +70,6 @@ pub trait BuildLedgerView {
 pub struct BuildLedgerFlushReport {
     pub account_state_nodes: usize,
     pub transaction_nodes: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct LedgerReplay {
-    parent: Arc<Ledger>,
-    replay: Arc<Ledger>,
-    ordered_txs: BTreeMap<u32, Arc<STTx>>,
-}
-
-impl LedgerReplay {
-    pub fn new(
-        parent: Arc<Ledger>,
-        replay: Arc<Ledger>,
-        ordered_txs: BTreeMap<u32, Arc<STTx>>,
-    ) -> Self {
-        Self {
-            parent,
-            replay,
-            ordered_txs,
-        }
-    }
-
-    pub fn parent(&self) -> &Arc<Ledger> {
-        &self.parent
-    }
-
-    pub fn replay(&self) -> &Arc<Ledger> {
-        &self.replay
-    }
-
-    pub fn ordered_txs(&self) -> &BTreeMap<u32, Arc<STTx>> {
-        &self.ordered_txs
-    }
-
-    pub fn from_replay_ledger(
-        parent: Arc<Ledger>,
-        replay: Arc<Ledger>,
-    ) -> Result<Self, LedgerReplayError> {
-        let mut ordered_txs = BTreeMap::new();
-
-        for (tx, meta) in replay.tx_snapshot()? {
-            ordered_txs.entry(meta.get_index()).or_insert(tx);
-        }
-
-        Ok(Self::new(parent, replay, ordered_txs))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LedgerReplayError {
-    TxRead(LedgerTxReadError),
-}
-
-impl From<LedgerTxReadError> for LedgerReplayError {
-    fn from(value: LedgerTxReadError) -> Self {
-        Self::TxRead(value)
-    }
 }
 
 #[derive(Debug)]
@@ -519,6 +459,34 @@ fn parallel_preflight_precheck(
             .then(|| tx.get_transaction_id())
         })
         .collect()
+}
+
+pub fn build_ledger_from_replay_delta(
+    replay: &LedgerReplay,
+) -> Result<Arc<ledger::Ledger>, String> {
+    // `LedgerReplay` has already preserved the remote TransactionIndex order.
+    // `build_ledger_from_acquired_tx` only needs the TransactionMd envelope to
+    // recover its STTx inputs; metadata is not consumed a second time there.
+    // Supplying an empty metadata VL therefore keeps the replay ordering at
+    // this boundary while retaining the established application build and
+    // hash-verification path.
+    let tx_items = replay
+        .ordered_txs()
+        .values()
+        .map(|tx| {
+            let mut item = Serializer::default();
+            item.add_vl(tx.get_serializer().data());
+            item.add_vl(&[]);
+            (item.data().to_vec(), tx.get_transaction_id())
+        })
+        .collect::<Vec<_>>();
+    build_ledger_from_acquired_tx(
+        replay.parent().as_ref(),
+        replay.replay().header(),
+        &tx_items,
+    )
+    .map(Arc::new)
+    .ok_or_else(|| "replay ledger build did not match its verified header".to_owned())
 }
 
 pub fn build_ledger_from_acquired_tx(

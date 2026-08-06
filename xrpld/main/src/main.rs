@@ -375,6 +375,14 @@ fn spawn_overlay_timer(deps: OverlayTimerDeps) -> thread::JoinHandle<()> {
                 let snapshot = overlay_runtime.overlay().take_queued_inbound_snapshot();
                 overlay_runtime.overlay().requeue_validations(snapshot.validations);
 
+                // `LedgerReplayMsgHandler::processReplayDeltaResponse` runs
+                // on the overlay handoff path in rippled. Keep the response
+                // in this single snapshot owner, validate it in app state,
+                // then let LedgerReplayer wake the matching delta/task.
+                for response in &snapshot.replay_delta_responses {
+                    let _ = deps.app.on_replay_delta_response(&response.message);
+                }
+
                 // Accumulate discovered endpoints for auto-connect
                 {
                     let mut state = deps.peerfinder_state.lock().expect("peerfinder state");

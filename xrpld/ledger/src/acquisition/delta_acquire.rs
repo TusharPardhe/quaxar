@@ -186,6 +186,19 @@ impl LedgerDeltaAcquire {
         ordered_txs: BTreeMap<u32, Arc<STTx>>,
         config: &LedgerConfig,
     ) {
+        self.process_data_with_rules(info, ordered_txs, crate::Rules::new(config.features.iter()));
+    }
+
+    /// Records a verified replay delta using the rules of the active ledger.
+    /// The overlay callback has no independent configuration authority: like
+    /// rippled's `LedgerDeltaAcquire::processData`, it only materializes the
+    /// temporary replay ledger after the response has been verified.
+    pub fn process_data_with_rules(
+        &mut self,
+        info: LedgerHeader,
+        ordered_txs: BTreeMap<u32, Arc<STTx>>,
+        rules: crate::Rules,
+    ) {
         if self.is_done() {
             return;
         }
@@ -196,7 +209,7 @@ impl LedgerDeltaAcquire {
                 SyncTree::new_synching_with_type(SHAMapType::State, true, info.seq),
                 SyncTree::new_synching_with_type(SHAMapType::Transaction, true, info.seq),
             );
-            replay_temp.set_rules(crate::Rules::new(config.features.iter()));
+            replay_temp.set_rules(rules);
             self.replay_temp = Some(Arc::new(replay_temp));
             self.ordered_txs = ordered_txs;
             self.complete = true;

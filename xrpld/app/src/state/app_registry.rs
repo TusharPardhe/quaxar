@@ -73,7 +73,7 @@ impl PerfLogReportSource for StateAccountingReportSource {
         }
     }
 }
-use protocol::{AccountID, PublicKey};
+use protocol::{AccountID, PublicKey, SeqProxy};
 use resource::ResourceManager;
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::{BTreeMap, HashMap};
@@ -85,7 +85,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::Duration as TimeDuration;
 use tx::{
-    QueueAcceptLockScope, QueueAcceptOwnerState, QueueApplyHoldPreflightTxSource,
+    ApplyResult, QueueAcceptLockScope, QueueAcceptOwnerState, QueueApplyHoldPreflightTxSource,
     QueueApplyLockScope, QueueApplyObservedAccountLookup, QueueApplyObservedTicketLookup,
     QueueApplyObservedTxSource, QueueApplyObservedViewSource, QueueFeeMetricsSnapshot,
     QueueTxQMetricsView, QueueTxQRpcView, QueueViews, TxQSetup,
@@ -694,6 +694,39 @@ impl SharedAppTxQ {
 
     pub fn metrics_snapshot(&self) -> QueueFeeMetricsSnapshot {
         self.lock().metrics_snapshot()
+    }
+
+    /// Applies the queue-side outcome of a completed clear-ahead attempt.
+    /// The transaction mutations themselves are committed by the caller's
+    /// sandbox first; this method then mirrors TxQ.cpp's retry bookkeeping and
+    /// `erase(account, begin, end)` cleanup under the queue owner lock.
+    pub fn apply_try_clear_effects(
+        &self,
+        account: AccountID,
+        attempts: &[(SeqProxy, ApplyResult)],
+        removed: &[SeqProxy],
+    ) {
+        if attempts.is_empty() && removed.is_empty() {
+            return;
+        }
+
+        let mut tx_q = self.lock();
+        let views = tx_q.views_mut();
+        if let Some(queued_account) = views.accounts.get_mut(&account) {
+            for (seq_proxy, result) in attempts {
+                if let Some(queued) = queued_account.transactions.get_mut(seq_proxy) {
+                    queued.payload.record_apply_attempt_result(result);
+                }
+            }
+            for seq_proxy in removed {
+                let _ = queued_account.remove(*seq_proxy);
+            }
+        }
+        if !removed.is_empty() {
+            views.fee_order.retain(|entry| {
+                entry.key.account != account || !removed.contains(&entry.key.seq_proxy)
+            });
+        }
     }
 
     /// Execute an admission attempt against a cloned TxQ. `simulate` must use
