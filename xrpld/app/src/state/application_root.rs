@@ -1536,6 +1536,55 @@ fn change_pseudo_transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
 /// Shared canonical admission used before any queue or ledger-builder sandbox
 /// is created. Signature checking belongs to shared preclaim, after typed
 /// preflight, exactly as in rippled's `invokePreclaim`.
+struct LoanSetCounterpartyPreflightTx {
+    is_inner_batch_txn: bool,
+    has_counterparty: bool,
+    counterparty_signature: Option<STObject>,
+}
+
+impl tx::LoanSetPreflightTx for LoanSetCounterpartyPreflightTx {
+    type CounterpartySignature = STObject;
+
+    fn is_inner_batch_txn(&self) -> bool {
+        self.is_inner_batch_txn
+    }
+
+    fn has_counterparty(&self) -> bool {
+        self.has_counterparty
+    }
+
+    fn counterparty_signature(&self) -> Option<&Self::CounterpartySignature> {
+        self.counterparty_signature.as_ref()
+    }
+}
+
+/// `../rippled/src/libxrpl/tx/transactors/lending/LoanSet.cpp::LoanSet::preflight`: enforces the `CounterpartySignature` gate.
+fn loan_set_counterparty_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
+    let counterparty_signature = tx
+        .is_field_present(get_field_by_symbol("sfCounterpartySignature"))
+        .then(|| tx.get_field_object(get_field_by_symbol("sfCounterpartySignature")));
+    let adapted = LoanSetCounterpartyPreflightTx {
+        is_inner_batch_txn: tx.is_flag(tfInnerBatchTxn),
+        has_counterparty: tx.is_field_present(get_field_by_symbol("sfCounterparty")),
+        counterparty_signature,
+    };
+
+    match tx::run_loan_set_preflight_signature_gate(
+        &adapted,
+        rules.enabled(&protocol::feature_batch()),
+        |signature| {
+            let signing_pub_key = signature.get_field_vl(get_field_by_symbol("sfSigningPubKey"));
+            tx::run_preflight_check_signing_key(tx::TransactorPreflightSigningKeyFacts {
+                signing_pub_key_is_empty: signing_pub_key.is_empty(),
+                signing_pub_key_type_known: PublicKey::from_slice(&signing_pub_key).is_ok(),
+            })
+        },
+    ) {
+        Ok(_) => Ter::TES_SUCCESS,
+        Err(ter) => ter,
+    }
+}
+
 pub(crate) fn transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
     if is_change_pseudo_transaction(tx.get_txn_type()) {
         return change_pseudo_transaction_preflight_ter(tx, rules);
@@ -1548,6 +1597,13 @@ pub(crate) fn transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
     };
     if !is_tes_success(semantic) {
         return semantic;
+    }
+
+    if tx.get_txn_type() == TxType::LOAN_SET {
+        let counterparty_preflight = loan_set_counterparty_preflight_ter(tx, rules);
+        if !is_tes_success(counterparty_preflight) {
+            return counterparty_preflight;
+        }
     }
 
     match tx.check_sign(rules) {
@@ -3560,7 +3616,6 @@ impl ApplicationRoot {
 
     fn validated_fee_levels_for_closed_ledger(&self, ledger: &Ledger) -> Vec<u64> {
         let fee_field = get_field_by_symbol("sfFee");
-        let calculated_base_fee_drops = i64::try_from(ledger.fees().base).unwrap_or(i64::MAX);
 
         ledger
             .tx_snapshot()
@@ -3574,10 +3629,15 @@ impl ApplicationRoot {
                             0
                         };
 
+                        // Parity: ../rippled/src/xrpld/app/misc/detail/TxQ.cpp::getFeeLevelPaid.
                         evaluate_fee_level_paid(QueueFeeLevelPaidInputs {
-                            calculated_base_fee_drops,
+                            calculated_base_fee_drops: fee_drops_as_i64(calculate_sttx_base_fee(
+                                ledger, &tx,
+                            )),
                             fee_paid_drops,
-                            default_base_fee_drops: calculated_base_fee_drops,
+                            default_base_fee_drops: fee_drops_as_i64(
+                                calculate_default_sttx_base_fee(ledger, &tx),
+                            ),
                         })
                     })
                     .collect()

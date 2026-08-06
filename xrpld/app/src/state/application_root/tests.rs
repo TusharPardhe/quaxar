@@ -3,8 +3,8 @@ use super::{
     ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, PersistentSubmitSandbox,
     TypedPreclaimRoute, apply_submit_transactor_shell, batch_base_fee,
     calculate_default_sttx_base_fee, calculate_sttx_base_fee, consensus_status_event,
-    preferred_lcl_matches_local_or_parent, queue_apply_preclaim_ter, transaction_preflight_ter,
-    typed_preclaim_route, typed_preclaim_ter,
+    loan_set_counterparty_preflight_ter, preferred_lcl_matches_local_or_parent,
+    queue_apply_preclaim_ter, transaction_preflight_ter, typed_preclaim_route, typed_preclaim_ter,
 };
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::network::network_ops_runtime::AppNetworkOpsApplyHeldOutcome;
@@ -3429,6 +3429,72 @@ fn change_pseudo_preflight_and_fee_dispatch_are_typed_and_zero_cost() {
 }
 
 #[test]
+fn closed_ledger_txq_fee_metrics_use_specialized_and_default_base_fees() {
+    let pseudo = Arc::new(STTx::new(TxType::AMENDMENT, |tx| {
+        tx.set_field_amount(get_field_by_symbol("sfFee"), STAmount::new_native(0, false));
+    }));
+    let amm_create = Arc::new(STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(2_000, false),
+        );
+    }));
+
+    let mut tx_tree = MutableTree::new(88);
+    for (index, tx) in [Arc::clone(&pseudo), Arc::clone(&amm_create)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut meta = STObject::new(get_field_by_symbol("sfTransactionMetaData"));
+        meta.set_field_u8(get_field_by_symbol("sfTransactionResult"), 0);
+        meta.set_field_u32(
+            get_field_by_symbol("sfTransactionIndex"),
+            u32::try_from(index).expect("test transaction index fits in u32"),
+        );
+        meta.set_field_array(
+            get_field_by_symbol("sfAffectedNodes"),
+            STArray::new(get_field_by_symbol("sfAffectedNodes")),
+        );
+        let mut payload = protocol::Serializer::new(0);
+        payload.add_vl(tx.get_serializer().data());
+        payload.add_vl(meta.get_serializer().data());
+        tx_tree
+            .add_item(
+                SHAMapNodeType::TransactionMd,
+                SHAMapItem::new(tx.get_transaction_id(), payload.data().to_vec()),
+            )
+            .expect("closed-ledger transaction metadata should insert");
+    }
+
+    let mut ledger = Ledger::from_maps(
+        LedgerHeader {
+            seq: 88,
+            ..LedgerHeader::default()
+        },
+        SyncTree::new_with_type(SHAMapType::State, false, 88),
+        SyncTree::from_root_with_type(
+            tx_tree.root(),
+            SHAMapType::Transaction,
+            false,
+            88,
+            SyncState::Immutable,
+        ),
+    );
+    ledger.set_fees(Fees {
+        base: 10,
+        reserve: 1_000_000,
+        increment: 2_000,
+    });
+
+    let root = ApplicationRoot::new(0).expect("application root should build");
+    let mut levels = root.validated_fee_levels_for_closed_ledger(&ledger);
+    levels.sort_unstable();
+
+    // Parity: ../rippled/src/xrpld/app/misc/detail/TxQ.cpp::getFeeLevelPaid and TxQ::FeeMetrics::update.
+    assert_eq!(levels, vec![tx::TXQ_BASE_LEVEL, tx::TXQ_BASE_LEVEL]);
+}
+
+#[test]
 fn txq_direct_apply_does_not_mutate_when_shared_preclaim_fails() {
     let destination = AccountID::from_array([0x91; 20]);
     let (source, tx) = signed_payment_tx(0x91, destination, 1, 10);
@@ -3714,6 +3780,35 @@ fn live_base_fee_dispatch_includes_multisign_and_specialized_owners() {
         calculate_sttx_base_fee(&ledger, &loan_set),
         ledger.fees().base * 2,
         "LoanSet charges the generic fee plus its counterparty signature"
+    );
+}
+
+#[test]
+fn loan_set_counterparty_preflight_requires_signature_and_known_signing_key() {
+    // ../rippled/src/libxrpl/tx/transactors/lending/LoanSet.cpp::LoanSet::preflight: rejects a missing CounterpartySignature before numeric validation.
+    let account = AccountID::from_array([0xC4; 20]);
+    let rules = Rules::default();
+    let missing_signature = STTx::new(TxType::LOAN_SET, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+    });
+    assert_eq!(
+        loan_set_counterparty_preflight_ter(&missing_signature, &rules),
+        Ter::TEM_BAD_SIGNER
+    );
+
+    let mut unknown_key = STTx::new(TxType::LOAN_SET, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+    });
+    let mut counterparty_signature =
+        STObject::make_inner_object(get_field_by_symbol("sfCounterpartySignature"));
+    counterparty_signature.set_field_vl(get_field_by_symbol("sfSigningPubKey"), &[0xFF]);
+    unknown_key.set_field_object(
+        get_field_by_symbol("sfCounterpartySignature"),
+        counterparty_signature,
+    );
+    assert_eq!(
+        loan_set_counterparty_preflight_ter(&unknown_key, &rules),
+        Ter::TEM_BAD_SIGNATURE
     );
 }
 

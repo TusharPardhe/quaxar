@@ -114,7 +114,15 @@ where
                 },
             )
         },
-        || check_ledger_signer_authorization(view, &adapted, flags),
+        || {
+            if tx.get_txn_type() == protocol::TxType::LOAN_SET {
+                check_loan_set_counterparty_sign(view, tx, flags, || {
+                    check_ledger_signer_authorization(view, &adapted, flags)
+                })
+            } else {
+                check_ledger_signer_authorization(view, &adapted, flags)
+            }
+        },
         calculate_base_fee,
         |base_fee| {
             run_transactor_check_fee(
@@ -393,6 +401,152 @@ impl TransactorSignMultiSignObject<AccountID> for LedgerSignatureObject<'_> {
     }
 }
 
+struct LedgerLoanSetSignTx<'a> {
+    tx: &'a STTx,
+    counterparty_signature: STObject,
+}
+
+impl tx::LoanSetSignTx for LedgerLoanSetSignTx<'_> {
+    type AccountId = AccountID;
+    type CounterpartySignature = STObject;
+
+    fn counterparty(&self) -> Option<Self::AccountId> {
+        self.tx
+            .is_field_present(sf("sfCounterparty"))
+            .then(|| self.tx.get_account_id(sf("sfCounterparty")))
+    }
+
+    fn has_counterparty_signature(&self) -> bool {
+        self.tx.is_field_present(sf("sfCounterpartySignature"))
+    }
+
+    fn counterparty_signature(&self) -> &Self::CounterpartySignature {
+        &self.counterparty_signature
+    }
+}
+
+struct LedgerCounterpartySignTx {
+    account: AccountID,
+}
+
+impl TransactorSignTx for LedgerCounterpartySignTx {
+    type AccountId = AccountID;
+
+    fn has_delegate(&self) -> bool {
+        false
+    }
+
+    fn delegate_account_id(&self) -> Self::AccountId {
+        self.account
+    }
+
+    fn account_id(&self) -> Self::AccountId {
+        self.account
+    }
+}
+
+struct LedgerCounterpartySignatureObject<'a> {
+    object: &'a STObject,
+}
+
+impl TransactorSignObject for LedgerCounterpartySignatureObject<'_> {
+    fn signing_pub_key_is_empty(&self) -> bool {
+        self.object.get_field_vl(sf("sfSigningPubKey")).is_empty()
+    }
+
+    fn has_signers(&self) -> bool {
+        self.object.is_field_present(sf("sfSigners"))
+    }
+
+    fn has_txn_signature(&self) -> bool {
+        self.object.is_field_present(sf("sfTxnSignature"))
+    }
+}
+
+impl TransactorSignMultiSignObject<AccountID> for LedgerCounterpartySignatureObject<'_> {
+    type TxSigner = LedgerTxSigner;
+    type TxSigners = Vec<LedgerTxSigner>;
+
+    fn tx_signers(&self) -> Self::TxSigners {
+        self.object
+            .get_field_array(sf("sfSigners"))
+            .iter()
+            .cloned()
+            .map(|object| LedgerTxSigner { object })
+            .collect()
+    }
+}
+
+/// `../rippled/src/libxrpl/tx/transactors/lending/LoanSet.cpp::LoanSet::checkSign`: runs the `CounterpartySignature` authorization part.
+fn check_loan_set_counterparty_sign<V: ReadView>(
+    view: &V,
+    tx: &STTx,
+    flags: ApplyFlags,
+    check_primary_sign: impl FnOnce() -> NotTec,
+) -> NotTec {
+    let adapted = LedgerLoanSetSignTx {
+        tx,
+        counterparty_signature: tx.get_field_object(sf("sfCounterpartySignature")),
+    };
+    tx::run_loan_set_check_sign(
+        &adapted,
+        || {
+            view.read(protocol::loan_broker_keylet_from_key(
+                tx.get_field_h256(sf("sfLoanBrokerID")),
+            ))
+            .ok()
+            .flatten()
+            .map(|broker| broker.get_account_id(sf("sfOwner")))
+        },
+        check_primary_sign,
+        |counter_signer, signature| {
+            check_ledger_counterparty_signer_authorization(view, counter_signer, signature, flags)
+        },
+    )
+}
+
+fn check_ledger_counterparty_signer_authorization<V: ReadView>(
+    view: &V,
+    counter_signer: AccountID,
+    signature: &STObject,
+    flags: ApplyFlags,
+) -> NotTec {
+    let signer_tx = LedgerCounterpartySignTx {
+        account: counter_signer,
+    };
+    let signature = LedgerCounterpartySignatureObject { object: signature };
+    tx::run_transactor_preclaim_check_sign(
+        flags,
+        false,
+        view.rules().enabled(&feature_batch()),
+        view.rules().enabled(&feature_lending_protocol()),
+        &signer_tx,
+        &signature,
+        |account| read_account(view, account).map(LedgerSignAccountState::from),
+        |account| {
+            view.read(protocol::signers_keylet(Uint160::from_void(account.data())))
+                .ok()
+                .flatten()
+                .map(LedgerSignerList::from)
+        },
+        is_pseudo_account,
+        |signature| {
+            PublicKey::from_slice(&signature.object.get_field_vl(sf("sfSigningPubKey"))).is_ok()
+        },
+        |signature| {
+            let key = PublicKey::from_slice(&signature.object.get_field_vl(sf("sfSigningPubKey")))
+                .expect("public-key type was checked before account derivation");
+            calc_account_id(key.as_bytes())
+        },
+        |signer| PublicKey::from_slice(&signer.object.get_field_vl(sf("sfSigningPubKey"))).is_ok(),
+        |signer| {
+            let key = PublicKey::from_slice(&signer.object.get_field_vl(sf("sfSigningPubKey")))
+                .expect("public-key type was checked before account derivation");
+            calc_account_id(key.as_bytes())
+        },
+    )
+}
+
 fn check_ledger_signer_authorization<V: ReadView>(
     view: &V,
     tx: &LedgerPreclaimTx<'_>,
@@ -443,4 +597,27 @@ fn check_ledger_signer_authorization<V: ReadView>(
             calc_account_id(key.as_bytes())
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use ledger::Ledger;
+    use protocol::{AccountID, ApplyFlags, STTx, Ter, TxType, get_field_by_symbol};
+
+    use super::check_loan_set_counterparty_sign;
+
+    #[test]
+    fn loan_set_check_sign_requires_a_counter_signer_before_optional_signature_success() {
+        // ../rippled/src/libxrpl/tx/transactors/lending/LoanSet.cpp::LoanSet::checkSign: resolves the counter-signer before accepting an absent CounterpartySignature.
+        let account = AccountID::from_array([0xC5; 20]);
+        let tx = STTx::new(TxType::LOAN_SET, |tx| {
+            tx.set_account_id(get_field_by_symbol("sfAccount"), account);
+        });
+        let view = Ledger::from_ledger_seq_and_close_time(1, 0, false);
+
+        assert_eq!(
+            check_loan_set_counterparty_sign(&view, &tx, ApplyFlags::NONE, || Ter::TES_SUCCESS),
+            Ter::TEM_BAD_SIGNER
+        );
+    }
 }

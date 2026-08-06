@@ -32,7 +32,6 @@ pub mod loan_pay_transfer_prep;
 pub mod loan_pay_unimpair;
 pub mod loan_pay_vault_balance_checks;
 pub mod loan_pay_vault_state;
-pub mod read_view_preclaim;
 pub mod loan_set;
 pub mod loan_set_do_apply;
 pub mod loan_set_do_apply_add_empty_holding;
@@ -87,6 +86,7 @@ pub mod loan_set_preclaim_vault_limit;
 pub mod loan_set_preflight;
 pub mod loan_set_properties;
 pub mod loan_set_sign;
+pub mod read_view_preclaim;
 
 // Re-export all from submodules
 pub use loan_broker_cover_clawback::*;
@@ -121,7 +121,6 @@ pub use loan_pay_transfer_prep::*;
 pub use loan_pay_unimpair::*;
 pub use loan_pay_vault_balance_checks::*;
 pub use loan_pay_vault_state::*;
-pub use read_view_preclaim::*;
 pub use loan_set::*;
 pub use loan_set_do_apply::*;
 pub use loan_set_do_apply_add_empty_holding::*;
@@ -176,3 +175,4 @@ pub use loan_set_preclaim_vault_limit::*;
 pub use loan_set_preflight::*;
 pub use loan_set_properties::*;
 pub use loan_set_sign::*;
+pub use read_view_preclaim::*;
