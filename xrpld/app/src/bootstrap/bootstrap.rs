@@ -4239,7 +4239,7 @@ fn replay_startup_ledger_from_storage(
         .map_err(|error| format!("replay parent setup failed: {error:?}"))?;
     parent_ledger.assert_sensible();
 
-    let parent = Arc::new(parent_ledger);
+    let parent = root.ledger_with_node_fetcher(Arc::new(parent_ledger));
     hydrate_loaded_ledger(
         root,
         Arc::clone(&parent),
@@ -4357,6 +4357,55 @@ fn hydrate_loaded_ledger(
     Ok(())
 }
 
+/// Admit every replay transaction against the exact immutable parent before
+/// touching the open-ledger shell. The startup replay path has no mutable
+/// `OpenView` accumulator yet, so its preclaim must deliberately read only
+/// the parent captured from the replay header.
+///
+/// This preserves the ordering of rippled's transaction pipeline:
+/// `preflight` then `preclaim`, before `doApply` can mutate a view
+/// (`../rippled/src/libxrpl/tx/applySteps.cpp`, `preclaim` and `doApply`).
+/// Rippled's startup loader inserts decoded replay transactions directly into
+/// `OpenLedger` (`../rippled/src/xrpld/app/main/Application.cpp::loadOldLedger`);
+/// Quaxar makes that shell insertion conditional on the shared, fail-closed
+/// admission path because a later standalone close would otherwise be the
+/// first semantic validation boundary.
+fn admit_replay_open_ledger_transactions(
+    parent: &Ledger,
+    replay_data: &LedgerReplay,
+) -> Result<Vec<Arc<STTx>>, String> {
+    let rules = parent.rules();
+    let current_ledger_seq = parent.header().seq.saturating_add(1);
+    let mut admitted = Vec::with_capacity(replay_data.ordered_txs().len());
+
+    for (transaction_index, tx) in replay_data.ordered_txs() {
+        let transaction_id = tx.get_transaction_id();
+        let preflight =
+            crate::state::application_root::transaction_preflight_ter(tx.as_ref(), &rules);
+        if !protocol::is_tes_success(preflight) {
+            return Err(format!(
+                "Replay transaction {transaction_id} at index {transaction_index} failed shared semantic preflight: {preflight:?}"
+            ));
+        }
+
+        let preclaim = crate::state::application_root::queue_apply_preclaim_ter(
+            parent,
+            tx.as_ref(),
+            current_ledger_seq,
+            protocol::ApplyFlags::NONE,
+        );
+        if !protocol::is_tes_success(preclaim) {
+            return Err(format!(
+                "Replay transaction {transaction_id} at index {transaction_index} failed immutable parent preclaim: {preclaim:?}"
+            ));
+        }
+
+        admitted.push(Arc::clone(tx));
+    }
+
+    Ok(admitted)
+}
+
 fn inject_replay_transactions<CLOCK, S, FB, F, MR, NS>(
     root: &ApplicationRoot,
     parent: Arc<Ledger>,
@@ -4372,22 +4421,25 @@ where
     MR: shamap::family::MissingNodeReporter,
 {
     let replay_data = build_replay_data_with_family(parent, replay, family)?;
-    let mut found_trap = trap_tx_hash.is_none();
 
-    let _ = root.open_ledger().modify(|view| {
-        for tx in replay_data.ordered_txs().values() {
-            let tx_id = tx.get_transaction_id();
-            if trap_tx_hash.is_some_and(|trap| trap == tx_id) {
-                found_trap = true;
-            }
-            view.push_transaction(tx.clone());
-        }
-        true
-    });
-
+    // Complete all immutable admission before the one `OpenLedger::modify`
+    // call below. This prevents a rejected later transaction (or a missing
+    // trap) from leaving an accepted prefix in the open-ledger shell.
+    let admitted = admit_replay_open_ledger_transactions(replay_data.parent(), &replay_data)?;
+    let found_trap = trap_tx_hash.is_none()
+        || admitted
+            .iter()
+            .any(|tx| trap_tx_hash == Some(tx.get_transaction_id()));
     if !found_trap {
         return Err("Replay ledger does not contain the requested trap transaction".to_owned());
     }
+
+    let _ = root.open_ledger().modify(|view| {
+        for tx in admitted {
+            view.push_transaction(tx);
+        }
+        true
+    });
 
     Ok(())
 }

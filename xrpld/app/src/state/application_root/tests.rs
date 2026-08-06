@@ -3851,7 +3851,6 @@ fn batch_all_or_nothing_discards_inner_metadata_with_the_whole_batch_view() {
 }
 
 #[test]
-#[ignore = "requires standalone shared preflight and preclaim before mutation"]
 fn standalone_accept_rejects_bad_signature_and_pre_sequence_before_mutation() {
     // ../rippled/src/libxrpl/tx/apply.cpp::apply (lines 132-158) always
     // executes preflight and preclaim before doApply. The standalone close
@@ -3906,7 +3905,6 @@ fn standalone_accept_rejects_bad_signature_and_pre_sequence_before_mutation() {
 }
 
 #[test]
-#[ignore = "requires publication-gap routing into LedgerReplayer"]
 fn publication_gap_routes_to_owned_ledger_replayer() {
     // ../rippled/src/xrpld/app/ledger/detail/LedgerMaster.cpp::findNewLedgersToPublish
     // (lines 1307-1335) narrows a contiguous publication gap and calls

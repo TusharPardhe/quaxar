@@ -6747,6 +6747,10 @@ impl ApplicationRoot {
             // provider result as validated by itself.
             report = lm_rt.plan_advance_publication();
         }
+        // `LedgerMaster.cpp::findNewLedgersToPublish` derives replay from the
+        // publication plan, not directly from an arbitrary missing hash. Keep
+        // that proof before publication mutates the owner's current pointer.
+        let replay_range = lm_rt.plan_publication_replay(&report);
 
         use crate::ledger::ledger_master_runtime::AppLedgerMasterPublishAdvance;
         match report.decision {
@@ -6807,6 +6811,30 @@ impl ApplicationRoot {
                                 crate::ledger::inbound_ledgers::AcquireReason::Generic,
                             );
                         }
+                    }
+                }
+                if let Some(replay) = replay_range {
+                    // `../rippled/src/xrpld/app/ledger/detail/LedgerMaster.cpp::
+                    // findNewLedgersToPublish` requests this exact inclusive
+                    // suffix through `LedgerReplayer::replay`. The planner has
+                    // already proved nonzero, bounded input; the replayer owns
+                    // duplicate-task and stopping checks.
+                    if let Ok(mut replayer) = self.registry.ledger_replayer.lock() {
+                        tracing::debug!(
+                            target: "ledger",
+                            finish_hash = %replay.finish_hash,
+                            total_ledgers = replay.total_ledgers,
+                            "tryAdvance: scheduling publication-gap ledger replay"
+                        );
+                        let _ = replayer.replay(
+                            ledger::InboundLedgerReason::Generic,
+                            replay.finish_hash,
+                            replay.total_ledgers,
+                        );
+                    } else {
+                        tracing::error!(target: "ledger",
+                            "tryAdvance: ledger replayer lock poisoned; refusing publication-gap replay"
+                        );
                     }
                 }
             }
@@ -7756,8 +7784,31 @@ impl ApplicationRoot {
         let mut accepted_entries = Vec::new();
         for st_tx in &open_txs {
             let txn_type = st_tx.get_txn_type();
-            // Use the full transactor lifecycle (preflight + sequence + fee + doApply)
-            // matching what the open ledger does during submit.
+            // `../rippled/src/xrpld/app/ledger/detail/BuildLedger.cpp::buildLedger`
+            // replays through `applyTransaction`, which runs the shared
+            // semantic preflight and immutable `invokePreclaim` before any
+            // `doApply` mutation. Keep the standalone open-ledger replay on
+            // that exact admission boundary; a rejected transaction must not
+            // consume a sequence, fee, or tx-map slot in `state_view`.
+            let rules = state_view.rules();
+            let preflight = transaction_preflight_ter(st_tx, &rules);
+            let preclaim = if is_tes_success(preflight) {
+                queue_apply_preclaim_ter(&state_view, st_tx, closed_seq, ApplyFlags::NONE)
+            } else {
+                preflight
+            };
+            if !is_tes_success(preclaim) {
+                tracing::debug!(
+                    target: "ledger",
+                    closed_seq,
+                    tx_id = %st_tx.get_transaction_id(),
+                    ?txn_type,
+                    ?preclaim,
+                    "standalone replay rejected transaction before shell mutation"
+                );
+                continue;
+            }
+
             let SubmitApplyOutcome {
                 result,
                 delivered_amount,

@@ -459,7 +459,6 @@ fn application_root_binds_runtime_components_under_one_shell() {
 /// the unretrieved range. The replay task is bounded and leaves the published
 /// ledger unchanged until a verified replay finishes.
 #[test]
-#[ignore = "requires LedgerReplayer publication-gap routing"]
 fn application_root_routes_missing_publication_gap_to_owned_ledger_replayer() {
     let mut root = ApplicationRoot::new(0).expect("root shell should build");
     let runtime = root.attach_default_ledger_master_runtime();

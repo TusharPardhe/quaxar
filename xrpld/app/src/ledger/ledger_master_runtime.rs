@@ -16,7 +16,10 @@ use basics::base_uint::Uint256;
 use basics::hardened_hash::HardenedHashBuilder;
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::MonotonicClock;
-use ledger::{CanonicalTXSet, Ledger, LedgerMaster, LedgerMasterConfig, NullLedgerJournal};
+use ledger::{
+    CanonicalTXSet, Ledger, LedgerMaster, LedgerMasterConfig, NullLedgerJournal,
+    REPLAY_MAX_TASK_SIZE,
+};
 use protocol::STTx;
 use shamap::traversal::TraversalError;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -55,6 +58,14 @@ pub enum AppLedgerMasterPublishAdvance {
 pub struct AppLedgerMasterMissingLedger {
     pub hash: Uint256,
     pub seq: u32,
+}
+
+/// A bounded, inclusive replay request derived only from a verified publication
+/// gap. `finish_hash` is the last unavailable ledger on the validated chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppLedgerMasterReplayRange {
+    pub finish_hash: Uint256,
+    pub total_ledgers: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -282,6 +293,81 @@ impl AppLedgerMasterRuntime {
                 }
             }
         }
+    }
+
+    /// Mirrors `../rippled/src/xrpld/app/ledger/detail/LedgerMaster.cpp::
+    /// LedgerMaster::findNewLedgersToPublish`: begin at the last contiguous
+    /// ledger ready for publication, walk backward through locally available
+    /// validated-chain parents, and replay the first unavailable inclusive
+    /// suffix. Invalid ancestry, an absent publication gap, or an over-limit
+    /// request is rejected rather than widened into a permissive replay.
+    pub fn plan_publication_replay(
+        &self,
+        report: &AppLedgerMasterAdvanceReport,
+    ) -> Option<AppLedgerMasterReplayRange> {
+        if report.decision != AppLedgerMasterPublishAdvance::Sequential {
+            return None;
+        }
+
+        // `findNewLedgersToPublish` derives both its contiguous prefix and
+        // replay suffix under LedgerMaster's lock. This Rust bridge receives a
+        // report across an owner boundary, so re-prove that its prefix extends
+        // the actual publication head before using it as replay's start.
+        let mut start = self.ledger_master.published_ledger()?;
+        for published in &report.published {
+            if published.header().seq != start.header().seq.checked_add(1)?
+                || published.header().parent_hash != start.header().hash
+            {
+                return None;
+            }
+            start = Arc::clone(published);
+        }
+
+        let mut finish = self.ledger_master.validated_ledger()?;
+        if finish.header().seq <= start.header().seq {
+            return None;
+        }
+        let missing = report.missing?;
+
+        while start.header().seq.checked_add(1)? < finish.header().seq {
+            let parent_hash = finish.header().parent_hash;
+            let parent_seq = finish.header().seq.checked_sub(1)?;
+            let Some(parent) = self.ledger_master.get_ledger_by_hash(parent_hash) else {
+                // Never turn an arbitrary report marker into acquisition work.
+                // The marker must be exactly the parent absent from the
+                // validated chain at this point, as in LedgerMaster.cpp's
+                // backward walk before it calls LedgerReplayer::replay.
+                if parent_hash.is_zero()
+                    || missing.seq != parent_seq
+                    || missing.hash != *parent_hash.as_uint256()
+                {
+                    return None;
+                }
+
+                let total_ledgers = finish
+                    .header()
+                    .seq
+                    .checked_sub(start.header().seq)?
+                    .checked_add(1)?;
+                if !(2..=REPLAY_MAX_TASK_SIZE).contains(&total_ledgers) {
+                    return None;
+                }
+                return Some(AppLedgerMasterReplayRange {
+                    finish_hash: *finish.header().hash.as_uint256(),
+                    total_ledgers,
+                });
+            };
+
+            // `LedgerMaster.cpp` follows a locally held parent. Do not treat a
+            // stale cache entry or a forked/non-consecutive candidate as that
+            // parent: no safe replay range can be proven from it.
+            if parent.header().seq != parent_seq || parent.header().hash != parent_hash {
+                return None;
+            }
+            finish = parent;
+        }
+
+        None
     }
 }
 
@@ -520,6 +606,41 @@ mod tests {
     }
 
     #[test]
+    fn runtime_rejects_an_unproven_publication_replay_marker() {
+        let runtime = AppLedgerMasterRuntime::default();
+        let first = immutable_ledger(1, 0x10);
+        let second = linked_ledger(&first, 600);
+        let third = linked_ledger(&second, 700);
+
+        runtime.ledger_master().set_pub_ledger(Arc::clone(&first));
+        runtime
+            .ledger_master()
+            .set_valid_ledger(Arc::clone(&third), None, None)
+            .expect("validated ledger should update");
+
+        let mut report = runtime.plan_advance_publication();
+        report.missing = Some(super::AppLedgerMasterMissingLedger {
+            hash: Uint256::from_array([0xEE; 32]),
+            seq: 2,
+        });
+        assert_eq!(
+            runtime.plan_publication_replay(&report),
+            None,
+            "a report marker not equal to the absent validated-chain parent must not schedule replay"
+        );
+
+        report.missing = Some(super::AppLedgerMasterMissingLedger {
+            hash: *second.header().hash.as_uint256(),
+            seq: 3,
+        });
+        assert_eq!(
+            runtime.plan_publication_replay(&report),
+            None,
+            "the right hash at the wrong sequence must not widen into replay work"
+        );
+    }
+
+    #[test]
     fn runtime_plans_exact_missing_publish_gap() {
         let runtime = AppLedgerMasterRuntime::default();
         let first = immutable_ledger(1, 0x10);
@@ -540,5 +661,13 @@ mod tests {
             .expect("seq=2 should be the first publish gap");
         assert_eq!(missing.seq, 2);
         assert_eq!(missing.hash, *second.header().hash.as_uint256());
+        assert_eq!(
+            runtime.plan_publication_replay(&report),
+            Some(super::AppLedgerMasterReplayRange {
+                finish_hash: *third.header().hash.as_uint256(),
+                total_ledgers: 3,
+            }),
+            "the replay request must start at the published ledger and end at the first unavailable validated suffix"
+        );
     }
 }

@@ -6,8 +6,9 @@ use basics::{base_uint::Uint256, intrusive_pointer::make_shared_intrusive, str_h
 use ledger::{Ledger, LedgerHeader, calculate_ledger_hash};
 use nodestore::{DummyScheduler, Manager, ManagerImp, NodeObjectType, NullJournal, Scheduler};
 use protocol::{
-    AccountID, LedgerEntryType, MPTAmount, MPTIssue, STAmount, STArray, STLedgerEntry, STObject,
-    STTx, TxType, account_keylet, get_field_by_symbol, make_mpt_id,
+    AccountID, KeyType, LedgerEntryType, MPTAmount, MPTIssue, STAmount, STArray, STLedgerEntry,
+    STObject, STTx, SecretKey, TxType, account_keylet, calc_account_id, derive_public_key,
+    get_field_by_symbol, make_mpt_id,
 };
 use shamap::{
     item::SHAMapItem,
@@ -59,6 +60,33 @@ fn payment_tx(sequence: u32, account_fill: u8, destination_fill: u8) -> Arc<STTx
     }))
 }
 
+fn signed_payment_tx(
+    sequence: u32,
+    secret_fill: u8,
+    destination: AccountID,
+) -> (Arc<STTx>, AccountID) {
+    let secret = SecretKey::from_bytes([secret_fill; 32]);
+    let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+    let source = calc_account_id(public.as_bytes());
+    let mut tx = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(get_field_by_symbol("sfAccount"), source);
+        tx.set_account_id(get_field_by_symbol("sfDestination"), destination);
+        tx.set_field_amount(
+            get_field_by_symbol("sfAmount"),
+            STAmount::new_native(1_000_000, false),
+        );
+        tx.set_field_amount(
+            get_field_by_symbol("sfFee"),
+            STAmount::new_native(10, false),
+        );
+        tx.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+        tx.set_field_vl(get_field_by_symbol("sfSigningPubKey"), public.as_bytes());
+    });
+    tx.sign(&public, &secret, None)
+        .expect("payment signature should succeed");
+    (Arc::new(tx), source)
+}
+
 fn metadata(index: u32, fill: u8) -> STObject {
     let mut final_fields = STObject::new(get_field_by_symbol("sfFinalFields"));
     final_fields.set_account_id(get_field_by_symbol("sfAccount"), account(fill));
@@ -88,6 +116,22 @@ fn tx_md_payload(tx: &STTx, meta: &STObject) -> Vec<u8> {
     serializer.add_vl(&tx_bytes);
     serializer.add_vl(&meta_bytes);
     serializer.data().to_vec()
+}
+
+fn persisted_bootstrap_account_root_for(account: AccountID, sequence: u32) -> SHAMapItem {
+    let key = account_keylet(raw_account_id(account)).key;
+    let mut entry = STLedgerEntry::from_type_and_key(LedgerEntryType::AccountRoot, key);
+    entry.set_account_id(get_field_by_symbol("sfAccount"), account);
+    entry.set_field_amount(
+        get_field_by_symbol("sfBalance"),
+        STAmount::new_native(1_000_000_000, false),
+    );
+    entry.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+    entry.set_field_u32(get_field_by_symbol("sfOwnerCount"), 0);
+    entry.set_field_u32(get_field_by_symbol("sfFlags"), 0);
+    entry.set_field_h256(get_field_by_symbol("sfPreviousTxnID"), Uint256::zero());
+    entry.set_field_u32(get_field_by_symbol("sfPreviousTxnLgrSeq"), 0);
+    SHAMapItem::new(key, entry.get_serializer().data().to_vec())
 }
 
 fn persisted_bootstrap_account_root(fill: u8) -> SHAMapItem {
@@ -151,11 +195,26 @@ fn persisted_bootstrap_ledger(seq: u32) -> Arc<Ledger> {
 }
 
 fn persisted_bootstrap_state_only_ledger(seq: u32) -> Arc<Ledger> {
-    let state_root = make_shared_intrusive(SHAMapTreeNode::new_leaf(
-        SHAMapNodeType::AccountState,
-        persisted_bootstrap_account_root(0x10 + seq as u8),
-        0,
-    ));
+    persisted_bootstrap_state_only_ledger_with_accounts(
+        seq,
+        &[(account(0x10 + seq as u8), u32::from(0x10 + seq as u8))],
+    )
+}
+
+fn persisted_bootstrap_state_only_ledger_with_accounts(
+    seq: u32,
+    accounts: &[(AccountID, u32)],
+) -> Arc<Ledger> {
+    let mut state_tree = MutableTree::new(seq);
+    for (account, account_sequence) in accounts {
+        state_tree
+            .add_item(
+                SHAMapNodeType::AccountState,
+                persisted_bootstrap_account_root_for(*account, *account_sequence),
+            )
+            .expect("account-state item should insert");
+    }
+    let state_root = state_tree.root();
     let mut header = LedgerHeader {
         seq,
         account_hash: state_root.get_hash(),
@@ -838,8 +897,17 @@ path = {}
 #[test]
 fn app_bootstrap_loads_replay_parent_and_injects_replay_transactions() {
     let dir = TempDir::new().expect("tempdir");
-    let parent = persisted_bootstrap_state_only_ledger(20);
-    let replay_tx = payment_tx(1, 0x11, 0x21);
+    let destination = account(0x21);
+    let (replay_tx, source) = signed_payment_tx(1, 0x11, destination);
+    let parent =
+        persisted_bootstrap_state_only_ledger_with_accounts(20, &[(source, 1), (destination, 1)]);
+    assert!(
+        parent
+            .read(account_keylet(raw_account_id(source)))
+            .expect("fixture source account read")
+            .is_some(),
+        "strict replay fixture must contain the transaction source account"
+    );
     let delivered_amount = STAmount::from_mpt_amount(
         get_field_by_symbol("sfDeliveredAmount"),
         MPTAmount::from_value(800),
@@ -915,6 +983,195 @@ path = {}
     assert_eq!(
         bootstrap.root.open_ledger().current().tx_ids(),
         vec![replay_tx.get_transaction_id()]
+    );
+}
+
+#[test]
+fn app_bootstrap_replay_rejects_semantically_invalid_transactions_before_open_ledger_injection() {
+    // Parity: ../rippled/src/libxrpl/tx/applySteps.cpp executes preflight and
+    // immutable preclaim before doApply. The unsigned fixture must fail at
+    // that admission boundary rather than being pushed into the open-ledger
+    // shell for a later standalone close.
+    let dir = TempDir::new().expect("tempdir");
+    let parent = persisted_bootstrap_state_only_ledger(20);
+    let rejected = payment_tx(1, 0x11, 0x21);
+    let replay = persisted_bootstrap_replay_ledger(
+        21,
+        *parent.header().hash.as_uint256(),
+        &[(Arc::clone(&rejected), metadata(0, 0x92))],
+    );
+    let (database_path, node_db_path, config_path) =
+        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "RocksDB");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let error = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Replay,
+            start_ledger: Some(replay.header().hash.as_uint256().to_string()),
+            start_valid: true,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect_err("invalid replay transaction must not reach open-ledger injection");
+
+    assert!(
+        error.contains("failed shared semantic preflight"),
+        "unexpected replay admission error: {error}"
+    );
+}
+
+#[test]
+fn app_bootstrap_replay_rejects_signed_transaction_at_immutable_parent_preclaim() {
+    // Parity: ../rippled/src/xrpld/app/ledger/detail/BuildLedger.cpp::buildLedger
+    // invokes applyTransaction, whose preflight and immutable-parent preclaim
+    // finish before doApply. This transaction has a valid signature but a
+    // future sequence, so it proves the startup shell does not treat
+    // preflight success as permission to mutate the open-ledger transaction
+    // list.
+    let dir = TempDir::new().expect("tempdir");
+    let destination = account(0x21);
+    let (rejected, source) = signed_payment_tx(2, 0x11, destination);
+    let parent =
+        persisted_bootstrap_state_only_ledger_with_accounts(20, &[(source, 1), (destination, 1)]);
+    let replay = persisted_bootstrap_replay_ledger(
+        21,
+        *parent.header().hash.as_uint256(),
+        &[(Arc::clone(&rejected), metadata(0, 0x92))],
+    );
+    let (database_path, node_db_path, config_path) =
+        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "RocksDB");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let error = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Replay,
+            start_ledger: Some(replay.header().hash.as_uint256().to_string()),
+            start_valid: true,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect_err("future-sequence replay transaction must not reach shell injection");
+
+    assert!(
+        error.contains("failed immutable parent preclaim"),
+        "unexpected replay admission error: {error}"
+    );
+}
+
+#[test]
+fn app_bootstrap_replay_rejects_stale_sequence_before_open_ledger_injection() {
+    // The transaction is otherwise valid and signed, so this exercises the
+    // immutable parent preclaim rather than the stateless preflight gate.
+    // Parity: ../rippled/src/libxrpl/tx/applySteps.cpp::preclaim builds its
+    // `PreclaimContext` from a read-only OpenView before `doApply` mutates it.
+    let dir = TempDir::new().expect("tempdir");
+    let destination = account(0x31);
+    let (stale, source) = signed_payment_tx(2, 0x12, destination);
+    let parent =
+        persisted_bootstrap_state_only_ledger_with_accounts(20, &[(source, 1), (destination, 1)]);
+    let replay = persisted_bootstrap_replay_ledger(
+        21,
+        *parent.header().hash.as_uint256(),
+        &[(Arc::clone(&stale), metadata(0, 0x93))],
+    );
+    let (database_path, node_db_path, config_path) =
+        persist_bootstrap_storage(&dir, &[Arc::clone(&parent), Arc::clone(&replay)], "RocksDB");
+
+    fs::write(
+        &config_path,
+        format!(
+            r#"
+[database_path]
+{}
+
+[server]
+port_rpc
+
+[port_rpc]
+ip = 127.0.0.1
+port = 5005
+protocol = http
+
+[node_db]
+type = RocksDB
+path = {}
+"#,
+            database_path.display(),
+            node_db_path.display(),
+        ),
+    )
+    .expect("config file");
+
+    let config = load_basic_config_file(&config_path).expect("config");
+    let error = build_bootstrap_root(
+        &config,
+        &AppBootstrapOptions {
+            config_path,
+            start_type: StartUpType::Replay,
+            start_ledger: Some(replay.header().hash.as_uint256().to_string()),
+            start_valid: true,
+            ..AppBootstrapOptions::default()
+        },
+    )
+    .expect_err("stale replay transaction must not reach open-ledger injection");
+
+    assert!(
+        error.contains("failed immutable parent preclaim"),
+        "unexpected replay admission error: {error}"
     );
 }
 
