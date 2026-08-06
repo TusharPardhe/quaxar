@@ -5707,6 +5707,7 @@ impl ApplicationRoot {
                 Arc::clone(&self.registry.inbound_ledgers),
                 Arc::clone(&self.registry.inbound_transactions),
                 Arc::clone(&self.registry.ledger_replayer),
+                self.clone(),
                 ledger_master_runtime,
                 network_ops_runtime,
             )));
@@ -7351,6 +7352,72 @@ impl ApplicationRoot {
                 }
             }
         }
+    }
+
+    /// Cheap scheduler predicate: while no replay owner is active, the
+    /// managed timer does not enqueue empty `JtReplayTask` work. A contended
+    /// replayer lock is treated as active so an admission transition cannot be
+    /// missed; the next 25 ms poll will observe the exact owner state.
+    pub(crate) fn has_active_ledger_replay_timers(&self) -> bool {
+        self.registry
+            .ledger_replayer
+            .try_lock()
+            .map_or(true, |replayer| {
+                let timers = replayer.timer_status();
+                timers.active_tasks != 0
+                    || timers.active_skip_lists != 0
+                    || timers.active_deltas != 0
+            })
+    }
+
+    /// Execute due replay task/subtask timers from the app-owned
+    /// `JtReplayTask` worker. The scheduler only queues this method; all
+    /// ledger lookup, inbound fallback, persistence, and publication remain
+    /// under the real application owners.
+    pub(crate) fn drive_ledger_replay_timers(&self) {
+        let Some(runtime) = self.ledger_master_runtime() else {
+            return;
+        };
+        let root = self.clone();
+        let inbound_ledgers = Arc::clone(&runtime.inbound_ledgers);
+        let completed = match self.registry.ledger_replayer.lock() {
+            Ok(mut replayer) => {
+                let result = replayer.drive_timeouts(
+                    std::time::Instant::now(),
+                    &mut |hash| root.resolve_ledger_by_hash(SHAMapHash::new(hash)),
+                    &mut |replay| crate::build_ledger_from_replay_delta(replay),
+                    &mut |hash, seq, _reason| {
+                        if let Ok(guard) = inbound_ledgers.lock()
+                            && let Some(shared) = guard.as_ref()
+                        {
+                            shared.acquire_async(
+                                hash,
+                                seq,
+                                crate::ledger::inbound_ledgers::AcquireReason::Generic,
+                            );
+                        }
+                    },
+                );
+                replayer.sweep();
+                result
+            }
+            Err(_) => {
+                tracing::error!(target: "ledger", "ledger replayer lock poisoned; skipping replay timer");
+                return;
+            }
+        };
+        let completed = match completed {
+            Ok(ledgers) => ledgers,
+            Err(error) => {
+                tracing::warn!(target: "ledger", ?error, "replay timer task failed while advancing delta");
+                return;
+            }
+        };
+        for ledger in completed {
+            let ledger = self.store_consensus_ledger(ledger);
+            self.check_accept_hash_seq(*ledger.header().hash.as_uint256(), ledger.header().seq);
+        }
+        self.try_advance_publication();
     }
 
     pub fn validated_ledger_age(&self) -> std::time::Duration {

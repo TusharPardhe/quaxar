@@ -36,7 +36,7 @@ flowchart TD
 | preflight → preclaim → apply | `state/invoke_preclaim.rs`, `state/application_root.rs` | MATCH target; audit required after every change |
 | canonical retry passes | `ApplicationRoot::accept_ledger_with_txns_outcome_on_parent` | MATCH target |
 | open ledger reapply | `ApplicationRoot::reapply_open_ledger_record` | MATCH target |
-| live TxQ clear-ahead | `AppOpenLedgerTxQApplyRuntime::run_try_clear` | **DIVERGENT: currently returns `terQUEUED`** |
+| live TxQ clear-ahead | `AppOpenLedgerTxQApplyRuntime::run_try_clear` | **MATCH**: applies queued predecessors and the current transaction in one `FlowSandbox`, commits only after all apply, then removes cleared queue entries. Source: `TxQ.cpp::tryClearAccountQueueUpThruTx` (517-609); Quaxar `xrpld/app/src/state/application_root.rs::run_try_clear`. |
 
 ## 2. Batch path
 
@@ -88,7 +88,7 @@ flowchart TD
 |---|---|---|
 | simulate current view/TxQ dry-run | `ApplicationRoot::simulate_transaction` | MATCH target |
 | Batch simulation | RPC simulate handler | MATCH target: reject as not supported |
-| clear-ahead execution | `run_try_clear` | **DIVERGENT/ABSENT production edge** |
+| clear-ahead execution | `run_try_clear` | **MATCH**: production TxQ owner runs predecessor replay, current repreclaim/apply, atomic sandbox commit, and queue cleanup. Source: `TxQ.cpp::tryClearAccountQueueUpThruTx`; Quaxar `xrpld/app/src/state/application_root.rs::run_try_clear`. |
 
 ## 4. Replay and publication gap
 
@@ -116,8 +116,8 @@ flowchart TD
 |---|---|---|
 | publication-gap proof/range planning | `AppLedgerMasterRuntime::plan_publication_replay` | MATCH target |
 | create skip-list/task/deltas | `history_runtime/replayer.rs` | MATCH target |
-| peer replay response → `got_replay_delta` | overlay/replayer bridge | **ABSENT** |
-| delta/task trigger → `tryAdvance` | replay runtime driver | **ABSENT** |
+| peer replay response → `got_replay_delta` | `ApplicationRoot::on_replay_delta_response` and bootstrap inbound router | **MATCH**: validates the response before owner delivery, then advances, stores, checks accept, and advances publication. Source: `LedgerReplayMsgHandler.cpp::processReplayDeltaResponse`, `LedgerReplayTask.cpp::deltaReady`; Quaxar `xrpld/app/src/state/application_root/replay_callback_impl.rs` and `xrpld/app/src/bootstrap/bootstrap.rs`. |
+| skip-list/delta/task timer → retry/fallback → `tryAdvance` | `ReplayTimerRuntime` → `ApplicationRoot::drive_ledger_replay_timers` → `LedgerReplayer::drive_timeouts` | **MATCH**: managed runtime polls due 250/500/1000 ms owner timers, queues `JtReplayTask`, retries replay peers, falls back to inbound acquisition, and stores/publishes completed replay. Source: `LedgerReplayTask.cpp::onTimer`, `LedgerDeltaAcquire.cpp::onTimer`, `SkipListAcquire.cpp::onTimer`; Quaxar `xrpld/app/src/runtime/component_runtime.rs`, `xrpld/app/src/state/application_root.rs`, and `xrpld/ledger/src/history_runtime/replayer.rs`. |
 
 ## 5. Inbound completion / NetworkOps ownership
 
@@ -140,6 +140,14 @@ flowchart TD
 | completed registry polling/persist/checkAccept/ack | `network_ops_strand.rs` | MATCH target |
 | completion receiver ownership | NetworkOps strand only | MATCH target |
 | sweep full-ledger release | `inbound_ledgers/registry.rs` | MATCH target |
+
+## Quaxar-only fail-closed extension: Confidential-MPT
+
+`ConfidentialMPTConvert`, `ConfidentialMPTMergeInbox`, `ConfidentialMPTConvertBack`, `ConfidentialMPTSend`, and `ConfidentialMPTClawback` are Quaxar-only typed dispatch extensions. The audited local `../rippled` tree has no corresponding transactors. They are therefore deliberately fail-closed as `TEM_UNKNOWN`, never promoted to `tesSUCCESS` and never directly applied. Source check: Quaxar `xrpld/app/src/state/application_root.rs::typed_preclaim_route` and `xrpld/app/src/state/transactor_dispatcher.rs::confidential_mpt_direct_apply_ter`; reference comparison: no Confidential-MPT implementation under `../rippled/src/libxrpl/tx/transactors`.
+
+### Read-only audit rule
+
+Auditors must not change implementation or status during certification. They must inspect the exact Quaxar paths and rippled anchors cited in each table row, record source paths/function names, and reject a `MATCH` claim if the concrete production owner or regression is absent. For replay timer certification, run and inspect `xrpld/app/tests/state/application_root.rs::production_replay_scheduler_timer_tick_retries_and_falls_back_to_inbound`; it starts the managed `AppLedgerRuntime`, schedules normal `JtReplayTask` work, asserts skip-list/delta/task timer ticks, and proves skip-list and delta inbound fallback without directly invoking a timer method.
 
 ## Required graph gates
 1. Never patch a path that is not attached to a graph node/edge.

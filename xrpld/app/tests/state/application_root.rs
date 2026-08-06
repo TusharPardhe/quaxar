@@ -12,7 +12,7 @@ use app::{
 };
 use basics::base_uint::Uint256;
 use ledger::{AcceptedLedger, LEDGER_DEFAULT_TIME_RESOLUTION, Ledger, LedgerHeader};
-use overlay::{Overlay, OverlayHandoff, OverlayImpl, Peer, PeerImp, Setup};
+use overlay::{Overlay, OverlayHandoff, OverlayImpl, Peer, PeerImp, Setup, SimplePeerSetBuilder};
 use protocol::{
     JsonOptions, JsonValue, LedgerEntryType, STAmount, STArray, STLedgerEntry, STObject, STTx,
     STVector256, TxType, amendments_key, calc_account_id, get_field_by_symbol,
@@ -1978,4 +1978,166 @@ fn application_root_mode_owner_uses_live_validated_ledger_age() {
         NetworkOpsOperatingMode::Connected
     );
     assert_eq!(owner.operating_mode(), NetworkOpsOperatingMode::Syncing);
+}
+
+#[test]
+fn production_replay_scheduler_timer_tick_retries_and_falls_back_to_inbound() {
+    // Source: LedgerReplayTask.cpp::onTimer, SkipListAcquire.cpp::onTimer,
+    // and LedgerDeltaAcquire.cpp::onTimer. This starts the managed
+    // AppLedgerRuntime and a normal JobQueue worker; it intentionally never
+    // calls a replay/acquire timer method directly.
+    let mut root = ApplicationRoot::new(0).expect("application root should build");
+    let ledger_master = root.attach_default_ledger_master_runtime();
+
+    let mut first = Ledger::from_ledger_seq_and_close_time(1, 500, false);
+    first.set_immutable(true);
+    let first = Arc::new(first);
+    let mut second = Ledger::from_previous(first.as_ref(), 600);
+    second.set_immutable(true);
+    let second = Arc::new(second);
+    let mut third = Ledger::from_previous(second.as_ref(), 700);
+    third.set_immutable(true);
+    let third = Arc::new(third);
+    let finish_hash = *third.header().hash.as_uint256();
+    let mut local_delta_middle = Ledger::from_previous(first.as_ref(), 625);
+    local_delta_middle
+        .update_skip_list()
+        .expect("local replay middle must have a skip list");
+    local_delta_middle.set_immutable(true);
+    let local_delta_middle = Arc::new(local_delta_middle);
+    let mut local_delta_finish = Ledger::from_previous(local_delta_middle.as_ref(), 650);
+    local_delta_finish
+        .update_skip_list()
+        .expect("locally available replay finish must have a skip list");
+    local_delta_finish.set_immutable(true);
+    let local_delta_finish = Arc::new(local_delta_finish);
+    let local_finish_hash = *local_delta_finish.header().hash.as_uint256();
+    let middle_hash = *local_delta_middle.header().hash.as_uint256();
+
+    let no_feature_peer = |id, seed| {
+        let secret = SecretKey::from_bytes([seed; 32]);
+        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("peer public key");
+        let peer = PeerImp::new(
+            id,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 56_000 + id as u16),
+            public,
+            format!("replay-no-feature-{id}"),
+        );
+        peer.record_ledger(finish_hash, third.header().seq);
+        peer
+    };
+    // Two peers which advertise the target ledger but not LedgerReplay cause
+    // the same max-no-feature-peer fallback transition as rippled.
+    let first_peer = no_feature_peer(71, 0x71);
+    let second_peer = no_feature_peer(72, 0x72);
+    first_peer.record_ledger(middle_hash, local_delta_middle.header().seq);
+    second_peer.record_ledger(middle_hash, local_delta_middle.header().seq);
+    root.get_ledger_replayer()
+        .lock()
+        .expect("replayer lock")
+        .set_peer_set_builder(Arc::new(SimplePeerSetBuilder::new(vec![
+            Arc::clone(&first_peer) as Arc<dyn Peer>,
+            Arc::clone(&second_peer) as Arc<dyn Peer>,
+        ])));
+
+    ledger_master
+        .ledger_master()
+        .set_pub_ledger(Arc::clone(&first));
+    ledger_master
+        .ledger_master()
+        .set_valid_ledger(Arc::clone(&third), None, None)
+        .expect("validated gap ledger should install");
+    root.try_advance_publication();
+
+    // This second production task sees its finish ledger locally, so its
+    // skip-list callback creates real delta owners. The intermediate delta is
+    // absent locally and both peers are replay-incompatible; the managed
+    // timer must retry it once and route it to normal inbound fallback. No
+    // test invokes an acquire/task timer directly.
+    ledger_master
+        .ledger_master()
+        .ledger_history()
+        .insert(Arc::clone(&first), false);
+    let local_finish = Arc::clone(&local_delta_finish);
+    let local_parent = Arc::clone(&first);
+    root.get_ledger_replayer()
+        .lock()
+        .expect("replayer lock")
+        .replay_and_init(
+            ledger::InboundLedgerReason::Generic,
+            local_finish_hash,
+            3,
+            1,
+            move |hash| {
+                if hash == local_finish_hash {
+                    Some(Arc::clone(&local_finish))
+                } else if hash == *local_parent.header().hash.as_uint256() {
+                    Some(Arc::clone(&local_parent))
+                } else {
+                    None
+                }
+            },
+            |_, _, _| {},
+        )
+        .expect("locally resolved skip list should create a delta task");
+
+    root.bind_default_component_runtimes();
+    let ledger_runtime = root
+        .runtime_bindings()
+        .ledger
+        .as_ref()
+        .expect("default ledger runtime")
+        .clone();
+    ledger_runtime
+        .start()
+        .expect("start managed ledger runtime");
+    let worker_root = root.clone();
+    let worker = std::thread::spawn(move || worker_root.job_queue().run_worker_loop());
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        let status = root
+            .get_ledger_replayer()
+            .lock()
+            .expect("replayer lock")
+            .timer_status();
+        if status.skip_list_fallbacks == 1
+            && status.delta_fallbacks == 1
+            && status.task_timer_ticks >= 1
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let status = root
+        .get_ledger_replayer()
+        .lock()
+        .expect("replayer lock")
+        .timer_status();
+    assert_eq!(status.active_tasks, 2, "both replay owners remain active");
+    assert!(
+        status.skip_list_timer_ticks >= 1,
+        "the managed scheduler must tick the skip-list owner"
+    );
+    assert!(
+        status.delta_timer_ticks >= 1,
+        "the managed scheduler must tick the delta owner"
+    );
+    assert!(
+        status.task_timer_ticks >= 1,
+        "the managed scheduler must tick the replay-task owner"
+    );
+    assert_eq!(
+        status.skip_list_fallbacks, 1,
+        "a production JtReplayTask tick must retry the active skip-list acquire and reach inbound fallback"
+    );
+    assert_eq!(
+        status.delta_fallbacks, 1,
+        "a production JtReplayTask tick must retry the active delta acquire and reach inbound fallback; status={status:?}"
+    );
+
+    ledger_runtime.stop();
+    root.job_queue().stop();
+    worker.join().expect("job queue worker should stop");
 }

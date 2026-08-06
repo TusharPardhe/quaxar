@@ -300,6 +300,18 @@ impl ApplicationRoot {
                 replayer.advance_ready_tasks(
                     &mut |hash, _seq| self.resolve_ledger_by_hash(SHAMapHash::new(hash)),
                     &mut |replay| crate::build_ledger_from_replay_delta(replay),
+                    &mut |hash, seq, _reason| {
+                        if let Some(runtime) = self.ledger_master_runtime()
+                            && let Ok(guard) = runtime.inbound_ledgers.lock()
+                            && let Some(shared) = guard.as_ref()
+                        {
+                            shared.acquire_async(
+                                hash,
+                                seq,
+                                crate::ledger::inbound_ledgers::AcquireReason::Generic,
+                            );
+                        }
+                    },
                 )
             }
             Err(_) => {

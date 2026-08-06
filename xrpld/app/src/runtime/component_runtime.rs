@@ -16,7 +16,7 @@ use consensus;
 use ledger::LedgerCleaner;
 use perflog::{PerfLog, PerfLogImp};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -75,7 +75,97 @@ impl ManagedComponent for AppNodeStoreRuntime {
 }
 
 // ---------------------------------------------------------------------------
-// AppLedgerRuntime (unchanged)
+// ReplayTimerRuntime
+// ---------------------------------------------------------------------------
+
+/// Schedules replay timeout work without running ledger logic on the timer
+/// thread. The queued operation owns the `JtReplayTask` context used by
+/// rippled's `TimeoutCounter` callbacks.
+struct ReplayTimerRuntime {
+    root: ApplicationRoot,
+    stopping: Arc<(Mutex<bool>, Condvar)>,
+    tick_queued: Arc<AtomicBool>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl ReplayTimerRuntime {
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+    fn new(root: ApplicationRoot) -> Self {
+        Self {
+            root,
+            stopping: Arc::new((Mutex::new(false), Condvar::new())),
+            tick_queued: Arc::new(AtomicBool::new(false)),
+            worker: Mutex::new(None),
+        }
+    }
+
+    fn start(&self) -> Result<(), String> {
+        let mut worker = self.worker.lock().expect("replay timer worker lock");
+        if worker.is_some() {
+            return Ok(());
+        }
+        *self.stopping.0.lock().expect("replay timer stop lock") = false;
+        let root = self.root.clone();
+        let stopping = Arc::clone(&self.stopping);
+        let tick_queued = Arc::clone(&self.tick_queued);
+        *worker = Some(
+            std::thread::Builder::new()
+                .name("xrpld-ledger-replay-timer".to_owned())
+                .spawn(move || {
+                    let (lock, wake) = &*stopping;
+                    let mut stopped = lock.lock().expect("replay timer stop lock");
+                    while !*stopped {
+                        let (next, _) = wake
+                            .wait_timeout(stopped, Self::POLL_INTERVAL)
+                            .expect("replay timer wait");
+                        stopped = next;
+                        if *stopped {
+                            break;
+                        }
+                        if !root.has_active_ledger_replay_timers() {
+                            continue;
+                        }
+                        if tick_queued
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        let job_root = root.clone();
+                        let job_queued = Arc::clone(&tick_queued);
+                        let queued = root.job_queue().add_job(
+                            crate::job::job_types::JobType::JtReplayTask,
+                            "LedgerReplayTimer",
+                            move || {
+                                job_queued.store(false, Ordering::Release);
+                                job_root.drive_ledger_replay_timers();
+                            },
+                        );
+                        if !queued {
+                            tick_queued.store(false, Ordering::Release);
+                        }
+                    }
+                })
+                .map_err(|error| format!("failed to spawn replay timer runtime: {error}"))?,
+        );
+        Ok(())
+    }
+
+    fn stop(&self) {
+        {
+            let (lock, wake) = &*self.stopping;
+            *lock.lock().expect("replay timer stop lock") = true;
+            wake.notify_all();
+        }
+        if let Some(worker) = self.worker.lock().expect("replay timer worker lock").take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AppLedgerRuntime
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -84,6 +174,7 @@ pub struct AppLedgerRuntime {
     inbound_ledgers: AppInboundLedgers,
     inbound_transactions: AppInboundTransactions,
     ledger_replayer: Arc<Mutex<ledger::LedgerReplayer>>,
+    replay_timer: Arc<ReplayTimerRuntime>,
     ledger_master_runtime: Arc<AppLedgerMasterRuntime>,
     network_ops_runtime: Option<Arc<AppNetworkOpsRuntime>>,
     started: Arc<AtomicBool>,
@@ -113,6 +204,7 @@ impl AppLedgerRuntime {
         inbound_ledgers: AppInboundLedgers,
         inbound_transactions: AppInboundTransactions,
         ledger_replayer: Arc<Mutex<ledger::LedgerReplayer>>,
+        root: ApplicationRoot,
         ledger_master_runtime: Arc<AppLedgerMasterRuntime>,
         network_ops_runtime: Option<Arc<AppNetworkOpsRuntime>>,
     ) -> Self {
@@ -121,6 +213,7 @@ impl AppLedgerRuntime {
             inbound_ledgers,
             inbound_transactions,
             ledger_replayer,
+            replay_timer: Arc::new(ReplayTimerRuntime::new(root)),
             ledger_master_runtime,
             network_ops_runtime,
             started: Arc::new(AtomicBool::new(false)),
@@ -138,6 +231,11 @@ impl ManagedComponent for AppLedgerRuntime {
             return Ok(());
         }
         self.ledger_cleaner.start();
+        if let Err(error) = self.replay_timer.start() {
+            self.ledger_cleaner.stop();
+            self.started.store(false, Ordering::Release);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -145,6 +243,7 @@ impl ManagedComponent for AppLedgerRuntime {
         if self.stopped.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.replay_timer.stop();
         self.ledger_cleaner.stop();
         self.inbound_ledgers
             .lock()

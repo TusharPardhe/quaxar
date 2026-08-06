@@ -211,7 +211,7 @@ pub use replay_task::{
     LedgerReplayTask, LedgerReplayTaskParameter, REPLAY_TASK_MAX_TIMEOUTS_MINIMUM,
     REPLAY_TASK_MAX_TIMEOUTS_MULTIPLIER, REPLAY_TASK_TIMEOUT, ReplayTaskError,
 };
-pub use replayer::{LedgerReplayer, REPLAY_MAX_TASK_SIZE, REPLAY_MAX_TASKS};
+pub use replayer::{LedgerReplayer, REPLAY_MAX_TASK_SIZE, REPLAY_MAX_TASKS, ReplayTimerStatus};
 pub use sandbox::Sandbox;
 pub use setup::{AmendmentsEntry, AmountField, FeeSettingsFields, LedgerSetupEntries, SetupLookup};
 use shamap::family::{FullBelowCache, MissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher};

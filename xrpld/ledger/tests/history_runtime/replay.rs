@@ -155,11 +155,10 @@ fn replay_task_parameter_update_and_merge_match_cpp() {
 }
 
 #[test]
-fn replayer_initializes_new_skip_list_through_the_real_trigger() {
-    // ../rippled/src/xrpld/app/ledger/detail/LedgerReplayer.cpp::replay
-    // initializes a newly-created SkipListAcquire immediately, before the
-    // replay task waits for its timer. A missing local ledger must therefore
-    // reach the normal fallback acquisition path at replay admission time.
+fn replayer_initializes_new_skip_list_without_bypassing_no_feature_fallback() {
+    // `LedgerReplayer.cpp::replay` initializes the new SkipListAcquire, but
+    // `SkipListAcquire.cpp::trigger` owns normal inbound fallback. A local
+    // miss alone must not bypass its replay-peer/no-feature timer policy.
     let finish_hash = Uint256::from_array([0xE1; 32]);
     let mut replayer = LedgerReplayer::new(Arc::new(SimplePeerSetBuilder::new(Vec::new())));
     let fallback = std::cell::RefCell::new(Vec::new());
@@ -178,10 +177,9 @@ fn replayer_initializes_new_skip_list_through_the_real_trigger() {
     assert_eq!(replayer.tasks_len(), 1);
     assert_eq!(replayer.skip_lists_len(), 1);
     assert!(!task.lock().expect("task lock").parameter().full);
-    assert_eq!(
-        fallback.into_inner(),
-        vec![(finish_hash, 0, InboundLedgerReason::Generic)],
-        "the initial SkipListAcquire must immediately request the real finish ledger fallback"
+    assert!(
+        fallback.into_inner().is_empty(),
+        "the initial skip-list trigger must leave fallback to SkipListAcquire's no-feature timer path"
     );
 }
 

@@ -182,6 +182,19 @@ impl LedgerReplayTask {
             return;
         }
 
+        if self
+            .deltas
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &delta))
+        {
+            return;
+        }
+
+        delta
+            .lock()
+            .expect("delta lock")
+            .add_data_reason(self.parameter.reason);
+
         if let Some(last) = self.deltas.last() {
             let last_seq = last.lock().expect("last delta lock").ledger_seq();
             let next_seq = delta.lock().expect("delta lock").ledger_seq();
@@ -214,10 +227,11 @@ impl LedgerReplayTask {
         }
     }
 
-    pub fn invoke_on_timer<LOOKUP, BUILD, E>(
+    pub fn invoke_on_timer<LOOKUP, BUILD, FALLBACK, E>(
         &mut self,
         lookup_parent: &mut LOOKUP,
         build_replay: &mut BUILD,
+        fallback_acquire: &mut FALLBACK,
     ) -> Result<(), ReplayTaskError<E>>
     where
         LOOKUP: FnMut(Uint256, u32) -> Option<Arc<Ledger>>,
@@ -225,6 +239,7 @@ impl LedgerReplayTask {
             &mut LedgerDeltaAcquire,
             &Arc<Ledger>,
         ) -> Result<Option<Arc<Ledger>>, LedgerDeltaBuildError<E>>,
+        FALLBACK: FnMut(Uint256, u32, InboundLedgerReason),
     {
         if self.finished() {
             return Ok(());
@@ -240,13 +255,14 @@ impl LedgerReplayTask {
             self.progress = false;
         }
 
-        self.trigger(lookup_parent, build_replay)
+        self.trigger(lookup_parent, build_replay, fallback_acquire)
     }
 
-    pub fn trigger<LOOKUP, BUILD, E>(
+    pub fn trigger<LOOKUP, BUILD, FALLBACK, E>(
         &mut self,
         lookup_parent: &mut LOOKUP,
         build_replay: &mut BUILD,
+        fallback_acquire: &mut FALLBACK,
     ) -> Result<(), ReplayTaskError<E>>
     where
         LOOKUP: FnMut(Uint256, u32) -> Option<Arc<Ledger>>,
@@ -254,6 +270,7 @@ impl LedgerReplayTask {
             &mut LedgerDeltaAcquire,
             &Arc<Ledger>,
         ) -> Result<Option<Arc<Ledger>>, LedgerDeltaBuildError<E>>,
+        FALLBACK: FnMut(Uint256, u32, InboundLedgerReason),
     {
         if !self.parameter.full {
             return Ok(());
@@ -261,6 +278,15 @@ impl LedgerReplayTask {
 
         if self.parent.is_none() {
             self.parent = lookup_parent(self.parameter.start_hash, self.parameter.start_seq);
+            if self.parent.is_none() {
+                // LedgerReplayTask.cpp::trigger requests the missing parent
+                // as a normal inbound ledger on every timer retry.
+                fallback_acquire(
+                    self.parameter.start_hash,
+                    self.parameter.start_seq,
+                    InboundLedgerReason::Generic,
+                );
+            }
         }
 
         self.try_advance(build_replay)

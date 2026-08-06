@@ -1286,6 +1286,13 @@ fn run_start_mode_consensus_loop(
                 overlay_rt.overlay(),
             )));
         }
+        if let Ok(mut replayer) = runtime.root().get_ledger_replayer().lock() {
+            replayer.set_peer_set_builder(Arc::new(overlay::OverlayPeerSetBuilder::new(
+                overlay_rt.overlay(),
+            )));
+        } else {
+            tracing::error!(target: "ledger", "ledger replayer lock poisoned; replay peer set remains unavailable");
+        }
         shared_inbound.set_overlay_rt(overlay_rt);
     }
 
