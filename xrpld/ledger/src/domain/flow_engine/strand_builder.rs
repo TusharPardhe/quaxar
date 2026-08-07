@@ -156,19 +156,12 @@ pub fn to_strand(
                         is_last: false,
                     });
                 }
-                // BookStep
-                let in_issue = Issue {
-                    currency: cur_currency,
-                    account: cur_issuer,
-                };
-                let out_issue = if is_xrp_currency(*out_c) {
-                    xrp_issue()
-                } else {
-                    Issue {
-                        currency: *out_c,
-                        account: *out_iss,
-                    }
-                };
+                // rippled `PaySteps.cpp::toStrand` normalizes `curAsset` after
+                // changing its currency and before it calls `toStep`: XRP
+                // always carries `xrpAccount()`, never a path issuer.  Keep
+                // both sides canonical before storing the typed BookStep.
+                let in_issue = canonical_book_issue(cur_currency, cur_issuer);
+                let out_issue = canonical_book_issue(*out_c, *out_iss);
                 strand.push(StepKind::Book {
                     book_in: in_issue,
                     book_out: out_issue,
@@ -197,18 +190,10 @@ pub fn to_strand(
                 continue;
             }
             (NormElem::Offer(_, _), NormElem::Offer(out_c, out_iss)) => {
-                let in_issue = Issue {
-                    currency: cur_currency,
-                    account: cur_issuer,
-                };
-                let out_issue = if is_xrp_currency(*out_c) {
-                    xrp_issue()
-                } else {
-                    Issue {
-                        currency: *out_c,
-                        account: *out_iss,
-                    }
-                };
+                // Match the same `PaySteps.cpp::toStrand` normalization used by
+                // the account-to-offer BookStep above.
+                let in_issue = canonical_book_issue(cur_currency, cur_issuer);
+                let out_issue = canonical_book_issue(*out_c, *out_iss);
                 strand.push(StepKind::Book {
                     book_in: in_issue,
                     book_out: out_issue,
@@ -286,6 +271,19 @@ pub fn to_strands(
     }
 
     (Ter::TES_SUCCESS, result)
+}
+
+/// Return the protocol's sole canonical issue for XRP while preserving the
+/// issuer required by every issued currency.  `Issue` equality intentionally
+/// ignores an XRP account, but `keylet::get_book_base` must receive the
+/// canonical zero XRP account (rippled `PaySteps.cpp::toStrand`, immediately
+/// before its `toStep` call).
+fn canonical_book_issue(currency: Currency, issuer: AccountID) -> Issue {
+    if is_xrp_currency(currency) {
+        xrp_issue()
+    } else {
+        Issue::new(currency, issuer)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +400,76 @@ mod tests {
 
         assert!(has_xrp_endpoint, "XRP→IOU should have XrpEndpointStep");
         assert!(has_book, "XRP→IOU should have BookStep");
+    }
+
+    #[test]
+    fn canonical_xrp_book_issue_discards_a_stale_issuer_before_keylet_lookup() {
+        let stale_issuer = protocol::parse_base58_account_id("rswh1fvyLqHizBS2awu1vs6QcmwTBd9qiv")
+            .expect("canonical XAH issuer");
+        let raw = Issue::new(protocol::xrp_currency(), stale_issuer);
+        assert!(
+            !protocol::is_consistent(raw),
+            "the protocol keylet must reject XRP with an issuer"
+        );
+
+        let normalized = canonical_book_issue(raw.currency, raw.account);
+        assert_eq!(normalized, xrp_issue());
+        assert!(protocol::is_consistent(normalized));
+    }
+
+    #[test]
+    fn canonical_xah_to_xrp_mainnet_direct_xrp_path_builds_a_consistent_book() {
+        // EDA59CA1B73A69E76E753F6790DBC2E323B3699CFA200D15B3EAA0FFC2FFC2B3,
+        // 0386E0015B04116D4F61ECF5EEE71C8912F53C74558982227B24990BD3CFD921,
+        // and DF801A1D59B2B36981AFD810978D84FA06F5E7D6872A5D3AEB2B908EAAF184C0
+        // are self-payments from rspxi5HWiqiGUdpge6hZh7drZXRMqDX93t. Each
+        // sends XAH issued by rswh1fvyLqHizBS2awu1vs6QcmwTBd9qiv to XRP,
+        // with tfPartialPayment|tfLimitQuality, and includes this direct
+        // explicit Path: [{ currency: XRP }]. Model its type-16 element here
+        // so the regression exercises the actual XAH-to-XRP strand shape,
+        // rather than an empty default path.
+        let account = protocol::parse_base58_account_id("rspxi5HWiqiGUdpge6hZh7drZXRMqDX93t")
+            .expect("canonical transaction account");
+        let issuer = protocol::parse_base58_account_id("rswh1fvyLqHizBS2awu1vs6QcmwTBd9qiv")
+            .expect("canonical XAH issuer");
+        let xah = protocol::currency_from_string("XAH");
+        let deliver = Asset::Issue(xrp_issue());
+        let send_max = Asset::Issue(Issue::new(xah, issuer));
+        let mut direct_xrp_path = protocol::STPath::new();
+        direct_xrp_path.push_back(protocol::STPathElement::raw(
+            protocol::STPathElement::TYPE_CURRENCY,
+            AccountID::zero(),
+            protocol::xrp_currency(),
+            AccountID::zero(),
+        ));
+
+        let (ter, strand) = to_strand(
+            &account,
+            &account,
+            &deliver,
+            Some(&send_max),
+            &direct_xrp_path,
+            false,
+            false,
+        );
+
+        assert_eq!(ter, Ter::TES_SUCCESS);
+        let (book_in, book_out) = strand
+            .iter()
+            .find_map(|step| match step {
+                StepKind::Book {
+                    book_in, book_out, ..
+                } => Some((*book_in, *book_out)),
+                _ => None,
+            })
+            .expect("XAH-to-XRP payment must include a BookStep");
+        assert_eq!(book_in, Issue::new(xah, issuer));
+        assert_eq!(book_out, xrp_issue());
+
+        let book = protocol::Book::new(book_in, book_out, None);
+        assert!(protocol::is_consistent_book(book));
+        // This is the exact protocol boundary that previously panicked.
+        let _ = protocol::get_book_base(book);
     }
 
     #[test]

@@ -706,6 +706,20 @@ fn remove_consumed_offer<V: ApplyView>(view: &mut V, offer_sle: &STLedgerEntry) 
     let _ = view.erase(Arc::new(offer_sle.clone()));
 }
 
+/// Transaction-context-free identity fields for malformed-book diagnostics.
+fn book_asset_identity(asset: Asset) -> (String, String) {
+    match asset {
+        Asset::Issue(issue) => (
+            protocol::currency_to_string(issue.currency),
+            protocol::to_base58(issue.account),
+        ),
+        Asset::MPTIssue(issue) => (
+            format!("MPT:{:?}", issue.mpt_id()),
+            protocol::to_base58(issue.issuer()),
+        ),
+    }
+}
+
 fn get_book_offers<V: ApplyView>(view: &mut V, book: &Book, max: u32) -> Vec<STLedgerEntry> {
     let mut offers = Vec::new();
 
@@ -716,6 +730,22 @@ fn get_book_offers<V: ApplyView>(view: &mut V, book: &Book, max: u32) -> Vec<STL
         out: book.out,
         domain: book.domain,
     };
+    let consistent = protocol::is_consistent_book(proto_book);
+    if !consistent {
+        // Diagnostics only: retain the protocol-owned assertion and do not
+        // normalize, reject, or otherwise change offer selection/state here.
+        let (input_currency, input_issuer) = book_asset_identity(book.r#in);
+        let (output_currency, output_issuer) = book_asset_identity(book.out);
+        tracing::warn!(
+            target: "ledger",
+            book_input_currency = %input_currency,
+            book_input_issuer = %input_issuer,
+            book_output_currency = %output_currency,
+            book_output_issuer = %output_issuer,
+            consistent,
+            "[book_step] inconsistent book passed to get_book_offers"
+        );
+    }
     let book_base = protocol::get_book_base(proto_book);
     let book_end = protocol::get_quality_next(book_base);
 
@@ -1213,6 +1243,31 @@ mod tests {
                 .expect("canonical required PAR")
         );
         assert_eq!(required_par.text(), "952.5048958");
+    }
+
+    #[test]
+    fn malformed_xah_to_xrp_book_is_identified_without_lookup_normalization() {
+        let issuer = protocol::parse_base58_account_id("rswh1fvyLqHizBS2awu1vs6QcmwTBd9qiv")
+            .expect("canonical XAH issuer must parse");
+        let xah = protocol::currency_from_string("XAH");
+        let raw = Book {
+            r#in: Asset::Issue(protocol::Issue::new(xah, issuer)),
+            // A nonzero issuer on XRP violates the keylet contract. The
+            // lookup boundary must diagnose it, not silently select a
+            // different canonical book.
+            out: Asset::Issue(protocol::Issue::new(protocol::xrp_currency(), issuer)),
+            domain: None,
+        };
+
+        let raw_protocol = protocol::Book::new(raw.r#in, raw.out, raw.domain);
+        assert!(!protocol::is_consistent_book(raw_protocol));
+
+        let (input_currency, input_issuer) = book_asset_identity(raw.r#in);
+        let (output_currency, output_issuer) = book_asset_identity(raw.out);
+        assert_eq!(input_currency, "XAH");
+        assert_eq!(input_issuer, protocol::to_base58(issuer));
+        assert_eq!(output_currency, "XRP");
+        assert_eq!(output_issuer, protocol::to_base58(issuer));
     }
 
     #[test]
