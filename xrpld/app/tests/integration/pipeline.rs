@@ -739,22 +739,32 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
                 0
             };
             let has_send_max = tx.is_field_present(sf("sfSendMax"));
+            let send_max = has_send_max.then(|| tx.get_field_amount(sf("sfSendMax")));
             let has_paths = tx.is_field_present(sf("sfPaths"));
+            let max_source_amount =
+                tx::payment_max_source_amount(account, &amount, send_max.as_ref());
             let xrp_direct =
-                amount.native() && (!has_send_max || tx.get_field_amount(sf("sfSendMax")).native());
+                amount.native() && send_max.as_ref().is_none_or(protocol::STAmount::native);
             let partial = (flags & 0x00020000) != 0;
             let limit_quality = (flags & 0x00040000) != 0;
             let no_ripple_direct = (flags & 0x00010000) != 0;
-            // Self-payment
-            if account == dst {
-                return Ter::TEM_REDUNDANT;
-            }
             if amount.signum() <= 0 {
                 return Ter::TEM_BAD_AMOUNT;
             }
             // C++ Payment::preflight: SendMax <= 0 -> temBAD_AMOUNT
             if has_send_max && tx.get_field_amount(sf("sfSendMax")).signum() <= 0 {
                 return Ter::TEM_BAD_AMOUNT;
+            }
+            // Mirrors Payment::preflight: cross-asset and explicitly-pathed
+            // self-payments may be conversion/arbitrage attempts.
+            if tx::payment_is_redundant_to_self(
+                account,
+                dst,
+                &max_source_amount,
+                &amount,
+                has_paths,
+            ) {
+                return Ter::TEM_REDUNDANT;
             }
             // XRP-to-XRP specific checks
             if xrp_direct && amount.native() {

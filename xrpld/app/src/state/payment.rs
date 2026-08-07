@@ -17,7 +17,7 @@ use std::{cell::RefCell, sync::Arc};
 use basics::math::base_uint::Uint160;
 use protocol::{
     AccountID, Asset, PARITY_RATE, STAmount, STLedgerEntry, STTx, Ter, XRPAmount, divide_rate,
-    get_field_by_symbol, is_ter_retry, is_tes_success, multiply_rate,
+    equal_tokens, get_field_by_symbol, is_ter_retry, is_tes_success, multiply_rate,
 };
 thread_local! {
     static MPT_DELIVERED_AMOUNT_CAPTURES: RefCell<Vec<Option<STAmount>>> = const { RefCell::new(Vec::new()) };
@@ -83,7 +83,9 @@ fn is_redundant_self_payment(
     destination_amount: &STAmount,
     has_paths: bool,
 ) -> bool {
-    account == destination && source_amount.asset() == destination_amount.asset() && !has_paths
+    account == destination
+        && equal_tokens(source_amount.asset(), destination_amount.asset())
+        && !has_paths
 }
 
 /// Full reference Payment::doApply parity.
@@ -688,6 +690,42 @@ mod tests {
         let xrp = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
         assert!(is_redundant_self_payment(
             account, account, &xrp, &xrp, false,
+        ));
+    }
+
+    #[test]
+    fn same_currency_iou_self_payment_is_redundant_despite_issuer_change() {
+        let account = AccountID::from_array([0x11; 20]);
+        let source = STAmount::from_iou_amount(
+            get_field_by_symbol("sfSendMax"),
+            protocol::IOUAmount::from_parts(1, 0).expect("valid positive IOU amount"),
+            Issue {
+                currency: protocol::Currency::from_array([0x22; 20]),
+                account: AccountID::from_array([0x33; 20]),
+            },
+        );
+        let destination = STAmount::from_iou_amount(
+            get_field_by_symbol("sfAmount"),
+            protocol::IOUAmount::from_parts(1, 0).expect("valid positive IOU amount"),
+            Issue {
+                currency: protocol::Currency::from_array([0x22; 20]),
+                account: AccountID::from_array([0x55; 20]),
+            },
+        );
+
+        assert!(is_redundant_self_payment(
+            account,
+            account,
+            &source,
+            &destination,
+            false,
+        ));
+        assert!(!is_redundant_self_payment(
+            account,
+            account,
+            &source,
+            &destination,
+            true,
         ));
     }
 }

@@ -6,8 +6,8 @@
 //! without depending on the higher-level RPC crate.
 
 use protocol::{
-    INNER_BATCH_TRANSACTION_FLAG, NotTec, Permission, Rules, STTx, Ter, TxType,
-    feature_lending_protocol, get_field_by_symbol, is_tes_success,
+    INNER_BATCH_TRANSACTION_FLAG, NotTec, Permission, Rules, STAmount, STTx, Ter, TxType,
+    equal_tokens, feature_lending_protocol, get_field_by_symbol, is_bad_asset, is_tes_success,
 };
 
 use crate::{
@@ -216,6 +216,39 @@ fn validate_sttx_noop_preflight(_txn_type: TxType) -> NotTec {
     Ter::TES_SUCCESS
 }
 
+/// Mirrors `rippled` `getMaxSourceAmount` in
+/// `src/libxrpl/tx/transactors/payment/Payment.cpp:62-83`.
+pub fn payment_max_source_amount(
+    account: protocol::AccountID,
+    destination_amount: &STAmount,
+    send_max: Option<&STAmount>,
+) -> STAmount {
+    if let Some(send_max) = send_max {
+        return send_max.clone();
+    }
+    if destination_amount.native() || destination_amount.holds_mpt_issue() {
+        return destination_amount.clone();
+    }
+
+    let mut source_amount = destination_amount.clone();
+    source_amount.set_issuer(account);
+    source_amount
+}
+
+/// Mirrors `Payment::preflight` at
+/// `../rippled/src/libxrpl/tx/transactors/payment/Payment.cpp:193-201`.
+pub fn payment_is_redundant_to_self(
+    account: protocol::AccountID,
+    destination: protocol::AccountID,
+    source_amount: &STAmount,
+    destination_amount: &STAmount,
+    has_paths: bool,
+) -> bool {
+    account == destination
+        && equal_tokens(source_amount.asset(), destination_amount.asset())
+        && !has_paths
+}
+
 fn validate_payment_preflight(tx: &STTx) -> NotTec {
     let account = get_field_by_symbol("sfAccount");
     let amount_field = get_field_by_symbol("sfAmount");
@@ -226,8 +259,26 @@ fn validate_payment_preflight(tx: &STTx) -> NotTec {
     }
 
     let amount = tx.get_field_amount(amount_field);
-    if amount.negative() || !amount.is_legal_net() {
+    let source_account = tx.get_account_id(account);
+    let send_max = get_field_by_symbol("sfSendMax");
+    let max_source_amount = payment_max_source_amount(
+        source_account,
+        &amount,
+        tx.is_field_present(send_max)
+            .then(|| tx.get_field_amount(send_max))
+            .as_ref(),
+    );
+    // Preserve rippled's preflight ordering: bad/zero source or destination
+    // amounts and bad assets are rejected before the self-payment predicate.
+    if amount.signum() <= 0
+        || !amount.is_legal_net()
+        || !max_source_amount.is_legal_net()
+        || (tx.is_field_present(send_max) && max_source_amount.signum() <= 0)
+    {
         return Ter::TEM_BAD_AMOUNT;
+    }
+    if is_bad_asset(max_source_amount.asset()) || is_bad_asset(amount.asset()) {
+        return Ter::TEM_BAD_CURRENCY;
     }
 
     if let Some(deliver_min) = tx
@@ -244,7 +295,18 @@ fn validate_payment_preflight(tx: &STTx) -> NotTec {
     if destination_account.is_zero() {
         return Ter::TEM_DST_IS_SRC;
     }
-    if destination_account == tx.get_account_id(account) {
+
+    // Match Payment::preflight's getMaxSourceAmount + equalTokens gate. IOUs
+    // compare by currency regardless of issuer, MPTs by issuance ID, and an
+    // explicit path is allowed because it may perform arbitrage.
+    let has_paths = tx.is_field_present(get_field_by_symbol("sfPaths"));
+    if payment_is_redundant_to_self(
+        source_account,
+        destination_account,
+        &max_source_amount,
+        &amount,
+        has_paths,
+    ) {
         return Ter::TEM_REDUNDANT;
     }
 
@@ -485,9 +547,12 @@ fn validate_account_set_preflight(tx: &STTx) -> NotTec {
 #[cfg(test)]
 mod tests {
     use basics::base_uint::Uint256;
-    use protocol::{Rules, STAmount, STTx, Ter, TxType, XRPAmount, get_field_by_symbol};
+    use protocol::{
+        AccountID, Currency, IOUAmount, Issue, Rules, STAmount, STPathSet, STTx, Ter, TxType,
+        XRPAmount, get_field_by_symbol,
+    };
 
-    use super::validate_sttx_transaction_preflight_with_rules;
+    use super::{validate_payment_preflight, validate_sttx_transaction_preflight_with_rules};
 
     fn sf(name: &str) -> &'static protocol::SField {
         get_field_by_symbol(name)
@@ -498,6 +563,97 @@ mod tests {
             tx.set_field_amount(sf("sfFee"), STAmount::from_xrp_amount(XRPAmount::new()));
             tx.set_field_h256(sf("sfAmendment"), Uint256::from_u64(1));
         })
+    }
+
+    fn payment_self_tx(amount: STAmount, send_max: Option<STAmount>, has_paths: bool) -> STTx {
+        let account = AccountID::from_array([0xA1; 20]);
+        STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(sf("sfAccount"), account);
+            tx.set_account_id(sf("sfDestination"), account);
+            tx.set_field_amount(sf("sfAmount"), amount);
+            tx.set_field_amount(
+                sf("sfFee"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+            );
+            tx.set_field_u32(sf("sfSequence"), 1);
+            if let Some(send_max) = send_max {
+                tx.set_field_amount(sf("sfSendMax"), send_max);
+            }
+            if has_paths {
+                tx.set_field_path_set(sf("sfPaths"), STPathSet::new(sf("sfPaths")));
+            }
+        })
+    }
+
+    fn iou(field: &'static protocol::SField, issuer: AccountID, currency_byte: u8) -> STAmount {
+        STAmount::from_iou_amount(
+            field,
+            IOUAmount::from_parts(1, 0).expect("positive IOU amount"),
+            Issue {
+                currency: Currency::from_array([currency_byte; 20]),
+                account: issuer,
+            },
+        )
+    }
+
+    #[test]
+    fn payment_self_preflight_matches_rippled_asset_and_path_rules() {
+        let issuer = AccountID::from_array([0xB2; 20]);
+        let amount_xrp = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
+        let amount_iou = iou(sf("sfAmount"), issuer, 0x55);
+        let send_max_iou = iou(sf("sfSendMax"), issuer, 0x55);
+        let send_max_xrp = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
+
+        // Cross-currency self payments are Flow candidates, not temREDUNDANT.
+        assert_eq!(
+            validate_payment_preflight(&payment_self_tx(
+                amount_xrp.clone(),
+                Some(send_max_iou),
+                false
+            )),
+            Ter::TES_SUCCESS,
+            "XRP Amount plus issued SendMax must not be treated as redundant"
+        );
+        assert_eq!(
+            validate_payment_preflight(&payment_self_tx(
+                amount_iou.clone(),
+                Some(send_max_xrp),
+                false
+            )),
+            Ter::TES_SUCCESS,
+            "issued Amount plus XRP SendMax must not be treated as redundant"
+        );
+
+        // getMaxSourceAmount changes an IOU's issuer to Account, but
+        // equalTokens intentionally compares IOUs by currency only.
+        assert_eq!(
+            validate_payment_preflight(&payment_self_tx(amount_iou.clone(), None, false)),
+            Ter::TEM_REDUNDANT,
+            "same-token direct self payment must remain redundant"
+        );
+        assert_eq!(
+            validate_payment_preflight(&payment_self_tx(amount_iou, None, true)),
+            Ter::TES_SUCCESS,
+            "an explicit path may perform arbitrage and must be admitted"
+        );
+    }
+
+    #[test]
+    fn payment_self_preflight_is_reached_through_the_canonical_dispatcher() {
+        let issuer = AccountID::from_array([0xB2; 20]);
+        let transaction = payment_self_tx(
+            STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
+            Some(iou(sf("sfSendMax"), issuer, 0x55)),
+            false,
+        );
+
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &transaction,
+                &Rules::new(std::iter::empty()),
+            ),
+            Ter::TES_SUCCESS,
+        );
     }
 
     #[test]

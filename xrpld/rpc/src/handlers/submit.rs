@@ -1,4 +1,4 @@
-use tx::{CheckValidityResult, Validity};
+use tx::{CheckValidityResult, Validity, payment_is_redundant_to_self, payment_max_source_amount};
 
 pub const INVALID_TRANSACTION_ERROR: &str = "invalidTransaction";
 pub const FAILS_LOCAL_CHECKS_PREFIX: &str = "fails local checks: ";
@@ -1181,9 +1181,20 @@ fn submit_semantic_preflight_with_ledger(
                 return Ter::TEM_MALFORMED;
             }
 
+            let account = st_tx.get_account_id(account_field);
             let amount = st_tx.get_field_amount(amount_field);
-            if amount.negative() || !amount.is_legal_net() {
+            let send_max_field = get_field_by_symbol("sfSendMax");
+            let send_max = st_tx
+                .is_field_present(send_max_field)
+                .then(|| st_tx.get_field_amount(send_max_field));
+            let max_source_amount = payment_max_source_amount(account, &amount, send_max.as_ref());
+            if !amount.is_legal_net() || !max_source_amount.is_legal_net() {
                 return Ter::TEM_BAD_AMOUNT;
+            }
+            if protocol::is_bad_asset(max_source_amount.asset())
+                || protocol::is_bad_asset(amount.asset())
+            {
+                return Ter::TEM_BAD_CURRENCY;
             }
 
             if let Some(deliver_min) = st_tx
@@ -1198,11 +1209,21 @@ fn submit_semantic_preflight_with_ledger(
                 }
             }
 
-            if st_tx.get_account_id(destination_field).is_zero() {
+            let destination = st_tx.get_account_id(destination_field);
+            if destination.is_zero() {
                 return Ter::TEM_DST_IS_SRC;
             }
-
-            if st_tx.get_account_id(destination_field) == st_tx.get_account_id(account_field) {
+            if send_max.as_ref().is_some_and(|amount| amount.signum() <= 0) || amount.signum() <= 0
+            {
+                return Ter::TEM_BAD_AMOUNT;
+            }
+            if payment_is_redundant_to_self(
+                account,
+                destination,
+                &max_source_amount,
+                &amount,
+                st_tx.is_field_present(get_field_by_symbol("sfPaths")),
+            ) {
                 return Ter::TEM_REDUNDANT;
             }
 

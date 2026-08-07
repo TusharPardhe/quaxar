@@ -4,6 +4,7 @@ pub mod app_registry;
 pub mod application_root;
 pub mod basic_app;
 pub mod batch;
+pub mod candidate_diagnostics;
 pub mod collector_manager;
 pub mod invariants;
 pub mod invoke_preclaim;

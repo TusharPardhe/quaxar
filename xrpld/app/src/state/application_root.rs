@@ -45,6 +45,9 @@ use crate::state::app_registry::{
     SharedAppTxQ,
 };
 use crate::state::basic_app::BasicApp;
+use crate::state::candidate_diagnostics::{
+    CandidateAdmissionDiagnostic, CandidateDiagnosticDecision, emit_candidate_admission_diagnostic,
+};
 use crate::state::collector_manager::{CollectorManager, CollectorParams};
 use crate::state::manifest::ManifestCache;
 use crate::state::node_store_scheduler::NodeStoreScheduler;
@@ -8777,6 +8780,14 @@ impl ApplicationRoot {
                         .as_ref()
                         .is_some_and(|parent| parent.tx_exists(transaction_id))
                 {
+                    emit_candidate_admission_diagnostic(
+                        CandidateAdmissionDiagnostic::skipped_existing(
+                            transaction_id,
+                            closed_seq,
+                            sttx.get_seq_proxy().value(),
+                            pass,
+                        ),
+                    );
                     completed_transaction_ids.insert(transaction_id);
                     continue;
                 }
@@ -8802,7 +8813,7 @@ impl ApplicationRoot {
                 };
                 let rules = view.rules();
                 let preflight = consensus_transaction_preflight_ter(&sttx, &rules);
-                let preclaim = if is_tes_success(preflight) {
+                let preclaim = is_tes_success(preflight).then(|| {
                     queue_apply_preclaim_ter_with_load_fee(
                         &*view,
                         &sttx,
@@ -8810,42 +8821,56 @@ impl ApplicationRoot {
                         retry_flags,
                         self.load_fee_track.as_ref(),
                     )
-                } else {
-                    preflight
-                };
-                let (result, delivered_amount, applied_batch_inner_transactions) = if is_tes_success(
-                    preclaim,
-                )
-                    || is_tec_claim(preclaim)
-                {
-                    let mut attempt_view =
-                        ledger::FlowSandbox::new_with_flags(&mut *view, retry_flags);
-                    let SubmitApplyOutcome {
-                        result,
-                        delivered_amount,
-                        applied_batch_inner_transactions,
-                    } = apply_submit_transactor_shell_with_flags_and_batch_outcome(
-                        &mut attempt_view,
-                        &sttx,
-                        txn_type,
-                        retry_flags,
-                    );
-                    if protocol::is_tes_success(result) || protocol::is_tec_claim(result) {
-                        attempt_view
-                                .apply_with_tx_thread(transaction_id, closed_seq, &rules)
-                                .map_err(|error| {
-                                    crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
-                                        "failed to thread accepted transaction {transaction_id}: {error:?}"
-                                    ))
-                                })?;
-                    }
-                    (result, delivered_amount, applied_batch_inner_transactions)
-                } else {
-                    (preclaim, None, Vec::new())
-                };
+                });
+                let preclaim_admitted =
+                    preclaim.is_some_and(|ter| is_tes_success(ter) || is_tec_claim(ter));
+                let (result, delivered_amount, applied_batch_inner_transactions) =
+                    if preclaim_admitted {
+                        let mut attempt_view =
+                            ledger::FlowSandbox::new_with_flags(&mut *view, retry_flags);
+                        let SubmitApplyOutcome {
+                            result,
+                            delivered_amount,
+                            applied_batch_inner_transactions,
+                        } = apply_submit_transactor_shell_with_flags_and_batch_outcome(
+                            &mut attempt_view,
+                            &sttx,
+                            txn_type,
+                            retry_flags,
+                        );
+                        if protocol::is_tes_success(result) || protocol::is_tec_claim(result) {
+                            attempt_view
+                            .apply_with_tx_thread(transaction_id, closed_seq, &rules)
+                            .map_err(|error| {
+                                crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
+                                    "failed to thread accepted transaction {transaction_id}: {error:?}"
+                                ))
+                            })?;
+                        }
+                        (result, delivered_amount, applied_batch_inner_transactions)
+                    } else {
+                        (preclaim.unwrap_or(preflight), None, Vec::new())
+                    };
+                let apply_ter = preclaim_admitted.then_some(result);
                 let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
                 drop(view);
                 if !applied {
+                    let decision = if protocol::is_ter_retry(result) {
+                        CandidateDiagnosticDecision::Retry
+                    } else {
+                        CandidateDiagnosticDecision::Terminal
+                    };
+                    emit_candidate_admission_diagnostic(CandidateAdmissionDiagnostic::attempted(
+                        transaction_id,
+                        closed_seq,
+                        sttx.get_seq_proxy().value(),
+                        pass,
+                        preflight,
+                        preclaim,
+                        apply_ter,
+                        decision,
+                        None,
+                    ));
                     if protocol::is_ter_retry(result) {
                         retry_txs.push(sttx);
                     } else {
@@ -8869,6 +8894,17 @@ impl ApplicationRoot {
                 completed_transaction_ids.insert(transaction_id);
 
                 let index = accepted_entries.len();
+                emit_candidate_admission_diagnostic(CandidateAdmissionDiagnostic::attempted(
+                    transaction_id,
+                    closed_seq,
+                    sttx.get_seq_proxy().value(),
+                    pass,
+                    preflight,
+                    preclaim,
+                    apply_ter,
+                    CandidateDiagnosticDecision::Accepted,
+                    Some(index as u32),
+                ));
                 let mut meta = protocol::TxMeta::new(transaction_id, closed_seq);
                 meta.set_delivered_amount(delivered_amount);
                 let delta_meta_nodes = meta.get_nodes().json(protocol::JsonOptions::NONE);
