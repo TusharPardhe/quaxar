@@ -423,11 +423,23 @@ pub fn transfer_xrp<V: ApplyView>(
             return Ter::TER_NO_ACCOUNT;
         };
         let to_balance = to_sle.get_field_amount(sf("sfBalance")).xrp().drops();
+        let Some(updated_balance) = to_balance.checked_add(amount.drops()) else {
+            return Ter::TEC_FAILED_PROCESSING;
+        };
         let mut to_obj = to_sle.clone_as_object();
-        to_obj.set_field_amount(
-            sf("sfBalance"),
-            STAmount::from_xrp_amount(XRPAmount::from_drops(to_balance + amount.drops())),
-        );
+        // Flow reverse passes use the virtual XRP issuer as the sender when
+        // probing a destination endpoint. rippled's native STAmount addition
+        // materializes that bounded, ephemeral sandbox balance without the
+        // network-amount canonicalizer (TokenHelpers.cpp:905-912 and
+        // STAmount.cpp:371-387). Keep ordinary account credits canonicalized,
+        // but preserve the virtual-sender intermediate until Flow constrains
+        // it and the sandbox is discarded or committed.
+        let updated_amount = if from_is_zero {
+            STAmount::new_native(updated_balance.unsigned_abs(), updated_balance < 0)
+        } else {
+            STAmount::from_xrp_amount(XRPAmount::from_drops(updated_balance))
+        };
+        to_obj.set_field_amount(sf("sfBalance"), updated_amount);
         let _ = view.update(Arc::new(STLedgerEntry::from_stobject(
             to_obj,
             *to_sle.key(),

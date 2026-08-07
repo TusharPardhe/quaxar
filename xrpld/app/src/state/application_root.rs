@@ -128,6 +128,52 @@ fn median_validation_sign_time(mut sign_times: Vec<u32>, quorum: usize, fallback
     low.saturating_add((high - low) / 2)
 }
 
+/// Mirrors `LedgerMaster::getNeededValidations`: standalone accepts without
+/// network validation while every non-standalone path uses the configured UNL
+/// quorum.
+fn needed_validations(standalone: bool, quorum: usize) -> usize {
+    if standalone { 0 } else { quorum }
+}
+
+/// Mirrors the resolver-miss branch of `LedgerMaster::checkAccept(hash, seq)`:
+/// only a quorum-backed nonzero validation with no valid ledger can update peer
+/// convergence before generic acquisition is requested.
+fn should_check_tracking_on_validation_resolver_miss(
+    seq: u32,
+    valid_ledger_seq: u32,
+    validation_count: usize,
+    quorum: usize,
+) -> bool {
+    seq != 0 && valid_ledger_seq == 0 && validation_count >= quorum
+}
+
+/// `LedgerMaster::consensusBuilt` intentionally uses a strict threshold when
+/// scanning alternate current-validation candidates, unlike `checkAccept`.
+fn consensus_built_alternate_threshold_met(validation_count: usize, needed: usize) -> bool {
+    validation_count > needed
+}
+
+/// Group the already filtered *current* trusted validations exactly as
+/// `LedgerMaster::consensusBuilt`'s local `ValSeq` map does. Historical
+/// validation sets are deliberately not consulted here; they belong only to
+/// the subsequent `checkAccept(hash, seq)` call.
+fn consensus_built_current_validation_counts(
+    validations: impl IntoIterator<Item = (Uint256, u32)>,
+) -> std::collections::HashMap<Uint256, (usize, u32)> {
+    let mut counts = std::collections::HashMap::new();
+    for (hash, seq) in validations {
+        let entry = counts.entry(hash).or_insert((0, 0));
+        entry.0 += 1;
+        // Match rippled ValSeq::mergeValidation: retain the first known
+        // nonzero sequence for a ledger hash even if an earlier validation
+        // omitted sfLedgerSequence.
+        if entry.1 == 0 {
+            entry.1 = seq;
+        }
+    }
+    counts
+}
+
 /// A preferred LCL equal to the local closed ledger or its immediate parent
 /// cannot justify an abnormal jump. This test-only predicate keeps the mode
 /// promotion regression assertion explicit without introducing another
@@ -4665,11 +4711,9 @@ impl ApplicationRoot {
         }
 
         // Step 2: Our built ledger didn't match the network. Scan all current
-        // trusted validations to find the highest-sequence ledger with quorum.
-        let quorum = self.validators().quorum();
-        if quorum == 0 {
-            return;
-        }
+        // trusted validations to find the highest-sequence ledger above the
+        // strict `consensusBuilt` alternate threshold.
+        let needed_validations = self.needed_validations();
 
         let current_trusted = {
             let validations_guard = self
@@ -4681,22 +4725,41 @@ impl ApplicationRoot {
         };
 
         // `current_trusted()` is deliberately generic and does not know the
-        // app's negative UNL. Re-check each candidate through the same exact
-        // sequence, nUNL-filtered count used by checkAccept.
-        let candidates: std::collections::HashSet<(Uint256, u32)> = current_trusted
-            .iter()
-            .map(|validation| {
+        // app's negative UNL. Match rippled by filtering that current set,
+        // then counting it by ledger hash. Do not substitute the historical
+        // `getTrustedForLedger` set here: it can include validators whose
+        // current validation has already moved to a different ledger.
+        let current_trusted = self.validators().negative_unl_filter_validations(
+            current_trusted
+                .into_iter()
+                .map(|validation| (*validation).clone())
+                .collect(),
+        );
+        let candidates = consensus_built_current_validation_counts(
+            current_trusted.into_iter().map(|validation| {
                 (
                     validation.get_ledger_hash(),
                     validation.get_field_u32(protocol::get_field_by_symbol("sfLedgerSequence")),
                 )
-            })
-            .collect();
+            }),
+        );
 
         let mut max_seq = valid_seq;
         let mut max_hash = built_hash;
-        for (hash, seq) in candidates {
-            if seq > max_seq && self.trusted_validation_count_for_ledger(hash, seq) >= quorum {
+        for (hash, (validation_count, mut seq)) in candidates {
+            if !consensus_built_alternate_threshold_met(validation_count, needed_validations) {
+                continue;
+            }
+            // Validations without sfLedgerSequence require the same
+            // ledger-history/closed-LCL lookup that rippled performs for a
+            // zero `ValSeq::ledgerSeq` before comparing candidate sequence.
+            if seq == 0 {
+                seq = lm
+                    .get_ledger_by_hash(SHAMapHash::new(hash))
+                    .map(|ledger| ledger.header().seq)
+                    .unwrap_or_default();
+            }
+            if seq > max_seq {
                 max_seq = seq;
                 max_hash = hash;
             }
@@ -6271,6 +6334,23 @@ impl ApplicationRoot {
         Arc::clone(&self.validators)
     }
 
+    /// Return the centralized validation requirement used by LedgerMaster
+    /// acceptance paths. This is `0` only for standalone mode, matching
+    /// rippled `LedgerMaster::getNeededValidations`.
+    fn needed_validations(&self) -> usize {
+        needed_validations(self.standalone(), self.validators().quorum())
+    }
+
+    /// Run the validation-set expiry portion of rippled `Application::doSweep`.
+    /// Bootstrap invokes this at the configured application sweep interval.
+    pub(crate) fn expire_validations(&self) {
+        self.validations()
+            .validations()
+            .lock()
+            .expect("validations mutex must not be poisoned")
+            .expire();
+    }
+
     /// Refresh NegativeUNL and trusted-validator state before every consensus
     /// round. This is the shared `NetworkOPs::beginConsensus` prelude: the
     /// selected LCL supplies both its NegativeUNL and its close time.
@@ -7756,6 +7836,8 @@ impl ApplicationRoot {
             return;
         };
         let lm = lm_rt.ledger_master();
+        let validator_quorum = self.validators().quorum();
+        let mut validation_count = 0usize;
 
         if seq != 0 {
             let current_valid_seq = lm.valid_ledger_seq();
@@ -7786,7 +7868,8 @@ impl ApplicationRoot {
                 return;
             }
             let val_count = self.trusted_validation_count_for_ledger(hash, seq);
-            let quorum = self.validators().quorum();
+            validation_count = val_count;
+            let quorum = validator_quorum;
             if val_count >= quorum {
                 tracing::info!(
                     target: "lcl_trace",
@@ -7873,6 +7956,21 @@ impl ApplicationRoot {
         let ledger = match ledger {
             Some(l) => Some(l),
             None => {
+                // `LedgerMaster::checkAccept` updates peer convergence before
+                // its Generic acquire when a quorum-backed validation arrives
+                // before any valid ledger exists.
+                if should_check_tracking_on_validation_resolver_miss(
+                    seq,
+                    lm.valid_ledger_seq(),
+                    validation_count,
+                    validator_quorum,
+                ) {
+                    use overlay::Overlay;
+                    if let Some(overlay_runtime) = self.overlay_runtime() {
+                        overlay_runtime.overlay().check_tracking(seq);
+                    }
+                }
+
                 // Matches rippled's `app_.getInboundLedgers().acquire(hash,
                 // seq, InboundLedger::Reason::GENERIC)`: actively fetch the
                 // ledger we don't have from peers rather than waiting.
@@ -7934,6 +8032,13 @@ impl ApplicationRoot {
         }
     }
 
+    /// Source-equivalent `InboundLedger::AcqDone` acceptance path. Completed
+    /// inbound ledgers bypass the validation-receipt building-sequence guard
+    /// and are evaluated directly by LedgerMaster's ledger overload.
+    pub(crate) fn check_accept_completed_inbound_ledger(&self, ledger: Arc<Ledger>) {
+        self.check_accept_ledger(ledger);
+    }
+
     /// Matches rippled's `LedgerMaster::checkAccept(ledger)`
     /// (LedgerMaster.cpp:946-1000): promotes `ledger` to validated if it
     /// has reached quorum among trusted validators.
@@ -7968,7 +8073,7 @@ impl ApplicationRoot {
             return;
         }
 
-        let quorum = self.validators().quorum();
+        let quorum = self.needed_validations();
         let val_count = self.trusted_validation_count_for_ledger(
             *ledger.header().hash.as_uint256(),
             ledger.header().seq,

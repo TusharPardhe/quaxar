@@ -14,7 +14,7 @@ use super::fixtures::*;
 use super::pipeline::full_apply;
 use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
-use ledger::{ApplyView, ReadView};
+use ledger::{ApplyView, FlowSandbox, ReadView};
 use protocol::{
     AccountID, Currency, IOUAmount, Issue, STAmount, STArray, STLedgerEntry, STObject, STTx, Ter,
     TxType, XRPAmount, get_field_by_symbol, sf_generic,
@@ -23,6 +23,55 @@ use std::sync::Arc;
 
 fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
+}
+
+// ─── Virtual XRP endpoint reverse probe ─────────────────────────────────────
+
+#[test]
+fn fp_virtual_xrp_reverse_probe_can_hold_and_discard_over_network_balance() {
+    let destination = acct(0x22);
+    let max_native = protocol::ST_AMOUNT_MAX_NATIVE_NETWORK as i64;
+    let l = build_ledger(vec![account_root(destination, max_native, 0, 0)]);
+    let mut view = new_view(l);
+
+    // Reverse XRP endpoint probing uses xrpAccount() as a virtual sender. The
+    // temporary balance is intentionally over the network amount limit, then
+    // its FlowSandbox is discarded when the path is dry/limited. This must not
+    // panic while the parent ledger remains unchanged.
+    let mut probe = FlowSandbox::new(&mut view);
+    assert_eq!(
+        ledger::ripple_state_helpers::transfer_xrp(
+            &mut probe,
+            &protocol::xrp_account(),
+            &destination,
+            XRPAmount::from_drops(1),
+        ),
+        Ter::TES_SUCCESS
+    );
+    let temporary = probe
+        .read(protocol::account_keylet(Uint160::from_void(
+            destination.data(),
+        )))
+        .unwrap()
+        .unwrap()
+        .get_field_amount(sf("sfBalance"));
+    assert_eq!(
+        temporary.mantissa(),
+        protocol::ST_AMOUNT_MAX_NATIVE_NETWORK + 1
+    );
+    assert!(!temporary.is_legal_net());
+    drop(probe);
+
+    let parent_balance = view
+        .read(protocol::account_keylet(Uint160::from_void(
+            destination.data(),
+        )))
+        .unwrap()
+        .unwrap()
+        .get_field_amount(sf("sfBalance"))
+        .xrp()
+        .drops();
+    assert_eq!(parent_balance, max_native);
 }
 
 // ─── Direct IOU: Issuer to Holder ───────────────────────────────────────────

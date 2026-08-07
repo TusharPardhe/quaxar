@@ -1874,6 +1874,58 @@ fn median_validation_sign_time_matches_rippled_even_odd_and_fallback_rules() {
 }
 
 #[test]
+fn needed_validations_is_zero_only_in_standalone_mode() {
+    assert_eq!(super::needed_validations(true, 5), 0);
+    assert_eq!(super::needed_validations(false, 5), 5);
+}
+
+#[test]
+fn validation_resolver_miss_tracks_only_early_quorum_backed_observations() {
+    assert!(super::should_check_tracking_on_validation_resolver_miss(
+        812, 0, 3, 3
+    ));
+    assert!(!super::should_check_tracking_on_validation_resolver_miss(
+        812, 811, 3, 3
+    ));
+    assert!(!super::should_check_tracking_on_validation_resolver_miss(
+        812, 0, 2, 3
+    ));
+    assert!(!super::should_check_tracking_on_validation_resolver_miss(
+        0, 0, 3, 3
+    ));
+}
+
+#[test]
+fn consensus_built_alternate_scan_requires_strictly_more_than_needed_validations() {
+    assert!(!super::consensus_built_alternate_threshold_met(3, 3));
+    assert!(super::consensus_built_alternate_threshold_met(4, 3));
+}
+
+#[test]
+fn consensus_built_counts_only_its_filtered_current_validation_input() {
+    let first_hash = Uint256::from_u64(81);
+    let second_hash = Uint256::from_u64(82);
+    let counts = super::consensus_built_current_validation_counts([
+        (first_hash, 901),
+        (first_hash, 901),
+        (second_hash, 902),
+    ]);
+
+    assert_eq!(counts.get(&first_hash), Some(&(2, 901)));
+    assert_eq!(counts.get(&second_hash), Some(&(1, 902)));
+    assert!(super::consensus_built_alternate_threshold_met(
+        counts[&first_hash].0,
+        1
+    ));
+}
+
+#[test]
+fn application_root_exposes_validation_expiry_maintenance() {
+    let app = ApplicationRoot::new(0).expect("root shell should build");
+    app.expire_validations();
+}
+
+#[test]
 fn application_root_published_ledger_emits_canonical_ledger_closed_event() {
     let app = ApplicationRoot::new(0).expect("root shell should build");
     let events = Arc::new(Mutex::new(Vec::new()));

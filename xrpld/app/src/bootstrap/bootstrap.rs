@@ -2312,9 +2312,6 @@ fn run_start_mode_consensus_loop(
                         break;
                     }
                     let root = hk_runtime.root();
-                    let Some(overlay_rt) = root.overlay_runtime() else {
-                        continue;
-                    };
 
                     // TreeNodeCache sweep — matching rippled's doSweep which calls
                     // nodeFamily_.sweep() at SweepInterval cadence (config-based per node_size).
@@ -2342,8 +2339,17 @@ fn run_start_mode_consensus_loop(
                         // Without this, completed transactions accumulate indefinitely.
                         root.transaction_master().sweep();
 
+                        // Application::doSweep expires validation maps on this
+                        // same configured SweepInterval; without it, historical
+                        // validation sets never age out in a running node.
+                        root.expire_validations();
+
                         last_cache_sweep = std::time::Instant::now();
                     }
+
+                    let Some(overlay_rt) = root.overlay_runtime() else {
+                        continue;
+                    };
 
                     // ─── Overlay timer duties (matching rippled OverlayImpl::Timer) ───
                     // Ping peers every 60s, check_tracking every 1s, delete_idle_peers every 4s

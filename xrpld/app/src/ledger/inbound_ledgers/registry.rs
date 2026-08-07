@@ -13,8 +13,7 @@ use overlay::Peer;
 use protocol::JsonValue;
 use shamap::family::{FullBelowCache, FullBelowCacheImpl};
 use shamap::tree_node_cache::TreeNodeCache;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Bound::{Excluded, Unbounded};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, RwLock};
@@ -211,10 +210,13 @@ struct Entry {
 struct RegistryInner {
     entries: BTreeMap<Uint256, Entry>,
     recent_failures: HashMap<Uint256, Instant>,
-    /// Last key consumed by bounded result polling. Ordered traversal from
-    /// this cursor keeps recovery fair while inspecting only one turn's
-    /// budget, even when channel notification was lost.
-    poll_cursor: Option<Uint256>,
+    /// Successful terminal completions in exact completion order. Each item
+    /// remains queued until acknowledged, and polling rotates unacknowledged
+    /// items fairly so a failed persistence attempt cannot block later work.
+    /// This is the direct equivalent of rippled's `InboundLedger::done()`
+    /// dispatching `AcqDone`; it avoids discovering a ready acquisition by
+    /// scanning an arbitrary bounded slice of the full registry.
+    completed_ready: VecDeque<(Uint256, u64)>,
 }
 
 fn failure_matches_entry(acquisition_id: Option<u64>, entry_id: u64) -> bool {
@@ -581,7 +583,7 @@ impl InboundLedgers {
             inner: Arc::new(Mutex::new(RegistryInner {
                 entries: BTreeMap::new(),
                 recent_failures: HashMap::new(),
-                poll_cursor: None,
+                completed_ready: VecDeque::new(),
             })),
             worker_pool,
             node_store: Arc::new(RwLock::new(None)),
@@ -770,11 +772,23 @@ impl InboundLedgers {
                 // Match InboundLedger::done(): terminal completion owns the
                 // last-action update, so queue latency cannot make a newly
                 // completed ledger eligible for an immediate sweep.
-                if let Some(entry) = inner.entries.get_mut(&completed_hash)
+                let registered = if let Some(entry) = inner.entries.get_mut(&completed_hash)
                     && entry.id == acquisition_id
                 {
                     entry.completed_ledger = Some(ledger);
                     entry.last_touched = Instant::now();
+                    true
+                } else {
+                    false
+                };
+                if registered {
+                    // `InboundLedger::done()` reaches `AcqDone` only after
+                    // the completed ledger has been stored. Publish the exact
+                    // acquisition identity here, rather than asking the
+                    // strand to eventually discover it by scanning entries.
+                    inner
+                        .completed_ready
+                        .push_back((completed_hash, acquisition_id));
                 } else {
                     // Match rippled's InboundLedgers::sweep ownership: once
                     // an entry is no longer resident, a late completion must
@@ -950,7 +964,15 @@ impl InboundLedgers {
 
         for (hash, entry) in &inner.entries {
             let idle_for = now.duration_since(entry.last_touched);
-            if idle_for > SWEEP_IDLE_TIMEOUT {
+            // A successful completion must remain resolver-visible until its
+            // AcqDone-equivalent consumer acknowledges persistence/acceptance.
+            // Rippled stores before dispatching AcqDone; retaining this entry
+            // prevents a delayed strand turn from silently losing that ledger.
+            if idle_for > SWEEP_IDLE_TIMEOUT
+                && (!entry.state.completed.load(Ordering::Acquire)
+                    && entry.completed_ledger.is_none()
+                    || entry.completion_acknowledged)
+            {
                 to_remove.push((
                     *hash,
                     entry.seq,
@@ -978,9 +1000,12 @@ impl InboundLedgers {
                     "LCL trace: inbound acquisition removed by sweep"
                 );
                 // Match rippled's sweep: removing an idle InboundLedger
-                // releases its completed ledger. Do not retain an unbounded
-                // side queue when NetworkOps is unavailable; future
-                // validation/history work will reacquire the exact hash.
+                // releases its completed ledger. Remove its direct completion
+                // handoff as well; future validation/history work will
+                // reacquire the exact hash.
+                inner
+                    .completed_ready
+                    .retain(|(ready_hash, _)| *ready_hash != hash);
                 swept_states.push(entry.state);
             }
         }
@@ -1167,9 +1192,19 @@ impl InboundLedgers {
     /// Notify that a ledger was completed (called externally or by sweep).
     pub fn on_complete(&self, hash: Uint256, ledger: Arc<Ledger>) {
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        if let Some(entry) = inner.entries.get_mut(&hash) {
-            entry.completed_ledger = Some(ledger);
-            entry.last_touched = Instant::now();
+        let completion_id = if let Some(entry) = inner.entries.get_mut(&hash) {
+            if entry.completed_ledger.is_none() {
+                entry.completed_ledger = Some(ledger);
+                entry.last_touched = Instant::now();
+                Some(entry.id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(acquisition_id) = completion_id {
+            inner.completed_ready.push_back((hash, acquisition_id));
         }
     }
 
@@ -1207,7 +1242,7 @@ impl InboundLedgers {
         let entries = {
             let mut inner = self.inner.lock().expect("inbound_ledgers lock");
             inner.recent_failures.clear();
-            inner.poll_cursor = None;
+            inner.completed_ready.clear();
             std::mem::take(&mut inner.entries)
         };
         for entry in entries.into_values() {
@@ -1289,6 +1324,9 @@ impl InboundLedgers {
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
         if let Some(entry) = inner.entries.remove(hash) {
             entry.state.stopped.store(true, Ordering::Release);
+            inner
+                .completed_ready
+                .retain(|(ready_hash, _)| ready_hash != hash);
         }
     }
 
@@ -1302,6 +1340,7 @@ impl InboundLedgers {
             entry.state.stopped.store(true, Ordering::Release);
         }
         inner.recent_failures.clear();
+        inner.completed_ready.clear();
         drop(inner);
 
         self.worker_pool.stop();
@@ -1316,100 +1355,57 @@ impl InboundLedgers {
         self.poll_results_bounded(usize::MAX)
     }
 
-    /// Poll at most `budget` acquisition entries. Entries beyond the budget
-    /// remain in the registry for a later turn; completed entries remain until
-    /// the consumer calls `acknowledge_completed` after its cache/persistence
-    /// work succeeds. This makes completion a two-phase handoff instead of
-    /// treating an in-memory result as a durable ledger transition.
+    /// Poll at most `budget` successful terminal handoffs. A completion is
+    /// enqueued by its terminal callback after it has been made registry-
+    /// visible; polling therefore never scans arbitrary in-progress entries.
+    /// Unacknowledged results rotate to the back of the queue, so failed
+    /// persistence retries remain durable without starving later completions.
     pub fn poll_results_bounded(
         &self,
         budget: usize,
     ) -> Vec<(Uint256, u64, Ledger, AcquireReason)> {
-        // Snapshot under the registry mutex, then inspect each acquisition
-        // after releasing it. Completion can race with a long map walk, so
-        // never hold the registry lock while taking `state.mutable`.
-        let entries: Vec<(
-            Uint256,
-            u64,
-            Arc<AcquisitionState>,
-            Option<Arc<Ledger>>,
-            bool,
-            bool,
-            AcquireReason,
-        )>;
-        let mut completed: Vec<(Uint256, u64, Ledger, AcquireReason)> = Vec::new();
-        {
-            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-            let mut snapshot = Vec::with_capacity(budget);
-            if budget != 0 {
-                let mut record = |hash: &Uint256, entry: &Entry| {
-                    snapshot.push((
-                        *hash,
-                        entry.id,
-                        Arc::clone(&entry.state),
-                        entry.completed_ledger.clone(),
-                        entry.completion_acknowledged,
-                        entry.failed,
-                        entry.reason,
-                    ));
-                };
-                match inner.poll_cursor {
-                    Some(cursor) => {
-                        for (hash, entry) in inner
-                            .entries
-                            .range((Excluded(cursor), Unbounded))
-                            .chain(inner.entries.range(..=cursor))
-                            .take(budget)
-                        {
-                            record(hash, entry);
-                        }
-                    }
-                    None => {
-                        for (hash, entry) in inner.entries.iter().take(budget) {
-                            record(hash, entry);
-                        }
-                    }
-                }
-                inner.poll_cursor = snapshot.last().map(|(hash, _, _, _, _, _, _)| *hash);
-            }
-            entries = snapshot;
-        };
-        let mut failed_entries = Vec::new();
-        for (
-            hash,
-            acquisition_id,
-            state,
-            externally_completed,
-            completion_acknowledged,
-            failed,
-            reason,
-        ) in entries
-        {
-            if completion_acknowledged {
-                continue;
-            }
-            if failed || state.failed.load(Ordering::Acquire) {
-                failed_entries.push((hash, acquisition_id));
-                continue;
-            }
-            if let Some(ledger) = externally_completed {
-                completed.push((hash, acquisition_id, (*ledger).clone(), reason));
-            } else if state.completed.load(Ordering::Acquire) {
-                if let Some(ledger) = state.completed_ledger() {
-                    completed.push((hash, acquisition_id, (*ledger).clone(), reason));
-                } else {
-                    failed_entries.push((hash, acquisition_id));
-                }
-            }
+        if budget == 0 {
+            return Vec::new();
         }
 
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        for (hash, acquisition_id) in &failed_entries {
-            // Do not remove a failed entry here. Rippled leaves it until its
-            // one-minute idle sweep; recent_failures separately blocks retry.
-            record_recent_failure(&mut inner, *hash, Some(*acquisition_id));
+        // Examine only the entries that were ready at this poll's start. This
+        // avoids returning the same unacknowledged completion repeatedly when
+        // the caller's budget exceeds the ready queue length. The budget counts
+        // live handoffs, not stale identities that must be discarded.
+        let ready_this_turn = inner.completed_ready.len();
+        let mut completed = Vec::with_capacity(ready_this_turn.min(budget));
+        for _ in 0..ready_this_turn {
+            if completed.len() >= budget {
+                break;
+            }
+            let Some((hash, acquisition_id)) = inner.completed_ready.pop_front() else {
+                break;
+            };
+            let ready = inner.entries.get(&hash).and_then(|entry| {
+                if entry.id != acquisition_id
+                    || entry.completion_acknowledged
+                    || entry.failed
+                    || entry.state.failed.load(Ordering::Acquire)
+                {
+                    return None;
+                }
+                entry
+                    .completed_ledger
+                    .clone()
+                    .map(|ledger| (ledger, entry.reason))
+            });
+            let Some((ledger, reason)) = ready else {
+                // Completion recording inserts the ledger before enqueuing
+                // this exact (hash, acquisition_id), so a non-ready item is
+                // stale: it was failed, acknowledged, swept, or replaced.
+                // Drop it rather than rotating it indefinitely and consuming
+                // later bounded polls ahead of live completions.
+                continue;
+            };
+            inner.completed_ready.push_back((hash, acquisition_id));
+            completed.push((hash, acquisition_id, (*ledger).clone(), reason));
         }
-
         completed
     }
 
@@ -1418,29 +1414,34 @@ impl InboundLedgers {
     /// retained so the owner can retry on a later bounded poll.
     pub fn acknowledge_completed(&self, hash: &Uint256, acquisition_id: u64) {
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        let completed = inner.entries.get(hash).is_some_and(|entry| {
-            !entry.failed
+        let acknowledged = inner.entries.get_mut(hash).and_then(|entry| {
+            let completed = !entry.failed
                 && !entry.state.failed.load(Ordering::Acquire)
                 && entry.id == acquisition_id
                 && (entry.completed_ledger.is_some()
-                    || entry.state.completed.load(Ordering::Acquire))
-        });
-        if completed {
-            if let Some(entry) = inner.entries.get_mut(hash) {
-                // Keep completed ledgers resident until the ordinary inbound
-                // sweep. `acquire(hash, ...)` must still return this ledger,
-                // just as rippled finds completed InboundLedger objects.
-                entry.completion_acknowledged = true;
-                tracing::info!(
-                    target: "lcl_trace",
-                    event = "inbound_completion_acknowledged",
-                    %hash,
-                    seq = entry.seq,
-                    reason = ?entry.reason,
-                    acquisition_id = entry.id,
-                    "LCL trace: completed inbound ledger retained until sweep after acknowledgement"
-                );
+                    || entry.state.completed.load(Ordering::Acquire));
+            if !completed {
+                return None;
             }
+            // Keep completed ledgers resident until the ordinary inbound
+            // sweep. `acquire(hash, ...)` must still return this ledger,
+            // just as rippled finds completed InboundLedger objects.
+            entry.completion_acknowledged = true;
+            Some((entry.seq, entry.reason, entry.id))
+        });
+        if let Some((seq, reason, entry_id)) = acknowledged {
+            inner.completed_ready.retain(|(ready_hash, ready_id)| {
+                *ready_hash != *hash || *ready_id != acquisition_id
+            });
+            tracing::info!(
+                target: "lcl_trace",
+                event = "inbound_completion_acknowledged",
+                %hash,
+                seq,
+                reason = ?reason,
+                acquisition_id = entry_id,
+                "LCL trace: completed inbound ledger retained until sweep after acknowledgement"
+            );
         } else {
             tracing::warn!(
                 target: "lcl_trace",
@@ -1480,6 +1481,9 @@ impl InboundLedgers {
         for hash in stale {
             if let Some(entry) = inner.entries.remove(&hash) {
                 entry.state.stopped.store(true, Ordering::Release);
+                inner
+                    .completed_ready
+                    .retain(|(ready_hash, _)| *ready_hash != hash);
             }
         }
         count
@@ -1568,6 +1572,9 @@ impl InboundLedgers {
         for (hash, _) in &stale {
             if let Some(entry) = inner.entries.remove(hash) {
                 entry.state.stopped.store(true, Ordering::Release);
+                inner
+                    .completed_ready
+                    .retain(|(ready_hash, _)| ready_hash != hash);
             }
         }
         stale
@@ -1714,7 +1721,7 @@ mod tests {
     use protocol::{JsonValue, PublicKey};
     use shamap::family::FullBelowCacheImpl;
     use shamap::tree_node_cache::TreeNodeCache;
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
@@ -1958,7 +1965,7 @@ mod tests {
         let mut inner = RegistryInner {
             entries: BTreeMap::new(),
             recent_failures: HashMap::new(),
-            poll_cursor: None,
+            completed_ready: VecDeque::new(),
         };
 
         record_recent_failure(&mut inner, hash, None);
@@ -1978,7 +1985,7 @@ mod tests {
         let mut inner = RegistryInner {
             entries: BTreeMap::new(),
             recent_failures: HashMap::new(),
-            poll_cursor: None,
+            completed_ready: VecDeque::new(),
         };
 
         record_recent_failure_at(&mut inner, hash, None, first_failure);
@@ -2048,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn swept_unacknowledged_completion_is_released() {
+    fn swept_unacknowledged_completion_remains_resolver_visible() {
         let worker_pool = Arc::new(WorkerPool::new(0));
         let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
         let mut ledger = Ledger::from_ledger_seq_and_close_time(44, 1_000, false);
@@ -2071,7 +2078,90 @@ mod tests {
         }
 
         registry.sweep();
-        assert!(!registry.contains(&hash));
+        assert!(registry.contains(&hash));
+        assert_eq!(registry.poll_results_bounded(1).len(), 1);
+        registry.stop();
+    }
+
+    #[test]
+    fn completion_ready_queue_bypasses_in_progress_registry_prefix() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        // These lower hashes would consume a scan budget before the completed
+        // target in the former BTreeMap polling implementation.
+        for fill in [0x01, 0x02, 0x03] {
+            assert!(
+                registry
+                    .acquire(Uint256::from_array([fill; 32]), 0, AcquireReason::Consensus)
+                    .is_none()
+            );
+        }
+
+        let mut ledger = Ledger::from_ledger_seq_and_close_time(45, 1_000, false);
+        ledger.set_immutable(true);
+        let ledger = Arc::new(ledger);
+        let hash = *ledger.header().hash.as_uint256();
+        assert!(
+            registry
+                .acquire(hash, 0, AcquireReason::Consensus)
+                .is_none()
+        );
+        registry.on_complete(hash, Arc::clone(&ledger));
+
+        let first = registry.poll_results_bounded(1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, hash);
+        assert_eq!(
+            first[0].1,
+            registry
+                .inner
+                .lock()
+                .expect("registry lock")
+                .entries
+                .get(&hash)
+                .expect("completed entry")
+                .id
+        );
+
+        // The retained handoff retries after a failed consumer turn, but it
+        // is not duplicated within a single oversized poll.
+        assert_eq!(registry.poll_results_bounded(8).len(), 1);
+        registry.acknowledge_completed(&hash, first[0].1);
+        assert!(registry.poll_results_bounded(1).is_empty());
+        registry.stop();
+    }
+
+    #[test]
+    fn stale_failed_completion_does_not_consume_next_ready_poll_slot() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+
+        let stale_hash = Uint256::from_array([0xF4; 32]);
+        assert!(
+            registry
+                .acquire(stale_hash, 0, AcquireReason::Consensus)
+                .is_none()
+        );
+        let mut stale_ledger = Ledger::from_ledger_seq_and_close_time(46, 1_000, false);
+        stale_ledger.set_immutable(true);
+        registry.on_complete(stale_hash, Arc::new(stale_ledger));
+        registry.on_failed(stale_hash);
+
+        let mut live_ledger = Ledger::from_ledger_seq_and_close_time(47, 1_000, false);
+        live_ledger.set_immutable(true);
+        let live_ledger = Arc::new(live_ledger);
+        let live_hash = *live_ledger.header().hash.as_uint256();
+        assert!(
+            registry
+                .acquire(live_hash, 0, AcquireReason::Consensus)
+                .is_none()
+        );
+        registry.on_complete(live_hash, Arc::clone(&live_ledger));
+
+        let ready = registry.poll_results_bounded(1);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, live_hash);
+        registry.acknowledge_completed(&live_hash, ready[0].1);
         assert!(registry.poll_results_bounded(1).is_empty());
         registry.stop();
     }
@@ -2141,7 +2231,7 @@ mod tests {
         let mut inner = RegistryInner {
             entries: BTreeMap::new(),
             recent_failures: HashMap::new(),
-            poll_cursor: None,
+            completed_ready: VecDeque::new(),
         };
 
         record_recent_failure_at(&mut inner, hash, Some(17), Instant::now());

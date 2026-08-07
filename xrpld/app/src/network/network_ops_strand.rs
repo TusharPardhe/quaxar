@@ -644,9 +644,10 @@ fn strand_loop(
 
         // ─── 5. Persist inbound completion before LCL reconciliation ────
         // ─── 6a. completion recovery — registry is authoritative ────────
-        // The sender is only a wakeup optimization. If it is disconnected or
-        // not yet drained, completed acquisition state remains recoverable
-        // here and follows the same storeLedger -> checkAccept path.
+        // The sender is only a wakeup optimization. The inbound registry
+        // exposes successful terminal work through a direct ready queue, so
+        // this path follows rippled `AcqDone` ordering without scanning
+        // arbitrary in-progress acquisitions.
         let mut registry_completion_count = 0usize;
         if let Some(lm_rt) = root.ledger_master_runtime() {
             let lm = lm_rt.ledger_master();
@@ -666,16 +667,20 @@ fn strand_loop(
             for (hash, acquisition_id, ledger, reason) in registry_completions {
                 let ledger = Arc::new(ledger);
                 let persisted = persist_completed_inbound_ledger(&root, &lm, &ledger, reason);
-                trace_completed_inbound_handoff("registry_poll", &lm, &ledger, reason, persisted);
-                root.check_accept_hash_seq(*ledger.header().hash.as_uint256(), ledger.header().seq);
+                // Match rippled's completed-ledger handoff: make the ledger
+                // resolver-visible before evaluating validation quorum. The
+                // adaptor-local map is the canonical fast path for
+                // `check_acquired`; registering after checkAccept could turn
+                // a completed ledger into a redundant Generic acquisition.
+                root.validations().register_ledger(&ledger);
+                root.check_accept_completed_inbound_ledger(Arc::clone(&ledger));
+                trace_completed_inbound_handoff("registry_ready", &lm, &ledger, reason, persisted);
+                // The queue item is acknowledged only after persistence,
+                // canonical resolver publication, and acceptance dispatch.
+                // A failed persistence remains ready for a fair later retry.
                 if persisted.acknowledged {
                     shared_inbound.acknowledge_completed(&hash, acquisition_id);
                 }
-                // Always register with the validations adaptor regardless of
-                // whether LedgerHistory already had this ledger. A ledger can
-                // be in LedgerHistory but absent from the adaptor's local map,
-                // which would leave check_acquired unable to resolve it.
-                root.validations().register_ledger(&ledger);
             }
         }
 
@@ -1033,10 +1038,6 @@ fn reconcile_preferred_lcl(
         return PreferredLclReconciliation::NoChange;
     }
 
-    // An `AcquiredRecoveryCandidate` can override a stale below-minimum trie
-    // preference, but it is only a verified target selection. The resolver,
-    // completeness, currentness, and compatibility checks below remain the
-    // sole authority for promoting it to the local closed ledger.
     let candidate = root
         .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash))
         // `checkLastClosedLedger` immediately asks InboundLedgers for a
@@ -1299,7 +1300,9 @@ fn switch_last_closed_ledger(
     root.on_closed_ledger(Arc::clone(&ledger));
     root.broadcast_consensus_status_change(ledger.as_ref(), 3, true);
 
-    root.check_accept_hash_seq(new_hash, new_seq);
+    // rippled's `switchLastClosedLedger` only installs the new closed/open
+    // ledger state and broadcasts `neSWITCHED_LEDGER`; it does not synthesize
+    // a validation-driven `LedgerMaster::checkAccept` call here.
     let proposing = root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full;
     let now = root.shared_time_keeper().close_time();
     let prev_cx = crate::consensus_ledger_from_ledger(&ledger);
@@ -1343,50 +1346,37 @@ fn check_accept_and_advance(
     let _lcl_transition_guard = root.lcl_transition_gate().lock();
     let published_before = root.published_ledger_seq();
 
-    // ── checkAccept: the closed ledger may now have reached quorum ───────
-    if let Some(closed) = root.closed_ledger() {
-        root.check_accept_hash_seq(*closed.header().hash.as_uint256(), closed.header().seq);
-    }
-
-    // ── tryAdvance: burst through consecutive quorum-backed ledgers ───────
-    let mut advanced = 0u32;
-    loop {
-        let next_seq = lm.valid_ledger_seq() + 1;
-        let Some(candidate) = lm.ledger_history().get_cached_ledger_by_seq(next_seq) else {
-            if let Some(hash) = contiguous_bridge_hash(root, &lm, shared_inbound, next_seq) {
-                tracing::info!(
-                    target: "lcl_trace",
-                    event = "try_advance_missing_successor_acquire",
-                    next_seq,
-                    %hash,
-                    last_valid = ?lm.last_valid_ledger(),
-                    "LCL trace: acquiring first missing contiguous validated successor"
-                );
-                shared_inbound.acquire_async(
-                    *hash.as_uint256(),
-                    next_seq,
-                    AcquireReason::Consensus,
-                );
-            } else {
-                tracing::debug!(
-                    target: "lcl_trace",
-                    event = "try_advance_missing_successor_unresolved",
-                    next_seq,
-                    last_valid = ?lm.last_valid_ledger(),
-                    "LCL trace: first missing contiguous successor cannot yet be resolved"
-                );
-            }
-            break;
-        };
-        let candidate_hash = *candidate.header().hash.as_uint256();
-        root.check_accept_hash_seq(candidate_hash, next_seq);
-        if lm.valid_ledger_seq() < next_seq {
-            break;
+    // Acceptance and `tryAdvance` are driven by validation receipt and the
+    // inbound `AcqDone`-equivalent handoff above. Do not periodically rescan
+    // the closed ledger or cached successors and synthesize checkAccept calls:
+    // rippled's NetworkOPs maintenance path does neither. It may still acquire
+    // the first unresolved contiguous bridge so the real validation/acquisition
+    // paths can resolve and accept it when evidence arrives.
+    let next_seq = lm.valid_ledger_seq() + 1;
+    if lm
+        .ledger_history()
+        .get_cached_ledger_by_seq(next_seq)
+        .is_none()
+    {
+        if let Some(hash) = contiguous_bridge_hash(root, &lm, shared_inbound, next_seq) {
+            tracing::info!(
+                target: "lcl_trace",
+                event = "try_advance_missing_successor_acquire",
+                next_seq,
+                %hash,
+                last_valid = ?lm.last_valid_ledger(),
+                "LCL trace: acquiring first missing contiguous validated successor"
+            );
+            shared_inbound.acquire_async(*hash.as_uint256(), next_seq, AcquireReason::Consensus);
+        } else {
+            tracing::debug!(
+                target: "lcl_trace",
+                event = "try_advance_missing_successor_unresolved",
+                next_seq,
+                last_valid = ?lm.last_valid_ledger(),
+                "LCL trace: first missing contiguous successor cannot yet be resolved"
+            );
         }
-        advanced += 1;
-    }
-    if advanced > 0 {
-        tracing::info!(target: "consensus", advanced, new_valid_seq = lm.valid_ledger_seq(), "tryAdvance burst");
     }
 
     // ── tryAdvance publication ────────────────────────────────────────────
@@ -2362,6 +2352,35 @@ mod tests {
         assert!(!scheduler.has_pending_accept());
         scheduler.accept_consumed();
         queue.stop();
+    }
+
+    #[test]
+    fn completion_handoff_registers_before_acceptance_or_acknowledgement() {
+        // Keep the ordering contract explicit: a completion is first durable
+        // in LedgerHistory, then visible to the validation adaptor's canonical
+        // resolver, then eligible for checkAccept, and only then acknowledged
+        // out of the inbound ready queue. The strand loop performs these calls
+        // in that exact sequence; this fixture documents the two visibility
+        // prerequisites without requiring a running node.
+        let root = ApplicationRoot::new(0).expect("root should build");
+        let master = LedgerMaster::new(MonotonicClock::default(), LedgerMasterConfig::default());
+        let ledger = immutable_ledger(102, 0xA2);
+        let hash = *ledger.header().hash.as_uint256();
+
+        assert!(
+            persist_completed_inbound_ledger(&root, &master, &ledger, AcquireReason::Consensus)
+                .acknowledged
+        );
+        root.validations().register_ledger(&ledger);
+        let validations = root
+            .validations()
+            .validations()
+            .lock()
+            .expect("validations lock");
+        assert!(
+            consensus::rcl_support::ValidationsAdaptor::acquire(validations.adaptor(), &hash,)
+                .is_some()
+        );
     }
 
     #[test]

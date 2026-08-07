@@ -81,11 +81,6 @@ pub enum PreferredLclWorkingSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreferredLclSelectionSource {
     WorkingPreferred,
-    /// A stale validation-trie preference was below `min_seq`, but a
-    /// separately acquired ledger has current trusted full validation support
-    /// and a strict peer-LCL majority. NetworkOPs must still admit the
-    /// resolved ledger before switching the local LCL.
-    AcquiredRecoveryCandidate,
     LocalBelowMinSeq,
     PeerFallback,
     LocalNoPreference,
@@ -100,10 +95,12 @@ pub struct PreferredLclDiagnostic<Seq, Id> {
     pub trie_preferred: Option<(Seq, Id)>,
     pub acquiring_preferred: Option<(Seq, Id)>,
     pub working_preferred: Option<(Seq, Id)>,
-    /// A verified, acquired recovery target considered only when the trie
-    /// preference is stale. The final switch remains subject to NetworkOPs'
-    /// completeness and compatibility admission checks.
+    /// Retained for diagnostic-schema compatibility with existing consumers.
+    /// Always `None`: rippled's `getPreferredLCL` has no acquired-ledger
+    /// recovery override when a trusted preference is below `minSeq`.
     pub acquired_recovery_candidate: Option<(Seq, Id)>,
+    /// Retained for diagnostic-schema compatibility; always `None` with the
+    /// source-equivalent selector above.
     pub acquired_recovery_peer_support: Option<u32>,
     pub working_source: PreferredLclWorkingSource,
     pub selection_source: PreferredLclSelectionSource,
@@ -331,7 +328,7 @@ impl<K: Eq + std::hash::Hash + Clone, V> AgedMap<K, V> {
         let expired: Vec<K> = self
             .last_touched
             .iter()
-            .filter(|&(_, &touched)| now.saturating_duration_since(touched) > expires_after)
+            .filter(|&(_, &touched)| now.saturating_duration_since(touched) >= expires_after)
             .map(|(k, _)| k.clone())
             .collect();
         for k in expired {
@@ -374,6 +371,10 @@ struct Inner<A: ValidationsAdaptor> {
     by_sequence: AgedMap<SeqOf<A>, HashMap<NodeIdOf<A>, A::Validation>>,
     /// A `[low, high)` range of sequences to protect from expiry.
     keep: Option<(SeqOf<A>, SeqOf<A>)>,
+    /// The next time the protected range may be re-touched. Matches
+    /// `Validations::expire`'s refresh-before-expiry cadence rather than
+    /// extending protected entries on every application sweep.
+    next_keep_refresh: Option<Instant>,
     /// Ancestry trie over trusted validated ledgers.
     trie: LedgerTrie<A::Ledger>,
     /// Last validated ledger successfully acquired per node; if present,
@@ -393,6 +394,7 @@ impl<A: ValidationsAdaptor> Inner<A> {
             by_ledger: AgedMap::new(),
             by_sequence: AgedMap::new(),
             keep: None,
+            next_keep_refresh: None,
             trie: LedgerTrie::new(),
             last_ledger: HashMap::new(),
             acquiring: BTreeMap::new(),
@@ -654,30 +656,54 @@ impl<A: ValidationsAdaptor> Validations<A> {
             let now = Instant::now();
 
             if let Some((low, high)) = inner.keep {
-                // by_ledger is keyed by ledger id, not sequence, so we must
-                // look at each entry's validations to find their sequence
-                // (matches the reference reading
-                // `validationMap.begin()->second.seq()`).
-                let to_refresh: Vec<LedgerIdOf<A>> = inner
-                    .by_ledger
-                    .entries
-                    .iter()
-                    .filter_map(|(ledger_id, validations)| {
-                        let seq = validations.values().next()?.seq();
-                        (low <= seq && seq < high).then_some(*ledger_id)
-                    })
-                    .collect();
-                for ledger_id in to_refresh {
-                    inner.by_ledger.touch(&ledger_id, now);
+                // Validations.h refreshes the protected range only shortly
+                // before it would expire. Re-touching on every sweep would
+                // extend a previously protected range after `set_seq_to_keep`
+                // moves elsewhere, changing its retention lifetime.
+                let refresh_due = inner.next_keep_refresh.is_none_or(|refresh| refresh <= now);
+                if refresh_due {
+                    inner.next_keep_refresh = Some(
+                        now + self
+                            .parms
+                            .validation_set_expires
+                            .saturating_sub(self.parms.validation_freshness),
+                    );
+                    // by_ledger is keyed by ledger id, not sequence, so we must
+                    // look at each entry's validations to find their sequence
+                    // (matches the reference reading
+                    // `validationMap.begin()->second.seq()`).
+                    let to_refresh: Vec<LedgerIdOf<A>> = inner
+                        .by_ledger
+                        .entries
+                        .iter()
+                        .filter_map(|(ledger_id, validations)| {
+                            let seq = validations.values().next()?.seq();
+                            (low <= seq && seq < high).then_some(*ledger_id)
+                        })
+                        .collect();
+                    for ledger_id in to_refresh {
+                        inner.by_ledger.touch(&ledger_id, now);
+                    }
+
+                    let seq_keep = |seq: &SeqOf<A>| low <= *seq && *seq < high;
+                    let sequence_to_refresh: Vec<SeqOf<A>> = inner
+                        .by_sequence
+                        .entries
+                        .keys()
+                        .filter(|seq| seq_keep(seq))
+                        .copied()
+                        .collect();
+                    for seq in sequence_to_refresh {
+                        inner.by_sequence.touch(&seq, now);
+                    }
                 }
 
-                let seq_keep = |seq: &SeqOf<A>| low <= *seq && *seq < high;
                 inner
                     .by_ledger
                     .expire(now, self.parms.validation_set_expires, None);
                 inner
                     .by_sequence
-                    .expire(now, self.parms.validation_set_expires, Some(&seq_keep));
+                    .expire(now, self.parms.validation_set_expires, None);
             } else {
                 inner
                     .by_ledger
@@ -842,45 +868,15 @@ impl<A: ValidationsAdaptor> Validations<A> {
             .max_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)))
             .map(|(id, count)| (*id, *count));
 
-        // A stale trie can remain preferred after a node has acquired the
-        // current network ledger. Do not let that stale preference force the
-        // local LCL when an independently acquired candidate has both a
-        // current trusted full validation and a strict majority of the peer
-        // LCL reports. `last_ledger` is populated only after adaptor.acquire
-        // succeeds, so this never promotes a merely requested ledger.
-        let acquired_recovery_candidate = match working_preferred {
-            Some((seq, _)) if seq < min_seq => {
-                let peer_total = peer_counts
-                    .values()
-                    .fold(0_u32, |total, count| total.saturating_add(*count));
-                inner
-                    .last_ledger
-                    .values()
-                    .filter_map(|ledger| {
-                        let seq = ledger.seq();
-                        let id = ledger.id();
-                        let has_current_trusted_full_validation = inner.current.values().any(|v| {
-                            v.trusted() && v.full() && v.seq() == seq && v.ledger_id() == id
-                        });
-                        let peer_support = peer_counts.get(&id).copied().unwrap_or_default();
-                        (seq >= min_seq
-                            && has_current_trusted_full_validation
-                            && peer_support > peer_total / 2)
-                            .then_some((seq, id, peer_support))
-                    })
-                    .max_by(|a, b| (a.2, a.0, a.1).cmp(&(b.2, b.0, b.1)))
-            }
-            _ => None,
-        };
-
+        // Match rippled `Validations::getPreferredLCL`: a trusted preference
+        // below `minSeq` keeps the local LCL. Peer counts are considered only
+        // when there is no trusted preference at all; an independently
+        // acquired ledger must not override this selector.
         let (selected, selection_source) = match working_preferred {
             Some((seq, id)) if seq >= min_seq => {
                 (id, PreferredLclSelectionSource::WorkingPreferred)
             }
-            Some(_) => match acquired_recovery_candidate {
-                Some((_, id, _)) => (id, PreferredLclSelectionSource::AcquiredRecoveryCandidate),
-                None => (lcl.id(), PreferredLclSelectionSource::LocalBelowMinSeq),
-            },
+            Some(_) => (lcl.id(), PreferredLclSelectionSource::LocalBelowMinSeq),
             None => match peer_preferred {
                 Some((id, _)) => (id, PreferredLclSelectionSource::PeerFallback),
                 None => (lcl.id(), PreferredLclSelectionSource::LocalNoPreference),
@@ -891,9 +887,8 @@ impl<A: ValidationsAdaptor> Validations<A> {
             trie_preferred: trie_preferred_info,
             acquiring_preferred,
             working_preferred,
-            acquired_recovery_candidate: acquired_recovery_candidate.map(|(seq, id, _)| (seq, id)),
-            acquired_recovery_peer_support: acquired_recovery_candidate
-                .map(|(_, _, peer_support)| peer_support),
+            acquired_recovery_candidate: None,
+            acquired_recovery_peer_support: None,
             working_source,
             selection_source,
             selected,
@@ -1218,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn preferred_lcl_recovers_quorum_backed_acquired_candidate_from_stale_trie() {
+    fn preferred_lcl_keeps_local_lcl_when_trusted_preference_is_below_min_seq() {
         let adaptor = MockAdaptor::new(1000);
         let local_lcl = ledger_at(911, 11);
         let stale_trie_ledger = ledger_at(910, 10);
@@ -1227,16 +1222,16 @@ mod tests {
         adaptor.register_ledger(acquired_candidate.clone());
         let validations = Validations::new(ValidationParms::default(), adaptor);
 
-        // The stale branch has enough historical validation support to remain
-        // trie-preferred even though it is below the validated anchor.
+        // The stale branch has enough support to remain trie-preferred below
+        // the validated anchor. A separately acquired newer ledger and a
+        // dominant peer report must not override it: rippled getPreferredLCL
+        // returns the local LCL whenever trusted preference is below minSeq.
         for node_id in 1..=3 {
             assert_eq!(
                 validations.add(node_id, val(10, 910, 1000, node_id, node_id)),
                 ValStatus::Current
             );
         }
-        // This current trusted full validation was already acquired, and the
-        // candidate has the canonical peer-LCL quorum (34 of 34 reports).
         assert_eq!(
             validations.add(4, val(42, 942, 1000, 4, 4)),
             ValStatus::Current
@@ -1247,13 +1242,13 @@ mod tests {
 
         assert_eq!(diagnostic.trie_preferred, Some((910, 10)));
         assert_eq!(diagnostic.working_preferred, Some((910, 10)));
-        assert_eq!(diagnostic.acquired_recovery_candidate, Some((942, 42)));
-        assert_eq!(diagnostic.acquired_recovery_peer_support, Some(34));
+        assert_eq!(diagnostic.acquired_recovery_candidate, None);
+        assert_eq!(diagnostic.acquired_recovery_peer_support, None);
         assert_eq!(
             diagnostic.selection_source,
-            PreferredLclSelectionSource::AcquiredRecoveryCandidate
+            PreferredLclSelectionSource::LocalBelowMinSeq
         );
-        assert_eq!(diagnostic.selected, 42);
+        assert_eq!(diagnostic.selected, local_lcl.id());
     }
 
     #[test]
@@ -1572,5 +1567,78 @@ mod tests {
 
         assert_eq!(validations.current_trusted().len(), 0);
         assert_eq!(validations.size_of_current_cache(), 0);
+    }
+
+    #[test]
+    fn aged_map_expires_at_validation_set_expiration_boundary() {
+        let expires_after = Duration::from_secs(10);
+        let start = Instant::now();
+        let mut map = AgedMap::new();
+        map.get_or_insert_with(1_u8, start, || 1_u8);
+
+        map.expire(start + expires_after, expires_after, None);
+
+        assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn expire_refreshes_the_configured_keep_range() {
+        let adaptor = MockAdaptor::new(1000);
+        let genesis = MockLedger::genesis_();
+        let child = genesis.child(1);
+        adaptor.register_ledger(genesis);
+        adaptor.register_ledger(child.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(child.id(), 1, 1000, 1, 100)),
+            ValStatus::Current
+        );
+        validations.set_seq_to_keep(child.seq(), child.seq() + 1);
+        let expired_at =
+            Instant::now() - validations.parms().validation_set_expires - Duration::from_secs(1);
+        {
+            let mut inner = validations.inner.lock();
+            inner.by_ledger.last_touched.insert(child.id(), expired_at);
+            inner
+                .by_sequence
+                .last_touched
+                .insert(child.seq(), expired_at);
+        }
+
+        validations.expire();
+
+        assert_eq!(validations.size_of_by_ledger_cache(), 1);
+        assert_eq!(validations.size_of_by_sequence_cache(), 1);
+    }
+
+    #[test]
+    fn expire_removes_aged_validation_sets() {
+        let adaptor = MockAdaptor::new(1000);
+        let genesis = MockLedger::genesis_();
+        let child = genesis.child(1);
+        adaptor.register_ledger(genesis);
+        adaptor.register_ledger(child.clone());
+        let validations = Validations::new(ValidationParms::default(), adaptor);
+
+        assert_eq!(
+            validations.add(1, val(child.id(), 1, 1000, 1, 100)),
+            ValStatus::Current
+        );
+        let expired_at =
+            Instant::now() - validations.parms().validation_set_expires - Duration::from_secs(1);
+        {
+            let mut inner = validations.inner.lock();
+            inner.by_ledger.last_touched.insert(child.id(), expired_at);
+            inner
+                .by_sequence
+                .last_touched
+                .insert(child.seq(), expired_at);
+        }
+
+        validations.expire();
+
+        assert_eq!(validations.size_of_by_ledger_cache(), 0);
+        assert_eq!(validations.size_of_by_sequence_cache(), 0);
     }
 }
