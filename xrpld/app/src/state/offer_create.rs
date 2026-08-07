@@ -13,7 +13,7 @@
 
 use basics::math::base_uint::Uint160;
 use protocol::{
-    AccountID, Amounts, Quality, STAmount, STLedgerEntry, STTx, Ter, XRPAmount,
+    AccountID, Amounts, Quality, STAmount, STLedgerEntry, STTx, StBase, Ter, XRPAmount,
     get_field_by_symbol, is_tes_success,
 };
 use std::sync::Arc;
@@ -189,7 +189,7 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         let quality = get_rate(&taker_gets, &taker_pays);
         let rounded_quality = round_quality(quality, tick_size);
         // Convert rounded quality back to a rate STAmount for multiply/divide
-        let rate_amount = quality_to_rate_amount(rounded_quality, &taker_pays, &taker_gets);
+        let rate_amount = quality_to_rate_amount(rounded_quality);
 
         if is_sell {
             // reference: saTakerPays = multiply(saTakerGets, rate, saTakerPays.asset())
@@ -839,26 +839,14 @@ fn round_quality(quality: u64, digits: u8) -> u64 {
 }
 
 /// Convert a quality (encoded u64) back to an STAmount rate for multiply/divide.
-fn quality_to_rate_amount(quality: u64, _pays: &STAmount, _gets: &STAmount) -> STAmount {
-    let mantissa = quality & 0x00ffffffffffffff;
-    if mantissa == 0 {
-        // Quality::rate() returns a zero STAmount. Keep it as an amount rather
-        // than skipping arithmetic: multiply produces zero for a sell and
-        // divide maps to tefEXCEPTION for a buy, exactly as in rippled.
-        return STAmount::from_iou_amount(
-            sf("sfAmount"),
-            protocol::IOUAmount::new(),
-            protocol::Issue::default(),
-        );
-    }
-    let exponent = (quality >> 56) as i32 - 100;
-    STAmount::new_with_asset(
-        sf("sfAmount"),
-        protocol::Asset::Issue(protocol::Issue::default()),
-        mantissa,
-        exponent,
-        false,
-    )
+///
+/// `Quality::rate()` is an arithmetic rate, not an XRP amount. It must use
+/// `no_issue()`'s non-native sentinel: `Issue::default()` is XRP and therefore
+/// canonicalizes fractional IOU/IOU rates as integral drops. This delegates to
+/// the shared Rust analogue of rippled `Quality::rate()` / `amountFromQuality`:
+/// `OfferCreate.cpp:685,694,699` applies it directly to divide or multiply.
+fn quality_to_rate_amount(quality: u64) -> STAmount {
+    protocol::amount_from_quality(quality)
 }
 
 #[cfg(test)]
@@ -875,13 +863,49 @@ mod tests {
 
     #[test]
     fn quality_to_rate_amount_underflow_is_zero() {
-        let amount = STAmount::from_xrp_amount(XRPAmount::from_drops(1));
-        let zero_rate = quality_to_rate_amount(0, &amount, &amount);
+        let zero_rate = quality_to_rate_amount(0);
         assert_eq!(zero_rate.signum(), 0);
         // Encoded quality exponent 0 decodes to STAmount exponent -100,
         // below the representable IOU range and therefore canonicalizes to zero.
-        let rate = quality_to_rate_amount(1_000_000_000_000_000, &amount, &amount);
+        let rate = quality_to_rate_amount(1_000_000_000_000_000);
         assert_eq!(rate.signum(), 0);
+    }
+
+    #[test]
+    fn canonical_3e8efc65_tick_size_rate_remains_non_native() {
+        // Canonical OfferCreate 3E8EFC…730D0B in ledger 106132761:
+        // BRRL 255395 -> RLUSD 50000, with the BRRL issuer TickSize=5.
+        let brrl = protocol::Issue::new(
+            protocol::currency_from_string("BRRL"),
+            protocol::AccountID::from_array([0xB7; 20]),
+        );
+        let rlusd = protocol::Issue::new(
+            protocol::currency_from_string("RLUSD"),
+            protocol::AccountID::from_array([0xE5; 20]),
+        );
+        let taker_gets = STAmount::from_iou_amount(
+            sf("sfTakerGets"),
+            protocol::IOUAmount::from_parts(255_395, 0).expect("canonical BRRL"),
+            brrl,
+        );
+        let taker_pays = STAmount::from_iou_amount(
+            sf("sfTakerPays"),
+            protocol::IOUAmount::from_parts(50_000, 0).expect("canonical RLUSD"),
+            rlusd,
+        );
+
+        let quality = round_quality(get_rate(&taker_gets, &taker_pays), 5);
+        let rate = quality_to_rate_amount(quality);
+        assert!(
+            !rate.native(),
+            "Quality::rate must use the no-issue arithmetic sentinel"
+        );
+        let rounded_gets = taker_pays
+            .try_divide(&rate, taker_gets.asset())
+            .expect("non-native tick-rounded rate must be representable");
+
+        assert_eq!(rounded_gets.text(), "255388.7016038411");
+        assert_eq!(quality, 0x5406_f49b_d58a_9000);
     }
 
     #[test]

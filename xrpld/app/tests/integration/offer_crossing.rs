@@ -17,8 +17,8 @@ use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
 use ledger::{ApplyView, ReadView};
 use protocol::{
-    AccountID, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry, STTx, Ter,
-    TxType, XRPAmount, account_keylet, get_field_by_symbol, sf_generic,
+    AccountID, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry, STTx, StBase,
+    Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol, sf_generic,
 };
 
 use super::fixtures::*;
@@ -623,6 +623,74 @@ fn offer_tick_size_rounding() {
     let tx = offer_tx(alice, xrp(1_234_567_890), iou(gw, usd, 999), 1);
     let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
     assert_eq!(result, Ter::TES_SUCCESS);
+}
+
+#[test]
+fn canonical_3e8efc65_tick_size_offer_places_rounded_residual() {
+    // Canonical evidence is retained in
+    // ledger/tests/fixtures/offer_create_106132761_3e8efc65. rippled
+    // OfferCreate.cpp:679-703 rounds the BRRL side at issuer TickSize=5,
+    // then uses the resulting noIssue rate to calculate TakerGets.
+    let creator = acct(0x11);
+    let brrl_issuer = acct(0x22);
+    let rlusd_issuer = acct(0x33);
+    let brrl = protocol::currency_from_string("BRRL");
+    let rlusd = protocol::currency_from_string("RLUSD");
+    let sequence = 99_420_541;
+
+    let mut creator_root = account_root(creator, 66_092_365_866, 2, 0);
+    creator_root.set_field_u32(sf("sfSequence"), sequence);
+    let mut brrl_root = account_root(brrl_issuer, 487_796_030, 0, 0);
+    brrl_root.set_field_u8(sf("sfTickSize"), 5);
+    let ledger = build_ledger(vec![
+        creator_root,
+        brrl_root,
+        account_root(rlusd_issuer, 99_881_635, 0, 0),
+        trust_line(creator, brrl_issuer, brrl, 638_391, 1_000_000, 0),
+        trust_line(creator, rlusd_issuer, rlusd, 50_048, 1_000_000, 0),
+    ]);
+    let mut view = new_view(ledger);
+    let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), creator);
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            STAmount::from_iou_amount(
+                sf("sfTakerGets"),
+                IOUAmount::from_parts(255_395, 0).expect("canonical BRRL"),
+                Issue::new(brrl, brrl_issuer),
+            ),
+        );
+        tx.set_field_amount(
+            sf("sfTakerPays"),
+            STAmount::from_iou_amount(
+                sf("sfTakerPays"),
+                IOUAmount::from_parts(50_000, 0).expect("canonical RLUSD"),
+                Issue::new(rlusd, rlusd_issuer),
+            ),
+        );
+        tx.set_field_amount(sf("sfFee"), xrp(12));
+        tx.set_field_u32(sf("sfSequence"), sequence);
+        tx.set_field_u32(sf("sfLastLedgerSequence"), 106_132_779);
+    });
+
+    assert_eq!(
+        apply_submit_transactor_shell(&mut view, &tx, TxType::OFFER_CREATE),
+        Ter::TES_SUCCESS
+    );
+
+    let offer = view
+        .read(protocol::offer_keylet(acct_id(creator), sequence))
+        .expect("read created offer")
+        .expect("canonical offer must be placed");
+    assert_eq!(
+        offer.get_field_amount(sf("sfTakerGets")).text(),
+        "255388.7016038411"
+    );
+    assert_eq!(offer.get_field_amount(sf("sfTakerPays")).text(), "50000");
+    assert_eq!(
+        offer.get_field_h256(sf("sfBookDirectory")).data()[24..],
+        [0x54, 0x06, 0xF4, 0x9B, 0xD5, 0x8A, 0x90, 0x00]
+    );
 }
 
 #[test]

@@ -1,0 +1,56 @@
+{
+  "baseline": "095bceb164316537951b2e0b3f6bef237ec201ca",
+  "source": "https://s1.ripple.com:51234/",
+  "retrieved_at": "2026-08-07T14:19:42+01:00",
+  "upstream_authority": {
+    "path": "/Users/tusharpardhe/Documents/xrpl/rippled/src/libxrpl/tx/transactors/dex/OfferCreate.cpp",
+    "behavior": "applyGuts lines 679-703 obtains Quality::round(tickSize).rate() and passes that no-issue arithmetic rate to divide for a buy offer."
+  },
+  "transaction": {
+    "hash": "3E8EFC654307CE6940C803A1CD22858258A749EDFCA36C95D73FA72BDC730D0B",
+    "ledger_index": 106132761,
+    "transaction_index": 73,
+    "type": "OfferCreate",
+    "canonical_result": "tesSUCCESS",
+    "captured_quaxar": {
+      "preflight": "tesSUCCESS",
+      "preclaim": "tesSUCCESS",
+      "apply": "tefEXCEPTION"
+    },
+    "classification": "actionable OfferCreate tick-size rate-sentinel defect"
+  },
+  "parent_ledger": {
+    "ledger_index": 106132760,
+    "ledger_hash": "0BEA976710B37E88B1B6F9340808EE6437ADD3CADF3EA3071EB5FF154113B275"
+  },
+  "canonical_placement": {
+    "creator": "rw7nJtEN2YuLt57AfAKdfyFMMLHhTMJKdu",
+    "offer_index": "3441193612157BB5AAB7675DBE11B61EB73E0014ED7BD34F562565644E135C02",
+    "book_directory": "EB6E2F22D46F3DA7D3F429EE845BF345AD624C51390AC0435406F49BD58A9000",
+    "exchange_rate": "5406f49bd58a9000",
+    "taker_gets_before_tick_rounding": "255395 BRRL",
+    "taker_gets_after_tick_rounding": "255388.7016038411 BRRL",
+    "taker_pays": "50000 RLUSD",
+    "brrl_issuer_tick_size": 5
+  },
+  "post_baseline_transaction_error_signal_classification": {
+    "observed_deployment_candidates": [
+      {
+        "hash": "3E8EFC654307CE6940C803A1CD22858258A749EDFCA36C95D73FA72BDC730D0B",
+        "signal": "preflight=tesSUCCESS preclaim=tesSUCCESS apply=tefEXCEPTION",
+        "classification": "real canonical-success divergence; repaired by using no_issue() for the tick-rounded Quality::rate()"
+      }
+    ],
+    "other_workspace_matches": [
+      {
+        "signal": "tefEXCEPTION containment strings and unit tests",
+        "classification": "intentional exception-mapping coverage, not an observed deployment transaction error"
+      },
+      {
+        "signal": "existing offer_create_106131671 canonical tecKILLED and tecUNFUNDED_OFFER metadata",
+        "classification": "canonical terminal claim outcomes, not Quaxar error divergences; its manifest records zero tefEXCEPTION OfferCreates"
+      }
+    ],
+    "conclusion": "No additional post-095bceb observed transaction-error record exists in the checked workspace logs, fixtures, diagnostics, or local Git refs."
+  }
+}
