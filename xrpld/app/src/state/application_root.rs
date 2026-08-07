@@ -8527,20 +8527,44 @@ impl ApplicationRoot {
                 continue;
             }
 
+            let mut attempt_view =
+                ledger::FlowSandbox::new_with_flags(&mut state_view, ApplyFlags::NONE);
             let SubmitApplyOutcome {
                 result,
                 delivered_amount,
                 applied_batch_inner_transactions,
             } = apply_submit_transactor_shell_with_flags_and_batch_outcome(
-                &mut state_view,
+                &mut attempt_view,
                 st_tx,
                 txn_type,
                 ApplyFlags::NONE,
             );
             let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
             if applied {
-                let mut meta = protocol::TxMeta::new(st_tx.get_transaction_id(), closed_seq);
-                meta.set_delivered_amount(delivered_amount);
+                // Keep replay's metadata boundary identical to consensus:
+                // build from this transaction's FlowSandbox before its delta
+                // is consumed into the ledger accumulator.
+                let mut meta = attempt_view
+                    .to_tx_meta(
+                        st_tx.get_transaction_id(),
+                        closed_seq,
+                        delivered_amount,
+                        &rules,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "standalone accepted transaction {} metadata failed: {error:?}",
+                            st_tx.get_transaction_id()
+                        )
+                    })?;
+                attempt_view
+                    .apply_with_tx_thread(st_tx.get_transaction_id(), closed_seq, &rules)
+                    .map_err(|error| {
+                        format!(
+                            "standalone accepted transaction {} state commit failed: {error:?}",
+                            st_tx.get_transaction_id()
+                        )
+                    })?;
                 let delta_meta_nodes = meta.get_nodes().json(protocol::JsonOptions::NONE);
                 let mut serializer = protocol::Serializer::default();
                 meta.add_raw(&mut serializer, result, accepted_entries.len() as u32);
@@ -8967,7 +8991,7 @@ impl ApplicationRoot {
                 });
                 let preclaim_admitted =
                     preclaim.is_some_and(|ter| is_tes_success(ter) || is_tec_claim(ter));
-                let (result, delivered_amount, applied_batch_inner_transactions) =
+                let (result, applied_batch_inner_transactions, transaction_meta) =
                     if preclaim_admitted {
                         let mut attempt_view =
                             ledger::FlowSandbox::new_with_flags(&mut *view, retry_flags);
@@ -8981,18 +9005,40 @@ impl ApplicationRoot {
                             txn_type,
                             retry_flags,
                         );
-                        if protocol::is_tes_success(result) || protocol::is_tec_claim(result) {
+                        let transaction_meta = if protocol::is_tes_success(result)
+                            || protocol::is_tec_claim(result)
+                        {
+                            // rippled's ApplyStateTable::apply builds TxMeta from
+                            // this transaction's state-table delta before it
+                            // serializes rawTxInsert and commits the delta. Do
+                            // not rebuild an empty TxMeta after this consuming
+                            // FlowSandbox commit.
+                            let meta = attempt_view
+                                .to_tx_meta(
+                                    transaction_id,
+                                    closed_seq,
+                                    delivered_amount,
+                                    &rules,
+                                )
+                                .map_err(|error| {
+                                    crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
+                                        "failed to build accepted transaction metadata {transaction_id}: {error:?}"
+                                    ))
+                                })?;
                             attempt_view
-                            .apply_with_tx_thread(transaction_id, closed_seq, &rules)
-                            .map_err(|error| {
-                                crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
-                                    "failed to thread accepted transaction {transaction_id}: {error:?}"
-                                ))
-                            })?;
-                        }
-                        (result, delivered_amount, applied_batch_inner_transactions)
+                                .apply_with_tx_thread(transaction_id, closed_seq, &rules)
+                                .map_err(|error| {
+                                    crate::bootstrap::build_ledger::BuildLedgerError::View(format!(
+                                        "failed to thread accepted transaction {transaction_id}: {error:?}"
+                                    ))
+                                })?;
+                            Some(meta)
+                        } else {
+                            None
+                        };
+                        (result, applied_batch_inner_transactions, transaction_meta)
                     } else {
-                        (preclaim.unwrap_or(preflight), None, Vec::new())
+                        (preclaim.unwrap_or(preflight), Vec::new(), None)
                     };
                 let apply_ter = preclaim_admitted.then_some(result);
                 let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
@@ -9048,8 +9094,9 @@ impl ApplicationRoot {
                     CandidateDiagnosticDecision::Accepted,
                     Some(index as u32),
                 ));
-                let mut meta = protocol::TxMeta::new(transaction_id, closed_seq);
-                meta.set_delivered_amount(delivered_amount);
+                let mut meta = transaction_meta.expect(
+                    "accepted consensus transaction must retain its pre-commit state delta",
+                );
                 let delta_meta_nodes = meta.get_nodes().json(protocol::JsonOptions::NONE);
                 let mut serializer = protocol::Serializer::default();
                 meta.add_raw(&mut serializer, result, index as u32);

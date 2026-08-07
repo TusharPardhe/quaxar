@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use basics::base_uint::Uint256;
-use protocol::{ApplyFlags, Keylet, Rules, STLedgerEntry, XRPAmount};
+use protocol::{
+    ApplyFlags, Keylet, Rules, SField, STLedgerEntry, STObject, SerializedTypeId, StBase, XRPAmount,
+};
 
 use crate::raw_view::RawView;
 use crate::read_view::{ReadView, ReadViewTx, ViewError};
@@ -63,6 +65,138 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
 
     pub fn items(&self) -> &BTreeMap<Uint256, Entry> {
         &self.items
+    }
+
+    /// Build the transaction metadata from this transaction's uncommitted
+    /// delta. This is deliberately callable before `apply_with_tx_thread`
+    /// consumes the sandbox: rippled's
+    /// `ApplyStateTable::apply(OpenView&, STTx const&, ...)` constructs
+    /// `TxMeta`, serializes the TransactionMd leaf, and only then applies the
+    /// state table to the accumulator.
+    pub fn to_tx_meta(
+        &self,
+        transaction_id: Uint256,
+        ledger_seq: u32,
+        delivered_amount: Option<protocol::STAmount>,
+        rules: &Rules,
+    ) -> Result<protocol::TxMeta, ViewError> {
+        let mut meta = protocol::TxMeta::new(transaction_id, ledger_seq);
+        meta.set_delivered_amount(delivered_amount);
+
+        for (key, entry) in &self.items {
+            match entry.action {
+                Action::Insert => {
+                    // rippled threads created entries before it selects their
+                    // `sfNewFields`, so the leaf and committed state agree.
+                    let current = crate::apply_state_table::thread_sle(
+                        entry.sle.as_ref(),
+                        transaction_id,
+                        ledger_seq,
+                        rules,
+                    );
+                    let node = meta.get_affected_node_for_sle(
+                        &current,
+                        protocol::get_field_by_symbol("sfCreatedNode"),
+                    );
+                    add_threading_previous_fields(node, entry.sle.as_ref(), transaction_id, rules);
+                    let fields = metadata_fields(&current, |field| {
+                        !field.is_default()
+                            && field
+                                .fname()
+                                .should_meta(SField::S_MD_CREATE | SField::S_MD_ALWAYS)
+                    });
+                    if has_present_fields(&fields) {
+                        node.set_field_object(protocol::get_field_by_symbol("sfNewFields"), fields);
+                    }
+                }
+                Action::Modify => {
+                    let original = self
+                        .parent
+                        .read(Keylet::new(entry.sle.get_type(), *key))?
+                        .ok_or_else(|| {
+                            ViewError::Conversion(
+                                "FlowSandbox::to_tx_meta: modified parent entry disappeared"
+                                    .to_owned(),
+                            )
+                        })?;
+                    // Source parity: ApplyStateTable skips an unchanged
+                    // modification before `threadItem` mutates it.
+                    if entry.sle.as_ref() == original.as_ref() {
+                        continue;
+                    }
+                    let current = crate::apply_state_table::thread_sle(
+                        entry.sle.as_ref(),
+                        transaction_id,
+                        ledger_seq,
+                        rules,
+                    );
+                    let node = meta.get_affected_node_for_sle(
+                        &current,
+                        protocol::get_field_by_symbol("sfModifiedNode"),
+                    );
+                    add_threading_previous_fields(node, entry.sle.as_ref(), transaction_id, rules);
+                    let previous = metadata_fields(original.as_ref(), |field| {
+                        field.fname().should_meta(SField::S_MD_CHANGE_ORIG)
+                            && !field_matches(&current, field)
+                    });
+                    if has_present_fields(&previous) {
+                        node.set_field_object(
+                            protocol::get_field_by_symbol("sfPreviousFields"),
+                            previous,
+                        );
+                    }
+                    let final_fields = metadata_fields(&current, |field| {
+                        field
+                            .fname()
+                            .should_meta(SField::S_MD_ALWAYS | SField::S_MD_CHANGE_NEW)
+                    });
+                    if has_present_fields(&final_fields) {
+                        node.set_field_object(
+                            protocol::get_field_by_symbol("sfFinalFields"),
+                            final_fields,
+                        );
+                    }
+                }
+                Action::Erase => {
+                    let original = self
+                        .parent
+                        .read(Keylet::new(entry.sle.get_type(), *key))?
+                        .ok_or_else(|| {
+                            ViewError::Conversion(
+                                "FlowSandbox::to_tx_meta: erased parent entry disappeared"
+                                    .to_owned(),
+                            )
+                        })?;
+                    let node = meta.get_affected_node_for_sle(
+                        entry.sle.as_ref(),
+                        protocol::get_field_by_symbol("sfDeletedNode"),
+                    );
+                    let previous = metadata_fields(original.as_ref(), |field| {
+                        field.fname().should_meta(SField::S_MD_CHANGE_ORIG)
+                            && !field_matches(entry.sle.as_ref(), field)
+                    });
+                    if has_present_fields(&previous) {
+                        node.set_field_object(
+                            protocol::get_field_by_symbol("sfPreviousFields"),
+                            previous,
+                        );
+                    }
+                    let final_fields = metadata_fields(entry.sle.as_ref(), |field| {
+                        field
+                            .fname()
+                            .should_meta(SField::S_MD_ALWAYS | SField::S_MD_DELETE_FINAL)
+                    });
+                    if has_present_fields(&final_fields) {
+                        node.set_field_object(
+                            protocol::get_field_by_symbol("sfFinalFields"),
+                            final_fields,
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(meta)
     }
 
     pub fn peek_parent(&self, k: Keylet) -> Result<Option<Arc<STLedgerEntry>>, ViewError> {
@@ -200,6 +334,70 @@ impl<'a, V: ApplyView + ?Sized> FlowSandbox<'a, V> {
         }
         Ok(())
     }
+}
+
+/// Copy the source's `for (auto const& obj : *sle)` metadata selection into a
+/// serializable inner object. Starting from the typed SLE preserves exact field
+/// encodings while absenting every field the SField metadata mask excludes.
+fn metadata_fields(sle: &STLedgerEntry, mut include: impl FnMut(&dyn StBase) -> bool) -> STObject {
+    let mut fields = sle.clone_as_object();
+    let absent = fields
+        .iter()
+        .filter(|field| field.stype() == SerializedTypeId::NotPresent || !include(*field))
+        .map(|field| field.fname())
+        .collect::<Vec<_>>();
+    for field in absent {
+        fields.make_field_absent(field);
+    }
+    // `sfLedgerEntryType` identifies the outer affected-node object and is
+    // never present inside NewFields, FinalFields, or PreviousFields.
+    fields.make_field_absent(protocol::get_field_by_symbol("sfLedgerEntryType"));
+    fields
+}
+
+fn has_present_fields(fields: &STObject) -> bool {
+    fields
+        .iter()
+        .any(|field| field.stype() != SerializedTypeId::NotPresent)
+}
+
+/// Preserve the outer fields that rippled's `ApplyStateTable::threadItem`
+/// writes on an affected node before generating its PreviousFields object.
+/// This only describes the already-planned threaded state; it never mutates
+/// the FlowSandbox or its parent.
+fn add_threading_previous_fields(
+    node: &mut STObject,
+    unthreaded: &STLedgerEntry,
+    transaction_id: Uint256,
+    rules: &Rules,
+) {
+    if !unthreaded.is_threaded_type(rules) {
+        return;
+    }
+
+    let previous_transaction =
+        unthreaded.get_field_h256(protocol::get_field_by_symbol("sfPreviousTxnID"));
+    if previous_transaction.is_zero() || previous_transaction == transaction_id {
+        return;
+    }
+
+    node.set_field_h256(
+        protocol::get_field_by_symbol("sfPreviousTxnID"),
+        previous_transaction,
+    );
+    node.set_field_u32(
+        protocol::get_field_by_symbol("sfPreviousTxnLgrSeq"),
+        unthreaded.get_field_u32(protocol::get_field_by_symbol("sfPreviousTxnLgrSeq")),
+    );
+}
+
+/// Equivalent to rippled `curNode->hasMatchingEntry(obj)`.
+fn field_matches(current: &STLedgerEntry, original_field: &dyn StBase) -> bool {
+    current
+        .peek_at_pfield(original_field.fname())
+        .is_some_and(|field| {
+            field.stype() != SerializedTypeId::NotPresent && field.is_equivalent(original_field)
+        })
 }
 
 impl<'a, V: ApplyView + ?Sized> std::fmt::Debug for FlowSandbox<'a, V> {
@@ -386,7 +584,7 @@ mod tests {
     use super::*;
     use crate::{Ledger, Sandbox};
     use basics::base_uint::Uint256;
-    use protocol::{ApplyFlags, LedgerEntryType};
+    use protocol::{ApplyFlags, LedgerEntryType, StBase};
     use std::sync::Arc;
 
     #[test]
@@ -455,6 +653,84 @@ mod tests {
                 .expect("read parent after failed commit"),
             "a failed FlowSandbox commit must not expose an earlier insert"
         );
+    }
+
+    #[test]
+    fn delta_metadata_retains_insert_modify_and_erase_before_commit() {
+        // rippled ApplyStateTable::apply builds TxMeta from the isolated
+        // transaction delta before it commits the accumulated state table.
+        let modify_keylet = Keylet::new(LedgerEntryType::AccountRoot, Uint256::from_u64(11));
+        let erase_keylet = Keylet::new(LedgerEntryType::Offer, Uint256::from_u64(12));
+        let insert_keylet = Keylet::new(LedgerEntryType::AccountRoot, Uint256::from_u64(13));
+
+        let mut base = Ledger::new(LedgerHeader::default(), false);
+        let mut modified = STLedgerEntry::new(modify_keylet);
+        let previous_transaction = Uint256::from_u64(0xBEEF);
+        modified.set_field_u32(protocol::get_field_by_symbol("sfSequence"), 1);
+        modified.set_field_h256(
+            protocol::get_field_by_symbol("sfPreviousTxnID"),
+            previous_transaction,
+        );
+        modified.set_field_u32(protocol::get_field_by_symbol("sfPreviousTxnLgrSeq"), 41);
+        base.raw_insert(Arc::new(modified.clone()))
+            .expect("seed modified entry");
+        base.raw_insert(Arc::new(STLedgerEntry::new(erase_keylet)))
+            .expect("seed erased entry");
+        let mut parent = Sandbox::new(Arc::new(base), ApplyFlags::default());
+        let rules = parent.rules();
+
+        let metadata = {
+            let mut delta = FlowSandbox::new(&mut parent);
+            let mut replacement = modified.clone_as_object();
+            replacement.set_field_u32(protocol::get_field_by_symbol("sfSequence"), 2);
+            delta
+                .raw_replace(Arc::new(STLedgerEntry::from_stobject(
+                    replacement,
+                    modify_keylet.key,
+                )))
+                .expect("stage modified entry");
+            delta
+                .raw_erase(Arc::new(STLedgerEntry::new(erase_keylet)))
+                .expect("stage erased entry");
+            delta
+                .raw_insert(Arc::new(STLedgerEntry::new(insert_keylet)))
+                .expect("stage inserted entry");
+
+            delta
+                .to_tx_meta(Uint256::from_u64(0xA11CE), 42, None, &rules)
+                .expect("delta metadata should build before commit")
+        };
+
+        let nodes = metadata.get_nodes();
+        assert_eq!(nodes.len(), 3, "every state-delta action needs metadata");
+        let modified_node = nodes
+            .iter()
+            .find(|node| {
+                node.fname() == protocol::get_field_by_symbol("sfModifiedNode")
+                    && node.get_field_h256(protocol::get_field_by_symbol("sfLedgerIndex"))
+                        == modify_keylet.key
+            })
+            .expect("modified delta needs a ModifiedNode");
+        assert_eq!(
+            modified_node.get_field_h256(protocol::get_field_by_symbol("sfPreviousTxnID")),
+            previous_transaction,
+            "threadItem records the prior transaction on the affected node"
+        );
+        assert_eq!(
+            modified_node.get_field_u32(protocol::get_field_by_symbol("sfPreviousTxnLgrSeq")),
+            41,
+            "threadItem records the prior ledger sequence on the affected node"
+        );
+        assert!(nodes.iter().any(|node| {
+            node.fname() == protocol::get_field_by_symbol("sfDeletedNode")
+                && node.get_field_h256(protocol::get_field_by_symbol("sfLedgerIndex"))
+                    == erase_keylet.key
+        }));
+        assert!(nodes.iter().any(|node| {
+            node.fname() == protocol::get_field_by_symbol("sfCreatedNode")
+                && node.get_field_h256(protocol::get_field_by_symbol("sfLedgerIndex"))
+                    == insert_keylet.key
+        }));
     }
 
     #[test]

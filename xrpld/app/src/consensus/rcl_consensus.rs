@@ -621,6 +621,22 @@ fn should_acquire_consensus_ledger(
     true
 }
 
+/// Match `RCLConsensus::Adaptor::acquireLedger`: once generic WrongLedger
+/// recovery resolves its target, age inbound transaction-set work to that
+/// target's sequence before the consensus engine replays cached proposals.
+///
+/// The ordinary strand-owned starts already call `new_round`; this is the
+/// missing generic `handleWrongLedger -> acquire_ledger -> start_round_internal`
+/// path, which bypasses those strand call sites.
+fn reset_inbound_transactions_for_resolved_consensus_ledger(
+    inbound_transactions: &AppInboundTransactions,
+    ledger_seq: u32,
+) {
+    if let Ok(mut inbound) = inbound_transactions.lock() {
+        inbound.new_round(ledger_seq);
+    }
+}
+
 /// Thin adapter bridging `Validations<RclValidationsAdaptor>` (our inner type)
 /// to the `NegativeUNLVoteValidations` trait expected by
 /// `NegativeUNLVote::do_voting`. Acquires no additional locks — the caller
@@ -654,10 +670,19 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
     fn acquire_ledger(&self, ledger_id: &Uint256) -> Option<Self::Ledger> {
         let hash = basics::sha_map_hash::SHAMapHash::new(*ledger_id);
         if let Some(ledger) = self.app_root.resolve_ledger_by_hash(hash) {
-            // Match rippled RCLConsensus::Adaptor::acquireLedger: a resolved
-            // ledger is immediately usable by generic WrongLedger recovery.
-            // `need_network_ledger` is a startup/publication status flag, not
-            // an eligibility gate for an already acquired consensus LCL.
+            // rippled RCLConsensus::Adaptor::acquireLedger calls
+            // inboundTransactions_.newRound(built->header().seq) before
+            // returning a cached target to generic WrongLedger recovery.
+            // Unlike normal strand starts, `handleWrongLedger` enters
+            // start_round_internal directly, so this reset must live here.
+            reset_inbound_transactions_for_resolved_consensus_ledger(
+                &self.inbound_transactions,
+                ledger.header().seq,
+            );
+            // A resolved ledger is immediately usable by generic WrongLedger
+            // recovery. `need_network_ledger` is a startup/publication status
+            // flag, not an eligibility gate for an already acquired consensus
+            // LCL.
             return Some(RclCxLedger::new(ledger));
         }
 
@@ -1637,8 +1662,9 @@ mod tests {
         AppConsensus, AppRclConsensusAdaptor, AppRclConsensusOptions, AppRclConsensusRelay,
         ConsensusRunner, NullRclConsensusJournal, PendingAcceptWork,
         decode_consensus_accept_transactions, disputed_relay_envelope,
-        pseudo_transaction_voting_enabled, trusted_validation_quorum_reached,
-        update_operating_mode_after_accept,
+        pseudo_transaction_voting_enabled,
+        reset_inbound_transactions_for_resolved_consensus_ledger,
+        trusted_validation_quorum_reached, update_operating_mode_after_accept,
     };
     use crate::network::network_ops::{
         AppNetworkOpsModeOwner, NetworkOpsOperatingMode, SharedNetworkOpsState,
@@ -1793,6 +1819,28 @@ mod tests {
         assert!(AppRclConsensusAdaptor::round_validation_eligible(
             true, 100, 100, false, true, 1, None, 1_000,
         ));
+    }
+
+    #[test]
+    fn resolved_consensus_ledger_prunes_stale_inbound_transaction_round() {
+        let root = ApplicationRoot::new(0).expect("root should build");
+        let inbound = root.inbound_transactions().clone();
+        let stale_set = Uint256::from_u64(0xA11CE);
+
+        {
+            let mut guard = inbound.lock().expect("inbound transactions mutex");
+            assert!(guard.get_set(stale_set, true).is_none());
+            assert!(guard.acquire(stale_set).is_some());
+        }
+
+        // Sequence 10 retains only sets from [7, 13]. The stale acquisition
+        // was created in the initial round (0), so rippled's acquireLedger
+        // newRound handoff must retire it before proposal playback.
+        reset_inbound_transactions_for_resolved_consensus_ledger(&inbound, 10);
+
+        let mut guard = inbound.lock().expect("inbound transactions mutex");
+        assert!(guard.acquire(stale_set).is_none());
+        assert!(guard.get_set(Uint256::zero(), false).is_some());
     }
 
     #[test]

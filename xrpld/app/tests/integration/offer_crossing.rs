@@ -15,10 +15,10 @@ use std::sync::Arc;
 use app::state::application_root::apply_submit_transactor_shell;
 use app::state::transactor_dispatcher::handle_real_dispatch;
 use basics::base_uint::{Uint160, Uint256};
-use ledger::{ApplyView, ReadView};
+use ledger::{ApplyView, ReadView, Sandbox};
 use protocol::{
-    AccountID, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry, STTx, StBase,
-    Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol, sf_generic,
+    AccountID, ApplyFlags, Currency, IOUAmount, Issue, LedgerEntryType, STAmount, STLedgerEntry,
+    STTx, StBase, Ter, TxType, XRPAmount, account_keylet, get_field_by_symbol, sf_generic,
 };
 
 use super::fixtures::*;
@@ -235,6 +235,196 @@ fn offer_replacement() {
     assert_eq!(r2, Ter::TES_SUCCESS);
     // Old offer removed, new one placed — still 2 (trust + offer)
     assert_eq!(get_owner_count(&view, alice), 2);
+}
+
+/// Regression for mainnet ledger 106134615 transaction
+/// 010A5050D712F5816FC6E7A3E1CE6AE0098DEE19DFC5D1CB76077309A02B5191.
+///
+/// The live transaction is an OfferSequence replacement. Replay applies each
+/// transaction from a fresh outer Sandbox, so the replacement must resolve its
+/// target from the previous state tree, remove its old owner/book membership,
+/// and transaction-thread the surviving mutable SLEs. This fixture deliberately
+/// commits the original offer before creating the replacement.
+///
+/// This is intentionally a **state-root** regression, not a byte-for-byte
+/// `TransactionMeta`/`AffectedNodes` golden test. The canonical mainnet
+/// metadata establishes that the reported empty affected-node list is a
+/// distinct transaction-root failure; its serialization is verified at the
+/// transaction-delta boundary. Here, the assertions prove the OfferCreate
+/// state transitions that must exist before metadata can describe them.
+#[test]
+fn offer_sequence_replacement_replays_parent_state_mutations() {
+    let alice = acct(0x11);
+    let gw = acct(0x33);
+    let usd = usd_currency();
+    // Contemporary mainnet has fixPreviousTxnID enabled. It is required for
+    // DirectoryNode transaction threading, which contributes to the state root.
+    let mut built = build_ledger_with_features(
+        vec![
+            account_root(alice, 10_000_000_000, 1, 0),
+            account_root(gw, 10_000_000_000, 0, 0),
+            trust_line(alice, gw, usd, 1_000, 10_000, 0),
+        ],
+        vec!["fixPreviousTxnID"],
+    );
+    // The fixture ledger constructor intentionally leaves total XRP at zero.
+    // A consensus-style commit destroys each transaction fee, so provide a
+    // realistic positive supply before replaying the two fee-bearing offers.
+    built.set_total_drops(100_000_000_000);
+    let ledger_seq = built.header().seq;
+    let rules = built.rules().clone();
+
+    let original = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1_000), 1);
+    {
+        let mut tx_view = Sandbox::new(Arc::new(built.clone()), ApplyFlags::NONE);
+        assert_eq!(
+            apply_submit_transactor_shell(&mut tx_view, &original, TxType::OFFER_CREATE),
+            Ter::TES_SUCCESS
+        );
+        tx_view
+            .apply_with_tx_thread(
+                &mut built,
+                original.get_transaction_id(),
+                ledger_seq,
+                &rules,
+            )
+            .expect("commit original offer into parent state");
+    }
+
+    let original_key = protocol::offer_keylet(acct_id(alice), 1);
+    let original_offer = built
+        .read(original_key)
+        .expect("read committed original offer")
+        .expect("original offer must exist in parent state");
+    let old_book_directory = original_offer.get_field_h256(sf("sfBookDirectory"));
+    assert_eq!(
+        original_offer.get_field_h256(sf("sfPreviousTxnID")),
+        original.get_transaction_id(),
+        "the cancelled parent offer must already carry its creating transaction thread"
+    );
+    assert_eq!(
+        original_offer.get_field_u32(sf("sfPreviousTxnLgrSeq")),
+        ledger_seq
+    );
+
+    // Keep the same supplied IOU amount so OfferCreate preclaim remains
+    // funded, but alter the price to exercise both old-book deletion and
+    // successor-book creation.
+    let replacement = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(2_000_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou(gw, usd, 1_000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 2);
+        tx.set_field_u32(sf("sfOfferSequence"), 1);
+    });
+    {
+        // This is the production sibling-ledger replay shape: a fresh outer
+        // sandbox reads the already-committed offer from its parent ledger.
+        let mut tx_view = Sandbox::new(Arc::new(built.clone()), ApplyFlags::NONE);
+        assert_eq!(
+            apply_submit_transactor_shell(&mut tx_view, &replacement, TxType::OFFER_CREATE),
+            Ter::TES_SUCCESS
+        );
+        tx_view
+            .apply_with_tx_thread(
+                &mut built,
+                replacement.get_transaction_id(),
+                ledger_seq,
+                &rules,
+            )
+            .expect("commit OfferSequence replacement into parent state");
+    }
+
+    let replacement_key = protocol::offer_keylet(acct_id(alice), 2);
+    assert!(
+        built
+            .read(original_key)
+            .expect("read cancelled offer")
+            .is_none(),
+        "OfferSequence must erase the parent-state target"
+    );
+    let replacement_offer = built
+        .read(replacement_key)
+        .expect("read replacement offer")
+        .expect("replacement offer must be inserted");
+    assert_eq!(
+        replacement_offer.get_field_h256(sf("sfPreviousTxnID")),
+        replacement.get_transaction_id(),
+        "new offer must be transaction-threaded during replay"
+    );
+    assert_eq!(
+        replacement_offer.get_field_u32(sf("sfPreviousTxnLgrSeq")),
+        ledger_seq
+    );
+
+    assert!(
+        built
+            .read(protocol::Keylet::new(
+                LedgerEntryType::DirectoryNode,
+                old_book_directory,
+            ))
+            .expect("read old book directory")
+            .is_none(),
+        "removing the final old offer must remove its empty book directory"
+    );
+    let replacement_book_directory = replacement_offer.get_field_h256(sf("sfBookDirectory"));
+    let replacement_book = built
+        .read(protocol::Keylet::new(
+            LedgerEntryType::DirectoryNode,
+            replacement_book_directory,
+        ))
+        .expect("read replacement book directory")
+        .expect("replacement book directory must exist");
+    assert_eq!(
+        replacement_book.get_field_v256(sf("sfIndexes")).value(),
+        &[replacement_key.key],
+        "replacement book directory must contain only the successor"
+    );
+    assert_eq!(
+        replacement_book.get_field_h256(sf("sfPreviousTxnID")),
+        replacement.get_transaction_id(),
+        "the successor book directory must be threaded into committed state"
+    );
+    assert_eq!(
+        replacement_book.get_field_u32(sf("sfPreviousTxnLgrSeq")),
+        ledger_seq
+    );
+
+    let owner_directory = built
+        .read(protocol::owner_dir_keylet(acct_id(alice)))
+        .expect("read owner directory")
+        .expect("owner directory must exist");
+    assert_eq!(
+        owner_directory.get_field_v256(sf("sfIndexes")).value(),
+        &[replacement_key.key],
+        "owner directory must replace, not retain, the cancelled offer"
+    );
+    assert_eq!(
+        owner_directory.get_field_h256(sf("sfPreviousTxnID")),
+        replacement.get_transaction_id(),
+        "the surviving owner directory must be threaded into committed state"
+    );
+    assert_eq!(
+        owner_directory.get_field_u32(sf("sfPreviousTxnLgrSeq")),
+        ledger_seq
+    );
+    let account = built
+        .read(account_keylet(acct_id(alice)))
+        .expect("read offer owner")
+        .expect("offer owner must exist");
+    assert_eq!(account.get_field_u32(sf("sfSequence")), 3);
+    assert_eq!(account.get_field_u32(sf("sfOwnerCount")), 2);
+    assert_eq!(
+        account.get_field_amount(sf("sfBalance")).xrp().drops(),
+        9_999_999_980,
+        "the replay must retain both fee claims while owner count remains net unchanged"
+    );
+    assert_eq!(
+        account.get_field_h256(sf("sfPreviousTxnID")),
+        replacement.get_transaction_id(),
+        "owner mutation must be threaded by the replacement transaction"
+    );
 }
 
 // ─── Full Crossing Tests ──────────────────────────────────────────────────
