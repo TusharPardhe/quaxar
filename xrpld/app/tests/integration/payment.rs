@@ -92,6 +92,66 @@ fn payment_xrp_to_self() {
     assert_eq!(result, Ter::TEM_REDUNDANT); // C++ parity
 }
 
+/// rippled BookStep::revImp clips an offer to the requested output before
+/// consuming it (src/libxrpl/tx/paths/BookStep.cpp:894-919). A valid
+/// cross-currency payment to self is therefore not redundant and must retain
+/// its 3,300-XRP SendMax while clipping a 1,000-IOU offer to 500 IOU.
+#[test]
+fn payment_xrp_to_iou_partial_self_payment_with_3300_xrp_sendmax() {
+    let checkles = acct(0x11);
+    let maker = acct(0x22);
+    let issuer = acct(0x33);
+    let usd = usd_currency();
+    let ledger = build_ledger(vec![
+        account_root(checkles, 10_000_000_000, 1, 0),
+        account_root(maker, 10_000_000_000, 1, 0),
+        account_root(issuer, 10_000_000_000, 0, 0),
+        trust_line(checkles, issuer, usd, 0, 10_000, 10_000),
+        trust_line(maker, issuer, usd, 1_000, 10_000, 10_000),
+    ]);
+    let mut view = new_view(ledger);
+
+    let offer = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), maker);
+        tx.set_field_amount(sf("sfTakerPays"), xrp(3_300_000_000));
+        tx.set_field_amount(sf("sfTakerGets"), iou(issuer, usd, 1_000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+    assert_eq!(
+        handle_real_dispatch(&mut view, &offer, TxType::OFFER_CREATE, None),
+        Ter::TES_SUCCESS
+    );
+
+    let payment = STTx::new(TxType::PAYMENT, |tx| {
+        tx.set_account_id(sf("sfAccount"), checkles);
+        tx.set_account_id(sf("sfDestination"), checkles);
+        tx.set_field_amount(sf("sfAmount"), iou(issuer, usd, 500));
+        tx.set_field_amount(sf("sfSendMax"), xrp(3_300_000_000));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfFlags"), 0x0002_0000); // tfPartialPayment
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        full_apply(&mut view, &payment, TxType::PAYMENT),
+        Ter::TES_SUCCESS
+    );
+
+    let offer = view
+        .read(protocol::offer_keylet(acct_id(maker), 1))
+        .expect("offer read")
+        .expect("partially consumed offer");
+    assert_eq!(
+        offer.get_field_amount(sf("sfTakerPays")),
+        xrp(1_650_000_000)
+    );
+    assert_eq!(
+        offer.get_field_amount(sf("sfTakerGets")),
+        iou(issuer, usd, 500)
+    );
+}
+
 /// C++ Payment — XRP payment to nonexistent creates account.
 #[test]
 fn payment_xrp_creates_account() {

@@ -242,9 +242,14 @@ pub fn execute_book_step_with_options<V: ApplyView>(
 
         offer_attempted = true;
 
-        // Compute consumption amounts with transfer rates (reference forEachOffer parity)
+        // Compute consumption amounts with transfer rates (reference forEachOffer parity).
+        // A reverse BookStep must limit the final offer by the outstanding
+        // requested output before it derives the required input. See
+        // rippled BookStep.cpp `limitStepOut` and `revImp`.
+        let remaining_out = max_out.clone() - total_out.clone();
         let consumption = compute_offer_consumption(
             &remaining_in,
+            &remaining_out,
             &taker_pays,
             &taker_gets,
             &owner_funds,
@@ -847,9 +852,11 @@ struct OfferConsumption {
 ///   stpAmt.in = mulRatio(ofrAmt.in, ofrInRate, QUALITY_ONE, true)
 ///   ownerGives = mulRatio(ofrAmt.out, ofrOutRate, QUALITY_ONE, false)
 ///   If funds < ownerGives: recompute from available funds
+///   If remaining_out < stpAmt.out: recompute from requested output
 ///   If remaining_in < stpAmt.in: recompute from remaining input
 fn compute_offer_consumption(
     remaining_in: &STAmount,
+    remaining_out: &STAmount,
     taker_pays: &STAmount,
     taker_gets: &STAmount,
     owner_funds: &STAmount,
@@ -882,6 +889,23 @@ fn compute_offer_consumption(
                 true,
             );
         }
+        stp_in = mul_ratio_amount(&actual_ofr_in, transfer_rate_in, QUALITY_ONE, true);
+    }
+
+    // reference: BookStep.cpp `limitStepOut` in `revImp`. The reverse pass
+    // receives an unbounded input and must not consume more than the output
+    // requested by the following step. `offer.limitOut(..., true)` delegates
+    // to Quality::ceilOut, which uses mulRound with round-away-from-zero.
+    // Do not use cross_type_scale here: its unchecked native conversion can
+    // construct an out-of-range XRP STAmount before the bounded offer input
+    // has been derived.
+    if *remaining_out < stp_out {
+        let offer_amounts = Amounts::new(actual_ofr_in.clone(), actual_ofr_out.clone());
+        let clipped = Quality::from_amounts(&offer_amounts).ceil_out(&offer_amounts, remaining_out);
+        actual_ofr_in = clipped.r#in;
+        actual_ofr_out = clipped.out;
+        stp_out = actual_ofr_out.clone();
+        owner_gives = mul_ratio_amount(&stp_out, transfer_rate_out, QUALITY_ONE, false);
         stp_in = mul_ratio_amount(&actual_ofr_in, transfer_rate_in, QUALITY_ONE, true);
     }
 
@@ -1211,6 +1235,43 @@ mod tests {
         assert!(quality_satisfies_threshold(better, Some(threshold)));
         assert!(!quality_satisfies_threshold(worse, Some(threshold)));
     }
+    #[test]
+    fn reverse_xrp_to_iou_output_cap_derives_only_required_3300_xrp_sendmax() {
+        // Regression for an XRP→IOU self-payment shape with a 3,300 XRP
+        // SendMax. The reverse probe is input-unbounded, but a 1-IOU request
+        // must consume only 3.3 XRP from a 3,300-XRP-for-1,000-IOU offer.
+        // rippled BookStep.cpp applies this through limitStepOut before
+        // deriving stpAmt.in in revImp.
+        let issuer = AccountID::from_array([0x33; 20]);
+        let issue = protocol::Issue::new(protocol::currency_from_string("USD"), issuer);
+        let consumption = compute_offer_consumption(
+            &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(3_300_000_000)),
+            &STAmount::from_iou_amount(
+                sf("sfAmount"),
+                protocol::IOUAmount::from_parts(1, 0).expect("canonical one IOU"),
+                issue,
+            ),
+            &STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(3_300_000_000)),
+            &STAmount::from_iou_amount(
+                sf("sfAmount"),
+                protocol::IOUAmount::from_parts(1_000, 0).expect("canonical offer output"),
+                issue,
+            ),
+            &STAmount::from_iou_amount(
+                sf("sfAmount"),
+                protocol::IOUAmount::from_parts(1_000, 0).expect("funded offer output"),
+                issue,
+            ),
+            QUALITY_ONE,
+            QUALITY_ONE,
+        );
+
+        assert_eq!(consumption.step_in.xrp().drops(), 3_300_000);
+        assert_eq!(consumption.step_out.iou().to_string(), "1");
+        assert_eq!(consumption.offer_in.xrp().drops(), 3_300_000);
+        assert_eq!(consumption.offer_out.iou().to_string(), "1");
+    }
+
     #[test]
     fn test_mul_ratio_amount_xrp_round_up() {
         // 100 drops * 1002000000 / 1000000000 = 100.2 → rounds UP to 101
