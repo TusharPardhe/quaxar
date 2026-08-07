@@ -5614,7 +5614,19 @@ fn offer_create_then_account_set_global_freeze() {
         full_apply(&mut view, &tx2, TxType::ACCOUNT_SET),
         Ter::TES_SUCCESS
     );
-    // Now alice can't create new offers
+    let gw_after_freeze = view
+        .read(account_keylet(acct_id(gw)))
+        .expect("global-freeze account read must succeed")
+        .expect("gateway account must remain in the ledger");
+    assert_ne!(
+        gw_after_freeze.get_field_u32(sf("sfFlags")) & protocol::lsfGlobalFreeze,
+        0,
+        "AccountSet asfGlobalFreeze must update the issuer account before OfferCreate"
+    );
+    // Upstream authority: rippled/src/libxrpl/tx/transactors/dex/
+    // OfferCreate.cpp:190-212 checks both assets with checkGlobalFrozen before
+    // accountFunds, so this fails as tecFROZEN rather than the funding-path
+    // tecUNFUNDED_OFFER used for an individually frozen line.
     let tx3 = STTx::new(TxType::OFFER_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_field_amount(sf("sfTakerPays"), xrp(500_000_000));
@@ -5624,7 +5636,7 @@ fn offer_create_then_account_set_global_freeze() {
     });
     assert_eq!(
         handle_real_dispatch(&mut view, &tx3, TxType::OFFER_CREATE, None),
-        Ter::TEC_UNFUNDED_OFFER
+        Ter::TEC_FROZEN
     );
 }
 

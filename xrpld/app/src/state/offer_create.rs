@@ -22,48 +22,35 @@ fn sf(name: &str) -> &'static protocol::SField {
     get_field_by_symbol(name)
 }
 
-/// Checks if the issuer has lsfGlobalFreeze set (global freeze on IOU assets).
-fn is_global_frozen_iou<V: ledger::ApplyView>(view: &mut V, issuer: &AccountID) -> bool {
-    let keylet = protocol::account_keylet(Uint160::from_void(issuer.data()));
-    view.peek(keylet)
-        .ok()
-        .flatten()
-        .is_some_and(|sle| sle.is_flag(protocol::lsfGlobalFreeze))
+/// Runs the canonical immutable OfferCreate preclaim implementation.
+///
+/// Authority: `rippled/src/libxrpl/tx/transactors/dex/OfferCreate.cpp`,
+/// `OfferCreate::preclaim` (global freeze, accountFunds, acceptance, and
+/// canTrade) is invoked by `src/libxrpl/tx/applySteps.cpp::invokePreclaim`
+/// before `Transactor::apply` consumes the sequence or fee.  The shared Rust
+/// DEX ReadView helper mirrors that phase and is used both by the normal
+/// application shell and by direct dispatcher callers.
+pub(crate) fn preclaim_offer_create<V: ledger::ReadView>(
+    view: &V,
+    sttx: &STTx,
+    flags: protocol::ApplyFlags,
+) -> Ter {
+    tx::run_dex_read_view_preclaim_with_flags(view, sttx, protocol::TxType::OFFER_CREATE, flags)
+        // This helper owns OfferCreate, so None would be a local dispatch
+        // violation rather than a transaction result.
+        .unwrap_or(Ter::TEF_INTERNAL)
 }
 
-fn check_mpt_offer_global_and_trade_allowed<V: ledger::ApplyView>(
+/// Mirrors preclaim for direct state-dispatch callers, which intentionally do
+/// not run the common account sequence-consumption preamble. Sequence-based
+/// transactions use their sequence as a non-lowering logical floor; ticket
+/// transactions must use the AccountRoot sequence exactly, as rippled does.
+fn preclaim_offer_create_for_direct_dispatch<V: ledger::ReadView>(
     view: &V,
-    asset: protocol::Asset,
+    sttx: &STTx,
+    flags: protocol::ApplyFlags,
 ) -> Ter {
-    let protocol::Asset::MPTIssue(issue) = asset else {
-        return Ter::TES_SUCCESS;
-    };
-
-    if ledger::mptoken_helpers::is_global_frozen_mpt(view, &issue).unwrap_or(true) {
-        return Ter::TEC_LOCKED;
-    }
-
-    ledger::mptoken_helpers::can_trade(view, &asset).unwrap_or(Ter::TEF_INTERNAL)
-}
-
-fn check_mpt_offer_accept_asset_allowed<V: ledger::ApplyView>(
-    view: &V,
-    account: &AccountID,
-    asset: protocol::Asset,
-) -> Ter {
-    let protocol::Asset::MPTIssue(issue) = asset else {
-        return Ter::TES_SUCCESS;
-    };
-
-    let auth = ledger::mptoken_helpers::require_auth_mpt(view, &issue, account)
-        .unwrap_or(Ter::TEF_INTERNAL);
-    if auth != Ter::TES_SUCCESS {
-        return auth;
-    }
-    if ledger::mptoken_helpers::is_frozen_mpt(view, account, &issue).unwrap_or(true) {
-        return Ter::TEC_LOCKED;
-    }
-    Ter::TES_SUCCESS
+    tx::run_offer_create_direct_dispatch_preclaim(view, sttx, flags)
 }
 
 const TF_PASSIVE: u32 = 0x0001_0000;
@@ -94,31 +81,6 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         return Ter::TEM_BAD_OFFER;
     }
 
-    let mpt_allowed = check_mpt_offer_global_and_trade_allowed(view, taker_pays.asset());
-    if mpt_allowed != Ter::TES_SUCCESS {
-        return mpt_allowed;
-    }
-    let mpt_allowed = check_mpt_offer_global_and_trade_allowed(view, taker_gets.asset());
-    if mpt_allowed != Ter::TES_SUCCESS {
-        return mpt_allowed;
-    }
-    let mpt_allowed = check_mpt_offer_accept_asset_allowed(view, &account, taker_pays.asset());
-    if mpt_allowed != Ter::TES_SUCCESS {
-        return mpt_allowed;
-    }
-
-    // Check GlobalFreeze for IOU assets before crossing
-    if let protocol::Asset::Issue(issue) = taker_pays.asset() {
-        if !issue.native() && is_global_frozen_iou(view, &issue.account) {
-            return Ter::TEC_FROZEN;
-        }
-    }
-    if let protocol::Asset::Issue(issue) = taker_gets.asset() {
-        if !issue.native() && is_global_frozen_iou(view, &issue.account) {
-            return Ter::TEC_FROZEN;
-        }
-    }
-
     let is_passive = (tx_flags & TF_PASSIVE) != 0;
     let is_ioc = (tx_flags & TF_IMMEDIATE_OR_CANCEL) != 0;
     let is_fok = (tx_flags & TF_FILL_OR_KILL) != 0;
@@ -139,11 +101,23 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         return Ter::TEM_DISABLED;
     }
 
+    // Normal application uses the same helper in the pre-fee apply shell.
+    // Direct state-dispatch callers have no preceding applySteps lifecycle,
+    // so run the exact ReadView preclaim here.  Do not run it again after the
+    // fee preamble: rippled's preclaim sees the pre-fee XRP balance, while
+    // flowCross performs its separate post-fee funding check.
+    if pre_fee_balance_drops.is_none() {
+        let preclaim =
+            preclaim_offer_create_for_direct_dispatch(view, sttx, protocol::ApplyFlags::NONE);
+        if preclaim != Ter::TES_SUCCESS {
+            return preclaim;
+        }
+    }
+
     // Get offer sequence (for the new offer's key)
     let offer_sequence = sttx.get_seq_value();
 
     let mut result = Ter::TES_SUCCESS;
-    let mut freed_taker_gets: Option<STAmount> = None;
 
     // --- Cancel existing offer if OfferSequence present ---
     if sttx.is_field_present(sf("sfOfferSequence")) {
@@ -184,13 +158,9 @@ pub fn do_offer_create<V: ledger::ApplyView>(
                     old_offer.get_field_h256(sf("sfBookDirectory"))
                 );
             }
-            let released_gets = old_offer.get_field_amount(sf("sfTakerGets"));
             result = offer_delete(view, &account, old_offer);
             if trace_offer_sequence {
                 eprintln!("TRACE offer_sequence: offer_delete_result={:?}", result);
-            }
-            if is_tes_success(result) {
-                freed_taker_gets = Some(released_gets);
             }
         } else if trace_offer_sequence {
             eprintln!("TRACE offer_sequence: cancelled offer absent");
@@ -246,29 +216,6 @@ pub fn do_offer_create<V: ledger::ApplyView>(
         }
         if taker_pays.signum() <= 0 || taker_gets.signum() <= 0 {
             return Ter::TES_SUCCESS; // Rounded to zero
-        }
-    }
-
-    // --- reference preclaim: tecUNFUNDED_OFFER check ---
-    {
-        let account_funds = get_account_funds_for_offer(
-            view,
-            &account,
-            &taker_pays,
-            &taker_gets,
-            freed_taker_gets.as_ref(),
-        );
-        static UNFUNDED_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if account_funds.signum() <= 0 {
-            if UNFUNDED_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
-                tracing::debug!(target: "tx",
-                    "[offer_debug] UNFUNDED_OFFER: funds_signum={} taker_gets_native={} freed={:?}",
-                    account_funds.signum(),
-                    taker_gets.native(),
-                    freed_taker_gets.as_ref().map(|f| f.signum())
-                );
-            }
-            return Ter::TEC_UNFUNDED_OFFER;
         }
     }
 
@@ -767,116 +714,6 @@ fn set_book_directory_fields(
 }
 
 /// Delete an offer — remove from owner dir, book dir, and erase SLE.
-/// Returns zero if frozen, unauthorized, or no balance.
-fn get_account_funds_for_offer<V: ledger::ApplyView>(
-    view: &mut V,
-    account: &AccountID,
-    _taker_pays: &STAmount,
-    taker_gets: &STAmount,
-    freed_taker_gets: Option<&STAmount>,
-) -> STAmount {
-    let mut funds = if taker_gets.native() {
-        let acct_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
-        if let Ok(Some(sle)) = view.peek(acct_keylet) {
-            let balance = sle.get_field_amount(sf("sfBalance")).xrp().drops();
-            let owner_count = sle.get_field_u32(sf("sfOwnerCount"));
-            let reserve = view.fees().account_reserve(owner_count as usize) as i64;
-            let available = balance - reserve;
-            if available > 0 {
-                STAmount::from_xrp_amount(protocol::XRPAmount::from_drops(available))
-            } else {
-                STAmount::default()
-            }
-        } else {
-            STAmount::default()
-        }
-    } else {
-        match taker_gets.asset() {
-            protocol::Asset::Issue(issue) => {
-                if *account == issue.account {
-                    taker_gets.clone()
-                } else {
-                    // return zero if the trust line or issuer is frozen.
-                    if ledger::ripple_state_helpers::is_frozen(view, account, &issue) {
-                        taker_gets.zeroed()
-                    } else {
-                        ledger::ripple_state_helpers::credit_balance(
-                            view,
-                            account,
-                            &issue.account,
-                            issue.currency,
-                        )
-                    }
-                }
-            }
-            protocol::Asset::MPTIssue(issue) => {
-                if issue.issuer() == *account {
-                    view.read(protocol::mpt_issuance_keylet_from_mptid(issue.mpt_id()))
-                        .ok()
-                        .flatten()
-                        .map(|issuance| {
-                            STAmount::from_mpt_amount(
-                                sf("sfAmount"),
-                                protocol::MPTAmount::from_value(
-                                    ledger::mptoken_helpers::available_mpt_amount(&issuance),
-                                ),
-                                issue,
-                            )
-                        })
-                        .unwrap_or_else(|| taker_gets.zeroed())
-                } else if ledger::mptoken_helpers::is_frozen_mpt(view, account, &issue)
-                    .unwrap_or(true)
-                    || ledger::mptoken_helpers::require_auth_mpt(view, &issue, account)
-                        .unwrap_or(Ter::TEF_INTERNAL)
-                        != Ter::TES_SUCCESS
-                {
-                    taker_gets.zeroed()
-                } else {
-                    view.read(protocol::mptoken_keylet_from_mptid(
-                        issue.mpt_id(),
-                        Uint160::from_void(account.data()),
-                    ))
-                    .ok()
-                    .flatten()
-                    .map(|token| {
-                        STAmount::from_mpt_amount(
-                            sf("sfAmount"),
-                            protocol::MPTAmount::from_value(
-                                token.get_field_u64(sf("sfMPTAmount")) as i64
-                            ),
-                            issue,
-                        )
-                    })
-                    .unwrap_or_else(|| taker_gets.zeroed())
-                }
-            }
-        }
-    };
-
-    if let Some(released) = freed_taker_gets
-        && released.asset() == taker_gets.asset()
-        && released.signum() > 0
-    {
-        funds += released.clone();
-    }
-
-    static FUNDS_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if FUNDS_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
-        tracing::debug!(target: "tx",
-            "[offer_funds] funds_signum={} taker_gets_native={} freed_signum={:?} acct={:02x}{:02x}{:02x}{:02x}",
-            funds.signum(),
-            taker_gets.native(),
-            freed_taker_gets.map(|f| f.signum()),
-            account.data()[0],
-            account.data()[1],
-            account.data()[2],
-            account.data()[3],
-        );
-    }
-
-    funds
-}
-
 pub fn offer_delete_pub<V: ledger::ApplyView>(
     view: &mut V,
     account: &AccountID,

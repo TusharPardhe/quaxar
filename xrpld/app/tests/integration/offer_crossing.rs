@@ -593,11 +593,12 @@ fn offer_globally_frozen_issuer() {
     ]);
     let mut view = new_view(ledger);
 
-    // Alice tries to sell USD from globally frozen issuer
+    // Upstream authority: rippled/src/libxrpl/tx/transactors/dex/
+    // OfferCreate.cpp:190-212 rejects GlobalFreeze before accountFunds;
+    // Freeze_test.cpp:480-489 expects tecFROZEN in both offer directions.
     let tx = offer_tx(alice, xrp(1_000_000_000), iou(gw, usd, 1000), 1);
     let result = handle_real_dispatch(&mut view, &tx, TxType::OFFER_CREATE, None);
-    // Should be unfunded due to global freeze
-    assert_eq!(result, Ter::TEC_UNFUNDED_OFFER);
+    assert_eq!(result, Ter::TEC_FROZEN);
 }
 
 /// C++ Offer_test — offer with tick size rounding.

@@ -1,0 +1,162 @@
+{
+  "result": {
+    "ledger_hash": "716FDCF61A3D926FD5D9F098C5DFC97FA2CD0CDA093DB298E3699B9135744F4C",
+    "ledger_index": 106131670,
+    "offers": [
+      {
+        "Account": "r4eVo8fqigp2WwkpmMCCFCVnqVssLXQJvv",
+        "BookDirectory": "EB6E2F22D46F3DA7D3F429EE845BF345AD624C51390AC0435420F41BEB142000",
+        "BookNode": "0",
+        "Flags": 0,
+        "LedgerEntryType": "Offer",
+        "OwnerNode": "0",
+        "PreviousTxnID": "E7DC9C34E94003AFEA17DB4770084833F42B74CBB4EEA3C92F159EBC73472134",
+        "PreviousTxnLgrSeq": 104973599,
+        "Sequence": 103252095,
+        "TakerGets": {
+          "currency": "4242524C00000000000000000000000000000000",
+          "issuer": "rH5CJsqvNqZGxrMyGaqLEoMWRYcVTAPZMt",
+          "value": "9.999946095131313"
+        },
+        "TakerPays": {
+          "currency": "524C555344000000000000000000000000000000",
+          "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+          "value": "9.27555"
+        },
+        "index": "17F161BDB4768BBBAEC803B51F419DE3E3B3FAAAD1CFA410D296A08386706AF1",
+        "owner_funds": "4.941427325204848",
+        "quality": "0.92756",
+        "taker_gets_funded": {
+          "currency": "4242524C00000000000000000000000000000000",
+          "issuer": "rH5CJsqvNqZGxrMyGaqLEoMWRYcVTAPZMt",
+          "value": "4.941427325204848"
+        },
+        "taker_pays_funded": {
+          "currency": "524C555344000000000000000000000000000000",
+          "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+          "value": "4.583470329767009"
+        }
+      },
+      {
+        "Account": "r4eVo8fqigp2WwkpmMCCFCVnqVssLXQJvv",
+        "BookDirectory": "EB6E2F22D46F3DA7D3F429EE845BF345AD624C51390AC0435505134DDB86B000",
+        "BookNode": "0",
+        "Flags": 0,
+        "LedgerEntryType": "Offer",
+        "OwnerNode": "0",
+        "PreviousTxnID": "8EAAC2BC3BD0B1229640EEE58703927F47749BC41153419E0306BDA4C204005C",
+        "PreviousTxnLgrSeq": 105011204,
+        "Sequence": 103252099,
+        "TakerGets": {
+          "currency": "4242524C00000000000000000000000000000000",
+          "issuer": "rH5CJsqvNqZGxrMyGaqLEoMWRYcVTAPZMt",
+          "value": "4.899902001959961"
+        },
+        "TakerPays": {
+          "currency": "524C555344000000000000000000000000000000",
+          "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+          "value": "7"
+        },
+        "index": "8BE35A4B471A50400112B72A98B378A20EEA989A5BE669BF949E180CBDE9D5DE",
+        "quality": "1.4286",
+        "taker_gets_funded": {
+          "currency": "4242524C00000000000000000000000000000000",
+          "issuer": "rH5CJsqvNqZGxrMyGaqLEoMWRYcVTAPZMt",
+          "value": "0"
+        },
+        "taker_pays_funded": {
+          "currency": "524C555344000000000000000000000000000000",
+          "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+          "value": "0"
+        }
+      },
+      {
+        "Account": "r4eVo8fqigp2WwkpmMCCFCVnqVssLXQJvv",
+        "BookDirectory": "EB6E2F22D46F3DA7D3F429EE845BF345AD624C51390AC04355053897E9F64000",
+        "BookNode": "0",
+        "Flags": 0,
+        "LedgerEntryType": "Offer",
+        "OwnerNode": "0",
+        "PreviousTxnID": "4400D2F8916BA62CFC2969B4A63DAE7C68252F58ACB0816A8A90871FA5616141",
+        "PreviousTxnLgrSeq": 105010581,
+        "Sequence": 103252097,
+        "TakerGets": {
+          "currency": "4242524C00000000000000000000000000000000",
+          "issuer": "rH5CJsqvNqZGxrMyGaqLEoMWRYcVTAPZMt",
+          "value": "5.443658138268917"
+        },
+        "TakerPays": {
+          "currency": "524C555344000000000000000000000000000000",
+          "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+          "value": "8"
+        },
+        "index": "80D6A559A4485F32C65F6138DCD3FECC39C5DE1A6196B3E3210DC6B2D4796661",
+        "quality": "1.4696",
+        "taker_gets_funded": {
+          "currency": "4242524C00000000000000000000000000000000",
+          "issuer": "rH5CJsqvNqZGxrMyGaqLEoMWRYcVTAPZMt",
+          "value": "0"
+        },
+        "taker_pays_funded": {
+          "currency": "524C555344000000000000000000000000000000",
+          "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+          "value": "0"
+        }
+      },
+      {
+        "Account": "r9KxyvWNznqZPQ2ZnHADJu2LXiLZGDvovR",
+        "BookDirectory": "EB6E2F22D46F3DA7D3F429EE845BF345AD624C51390AC04355121E6C485AC000",
+        "BookNode": "0",
+        "Flags": 0,
+        "LedgerEntryType": "Offer",
+        "OwnerNode": "0",
+        "PreviousTxnID": "CC73455FB349334EDE64EEC531E2F5A98B63D30A06C69109BC62E9AEAA830CAD",
+        "PreviousTxnLgrSeq": 102445723,
+        "Sequence": 102424844,
+        "TakerGets": {
+          "currency": "4242524C00000000000000000000000000000000",
+          "issuer": "rH5CJsqvNqZGxrMyGaqLEoMWRYcVTAPZMt",
+          "value": "0.001"
+        },
+        "TakerPays": {
+          "currency": "524C555344000000000000000000000000000000",
+          "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+          "value": "0.0051"
+        },
+        "index": "160ED893B0C1D221E1827E0C7D61077E23F1EC894114554394D0310EDAB59889",
+        "owner_funds": "5.818746483620474",
+        "quality": "5.1"
+      },
+      {
+        "Account": "r9KxyvWNznqZPQ2ZnHADJu2LXiLZGDvovR",
+        "BookDirectory": "EB6E2F22D46F3DA7D3F429EE845BF345AD624C51390AC04355121E6C485AC000",
+        "BookNode": "0",
+        "Flags": 0,
+        "LedgerEntryType": "Offer",
+        "OwnerNode": "0",
+        "PreviousTxnID": "82ADE77C8508463F201F4954B61D53E1CB3A560F75831978ADE89CCFA5B01052",
+        "PreviousTxnLgrSeq": 102446056,
+        "Sequence": 102424853,
+        "TakerGets": {
+          "currency": "4242524C00000000000000000000000000000000",
+          "issuer": "rH5CJsqvNqZGxrMyGaqLEoMWRYcVTAPZMt",
+          "value": "0.001"
+        },
+        "TakerPays": {
+          "currency": "524C555344000000000000000000000000000000",
+          "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De",
+          "value": "0.0051"
+        },
+        "index": "38BB83DD99CA6723BFC4F2A2E1E4FF96CBF130A28764AB64FF1B33857235DFED",
+        "quality": "5.1"
+      }
+    ],
+    "status": "success"
+  },
+  "warnings": [
+    {
+      "id": 2001,
+      "message": "This is a clio server. clio only serves validated data. If you want to talk to rippled, include 'ledger_index':'current' in your request"
+    }
+  ]
+}

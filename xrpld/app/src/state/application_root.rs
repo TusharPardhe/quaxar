@@ -2742,7 +2742,7 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
         // unapplied FlowSandbox and reporting tefEXCEPTION.
         let mut tx_view = ledger::FlowSandbox::new_with_flags(view, flags);
         let mut result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_submit_transactor_shell_impl(&mut tx_view, tx, txn_type)
+            apply_submit_transactor_shell_impl(&mut tx_view, tx, txn_type, flags)
         })) {
             Ok(result) => result,
             Err(payload) => {
@@ -2807,6 +2807,7 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
     view: &mut ledger::FlowSandbox<'_, V>,
     tx: &STTx,
     txn_type: TxType,
+    flags: ApplyFlags,
 ) -> Ter {
     let account_field = get_field_by_symbol("sfAccount");
 
@@ -2893,6 +2894,21 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
     if view.tx_exists(tx.get_transaction_id()).unwrap_or(false) {
         return Ter::TEF_ALREADY;
     }
+
+    // `OfferCreate::preclaim` is an immutable, pre-fee decision in rippled:
+    // `applySteps.cpp::invokePreclaim` runs it before `Transactor::apply`
+    // consumes a sequence or deducts a fee. Preserve a tec outcome through
+    // the remainder of this shell so the standard fee-claim lifecycle still
+    // runs, but never dispatch it into the mutating OfferCreate flow.
+    let offer_preclaim = if txn_type == TxType::OFFER_CREATE {
+        let preclaim = crate::state::offer_create::preclaim_offer_create(&*view, tx, flags);
+        if !is_tes_success(preclaim) && !is_tec_claim(preclaim) {
+            return preclaim;
+        }
+        preclaim
+    } else {
+        Ter::TES_SUCCESS
+    };
 
     let oracle_preclaim = if txn_type == TxType::ORACLE_SET {
         run_oracle_set_preclaim_with_view(view, tx)
@@ -3110,7 +3126,9 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
         // We achieve this by running handle_real_dispatch in a nested FlowSandbox and
         // only applying it to the outer view when the result is NOT tecKILLED.
         let mut inner = ledger::FlowSandbox::new(view);
-        let mut result = if is_tes_success(oracle_preclaim) {
+        let mut result = if is_tec_claim(offer_preclaim) {
+            offer_preclaim
+        } else if is_tes_success(oracle_preclaim) {
             handle_real_dispatch(&mut inner, tx, txn_type, pre_fee_balance_drops)
         } else {
             oracle_preclaim
@@ -3170,6 +3188,22 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             let mut expired_nft_offers = Vec::new();
             let mut expired_credentials = Vec::new();
 
+            // rippled applies `sbCancel`, not the main `sb`, when OfferCreate
+            // returns `tecKILLED`. An explicit sfOfferSequence deletion lives
+            // in the main sandbox, so it must be discarded with the failed
+            // replacement. Keep filtering only that key; flow-discovered
+            // unfunded offers remain eligible for canonical cleanup.
+            let preserved_offer_sequence_cancel = (result == Ter::TEC_KILLED
+                && txn_type == TxType::OFFER_CREATE
+                && tx.is_field_present(get_field_by_symbol("sfOfferSequence")))
+            .then(|| {
+                protocol::offer_keylet(
+                    Uint160::from_void(tx.get_account_id(account_field).data()),
+                    tx.get_field_u32(get_field_by_symbol("sfOfferSequence")),
+                )
+                .key
+            });
+
             let erased_entries: Vec<(basics::base_uint::Uint256, Arc<protocol::STLedgerEntry>)> =
                 inner
                     .items()
@@ -3183,7 +3217,10 @@ fn apply_submit_transactor_shell_impl<V: ledger::ApplyView + ?Sized>(
             for (index, after) in erased_entries {
                 if let Ok(Some(before)) = view.peek(protocol::Keylet::new(after.get_type(), index))
                 {
-                    if do_offers && before.get_type() == protocol::LedgerEntryType::Offer {
+                    if do_offers
+                        && Some(index) != preserved_offer_sequence_cancel
+                        && before.get_type() == protocol::LedgerEntryType::Offer
+                    {
                         let taker_pays = protocol::get_field_by_symbol("sfTakerPays");
                         if before.get_field_amount(taker_pays) == after.get_field_amount(taker_pays)
                         {
@@ -3395,6 +3432,7 @@ fn apply_submit_batch_followup<V: ledger::ApplyView + ?Sized>(
                     &mut per_tx_batch_view,
                     &inner_tx,
                     inner_tx.get_txn_type(),
+                    ApplyFlags::BATCH,
                 );
                 let delivered_amount = delivered_amount_capture
                     .map(crate::state::payment::MptDeliveredAmountCapture::finish)

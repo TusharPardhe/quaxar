@@ -1,0 +1,23 @@
+{
+  "canonical_offercreate_count_at_candidate_ledger": 180,
+  "canonical_offercreate_results_at_candidate_ledger": {
+    "tecKILLED": 53,
+    "tecUNFUNDED_OFFER": 52,
+    "tesSUCCESS": 75
+  },
+  "exception_candidate_ledger": 106131674,
+  "parent_book_evidence": {
+    "brrl_to_rlusd_file": "106131670.brrl-to-rlusd.book-offers.json",
+    "brrl_to_rlusd_offer_count": 5,
+    "rlusd_to_brrl_file": "106131670.rlusd-to-brrl.book-offers.json",
+    "rlusd_to_brrl_offer_count": 0
+  },
+  "parent_ledger": 106131670,
+  "parent_ledger_hash": "716FDCF61A3D926FD5D9F098C5DFC97FA2CD0CDA093DB298E3699B9135744F4C",
+  "source": "https://s1.ripple.com:51234/",
+  "successful_transaction_hash": "2FA0B93E4064ACE6BDA006CEE75A64EB0EC305BD1238904307CCA3944CA10E73",
+  "successful_transaction_ledger": 106131671,
+  "successful_transaction_result": "tesSUCCESS",
+  "tefexception_offercreate_count": 0,
+  "tefexception_offercreate_hashes": []
+}

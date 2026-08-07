@@ -5444,7 +5444,7 @@ fn ledger_state_fix_book_exchange_rate_enforces_preclaim_guards() {
 fn offer_create_hybrid_domain_offer_places_domain_and_open_books() {
     let account = sample_account(0x55);
     let issuer = sample_account(0x56);
-    let domain_id = sample_uint256(0x57);
+    let domain_id = permissioned_domain_keylet(raw_account_id(account), 7).key;
     let issue = Issue::new(currency_from_string("USD"), issuer);
     let taker_pays = STAmount::from_iou_amount(
         get_field_by_symbol("sfTakerPays"),
@@ -5452,7 +5452,12 @@ fn offer_create_hybrid_domain_offer_places_domain_and_open_books() {
         issue,
     );
     let taker_gets = STAmount::from_xrp_amount(XRPAmount::from_drops(1_000));
-    let mut ledger = empty_ledger(vec![account_root_with_balance(account, 0, 0, 100_000_000)]);
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(account, 1, 0, 100_000_000),
+        account_root_with_balance(issuer, 0, 0, 100_000_000),
+        owner_dir_root(account, domain_id),
+        permissioned_domain_entry(account, 7, 0, &[]),
+    ]);
     ledger.set_rules(protocol::Rules::new([
         protocol::feature_id("PermissionedDEX"),
         protocol::feature_id("fixCleanup3_2_0"),
@@ -5480,6 +5485,19 @@ fn offer_create_hybrid_domain_offer_places_domain_and_open_books() {
         offer.get_field_h256(get_field_by_symbol("sfDomainID")),
         domain_id
     );
+    let owner = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("owner read should succeed")
+        .expect("owner should exist");
+    assert_eq!(owner.get_field_u32(sf("sfOwnerCount")), 2);
+    let owner_dir = view
+        .read(owner_dir_keylet(raw_account_id(account)))
+        .expect("owner directory read should succeed")
+        .expect("owner directory should exist");
+    let owner_indexes_value = owner_dir.get_field_v256(sf("sfIndexes"));
+    let owner_indexes = owner_indexes_value.value();
+    assert!(owner_indexes.contains(&domain_id));
+    assert!(owner_indexes.contains(&offer_keylet.key));
 
     let primary_dir_key = offer.get_field_h256(get_field_by_symbol("sfBookDirectory"));
     let primary_dir = view
@@ -5533,7 +5551,7 @@ fn offer_create_hybrid_domain_offer_places_domain_and_open_books() {
 fn offer_create_cancel_hybrid_offer_removes_domain_and_open_book_entries() {
     let account = sample_account(0x5A);
     let issuer = sample_account(0x5B);
-    let domain_id = sample_uint256(0x5C);
+    let domain_id = permissioned_domain_keylet(raw_account_id(account), 7).key;
     let issue = Issue::new(currency_from_string("USD"), issuer);
     let taker_pays = STAmount::from_iou_amount(
         get_field_by_symbol("sfTakerPays"),
@@ -5541,7 +5559,12 @@ fn offer_create_cancel_hybrid_offer_removes_domain_and_open_book_entries() {
         issue,
     );
     let taker_gets = STAmount::from_xrp_amount(XRPAmount::from_drops(1_000));
-    let mut ledger = empty_ledger(vec![account_root_with_balance(account, 0, 0, 100_000_000)]);
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(account, 1, 0, 100_000_000),
+        account_root_with_balance(issuer, 0, 0, 100_000_000),
+        owner_dir_root(account, domain_id),
+        permissioned_domain_entry(account, 7, 0, &[]),
+    ]);
     ledger.set_rules(protocol::Rules::new([
         protocol::feature_id("PermissionedDEX"),
         protocol::feature_id("fixCleanup3_2_0"),
@@ -5604,6 +5627,26 @@ fn offer_create_cancel_hybrid_offer_removes_domain_and_open_book_entries() {
         ))
         .expect("open book directory read should succeed")
         .is_none()
+    );
+    assert!(
+        view.read(protocol::permissioned_domain_keylet_from_id(domain_id))
+            .expect("domain read should succeed")
+            .is_some(),
+        "OfferSequence cancellation must preserve the preexisting domain"
+    );
+    let owner = view
+        .read(account_keylet(raw_account_id(account)))
+        .expect("owner read should succeed")
+        .expect("owner should exist");
+    assert_eq!(owner.get_field_u32(sf("sfOwnerCount")), 1);
+    let owner_dir = view
+        .read(owner_dir_keylet(raw_account_id(account)))
+        .expect("owner directory read should succeed")
+        .expect("owner directory should retain the domain");
+    assert_eq!(
+        owner_dir.get_field_v256(sf("sfIndexes")).value(),
+        &[domain_id],
+        "OfferSequence cancellation must remove only the offer owner-directory entry"
     );
 }
 

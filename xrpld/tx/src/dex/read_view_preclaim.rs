@@ -656,6 +656,7 @@ fn preclaim_offer_create<V: ReadView>(
     view: &V,
     tx: &STTx,
     apply_flags: ApplyFlags,
+    account_sequence_floor: Option<u32>,
 ) -> Result<Ter, Ter> {
     let account = tx.get_account_id(sf("sfAccount"));
     let taker_pays = tx.get_field_amount(sf("sfTakerPays"));
@@ -678,8 +679,16 @@ fn preclaim_offer_create<V: ReadView>(
         return Ok(Ter::TEC_UNFUNDED_OFFER);
     }
 
+    // Normal application supplies no floor, so this is exactly rippled's
+    // `uAccountSequence <= OfferSequence` preclaim test. Direct dispatcher
+    // callers deliberately omit the common sequence-consumption preamble;
+    // they can provide their transaction sequence as a floor to represent the
+    // logical account sequence without ever lowering a real ledger sequence.
+    let account_sequence = account_sle
+        .get_field_u32(sf("sfSequence"))
+        .max(account_sequence_floor.unwrap_or_default());
     if tx.is_field_present(sf("sfOfferSequence"))
-        && account_sle.get_field_u32(sf("sfSequence")) <= tx.get_field_u32(sf("sfOfferSequence"))
+        && account_sequence <= tx.get_field_u32(sf("sfOfferSequence"))
     {
         return Ok(Ter::TEM_BAD_SEQUENCE);
     }
@@ -1165,6 +1174,26 @@ fn preclaim_amm_clawback<V: ReadView>(view: &V, tx: &STTx) -> Result<Ter, Ter> {
     }))
 }
 
+/// Runs OfferCreate preclaim for direct state-dispatch callers that bypass
+/// the common sequence-consumption preamble. Only a conventional Sequence
+/// transaction gets a non-lowering logical account-sequence floor. A ticket
+/// does not advance AccountRoot.sfSequence, so ticket transactions must retain
+/// the canonical AccountRoot-only comparison used by rippled preclaim.
+///
+/// Production application must use `run_dex_read_view_preclaim_*`, which
+/// always reads only AccountRoot.sfSequence before the common preamble.
+pub fn run_offer_create_direct_dispatch_preclaim<V: ReadView>(
+    view: &V,
+    tx: &STTx,
+    apply_flags: ApplyFlags,
+) -> Ter {
+    let sequence_floor = tx
+        .get_seq_proxy()
+        .is_seq()
+        .then(|| tx.get_seq_proxy().value());
+    preclaim_offer_create(view, tx, apply_flags, sequence_floor).unwrap_or_else(|ter| ter)
+}
+
 /// Evaluates the owned DEX preclaim tail with explicit apply flags.
 ///
 /// `None` means the type is not owned by this helper. In particular it never
@@ -1176,7 +1205,7 @@ pub fn run_dex_read_view_preclaim_with_flags<V: ReadView>(
     apply_flags: ApplyFlags,
 ) -> Option<Ter> {
     let result = match txn_type {
-        TxType::OFFER_CREATE => preclaim_offer_create(view, tx, apply_flags),
+        TxType::OFFER_CREATE => preclaim_offer_create(view, tx, apply_flags, None),
         TxType::OFFER_CANCEL => preclaim_offer_cancel(view, tx),
         TxType::AMM_CREATE => preclaim_amm_create(view, tx),
         TxType::AMM_DEPOSIT => preclaim_amm_deposit(view, tx),
@@ -1214,7 +1243,10 @@ mod tests {
         STLedgerEntry, STTx, Ter, TxType, XRPAmount, get_field_by_symbol,
     };
 
-    use super::{run_dex_read_view_preclaim, run_dex_read_view_preclaim_with_flags};
+    use super::{
+        run_dex_read_view_preclaim, run_dex_read_view_preclaim_with_flags,
+        run_offer_create_direct_dispatch_preclaim,
+    };
 
     fn sf(name: &str) -> &'static protocol::SField {
         get_field_by_symbol(name)
@@ -1338,6 +1370,80 @@ mod tests {
             run_dex_read_view_preclaim(&view, &tx, TxType::PAYMENT),
             None,
             "unowned types must not receive a success result"
+        );
+    }
+
+    #[test]
+    fn offer_create_direct_dispatch_sequence_allows_prior_offer_replacement() {
+        let owner = account(1);
+        let mut view = View::default();
+        // Direct dispatcher tests apply the first transaction's OfferCreate
+        // mutation but not its common account-sequence preamble. The second
+        // transaction still carries its real sequence (2).
+        view.insert(account_entry(owner, 1));
+        let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), owner);
+            tx.set_field_u32(sf("sfSequence"), 2);
+            tx.set_field_u32(sf("sfOfferSequence"), 1);
+            tx.set_field_amount(
+                sf("sfTakerPays"),
+                STAmount::from_iou_amount(
+                    sf("sfTakerPays"),
+                    IOUAmount::from_parts(1, 0).expect("valid offer amount"),
+                    Issue::new(Currency::from_array([3; 20]), owner),
+                ),
+            );
+            tx.set_field_amount(
+                sf("sfTakerGets"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
+            );
+        });
+
+        assert_eq!(
+            run_dex_read_view_preclaim(&view, &tx, TxType::OFFER_CREATE),
+            Some(Ter::TEM_BAD_SEQUENCE),
+            "normal application must use the AccountRoot sequence exactly"
+        );
+        assert_eq!(
+            run_offer_create_direct_dispatch_preclaim(&view, &tx, ApplyFlags::NONE),
+            Ter::TES_SUCCESS,
+            "direct dispatch must model the logical transaction sequence"
+        );
+    }
+
+    #[test]
+    fn offer_create_direct_dispatch_ticket_keeps_account_sequence_check() {
+        let owner = account(1);
+        let mut view = View::default();
+        view.insert(account_entry(owner, 1));
+        let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+            tx.set_account_id(sf("sfAccount"), owner);
+            tx.set_field_u32(sf("sfSequence"), 0);
+            tx.set_field_u32(sf("sfTicketSequence"), 2);
+            tx.set_field_u32(sf("sfOfferSequence"), 1);
+            tx.set_field_amount(
+                sf("sfTakerPays"),
+                STAmount::from_iou_amount(
+                    sf("sfTakerPays"),
+                    IOUAmount::from_parts(1, 0).expect("valid offer amount"),
+                    Issue::new(Currency::from_array([3; 20]), owner),
+                ),
+            );
+            tx.set_field_amount(
+                sf("sfTakerGets"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(1)),
+            );
+        });
+
+        assert_eq!(
+            run_dex_read_view_preclaim(&view, &tx, TxType::OFFER_CREATE),
+            Some(Ter::TEM_BAD_SEQUENCE),
+            "normal ticket application compares OfferSequence to AccountRoot sequence"
+        );
+        assert_eq!(
+            run_offer_create_direct_dispatch_preclaim(&view, &tx, ApplyFlags::NONE),
+            Ter::TEM_BAD_SEQUENCE,
+            "a ticket number must not relax OfferSequence validation"
         );
     }
 

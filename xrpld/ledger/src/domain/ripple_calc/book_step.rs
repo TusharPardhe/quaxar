@@ -913,6 +913,9 @@ fn compute_offer_consumption(
     if *remaining_in < stp_in {
         stp_in = remaining_in.clone();
         let in_lmt = mul_ratio_amount(&stp_in, QUALITY_ONE, transfer_rate_in, false);
+        // Reference: rippled `BookStep.cpp::limitStepIn` is generic over
+        // `TIn`/`TOut`; this path must remain valid for IOU, XRP, and MPT
+        // inputs and must not inspect an amount as XRP merely for diagnostics.
         if taker_pays.signum() > 0 {
             actual_ofr_in = in_lmt;
             // quality.rate() = taker_pays / taker_gets
@@ -924,15 +927,6 @@ fn compute_offer_consumption(
                 taker_gets.asset(),
                 false,
             );
-            static SCALE_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if SCALE_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
-                tracing::debug!(target: "ledger",                    "[cross_type_scale] in={:?} gets={:?} pays={:?} out={:?}",
-                    actual_ofr_in.xrp().drops(),
-                    taker_gets.mantissa(),
-                    taker_pays.xrp().drops(),
-                    actual_ofr_out.mantissa()
-                );
-            }
         }
         stp_out = actual_ofr_out.clone();
         owner_gives = mul_ratio_amount(&stp_out, transfer_rate_out, QUALITY_ONE, false);
@@ -1183,6 +1177,10 @@ pub fn execute_explicit_book_step<V: ApplyView>(
         Ok(None)
     }
 }
+
+#[cfg(test)]
+#[path = "book_step_success_path_tests.rs"]
+mod success_path_tests;
 
 #[cfg(test)]
 mod tests {
