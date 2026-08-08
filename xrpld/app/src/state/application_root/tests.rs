@@ -1,7 +1,8 @@
 use super::{
     AcceptLedgerPendingRuntime, AcceptLedgerPendingTransaction, AppOpenLedgerTxQApplyRuntime,
     ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, PersistentSubmitSandbox,
-    TypedPreclaimRoute, apply_submit_transactor_shell, batch_base_fee,
+    TypedPreclaimRoute, apply_submit_transactor_shell,
+    apply_submit_transactor_shell_with_flags, batch_base_fee,
     calculate_default_sttx_base_fee, calculate_sttx_base_fee, consensus_status_event,
     loan_set_counterparty_preflight_ter, preferred_lcl_matches_local_or_parent,
     queue_apply_preclaim_ter, transaction_preflight_ter, typed_preclaim_route, typed_preclaim_ter,
@@ -677,6 +678,74 @@ fn simulate_clones_persistent_open_view_sequence_and_balance() {
             .drops(),
         live_balance,
         "simulation must clone, never mutate, the persistent open view"
+    );
+}
+
+#[test]
+fn retry_pass_tec_does_not_commit_until_final_pass() {
+    let source = account("ABABABABABABABABABABABABABABABABABABABAB");
+    let missing_destination = account("CDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCDCD");
+    let tx = payment_tx(source, missing_destination, 1, None, 10);
+    let destination_root = || {
+        let mut entry = STLedgerEntry::from_type_and_key(
+            LedgerEntryType::AccountRoot,
+            account_keylet(raw_account_id(missing_destination)).key,
+        );
+        entry.set_account_id(get_field_by_symbol("sfAccount"), missing_destination);
+        entry.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+        entry.set_field_u32(get_field_by_symbol("sfFlags"), protocol::lsfDepositAuth);
+        entry.set_field_amount(
+            get_field_by_symbol("sfBalance"),
+            STAmount::new_native(1_000_000, false),
+        );
+        entry
+    };
+    let base = Arc::new(ledger_view(10, source, 1, &[]));
+
+    let mut retry_view = Sandbox::new(Arc::clone(&base), ApplyFlags::NONE);
+    retry_view
+        .insert(Arc::new(destination_root()))
+        .expect("retry destination insert");
+    assert_eq!(
+        apply_submit_transactor_shell_with_flags(
+            &mut retry_view,
+            &tx,
+            TxType::PAYMENT,
+            ApplyFlags::RETRY,
+        ),
+        Ter::TEC_NO_PERMISSION
+    );
+    let retry_source = retry_view
+        .read(account_keylet(raw_account_id(source)))
+        .expect("retry source read")
+        .expect("retry source account");
+    assert_eq!(
+        retry_source.get_field_u32(get_field_by_symbol("sfSequence")),
+        1,
+        "TapRetry must discard a fee-claiming tec so BuildLedger can retry it"
+    );
+
+    let mut final_view = Sandbox::new(base, ApplyFlags::NONE);
+    final_view
+        .insert(Arc::new(destination_root()))
+        .expect("final destination insert");
+    assert_eq!(
+        apply_submit_transactor_shell_with_flags(
+            &mut final_view,
+            &tx,
+            TxType::PAYMENT,
+            ApplyFlags::NONE,
+        ),
+        Ter::TEC_NO_PERMISSION
+    );
+    let final_source = final_view
+        .read(account_keylet(raw_account_id(source)))
+        .expect("final source read")
+        .expect("final source account");
+    assert_eq!(
+        final_source.get_field_u32(get_field_by_symbol("sfSequence")),
+        2,
+        "the final pass must claim the fee and consume the sequence"
     );
 }
 

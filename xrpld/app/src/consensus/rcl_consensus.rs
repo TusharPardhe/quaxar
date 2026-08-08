@@ -1050,7 +1050,17 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 .lock()
                 .expect("inbound_transactions mutex");
             guard.give_set(position_id, Arc::new(sync_tree), false);
-            tracing::info!(target: "consensus", %position_id, "on_close: stored tx-set");
+            tracing::info!(
+                target: "consensus",
+                parent_hash = %prev_ledger.id(),
+                parent_seq = prev_ledger.seq(),
+                next_seq = prev_ledger.seq().saturating_add(1),
+                consensus_mode = ?mode,
+                open_tx_count = txs.len(),
+                tx_set_id = %position_id,
+                proposed_close_time = now.as_seconds(),
+                "on_close: captured local next-round transaction set"
+            );
         }
 
         consensus::algorithm::types::ConsensusResult::new(set, position, position_id)
@@ -1080,6 +1090,28 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             .into_iter()
             .map(|tx| canonicalize_consensus_transaction(self.transaction_master.as_ref(), tx))
             .collect::<Vec<_>>();
+        let canonical_input_order = txns
+            .iter()
+            .enumerate()
+            .map(|(input_position, tx)| {
+                (
+                    input_position,
+                    tx.get_transaction_id(),
+                    tx.get_account_id(protocol::get_field_by_symbol("sfAccount")),
+                    tx.get_seq_proxy().value(),
+                    tx.get_seq_proxy().is_ticket(),
+                    tx.get_txn_type(),
+                )
+            })
+            .collect::<Vec<_>>();
+        tracing::info!(
+            target: "lcl_audit",
+            parent_hash = %prev_ledger.id(),
+            parent_seq = prev_ledger.seq(),
+            consensus_tx_set = %result.txns.id(),
+            canonical_input_order = ?canonical_input_order,
+            "LCL_AUDIT accepted consensus canonical input order"
+        );
         let malformed_tx_count = malformed_txns.len();
         for (payload_len, message) in malformed_txns {
             tracing::warn!(
@@ -1098,6 +1130,7 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 "consensus transaction set contains malformed entries"
             );
         }
+        let decoded_tx_count = txns.len();
         let raw_close_time = result.position.close_time();
         let close_time_correct = raw_close_time != NetClockTimePoint::default();
         let effective_close_time = if !close_time_correct {
@@ -1201,7 +1234,24 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 validation: pending_validation,
             });
         }
-        tracing::debug!(target: "consensus", closed_seq, "on_accept: stored pending accept work for synchronous execution");
+        tracing::info!(
+            target: "consensus",
+            parent_hash = %prev_ledger.id(),
+            parent_seq = prev_ledger.seq(),
+            closed_seq,
+            consensus_mode = ?mode,
+            consensus_state = ?result.state,
+            consensus_tx_set = %result.txns.id(),
+            consensus_tx_count = items.len(),
+            decoded_tx_count,
+            raw_close_time = raw_close_time.as_seconds(),
+            raw_close_time_self = raw_close_times.self_.as_seconds(),
+            raw_close_time_peer_votes = ?raw_close_times.peers,
+            effective_close_time = close_time,
+            close_resolution_secs,
+            close_time_correct,
+            "on_accept: captured consensus result for local child"
+        );
     }
 
     fn propose(&self, pos: &consensus::ConsensusProposal<PublicKey, Uint256, Uint256>) {
@@ -1600,6 +1650,21 @@ impl AppConsensus {
                 // mutable LCL here could attach this consensus result to a
                 // later validation/acquisition switch.
                 let closed = root.store_consensus_ledger(Arc::clone(&outcome.closed));
+                tracing::info!(
+                    target: "lcl_audit",
+                    work_parent_hash = %work.parent_ledger.header().hash,
+                    work_parent_seq = work.parent_ledger.header().seq,
+                    closed_hash = %closed.header().hash,
+                    closed_seq = closed.header().seq,
+                    closed_parent_hash = %closed.header().parent_hash,
+                    closed_tx_hash = %closed.header().tx_hash,
+                    closed_close_time = closed.header().close_time,
+                    consensus_tx_set = %work.consensus_hash,
+                    accepted_tx_count = work.txns.len(),
+                    consensus_mode_correct_lcl = work.have_correct_lcl,
+                    consensus_succeeded = work.consensus_succeeded,
+                    "LCL_AUDIT local consensus child built"
+                );
                 let mut retriable_transactions = outcome.retry_transactions.clone();
                 self.notify_accepted(&root, &closed, &work);
                 if work.have_correct_lcl && work.consensus_succeeded {

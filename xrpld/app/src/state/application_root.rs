@@ -92,7 +92,7 @@ use tx::{
     QueueAcceptLedgerViewSource, QueueAcceptLiveApplyRuntime, QueueApplyExecutionRuntime,
     QueueFeeLevelPaidInputs, QueueTxQClosedLedgerAppSource, QueueTxQClosedLedgerView,
     QueueTxQMetrics, QueueTxQRpcReport, TxConsequences, TxDetails, evaluate_fee_level_paid,
-    snapshot_queue_apply_app_view_with_metrics,
+    likely_to_claim_fee, snapshot_queue_apply_app_view_with_metrics,
 };
 use xrpl_core::{
     FixedNetworkIdService, HashRouter, LoadMonitorJournalFactory, NetworkIDService,
@@ -2138,10 +2138,6 @@ pub(crate) fn calculate_sttx_base_fee(view: &impl ReadView, tx: &STTx) -> u64 {
     }
 }
 
-fn consensus_transaction_preflight_ter(tx: &STTx, rules: &Rules) -> Ter {
-    transaction_preflight_ter(tx, rules)
-}
-
 /// Batch's invalid calculation is a documented sentinel consumed by its typed
 /// preclaim. Every other fee must be representable at this signed TxQ boundary.
 pub(crate) fn fee_drops_as_i64(fee: u64) -> i64 {
@@ -2741,7 +2737,9 @@ fn apply_submit_transactor_shell_with_flags_and_batch_outcome<V: ledger::ApplyVi
             applied_batch_inner_transactions = followup.applied_inner_transactions;
         }
 
-        if is_tes_success(result) || is_tec_claim(result) {
+        if likely_to_claim_fee(result, flags) {
+            // A retry-pass `tec` is intentionally left unapplied so
+            // BuildLedger can retry it after the remaining canonical input.
             // A commit failure means the parent changed underneath this
             // transaction. Never report an applied result after discarding a
             // `FlowSandbox::apply` error.
@@ -4422,6 +4420,35 @@ impl ApplicationRoot {
         let base_fee_drops = parent.fees().base;
         let parent_hash = *parent.header().hash.as_uint256();
         let local_txs = self.local_open_ledger_records();
+        let local_tx_count = local_txs.len();
+        let already_in_parent_count = local_txs
+            .iter()
+            .filter(|record| parent.tx_exists(record.tx.get_transaction_id()))
+            .count();
+        let local_tx_id_sample = local_txs
+            .iter()
+            .take(16)
+            .map(|record| record.tx.get_transaction_id())
+            .collect::<Vec<_>>();
+        let open_before = self.open_ledger().current_open_transactions();
+        let open_before_count = open_before.len();
+        let open_before_id_sample = open_before
+            .iter()
+            .take(16)
+            .map(|tx| tx.get_transaction_id())
+            .collect::<Vec<_>>();
+        tracing::info!(
+            target: "lcl_audit",
+            parent_hash = %parent.header().hash,
+            parent_seq = parent.header().seq,
+            next_open_index,
+            local_tx_count,
+            already_in_parent_count,
+            local_tx_id_sample = ?local_tx_id_sample,
+            open_before_count,
+            open_before_id_sample = ?open_before_id_sample,
+            "LCL_AUDIT open-ledger rebase started"
+        );
         let mut retries = Vec::<AppOpenLedgerTxRecord>::new();
         let rebase_view =
             std::cell::RefCell::new(Sandbox::new(Arc::clone(&parent), ApplyFlags::NONE));
@@ -4474,6 +4501,22 @@ impl ApplicationRoot {
             &mut |_tx: &AppOpenLedgerTxRecord| {},
         );
         *self.open_ledger_sandbox.lock().expect("sandbox mutex") = Some(rebase_view.into_inner());
+        let open_after = self.open_ledger().current_open_transactions();
+        let open_after_id_sample = open_after
+            .iter()
+            .take(16)
+            .map(|tx| tx.get_transaction_id())
+            .collect::<Vec<_>>();
+        tracing::info!(
+            target: "lcl_audit",
+            parent_hash = %parent.header().hash,
+            parent_seq = parent.header().seq,
+            next_open_index,
+            retry_count = retries.len(),
+            open_after_count = open_after.len(),
+            open_after_id_sample = ?open_after_id_sample,
+            "LCL_AUDIT open-ledger rebase completed"
+        );
     }
 
     fn reapply_open_ledger_record(
@@ -8900,7 +8943,7 @@ impl ApplicationRoot {
             let mut changes = 0usize;
             let mut retry_txs = Vec::new();
             let open_txs = std::mem::take(&mut pending_txs);
-            for sttx in open_txs {
+            for (input_position, sttx) in open_txs.into_iter().enumerate() {
                 let transaction_id = sttx.get_hash(protocol::HashPrefix::TransactionId);
                 if pass == 0
                     && parent_ledger
@@ -8939,7 +8982,7 @@ impl ApplicationRoot {
                     protocol::ApplyFlags::NONE
                 };
                 let rules = view.rules();
-                let preflight = consensus_transaction_preflight_ter(&sttx, &rules);
+                let preflight = transaction_preflight_ter_with_flags(&sttx, &rules, retry_flags);
                 let preclaim = is_tes_success(preflight).then(|| {
                     queue_apply_preclaim_ter_with_load_fee(
                         &*view,
@@ -8950,7 +8993,7 @@ impl ApplicationRoot {
                     )
                 });
                 let preclaim_admitted =
-                    preclaim.is_some_and(|ter| is_tes_success(ter) || is_tec_claim(ter));
+                    preclaim.is_some_and(|ter| likely_to_claim_fee(ter, retry_flags));
                 let (result, applied_batch_inner_transactions, transaction_meta) =
                     if preclaim_admitted {
                         let mut attempt_view =
@@ -9001,10 +9044,11 @@ impl ApplicationRoot {
                         (preclaim.unwrap_or(preflight), Vec::new(), None)
                     };
                 let apply_ter = preclaim_admitted.then_some(result);
-                let applied = protocol::is_tes_success(result) || protocol::is_tec_claim(result);
+                let applied = likely_to_claim_fee(result, retry_flags);
                 drop(view);
                 if !applied {
-                    let decision = if protocol::is_ter_retry(result) {
+                    let retryable = protocol::is_ter_retry(result) || protocol::is_tec_claim(result);
+                    let decision = if retryable {
                         CandidateDiagnosticDecision::Retry
                     } else {
                         CandidateDiagnosticDecision::Terminal
@@ -9020,7 +9064,27 @@ impl ApplicationRoot {
                         decision,
                         None,
                     ));
-                    if protocol::is_ter_retry(result) {
+                    tracing::info!(
+                        target: "lcl_audit",
+                        closed_seq,
+                        pass,
+                        input_position,
+                        tx_id = %transaction_id,
+                        account = %sttx.get_account_id(protocol::get_field_by_symbol("sfAccount")),
+                        seq_proxy = sttx.get_seq_proxy().value(),
+                        seq_proxy_is_ticket = sttx.get_seq_proxy().is_ticket(),
+                        txn_type = ?txn_type,
+                        preflight = ?preflight,
+                        preclaim = ?preclaim,
+                        apply_ter = ?apply_ter,
+                        result = ?result,
+                        decision = ?decision,
+                        "LCL_AUDIT consensus transaction application result"
+                    );
+                    if retryable {
+                        // rippled::applyTransaction retries an unapplied `tec`
+                        // from a TapRetry pass; it becomes fee-claiming only in
+                        // the final non-retry pass.
                         retry_txs.push(sttx);
                     } else {
                         completed_transaction_ids.insert(transaction_id);
@@ -9043,6 +9107,23 @@ impl ApplicationRoot {
                 completed_transaction_ids.insert(transaction_id);
 
                 let index = accepted_entries.len();
+                tracing::info!(
+                    target: "lcl_audit",
+                    closed_seq,
+                    pass,
+                    input_position,
+                    transaction_index = index,
+                    tx_id = %transaction_id,
+                    account = %sttx.get_account_id(protocol::get_field_by_symbol("sfAccount")),
+                    seq_proxy = sttx.get_seq_proxy().value(),
+                    seq_proxy_is_ticket = sttx.get_seq_proxy().is_ticket(),
+                    txn_type = ?txn_type,
+                    preflight = ?preflight,
+                    preclaim = ?preclaim,
+                    apply_ter = ?apply_ter,
+                    result = ?result,
+                    "LCL_AUDIT consensus transaction application accepted"
+                );
                 emit_candidate_admission_diagnostic(CandidateAdmissionDiagnostic::attempted(
                     transaction_id,
                     closed_seq,

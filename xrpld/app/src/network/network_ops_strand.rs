@@ -1288,9 +1288,21 @@ fn switch_last_closed_ledger(
         target_hash = %target,
         new_hash = %new_hash,
         new_seq,
+        new_parent_hash = %ledger.header().parent_hash,
+        new_tx_hash = %ledger.header().tx_hash,
+        new_close_time = ledger.header().close_time,
+        new_close_time_resolution = ledger.header().close_time_resolution,
         prior_closed = ?root.closed_ledger().map(|closed| {
             (*closed.header().hash.as_uint256(), closed.header().seq)
         }),
+        prior_closed_details = ?root.closed_ledger().map(|closed| (
+            *closed.header().hash.as_uint256(),
+            *closed.header().parent_hash.as_uint256(),
+            *closed.header().tx_hash.as_uint256(),
+            *closed.header().account_hash.as_uint256(),
+            closed.header().close_time,
+            closed.header().close_time_resolution,
+        )),
         "LCL_AUDIT preferred-LCL switch admitted"
     );
     tracing::info!(
