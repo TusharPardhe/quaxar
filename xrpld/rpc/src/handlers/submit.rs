@@ -1245,6 +1245,8 @@ fn submit_semantic_preflight_with_ledger(
                 amount_positive: amount.signum() > 0 && amount.is_legal_net(),
                 feature_token_escrow_enabled: true,
                 feature_mptokens_enabled: true,
+                fix_cleanup_3_2_0_enabled: rules
+                    .enabled(&protocol::feature_id("fixCleanup3_2_0")),
                 issue_has_bad_currency: amount.holds_issue()
                     && amount.issue().currency == protocol::bad_currency(),
                 mpt_amount_within_limit: !amount.holds_mpt_issue()
