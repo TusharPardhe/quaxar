@@ -479,41 +479,7 @@ fn validate_escrow_create_preflight(tx: &STTx, rules: &Rules) -> NotTec {
         return Ter::TEM_MALFORMED;
     }
 
-    let amount = tx.get_field_amount(amount_field);
-    let cancel_after = get_field_by_symbol("sfCancelAfter");
-    let finish_after = get_field_by_symbol("sfFinishAfter");
-    let condition = get_field_by_symbol("sfCondition");
-    let cancel_after_value = tx
-        .is_field_present(cancel_after)
-        .then(|| tx.get_field_u32(cancel_after));
-    let finish_after_value = tx
-        .is_field_present(finish_after)
-        .then(|| tx.get_field_u32(finish_after));
-
-    crate::run_escrow_create_preflight(crate::EscrowCreatePreflightFacts {
-        amount_kind: if amount.native() {
-            crate::EscrowCreateAmountKind::Xrp
-        } else if amount.holds_mpt_issue() {
-            crate::EscrowCreateAmountKind::Mpt
-        } else {
-            crate::EscrowCreateAmountKind::Issue
-        },
-        amount_positive: amount.signum() > 0 && amount.is_legal_net(),
-        feature_token_escrow_enabled: rules.enabled(&protocol::feature_id("TokenEscrow")),
-        feature_mptokens_enabled: rules.enabled(&protocol::feature_id("MPTokensV1")),
-        issue_has_bad_currency: amount.holds_issue()
-            && amount.issue().currency == protocol::bad_currency(),
-        mpt_amount_within_limit: !amount.holds_mpt_issue()
-            || amount.mantissa() <= crate::ESCROW_CREATE_MAX_MPTOKEN_AMOUNT,
-        cancel_after_present: cancel_after_value.is_some(),
-        finish_after_present: finish_after_value.is_some(),
-        cancel_after_strictly_after_finish_after: match (cancel_after_value, finish_after_value) {
-            (Some(cancel), Some(finish)) => cancel > finish,
-            _ => true,
-        },
-        condition_present: tx.is_field_present(condition),
-        condition_valid: !tx.is_field_present(condition) || !tx.get_field_vl(condition).is_empty(),
-    })
+    crate::run_escrow_create_sttx_preflight(tx, rules)
 }
 
 fn validate_account_set_preflight(tx: &STTx) -> NotTec {

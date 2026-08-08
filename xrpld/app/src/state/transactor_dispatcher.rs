@@ -2630,33 +2630,7 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
             let condition = sttx
                 .is_field_present(sf("sfCondition"))
                 .then(|| sttx.get_field_vl(sf("sfCondition")).to_vec());
-            let amount_kind = match amount.asset() {
-                protocol::Asset::Issue(issue) if issue.native() => tx::EscrowCreateAmountKind::Xrp,
-                protocol::Asset::Issue(_) => tx::EscrowCreateAmountKind::Issue,
-                protocol::Asset::MPTIssue(_) => tx::EscrowCreateAmountKind::Mpt,
-            };
-            let condition_valid = condition.as_ref().is_none_or(|value| {
-                protocol::crypto::conditions::deserialize_condition(value).is_ok()
-            });
-            let preflight = tx::run_escrow_create_preflight(tx::EscrowCreatePreflightFacts {
-                amount_kind,
-                amount_positive: amount.signum() > 0,
-                feature_token_escrow_enabled: view
-                    .rules()
-                    .enabled(&protocol::feature_token_escrow()),
-                feature_mptokens_enabled: view.rules().enabled(&protocol::feature_id("MPTokensV1")),
-                issue_has_bad_currency: false,
-                mpt_amount_within_limit: !matches!(amount.asset(), protocol::Asset::MPTIssue(_))
-                    || amount.mpt().value() <= tx::ESCROW_CREATE_MAX_MPTOKEN_AMOUNT as i64,
-                cancel_after_present: cancel_after.is_some(),
-                finish_after_present: finish_after.is_some(),
-                cancel_after_strictly_after_finish_after: match (cancel_after, finish_after) {
-                    (Some(cancel_after), Some(finish_after)) => cancel_after > finish_after,
-                    _ => true,
-                },
-                condition_present: condition.is_some(),
-                condition_valid,
-            });
+            let preflight = run_escrow_create_sttx_preflight(sttx, &view.rules());
             if preflight != Ter::TES_SUCCESS {
                 return preflight;
             }

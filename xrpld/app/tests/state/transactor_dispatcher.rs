@@ -379,7 +379,7 @@ fn escrow_create_tx(account: AccountID, destination: AccountID, sequence: u32) -
             sf("sfAmount"),
             STAmount::from_xrp_amount(XRPAmount::from_drops(1_000)),
         );
-        object.set_field_u32(sf("sfFinishAfter"), 1);
+        object.set_field_u32(sf("sfFinishAfter"), 1001);
         object.set_field_u32(sf("sfSequence"), sequence);
         object.set_field_amount(
             sf("sfFee"),
@@ -3266,6 +3266,7 @@ fn mpt_escrow_create_then_cancel_enforces_boundary_and_releases_full_lock() {
             tx.set_account_id(sf("sfAccount"), owner);
             tx.set_account_id(sf("sfDestination"), destination);
             tx.set_field_amount(sf("sfAmount"), amount.clone());
+            tx.set_field_u32(sf("sfFinishAfter"), 0);
             tx.set_field_u32(sf("sfCancelAfter"), 1);
             tx.set_field_amount(sf("sfFee"), test_xrp(10));
             tx.set_field_u32(sf("sfSequence"), 1);
@@ -4164,6 +4165,7 @@ fn escrow_create_sequence_tracks_fix_include_keylet_fields() {
         );
         object.set_field_u32(sf("sfSequence"), 0);
         object.set_field_u32(sf("sfTicketSequence"), ticket_sequence);
+        object.set_field_u32(sf("sfFinishAfter"), 1001);
         object.set_field_amount(
             sf("sfFee"),
             STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
@@ -4250,7 +4252,7 @@ fn escrow_create_uses_strict_parent_close_time_expiration() {
     let destination = sample_account(0x17);
     let tx = escrow_create_tx(account, destination, 9);
 
-    for (parent_close_time, expected) in [(1, Ter::TES_SUCCESS), (2, Ter::TEC_NO_PERMISSION)] {
+    for (parent_close_time, expected) in [(1001, Ter::TES_SUCCESS), (1002, Ter::TEC_NO_PERMISSION)] {
         let ledger = ledger_with_header(
             LedgerHeader {
                 parent_close_time,

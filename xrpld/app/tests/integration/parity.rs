@@ -1363,6 +1363,7 @@ fn escrow_create_with_condition() {
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_account_id(sf("sfDestination"), bob);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000_000));
+        tx.set_field_u32(sf("sfFinishAfter"), 1001);
         tx.set_field_vl(sf("sfCondition"), &condition);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -3111,6 +3112,7 @@ fn escrow_create_to_self_with_condition() {
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_account_id(sf("sfDestination"), alice); // self
         tx.set_field_amount(sf("sfAmount"), xrp(500_000));
+        tx.set_field_u32(sf("sfFinishAfter"), 1001);
         tx.set_field_vl(sf("sfCondition"), &condition);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -4166,6 +4168,7 @@ fn escrow_create_cancel_only() {
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_account_id(sf("sfDestination"), bob);
         tx.set_field_amount(sf("sfAmount"), xrp(500_000));
+        tx.set_field_u32(sf("sfFinishAfter"), 1000);
         tx.set_field_u32(sf("sfCancelAfter"), 5000); // future
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -4541,7 +4544,7 @@ fn escrow_create_finish_cancel_sequence() {
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_account_id(sf("sfDestination"), bob);
         tx.set_field_amount(sf("sfAmount"), xrp(500_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500); // past
+        tx.set_field_u32(sf("sfFinishAfter"), 1000);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -4559,7 +4562,7 @@ fn escrow_create_finish_cancel_sequence() {
     });
     assert_eq!(
         full_apply(&mut view, &tx2, TxType::ESCROW_FINISH),
-        Ter::TES_SUCCESS
+        Ter::TEC_NO_PERMISSION
     );
 }
 
@@ -5137,25 +5140,33 @@ fn offer_crossing_issuer_sells_own_token() {
 fn escrow_create_then_cancel_after_time() {
     let alice = acct(0x11);
     let bob = acct(0x22);
-    let ledger = build_ledger(vec![
+    let mut ledger = build_ledger(vec![
         account_root(alice, 5_000_000_000, 0, 0),
         account_root(bob, 5_000_000_000, 0, 0),
     ]);
-    let mut view = new_view(ledger);
-    // Create with past cancel time
+    // Create an escrow which becomes cancellable only after the next close.
     let tx1 = STTx::new(TxType::ESCROW_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_account_id(sf("sfDestination"), bob);
         tx.set_field_amount(sf("sfAmount"), xrp(500_000));
-        tx.set_field_u32(sf("sfCancelAfter"), 500); // past
+        tx.set_field_u32(sf("sfFinishAfter"), 1000);
+        tx.set_field_u32(sf("sfCancelAfter"), 1001);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
+    let mut create_view = ledger::Sandbox::new(Arc::new(ledger.clone()), protocol::ApplyFlags::NONE);
     assert_eq!(
-        full_apply(&mut view, &tx1, TxType::ESCROW_CREATE),
+        handle_real_dispatch(&mut create_view, &tx1, TxType::ESCROW_CREATE, None),
         Ter::TES_SUCCESS
     );
-    // Cancel (time has passed)
+    create_view
+        .apply(&mut ledger)
+        .expect("create state should apply");
+
+    let mut header = ledger.header();
+    header.parent_close_time = 1002;
+    ledger.set_ledger_info(header);
+
     let tx2 = STTx::new(TxType::ESCROW_CANCEL, |tx| {
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_account_id(sf("sfOwner"), alice);
@@ -5163,8 +5174,9 @@ fn escrow_create_then_cancel_after_time() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 2);
     });
+    let mut cancel_view = ledger::Sandbox::new(Arc::new(ledger.clone()), protocol::ApplyFlags::NONE);
     assert_eq!(
-        full_apply(&mut view, &tx2, TxType::ESCROW_CANCEL),
+        handle_real_dispatch(&mut cancel_view, &tx2, TxType::ESCROW_CANCEL, None),
         Ter::TES_SUCCESS
     );
 }
@@ -6335,7 +6347,7 @@ fn escrow_create_with_both_condition_and_time() {
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_account_id(sf("sfDestination"), bob);
         tx.set_field_amount(sf("sfAmount"), xrp(500_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1001);
         tx.set_field_u32(sf("sfCancelAfter"), 5000);
         tx.set_field_vl(sf("sfCondition"), &condition);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -6632,7 +6644,7 @@ fn escrow_create_minimum_amount() {
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_account_id(sf("sfDestination"), bob);
         tx.set_field_amount(sf("sfAmount"), xrp(1)); // minimum: 1 drop
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1001);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7039,7 +7051,7 @@ fn escrow_create_max_amount() {
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_account_id(sf("sfDestination"), bob);
         tx.set_field_amount(sf("sfAmount"), xrp(80_000_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1001);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -7323,7 +7335,7 @@ fn escrow_create_one_second_finish() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(100_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 1);
+        tx.set_field_u32(sf("sfFinishAfter"), 1001);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8071,7 +8083,7 @@ fn b13_escrow_create_10_drops() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(10));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1000);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -8457,6 +8469,7 @@ fn b14_escrow_create_100k_drops() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(100_000));
+        tx.set_field_u32(sf("sfFinishAfter"), 1000);
         tx.set_field_u32(sf("sfCancelAfter"), 9999);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -8750,7 +8763,7 @@ fn b14_escrow_create_with_dest_tag() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(500_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1000);
         tx.set_field_u32(sf("sfDestinationTag"), 42);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -9097,7 +9110,7 @@ fn b15_escrow_create_1_xrp() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1000);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -9401,6 +9414,7 @@ fn b15_escrow_create_50_xrp() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(50_000_000));
+        tx.set_field_u32(sf("sfFinishAfter"), 1000);
         tx.set_field_u32(sf("sfCancelAfter"), 2000);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -9732,7 +9746,7 @@ fn b16_escrow_create_500_xrp() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(500_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 800);
+        tx.set_field_u32(sf("sfFinishAfter"), 1000);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -10043,7 +10057,7 @@ fn b16_escrow_create_with_source_tag() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(300_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 600);
+        tx.set_field_u32(sf("sfFinishAfter"), 1000);
         tx.set_field_u32(sf("sfSourceTag"), 77);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
@@ -17419,7 +17433,7 @@ fn ledger_escrow_creates_entry() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(500_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1001);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -18769,7 +18783,7 @@ fn ls4_escrow_deducts_source() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1001);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
@@ -19197,23 +19211,30 @@ fn ls5_trust_set_ten_currencies() {
 fn ls5_escrow_create_finish_balance_check() {
     let a = acct(0x11);
     let b = acct(0x22);
-    let l = build_ledger(vec![
+    let mut ledger = build_ledger(vec![
         account_root(a, 5_000_000_000, 0, 0),
         account_root(b, 1_000_000_000, 0, 0),
     ]);
-    let mut v = new_view(l);
     let tx1 = STTx::new(TxType::ESCROW_CREATE, |tx| {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(2_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1001);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
+    let mut create_view = ledger::Sandbox::new(Arc::new(ledger.clone()), protocol::ApplyFlags::NONE);
     assert_eq!(
-        full_apply(&mut v, &tx1, TxType::ESCROW_CREATE),
+        handle_real_dispatch(&mut create_view, &tx1, TxType::ESCROW_CREATE, None),
         Ter::TES_SUCCESS
     );
+    create_view
+        .apply(&mut ledger)
+        .expect("create state should apply");
+    let mut header = ledger.header();
+    header.parent_close_time = 1002;
+    ledger.set_ledger_info(header);
+
     let tx2 = STTx::new(TxType::ESCROW_FINISH, |tx| {
         tx.set_account_id(sf("sfAccount"), b);
         tx.set_account_id(sf("sfOwner"), a);
@@ -19221,11 +19242,12 @@ fn ls5_escrow_create_finish_balance_check() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
+    let mut finish_view = ledger::Sandbox::new(Arc::new(ledger), protocol::ApplyFlags::NONE);
     assert_eq!(
-        full_apply(&mut v, &tx2, TxType::ESCROW_FINISH),
+        handle_real_dispatch(&mut finish_view, &tx2, TxType::ESCROW_FINISH, None),
         Ter::TES_SUCCESS
     );
-    let b_bal = v
+    let b_bal = finish_view
         .read(account_keylet(acct_id(b)))
         .unwrap()
         .unwrap()
@@ -31503,11 +31525,14 @@ fn lv2_escrow_creates_entry() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
+        tx.set_field_u32(sf("sfFinishAfter"), 1001);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    full_apply(&mut v, &tx, TxType::ESCROW_CREATE);
+    assert_eq!(
+        full_apply(&mut v, &tx, TxType::ESCROW_CREATE),
+        Ter::TES_SUCCESS
+    );
     let k = protocol::escrow_keylet(acct_id(a), 1);
     assert!(v.peek(k).ok().flatten().is_some());
 }

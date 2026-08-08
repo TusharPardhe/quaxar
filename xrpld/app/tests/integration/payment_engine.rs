@@ -24016,8 +24016,8 @@ fn cpp_step3_escrow_create_both_times_valid() {
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_account_id(sf("sfDestination"), b);
         tx.set_field_amount(sf("sfAmount"), xrp(1_000_000));
-        tx.set_field_u32(sf("sfFinishAfter"), 500);
-        tx.set_field_u32(sf("sfCancelAfter"), 1000);
+        tx.set_field_u32(sf("sfFinishAfter"), 1001);
+        tx.set_field_u32(sf("sfCancelAfter"), 1002);
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });

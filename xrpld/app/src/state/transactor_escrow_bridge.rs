@@ -8,6 +8,19 @@ use tx::escrow::escrow_cancel::EscrowCancelApplySink;
 use tx::escrow::escrow_create::{EscrowCreateApplyFacts, EscrowCreateApplySink};
 use tx::escrow::escrow_finish::EscrowFinishApplySink;
 
+/// Check the source account's reserve after XRP is locked without relying on
+/// signed subtraction. rippled's STAmount arithmetic permits an intermediate
+/// negative value, whereas a Rust `i64` subtraction would panic in debug mode.
+fn xrp_post_lock_reserve_sufficient(
+    balance_drops: i64,
+    escrow_drops: i64,
+    reserve_drops: i64,
+) -> bool {
+    balance_drops
+        .checked_sub(escrow_drops)
+        .is_some_and(|remaining| remaining >= reserve_drops)
+}
+
 pub fn build_escrow_create_facts<V: ApplyView>(
     view: &mut V,
     account: &AccountID,
@@ -31,17 +44,28 @@ pub fn build_escrow_create_facts<V: ApplyView>(
     {
         facts.owner_exists = true;
         let owner_count = src_sle.get_field_u32(get_field_by_symbol("sfOwnerCount"));
-        facts.reserve_sufficient = view.fees().account_reserve(owner_count as usize + 1) as i64
-            <= src_sle
-                .get_field_amount(get_field_by_symbol("sfBalance"))
-                .xrp()
-                .drops();
+        let reserve_drops = view.fees().account_reserve(owner_count as usize + 1) as i64;
+        let balance_drops = src_sle
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops();
+        facts.reserve_sufficient = reserve_drops <= balance_drops;
         facts.xrp_balance_covers_amount = !amount.native()
-            || src_sle
-                .get_field_amount(get_field_by_symbol("sfBalance"))
-                .xrp()
-                .drops()
-                >= amount.xrp().drops();
+            || xrp_post_lock_reserve_sufficient(balance_drops, amount.xrp().drops(), reserve_drops);
+        facts.should_set_transfer_rate = !amount.native()
+            && view.rules().enabled(&protocol::feature_token_escrow())
+            && match amount.asset() {
+                Asset::Issue(issue) => {
+                    ledger::ripple_state_helpers::transfer_rate(view, &issue.issuer())
+                        != protocol::PARITY_RATE.value
+                }
+                Asset::MPTIssue(issue) => {
+                    ledger::mptoken_helpers::transfer_rate_mpt(view, issue.mpt_id())
+                        .map(|rate| rate.value)
+                        .unwrap_or(protocol::PARITY_RATE.value)
+                        != protocol::PARITY_RATE.value
+                }
+            };
     }
 
     facts.destination_exists = view.exists(protocol::account_keylet(Uint160::from_void(
@@ -95,21 +119,6 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
         if let Some(destination_tag) = self.destination_tag {
             sle.set_field_u32(get_field_by_symbol("sfDestinationTag"), destination_tag);
         }
-        if !self.amount.native() {
-            let rate = match self.amount.asset() {
-                Asset::Issue(issue) => {
-                    ledger::ripple_state_helpers::transfer_rate(self.view, &issue.issuer())
-                }
-                Asset::MPTIssue(issue) => {
-                    ledger::mptoken_helpers::transfer_rate_mpt(self.view, issue.mpt_id())
-                        .map(|rate| rate.value)
-                        .unwrap_or(protocol::PARITY_RATE.value)
-                }
-            };
-            if rate != protocol::PARITY_RATE.value {
-                sle.set_field_u32(get_field_by_symbol("sfTransferRate"), rate);
-            }
-        }
         let _ = self.view.insert(Arc::new(sle));
     }
     fn set_sequence_field(&mut self) {
@@ -124,7 +133,28 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
                 .update(Arc::new(STLedgerEntry::from_stobject(obj, *sle.key())));
         }
     }
-    fn set_transfer_rate(&mut self) {}
+    fn set_transfer_rate(&mut self) {
+        let rate = match self.amount.asset() {
+            Asset::Issue(issue) => {
+                ledger::ripple_state_helpers::transfer_rate(self.view, &issue.issuer())
+            }
+            Asset::MPTIssue(issue) => {
+                ledger::mptoken_helpers::transfer_rate_mpt(self.view, issue.mpt_id())
+                    .map(|rate| rate.value)
+                    .unwrap_or(protocol::PARITY_RATE.value)
+            }
+        };
+        if let Ok(Some(sle)) = self.view.peek(protocol::escrow_keylet(
+            Uint160::from_void(self.account.data()),
+            self.escrow_seq,
+        )) {
+            let mut object = sle.clone_as_object();
+            object.set_field_u32(get_field_by_symbol("sfTransferRate"), rate);
+            let _ = self
+                .view
+                .update(Arc::new(STLedgerEntry::from_stobject(object, *sle.key())));
+        }
+    }
     fn insert_sender_owner_dir(&mut self) -> Option<u64> {
         let escrow_kl =
             protocol::escrow_keylet(Uint160::from_void(self.account.data()), self.escrow_seq);
@@ -244,6 +274,21 @@ impl<'a, V: ApplyView> EscrowCreateApplySink for ViewBackedEscrowCreateSink<'a, 
         ))) {
             let _ = self.view.update(src_sle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::xrp_post_lock_reserve_sufficient;
+
+    #[test]
+    fn xrp_post_lock_reserve_rejects_an_escrow_larger_than_the_source_balance() {
+        assert!(!xrp_post_lock_reserve_sufficient(10, 11, 0));
+    }
+
+    #[test]
+    fn xrp_post_lock_reserve_accepts_an_exact_reserve_remainder() {
+        assert!(xrp_post_lock_reserve_sufficient(100, 60, 40));
     }
 }
 

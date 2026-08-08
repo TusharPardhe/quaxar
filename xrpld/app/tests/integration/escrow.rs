@@ -362,7 +362,10 @@ fn escrow_create_and_cancel() {
         account_root(alice, 5_000_000_000, 0, 0),
         account_root(bob, 5_000_000_000, 0, 0),
     ]);
-    let tx_create = escrow_create_cancel_tx(alice, bob, 1_000_000_000, 1, 1_001);
+    let mut tx_create = escrow_create_cancel_tx(alice, bob, 1_000_000_000, 1, 1_001);
+    // rippled rejects a cancel-only escrow: provide a finish time before
+    // CancelAfter so the lifecycle exercises cancellation rather than malformed preflight.
+    tx_create.set_field_u32(sf("sfFinishAfter"), 1_000);
     let mut create_view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
     assert_eq!(
         handle_real_dispatch(&mut create_view, &tx_create, TxType::ESCROW_CREATE, None),

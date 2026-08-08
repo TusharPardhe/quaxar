@@ -10,7 +10,7 @@
 
 use crate::TxConsequences;
 use crate::consequences::{TxConsequencesShape, build_tx_consequences};
-use protocol::{NotTec, SeqProxy, Ter, is_tes_success};
+use protocol::{NotTec, Rules, STTx, SeqProxy, Ter, get_field_by_symbol, is_tes_success};
 
 pub const MAX_MPTOKEN_AMOUNT: u64 = 0x7fff_ffff_ffff_ffff;
 
@@ -27,6 +27,8 @@ pub struct EscrowCreatePreflightFacts {
     pub amount_positive: bool,
     pub feature_token_escrow_enabled: bool,
     pub feature_mptokens_enabled: bool,
+    /// `fixCleanup3_2_0` moves the MPTokensV1 gate ahead of EscrowCreate.
+    pub fix_cleanup_3_2_0_enabled: bool,
     pub issue_has_bad_currency: bool,
     pub mpt_amount_within_limit: bool,
     pub cancel_after_present: bool,
@@ -124,6 +126,59 @@ pub fn run_escrow_create_make_tx_consequences(
     build_tx_consequences(fee_drops, seq_proxy, shape)
 }
 
+/// Build and run EscrowCreate preflight from the canonical transaction fields.
+/// Keeping parsing here makes semantic, submission, and live-apply paths agree
+/// on condition DER validation and amendment precedence.
+pub fn run_escrow_create_sttx_preflight(st_tx: &STTx, rules: &Rules) -> NotTec {
+    let amount_field = get_field_by_symbol("sfAmount");
+    let destination_field = get_field_by_symbol("sfDestination");
+    if !st_tx.is_field_present(amount_field) || !st_tx.is_field_present(destination_field) {
+        return Ter::TEM_MALFORMED;
+    }
+
+    let amount = st_tx.get_field_amount(amount_field);
+    let cancel_after_field = get_field_by_symbol("sfCancelAfter");
+    let finish_after_field = get_field_by_symbol("sfFinishAfter");
+    let condition_field = get_field_by_symbol("sfCondition");
+    let cancel_after = st_tx
+        .is_field_present(cancel_after_field)
+        .then(|| st_tx.get_field_u32(cancel_after_field));
+    let finish_after = st_tx
+        .is_field_present(finish_after_field)
+        .then(|| st_tx.get_field_u32(finish_after_field));
+    let condition = st_tx
+        .is_field_present(condition_field)
+        .then(|| st_tx.get_field_vl(condition_field));
+
+    run_escrow_create_preflight(EscrowCreatePreflightFacts {
+        amount_kind: if amount.native() {
+            EscrowCreateAmountKind::Xrp
+        } else if amount.holds_mpt_issue() {
+            EscrowCreateAmountKind::Mpt
+        } else {
+            EscrowCreateAmountKind::Issue
+        },
+        amount_positive: amount.signum() > 0 && amount.is_legal_net(),
+        feature_token_escrow_enabled: rules.enabled(&protocol::feature_token_escrow()),
+        feature_mptokens_enabled: rules.enabled(&protocol::feature_id("MPTokensV1")),
+        fix_cleanup_3_2_0_enabled: rules.enabled(&protocol::feature_id("fixCleanup3_2_0")),
+        issue_has_bad_currency: amount.holds_issue()
+            && amount.issue().currency == protocol::bad_currency(),
+        mpt_amount_within_limit: !amount.holds_mpt_issue()
+            || amount.mantissa() <= MAX_MPTOKEN_AMOUNT,
+        cancel_after_present: cancel_after.is_some(),
+        finish_after_present: finish_after.is_some(),
+        cancel_after_strictly_after_finish_after: match (cancel_after, finish_after) {
+            (Some(cancel), Some(finish)) => cancel > finish,
+            _ => true,
+        },
+        condition_present: condition.is_some(),
+        condition_valid: condition.is_none_or(|value| {
+            protocol::crypto::conditions::deserialize_condition(&value).is_ok()
+        }),
+    })
+}
+
 pub fn run_escrow_create_preflight(facts: EscrowCreatePreflightFacts) -> NotTec {
     match facts.amount_kind {
         EscrowCreateAmountKind::Xrp => {
@@ -140,6 +195,11 @@ pub fn run_escrow_create_preflight(facts: EscrowCreatePreflightFacts) -> NotTec 
             }
         }
         EscrowCreateAmountKind::Mpt => {
+            // fixCleanup3_2_0 moves MPTokensV1 into checkExtraFeatures,
+            // which runs before the normal TokenEscrow amount gate.
+            if facts.fix_cleanup_3_2_0_enabled && !facts.feature_mptokens_enabled {
+                return Ter::TEM_DISABLED;
+            }
             if !facts.feature_token_escrow_enabled {
                 return Ter::TEM_BAD_AMOUNT;
             }
@@ -161,6 +221,13 @@ pub fn run_escrow_create_preflight(facts: EscrowCreatePreflightFacts) -> NotTec 
         && !facts.cancel_after_strictly_after_finish_after
     {
         return Ter::TEM_BAD_EXPIRATION;
+    }
+
+    // A cancellable escrow without either an explicit finish time or a
+    // condition could be finished immediately. rippled rejects it after the
+    // timeout ordering checks, before DER parsing the supplied condition.
+    if !facts.finish_after_present && !facts.condition_present {
+        return Ter::TEM_MALFORMED;
     }
 
     if facts.condition_present && !facts.condition_valid {
