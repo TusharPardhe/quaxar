@@ -250,18 +250,18 @@ impl ConnectAttempt {
         .await?;
 
         self.ensure_not_stopping(&stop_requested)?;
-        let wire_response = self
+        let http_response = self
             .await_phase(ConnectionStep::HttpRead, &mut stop_requested, async {
                 read_http_response(&mut tls_stream)
                     .await
                     .map_err(ConnectAttemptError::Io)
             })
             .await?;
-        let response =
-            parse_http_response(&wire_response).map_err(ConnectAttemptError::InvalidHttp)?;
+        let response = parse_http_response(&http_response.wire)
+            .map_err(ConnectAttemptError::InvalidHttp)?;
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             if response.status() == StatusCode::SERVICE_UNAVAILABLE
-                && let Some(peers) = parse_redirect_peers(&wire_response)
+                && let Some(peers) = parse_redirect_peers(&http_response.wire)
             {
                 tracing::debug!(
                     target: "overlay",
@@ -291,7 +291,8 @@ impl ConnectAttempt {
             peer_id = %peer.id(),
             "Outbound connection established"
         );
-        let session = PeerSessionStarter::new(Box::new(tls_stream), self.stop_requested.clone());
+        let session = PeerSessionStarter::new(Box::new(tls_stream), self.stop_requested.clone())
+            .with_initial_buffer(http_response.read_ahead);
         Ok(ConnectAttemptResult {
             negotiated_features: response.headers().clone(),
             peer,
@@ -316,7 +317,12 @@ impl ConnectAttempt {
     }
 }
 
-async fn read_http_response<S>(stream: &mut S) -> Result<Vec<u8>, io::Error>
+struct HttpResponseRead {
+    wire: Vec<u8>,
+    read_ahead: Vec<u8>,
+}
+
+async fn read_http_response<S>(stream: &mut S) -> Result<HttpResponseRead, io::Error>
 where
     S: AsyncReadExt + Unpin,
 {
@@ -345,7 +351,11 @@ where
         if let Some(expected) = total_len
             && buffer.len() >= expected
         {
-            return Ok(buffer);
+            let read_ahead = buffer.split_off(expected);
+            return Ok(HttpResponseRead {
+                wire: buffer,
+                read_ahead,
+            });
         }
     }
 }
@@ -400,4 +410,26 @@ fn make_shared_value(stream: &SslStream<TcpStream>) -> Result<Uint256, ConnectAt
         &peer_finished[..peer_len],
     )
     .ok_or_else(|| ConnectAttemptError::Protocol("unable to derive shared value".to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_http_response;
+    use tokio::io::{AsyncWriteExt, duplex};
+
+    #[tokio::test]
+    async fn http_response_preserves_coalesced_overlay_read_ahead() {
+        let response = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: XRPL/2.2\r\n\r\n";
+        let frame = [0_u8, 0, 0, 1, 0, 3, 0x08];
+        let (mut reader, mut writer) = duplex(2048);
+        writer.write_all(response).await.expect("write response");
+        writer.write_all(&frame).await.expect("write frame");
+
+        let parsed = read_http_response(&mut reader)
+            .await
+            .expect("read coalesced response");
+
+        assert_eq!(parsed.wire, response);
+        assert_eq!(parsed.read_ahead, frame);
+    }
 }

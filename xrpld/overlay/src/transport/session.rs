@@ -45,6 +45,7 @@ impl PeerSessionHooks for NoopPeerSessionHooks {}
 
 pub struct PeerSessionStarter {
     stream: Option<BoxPeerSessionStream>,
+    initial_buffer: Vec<u8>,
     stop_requested: watch::Receiver<bool>,
 }
 
@@ -60,8 +61,15 @@ impl PeerSessionStarter {
     pub fn new(stream: BoxPeerSessionStream, stop_requested: watch::Receiver<bool>) -> Self {
         Self {
             stream: Some(stream),
+            initial_buffer: Vec::new(),
             stop_requested,
         }
+    }
+
+    /// Seed the session decoder with bytes read after the HTTP upgrade.
+    pub fn with_initial_buffer(mut self, initial_buffer: Vec<u8>) -> Self {
+        self.initial_buffer = initial_buffer;
+        self
     }
 
     pub fn start(
@@ -81,6 +89,7 @@ impl PeerSessionStarter {
         on_close: Arc<dyn Fn(PeerId) + Send + Sync>,
     ) -> JoinHandle<Result<(), OverlayError>> {
         let stream = self.stream.take().expect("peer session stream must exist");
+        let initial_buffer = std::mem::take(&mut self.initial_buffer);
         let stop_requested = self.stop_requested.clone();
         let (session_stop_tx, session_stop_rx) = watch::channel(false);
         // rippled's sendQueue_ is unbounded (PeerImp.cpp:322 always pushes).
@@ -98,6 +107,7 @@ impl PeerSessionStarter {
             let session = PeerSession::new(
                 peer,
                 stream,
+                initial_buffer,
                 receiver,
                 pending,
                 outbound_queue_depth,
@@ -114,6 +124,7 @@ impl PeerSessionStarter {
 struct PeerSession {
     peer: Arc<PeerImp>,
     stream: Option<BoxPeerSessionStream>,
+    initial_buffer: Vec<u8>,
     outbound: mpsc::UnboundedReceiver<Message>,
     pending_outbound: Vec<Message>,
     outbound_queue_depth: Arc<std::sync::atomic::AtomicUsize>,
@@ -171,6 +182,7 @@ impl PeerSession {
     fn new(
         peer: Arc<PeerImp>,
         stream: BoxPeerSessionStream,
+        initial_buffer: Vec<u8>,
         outbound: mpsc::UnboundedReceiver<Message>,
         pending_outbound: Vec<Message>,
         outbound_queue_depth: Arc<std::sync::atomic::AtomicUsize>,
@@ -182,6 +194,7 @@ impl PeerSession {
         Self {
             peer,
             stream: Some(stream),
+            initial_buffer,
             outbound,
             pending_outbound,
             outbound_queue_depth,
@@ -236,7 +249,7 @@ impl PeerSession {
     async fn run_inner(&mut self) -> Result<(), OverlayError> {
         let stream = self.stream.take().expect("peer session stream must exist");
         let (mut reader, mut writer) = tokio::io::split(stream);
-        let mut buffer = Vec::new();
+        let mut buffer = std::mem::take(&mut self.initial_buffer);
         let mut handler = PeerSessionDispatch::new(Arc::clone(&self.peer), Arc::clone(&self.hooks));
 
         if *self.stop_requested.borrow() || *self.session_stop.borrow() {
@@ -759,6 +772,51 @@ mod tests {
         );
         peer.send(probe);
         assert_eq!(peer.queued_messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn peer_session_dispatches_initial_read_ahead_frame() {
+        let peer = peer(4);
+        let (local, _remote) = duplex(4096);
+        let (_stop_requested, stop_rx) = watch::channel(false);
+        let hooks = Arc::new(RecordingHooks::default());
+        let initial = Message::new(
+            ProtocolMessage::new(ProtocolPayload::Transaction(TmTransaction {
+                raw_transaction: vec![4, 5, 6],
+                status: 1,
+                receive_timestamp: None,
+                deferred: None,
+            })),
+            None,
+        )
+        .get_buffer(Compressed::Off)
+        .to_vec();
+        let session = PeerSessionStarter::new(Box::new(local), stop_rx)
+            .with_initial_buffer(initial);
+        let handle = session.start(
+            Arc::clone(&peer),
+            hooks.clone(),
+            Arc::new(move |_peer_id: PeerId| {}),
+        );
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if hooks
+                    .messages
+                    .lock()
+                    .expect("messages lock")
+                    .contains(&(ProtocolMessageType::MtTransaction as u16))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial frame dispatch");
+
+        peer.detach_session();
+        handle.await.expect("session join").expect("session");
     }
 
     #[test]

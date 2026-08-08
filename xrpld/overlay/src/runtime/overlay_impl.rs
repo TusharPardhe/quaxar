@@ -1741,7 +1741,7 @@ impl OverlayImpl {
                 }
             },
         };
-        let request = match request_result {
+        let (request, read_ahead) = match request_result {
             Some(request) => request,
             None => return Ok(()),
         };
@@ -1974,10 +1974,10 @@ impl OverlayImpl {
                 peer,
                 response,
                 negotiated_features: headers,
-                session: Some(PeerSessionStarter::new(
-                    Box::new(tls_stream),
-                    stop_requested.clone(),
-                )),
+                session: Some(
+                    PeerSessionStarter::new(Box::new(tls_stream), stop_requested.clone())
+                        .with_initial_buffer(read_ahead),
+                ),
             };
             let _ = self.finalize_inbound_connect_result(result, inbound_reservation);
         }
@@ -3487,7 +3487,7 @@ where
 async fn read_http_request<S>(
     stream: &mut S,
     mut stop_requested: watch::Receiver<bool>,
-) -> Result<Option<Request<()>>, OverlayError>
+) -> Result<Option<(Request<()>, Vec<u8>)>, OverlayError>
 where
     S: AsyncReadExt + Unpin,
 {
@@ -3508,10 +3508,14 @@ where
             ));
         }
         buffer.extend_from_slice(&chunk[..read]);
-        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-            return parse_http_request(&buffer)
-                .map(Some)
-                .map_err(OverlayError::InvalidRequest);
+        if let Some(header_end) = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+        {
+            let read_ahead = buffer.split_off(header_end);
+            let request = parse_http_request(&buffer).map_err(OverlayError::InvalidRequest)?;
+            return Ok(Some((request, read_ahead)));
         }
     }
 }

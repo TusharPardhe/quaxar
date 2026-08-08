@@ -27,7 +27,7 @@ use super::{
     OverlayAcceptor, OverlayHandoff, OverlayImpl, OverlayInboundRouter, PEERFINDER_LIVE_CACHE_TTL,
     PEERFINDER_MAX_ACCEPTED_ENDPOINTS, PEERFINDER_MAX_HOPS, PEERFINDER_REDIRECT_ENDPOINT_COUNT,
     PeerReservation, PeerReservationSource, PeerReservationTable, RelayKind,
-    is_valid_peer_endpoint,
+    is_valid_peer_endpoint, read_http_request,
 };
 use crate::message::{
     Message, ProtocolMessage, ProtocolPayload, TmEndpoints, TmGetLedger, TmGetObjectByHash,
@@ -1218,6 +1218,24 @@ fn finalize_connected_peer_sends_cached_manifests() {
         messages[0].protocol().payload,
         ProtocolPayload::Manifests(TmManifests { ref list, .. }) if list.len() == 1
     ));
+}
+
+#[tokio::test]
+async fn http_request_preserves_coalesced_overlay_read_ahead() {
+    let request = b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n";
+    let frame = [0_u8, 0, 0, 1, 0, 3, 0x08];
+    let (mut reader, mut writer) = duplex(2048);
+    writer.write_all(request).await.expect("write request");
+    writer.write_all(&frame).await.expect("write frame");
+    let (_stop_tx, stop_rx) = watch::channel(false);
+
+    let (parsed, read_ahead) = read_http_request(&mut reader, stop_rx)
+        .await
+        .expect("read request")
+        .expect("request available");
+
+    assert_eq!(parsed.uri().path(), "/");
+    assert_eq!(read_ahead, frame);
 }
 
 #[test]
