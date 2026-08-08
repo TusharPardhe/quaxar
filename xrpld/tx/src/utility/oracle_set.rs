@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use protocol::{NotTec, Ter, is_tes_success};
+use protocol::{Currency, NotTec, STObject, STTx, Ter, get_field_by_symbol, is_tes_success};
 
 pub const MAX_ORACLE_URI_LEN: usize = 256;
 pub const MAX_ORACLE_PROVIDER_LEN: usize = 256;
@@ -32,8 +32,10 @@ pub struct OracleSetPreclaimFrontFacts {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OracleTokenPair {
-    pub base_asset: String,
-    pub quote_asset: String,
+    /// Canonical serialized currencies. Oracle ordering is defined over these
+    /// values, not their JSON or debug string renderings.
+    pub base_asset: Currency,
+    pub quote_asset: Currency,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,9 +60,11 @@ pub struct OracleSetPreclaimFacts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OracleSetApplyFacts {
-    pub provider: String,
-    pub asset_class: String,
-    pub uri: Option<String>,
+    /// All three fields are variable-length bytes on-ledger. Keeping them as
+    /// bytes avoids changing non-UTF-8 values while reconstructing an Oracle.
+    pub provider: Vec<u8>,
+    pub asset_class: Vec<u8>,
+    pub uri: Option<Vec<u8>>,
     pub last_update_time_secs: u64,
     pub oracle_document_id: u32,
     pub tx_series: Vec<OracleSetSeriesEntry>,
@@ -75,7 +79,8 @@ pub struct OracleSetLoadedOracle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OracleSetUpdateMutation {
     pub updated_series: Vec<OracleSetSeriesEntry>,
-    pub uri: Option<String>,
+    /// `None` means the transaction omitted URI and the stored URI is retained.
+    pub uri: Option<Vec<u8>>,
     pub last_update_time_secs: u64,
     pub set_oracle_document_id: bool,
     pub oracle_document_id: u32,
@@ -83,9 +88,9 @@ pub struct OracleSetUpdateMutation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OracleSetCreateMutation {
-    pub provider: String,
-    pub asset_class: String,
-    pub uri: Option<String>,
+    pub provider: Vec<u8>,
+    pub asset_class: Vec<u8>,
+    pub uri: Option<Vec<u8>>,
     pub price_data_series: Vec<OracleSetSeriesEntry>,
     pub last_update_time_secs: u64,
     pub include_oracle_document_id: bool,
@@ -98,13 +103,64 @@ pub trait OracleSetReserveSink {
 }
 
 pub trait OracleSetApplySink {
-    fn existing_oracle(&mut self) -> Option<OracleSetLoadedOracle>;
+    fn existing_oracle(&mut self) -> Result<Option<OracleSetLoadedOracle>, Ter>;
     fn fix_include_keylet_fields_enabled(&mut self) -> bool;
     fn fix_price_oracle_order_enabled(&mut self) -> bool;
     fn adjust_owner_count(&mut self, delta: i8) -> bool;
-    fn update_existing_oracle(&mut self, mutation: OracleSetUpdateMutation);
-    fn insert_owner_dir(&mut self) -> Option<u64>;
-    fn create_oracle(&mut self, mutation: OracleSetCreateMutation);
+    fn update_existing_oracle(&mut self, mutation: OracleSetUpdateMutation) -> bool;
+    fn insert_owner_dir(&mut self) -> Result<Option<u64>, Ter>;
+    fn create_oracle(&mut self, mutation: OracleSetCreateMutation) -> bool;
+}
+
+/// Reconstruct price data from the serialized fields shared by STTx and SLE.
+/// This preserves the canonical `Currency` ordering used by rippled.
+pub fn oracle_set_series_from_stobject(st_object: &STObject) -> Vec<OracleSetSeriesEntry> {
+    st_object
+        .get_field_array(get_field_by_symbol("sfPriceDataSeries"))
+        .iter()
+        .map(|entry| OracleSetSeriesEntry {
+            pair: OracleTokenPair {
+                base_asset: entry
+                    .get_field_currency(get_field_by_symbol("sfBaseAsset"))
+                    .currency(),
+                quote_asset: entry
+                    .get_field_currency(get_field_by_symbol("sfQuoteAsset"))
+                    .currency(),
+            },
+            asset_price: entry
+                .is_field_present(get_field_by_symbol("sfAssetPrice"))
+                .then(|| entry.get_field_u64(get_field_by_symbol("sfAssetPrice"))),
+            scale: entry
+                .is_field_present(get_field_by_symbol("sfScale"))
+                .then(|| u16::from(entry.get_field_u8(get_field_by_symbol("sfScale")))),
+        })
+        .collect()
+}
+
+/// Execute OracleSet's complete transaction-local preflight once for every
+/// caller that begins with an STTx.
+pub fn run_oracle_set_sttx_preflight(st_tx: &STTx) -> NotTec {
+    let price_data_series = get_field_by_symbol("sfPriceDataSeries");
+
+    // STObject exposes an absent array as its empty default. This deliberately
+    // matches rippled's `getFieldArray(...).empty()` path, which returns
+    // temARRAY_EMPTY rather than temMALFORMED for an omitted series.
+    run_oracle_set_preflight(OracleSetPreflightFacts {
+        price_data_series_len: st_tx.get_field_array(price_data_series).len(),
+        provider_len: st_tx
+            .is_field_present(get_field_by_symbol("sfProvider"))
+            .then(|| st_tx.get_field_vl(get_field_by_symbol("sfProvider")).len()),
+        uri_len: st_tx
+            .is_field_present(get_field_by_symbol("sfURI"))
+            .then(|| st_tx.get_field_vl(get_field_by_symbol("sfURI")).len()),
+        asset_class_len: st_tx
+            .is_field_present(get_field_by_symbol("sfAssetClass"))
+            .then(|| {
+                st_tx
+                    .get_field_vl(get_field_by_symbol("sfAssetClass"))
+                    .len()
+            }),
+    })
 }
 
 fn invalid_length(length: Option<usize>, max_len: usize) -> bool {
@@ -280,7 +336,11 @@ pub fn run_oracle_set_do_apply<S: OracleSetApplySink>(
     facts: OracleSetApplyFacts,
     sink: &mut S,
 ) -> Ter {
-    if let Some(loaded) = sink.existing_oracle() {
+    let loaded = match sink.existing_oracle() {
+        Ok(loaded) => loaded,
+        Err(error) => return error,
+    };
+    if let Some(loaded) = loaded {
         let mut pairs = collect_current_pairs_for_update(&loaded);
         let old_count = owner_count_for_pair_count(pairs.len());
 
@@ -305,14 +365,17 @@ pub fn run_oracle_set_do_apply<S: OracleSetApplySink>(
 
         let set_oracle_document_id =
             !loaded.has_oracle_document_id && sink.fix_include_keylet_fields_enabled();
-        sink.update_existing_oracle(OracleSetUpdateMutation {
+        return if sink.update_existing_oracle(OracleSetUpdateMutation {
             updated_series,
             uri: facts.uri,
             last_update_time_secs: facts.last_update_time_secs,
             set_oracle_document_id,
             oracle_document_id: facts.oracle_document_id,
-        });
-        return Ter::TES_SUCCESS;
+        }) {
+            Ter::TES_SUCCESS
+        } else {
+            Ter::TEF_INTERNAL
+        };
     }
 
     let price_data_series: Vec<_> = if !sink.fix_price_oracle_order_enabled() {
@@ -326,8 +389,9 @@ pub fn run_oracle_set_do_apply<S: OracleSetApplySink>(
     };
 
     let owner_node = match sink.insert_owner_dir() {
-        Some(owner_node) => owner_node,
-        None => return Ter::TEC_DIR_FULL,
+        Ok(Some(owner_node)) => owner_node,
+        Ok(None) => return Ter::TEC_DIR_FULL,
+        Err(error) => return error,
     };
 
     let adjust = owner_count_for_pair_count(price_data_series.len());
@@ -336,7 +400,7 @@ pub fn run_oracle_set_do_apply<S: OracleSetApplySink>(
     }
 
     let include_oracle_document_id = sink.fix_include_keylet_fields_enabled();
-    sink.create_oracle(OracleSetCreateMutation {
+    if sink.create_oracle(OracleSetCreateMutation {
         provider: facts.provider,
         asset_class: facts.asset_class,
         uri: facts.uri,
@@ -345,13 +409,16 @@ pub fn run_oracle_set_do_apply<S: OracleSetApplySink>(
         include_oracle_document_id,
         oracle_document_id: facts.oracle_document_id,
         owner_node,
-    });
-    Ter::TES_SUCCESS
+    }) {
+        Ter::TES_SUCCESS
+    } else {
+        Ter::TEF_INTERNAL
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use protocol::{Ter, trans_token};
+    use protocol::{STTx, Ter, TxType, currency_from_string, trans_token};
 
     use super::{
         MAX_ORACLE_DATA_SERIES, MAX_ORACLE_LAST_UPDATE_TIME_DELTA_SECS, MAX_ORACLE_PRICE_SCALE,
@@ -361,6 +428,7 @@ mod tests {
         OracleSetPreclaimFrontFacts, OracleSetPreflightFacts, OracleSetReserveSink,
         OracleSetSeriesEntry, OracleSetUpdateMutation, OracleTokenPair, run_oracle_set_do_apply,
         run_oracle_set_preclaim, run_oracle_set_preclaim_front, run_oracle_set_preflight,
+        run_oracle_set_sttx_preflight,
     };
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,9 +483,9 @@ mod tests {
     }
 
     impl OracleSetApplySink for TestApplySink {
-        fn existing_oracle(&mut self) -> Option<OracleSetLoadedOracle> {
+        fn existing_oracle(&mut self) -> Result<Option<OracleSetLoadedOracle>, Ter> {
             self.events.push("existing_oracle".to_string());
-            self.existing_oracle.clone()
+            Ok(self.existing_oracle.clone())
         }
 
         fn fix_include_keylet_fields_enabled(&mut self) -> bool {
@@ -436,26 +504,28 @@ mod tests {
             self.adjust_owner_count_ok
         }
 
-        fn update_existing_oracle(&mut self, mutation: OracleSetUpdateMutation) {
+        fn update_existing_oracle(&mut self, mutation: OracleSetUpdateMutation) -> bool {
             self.events.push("update".to_string());
             self.update_mutation = Some(mutation);
+            true
         }
 
-        fn insert_owner_dir(&mut self) -> Option<u64> {
+        fn insert_owner_dir(&mut self) -> Result<Option<u64>, Ter> {
             self.events.push("dir_insert".to_string());
-            self.insert_owner_dir_result
+            Ok(self.insert_owner_dir_result)
         }
 
-        fn create_oracle(&mut self, mutation: OracleSetCreateMutation) {
+        fn create_oracle(&mut self, mutation: OracleSetCreateMutation) -> bool {
             self.events.push("create".to_string());
             self.create_mutation = Some(mutation);
+            true
         }
     }
 
     fn pair(base: &str, quote: &str) -> OracleTokenPair {
         OracleTokenPair {
-            base_asset: base.to_string(),
-            quote_asset: quote.to_string(),
+            base_asset: currency_from_string(base),
+            quote_asset: currency_from_string(quote),
         }
     }
 
@@ -505,13 +575,23 @@ mod tests {
 
     fn apply_facts() -> OracleSetApplyFacts {
         OracleSetApplyFacts {
-            provider: "provider".to_string(),
-            asset_class: "currency".to_string(),
-            uri: Some("URI".to_string()),
+            provider: b"provider".to_vec(),
+            asset_class: b"currency".to_vec(),
+            uri: Some(b"URI".to_vec()),
             last_update_time_secs: ORACLE_LAST_UPDATE_TIME_EPOCH_OFFSET_SECS + 10_000,
             oracle_document_id: 7,
             tx_series: vec![entry("XRP", "USD", Some(740), Some(1))],
         }
+    }
+
+    #[test]
+    fn oracle_set_sttx_preflight_maps_an_absent_series_to_array_empty() {
+        let transaction = STTx::new(TxType::ORACLE_SET, |_| {});
+
+        assert_eq!(
+            run_oracle_set_sttx_preflight(&transaction),
+            Ter::TEM_ARRAY_EMPTY
+        );
     }
 
     #[test]
@@ -961,9 +1041,9 @@ mod tests {
         assert_eq!(
             update.updated_series,
             vec![
-                entry("BTC", "USD", None, None),
                 entry("XRP", "EUR", Some(711), Some(2)),
                 entry("XRP", "USD", Some(742), Some(2)),
+                entry("BTC", "USD", None, None),
             ]
         );
     }

@@ -120,24 +120,14 @@ impl<V: ReadView> OracleSetReserveSink for OracleReserve<'_, V> {
     }
 }
 
-fn oracle_pair(entry: &protocol::STObject) -> OracleTokenPair {
-    OracleTokenPair {
-        base_asset: format!(
-            "{:?}",
-            entry.get_field_currency(sf("sfBaseAsset")).currency()
-        ),
-        quote_asset: format!(
-            "{:?}",
-            entry.get_field_currency(sf("sfQuoteAsset")).currency()
-        ),
-    }
-}
-
 fn oracle_series(series: &protocol::STArray) -> Vec<OracleSetSeriesEntry> {
     series
         .iter()
         .map(|entry| OracleSetSeriesEntry {
-            pair: oracle_pair(entry),
+            pair: OracleTokenPair {
+                base_asset: entry.get_field_currency(sf("sfBaseAsset")).currency(),
+                quote_asset: entry.get_field_currency(sf("sfQuoteAsset")).currency(),
+            },
             asset_price: entry
                 .is_field_present(sf("sfAssetPrice"))
                 .then(|| entry.get_field_u64(sf("sfAssetPrice"))),

@@ -4334,7 +4334,9 @@ fn oracle_set_keylet_fields_and_creation_order_track_amendments() {
         oracle_price_data_with_currencies(currency_from_string("XRP"), high_currency, 742, 2),
         oracle_price_data("XRP", "USD", 711, 2),
     ];
-    let create = oracle_set_tx(account, document_id, 1_000, &input_series, true);
+    let mut create = oracle_set_tx(account, document_id, 1_000, &input_series, true);
+    let raw_uri = [0xFF, 0x00, b'o', b'r', b'a', b'c', b'l', b'e'];
+    create.set_field_vl(sf("sfURI"), &raw_uri);
     let update = oracle_set_tx(account, document_id, 1_001, &input_series, false);
     let keylet = protocol::oracle_keylet(raw_account_id(account), document_id);
 
@@ -4349,6 +4351,7 @@ fn oracle_set_keylet_fields_and_creation_order_track_amendments() {
         .expect("legacy oracle read")
         .expect("legacy oracle exists");
     assert!(!legacy_created.is_field_present(sf("sfOracleDocumentID")));
+    assert_eq!(legacy_created.get_field_vl(sf("sfURI")), raw_uri);
     let legacy_created_series = legacy_created.get_field_array(sf("sfPriceDataSeries"));
     assert_eq!(
         oracle_pair(legacy_created_series.get(0).expect("first legacy pair")),
@@ -4368,6 +4371,7 @@ fn oracle_set_keylet_fields_and_creation_order_track_amendments() {
         .expect("updated legacy oracle read")
         .expect("updated legacy oracle exists");
     assert!(!legacy_updated.is_field_present(sf("sfOracleDocumentID")));
+    assert_eq!(legacy_updated.get_field_vl(sf("sfURI")), raw_uri);
     let legacy_updated_series = legacy_updated.get_field_array(sf("sfPriceDataSeries"));
     assert_eq!(
         oracle_pair(

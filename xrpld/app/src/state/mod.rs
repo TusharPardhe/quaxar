@@ -27,6 +27,7 @@ pub mod transactor_apply_bridge;
 pub mod transactor_check_bridge;
 pub mod transactor_dispatcher;
 pub mod transactor_escrow_bridge;
+pub mod transactor_oracle_bridge;
 pub mod trust_set;
 pub mod tuning;
 pub mod vault;

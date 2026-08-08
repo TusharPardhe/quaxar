@@ -1,7 +1,7 @@
 //! Integration tests that pin the narrowed Rust `OracleSet.cpp` shells to the
 //! current C++ behavior.
 
-use protocol::{Ter, trans_token};
+use protocol::{Ter, currency_from_string, trans_token};
 use tx::{
     MAX_ORACLE_DATA_SERIES, MAX_ORACLE_LAST_UPDATE_TIME_DELTA_SECS, MAX_ORACLE_PRICE_SCALE,
     MAX_ORACLE_PROVIDER_LEN, MAX_ORACLE_SYMBOL_CLASS_LEN, MAX_ORACLE_URI_LEN,
@@ -62,8 +62,8 @@ impl TestApplySink {
 }
 
 impl OracleSetApplySink for TestApplySink {
-    fn existing_oracle(&mut self) -> Option<OracleSetLoadedOracle> {
-        self.existing_oracle.clone()
+    fn existing_oracle(&mut self) -> Result<Option<OracleSetLoadedOracle>, Ter> {
+        Ok(self.existing_oracle.clone())
     }
 
     fn fix_include_keylet_fields_enabled(&mut self) -> bool {
@@ -79,16 +79,18 @@ impl OracleSetApplySink for TestApplySink {
         self.adjust_owner_count_ok
     }
 
-    fn update_existing_oracle(&mut self, mutation: OracleSetUpdateMutation) {
+    fn update_existing_oracle(&mut self, mutation: OracleSetUpdateMutation) -> bool {
         self.update_mutation = Some(mutation);
+        true
     }
 
-    fn insert_owner_dir(&mut self) -> Option<u64> {
-        self.insert_owner_dir_result
+    fn insert_owner_dir(&mut self) -> Result<Option<u64>, Ter> {
+        Ok(self.insert_owner_dir_result)
     }
 
-    fn create_oracle(&mut self, mutation: OracleSetCreateMutation) {
+    fn create_oracle(&mut self, mutation: OracleSetCreateMutation) -> bool {
         self.create_mutation = Some(mutation);
+        true
     }
 }
 
@@ -111,8 +113,8 @@ fn preclaim_front_facts() -> OracleSetPreclaimFrontFacts {
 
 fn pair(base: &str, quote: &str) -> OracleTokenPair {
     OracleTokenPair {
-        base_asset: base.to_string(),
-        quote_asset: quote.to_string(),
+        base_asset: currency_from_string(base),
+        quote_asset: currency_from_string(quote),
     }
 }
 
@@ -145,9 +147,9 @@ fn preclaim_facts() -> OracleSetPreclaimFacts {
 
 fn apply_facts() -> OracleSetApplyFacts {
     OracleSetApplyFacts {
-        provider: "provider".to_string(),
-        asset_class: "currency".to_string(),
-        uri: Some("URI".to_string()),
+        provider: b"provider".to_vec(),
+        asset_class: b"currency".to_vec(),
+        uri: Some(b"URI".to_vec()),
         last_update_time_secs: ORACLE_LAST_UPDATE_TIME_EPOCH_OFFSET_SECS + 10_000,
         oracle_document_id: 7,
         tx_series: vec![entry("XRP", "USD", Some(740), Some(1))],
@@ -413,9 +415,9 @@ fn oracle_set_do_apply_update_merges_pairs_and_sets_document_id() {
     assert_eq!(
         update.updated_series,
         vec![
-            entry("BTC", "USD", None, None),
             entry("XRP", "EUR", Some(711), Some(2)),
             entry("XRP", "USD", Some(742), Some(2)),
+            entry("BTC", "USD", None, None),
         ]
     );
 }

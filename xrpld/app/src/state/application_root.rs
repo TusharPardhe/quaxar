@@ -2423,53 +2423,13 @@ impl tx::OracleSetReserveSink for SubmitOracleSetReserveSink {
 }
 
 fn oracle_set_series(st_tx: &STTx) -> Vec<tx::OracleSetSeriesEntry> {
-    st_tx
-        .get_field_array(get_field_by_symbol("sfPriceDataSeries"))
-        .iter()
-        .map(|entry| tx::OracleSetSeriesEntry {
-            pair: tx::OracleTokenPair {
-                base_asset: protocol::currency_to_string(
-                    entry
-                        .get_field_currency(get_field_by_symbol("sfBaseAsset"))
-                        .currency(),
-                ),
-                quote_asset: protocol::currency_to_string(
-                    entry
-                        .get_field_currency(get_field_by_symbol("sfQuoteAsset"))
-                        .currency(),
-                ),
-            },
-            asset_price: entry
-                .is_field_present(get_field_by_symbol("sfAssetPrice"))
-                .then(|| entry.get_field_u64(get_field_by_symbol("sfAssetPrice"))),
-            scale: entry
-                .is_field_present(get_field_by_symbol("sfScale"))
-                .then(|| u16::from(entry.get_field_u8(get_field_by_symbol("sfScale")))),
-        })
-        .collect()
+    tx::oracle_set_series_from_stobject(st_tx)
 }
 
 fn run_oracle_set_preclaim_with_view<V: ReadView>(view: &V, st_tx: &STTx) -> Ter {
-    let price_data_series_field = get_field_by_symbol("sfPriceDataSeries");
     let provider_field = get_field_by_symbol("sfProvider");
-    let uri_field = get_field_by_symbol("sfURI");
     let asset_class_field = get_field_by_symbol("sfAssetClass");
-    if !st_tx.is_field_present(price_data_series_field) {
-        return Ter::TEM_MALFORMED;
-    }
-
-    let preflight = tx::run_oracle_set_preflight(tx::OracleSetPreflightFacts {
-        price_data_series_len: st_tx.get_field_array(price_data_series_field).len(),
-        provider_len: st_tx
-            .is_field_present(provider_field)
-            .then(|| st_tx.get_field_vl(provider_field).len()),
-        uri_len: st_tx
-            .is_field_present(uri_field)
-            .then(|| st_tx.get_field_vl(uri_field).len()),
-        asset_class_len: st_tx
-            .is_field_present(asset_class_field)
-            .then(|| st_tx.get_field_vl(asset_class_field).len()),
-    });
+    let preflight = tx::run_oracle_set_sttx_preflight(st_tx);
     if preflight != Ter::TES_SUCCESS {
         return preflight;
     }

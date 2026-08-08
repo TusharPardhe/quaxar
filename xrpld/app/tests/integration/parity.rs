@@ -42,6 +42,32 @@ fn get_owner_count(view: &impl ReadView, account: AccountID) -> u32 {
         .unwrap_or(0)
 }
 
+fn populate_oracle_set_fields(tx: &mut STObject) {
+    let mut price_data = STObject::make_inner_object(sf("sfPriceData"));
+    price_data.set_field_currency(
+        sf("sfBaseAsset"),
+        protocol::STCurrency::new_with_currency(
+            sf("sfBaseAsset"),
+            protocol::currency_from_string("XRP"),
+        ),
+    );
+    price_data.set_field_currency(
+        sf("sfQuoteAsset"),
+        protocol::STCurrency::new_with_currency(
+            sf("sfQuoteAsset"),
+            protocol::currency_from_string("USD"),
+        ),
+    );
+    price_data.set_field_u64(sf("sfAssetPrice"), 1);
+    price_data.set_field_u8(sf("sfScale"), 0);
+    let mut series = STArray::new(sf("sfPriceDataSeries"));
+    series.push_back(price_data);
+    tx.set_field_array(sf("sfPriceDataSeries"), series);
+    tx.set_field_vl(sf("sfProvider"), b"provider");
+    tx.set_field_vl(sf("sfAssetClass"), b"currency");
+    tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_800);
+}
+
 // ─── DID Tests (C++ DID_test.cpp) ─────────────────────────────────────────
 
 #[test]
@@ -126,6 +152,7 @@ fn oracle_set_basic() {
     let mut view = new_view(ledger);
 
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -1292,6 +1319,7 @@ fn oracle_set_then_delete() {
     let mut view = new_view(ledger);
 
     let tx1 = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -3237,6 +3265,7 @@ fn oracle_set_with_data_series() {
     let ledger = build_ledger(vec![account_root(alice, 5_000_000_000, 0, 0)]);
     let mut view = new_view(ledger);
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_field_u32(sf("sfOracleDocumentID"), 42);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -5271,6 +5300,7 @@ fn oracle_set_multiple_documents() {
     let mut view = new_view(ledger);
     for i in 1..=3u32 {
         let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
             tx.set_account_id(sf("sfAccount"), alice);
             tx.set_field_u32(sf("sfOracleDocumentID"), i);
             tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -6877,6 +6907,7 @@ fn oracle_set_update_existing() {
     let ledger = build_ledger(vec![account_root(alice, 5_000_000_000, 0, 0)]);
     let mut view = new_view(ledger);
     let tx1 = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -6888,6 +6919,8 @@ fn oracle_set_update_existing() {
     );
     // Update same oracle
     let tx2 = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
+        tx.set_field_u32(sf("sfLastUpdateTime"), 946_685_801);
         tx.set_account_id(sf("sfAccount"), alice);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -7510,6 +7543,7 @@ fn oracle_set_five_documents() {
     let mut v = new_view(l);
     for i in 1..=5u32 {
         let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
             tx.set_account_id(sf("sfAccount"), a);
             tx.set_field_u32(sf("sfOracleDocumentID"), i);
             tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -7805,6 +7839,7 @@ fn b13_oracle_set_id_zero() {
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 0);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -8651,6 +8686,7 @@ fn b14_oracle_set_id_max() {
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), u32::MAX);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -9291,6 +9327,7 @@ fn b15_oracle_set_id_100() {
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 100);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -9931,6 +9968,7 @@ fn b16_oracle_set_id_999() {
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 999);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -18040,6 +18078,7 @@ fn ledger_oracle_set_creates_entry() {
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -19710,6 +19749,7 @@ fn ls5_oracle_set_then_delete() {
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx1 = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -21670,6 +21710,7 @@ fn b4_oracle_1() {
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -21686,6 +21727,7 @@ fn b4_oracle_50() {
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 50);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -23398,6 +23440,7 @@ fn b5_oracle_full() {
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1);
         tx.set_field_vl(sf("sfProvider"), b"chainlink");
@@ -32022,6 +32065,7 @@ fn lv2_oracle_creates() {
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1);
         tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -35165,6 +35209,7 @@ fn cp_oracle_full() {
     let l = build_ledger(vec![account_root(a, 5_000_000_000, 0, 0)]);
     let mut v = new_view(l);
     let tx = STTx::new(TxType::ORACLE_SET, |tx| {
+        populate_oracle_set_fields(tx);
         tx.set_account_id(sf("sfAccount"), a);
         tx.set_field_u32(sf("sfOracleDocumentID"), 1);
         tx.set_field_amount(sf("sfFee"), xrp(10));

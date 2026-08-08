@@ -23178,7 +23178,7 @@ fn cpp_step2_oracle_set_empty_series() {
         tx.set_field_u32(sf("sfSequence"), 1);
     });
     let r = full_apply(&mut v, &tx, TxType::ORACLE_SET);
-    assert!(r == Ter::from_int(-285) || r == Ter::TES_SUCCESS, "{:?}", r); // temARRAY_EMPTY
+    assert_eq!(r, Ter::TEM_ARRAY_EMPTY, "{r:?}"); // temARRAY_EMPTY
 }
 
 /// C++: MPTokenIssuanceSet invalid flags → temINVALID_FLAG

@@ -4676,138 +4676,33 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
 
         // --- Oracle ---
         TxType::ORACLE_SET => {
-            let account = sttx.get_account_id(sf("sfAccount"));
-            let oracle_doc_id = sttx.get_field_u32(sf("sfOracleDocumentID"));
-            let oracle_keylet =
-                protocol::oracle_keylet(Uint160::from_void(account.data()), oracle_doc_id);
-            let fix_include_keylet_fields = view
-                .rules()
-                .enabled(&protocol::feature_id("fixIncludeKeyletFields"));
-
-            if let Some(oracle_sle) = view.peek(oracle_keylet).ok().flatten() {
-                let mut pairs = std::collections::BTreeMap::new();
-                for entry in oracle_sle.get_field_array(sf("sfPriceDataSeries")).iter() {
-                    let key = oracle_pair_key(entry);
-                    pairs.entry(key).or_insert_with(|| {
-                        let mut price_data = STObject::make_inner_object(sf("sfPriceData"));
-                        price_data.set_field_currency(
-                            sf("sfBaseAsset"),
-                            entry.get_field_currency(sf("sfBaseAsset")),
-                        );
-                        price_data.set_field_currency(
-                            sf("sfQuoteAsset"),
-                            entry.get_field_currency(sf("sfQuoteAsset")),
-                        );
-                        price_data
-                    });
-                }
-                let old_owner_count = oracle_owner_count(pairs.len());
-
-                for entry in sttx.get_field_array(sf("sfPriceDataSeries")).iter() {
-                    let key = oracle_pair_key(entry);
-                    if !entry.is_field_present(sf("sfAssetPrice")) {
-                        pairs.remove(&key);
-                    } else if let Some(price_data) = pairs.get_mut(&key) {
-                        price_data.set_field_u64(
-                            sf("sfAssetPrice"),
-                            entry.get_field_u64(sf("sfAssetPrice")),
-                        );
-                        if entry.is_field_present(sf("sfScale")) {
-                            price_data
-                                .set_field_u8(sf("sfScale"), entry.get_field_u8(sf("sfScale")));
-                        }
-                    } else {
-                        pairs.insert(key, populated_oracle_price_data(entry));
-                    }
-                }
-
-                let mut obj = oracle_sle.clone_as_object();
-                obj.set_field_array(sf("sfPriceDataSeries"), oracle_price_data_series(pairs));
-                if sttx.is_field_present(sf("sfURI")) {
-                    obj.set_field_vl(sf("sfURI"), &sttx.get_field_vl(sf("sfURI")));
-                }
-                obj.set_field_u32(
-                    sf("sfLastUpdateTime"),
-                    sttx.get_field_u32(sf("sfLastUpdateTime")),
-                );
-                if fix_include_keylet_fields && !obj.is_field_present(sf("sfOracleDocumentID")) {
-                    obj.set_field_u32(sf("sfOracleDocumentID"), oracle_doc_id);
-                }
-
-                let new_owner_count =
-                    oracle_owner_count(obj.get_field_array(sf("sfPriceDataSeries")).len());
-                let owner_count_adjustment = new_owner_count - old_owner_count;
-                if owner_count_adjustment != 0 {
-                    let account_keylet =
-                        protocol::account_keylet(Uint160::from_void(account.data()));
-                    let Some(account_sle) = view.peek(account_keylet).ok().flatten() else {
-                        return Ter::TEF_INTERNAL;
-                    };
-                    if ledger::adjust_owner_count(view, &account_sle, owner_count_adjustment)
-                        .is_err()
-                    {
-                        return Ter::TEF_INTERNAL;
-                    }
-                }
-                if view
-                    .update(Arc::new(STLedgerEntry::from_stobject(
-                        obj,
-                        *oracle_sle.key(),
-                    )))
-                    .is_err()
-                {
-                    return Ter::TEF_INTERNAL;
-                }
-            } else {
-                let price_data_series = if !view
-                    .rules()
-                    .enabled(&protocol::feature_id("fixPriceOracleOrder"))
-                {
-                    sttx.get_field_array(sf("sfPriceDataSeries"))
-                } else {
-                    let mut pairs = std::collections::BTreeMap::new();
-                    for entry in sttx.get_field_array(sf("sfPriceDataSeries")).iter() {
-                        pairs.insert(oracle_pair_key(entry), populated_oracle_price_data(entry));
-                    }
-                    oracle_price_data_series(pairs)
-                };
-                let owner_count_adjustment = oracle_owner_count(price_data_series.len());
-                let owner_dir = protocol::owner_dir_keylet(Uint160::from_void(account.data()));
-                let owner_node =
-                    match ledger::dir_append(view, &owner_dir, oracle_keylet.key, &|_| {}) {
-                        Ok(Some(page)) => page,
-                        Ok(None) => return Ter::TEC_DIR_FULL,
-                        Err(_) => return Ter::TEF_INTERNAL,
-                    };
-                let account_keylet = protocol::account_keylet(Uint160::from_void(account.data()));
-                let Some(account_sle) = view.peek(account_keylet).ok().flatten() else {
-                    return Ter::TEF_INTERNAL;
-                };
-                if ledger::adjust_owner_count(view, &account_sle, owner_count_adjustment).is_err() {
-                    return Ter::TEF_INTERNAL;
-                }
-
-                let mut sle = STLedgerEntry::new(oracle_keylet);
-                sle.set_account_id(sf("sfOwner"), account);
-                if fix_include_keylet_fields {
-                    sle.set_field_u32(sf("sfOracleDocumentID"), oracle_doc_id);
-                }
-                sle.set_field_vl(sf("sfProvider"), &sttx.get_field_vl(sf("sfProvider")));
-                if sttx.is_field_present(sf("sfURI")) {
-                    sle.set_field_vl(sf("sfURI"), &sttx.get_field_vl(sf("sfURI")));
-                }
-                sle.set_field_array(sf("sfPriceDataSeries"), price_data_series);
-                sle.set_field_vl(sf("sfAssetClass"), &sttx.get_field_vl(sf("sfAssetClass")));
-                sle.set_field_u32(
-                    sf("sfLastUpdateTime"),
-                    sttx.get_field_u32(sf("sfLastUpdateTime")),
-                );
-                sle.set_field_u64(sf("sfOwnerNode"), owner_node);
-                if view.insert(Arc::new(sle)).is_err() {
-                    return Ter::TEF_INTERNAL;
-                }
+            let preflight = run_oracle_set_sttx_preflight(sttx);
+            if preflight != Ter::TES_SUCCESS {
+                return preflight;
             }
-            Ter::TES_SUCCESS
+
+            let account = sttx.get_account_id(sf("sfAccount"));
+            let oracle_document_id = sttx.get_field_u32(sf("sfOracleDocumentID"));
+            let mut sink = crate::state::transactor_oracle_bridge::ViewBackedOracleSetSink {
+                view,
+                account,
+                oracle_document_id,
+            };
+            run_oracle_set_do_apply(
+                OracleSetApplyFacts {
+                    provider: sttx.get_field_vl(sf("sfProvider")).to_vec(),
+                    asset_class: sttx.get_field_vl(sf("sfAssetClass")).to_vec(),
+                    // Omission retains the stored URI; present values, including
+                    // arbitrary VL bytes, replace it exactly.
+                    uri: sttx
+                        .is_field_present(sf("sfURI"))
+                        .then(|| sttx.get_field_vl(sf("sfURI")).to_vec()),
+                    last_update_time_secs: u64::from(sttx.get_field_u32(sf("sfLastUpdateTime"))),
+                    oracle_document_id,
+                    tx_series: oracle_set_series_from_stobject(sttx),
+                },
+                &mut sink,
+            )
         }
         TxType::ORACLE_DELETE => {
             let account = sttx.get_account_id(sf("sfAccount"));

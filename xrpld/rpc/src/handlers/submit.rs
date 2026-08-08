@@ -752,30 +752,7 @@ impl tx::OracleSetReserveSink for OracleSetReserveSink {
 }
 
 fn oracle_set_series(st_object: &protocol::STObject) -> Vec<tx::OracleSetSeriesEntry> {
-    st_object
-        .get_field_array(get_field_by_symbol("sfPriceDataSeries"))
-        .iter()
-        .map(|entry| tx::OracleSetSeriesEntry {
-            pair: tx::OracleTokenPair {
-                base_asset: protocol::currency_to_string(
-                    entry
-                        .get_field_currency(get_field_by_symbol("sfBaseAsset"))
-                        .currency(),
-                ),
-                quote_asset: protocol::currency_to_string(
-                    entry
-                        .get_field_currency(get_field_by_symbol("sfQuoteAsset"))
-                        .currency(),
-                ),
-            },
-            asset_price: entry
-                .is_field_present(get_field_by_symbol("sfAssetPrice"))
-                .then(|| entry.get_field_u64(get_field_by_symbol("sfAssetPrice"))),
-            scale: entry
-                .is_field_present(get_field_by_symbol("sfScale"))
-                .then(|| u16::from(entry.get_field_u8(get_field_by_symbol("sfScale")))),
-        })
-        .collect()
+    tx::oracle_set_series_from_stobject(st_object)
 }
 
 fn run_oracle_set_preclaim_with_ledger(st_tx: &STTx, ledger: &Ledger) -> Ter {
