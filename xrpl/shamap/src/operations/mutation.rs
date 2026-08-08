@@ -395,7 +395,6 @@ impl MutableTree {
 
         let leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(node_type, item, self.cowid));
         parent.set_child(branch, Some(leaf));
-        parent.update_hash_deep();
         self.root = self.dirty_up(&path[..path.len() - 1], target, parent)?;
         Ok(true)
     }
@@ -1084,6 +1083,39 @@ mod tests {
                 .key(),
             inserted_key
         );
+    }
+
+    #[test]
+    fn add_into_empty_branch_keeps_ancestors_dirty_when_a_sibling_split_is_dirty() {
+        let first = Uint256::from_hex(
+            "1000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("hex should parse");
+        let colliding = Uint256::from_hex(
+            "1100000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("hex should parse");
+        let unrelated = Uint256::from_hex(
+            "2000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("hex should parse");
+        let mut tree = MutableTree::new(1);
+
+        for key in [first, colliding, unrelated] {
+            assert!(tree
+                .add_item(
+                    SHAMapNodeType::AccountState,
+                    SHAMapItem::new(key, vec![0xA5; 12]),
+                )
+                .expect("insert should succeed"));
+        }
+
+        assert!(
+            tree.root().get_hash().is_zero(),
+            "an ancestor cannot be considered hashed while its split child remains dirty"
+        );
+        tree.unshare();
+        assert!(tree.root().get_hash().is_non_zero());
     }
 
     #[test]
