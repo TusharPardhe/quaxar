@@ -7,7 +7,7 @@ use basics::chrono::NetClockTimePoint;
 use consensus::model::TrieLedger;
 use consensus::rcl_support::{ValidationT, ValidationsLedger};
 use ledger::{Ledger, LedgerJournal, NullLedgerJournal};
-use protocol::{NodeID, PublicKey, STValidation, get_field_by_symbol};
+use protocol::{NodeID, PublicKey, STValidation, get_field_by_symbol, skip_keylet};
 
 use crate::job::{job_queue::JobQueue, job_types::JobType};
 
@@ -98,8 +98,6 @@ impl ValidationT for RclValidation {
     }
 }
 
-const MAX_ANCESTORS_TRACKED: u32 = 256;
-
 #[derive(Clone)]
 pub struct RclValidatedLedger {
     ledger_id: Uint256,
@@ -125,15 +123,29 @@ impl RclValidatedLedger {
         let ledger_seq = header.seq;
         let ledger_id = *header.hash.as_uint256();
 
-        let min_seq = ledger_seq.saturating_sub(MAX_ANCESTORS_TRACKED.min(ledger_seq));
-        let mut ancestors = Vec::with_capacity((ledger_seq - min_seq + 1) as usize);
-        for seq in min_seq..=ledger_seq {
-            let hash = ledger
-                .hash_of_seq(seq, journal)
-                .map(|h| *h.as_uint256())
-                .unwrap_or_else(Uint256::zero);
-            ancestors.push(hash);
-        }
+        // Match rippled RCLValidatedLedger exactly: only sfHashes from the
+        // ledger's global skip-list establish known ancestry. A missing or
+        // unreadable skip SLE means that ancestors are unknown; it must not
+        // become a synthetic window of zero hashes.
+        let ancestors = match ledger.read(skip_keylet()) {
+            Ok(Some(hash_index)) => {
+                assert_eq!(
+                    hash_index.get_field_u32(get_field_by_symbol("sfLastLedgerSequence")),
+                    ledger_seq.saturating_sub(1),
+                    "xrpl::RCLValidatedLedger::RCLValidatedLedger(Ledger): valid last ledger sequence"
+                );
+                hash_index
+                    .get_field_v256(get_field_by_symbol("sfHashes"))
+                    .value()
+                    .to_vec()
+            }
+            Ok(None) | Err(_) => {
+                journal.warn(&format!(
+                    "Ledger {ledger_seq}:{ledger_id} missing recent ancestor hashes"
+                ));
+                Vec::new()
+            }
+        };
 
         Self {
             ledger_id,
@@ -143,7 +155,7 @@ impl RclValidatedLedger {
     }
 
     fn min_seq(&self) -> u32 {
-        self.ledger_seq + 1 - self.ancestors.len() as u32
+        self.ledger_seq.saturating_sub(self.ancestors.len() as u32)
     }
 }
 
@@ -170,22 +182,21 @@ impl TrieLedger for RclValidatedLedger {
         if s < min_seq {
             return Uint256::zero();
         }
-        self.ancestors[(s - min_seq) as usize]
+        self.ancestors[self.ancestors.len() - (self.ledger_seq - s) as usize]
     }
 
     fn mismatch(&self, other: &Self) -> u32 {
-        let max_check = self.ledger_seq.min(other.ledger_seq) + 1;
-        let mut lo = 0u32;
-        let mut hi = max_check;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.ancestor(mid) == other.ancestor(mid) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
+        // Match rippled RCLValidations.cpp: search only the overlap that both
+        // ledgers can actually establish. Unknown ancestry is not evidence of
+        // a shared prefix.
+        let lower = self.min_seq().max(other.min_seq());
+        let upper = self.ledger_seq.min(other.ledger_seq);
+        let mut current = upper;
+        while current != 0 && self.ancestor(current) != other.ancestor(current) && current >= lower
+        {
+            current -= 1;
         }
-        lo
+        if current < lower { 1 } else { current + 1 }
     }
 }
 
@@ -457,6 +468,55 @@ mod tests {
 
         assert_eq!(TrieLedger::seq(&wrapped), 5);
         assert_eq!(wrapped.ancestor(5), wrapped.ledger_id);
+    }
+
+    #[test]
+    fn missing_skip_ancestry_has_no_false_common_prefix() {
+        // These independent fixture ledgers have no skip-list SLE. Rippled's
+        // RCLValidatedLedger keeps no ancestors in that case, so its known
+        // ranges do not overlap and `mismatch` returns 1.
+        let older = LedgerImpl::from_header_hashes(LedgerHeader {
+            seq: 100,
+            hash: SHAMapHash::new(Uint256::from_u64(0xA0)),
+            parent_hash: SHAMapHash::new(Uint256::from_u64(0xA1)),
+            ..LedgerHeader::default()
+        });
+        let newer = LedgerImpl::from_header_hashes(LedgerHeader {
+            seq: 101,
+            hash: SHAMapHash::new(Uint256::from_u64(0xB0)),
+            parent_hash: SHAMapHash::new(Uint256::from_u64(0xB1)),
+            ..LedgerHeader::default()
+        });
+        let older = RclValidatedLedger::from_ledger(&older);
+        let newer = RclValidatedLedger::from_ledger(&newer);
+
+        assert_eq!(older.min_seq(), 100);
+        assert_eq!(newer.min_seq(), 101);
+        assert_eq!(older.ancestor(99), Uint256::zero());
+        assert_eq!(newer.ancestor(100), Uint256::zero());
+        assert_eq!(older.mismatch(&newer), 1);
+    }
+
+    #[test]
+    fn skip_hashes_define_the_only_known_ancestor_window() {
+        let ledger = RclValidatedLedger {
+            ledger_id: Uint256::from_u64(10),
+            ledger_seq: 10,
+            // sfHashes is ordered oldest to newest and excludes the ledger's
+            // own ID, exactly as rippled stores RCLValidatedLedger::ancestors_.
+            ancestors: Arc::new(vec![
+                Uint256::from_u64(7),
+                Uint256::from_u64(8),
+                Uint256::from_u64(9),
+            ]),
+        };
+
+        assert_eq!(ledger.min_seq(), 7);
+        assert_eq!(ledger.ancestor(6), Uint256::zero());
+        assert_eq!(ledger.ancestor(7), Uint256::from_u64(7));
+        assert_eq!(ledger.ancestor(8), Uint256::from_u64(8));
+        assert_eq!(ledger.ancestor(9), Uint256::from_u64(9));
+        assert_eq!(ledger.ancestor(10), Uint256::from_u64(10));
     }
 
     #[test]

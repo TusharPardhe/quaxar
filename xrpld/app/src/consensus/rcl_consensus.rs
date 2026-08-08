@@ -764,14 +764,53 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             // rippled RCLConsensus.cpp:313-316: consensusViewChange() demotes
             // FULL/TRACKING→CONNECTED when the preferred ledger diverges.
             let current_mode = self.app_root.network_ops_operating_mode();
+            let preferred_resident = self
+                .app_root
+                .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred))
+                .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
+            let local_closed = self.app_root.closed_ledger().map(|ledger| {
+                (
+                    *ledger.header().hash.as_uint256(),
+                    ledger.header().seq,
+                    ledger.header().close_time,
+                )
+            });
+            let published_ledger = self
+                .app_root
+                .published_ledger()
+                .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
+            let validated_anchor = self
+                .ledger_master_runtime
+                .ledger_master()
+                .validated_ledger()
+                .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
+            let last_valid_anchor = self
+                .ledger_master_runtime
+                .ledger_master()
+                .last_valid_ledger();
+            let previous_ledger = (
+                *prev_ledger.ledger().header().hash.as_uint256(),
+                prev_ledger.ledger().header().seq,
+                prev_ledger.ledger().header().close_time,
+            );
             if current_mode == crate::NetworkOpsOperatingMode::Full
                 || current_mode == crate::NetworkOpsOperatingMode::Tracking
             {
                 tracing::info!(
                     target: "consensus",
+                    event = "consensus_view_change_demotion",
                     ?current_mode,
+                    consensus_mode = ?mode,
+                    min_valid_seq,
                     requested = %prev_ledger_id,
+                    previous_ledger = ?previous_ledger,
                     preferred = %preferred,
+                    preferred_resident = ?preferred_resident,
+                    local_closed = ?local_closed,
+                    published_ledger = ?published_ledger,
+                    validated_anchor = ?validated_anchor,
+                    last_valid_anchor = ?last_valid_anchor,
+                    live_current_ledger_index = ?self.app_root.live_current_ledger_index(),
                     "consensusViewChange: demoting to Connected (preferred ledger differs)"
                 );
                 self.app_root
@@ -779,8 +818,18 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
             } else {
                 tracing::info!(
                     target: "consensus",
+                    event = "consensus_view_change_mismatch",
+                    consensus_mode = ?mode,
+                    min_valid_seq,
                     requested = %prev_ledger_id,
+                    previous_ledger = ?previous_ledger,
                     preferred = %preferred,
+                    preferred_resident = ?preferred_resident,
+                    local_closed = ?local_closed,
+                    published_ledger = ?published_ledger,
+                    validated_anchor = ?validated_anchor,
+                    last_valid_anchor = ?last_valid_anchor,
+                    live_current_ledger_index = ?self.app_root.live_current_ledger_index(),
                     "Consensus view change — preferred ledger differs from current"
                 );
             }

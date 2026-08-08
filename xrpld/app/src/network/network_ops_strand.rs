@@ -953,12 +953,16 @@ fn reconcile_preferred_lcl(
         *peer_counts.entry(our_hash).or_default() += 1;
     }
 
+    let min_valid_seq = lm.valid_ledger_seq();
     let preference_diagnostic = root.validations().preferred_lcl_diagnostic(
         &RclValidatedLedger::from_ledger(&our_closed),
-        lm.valid_ledger_seq(),
+        min_valid_seq,
         &peer_counts,
     );
     let preferred_hash = preference_diagnostic.selected;
+    let selected_preferred_resident = root
+        .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash))
+        .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
     tracing::info!(
         target: "lcl_trace",
         event = "preferred_lcl_selected",
@@ -986,6 +990,15 @@ fn reconcile_preferred_lcl(
             local_lcl_hash = %our_hash,
             local_lcl_seq = our_closed.header().seq,
             local_parent_hash = %parent_hash,
+            local_lcl_close_time = our_closed.header().close_time,
+            local_lcl_close_time_resolution = our_closed.header().close_time_resolution,
+            now_close_time = root.current_close_time_seconds(),
+            min_valid_seq,
+            live_current_ledger_index = ?root.live_current_ledger_index(),
+            selected_preferred_resident = ?selected_preferred_resident,
+            published_ledger = ?root
+                .published_ledger()
+                .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq)),
             operating_mode = ?root.network_ops_operating_mode(),
             need_network_ledger = root.need_network_ledger(),
             peer_count = peers.len(),
@@ -1426,28 +1439,56 @@ fn check_accept_and_advance(
             next_mode = NetworkOpsOperatingMode::Tracking;
         }
 
-        // Connected/Tracking → Full when published ledger is fresh
+        let local_lcl = root.closed_ledger();
+        let now_close_time = root.current_close_time_seconds();
+        let full_freshness = local_lcl.as_ref().map(|lcl| {
+            let resolution = u32::from(lcl.header().close_time_resolution);
+            let freshness_deadline = lcl
+                .header()
+                .close_time
+                .saturating_add(resolution.saturating_mul(2));
+            (
+                *lcl.header().hash.as_uint256(),
+                lcl.header().seq,
+                lcl.header().close_time,
+                resolution,
+                freshness_deadline,
+                now_close_time < freshness_deadline,
+            )
+        });
+
+        // Connected/Tracking → Full when the local LCL close time is fresh.
         // rippled (NetworkOPs.cpp:2219-2230) does NOT gate this on needNetworkLedger.
         if matches!(
             next_mode,
             NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Tracking
-        ) {
-            // rippled (NetworkOPs.cpp:2226-2230): uses the current open ledger's
-            // parentCloseTime (= LCL close time) and closeTimeResolution.
-            // auto current = ledgerMaster_.getCurrentLedger();
-            // if (now < current->header().parentCloseTime + 2 * closeTimeResolution)
-            let fresh = root.closed_ledger().map_or(false, |lcl| {
-                let now_close = root.current_close_time_seconds();
-                let lcl_close = lcl.header().close_time;
-                let resolution = u32::from(lcl.header().close_time_resolution);
-                now_close < lcl_close.saturating_add(resolution.saturating_mul(2))
-            });
-            if fresh {
-                next_mode = NetworkOpsOperatingMode::Full;
-            }
+        ) && full_freshness.is_some_and(|(_, _, _, _, _, fresh)| fresh)
+        {
+            next_mode = NetworkOpsOperatingMode::Full;
         }
 
         if next_mode != current_mode {
+            tracing::info!(
+                target: "lcl_trace",
+                event = "operating_mode_promotion_decision",
+                ?current_mode,
+                ?next_mode,
+                allow_mode_promotion,
+                need_network_ledger = need_network,
+                min_valid_seq = lm.valid_ledger_seq(),
+                validated_anchor = ?lm.validated_ledger().map(|ledger| (
+                    *ledger.header().hash.as_uint256(),
+                    ledger.header().seq
+                )),
+                last_valid_anchor = ?lm.last_valid_ledger(),
+                published_ledger = ?root.published_ledger().map(|ledger| (
+                    *ledger.header().hash.as_uint256(),
+                    ledger.header().seq
+                )),
+                live_current_ledger_index = ?root.live_current_ledger_index(),
+                local_lcl_freshness = ?full_freshness,
+                "LCL trace: operating-mode promotion decision"
+            );
             tracing::info!(target: "app", ?current_mode, ?next_mode, "strand: operating mode promoted");
             root.set_network_ops_operating_mode(next_mode);
         }
