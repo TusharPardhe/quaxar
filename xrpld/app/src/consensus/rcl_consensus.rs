@@ -1585,10 +1585,12 @@ impl AppConsensus {
                     if fee > load_fee_track.load_base() {
                         v.set_field_u32(protocol::get_field_by_symbol("sfLoadFee"), fee);
                     }
+                    if let Some(fee_vote) = self.adaptor.fee_vote.as_ref()
+                        && closed.is_voting_ledger()
+                    {
+                        fee_vote.do_validation(closed.fees(), closed.rules(), v);
+                    }
                     if closed.is_voting_ledger() {
-                        if let Some(fee_vote) = self.adaptor.fee_vote.as_ref() {
-                            fee_vote.do_validation(closed.fees(), closed.rules(), v);
-                        }
                         if let Some(amendment_status) = self.adaptor.amendment_status.as_ref() {
                             amendment_status.do_validation_for_ledger(closed.as_ref(), v);
                         }
@@ -1704,12 +1706,8 @@ impl AppConsensus {
                 // canonical retry set to OpenLedger::accept.
                 retriable_transactions.extend(work.rejected_dispute_retries.iter().cloned());
                 {
-                    RclConsensusOpenLedgerSource::accept_consensus_ledger(
-                        &self.adaptor.open_ledger,
-                        outcome.next_open_index,
-                        work.base_fee_drops,
-                        closed.header().hash.as_uint256(),
-                        &outcome.completed_transaction_ids,
+                    root.rebuild_open_ledger_after_consensus(
+                        Arc::clone(&closed),
                         &retriable_transactions,
                         !work.rejected_dispute_retries.is_empty(),
                     );

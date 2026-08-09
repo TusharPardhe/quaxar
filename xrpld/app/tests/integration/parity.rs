@@ -5183,7 +5183,8 @@ fn escrow_create_then_cancel_after_time() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    let mut create_view = ledger::Sandbox::new(Arc::new(ledger.clone()), protocol::ApplyFlags::NONE);
+    let mut create_view =
+        ledger::Sandbox::new(Arc::new(ledger.clone()), protocol::ApplyFlags::NONE);
     assert_eq!(
         handle_real_dispatch(&mut create_view, &tx1, TxType::ESCROW_CREATE, None),
         Ter::TES_SUCCESS
@@ -5203,7 +5204,8 @@ fn escrow_create_then_cancel_after_time() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 2);
     });
-    let mut cancel_view = ledger::Sandbox::new(Arc::new(ledger.clone()), protocol::ApplyFlags::NONE);
+    let mut cancel_view =
+        ledger::Sandbox::new(Arc::new(ledger.clone()), protocol::ApplyFlags::NONE);
     assert_eq!(
         handle_real_dispatch(&mut cancel_view, &tx2, TxType::ESCROW_CANCEL, None),
         Ter::TES_SUCCESS
@@ -5300,7 +5302,7 @@ fn oracle_set_multiple_documents() {
     let mut view = new_view(ledger);
     for i in 1..=3u32 {
         let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-        populate_oracle_set_fields(tx);
+            populate_oracle_set_fields(tx);
             tx.set_account_id(sf("sfAccount"), alice);
             tx.set_field_u32(sf("sfOracleDocumentID"), i);
             tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -7543,7 +7545,7 @@ fn oracle_set_five_documents() {
     let mut v = new_view(l);
     for i in 1..=5u32 {
         let tx = STTx::new(TxType::ORACLE_SET, |tx| {
-        populate_oracle_set_fields(tx);
+            populate_oracle_set_fields(tx);
             tx.set_account_id(sf("sfAccount"), a);
             tx.set_field_u32(sf("sfOracleDocumentID"), i);
             tx.set_field_amount(sf("sfFee"), xrp(10));
@@ -19262,7 +19264,8 @@ fn ls5_escrow_create_finish_balance_check() {
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), 1);
     });
-    let mut create_view = ledger::Sandbox::new(Arc::new(ledger.clone()), protocol::ApplyFlags::NONE);
+    let mut create_view =
+        ledger::Sandbox::new(Arc::new(ledger.clone()), protocol::ApplyFlags::NONE);
     assert_eq!(
         handle_real_dispatch(&mut create_view, &tx1, TxType::ESCROW_CREATE, None),
         Ter::TES_SUCCESS

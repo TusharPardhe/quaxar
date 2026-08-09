@@ -5,6 +5,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use basics::{base_uint::Uint256, str_hex::str_hex, string_utilities::to_uint64};
+use protocol::tokens::decode_base58_token_multibyte;
 use protocol::{
     JsonOptions, JsonValue, KeyType, LedgerEntryType, LedgerFormats, PublicKey, STArray, STObject,
     STParsedJSONObject, STTx, SecretKey, Seed, SerialIter, Serializer, StBase,
@@ -697,8 +698,16 @@ pub fn simulate_txn<Runtime: RpcRuntime>(
     Ok(JsonValue::Object(ret))
 }
 
+/// Decode only xrpl.js's legacy Ed25519 seed encoding.
+///
+/// rippled's `parseXrplLibSeed` accepts the raw Base58 payload prefix E1 4B,
+/// followed by exactly 16 seed bytes. A normal XRPL family seed must not be
+/// accepted here: it falls through to normal seed handling and therefore
+/// retains the default Secp256k1 key type.
 pub fn parse_xrpl_lib_seed(s: &str) -> Option<Seed> {
-    protocol::parse_base58_seed(s)
+    decode_base58_token_multibyte(s, &[0xE1, 0x4B])
+        .filter(|bytes| bytes.len() == 16)
+        .and_then(|bytes| Seed::from_slice(&bytes).ok())
 }
 
 pub fn get_seed_from_rpc(params: &JsonValue) -> Result<Seed, Status> {

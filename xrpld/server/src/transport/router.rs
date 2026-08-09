@@ -231,7 +231,6 @@ pub struct RpcServer<D> {
 }
 
 pub struct RpcServerState {
-    pub in_flight: dashmap::DashMap<String, tokio::sync::watch::Receiver<Option<RpcReply>>>,
     pub p0_pool: tokio::sync::Semaphore,
     pub p1_pool: tokio::sync::Semaphore,
     pub p2_pool: tokio::sync::Semaphore,
@@ -240,7 +239,6 @@ pub struct RpcServerState {
 impl Default for RpcServerState {
     fn default() -> Self {
         Self {
-            in_flight: dashmap::DashMap::new(),
             p0_pool: tokio::sync::Semaphore::new(128),
             p1_pool: tokio::sync::Semaphore::new(64),
             p2_pool: tokio::sync::Semaphore::new(16),
@@ -384,29 +382,12 @@ where
         params: JsonValue,
         metadata: RequestMetadata,
     ) -> RpcReply {
-        let hash_key = format!(
-            "{}:{}",
-            method,
-            sonic_rs::to_string(&params).unwrap_or_default()
-        );
-
-        // Atomically check-or-insert to prevent the race where two threads
-        // both see an empty slot and both start computing.
-        use dashmap::mapref::entry::Entry;
-        let rx_opt = match self.state.in_flight.entry(hash_key.clone()) {
-            Entry::Occupied(e) => Some(e.get().clone()),
-            Entry::Vacant(_) => None,
-        };
-
-        if let Some(mut rx) = rx_opt
-            && rx.changed().await.is_ok()
-            && let Some(reply) = rx.borrow().clone()
-        {
-            return reply;
-        }
-
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        self.state.in_flight.insert(hash_key.clone(), rx);
+        // Do not share replies between identical requests. Some RPCs are
+        // intentionally non-deterministic (for example, parameterless
+        // wallet_propose), and others mutate server state. rippled dispatches
+        // each request independently, even when method and parameters match.
+        // Request coalescing here replayed the first wallet response to every
+        // concurrent caller and therefore produced duplicate account seeds.
 
         // rippled: ALL requests are rejected with tooBusy when the server is
         // overloaded AND the client is not unlimited (admin). This prevents
@@ -428,8 +409,6 @@ where
                     rpc::RpcErrorCode::TooBusy,
                     "Server is too busy. Try again later.",
                 );
-                let _ = tx.send(Some(reply.clone()));
-                self.state.in_flight.remove(&hash_key);
                 return reply;
             }
         }
@@ -454,9 +433,6 @@ where
         .expect("dispatcher::dispatch panicked");
 
         drop(permit);
-
-        let _ = tx.send(Some(reply.clone()));
-        self.state.in_flight.remove(&hash_key);
 
         reply
     }
@@ -1246,9 +1222,13 @@ mod tests {
     };
     use crate::transport::{RpcDispatcher, RpcReply, RpcRequest};
     use app::ServerPortSetup;
+    use axum::body::Body;
+    use axum::http::Request;
     use protocol::JsonValue;
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct NoopDispatcher;
 
@@ -1256,6 +1236,48 @@ mod tests {
         fn dispatch(&self, _request: RpcRequest<'_>) -> RpcReply {
             RpcReply::result(JsonValue::Object(BTreeMap::new()))
         }
+    }
+
+    struct CountingDispatcher(AtomicU64);
+
+    impl RpcDispatcher for CountingDispatcher {
+        fn dispatch(&self, _request: RpcRequest<'_>) -> RpcReply {
+            RpcReply::result(JsonValue::Unsigned(self.0.fetch_add(1, Ordering::SeqCst)))
+        }
+    }
+
+    fn test_metadata() -> crate::session::RequestMetadata {
+        crate::session::RequestMetadata::new(
+            "127.0.0.1:50000".parse().unwrap(),
+            &Request::new(Body::empty()),
+        )
+    }
+
+    #[tokio::test]
+    async fn identical_concurrent_requests_are_dispatched_independently() {
+        let server = Arc::new(RpcServer::new(CountingDispatcher(AtomicU64::new(0))));
+        let params = JsonValue::Object(BTreeMap::new());
+        let mut tasks = Vec::new();
+
+        for _ in 0..32 {
+            let server = Arc::clone(&server);
+            let params = params.clone();
+            tasks.push(tokio::spawn(async move {
+                server
+                    .dispatch_async("wallet_propose".to_owned(), params, test_metadata())
+                    .await
+            }));
+        }
+
+        let mut values = Vec::new();
+        for task in tasks {
+            match task.await.unwrap() {
+                RpcReply::Result(JsonValue::Unsigned(value)) => values.push(value),
+                reply => panic!("unexpected reply: {reply:?}"),
+            }
+        }
+        values.sort_unstable();
+        assert_eq!(values, (0..32).collect::<Vec<_>>());
     }
 
     #[test]

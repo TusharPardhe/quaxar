@@ -88,7 +88,8 @@ use tx::{
     ApplyResult, QueueAcceptLockScope, QueueAcceptOwnerState, QueueApplyHoldPreflightTxSource,
     QueueApplyLockScope, QueueApplyObservedAccountLookup, QueueApplyObservedTicketLookup,
     QueueApplyObservedTxSource, QueueApplyObservedViewSource, QueueFeeMetricsSnapshot,
-    QueueTxQMetricsView, QueueTxQRpcView, QueueViews, TxQSetup,
+    QueueTxQMetricsView, QueueTxQRequiredFeeTxSource, QueueTxQRequiredFeeViewSource,
+    QueueTxQRpcView, QueueViews, TxQSetup,
 };
 use xrpl_core::{
     FixedNetworkIdService, HashRouter, HashRouterSetup, LoadMonitorJournal,
@@ -230,6 +231,15 @@ impl QueueApplyObservedTxSource for AppQueueApplyTxSource<'_> {
     }
 }
 
+/// `QueueTxQRequiredFeeTxSource` lets the production TxQ call
+/// `get_tx_required_fee_and_seq` with a real `AppQueueApplyTxSource`, matching
+/// rippled's `getTxRequiredFeeAndSeq` which also keys on `sfAccount`.
+impl QueueTxQRequiredFeeTxSource<AccountID> for AppQueueApplyTxSource<'_> {
+    fn account(&self) -> &AccountID {
+        &self.account
+    }
+}
+
 impl QueueApplyHoldPreflightTxSource for AppQueueApplyTxSource<'_> {
     fn has_previous_txn_id(&self) -> bool {
         self.tx
@@ -333,6 +343,57 @@ impl tx::QueueAcceptLedgerViewSource for AppOpenLedgerView {
 
     fn parent_hash(&self) -> Uint256 {
         self.parent_hash
+    }
+}
+
+/// A thin view wrapper used exclusively by
+/// `apply_network_ops_pending_to_open_ledger` to compute the queue-aware
+/// `available_seq` for the submit response, matching rippled's
+/// `TxQ::getTxRequiredFeeAndSeq(OpenView const& view, ...)` which reads the
+/// account SLE from the *open ledger view* and walks the TxQ.
+///
+/// Fields:
+/// - `ledger`        — the current closed/validated base ledger (read-only)
+/// - `open_tx_count` — tx count from the open ledger for fee scaling
+pub struct AppRequiredFeeView<'a> {
+    ledger: &'a ledger::Ledger,
+    open_tx_count: usize,
+}
+
+impl<'a> AppRequiredFeeView<'a> {
+    pub fn new(ledger: &'a ledger::Ledger, open_tx_count: usize) -> Self {
+        Self {
+            ledger,
+            open_tx_count,
+        }
+    }
+}
+
+impl QueueTxQRequiredFeeViewSource<AccountID, AppQueueApplyTxSource<'_>>
+    for AppRequiredFeeView<'_>
+{
+    fn open_ledger_tx_count(&self) -> usize {
+        self.open_tx_count
+    }
+
+    /// Mirrors rippled `TxQ::getTxRequiredFeeAndSeq` which calls
+    /// `calculateBaseFee(view, *tx)` on the open-ledger view.
+    fn calculate_base_fee_drops(&self, tx: &AppQueueApplyTxSource<'_>) -> u64 {
+        crate::state::application_root::calculate_sttx_base_fee(self.ledger, tx.tx())
+    }
+
+    /// Reads `sfSequence` from the account SLE in the base ledger,
+    /// returning `None` for unknown accounts (TxQ treats this as seq=0).
+    fn account_sequence(&self, account: &AccountID) -> Option<u32> {
+        let keylet = protocol::account_keylet(
+            basics::base_uint::Uint160::from_slice(account.data())
+                .expect("AccountID width should match Uint160"),
+        );
+        self.ledger
+            .read(keylet)
+            .ok()
+            .flatten()
+            .map(|sle| sle.get_field_u32(protocol::get_field_by_symbol("sfSequence")))
     }
 }
 
@@ -767,6 +828,24 @@ impl SharedAppTxQ {
         View: QueueTxQRpcView,
     {
         self.lock().get_rpc_fee_report(lock, view)
+    }
+
+    /// Mirrors `TxQ::getTxRequiredFeeAndSeq` from rippled: returns the open
+    /// ledger fee, the raw account sequence from the ledger SLE
+    /// (`account_seq_next`), and the queue-aware next available sequence
+    /// (`account_seq_avail`) by calling `nextQueuableSeqImpl` internally.
+    pub fn get_tx_required_fee_and_seq<Lock, View, TxSource>(
+        &self,
+        lock: &mut Lock,
+        view: &View,
+        tx: &TxSource,
+    ) -> tx::QueueTxQRequiredFeeAndSeq
+    where
+        Lock: QueueAcceptLockScope,
+        View: tx::QueueTxQRequiredFeeViewSource<AppTxQAccount, TxSource>,
+        TxSource: tx::QueueTxQRequiredFeeTxSource<AppTxQAccount>,
+    {
+        self.lock().get_tx_required_fee_and_seq(lock, view, tx)
     }
 
     pub fn process_closed_ledger<Lock, App, View>(

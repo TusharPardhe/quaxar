@@ -1,11 +1,11 @@
 use super::{
     AcceptLedgerPendingRuntime, AcceptLedgerPendingTransaction, AppOpenLedgerTxQApplyRuntime,
     ApplicationRoot, INVALID_BATCH_BASE_FEE, NodeFamilyRuntime, PersistentSubmitSandbox,
-    TypedPreclaimRoute, apply_submit_transactor_shell,
-    apply_submit_transactor_shell_with_flags, batch_base_fee,
-    calculate_default_sttx_base_fee, calculate_sttx_base_fee, consensus_status_event,
-    loan_set_counterparty_preflight_ter, preferred_lcl_matches_local_or_parent,
-    queue_apply_preclaim_ter, transaction_preflight_ter, typed_preclaim_route, typed_preclaim_ter,
+    TypedPreclaimRoute, apply_submit_transactor_shell, apply_submit_transactor_shell_with_flags,
+    batch_base_fee, calculate_default_sttx_base_fee, calculate_sttx_base_fee,
+    consensus_status_event, loan_set_counterparty_preflight_ter,
+    preferred_lcl_matches_local_or_parent, queue_apply_preclaim_ter, transaction_preflight_ter,
+    typed_preclaim_route, typed_preclaim_ter,
 };
 use crate::ledger::ledger_master_runtime::AppLedgerMasterRuntime;
 use crate::network::network_ops_runtime::AppNetworkOpsApplyHeldOutcome;
@@ -586,9 +586,9 @@ fn ledger_view_with_ticket(
     )
 }
 
-fn apply_submit_tx_for_test(
+fn apply_submit_tx_for_test<V: ApplyView>(
     open_ledger: &mut AppOpenLedgerView,
-    submit_view: &mut Sandbox<Ledger>,
+    submit_view: &mut V,
     tx: Arc<STTx>,
     current_ledger_index: u32,
 ) -> ApplyResult {
@@ -615,9 +615,17 @@ fn simulate_clones_persistent_open_view_sequence_and_balance() {
     let (source, first) = signed_payment_tx(0xC1, destination, 1, 10);
     let (_, second) = signed_payment_tx(0xC1, destination, 2, 10);
     let base = Arc::new(ledger_view(10, source, 1, &[]));
-    let mut live = Sandbox::new(Arc::clone(&base), ApplyFlags::NONE);
+    let mut live = Sandbox::new(
+        Arc::new(OpenView::new_open(Arc::clone(&base), base.rules().clone())),
+        ApplyFlags::NONE,
+    );
     let mut open =
         AppOpenLedgerView::with_parent_hash(11, base.fees().base, *base.header().hash.as_uint256());
+
+    assert!(
+        live.open(),
+        "persistent submit view must retain OpenView semantics"
+    );
 
     assert_eq!(
         apply_submit_tx_for_test(&mut open, &mut live, Arc::clone(&first), 11),
@@ -821,9 +829,25 @@ fn closed_ledger_transition_rebases_persistent_submit_state() {
     let account = AccountID::from_array([0xA5; 20]);
 
     root.on_closed_ledger(Arc::clone(&first));
-    *root.open_ledger_sandbox.lock().expect("sandbox mutex") =
-        Some(Sandbox::new(first, ApplyFlags::NONE));
+    *root.open_ledger_sandbox.lock().expect("sandbox mutex") = Some(Sandbox::new(
+        Arc::new(OpenView::new_open(
+            Arc::clone(&first),
+            first.rules().clone(),
+        )),
+        ApplyFlags::NONE,
+    ));
     root.note_open_ledger_tx(&account, 7);
+    assert_eq!(
+        root.network_ops_current_account_seq(&account),
+        Some(8),
+        "an accepted open-ledger transaction must advance the next signing sequence",
+    );
+    root.note_open_ledger_tx(&account, 6);
+    assert_eq!(
+        root.network_ops_current_account_seq(&account),
+        Some(8),
+        "out-of-order observations must not regress the next signing sequence",
+    );
 
     root.on_closed_ledger(second);
 
@@ -2870,7 +2894,7 @@ fn acquired_lcl_rebase_discards_transactions_already_in_parent() {
     });
 
     let acquired_lcl = Arc::new(acquired_lcl);
-    app.rebuild_open_ledger_after_consensus(Arc::clone(&acquired_lcl));
+    app.rebuild_open_ledger_after_consensus(Arc::clone(&acquired_lcl), &[], false);
 
     let current = app.open_ledger().current();
     assert_eq!(
@@ -2952,7 +2976,7 @@ fn consensus_rebase_discards_transaction_with_consumed_parent_sequence() {
         true
     });
 
-    app.rebuild_open_ledger_after_consensus(Arc::clone(&parent));
+    app.rebuild_open_ledger_after_consensus(Arc::clone(&parent), &[], false);
 
     assert!(
         !app.open_ledger()
@@ -4398,7 +4422,7 @@ fn persistent_submit_sandbox_is_restored_during_unwind() {
     let source = AccountID::from_array([0xC3; 20]);
     let base = Arc::new(ledger_view(10, source, 1, &[]));
     let holder = Arc::new(Mutex::new(Some(Sandbox::new(
-        Arc::clone(&base),
+        Arc::new(OpenView::new_open(Arc::clone(&base), base.rules().clone())),
         ApplyFlags::NONE,
     ))));
 

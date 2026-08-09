@@ -5783,12 +5783,20 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
         // --- Change pseudo-transaction (reference the reference source) ---
         TxType::FEE => {
             let k = protocol::fee_settings_keylet();
-            let mut obj = if let Ok(Some(existing)) = view.peek(k) {
-                existing.clone_as_object()
-            } else {
-                protocol::STObject::new(sf("sfGeneric"))
-            };
-            if sttx.is_field_present(sf("sfBaseFeeDrops")) {
+            // Match Change::applyFee: a missing fee object is a typed
+            // FeeSettings SLE, not a generic STObject. The latter serializes
+            // without sfLedgerEntryType and cannot be decoded by the accepted
+            // ledger's state-batch path.
+            let existing = view.peek(k).ok().flatten();
+            let mut obj = existing.as_ref().map_or_else(
+                || protocol::STLedgerEntry::new(k).clone_as_object(),
+                |entry| entry.clone_as_object(),
+            );
+            // `Change::applyFee` selects the format from the ledger rules, not
+            // from whichever fields happen to be present on the transaction.
+            // The pseudo-transaction preflight has already enforced the exact
+            // required/forbidden shape for this rule set.
+            if view.rules().enabled(&protocol::feature_xrp_fees()) {
                 obj.set_field_amount(
                     sf("sfBaseFeeDrops"),
                     sttx.get_field_amount(sf("sfBaseFeeDrops")),
@@ -5801,29 +5809,35 @@ fn handle_real_dispatch_inner<V: ledger::ApplyView>(
                     sf("sfReserveIncrementDrops"),
                     sttx.get_field_amount(sf("sfReserveIncrementDrops")),
                 );
+                // Exact `Change::applyFee` XRPFees transition: discard the
+                // legacy representation after writing all three drops fields.
+                obj.make_field_absent(sf("sfBaseFee"));
+                obj.make_field_absent(sf("sfReferenceFeeUnits"));
+                obj.make_field_absent(sf("sfReserveBase"));
+                obj.make_field_absent(sf("sfReserveIncrement"));
             } else {
-                if sttx.is_field_present(sf("sfBaseFee")) {
-                    obj.set_field_u64(sf("sfBaseFee"), sttx.get_field_u64(sf("sfBaseFee")));
-                }
-                if sttx.is_field_present(sf("sfReferenceFeeUnits")) {
-                    obj.set_field_u32(
-                        sf("sfReferenceFeeUnits"),
-                        sttx.get_field_u32(sf("sfReferenceFeeUnits")),
-                    );
-                }
-                if sttx.is_field_present(sf("sfReserveBase")) {
-                    obj.set_field_u32(sf("sfReserveBase"), sttx.get_field_u32(sf("sfReserveBase")));
-                }
-                if sttx.is_field_present(sf("sfReserveIncrement")) {
-                    obj.set_field_u32(
-                        sf("sfReserveIncrement"),
-                        sttx.get_field_u32(sf("sfReserveIncrement")),
-                    );
-                }
+                obj.set_field_u64(sf("sfBaseFee"), sttx.get_field_u64(sf("sfBaseFee")));
+                obj.set_field_u32(
+                    sf("sfReferenceFeeUnits"),
+                    sttx.get_field_u32(sf("sfReferenceFeeUnits")),
+                );
+                obj.set_field_u32(sf("sfReserveBase"), sttx.get_field_u32(sf("sfReserveBase")));
+                obj.set_field_u32(
+                    sf("sfReserveIncrement"),
+                    sttx.get_field_u32(sf("sfReserveIncrement")),
+                );
             }
             let sle = Arc::new(protocol::STLedgerEntry::from_stobject(obj, k.key));
-            let _ = view.update(sle);
-            Ter::TES_SUCCESS
+            let result = if existing.is_some() {
+                view.update(sle)
+            } else {
+                view.insert(sle)
+            };
+            if result.is_err() {
+                Ter::TEF_INTERNAL
+            } else {
+                Ter::TES_SUCCESS
+            }
         }
 
         TxType::AMENDMENT => {

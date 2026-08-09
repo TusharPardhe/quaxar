@@ -2833,6 +2833,110 @@ fn amendment_pseudo_transaction_serializes_and_replays_each_public_testnet_targe
 }
 
 #[test]
+fn fee_pseudo_transaction_creates_typed_fee_settings_entry_and_persists() {
+    // Match Change::applyFee's missing-object path. The state batch must receive
+    // a standalone FeeSettings SLE, including sfLedgerEntryType, rather than an
+    // untyped generic object.
+    let mut ledger = empty_ledger(Vec::new());
+    let mut view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+    let pseudo_transaction = STTx::new(TxType::FEE, |tx| {
+        tx.set_field_u64(sf("sfBaseFee"), 10);
+        tx.set_field_u32(sf("sfReferenceFeeUnits"), 10);
+        tx.set_field_u32(sf("sfReserveBase"), 20);
+        tx.set_field_u32(sf("sfReserveIncrement"), 30);
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &pseudo_transaction, TxType::FEE, None),
+        Ter::TES_SUCCESS
+    );
+    let fee_settings = view
+        .read(protocol::fee_settings_keylet())
+        .expect("FeeSettings SLE read should succeed")
+        .expect("Fee pseudo-transaction should create the FeeSettings SLE");
+    assert_eq!(fee_settings.get_type(), LedgerEntryType::FeeSettings);
+
+    view.apply(&mut ledger)
+        .expect("typed FeeSettings payload should survive state-batch decoding");
+    assert_eq!(
+        ledger
+            .read(protocol::fee_settings_keylet())
+            .expect("persisted FeeSettings SLE read should succeed")
+            .expect("persisted FeeSettings SLE should exist")
+            .get_type(),
+        LedgerEntryType::FeeSettings
+    );
+}
+
+#[test]
+fn fee_pseudo_transaction_xrp_fees_replaces_legacy_fields_and_persists() {
+    // `Change::applyFee` uses the ledger amendment state, rather than the
+    // incoming field shape, and removes all legacy fee fields in XRPFees mode.
+    let keylet = protocol::fee_settings_keylet();
+    let mut legacy_fee_settings = STLedgerEntry::new(keylet);
+    legacy_fee_settings.set_field_u64(sf("sfBaseFee"), 10);
+    legacy_fee_settings.set_field_u32(sf("sfReferenceFeeUnits"), 10);
+    legacy_fee_settings.set_field_u32(sf("sfReserveBase"), 20);
+    legacy_fee_settings.set_field_u32(sf("sfReserveIncrement"), 30);
+
+    let mut ledger = empty_ledger(vec![legacy_fee_settings]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_xrp_fees()]));
+    let mut view = Sandbox::new(Arc::new(ledger.clone()), ApplyFlags::NONE);
+    let pseudo_transaction = STTx::new(TxType::FEE, |tx| {
+        tx.set_field_amount(sf("sfBaseFeeDrops"), test_xrp(12));
+        tx.set_field_amount(sf("sfReserveBaseDrops"), test_xrp(22));
+        tx.set_field_amount(sf("sfReserveIncrementDrops"), test_xrp(32));
+    });
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &pseudo_transaction, TxType::FEE, None),
+        Ter::TES_SUCCESS
+    );
+    let fee_settings = view
+        .read(keylet)
+        .expect("FeeSettings SLE read should succeed")
+        .expect("FeeSettings SLE should remain present");
+    assert_eq!(fee_settings.get_type(), LedgerEntryType::FeeSettings);
+    assert_eq!(
+        fee_settings.get_field_amount(sf("sfBaseFeeDrops")),
+        test_xrp(12)
+    );
+    assert_eq!(
+        fee_settings.get_field_amount(sf("sfReserveBaseDrops")),
+        test_xrp(22)
+    );
+    assert_eq!(
+        fee_settings.get_field_amount(sf("sfReserveIncrementDrops")),
+        test_xrp(32)
+    );
+    for legacy_field in [
+        sf("sfBaseFee"),
+        sf("sfReferenceFeeUnits"),
+        sf("sfReserveBase"),
+        sf("sfReserveIncrement"),
+    ] {
+        assert!(
+            !fee_settings.is_field_present(legacy_field),
+            "XRPFees FeeSettings must not retain {}",
+            legacy_field.name()
+        );
+    }
+
+    view.apply(&mut ledger)
+        .expect("XRPFees FeeSettings payload should survive state-batch decoding");
+    let persisted = ledger
+        .read(keylet)
+        .expect("persisted FeeSettings SLE read should succeed")
+        .expect("persisted FeeSettings SLE should exist");
+    assert_eq!(persisted.get_type(), LedgerEntryType::FeeSettings);
+    assert_eq!(
+        persisted.get_field_amount(sf("sfBaseFeeDrops")),
+        test_xrp(12)
+    );
+    assert!(!persisted.is_field_present(sf("sfBaseFee")));
+}
+
+#[test]
 fn conditional_escrow_create_persists_condition_and_finish_requires_matching_fulfillment() {
     let owner = sample_account(0xE1);
     let destination = sample_account(0xE2);
@@ -4252,7 +4356,8 @@ fn escrow_create_uses_strict_parent_close_time_expiration() {
     let destination = sample_account(0x17);
     let tx = escrow_create_tx(account, destination, 9);
 
-    for (parent_close_time, expected) in [(1001, Ter::TES_SUCCESS), (1002, Ter::TEC_NO_PERMISSION)] {
+    for (parent_close_time, expected) in [(1001, Ter::TES_SUCCESS), (1002, Ter::TEC_NO_PERMISSION)]
+    {
         let ledger = ledger_with_header(
             LedgerHeader {
                 parent_close_time,

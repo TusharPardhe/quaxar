@@ -831,10 +831,7 @@ fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
 }
 
 fn submit_ledger(runtime: &app::AppNetworkOpsRuntime) -> Option<Arc<Ledger>> {
-    let ledger_state = runtime.ledger_master_state();
-    ledger_state
-        .closed_ledger()
-        .or_else(|| ledger_state.validated_ledger())
+    runtime.ledger_master_state().latest_ledger()
 }
 
 fn ledger_keylet_exists(ledger: &Ledger, keylet: Keylet) -> bool {
@@ -1245,8 +1242,7 @@ fn submit_semantic_preflight_with_ledger(
                 amount_positive: amount.signum() > 0 && amount.is_legal_net(),
                 feature_token_escrow_enabled: true,
                 feature_mptokens_enabled: true,
-                fix_cleanup_3_2_0_enabled: rules
-                    .enabled(&protocol::feature_id("fixCleanup3_2_0")),
+                fix_cleanup_3_2_0_enabled: rules.enabled(&protocol::feature_id("fixCleanup3_2_0")),
                 issue_has_bad_currency: amount.holds_issue()
                     && amount.issue().currency == protocol::bad_currency(),
                 mpt_amount_within_limit: !amount.holds_mpt_issue()
@@ -2715,6 +2711,24 @@ pub(crate) fn submit_sttx<Env, Runtime: RpcRuntime>(
         );
     }
 
+    // Legacy submit-with-secret signs the next request from the open ledger.
+    // Keep that sequence source in lockstep only after this transaction was
+    // admitted to the local open ledger. Without this update every rapid
+    // submit from an account is signed with the same Sequence, leaving only
+    // one candidate transaction to reach consensus. This is the equivalent
+    // of rippled TxQ::nextQueuableSeq used by TransactionSign.
+    let admitted = transaction
+        .lock()
+        .expect("transaction mutex must not be poisoned")
+        .get_submit_result()
+        .any();
+    if admitted && is_tes_success(result) {
+        if let Some(app) = ctx.runtime.app() {
+            let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
+            app.note_open_ledger_tx(&account, st_tx.get_seq_value());
+        }
+    }
+
     tracing::info!(target: "rpc", tx_hash = %st_tx.get_transaction_id(), "Transaction submitted via RPC");
 
     // In standalone mode, submit immediately closes the ledger
@@ -2773,6 +2787,18 @@ fn submit_with_sign<Runtime: RpcRuntime>(
     ctx: &RpcRequestContext<'_, SubmitSource, Runtime>,
 ) -> Result<JsonValue, Status> {
     use crate::commands::rpc_helpers::transaction_sign;
+
+    // `submit` with a server-side secret leaves Sequence unspecified. Match
+    // rippled's synchronous NetworkOPs admission contract by holding the LCL
+    // transition gate from open-ledger sequence autofill through signing and
+    // direct open-ledger admission. `submit_sttx` re-enters this gate while it
+    // takes close_gate and drains its synchronous batch. Without this outer
+    // scope, concurrent legacy handlers can sign distinct transactions with
+    // the same open-ledger sequence; TxQ only detects the conflict later and
+    // one otherwise accepted transaction is discarded at consensus as
+    // tefPAST_SEQ.
+    let app = ctx.runtime.app();
+    let _legacy_sign_submit_guard = app.map(|app| app.lcl_transition_gate().lock());
 
     // Reinterpret the context with a temporary SignSource for the sign call
     let sign_ctx = RpcRequestContext {

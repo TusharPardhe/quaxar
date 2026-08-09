@@ -11,8 +11,9 @@ use protocol::{
 };
 
 use crate::{
-    ChangePreflightFacts, TransactorPreflight0Facts, run_change_invoke_preflight_for_txn_type,
-    run_change_preflight, run_change_preflight_flag_mask, run_transactor_preflight0,
+    ChangePreflightFacts, PaymentPreflightEvalFacts, TransactorPreflight0Facts,
+    run_change_invoke_preflight_for_txn_type, run_change_preflight, run_change_preflight_flag_mask,
+    run_payment_preflight_eval, run_transactor_preflight0,
 };
 
 /// Runs the common, amendment-aware, stateless preflight portion for a
@@ -189,7 +190,7 @@ fn validate_sttx_common_transactor_preflight(tx: &STTx) -> NotTec {
 
 fn validate_sttx_typed_semantic_preflight(tx: &STTx, rules: &Rules, txn_type: TxType) -> NotTec {
     match txn_type {
-        TxType::PAYMENT => validate_payment_preflight(tx),
+        TxType::PAYMENT => validate_payment_preflight_with_rules(tx, rules),
         TxType::DEPOSIT_PREAUTH => validate_deposit_preauth_preflight(tx, rules),
         TxType::ACCOUNT_DELETE => validate_account_delete_preflight(tx, rules),
         TxType::TICKET_CREATE => crate::run_ticket_create_preflight(
@@ -249,68 +250,75 @@ pub fn payment_is_redundant_to_self(
         && !has_paths
 }
 
+#[cfg(test)]
 fn validate_payment_preflight(tx: &STTx) -> NotTec {
-    let account = get_field_by_symbol("sfAccount");
+    validate_payment_preflight_with_rules(tx, &Rules::default())
+}
+
+fn validate_payment_preflight_with_rules(tx: &STTx, rules: &Rules) -> NotTec {
+    let account_field = get_field_by_symbol("sfAccount");
     let amount_field = get_field_by_symbol("sfAmount");
-    let destination = get_field_by_symbol("sfDestination");
-    let deliver_min = get_field_by_symbol("sfDeliverMin");
-    if !tx.is_field_present(amount_field) || !tx.is_field_present(destination) {
+    let destination_field = get_field_by_symbol("sfDestination");
+    let deliver_min_field = get_field_by_symbol("sfDeliverMin");
+    let send_max_field = get_field_by_symbol("sfSendMax");
+    let paths_field = get_field_by_symbol("sfPaths");
+    if !tx.is_field_present(amount_field) || !tx.is_field_present(destination_field) {
         return Ter::TEM_MALFORMED;
     }
 
+    // This is the same Payment::preflight decision table used by the concrete
+    // Payment transactor. Keeping semantic preflight on this shared evaluator
+    // prevents RPC admission from accepting flag combinations that rippled
+    // rejects before preclaim or Flow execution.
     let amount = tx.get_field_amount(amount_field);
-    let source_account = tx.get_account_id(account);
-    let send_max = get_field_by_symbol("sfSendMax");
-    let max_source_amount = payment_max_source_amount(
-        source_account,
-        &amount,
-        tx.is_field_present(send_max)
-            .then(|| tx.get_field_amount(send_max))
-            .as_ref(),
-    );
-    // Preserve rippled's preflight ordering: bad/zero source or destination
-    // amounts and bad assets are rejected before the self-payment predicate.
-    if amount.signum() <= 0
-        || !amount.is_legal_net()
-        || !max_source_amount.is_legal_net()
-        || (tx.is_field_present(send_max) && max_source_amount.signum() <= 0)
-    {
-        return Ter::TEM_BAD_AMOUNT;
-    }
-    if is_bad_asset(max_source_amount.asset()) || is_bad_asset(amount.asset()) {
-        return Ter::TEM_BAD_CURRENCY;
-    }
+    let source_account = tx.get_account_id(account_field);
+    let send_max = tx
+        .is_field_present(send_max_field)
+        .then(|| tx.get_field_amount(send_max_field));
+    let max_source_amount = payment_max_source_amount(source_account, &amount, send_max.as_ref());
+    let deliver_min = tx
+        .is_field_present(deliver_min_field)
+        .then(|| tx.get_field_amount(deliver_min_field));
+    let destination_account = tx.get_account_id(destination_field);
+    let has_paths = tx.is_field_present(paths_field);
 
-    if let Some(deliver_min) = tx
-        .is_field_present(deliver_min)
-        .then(|| tx.get_field_amount(deliver_min))
-        && (deliver_min.negative()
-            || !deliver_min.is_legal_net()
-            || deliver_min.asset() != amount.asset())
-    {
-        return Ter::TEM_BAD_AMOUNT;
-    }
-
-    let destination_account = tx.get_account_id(destination);
-    if destination_account.is_zero() {
-        return Ter::TEM_DST_IS_SRC;
-    }
-
-    // Match Payment::preflight's getMaxSourceAmount + equalTokens gate. IOUs
-    // compare by currency regardless of issuer, MPTs by issuance ID, and an
-    // explicit path is allowed because it may perform arbitrage.
-    let has_paths = tx.is_field_present(get_field_by_symbol("sfPaths"));
-    if payment_is_redundant_to_self(
-        source_account,
-        destination_account,
-        &max_source_amount,
-        &amount,
-        has_paths,
-    ) {
-        return Ter::TEM_REDUNDANT;
-    }
-
-    Ter::TES_SUCCESS
+    run_payment_preflight_eval(
+        PaymentPreflightEvalFacts {
+            tx_flags: tx.get_flags(),
+            mptokens_v1_enabled: rules.enabled(&protocol::feature_id("MPTokensV1")),
+            mptokens_v2_enabled: rules.enabled(&protocol::feature_id("MPTokensV2")),
+            amount_is_mpt: amount.holds_mpt_issue(),
+            paths_present: has_paths,
+            send_max_present: send_max.is_some(),
+            send_max_asset_matches_amount: send_max
+                .as_ref()
+                .is_none_or(|value| value.asset() == amount.asset()),
+            send_max_is_mpt: send_max.as_ref().is_some_and(STAmount::holds_mpt_issue),
+            amount_is_legal_net: amount.is_legal_net(),
+            max_source_is_legal_net: max_source_amount.is_legal_net(),
+            destination_present: !destination_account.is_zero(),
+            max_source_positive: max_source_amount.signum() > 0,
+            amount_positive: amount.signum() > 0,
+            src_asset_bad: is_bad_asset(max_source_amount.asset()),
+            dst_asset_bad: is_bad_asset(amount.asset()),
+            src_asset_is_xrp: max_source_amount.native(),
+            dst_asset_is_xrp: amount.native(),
+            account_equals_destination: source_account == destination_account,
+            src_dst_tokens_equal: equal_tokens(max_source_amount.asset(), amount.asset()),
+            deliver_min_present: deliver_min.is_some(),
+            deliver_min_is_legal_net: deliver_min.as_ref().is_none_or(STAmount::is_legal_net),
+            deliver_min_is_positive: deliver_min.as_ref().is_none_or(|value| value.signum() > 0),
+            deliver_min_asset_matches_amount: deliver_min
+                .as_ref()
+                .is_none_or(|value| value.asset() == amount.asset()),
+            deliver_min_not_greater_than_amount: deliver_min
+                .as_ref()
+                .is_none_or(|value| value <= &amount),
+        },
+        || Ter::TES_SUCCESS,
+        || Ter::TES_SUCCESS,
+        || Ter::TES_SUCCESS,
+    )
 }
 
 fn validate_deposit_preauth_preflight(tx: &STTx, rules: &Rules) -> NotTec {

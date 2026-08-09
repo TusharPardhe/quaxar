@@ -216,11 +216,6 @@ where
         L: FeeVoteLedgerView,
         S: VoteTxSet,
     {
-        assert!(
-            last_closed_ledger.is_flag_ledger(),
-            "xrpl::FeeVote::doVoting : has a flag ledger"
-        );
-
         let (current_base, current_reserve, current_increment) =
             current_fee_schedule(last_closed_ledger.fees());
         let mut base_fee_vote = VotableValue::new(current_base, self.target.reference_fee);

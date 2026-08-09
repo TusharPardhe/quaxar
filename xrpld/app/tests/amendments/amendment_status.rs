@@ -41,6 +41,31 @@ fn signed_validation(
 }
 
 #[test]
+fn need_validated_ledger_fires_on_genesis_matching_rippled_uint32_wraparound() {
+    // Matches rippled's AmendmentTableImpl::needValidatedLedger, which relies
+    // on unsigned std::uint32_t wraparound: lastUpdateSeq_ starts at 0, so
+    // `lastUpdateSeq_ - 1` underflows to UINT32_MAX on the very first call,
+    // making `(ledgerSeq - 1) / 256 != (UINT32_MAX) / 256` true for ledger 1.
+    // A naive saturating_sub(1) implementation instead computes `0 / 256`
+    // for the default last_update_seq, which never differs from ledger 1
+    // through 256's `(seq - 1) / 256 == 0`, silently skipping the sync until
+    // ledger 257.
+    let table = AmendmentStatus::new();
+    assert!(
+        table.need_validated_ledger(1),
+        "the first validated ledger must trigger an amendment-status sync"
+    );
+
+    // Once synced at some ledger seq, the table should not need another sync
+    // until crossing the next 256-ledger boundary, and should need one again
+    // immediately after crossing it.
+    table.do_validated_ledger_with_sets(1, &BTreeSet::new(), &BTreeMap::new());
+    assert!(!table.need_validated_ledger(2));
+    assert!(!table.need_validated_ledger(256));
+    assert!(table.need_validated_ledger(257));
+}
+
+#[test]
 fn amendment_table_validation_only_votes_for_upvoted_supported_unenabled_features() {
     let alpha = Uint256::from_u64(1);
     let beta = Uint256::from_u64(2);

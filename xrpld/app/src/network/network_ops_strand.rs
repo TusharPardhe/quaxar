@@ -1321,7 +1321,7 @@ fn switch_last_closed_ledger(
     // clears only after a real LCL jump, never on a target replacement.
     root.set_need_network_ledger(false);
     root.process_closed_ledger_txq(ledger.as_ref(), true);
-    root.rebuild_open_ledger_after_consensus(Arc::clone(&ledger));
+    root.rebuild_open_ledger_after_consensus(Arc::clone(&ledger), &[], false);
     root.on_closed_ledger(Arc::clone(&ledger));
     root.broadcast_consensus_status_change(ledger.as_ref(), 3, true);
 

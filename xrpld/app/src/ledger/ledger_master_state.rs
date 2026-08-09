@@ -102,6 +102,20 @@ impl SharedLedgerMasterState {
         self.validated_ledger.load_full()
     }
 
+    /// Return the newest locally available immutable ledger view. Submission
+    /// must not use an older closed slot when validation has already advanced:
+    /// the OpenLedger sandbox and signing flow need one current account-state
+    /// base, matching rippled's OpenLedger/TxQ view.
+    pub fn latest_ledger(&self) -> Option<Arc<Ledger>> {
+        match (self.closed_ledger(), self.validated_ledger()) {
+            (Some(closed), Some(validated)) if validated.header().seq > closed.header().seq => {
+                Some(validated)
+            }
+            (Some(closed), _) => Some(closed),
+            (None, validated) => validated,
+        }
+    }
+
     pub fn published_ledger(&self) -> Option<Arc<Ledger>> {
         self.published_ledger.load_full()
     }
@@ -263,6 +277,27 @@ mod tests {
             .closed_ledger()
             .expect("authoritative LCL remains installed");
         assert!(Arc::ptr_eq(&current, &authoritative));
+    }
+
+    #[test]
+    fn latest_ledger_uses_newer_validated_state_but_preserves_newer_closed_state() {
+        let state = SharedLedgerMasterState::new(Arc::new(FixedCloseTimeProvider::new(200)));
+        let closed = Arc::new(Ledger::from_ledger_seq_and_close_time(100, 100, false));
+        let validated = Arc::new(Ledger::from_ledger_seq_and_close_time(101, 101, false));
+
+        state.note_closed_ledger(Arc::clone(&closed));
+        state.note_validated_ledger(Arc::clone(&validated));
+        assert!(Arc::ptr_eq(
+            &state.latest_ledger().expect("newer validated ledger selected"),
+            &validated,
+        ));
+
+        let newer_closed = Arc::new(Ledger::from_ledger_seq_and_close_time(102, 102, false));
+        state.note_closed_ledger(Arc::clone(&newer_closed));
+        assert!(Arc::ptr_eq(
+            &state.latest_ledger().expect("newer closed ledger selected"),
+            &newer_closed,
+        ));
     }
 
     #[test]

@@ -40,9 +40,9 @@ use crate::state::accept_ledger_pending_apply::AcceptLedgerPendingApplyRuntime;
 use crate::state::app_registry::{
     AppAcceptedLedgerCache, AppConfig, AppInboundLedgers, AppInboundTransactions, AppLogs,
     AppOpenLedgerTxRecord, AppOpenLedgerView, AppPlaceholder, AppQueueApplyTxSource,
-    AppServerHandler, AppTxQAccount, AppTxQJournalTag, AppTxQLock, AppTxQParentBatchId,
-    AppTxQTransaction, ApplicationRegistryOwners, RelayUntrustedPolicy, SharedAppOpenLedger,
-    SharedAppTxQ,
+    AppRequiredFeeView, AppServerHandler, AppTxQAccount, AppTxQJournalTag, AppTxQLock,
+    AppTxQParentBatchId, AppTxQTransaction, ApplicationRegistryOwners, RelayUntrustedPolicy,
+    SharedAppOpenLedger, SharedAppTxQ,
 };
 use crate::state::basic_app::BasicApp;
 use crate::state::candidate_diagnostics::{
@@ -507,7 +507,7 @@ pub struct ApplicationRoot {
         Arc<std::sync::Mutex<std::collections::HashMap<protocol::AccountID, u32>>>,
     /// Persistent submit sandbox matching rippled's OpenView. Accumulates state changes
     /// across submit calls within the same open ledger period. Reset on ledger_accept.
-    open_ledger_sandbox: Arc<std::sync::Mutex<Option<Sandbox<Ledger>>>>,
+    open_ledger_sandbox: Arc<std::sync::Mutex<Option<Sandbox<ledger::OpenView<Ledger>>>>>,
     /// Close gate: serializes on_close's apply+capture with NetworkOPs batch
     /// application. rippled protects this work with its application and ledger
     /// locks; the Rust runtime uses this narrow gate around the same mutable
@@ -1204,27 +1204,36 @@ fn batch_preclaim_ter(view: &impl ReadView, tx: &STTx, _flags: ApplyFlags) -> Te
 
 #[derive(Debug)]
 struct PersistentSubmitSandbox {
-    holder: Arc<std::sync::Mutex<Option<Sandbox<Ledger>>>>,
-    sandbox: Option<Sandbox<Ledger>>,
+    holder: Arc<std::sync::Mutex<Option<Sandbox<ledger::OpenView<Ledger>>>>>,
+    sandbox: Option<Sandbox<ledger::OpenView<Ledger>>>,
 }
 
 impl PersistentSubmitSandbox {
     fn take_or_new(
-        holder: Arc<std::sync::Mutex<Option<Sandbox<Ledger>>>>,
+        holder: Arc<std::sync::Mutex<Option<Sandbox<ledger::OpenView<Ledger>>>>>,
         base: Arc<Ledger>,
     ) -> Self {
         let sandbox = holder
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
-            .unwrap_or_else(|| Sandbox::new(base, ApplyFlags::NONE));
+            // TxQ::apply receives rippled's OpenView. A Sandbox<Ledger>
+            // delegates `open()` to the closed parent and therefore skips
+            // Transactor::checkFee's open-ledger minimum-fee rejection.
+            .unwrap_or_else(|| {
+                let rules = base.rules().clone();
+                Sandbox::new(
+                    Arc::new(ledger::OpenView::new_open(base, rules)),
+                    ApplyFlags::NONE,
+                )
+            });
         Self {
             holder,
             sandbox: Some(sandbox),
         }
     }
 
-    fn view_mut(&mut self) -> &mut Sandbox<Ledger> {
+    fn view_mut(&mut self) -> &mut Sandbox<ledger::OpenView<Ledger>> {
         self.sandbox
             .as_mut()
             .expect("persistent submit sandbox must be present while applying")
@@ -1279,21 +1288,23 @@ impl QueueAcceptLedgerViewSource for AppOpenLedgerTxQAcceptView {
     }
 }
 
-struct AppOpenLedgerTxQAcceptRuntime<'a> {
+struct AppOpenLedgerTxQAcceptRuntime<'a, V> {
     root: &'a ApplicationRoot,
     view: &'a mut AppOpenLedgerView,
-    rebase_view: &'a mut Sandbox<Ledger>,
+    rebase_view: &'a mut V,
     applied_ids: &'a mut std::collections::HashSet<Uint256>,
     flags: ApplyFlags,
 }
 
-impl
+impl<V>
     QueueAcceptLiveApplyRuntime<
         AppTxQAccount,
         AppTxQTransaction,
         AppTxQJournalTag,
         AppTxQParentBatchId,
-    > for AppOpenLedgerTxQAcceptRuntime<'_>
+    > for AppOpenLedgerTxQAcceptRuntime<'_, V>
+where
+    V: ledger::ApplyView,
 {
     fn apply_queued(
         &mut self,
@@ -4313,7 +4324,15 @@ impl ApplicationRoot {
             .expect("sandbox mutex")
             .as_ref()
             .cloned()
-            .unwrap_or_else(|| Sandbox::new(Arc::clone(&ledger), ApplyFlags::DRY_RUN));
+            .unwrap_or_else(|| {
+                Sandbox::new(
+                    Arc::new(ledger::OpenView::new_open(
+                        Arc::clone(&ledger),
+                        ledger.rules().clone(),
+                    )),
+                    ApplyFlags::DRY_RUN,
+                )
+            });
         let ledger_seq = open_view.ledger_current_index;
         let close_time = apply_view.header().close_time;
         let tx_source = AppQueueApplyTxSource::new(tx.as_ref());
@@ -4450,8 +4469,13 @@ impl ApplicationRoot {
             "LCL_AUDIT open-ledger rebase started"
         );
         let mut retries = Vec::<AppOpenLedgerTxRecord>::new();
-        let rebase_view =
-            std::cell::RefCell::new(Sandbox::new(Arc::clone(&parent), ApplyFlags::NONE));
+        let rebase_view = std::cell::RefCell::new(Sandbox::new(
+            Arc::new(ledger::OpenView::new_open(
+                Arc::clone(&parent),
+                parent.rules().clone(),
+            )),
+            ApplyFlags::NONE,
+        ));
         let applied_ids = std::cell::RefCell::new(std::collections::HashSet::new());
 
         self.open_ledger().accept(
@@ -4464,7 +4488,7 @@ impl ApplicationRoot {
             &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, flags| {
                 self.reapply_open_ledger_record(
                     view,
-                    &mut rebase_view.borrow_mut(),
+                    &mut *rebase_view.borrow_mut(),
                     &mut applied_ids.borrow_mut(),
                     tx,
                     flags,
@@ -4473,7 +4497,7 @@ impl ApplicationRoot {
             &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, flags| {
                 let _ = self.reapply_open_ledger_record(
                     view,
-                    &mut rebase_view.borrow_mut(),
+                    &mut *rebase_view.borrow_mut(),
                     &mut applied_ids.borrow_mut(),
                     tx,
                     flags,
@@ -4487,7 +4511,7 @@ impl ApplicationRoot {
                 let mut runtime = AppOpenLedgerTxQAcceptRuntime {
                     root: self,
                     view,
-                    rebase_view: &mut rebase_view.borrow_mut(),
+                    rebase_view: &mut *rebase_view.borrow_mut(),
                     applied_ids: &mut applied_ids.borrow_mut(),
                     flags: ApplyFlags::NONE,
                 };
@@ -4497,8 +4521,36 @@ impl ApplicationRoot {
                     .accept(&mut lock, &mut runtime, &snapshot)
                     .ledger_changed
             }),
-            &mut |_tx_id: &Uint256| false,
-            &mut |_tx: &AppOpenLedgerTxRecord| {},
+            // Match rippled OpenLedger::accept: re-relay every recovered
+            // transaction that survives reapplication, so a peer that missed
+            // the first ingress relay can include it in a later consensus set.
+            &mut |_tx_id: &Uint256| true,
+            &mut |record: &AppOpenLedgerTxRecord| {
+                use overlay::Overlay;
+
+                let tx = &record.tx;
+                // Inner Batch transactions are never independently relayed.
+                if tx.is_flag(tfInnerBatchTxn) {
+                    return;
+                }
+                let tx_id = tx.get_transaction_id();
+                let Some(to_skip) = self.registry.hash_router.should_relay(tx_id) else {
+                    return;
+                };
+                let Some(overlay_rt) = self.overlay_runtime() else {
+                    return;
+                };
+                let now = self.shared_time_keeper().now().as_seconds() as u64;
+                overlay_rt.overlay().relay_transaction(
+                    tx_id,
+                    Some(queue_relay_envelope(
+                        tx.get_serializer().data().to_vec(),
+                        now,
+                        false,
+                    )),
+                    &to_skip,
+                );
+            },
         );
         *self.open_ledger_sandbox.lock().expect("sandbox mutex") = Some(rebase_view.into_inner());
         let open_after = self.open_ledger().current_open_transactions();
@@ -4519,10 +4571,10 @@ impl ApplicationRoot {
         );
     }
 
-    fn reapply_open_ledger_record(
+    fn reapply_open_ledger_record<V: ledger::ApplyView>(
         &self,
         open_ledger: &mut AppOpenLedgerView,
-        rebase_view: &mut Sandbox<Ledger>,
+        rebase_view: &mut V,
         applied_ids: &mut std::collections::HashSet<Uint256>,
         record: &AppOpenLedgerTxRecord,
         flags: ApplyFlags,
@@ -4570,26 +4622,40 @@ impl ApplicationRoot {
     /// in the parent must be discarded rather than carried into the next
     /// proposal. This matters especially when switching to an acquired LCL,
     /// whose transaction map can overlap the old local open ledger.
-    pub(crate) fn rebuild_open_ledger_after_consensus(&self, parent: Arc<Ledger>) {
+    pub(crate) fn rebuild_open_ledger_after_consensus(
+        &self,
+        parent: Arc<Ledger>,
+        retry_transactions: &[Arc<STTx>],
+        retries_first: bool,
+    ) {
         let next_open_index = parent.header().seq.saturating_add(1);
         let base_fee_drops = parent.fees().base;
         let parent_hash = *parent.header().hash.as_uint256();
         let local_txs = self.local_open_ledger_records();
-        let mut retries = Vec::<AppOpenLedgerTxRecord>::new();
-        let rebase_view =
-            std::cell::RefCell::new(Sandbox::new(Arc::clone(&parent), ApplyFlags::NONE));
+        let mut retries = retry_transactions
+            .iter()
+            .cloned()
+            .map(AppOpenLedgerTxRecord::new)
+            .collect::<Vec<_>>();
+        let rebase_view = std::cell::RefCell::new(Sandbox::new(
+            Arc::new(ledger::OpenView::new_open(
+                Arc::clone(&parent),
+                parent.rules().clone(),
+            )),
+            ApplyFlags::NONE,
+        ));
         let applied_ids = std::cell::RefCell::new(std::collections::HashSet::new());
         self.open_ledger().accept(
             || AppOpenLedgerView::with_parent_hash(next_open_index, base_fee_drops, parent_hash),
             &|tx_id: &Uint256| parent.tx_exists(*tx_id),
             local_txs,
-            false,
+            retries_first,
             &mut retries,
             ApplyFlags::NONE,
             &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, flags| {
                 self.reapply_open_ledger_record(
                     view,
-                    &mut rebase_view.borrow_mut(),
+                    &mut *rebase_view.borrow_mut(),
                     &mut applied_ids.borrow_mut(),
                     tx,
                     flags,
@@ -4598,7 +4664,7 @@ impl ApplicationRoot {
             &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, flags| {
                 let _ = self.reapply_open_ledger_record(
                     view,
-                    &mut rebase_view.borrow_mut(),
+                    &mut *rebase_view.borrow_mut(),
                     &mut applied_ids.borrow_mut(),
                     tx,
                     flags,
@@ -4612,7 +4678,7 @@ impl ApplicationRoot {
                 let mut runtime = AppOpenLedgerTxQAcceptRuntime {
                     root: self,
                     view,
-                    rebase_view: &mut rebase_view.borrow_mut(),
+                    rebase_view: &mut *rebase_view.borrow_mut(),
                     applied_ids: &mut applied_ids.borrow_mut(),
                     flags: ApplyFlags::NONE,
                 };
@@ -4622,8 +4688,36 @@ impl ApplicationRoot {
                     .accept(&mut lock, &mut runtime, &snapshot)
                     .ledger_changed
             }),
-            &mut |_tx_id: &Uint256| false,
-            &mut |_tx: &AppOpenLedgerTxRecord| {},
+            // Match rippled OpenLedger::accept: re-relay every recovered
+            // transaction that survives reapplication, so a peer that missed
+            // the first ingress relay can include it in a later consensus set.
+            &mut |_tx_id: &Uint256| true,
+            &mut |record: &AppOpenLedgerTxRecord| {
+                use overlay::Overlay;
+
+                let tx = &record.tx;
+                // Inner Batch transactions are never independently relayed.
+                if tx.is_flag(tfInnerBatchTxn) {
+                    return;
+                }
+                let tx_id = tx.get_transaction_id();
+                let Some(to_skip) = self.registry.hash_router.should_relay(tx_id) else {
+                    return;
+                };
+                let Some(overlay_rt) = self.overlay_runtime() else {
+                    return;
+                };
+                let now = self.shared_time_keeper().now().as_seconds() as u64;
+                overlay_rt.overlay().relay_transaction(
+                    tx_id,
+                    Some(queue_relay_envelope(
+                        tx.get_serializer().data().to_vec(),
+                        now,
+                        false,
+                    )),
+                    &to_skip,
+                );
+            },
         );
         *self.open_ledger_sandbox.lock().expect("sandbox mutex") = Some(rebase_view.into_inner());
     }
@@ -4705,7 +4799,7 @@ impl ApplicationRoot {
         let _ = self.update_local_tx(ledger.as_ref());
 
         let next_open_index = ledger.header().seq.saturating_add(1);
-        self.rebuild_open_ledger_after_consensus(Arc::clone(&ledger));
+        self.rebuild_open_ledger_after_consensus(Arc::clone(&ledger), &[], false);
 
         if let Some(runtime) = self.ledger_master_runtime() {
             // `record_consensus_built_ledger` already inserted this built
@@ -6112,8 +6206,8 @@ impl ApplicationRoot {
         let _lcl_transition_guard = self.lcl_transition_gate().lock();
         let pending = self.network_ops_pending_transaction_count().unwrap_or(0);
         if pending > 0 {}
-        let base_ledger = match self.closed_ledger().or_else(|| self.validated_ledger()) {
-            Some(l) => l,
+        let base_ledger = match self.ledger_master_state.latest_ledger() {
+            Some(ledger) => self.ledger_with_node_fetcher(ledger),
             None => {
                 tracing::warn!(target: "relay", pending_count = self.network_ops_pending_transaction_count(), "apply_pending: NO base_ledger — early return, txns NOT applied");
                 return None;
@@ -6132,7 +6226,11 @@ impl ApplicationRoot {
         );
         let tx_q = self.registry.tx_q.clone();
         let open_ledger = self.registry.open_ledger.clone();
-        let current_base_fee = self.open_ledger().current().base_fee_drops;
+        // Clone for the current_ledger_state closure (the batch closure below
+        // already moves tx_q/open_ledger, so the state closure needs its own
+        // Arc refs to query the queue-aware fee and seq after apply).
+        let tx_q_for_state = tx_q.clone();
+        let open_ledger_for_state = open_ledger.clone();
         let state_ledger = Arc::clone(&base_ledger);
         let account_seqs = Arc::clone(&self.open_ledger_account_seqs);
         let sandbox_holder = Arc::clone(&self.open_ledger_sandbox);
@@ -6259,23 +6357,23 @@ impl ApplicationRoot {
                         .expect("transaction mutex must not be poisoned")
                         .get_s_transaction(),
                 );
-                let account = tx.get_account_id(get_field_by_symbol("sfAccount"));
-                let account_seq = state_ledger
-                    .read(account_keylet(
-                        Uint160::from_slice(account.data())
-                            .expect("account width should match Uint160"),
-                    ))
-                    .ok()
-                    .flatten()
-                    .map(|account_root| account_root.get_field_u32(get_field_by_symbol("sfSequence")))
-                    .unwrap_or(0);
-
+                let tx_source = AppQueueApplyTxSource::new(tx.as_ref());
+                // Build a thin view over the current base ledger so that
+                // `get_tx_required_fee_and_seq` reads `sfSequence` from the
+                // same source rippled uses (`calculateBaseFee` on the open
+                // ledger view) and calls `nextQueuableSeqImpl` to produce a
+                // queue-aware `available_seq`. This matches rippled's
+                // `NetworkOPsImp::apply` → `getTxRequiredFeeAndSeq` path.
+                let fee_view =
+                    AppRequiredFeeView::new(state_ledger.as_ref(), open_ledger_for_state.current().open_ledger_tx_count());
+                let mut lock = AppTxQLock;
+                let fee_and_seq = tx_q_for_state.get_tx_required_fee_and_seq(&mut lock, &fee_view, &tx_source);
                 crate::NetworkOpsCurrentLedgerState {
                     fee: protocol::XRPAmount::from_drops(
-                        i64::try_from(current_base_fee).unwrap_or(i64::MAX),
+                        fee_and_seq.required_fee_drops,
                     ),
-                    account_seq,
-                    available_seq: account_seq,
+                    account_seq: fee_and_seq.account_seq,
+                    available_seq: fee_and_seq.available_seq,
                 }
             },
         )
@@ -7090,6 +7188,13 @@ impl ApplicationRoot {
                 .lock()
                 .expect("close_gate mutex must not be poisoned");
             self.clear_open_ledger_account_seqs();
+            // The persistent sandbox is an OpenView over the prior LCL. It
+            // must be discarded with its parent; otherwise subsequent local
+            // submits can be admitted against stale account roots and state.
+            *self
+                .open_ledger_sandbox
+                .lock()
+                .expect("sandbox mutex must not be poisoned") = None;
         }
         self.ledger_master_state
             .note_closed_ledger(Arc::clone(&normalized));
@@ -7171,7 +7276,7 @@ impl ApplicationRoot {
             }
         }
         // Fall back to closed/validated ledger
-        let base = self.closed_ledger().or_else(|| self.validated_ledger())?;
+        let base = self.ledger_master_state.latest_ledger()?;
         let keylet =
             protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
         let sle = base.read(keylet).ok().flatten()?;
@@ -9047,7 +9152,8 @@ impl ApplicationRoot {
                 let applied = likely_to_claim_fee(result, retry_flags);
                 drop(view);
                 if !applied {
-                    let retryable = protocol::is_ter_retry(result) || protocol::is_tec_claim(result);
+                    let retryable =
+                        protocol::is_ter_retry(result) || protocol::is_tec_claim(result);
                     let decision = if retryable {
                         CandidateDiagnosticDecision::Retry
                     } else {
