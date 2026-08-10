@@ -27,13 +27,21 @@ use rpc::context::{RpcRequestContext, RpcRuntime};
 #[cfg(test)]
 use rpc::simulate::SimulateSource;
 
+fn log_rpc_error(code: &RpcErrorCode) {
+    if matches!(code, RpcErrorCode::ActNotFound) {
+        tracing::debug!(target: "rpc", error = ?code, "RPC request returned expected not-found error");
+    } else {
+        tracing::warn!(target: "rpc", error = ?code, "RPC request failed");
+    }
+}
+
 pub fn inject_error(code: RpcErrorCode, json: &mut JsonValue) {
-    tracing::warn!(target: "rpc", error = ?code, "RPC request failed");
+    log_rpc_error(&code);
     Status::new(code).inject(json);
 }
 
 pub fn inject_error_message(code: RpcErrorCode, message: impl Into<String>, json: &mut JsonValue) {
-    tracing::warn!(target: "rpc", error = ?code, "RPC request failed");
+    log_rpc_error(&code);
     Status::with_message(code, message).inject(json);
 }
 
@@ -112,25 +120,15 @@ pub fn transaction_sign<Runtime: RpcRuntime, Source>(
     if app_network_id > 1024 && !st_tx.is_field_present(get_field_by_symbol("sfNetworkID")) {
         st_tx.set_field_u32(get_field_by_symbol("sfNetworkID"), app_network_id);
     }
-    // Auto-fill Sequence from the current account state (matching rippled).
-    // If Sequence is 0 (default/missing), look up the account's current sequence.
-    // Use the open ledger state (which reflects submitted-but-not-yet-closed txs)
-    // so that multiple transactions in the same ledger get correct sequences.
+    // TransactionSign.cpp reads the account root from OpenLedger::current()
+    // then calls TxQ::nextQueuableSeq. Keep that exact ordering: the persistent
+    // submit sandbox includes rebuilt LocalTx effects, while TxQ fills any
+    // contiguous queued sequence gap. The legacy sequence cache is not an
+    // authoritative signing source because it is intentionally cleared at an
+    // LCL transition and is not reconstructed during LocalTx replay.
     if st_tx.get_seq_value() == 0 {
         if let Some(app) = ctx.runtime.app() {
-            let account = st_tx.get_account_id(get_field_by_symbol("sfAccount"));
-            let account_keylet =
-                protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));
-            // Try open ledger first (has latest state including pending txs)
-            let seq = app
-                .network_ops_current_account_seq(&account)
-                .or_else(|| {
-                    app.closed_ledger()
-                        .or_else(|| app.validated_ledger())
-                        .and_then(|ledger| ledger.read(account_keylet).ok().flatten())
-                        .map(|sle| sle.get_field_u32(get_field_by_symbol("sfSequence")))
-                })
-                .unwrap_or(1);
+            let seq = app.network_ops_next_account_seq_for_tx(&st_tx).unwrap_or(1);
             st_tx.set_field_u32(get_field_by_symbol("sfSequence"), seq);
         }
     }

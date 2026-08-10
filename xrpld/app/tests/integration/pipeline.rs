@@ -497,8 +497,9 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
             } else {
                 0
             };
-            // Valid flags: tfBurnable(1) | tfOnlyXRP(2) | tfTrustLine(4) | tfTransferable(8)
-            let valid_flags: u32 = 0x0000000F;
+            // Current-ledger rules activate fixRemoveNFTokenAutoTrustLine and
+            // DynamicNFT: tfTrustLine(4) is invalid; tfMutable(16) is valid.
+            let valid_flags: u32 = 0x0000001B;
             if flags & !valid_flags != 0 {
                 return Ter::TEM_INVALID_FLAG;
             }
@@ -787,15 +788,16 @@ fn run_preflight(view: &impl ReadView, tx: &STTx, txn_type: TxType) -> Ter {
             Ter::TES_SUCCESS
         }
         TxType::VAULT_CREATE => {
-            let asset = tx.get_field_amount(sf("sfAsset"));
+            if tx.peek_at_pfield(sf("sfAsset")).map(|value| value.stype())
+                != Some(protocol::SerializedTypeId::Issue)
+            {
+                return Ter::TEM_MALFORMED;
+            }
             let flags = if tx.is_field_present(sf("sfFlags")) {
                 tx.get_field_u32(sf("sfFlags"))
             } else {
                 0
             };
-            if asset.native() {
-                return Ter::TEM_MALFORMED;
-            }
             // Valid vault flags: tfPrivate(1) | tfShareNonTransferable(2)
             let valid_flags: u32 = 0x03;
             if flags & !valid_flags != 0 {

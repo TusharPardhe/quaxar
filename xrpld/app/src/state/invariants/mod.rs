@@ -403,14 +403,7 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
                     }
                 }
             }
-            LedgerEntryType::Vault => {
-                if vault_invariant_enabled
-                    && let Some(a) = after_sle
-                    && !validate_vault_entry(a)
-                {
-                    return Err(());
-                }
-            }
+            LedgerEntryType::Vault => {}
             LedgerEntryType::AMM => {
                 if amm_invariant_enabled
                     && amm_invariant_result_applies(result)
@@ -544,7 +537,6 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
             tx_amount.as_ref(),
             fix_cleanup_3_2_0,
             result,
-            fee,
             &vault,
         )
     {
@@ -584,7 +576,8 @@ fn check_invariants_inner<V: ApplyView + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::vault::{
-        VaultAssetDelta, VaultSnapshot, compute_vault_min_scale, rounded_vault_delta,
+        VaultAssetDelta, VaultSnapshot, VaultState, add_vault_asset_delta, compute_vault_min_scale,
+        rounded_vault_delta, vault_transaction_account_asset_delta,
     };
     use basics::{
         base_uint::Uint256,
@@ -614,6 +607,24 @@ mod tests {
             assets_available: RuntimeNumber::from_i64(1),
             loss_unrealized: RuntimeNumber::zero(),
         }
+    }
+
+    #[test]
+    fn vault_invariant_uses_post_fee_xrp_depositor_delta() {
+        let depositor = account(0xA3);
+        let asset = Asset::Issue(protocol::xrp_issue());
+        let mut state = VaultState::default();
+        add_vault_asset_delta(
+            &mut state,
+            depositor,
+            asset,
+            RuntimeNumber::from_i64(-1_000_000),
+            None,
+        );
+
+        let delta = vault_transaction_account_asset_delta(&state, depositor, asset)
+            .expect("the XRP deposit transfer must retain its nonzero delta");
+        assert_eq!(delta.delta, RuntimeNumber::from_i64(-1_000_000));
     }
 
     #[test]

@@ -44,6 +44,19 @@ pub trait RawView {
     fn raw_insert(&mut self, sle: Arc<STLedgerEntry>) -> Result<(), ViewError>;
     fn raw_replace(&mut self, sle: Arc<STLedgerEntry>) -> Result<(), ViewError>;
     fn raw_destroy_xrp(&mut self, fee: XRPAmount) -> Result<(), ViewError>;
+    fn raw_apply_sle_batch(
+        &mut self,
+        ops: &[(crate::StateBatchOp, Arc<STLedgerEntry>)],
+    ) -> Result<(), ViewError> {
+        for (op, sle) in ops {
+            match op {
+                crate::StateBatchOp::Insert => self.raw_insert(Arc::clone(sle))?,
+                crate::StateBatchOp::Update => self.raw_replace(Arc::clone(sle))?,
+                crate::StateBatchOp::Delete => self.raw_erase(Arc::clone(sle))?,
+            }
+        }
+        Ok(())
+    }
     /// Apply a batch of state map operations using a single MutableTree session.
     /// Default implementation falls back to individual operations.
     fn raw_apply_batch(
@@ -128,6 +141,18 @@ impl RawView for Ledger {
                 .ok_or(ViewError::InvalidFee(fee))?,
         );
         Ok(())
+    }
+
+    fn raw_apply_sle_batch(
+        &mut self,
+        ops: &[(crate::StateBatchOp, Arc<STLedgerEntry>)],
+    ) -> Result<(), ViewError> {
+        let serialized = ops
+            .iter()
+            .map(|(op, sle)| (*op, *sle.key(), sle.get_serializer().data().to_vec()))
+            .collect::<Vec<_>>();
+        self.apply_state_batch(&serialized)
+            .map_err(ViewError::Mutation)
     }
 
     fn raw_apply_batch(

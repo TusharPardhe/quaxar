@@ -168,6 +168,10 @@ fn handle_xrp_to_xrp_flow<V: ApplyView>(
     })
 }
 
+fn preserves_partial_flow_result(ter: Ter, actual_amount_out: &STAmount) -> bool {
+    ter == Ter::TEC_PATH_PARTIAL && actual_amount_out.signum() > 0
+}
+
 pub fn ripple_calculate<V: ApplyView>(
     view: &mut V,
     max_source_amount: &STAmount,
@@ -266,7 +270,19 @@ fn ripple_calculate_inner<V: ApplyView>(
         false, // offerCrossing = false for payments
     );
 
-    if is_tes_success(strand_ter) && !strands.is_empty() {
+    // `tfNoRippleDirect` with no explicit Paths makes Flow reject the
+    // transaction as `temRIPPLE_EMPTY`. Do not fall through to the legacy
+    // fallback, which has no paths to evaluate and incorrectly recasts that
+    // malformed result as `tecPATH_PARTIAL`.
+    if !is_tes_success(strand_ter) {
+        return Ok(RippleCalcOutput {
+            result: strand_ter,
+            actual_amount_in: max_source_amount.zeroed(),
+            actual_amount_out: dst_amount.zeroed(),
+        });
+    }
+
+    if !strands.is_empty() {
         // Flow engine runs in its own sandbox. If it fails, changes are discarded
         // and the fallback runs on a clean view.
         let mut engine_sb = crate::FlowSandbox::new(view);
@@ -297,6 +313,16 @@ fn ripple_calculate_inner<V: ApplyView>(
         if is_tes_success(flow_result.ter) && flow_result.actual_out.signum() > 0 {
             // Apply flow engine changes to the view
             let _ = engine_sb.apply();
+            return Ok(RippleCalcOutput {
+                result: flow_result.ter,
+                actual_amount_in: flow_result.actual_in,
+                actual_amount_out: flow_result.actual_out,
+            });
+        }
+        if preserves_partial_flow_result(flow_result.ter, &flow_result.actual_out) {
+            // A non-partial Payment must return the engine's partial result
+            // while dropping its sandbox. Falling through loses the discovered
+            // liquidity and can incorrectly reclassify it as tecPATH_DRY.
             return Ok(RippleCalcOutput {
                 result: flow_result.ter,
                 actual_amount_in: flow_result.actual_in,
@@ -961,6 +987,30 @@ fn try_explicit_path<V: ApplyView>(
         input.partial_payment_allowed,
     )
 }
+#[cfg(test)]
+mod tests {
+    use protocol::{STAmount, Ter, XRPAmount};
+
+    use super::preserves_partial_flow_result;
+
+    #[test]
+    fn preserves_nonzero_partial_flow_result_without_committing_its_sandbox() {
+        let delivered = STAmount::from_xrp_amount(XRPAmount::from_drops(5));
+        assert!(preserves_partial_flow_result(
+            Ter::TEC_PATH_PARTIAL,
+            &delivered
+        ));
+        assert!(!preserves_partial_flow_result(
+            Ter::TEC_PATH_DRY,
+            &delivered
+        ));
+        assert!(!preserves_partial_flow_result(
+            Ter::TEC_PATH_PARTIAL,
+            &delivered.zeroed()
+        ));
+    }
+}
+
 pub mod book_step;
 pub mod direct_step;
 pub mod xrp_endpoint_step;

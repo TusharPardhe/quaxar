@@ -288,7 +288,9 @@ mod tests {
         state.note_closed_ledger(Arc::clone(&closed));
         state.note_validated_ledger(Arc::clone(&validated));
         assert!(Arc::ptr_eq(
-            &state.latest_ledger().expect("newer validated ledger selected"),
+            &state
+                .latest_ledger()
+                .expect("newer validated ledger selected"),
             &validated,
         ));
 

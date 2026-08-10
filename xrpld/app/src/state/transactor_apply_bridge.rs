@@ -1389,13 +1389,27 @@ pub struct ViewBackedOfferCancelSink<'a, V> {
 
 impl<'a, V: ApplyView> OfferCancelApplySink for ViewBackedOfferCancelSink<'a, V> {
     fn account_exists(&mut self) -> bool {
-        true
+        self.view
+            .exists(protocol::account_keylet(Uint160::from_void(
+                self.account.data(),
+            )))
+            .unwrap_or(false)
     }
     fn offer_exists(&mut self) -> bool {
-        true
+        let keylet =
+            protocol::offer_keylet(Uint160::from_void(self.account.data()), self.offer_sequence);
+        self.view.exists(keylet).unwrap_or(false)
     }
     fn delete_offer(&mut self) -> Ter {
-        Ter::TES_SUCCESS
+        let keylet =
+            protocol::offer_keylet(Uint160::from_void(self.account.data()), self.offer_sequence);
+        let Ok(Some(sle)) = self.view.peek(keylet) else {
+            return Ter::TES_SUCCESS;
+        };
+        match ledger::offer_helpers::offer_delete(self.view, sle) {
+            Ok(ter) => ter,
+            Err(_) => Ter::TEF_BAD_LEDGER,
+        }
     }
 }
 

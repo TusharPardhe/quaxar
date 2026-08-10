@@ -353,15 +353,15 @@ impl tx::QueueAcceptLedgerViewSource for AppOpenLedgerView {
 /// account SLE from the *open ledger view* and walks the TxQ.
 ///
 /// Fields:
-/// - `ledger`        — the current closed/validated base ledger (read-only)
+/// - `ledger`        — the current open or closed ledger view (read-only)
 /// - `open_tx_count` — tx count from the open ledger for fee scaling
-pub struct AppRequiredFeeView<'a> {
-    ledger: &'a ledger::Ledger,
+pub struct AppRequiredFeeView<'a, V: ReadView> {
+    ledger: &'a V,
     open_tx_count: usize,
 }
 
-impl<'a> AppRequiredFeeView<'a> {
-    pub fn new(ledger: &'a ledger::Ledger, open_tx_count: usize) -> Self {
+impl<'a, V: ReadView> AppRequiredFeeView<'a, V> {
+    pub fn new(ledger: &'a V, open_tx_count: usize) -> Self {
         Self {
             ledger,
             open_tx_count,
@@ -369,8 +369,8 @@ impl<'a> AppRequiredFeeView<'a> {
     }
 }
 
-impl QueueTxQRequiredFeeViewSource<AccountID, AppQueueApplyTxSource<'_>>
-    for AppRequiredFeeView<'_>
+impl<V: ReadView> QueueTxQRequiredFeeViewSource<AccountID, AppQueueApplyTxSource<'_>>
+    for AppRequiredFeeView<'_, V>
 {
     fn open_ledger_tx_count(&self) -> usize {
         self.open_tx_count

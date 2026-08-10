@@ -84,6 +84,18 @@ fn trust_line_entry(
     limit_low: IOUAmount,
     limit_high: IOUAmount,
 ) -> (Uint256, Vec<u8>) {
+    trust_line_entry_with_flags(low, high, currency, balance, limit_low, limit_high, 0)
+}
+
+fn trust_line_entry_with_flags(
+    low: AccountID,
+    high: AccountID,
+    currency: Currency,
+    balance: IOUAmount,
+    limit_low: IOUAmount,
+    limit_high: IOUAmount,
+    flags: u32,
+) -> (Uint256, Vec<u8>) {
     let keylet = protocol::line(low, high, currency);
     let issue_low = Issue {
         currency,
@@ -106,7 +118,7 @@ fn trust_line_entry(
         sf("sfHighLimit"),
         STAmount::from_iou_amount(sf("sfHighLimit"), limit_high, issue_high),
     );
-    sle.set_field_u32(sf("sfFlags"), 0);
+    sle.set_field_u32(sf("sfFlags"), flags);
     (keylet.key, sle.get_serializer().data().to_vec())
 }
 
@@ -360,6 +372,58 @@ fn offer_create_native_funding_uses_pre_fee_balance() {
         run(&ledger, tx),
         Ter::TEC_INSUF_RESERVE_OFFER,
         "pre-fee XRP liquidity must pass OfferCreate funding before the later reserve claim"
+    );
+}
+
+#[test]
+fn offer_create_holder_freeze_does_not_zero_issued_token_funds() {
+    // The holder is the low side and has set lsfLowFreeze on its own
+    // trust line. Only the issuer's high-side freeze can freeze USD held by
+    // this account, so OfferCreate must remain funded and place the offer.
+    let account = acct(0x10);
+    let issuer = acct(0x20);
+    let currency = iou_currency(b"FRZ");
+    let issue = Issue {
+        currency,
+        account: issuer,
+    };
+    let ledger = build_ledger(
+        104111036,
+        vec![
+            account_entry(account, 100_000_000, 0),
+            account_entry(issuer, 100_000_000, 0),
+            trust_line_entry_with_flags(
+                account,
+                issuer,
+                currency,
+                iou(1_000, 0),
+                iou(10_000, 0),
+                iou(0, 0),
+                protocol::lsfLowFreeze,
+            ),
+        ],
+    );
+    let tx = STTx::new(TxType::OFFER_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+        tx.set_field_amount(
+            sf("sfTakerPays"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(1_000_000)),
+        );
+        tx.set_field_amount(
+            sf("sfTakerGets"),
+            STAmount::from_iou_amount(sf("sfTakerGets"), iou(1, 0), issue),
+        );
+    });
+
+    assert_eq!(
+        run(&ledger, tx),
+        Ter::TES_SUCCESS,
+        "a holder's own freeze bit must not return tecUNFUNDED_OFFER"
     );
 }
 

@@ -403,6 +403,32 @@ mod tests {
     }
 
     #[test]
+    fn no_default_path_without_explicit_paths_returns_ripple_empty() {
+        let src = make_account(1);
+        let dst = make_account(2);
+        let gateway = make_account(3);
+        let eur = make_currency("EUR");
+        let deliver = Asset::Issue(Issue {
+            currency: eur,
+            account: gateway,
+        });
+
+        let (ter, strands) = to_strands(
+            &src,
+            &dst,
+            &deliver,
+            None,
+            &protocol::STPathSet::new(protocol::get_field_by_symbol("sfPaths")),
+            false,
+            false,
+            false,
+        );
+
+        assert_eq!(ter, Ter::TEM_RIPPLE_EMPTY);
+        assert!(strands.is_empty());
+    }
+
+    #[test]
     fn canonical_xrp_book_issue_discards_a_stale_issuer_before_keylet_lookup() {
         let stale_issuer = protocol::parse_base58_account_id("rswh1fvyLqHizBS2awu1vs6QcmwTBd9qiv")
             .expect("canonical XAH issuer");

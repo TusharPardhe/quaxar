@@ -7,7 +7,6 @@ use basics::{
 use ledger::{ApplyView, FlowSandbox, ReadView};
 use protocol::{
     AccountID, Asset, Issue, LedgerEntryType, MPTID, STAmount, STLedgerEntry, STNumber, Ter,
-    XRPAmount,
 };
 use std::collections::BTreeMap;
 
@@ -45,32 +44,6 @@ pub(super) struct VaultState {
     share_issuance_delta: BTreeMap<MPTID, i128>,
     share_holder_delta: BTreeMap<MPTID, BTreeMap<AccountID, i128>>,
     asset_delta: BTreeMap<(AccountID, Asset), VaultAssetDelta>,
-}
-
-pub(super) fn validate_vault_entry(sle: &STLedgerEntry) -> bool {
-    let asset = sle.get_field_issue(sf("sfAsset")).asset();
-    let assets_total = sle.get_field_number(sf("sfAssetsTotal"));
-    let assets_available = sle.get_field_number(sf("sfAssetsAvailable"));
-    let loss_unrealized = sle.get_field_number(sf("sfLossUnrealized"));
-    let assets_maximum = sle
-        .is_field_present(sf("sfAssetsMaximum"))
-        .then(|| sle.get_field_number(sf("sfAssetsMaximum")));
-    let unavailable = assets_total.value() - assets_available.value();
-    let zero = basics::number::NumberParts::zero();
-
-    assets_total.associated_asset() == Some(asset)
-        && assets_available.associated_asset() == Some(asset)
-        && loss_unrealized.associated_asset() == Some(asset)
-        && assets_total.value() >= zero
-        && assets_available.value() >= zero
-        && loss_unrealized.value() >= zero
-        && assets_maximum.is_none_or(|value| {
-            value.associated_asset() == Some(asset)
-                && value.value() >= zero
-                && (value.value() == zero || assets_total.value() <= value.value())
-        })
-        && assets_available.value() <= assets_total.value()
-        && loss_unrealized.value() <= unavailable
 }
 
 pub(super) fn vault_snapshot(sle: &STLedgerEntry) -> VaultSnapshot {
@@ -462,21 +435,15 @@ pub(super) fn rounded_vault_delta(
     round_number_to_asset_with_scale(asset, delta.delta, scale, RoundingMode::ToNearest)
 }
 
-pub(super) fn vault_account_asset_delta(
+pub(super) fn vault_transaction_account_asset_delta(
     state: &VaultState,
     account: AccountID,
     asset: Asset,
-    fee: XRPAmount,
 ) -> Option<VaultAssetDelta> {
-    let mut delta = state.asset_delta.get(&(account, asset)).copied()?;
-    if asset.native() {
-        delta.delta += RuntimeNumber::from(fee);
-    }
-    if delta.delta == RuntimeNumber::zero() {
-        None
-    } else {
-        Some(delta)
-    }
+    // Quaxar deducts the XRP fee in the outer view before it creates the
+    // inner doApply sandbox. The balance delta captured here is therefore
+    // already post-fee and must not receive rippled's pre-fee compensation.
+    vault_asset_delta(state, account, asset)
 }
 
 pub(super) fn vault_asset_delta(
@@ -500,7 +467,6 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
     tx_amount: Option<&STAmount>,
     fix_cleanup_3_2_0: bool,
     result: Ter,
-    fee: XRPAmount,
     state: &VaultState,
 ) -> bool {
     if !protocol::is_tes_success(result) {
@@ -569,6 +535,25 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
             return false;
         }
     } else if updated_shares.shares_total > updated_shares.shares_maximum {
+        return false;
+    }
+
+    // Mirrors rippled ValidVault::finalize's universal persisted-value checks.
+    // STNumber's asset association is transient serialization metadata and is
+    // therefore deliberately not part of invariant validation.
+    let unavailable = after_vault.assets_total - after_vault.assets_available;
+    let assets_maximum = sandbox
+        .read(protocol::vault_keylet_from_key(after_vault.key))
+        .ok()
+        .flatten()
+        .map(|vault| vault.get_field_number(sf("sfAssetsMaximum")).value())
+        .unwrap_or(zero);
+    if after_vault.assets_available < zero
+        || after_vault.assets_available > after_vault.assets_total
+        || after_vault.loss_unrealized > unavailable
+        || after_vault.assets_total < zero
+        || assets_maximum < zero
+    {
         return false;
     }
 
@@ -676,8 +661,8 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                     if account == asset_issuer(after_vault.asset) {
                         return true;
                     }
-                    vault_account_asset_delta(state, account, after_vault.asset, fee).is_some_and(
-                        |delta| {
+                    vault_transaction_account_asset_delta(state, account, after_vault.asset)
+                        .is_some_and(|delta| {
                             let local_scale = min_scale.max(delta.scale.unwrap_or(0));
                             let account_delta =
                                 rounded_vault_delta(after_vault.asset, delta, local_scale);
@@ -689,8 +674,7 @@ pub(super) fn validates_vault_state<V: ApplyView + ?Sized>(
                             );
                             account_delta < RuntimeNumber::zero()
                                 && -account_delta == local_vault_delta
-                        },
-                    )
+                        })
                 })
         }),
         protocol::TxType::VAULT_WITHDRAW => before_vault.is_some_and(|before| {

@@ -133,12 +133,15 @@ fn asset_frozen<V: ReadView>(view: &V, account: AccountID, asset: Asset) -> Resu
         Asset::Issue(issue) => {
             let global_frozen = read_account(view, issue.account)?
                 .is_some_and(|issuer| issuer.get_field_u32(sf("sfFlags")) & lsfGlobalFreeze != 0);
+            // Only the issuer's side freezes the issuer's asset. A holder may
+            // set its own trust-line freeze bit, but that must not make its
+            // balance unavailable for OfferCreate funding.
             let individually_frozen = view
                 .read(protocol::line(account, issue.account, issue.currency))
                 .map_err(|_| read_error())?
                 .is_some_and(|line| {
                     line.get_field_u32(sf("sfFlags"))
-                        & if account > issue.account {
+                        & if issue.account > account {
                             lsfHighFreeze
                         } else {
                             lsfLowFreeze

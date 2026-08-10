@@ -97,11 +97,8 @@ fn accept_offer_tx(
     })
 }
 
-fn get_token_id(view: &impl ReadView, owner: AccountID, mint_tx: &STTx) -> Uint256 {
-    let page_keylet = protocol::nft_page_keylet(
-        protocol::nft_page_min_keylet(acct_id(owner)),
-        Uint256::from(mint_tx.get_transaction_id()),
-    );
+fn get_token_id(view: &impl ReadView, owner: AccountID, _mint_tx: &STTx) -> Uint256 {
+    let page_keylet = protocol::nft_page_max_keylet(acct_id(owner));
     if let Ok(Some(page)) = view.read(page_keylet) {
         let tokens = page.get_field_array(sf("sfNFTokens"));
         if let Some(token) = tokens.get(0) {
@@ -159,6 +156,23 @@ fn nftoken_create_buy_offer() {
     let result = full_apply(&mut view, &tx_offer, TxType::NFTOKEN_CREATE_OFFER);
     assert_eq!(result, Ter::TES_SUCCESS);
     assert_eq!(get_owner_count(&view, bob), 1); // offer
+
+    let offer_keylet = protocol::keylet::nft_offer_keylet_for_owner(acct_id(bob), 1);
+    let buy_offer_directory = view
+        .read(protocol::nft_buy_offers_keylet(token_id))
+        .expect("buy offer directory read should succeed")
+        .expect("buy offer directory should exist");
+    assert!(
+        buy_offer_directory
+            .get_field_v256(sf("sfIndexes"))
+            .value()
+            .contains(&offer_keylet.key)
+    );
+    let offer = view
+        .read(offer_keylet)
+        .expect("buy offer read should succeed")
+        .expect("buy offer should be indexed");
+    assert_eq!(offer.get_type(), LedgerEntryType::NFTokenOffer);
 }
 
 #[test]

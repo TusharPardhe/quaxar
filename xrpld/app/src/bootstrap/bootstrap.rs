@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use xrpl_core::{ServiceRegistry, StartUpType};
+use xrpl_core::{HashRouter, ServiceRegistry, StartUpType};
 use xrpld_core::{
     DatabaseCon, LEDGER_DB_INIT, LEDGER_DB_NAME, TRANSACTION_DB_INIT, TRANSACTION_DB_NAME,
     build_database_con_setup,
@@ -1444,7 +1444,23 @@ fn run_start_mode_consensus_loop(
         overlay_rt
             .overlay()
             .queued_inbound()
-            .set_transaction_router(Box::new(move |_peer_id, message| {
+            .set_transaction_router(Box::new(move |peer_id, message| {
+                // Mirror PeerImp::handleTransaction: record the inbound
+                // source and reject a recently processed relay before it
+                // consumes a JtTransaction worker. The source record also
+                // prevents `should_relay` from echoing the transaction back
+                // to this peer after it enters the local open ledger.
+                let Some(network_ops_runtime) = router_root.network_ops_runtime() else {
+                    return;
+                };
+                if !should_schedule_relayed_transaction(
+                    network_ops_runtime.hash_router().as_ref(),
+                    message.id,
+                    peer_id,
+                ) {
+                    return;
+                }
+
                 let root = router_root.clone();
                 let queue = job_queue.clone();
                 let inbound = message.message;
@@ -4713,6 +4729,7 @@ fn seed_startup_ledger_state(
             let genesis_amendments = amendments_from_config(config, options.start_type);
             let genesis_config = LedgerConfig {
                 fees: ledger::CURRENT_DEFAULT_FEES,
+                features: protocol::FeatureSet::new(genesis_amendments.clone()),
                 ..LedgerConfig::default()
             };
             Ledger::create_genesis(backed, &genesis_config, genesis_amendments)
@@ -4857,6 +4874,24 @@ fn amendments_from_config(config: &BasicConfig, start_type: StartUpType) -> Vec<
                 }
                 let bytes = str_unhex(hex)?;
                 Uint256::from_slice(&bytes)
+            })
+            .collect();
+    }
+
+    // Pulsar's generated private-network configs use named features rather
+    // than a hexadecimal [amendments] section. Preserve that explicit desired
+    // set at Fresh genesis; falling through to every supported feature changes
+    // the harness contract and left the full nodes with a no-amendment ledger.
+    let named_features = config.section("features").values();
+    if !named_features.is_empty() {
+        return named_features
+            .iter()
+            .filter_map(|line| {
+                let name = line.split_whitespace().next()?;
+                REGISTERED_FEATURES
+                    .iter()
+                    .find(|feature| feature.supported && feature.name == name)
+                    .map(|feature| feature_id(feature.name))
             })
             .collect();
     }
@@ -5147,26 +5182,95 @@ impl DescriptorLimitProvider for SystemDescriptorLimitProvider {
     }
 }
 
+fn should_schedule_relayed_transaction(
+    hash_router: &HashRouter,
+    transaction_id: Uint256,
+    peer_id: overlay::PeerId,
+) -> bool {
+    // rippled PeerImp::handleTransaction uses a ten-second per-transaction
+    // process interval before queuing the RcvCheckTx job.
+    const TX_PROCESS_INTERVAL: Duration = Duration::from_secs(10);
+    hash_router
+        .should_process(transaction_id, peer_id, TX_PROCESS_INTERVAL)
+        .0
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ENDPOINT_HANDOUT_LIMIT, FetchPackAdmission, GenericGetObjectAdmission,
-        MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE, MainRuntime, build_endpoint_handout,
-        build_validator_list_collection_messages, candidate_ledger_data_charge,
-        classify_fetch_pack_request, classify_generic_get_object_request,
-        configured_sweep_interval, fetch_pack_failure_charge, get_ledger_send_queue_is_admissible,
-        get_object_query_send_queue_is_admissible, ledger_data_nodes_are_admissible,
-        ledger_data_sequence_is_admissible, manifest_rate_limit_policy, parse_basic_config_text,
-        relay_accepted_manifest, requested_transaction_envelope, sequence_is_fetchable_at_floor,
-        spawn_shutdown_watcher, transaction_object_request_is_admissible,
-        trusted_first_manifest_payloads, validator_list_collection_blobs,
-        validator_list_threshold_from_config,
+        MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE, MainRuntime, StartUpType, amendments_from_config,
+        build_endpoint_handout, build_validator_list_collection_messages,
+        candidate_ledger_data_charge, classify_fetch_pack_request,
+        classify_generic_get_object_request, configured_sweep_interval, fetch_pack_failure_charge,
+        get_ledger_send_queue_is_admissible, get_object_query_send_queue_is_admissible,
+        ledger_data_nodes_are_admissible, ledger_data_sequence_is_admissible,
+        manifest_rate_limit_policy, parse_basic_config_text, relay_accepted_manifest,
+        requested_transaction_envelope, sequence_is_fetchable_at_floor,
+        should_schedule_relayed_transaction, spawn_shutdown_watcher,
+        transaction_object_request_is_admissible, trusted_first_manifest_payloads,
+        validator_list_collection_blobs, validator_list_threshold_from_config,
     };
     use crate::state::manifest::{ManifestDisposition, ManifestRateLimitCapPolicy};
     use crate::{ApplicationRoot, ValidatorListBroadcastBlob, ValidatorListCollectionForBroadcast};
+    use basics::base_uint::Uint256;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
+    use xrpl_core::HashRouter;
+
+    #[test]
+    fn relayed_transaction_ingress_suppresses_duplicates_and_skips_source_peer() {
+        let hash_router = HashRouter::default();
+        let tx_id = Uint256::from_u64(0xC0FFEE);
+        let source_peer = 41;
+
+        assert!(should_schedule_relayed_transaction(
+            &hash_router,
+            tx_id,
+            source_peer,
+        ));
+        assert!(
+            !should_schedule_relayed_transaction(&hash_router, tx_id, 42),
+            "the ten-second HashRouter interval suppresses duplicate relay work"
+        );
+        assert_eq!(
+            hash_router.should_relay(tx_id),
+            Some(BTreeSet::from([source_peer, 42])),
+            "all inbound sources, including suppressed duplicates, are withheld from re-relay"
+        );
+    }
+
+    #[test]
+    fn fresh_genesis_honors_pulsar_named_features() {
+        let config = parse_basic_config_text("[features]\nDID\nCredentials\nunknown_feature\n")
+            .expect("Pulsar-style feature config parses");
+        let amendments = amendments_from_config(&config, StartUpType::Fresh);
+
+        assert_eq!(amendments.len(), 2);
+        assert!(amendments.contains(&protocol::feature_id("DID")));
+        assert!(amendments.contains(&protocol::feature_id("Credentials")));
+        let genesis = ledger::Ledger::create_genesis(
+            false,
+            &ledger::LedgerConfig {
+                features: protocol::FeatureSet::new(amendments.clone()),
+                ..ledger::LedgerConfig::default()
+            },
+            amendments,
+        )
+        .expect("Fresh genesis should build");
+        assert!(genesis.rules().enabled(&protocol::feature_id("DID")));
+        assert!(
+            genesis
+                .rules()
+                .enabled(&protocol::feature_id("Credentials"))
+        );
+        assert!(
+            amendments_from_config(&config, StartUpType::Normal).is_empty(),
+            "only Fresh genesis applies configured amendment desires"
+        );
+    }
 
     #[test]
     fn sweep_interval_matches_rippled_default_and_explicit_override_rules() {

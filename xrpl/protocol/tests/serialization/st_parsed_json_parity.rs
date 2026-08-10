@@ -310,6 +310,15 @@ fn st_parsed_json_object_array_and_permission_categories_match_cpp_rules() {
 }
 
 #[test]
+fn st_parsed_json_rejects_out_of_range_native_amount_without_panicking() {
+    let json = object([("Amount", JsonValue::String("999999999999999999".to_owned()))]);
+
+    let parsed = std::panic::catch_unwind(|| STParsedJSONObject::new("test", &json))
+        .expect("over-limit native amount must return a parse error, not panic");
+    assert!(parsed.object.is_none());
+}
+
+#[test]
 fn st_parsed_json_edge_case_failures_match_current_cpp_rules() {
     let unknown = object([("NotARealField", JsonValue::Unsigned(1))]);
     assert!(STParsedJSONObject::new("test", &unknown).object.is_none());

@@ -73,9 +73,21 @@ pub fn append_runtime_metadata(
     );
 
     if human {
-        if let Some(hostid) = &snapshot.hostid {
-            info.insert("hostid".to_owned(), JsonValue::String(hostid.clone()));
-        }
+        // rippled always exposes a non-empty hostid in a human server_info
+        // response. Prefer an explicitly configured value, then the process
+        // hostname, with a stable fallback for restricted environments.
+        let hostid = snapshot
+            .hostid
+            .as_deref()
+            .and_then(|hostid| non_empty_owned(Some(hostid)))
+            .or_else(|| {
+                std::env::var("HOSTNAME").ok().and_then(|hostid| {
+                    let hostid = hostid.trim();
+                    (!hostid.is_empty()).then(|| hostid.to_owned())
+                })
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
+        info.insert("hostid".to_owned(), JsonValue::String(hostid));
     }
 
     if let Some(server_domain) = &snapshot.server_domain {
@@ -85,12 +97,12 @@ pub fn append_runtime_metadata(
         );
     }
 
-    if let Some(io_latency_ms) = snapshot.io_latency_ms {
-        info.insert(
-            "io_latency_ms".to_owned(),
-            JsonValue::Unsigned(io_latency_ms),
-        );
-    }
+    // rippled always emits io_latency_ms, including zero before an I/O sample
+    // is available (NetworkOPs::getServerInfo).
+    info.insert(
+        "io_latency_ms".to_owned(),
+        JsonValue::Unsigned(snapshot.io_latency_ms.unwrap_or(0)),
+    );
 
     if let Some(complete_ledgers) = &snapshot.complete_ledgers {
         info.insert(
@@ -143,6 +155,11 @@ mod tests {
             Some(&JsonValue::String(get_version_string().to_owned()))
         );
         assert!(matches!(info.get("uptime"), Some(JsonValue::Unsigned(_))));
+        assert_eq!(info.get("io_latency_ms"), Some(&JsonValue::Unsigned(0)));
+        assert!(matches!(
+            info.get("hostid"),
+            Some(JsonValue::String(hostid)) if !hostid.is_empty()
+        ));
         assert_eq!(
             info.get("complete_ledgers"),
             Some(&JsonValue::String("98-99".to_owned()))

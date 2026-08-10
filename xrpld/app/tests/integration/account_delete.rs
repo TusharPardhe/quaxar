@@ -210,10 +210,8 @@ fn account_delete_success() {
 
     let tx = account_delete_tx(alice, bob, 1, 2_000_000);
     let result = full_apply(&mut view, &tx, TxType::ACCOUNT_DELETE);
-    // May succeed or fail with tecTOO_SOON depending on ledger seq vs account seq
-    if result == Ter::TES_SUCCESS {
-        assert!(!acct_exists(&view, alice));
-    }
+    assert_eq!(result, Ter::TES_SUCCESS);
+    assert!(!acct_exists(&view, alice));
 }
 
 /// C++ AccountDelete_test — destination requires tag.

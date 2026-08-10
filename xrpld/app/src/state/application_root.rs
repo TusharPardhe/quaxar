@@ -1213,10 +1213,20 @@ impl PersistentSubmitSandbox {
         holder: Arc<std::sync::Mutex<Option<Sandbox<ledger::OpenView<Ledger>>>>>,
         base: Arc<Ledger>,
     ) -> Self {
+        let base_header = base.header();
         let sandbox = holder
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
+            // Reuse only the OpenView built over this exact LCL. In
+            // particular, preclaim expiration compares parent_close_time, so
+            // retaining an OpenView after the parent advances can evaluate a
+            // transaction against an obsolete (including zero) close time.
+            .filter(|sandbox| {
+                let header = sandbox.header();
+                header.parent_hash == base_header.hash
+                    && header.parent_close_time == base_header.close_time
+            })
             // TxQ::apply receives rippled's OpenView. A Sandbox<Ledger>
             // delegates `open()` to the closed parent and therefore skips
             // Transactor::checkFee's open-ledger minimum-fee rejection.
@@ -1252,6 +1262,30 @@ impl Drop for PersistentSubmitSandbox {
         *holder = Some(sandbox);
         drop(holder);
         self.holder.clear_poison();
+    }
+}
+
+#[cfg(test)]
+mod persistent_submit_sandbox_tests {
+    use super::PersistentSubmitSandbox;
+    use ledger::{Ledger, OpenView, ReadView, Sandbox};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn rebases_parent_close_time_when_submit_lcl_advances() {
+        let holder: Arc<Mutex<Option<Sandbox<OpenView<Ledger>>>>> = Arc::new(Mutex::new(None));
+        let initial = Arc::new(Ledger::from_ledger_seq_and_close_time(1, 0, false));
+        {
+            let mut sandbox =
+                PersistentSubmitSandbox::take_or_new(Arc::clone(&holder), Arc::clone(&initial));
+            assert_eq!(sandbox.view_mut().header().parent_close_time, 0);
+        }
+
+        let lcl = Arc::new(Ledger::from_ledger_seq_and_close_time(2, 1_000, false));
+        let mut sandbox = PersistentSubmitSandbox::take_or_new(holder, Arc::clone(&lcl));
+        let header = sandbox.view_mut().header();
+        assert_eq!(header.parent_hash, lcl.header().hash);
+        assert_eq!(header.parent_close_time, lcl.header().close_time);
     }
 }
 
@@ -4176,27 +4210,21 @@ impl ApplicationRoot {
 
     /// Execute the complete `NetworkOPsImp::transactionBatch` drain loop on a
     /// JobQueue worker. This is intentionally not a consensus-strand task.
+    ///
+    /// Matches rippled's `transactionBatch` exactly: the while-loop condition
+    /// check does NOT hold any ledger gate. Only the inner
+    /// `apply_network_ops_pending_to_open_ledger` acquires the gate for the
+    /// actual open-ledger modification. This allows concurrent
+    /// `process_transaction` calls (from JtTransaction jobs processing relayed
+    /// peer transactions) to enqueue new work between iterations — matching
+    /// rippled's `batchLock.unlock()` before `apply()` pattern.
     pub fn run_network_ops_transaction_batch(&self) {
         while self.network_ops_pending_transaction_count().unwrap_or(0) != 0 {
-            // Preferred-LCL reconciliation holds this gate across the whole
-            // TxQ/open-ledger/LCL transition. Take it before close_gate so a
-            // batch never applies transactions against a mixed old/new parent.
-            let _lcl_transition_guard = self.lcl_transition_gate().lock();
-            let _close_guard = self
-                .close_gate()
-                .lock()
-                .expect("close_gate mutex must not be poisoned");
             if self.apply_network_ops_pending_to_open_ledger().is_none() {
                 if let Some(runtime) = self.network_ops_runtime() {
                     if runtime.take_pending_batch_panic_recovery() {
-                        // A caught panic restored TxQ and NetworkOps state.
-                        // Schedule exactly one fresh guarded batch for that
-                        // recovered pending work.
                         let _ = self.schedule_network_ops_transaction_batch();
                     } else {
-                        // `apply` has not swapped the queue when no base ledger
-                        // is available. Return to `None` so the next ingress or
-                        // closed ledger transition can schedule a fresh JtBatch.
                         let _ = runtime.release_scheduled_transaction_batch_for_retry();
                     }
                 }
@@ -4275,6 +4303,33 @@ impl ApplicationRoot {
     pub fn live_current_ledger_index(&self) -> Option<u32> {
         let current_index = self.registry.open_ledger.current().ledger_current_index;
         (current_index != 0).then_some(current_index)
+    }
+
+    /// Read the persistent current OpenView used by local transaction
+    /// admission. The outer `None` means no open sandbox has been published
+    /// yet; callers may then use the closed parent as the bootstrap fallback.
+    /// Once available, its result is authoritative for RPC requests selecting
+    /// `ledger_index: current`.
+    pub fn current_open_ledger_entry(
+        &self,
+        keylet: protocol::Keylet,
+    ) -> Option<Result<Option<STLedgerEntry>, ledger::ViewError>> {
+        let sandbox = self.open_ledger_sandbox.lock().ok()?;
+        sandbox.as_ref().map(|view| {
+            view.read(keylet)
+                .map(|entry| entry.map(|entry| entry.as_ref().clone()))
+        })
+    }
+
+    /// Return the next state key from the persistent current OpenView. See
+    /// `current_open_ledger_entry` for the availability and authority rules.
+    pub fn current_open_ledger_successor(
+        &self,
+        key: Uint256,
+        last: Option<Uint256>,
+    ) -> Option<Result<Option<Uint256>, ledger::ViewError>> {
+        let sandbox = self.open_ledger_sandbox.lock().ok()?;
+        sandbox.as_ref().map(|view| view.succ(key, last))
     }
 
     pub fn tx_q(&self) -> &SharedAppTxQ {
@@ -4435,6 +4490,12 @@ impl ApplicationRoot {
     }
 
     fn rebuild_open_ledger_after_close(&self, parent: Arc<Ledger>) {
+        // OpenLedger::accept and the persistent sandbox replacement form one
+        // current-open-state transition. Server-side legacy signing holds this
+        // same re-entrant gate from TxQ::nextQueuableSeq through admission, so
+        // it cannot read the old sandbox while this rebase is replaying local
+        // transactions and then overwrite its newly admitted state.
+        let _lcl_transition_guard = self.lcl_transition_gate().lock();
         let next_open_index = parent.header().seq.saturating_add(1);
         let base_fee_drops = parent.fees().base;
         let parent_hash = *parent.header().hash.as_uint256();
@@ -4495,7 +4556,7 @@ impl ApplicationRoot {
                 )
             },
             &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, flags| {
-                let _ = self.reapply_open_ledger_record(
+                let _ = self.apply_local_open_ledger_record_with_txq(
                     view,
                     &mut *rebase_view.borrow_mut(),
                     &mut applied_ids.borrow_mut(),
@@ -4616,6 +4677,72 @@ impl ApplicationRoot {
         ApplyResult::new(ter, applied, false)
     }
 
+    /// Apply a LocalTx during `OpenLedger::accept` through the full TxQ
+    /// admission path, matching rippled `TxQ::apply(app, view, tx, flags)`.
+    ///
+    /// rippled first preflights and tries a direct apply; if direct application
+    /// cannot proceed, it performs complete persistent TxQ admission instead of
+    /// losing the transaction. That queue admission includes account sequence
+    /// ordering, replacement, fee escalation, blocker checks, and queue-size
+    /// eviction. Reuse the same facade/runtime already used by ordinary local
+    /// `submit`, rather than maintaining a narrower replay-only substitute.
+    fn apply_local_open_ledger_record_with_txq<V: ledger::ApplyView>(
+        &self,
+        open_ledger: &mut AppOpenLedgerView,
+        rebase_view: &mut V,
+        applied_ids: &mut std::collections::HashSet<Uint256>,
+        record: &AppOpenLedgerTxRecord,
+        flags: ApplyFlags,
+    ) -> ApplyResult {
+        let tx = Arc::clone(&record.tx);
+        let tx_id = tx.get_transaction_id();
+        if applied_ids.contains(&tx_id) {
+            return ApplyResult::new(Ter::TEF_ALREADY, false, false);
+        }
+
+        let tx_source = AppQueueApplyTxSource::new(tx.as_ref());
+        let account = tx.get_account_id(get_field_by_symbol("sfAccount"));
+        let tx_q = &self.registry.tx_q;
+        let clear_ahead_queue = tx_q.current_account_txs(account);
+        let metrics_snapshot = tx_q.metrics_snapshot();
+        let view_snapshot = open_ledger.clone();
+        let live_queue_view =
+            view_snapshot.queue_apply_view(rebase_view, tx.as_ref(), metrics_snapshot);
+        let queue_view = snapshot_queue_apply_app_view_with_metrics(
+            &tx_source,
+            &live_queue_view,
+            metrics_snapshot,
+        );
+        let current_ledger_index = open_ledger.ledger_current_index;
+        let mut runtime = AppOpenLedgerTxQApplyRuntime::new_with_clear_ahead(
+            open_ledger,
+            rebase_view,
+            Arc::clone(&tx),
+            flags,
+            current_ledger_index,
+            self.load_fee_track.as_ref(),
+            Arc::clone(&self.open_ledger_account_seqs),
+            clear_ahead_queue,
+            metrics_snapshot,
+        );
+        let mut lock = AppTxQLock;
+        let result = tx_q
+            .apply_with_owned_metrics_and_derived_preflight_facts_and_hold_admission(
+                &mut lock,
+                &mut runtime,
+                &queue_view,
+                &tx_source,
+            )
+            .apply_result();
+        let (clear_attempts, clear_removed) = runtime.take_clear_ahead_effects();
+        tx_q.apply_try_clear_effects(account, &clear_attempts, &clear_removed);
+
+        if result.applied {
+            applied_ids.insert(tx_id);
+        }
+        result
+    }
+
     /// Rebuild the open ledger on a newly selected closed parent.
     ///
     /// This mirrors rippled `OpenLedger::apply`: transactions already included
@@ -4628,15 +4755,37 @@ impl ApplicationRoot {
         retry_transactions: &[Arc<STTx>],
         retries_first: bool,
     ) {
+        // See `rebuild_open_ledger_after_close`: publication of the rebuilt
+        // OpenLedger and persistent sandbox must be atomic with respect to
+        // server-side signing's current-open TxQ sequence lookup.
+        let _lcl_transition_guard = self.lcl_transition_gate().lock();
         let next_open_index = parent.header().seq.saturating_add(1);
         let base_fee_drops = parent.fees().base;
         let parent_hash = *parent.header().hash.as_uint256();
         let local_txs = self.local_open_ledger_records();
+        let local_tx_count = local_txs.len();
+        let local_tx_id_sample = local_txs
+            .iter()
+            .take(16)
+            .map(|record| record.tx.get_transaction_id())
+            .collect::<Vec<_>>();
+        let retry_count_in = retry_transactions.len();
         let mut retries = retry_transactions
             .iter()
             .cloned()
             .map(AppOpenLedgerTxRecord::new)
             .collect::<Vec<_>>();
+        tracing::info!(
+            target: "lcl_audit",
+            parent_hash = %parent.header().hash,
+            parent_seq = parent.header().seq,
+            next_open_index,
+            local_tx_count,
+            retry_count_in,
+            retries_first,
+            local_tx_id_sample = ?local_tx_id_sample,
+            "LCL_AUDIT consensus open-ledger rebuild started"
+        );
         let rebase_view = std::cell::RefCell::new(Sandbox::new(
             Arc::new(ledger::OpenView::new_open(
                 Arc::clone(&parent),
@@ -4662,7 +4811,7 @@ impl ApplicationRoot {
                 )
             },
             &mut |view: &mut AppOpenLedgerView, tx: &AppOpenLedgerTxRecord, flags| {
-                let _ = self.reapply_open_ledger_record(
+                let _ = self.apply_local_open_ledger_record_with_txq(
                     view,
                     &mut *rebase_view.borrow_mut(),
                     &mut applied_ids.borrow_mut(),
@@ -4718,6 +4867,25 @@ impl ApplicationRoot {
                     &to_skip,
                 );
             },
+        );
+        let open_after = self.open_ledger().current_open_transactions();
+        let open_after_count = open_after.len();
+        let open_after_id_sample = open_after
+            .iter()
+            .take(16)
+            .map(|tx| tx.get_transaction_id())
+            .collect::<Vec<_>>();
+        tracing::info!(
+            target: "lcl_audit",
+            parent_hash = %parent.header().hash,
+            parent_seq = parent.header().seq,
+            next_open_index,
+            local_tx_count,
+            retry_count_in,
+            retry_count_out = retries.len(),
+            open_after_count,
+            open_after_id_sample = ?open_after_id_sample,
+            "LCL_AUDIT consensus open-ledger rebuild completed"
         );
         *self.open_ledger_sandbox.lock().expect("sandbox mutex") = Some(rebase_view.into_inner());
     }
@@ -6035,7 +6203,7 @@ impl ApplicationRoot {
                         let _ = runtime.process_transaction(
                             &mut transaction,
                             false,
-                            false,
+                            true,
                             false,
                             || batch_root.enqueue_network_ops_transaction_batch(),
                             || {},
@@ -7187,17 +7355,43 @@ impl ApplicationRoot {
                 .close_gate
                 .lock()
                 .expect("close_gate mutex must not be poisoned");
-            self.clear_open_ledger_account_seqs();
-            // The persistent sandbox is an OpenView over the prior LCL. It
-            // must be discarded with its parent; otherwise subsequent local
-            // submits can be admitted against stale account roots and state.
-            *self
+            // This legacy per-account cache is not reconstructible from a
+            // LocalTx replay, so every LCL transition invalidates it.
+            if let Ok(mut seqs) = self.open_ledger_account_seqs.lock() {
+                seqs.clear();
+            }
+
+            // `OpenLedger::accept` may already have rebuilt and published the
+            // persistent OpenView for `normalized` before this closed-ledger
+            // notification runs. Preserve that exact-parent view: it contains
+            // the direct current-open effects that TransactionSign and TxQ
+            // must both observe. Discard only a sandbox over a genuinely old
+            // LCL. Unconditionally clearing here split signing from the
+            // rebuilt OpenLedger and allowed server-side autofill to reuse a
+            // sequence already occupied by a current-open transaction.
+            let normalized_header = normalized.header();
+            let mut sandbox = self
                 .open_ledger_sandbox
                 .lock()
-                .expect("sandbox mutex must not be poisoned") = None;
+                .expect("sandbox mutex must not be poisoned");
+            let sandbox_matches_new_lcl = sandbox.as_ref().is_some_and(|sandbox| {
+                let header = sandbox.header();
+                header.parent_hash == normalized_header.hash
+                    && header.parent_close_time == normalized_header.close_time
+            });
+            if !sandbox_matches_new_lcl {
+                *sandbox = None;
+            }
         }
         self.ledger_master_state
             .note_closed_ledger(Arc::clone(&normalized));
+        // A fresh standalone network may not yet advance through the
+        // quorum-backed validated-ledger path, but its active closed LCL
+        // already supplies the amendment rules used for the next open
+        // ledger. Keep the feature RPC table synchronized with that LCL so
+        // its enabled flags describe the rules the node is actually using.
+        self.amendment_status
+            .do_validated_ledger(normalized.as_ref());
 
         if let Some(overlay_runtime) = self.overlay_runtime() {
             overlay_runtime.overlay().set_handshake_ledgers(
@@ -7266,16 +7460,53 @@ impl ApplicationRoot {
         self.ledger_master_state.closed_ledger_seq()
     }
 
+    /// Return the next sequence that the current open ledger can accept for
+    /// `tx`. This is the server-side signing source of truth: it mirrors
+    /// rippled `TransactionSign.cpp`, which reads `OpenLedger::current()` and
+    /// asks `TxQ::nextQueuableSeq` for the contiguous queued successor.
+    ///
+    /// The persistent submit sandbox is the Rust equivalent of that current
+    /// OpenView. It is deliberately preferred over the legacy cache because
+    /// an LCL rebase rebuilds the sandbox from LocalTxs without reconstructing
+    /// the cache.
+    pub fn network_ops_next_account_seq_for_tx(&self, tx: &STTx) -> Option<u32> {
+        let tx_source = AppQueueApplyTxSource::new(tx);
+        let open_tx_count = self.open_ledger().current().open_ledger_tx_count();
+
+        if let Ok(sandbox_holder) = self.open_ledger_sandbox.lock()
+            && let Some(sandbox) = sandbox_holder.as_ref()
+        {
+            let fee_view = AppRequiredFeeView::new(sandbox, open_tx_count);
+            let mut lock = AppTxQLock;
+            let fee_and_seq = self
+                .registry
+                .tx_q
+                .get_tx_required_fee_and_seq(&mut lock, &fee_view, &tx_source);
+            return (fee_and_seq.account_seq != 0).then_some(fee_and_seq.available_seq);
+        }
+
+        // Before a persistent open sandbox is first created, the closed LCL
+        // is the best current view. Still use TxQ so queued contiguous
+        // sequences are preserved if one exists at this boundary.
+        let base = self.ledger_master_state.latest_ledger()?;
+        let fee_view = AppRequiredFeeView::new(base.as_ref(), open_tx_count);
+        let mut lock = AppTxQLock;
+        let fee_and_seq = self
+            .registry
+            .tx_q
+            .get_tx_required_fee_and_seq(&mut lock, &fee_view, &tx_source);
+        (fee_and_seq.account_seq != 0).then_some(fee_and_seq.available_seq)
+    }
+
     /// Get the account's current sequence from the network ops pending state.
-    /// This accounts for transactions already submitted to the open ledger but not yet closed.
+    /// This cache remains available for callers that only have an AccountID;
+    /// server-side signing must use `network_ops_next_account_seq_for_tx`.
     pub fn network_ops_current_account_seq(&self, account: &protocol::AccountID) -> Option<u32> {
-        // Check the persistent open ledger sequence tracker first
         if let Ok(seqs) = self.open_ledger_account_seqs.lock() {
             if let Some(&seq) = seqs.get(account) {
                 return Some(seq);
             }
         }
-        // Fall back to closed/validated ledger
         let base = self.ledger_master_state.latest_ledger()?;
         let keylet =
             protocol::account_keylet(basics::base_uint::Uint160::from_void(account.data()));

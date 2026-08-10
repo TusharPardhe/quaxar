@@ -358,8 +358,7 @@ impl ApplyStateTable {
         // Collect all state map operations into a batch to apply using a single
         // MutableTree. This prevents MissingNode errors when sequential mutations
         // create new inner nodes that subsequent mutations can't find in NuDB.
-        let mut batch_ops: Vec<(crate::StateBatchOp, basics::base_uint::Uint256, Vec<u8>)> =
-            Vec::new();
+        let mut batch_ops: Vec<(crate::StateBatchOp, Arc<STLedgerEntry>)> = Vec::new();
 
         for (key, entry) in &self.items {
             match entry.action {
@@ -371,8 +370,7 @@ impl ApplyStateTable {
                         key.data()[3],
                         entry.sle.get_type(),
                     );
-                    let payload = entry.sle.get_serializer().data().to_vec();
-                    batch_ops.push((crate::StateBatchOp::Delete, *key, payload));
+                    batch_ops.push((crate::StateBatchOp::Delete, Arc::clone(&entry.sle)));
                 }
                 Action::Insert => {
                     tracing::debug!(target: "ledger",                        "[sandbox_apply] INSERT key={:02x}{:02x}{:02x}{:02x} sle_type={:?}",
@@ -382,8 +380,7 @@ impl ApplyStateTable {
                         key.data()[3],
                         entry.sle.get_type(),
                     );
-                    let payload = entry.sle.get_serializer().data().to_vec();
-                    batch_ops.push((crate::StateBatchOp::Insert, *key, payload));
+                    batch_ops.push((crate::StateBatchOp::Insert, Arc::clone(&entry.sle)));
                 }
                 Action::Modify => {
                     tracing::debug!(target: "ledger",                        "[sandbox_apply] MODIFY key={:02x}{:02x}{:02x}{:02x} sle_type={:?}",
@@ -393,15 +390,14 @@ impl ApplyStateTable {
                         key.data()[3],
                         entry.sle.get_type(),
                     );
-                    let payload = entry.sle.get_serializer().data().to_vec();
-                    batch_ops.push((crate::StateBatchOp::Update, *key, payload));
+                    batch_ops.push((crate::StateBatchOp::Update, Arc::clone(&entry.sle)));
                 }
                 Action::Cache => {}
             }
         }
 
         // Apply all state map operations in a single MutableTree session
-        to.raw_apply_batch(&batch_ops)?;
+        to.raw_apply_sle_batch(&batch_ops)?;
 
         if self.drops_destroyed.drops() != 0 {
             tracing::debug!(target: "ledger",                "[sandbox_apply] DESTROY_XRP drops={}",
@@ -425,8 +421,7 @@ impl ApplyStateTable {
         ledger_seq: u32,
         rules: &Rules,
     ) -> Result<(), ViewError> {
-        let mut batch_ops: Vec<(crate::StateBatchOp, basics::base_uint::Uint256, Vec<u8>)> =
-            Vec::new();
+        let mut batch_ops: Vec<(crate::StateBatchOp, Arc<STLedgerEntry>)> = Vec::new();
         // Matches rippled's `threadOwners` / `getForMod` path for deleted
         // RippleState SLEs. AccountRoots already Inserted or Modified by the
         // transaction are threaded through their normal payload, while cached
@@ -436,8 +431,7 @@ impl ApplyStateTable {
         for (key, entry) in &self.items {
             match entry.action {
                 Action::Erase => {
-                    let payload = entry.sle.get_serializer().data().to_vec();
-                    batch_ops.push((crate::StateBatchOp::Delete, *key, payload));
+                    batch_ops.push((crate::StateBatchOp::Delete, Arc::clone(&entry.sle)));
                     self.collect_erased_ripple_state_owner_threads(
                         to,
                         entry.sle.as_ref(),
@@ -445,7 +439,10 @@ impl ApplyStateTable {
                     )?;
                 }
                 Action::Insert | Action::Modify => {
-                    let payload = threaded_payload(entry.sle.as_ref(), tx_id, ledger_seq, rules);
+                    let threaded =
+                        Arc::new(thread_sle(entry.sle.as_ref(), tx_id, ledger_seq, rules));
+                    let serializer = threaded.get_serializer();
+                    let payload = serializer.data();
                     let op = if entry.action == Action::Insert {
                         crate::StateBatchOp::Insert
                     } else {
@@ -472,28 +469,27 @@ impl ApplyStateTable {
                                 .join("")
                         );
                     }
-                    batch_ops.push((op, *key, payload));
+                    batch_ops.push((op, threaded));
                 }
                 Action::Cache => {}
             }
         }
 
-        to.raw_apply_batch(&batch_ops)?;
+        to.raw_apply_sle_batch(&batch_ops)?;
 
         // rippled applies `newMod` after the transaction's regular state
         // changes. Keep the same ordering so these thread-only AccountRoot
         // updates cannot overwrite material modifications.
         let owner_thread_ops = owner_threads
-            .into_iter()
-            .map(|(key, sle)| {
+            .into_values()
+            .map(|sle| {
                 (
                     crate::StateBatchOp::Update,
-                    key,
-                    threaded_payload(sle.as_ref(), tx_id, ledger_seq, rules),
+                    Arc::new(thread_sle(sle.as_ref(), tx_id, ledger_seq, rules)),
                 )
             })
             .collect::<Vec<_>>();
-        to.raw_apply_batch(&owner_thread_ops)?;
+        to.raw_apply_sle_batch(&owner_thread_ops)?;
         to.raw_destroy_xrp(self.drops_destroyed)?;
         Ok(())
     }
@@ -621,18 +617,6 @@ pub(crate) fn thread_sle(
         );
     }
     threaded
-}
-
-fn threaded_payload(
-    sle: &STLedgerEntry,
-    tx_id: basics::base_uint::Uint256,
-    ledger_seq: u32,
-    rules: &Rules,
-) -> Vec<u8> {
-    thread_sle(sle, tx_id, ledger_seq, rules)
-        .get_serializer()
-        .data()
-        .to_vec()
 }
 
 #[cfg(test)]

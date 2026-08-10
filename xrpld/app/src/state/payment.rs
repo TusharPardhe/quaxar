@@ -23,9 +23,9 @@ thread_local! {
     static MPT_DELIVERED_AMOUNT_CAPTURES: RefCell<Vec<Option<STAmount>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Scoped equivalent of rippled's `ApplyContext::deliver` handoff for direct
-/// MPT payment metadata. Transaction-shell callers that do not construct
-/// metadata safely discard the capture when their application returns.
+/// Scoped equivalent of rippled's `ApplyContext::deliver` handoff for Payment
+/// metadata. Transaction-shell callers that do not construct metadata safely
+/// discard the capture when their application returns.
 pub struct MptDeliveredAmountCapture {
     active: bool,
 }
@@ -52,7 +52,7 @@ impl Drop for MptDeliveredAmountCapture {
     }
 }
 
-fn record_mpt_delivered_amount(amount: STAmount) {
+fn record_delivered_amount(amount: STAmount) {
     MPT_DELIVERED_AMOUNT_CAPTURES.with(|captures| {
         if let Some(delivered_amount) = captures.borrow_mut().last_mut() {
             *delivered_amount = Some(amount);
@@ -276,6 +276,12 @@ pub fn do_payment<V: ledger::ApplyView>(
                 if is_ter_retry(result) {
                     result = Ter::TEC_PATH_DRY;
                 }
+                if is_tes_success(result) {
+                    // `Payment::doApply` hands Flow's actual output to
+                    // ApplyContext so TxMeta records DeliveredAmount, which
+                    // differs from Amount for successful partial payments.
+                    record_delivered_amount(output.actual_amount_out);
+                }
 
                 result
             }
@@ -407,7 +413,7 @@ fn do_direct_mpt_payment<V: ledger::ApplyView>(
     {
         // Matches Payment.cpp: direct MPT payments use the actual net amount,
         // not the requested destination amount, when the amendment is active.
-        record_mpt_delivered_amount(amount_deliver);
+        record_delivered_amount(amount_deliver);
     }
     result
 }

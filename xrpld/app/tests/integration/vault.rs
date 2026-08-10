@@ -104,7 +104,10 @@ fn get_owner_count(view: &impl ReadView, account: AccountID) -> u32 {
 fn vault_create_tx(from: AccountID, asset: STAmount, seq: u32) -> STTx {
     STTx::new(TxType::VAULT_CREATE, move |tx| {
         tx.set_account_id(sf("sfAccount"), from);
-        tx.set_field_amount(sf("sfAsset"), asset);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), asset.asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), seq);
     })
@@ -113,7 +116,10 @@ fn vault_create_tx(from: AccountID, asset: STAmount, seq: u32) -> STTx {
 fn vault_create_tx_with_flags(from: AccountID, asset: STAmount, seq: u32, flags: u32) -> STTx {
     STTx::new(TxType::VAULT_CREATE, move |tx| {
         tx.set_account_id(sf("sfAccount"), from);
-        tx.set_field_amount(sf("sfAsset"), asset);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(sf("sfAsset"), asset.asset()),
+        );
         tx.set_field_amount(sf("sfFee"), xrp(10));
         tx.set_field_u32(sf("sfSequence"), seq);
         tx.set_field_u32(sf("sfFlags"), flags);
@@ -178,14 +184,49 @@ fn vault_create_basic() {
 
 /// C++ Vault_test — vault with XRP asset rejected (native not allowed).
 #[test]
+fn vault_create_native_issue_asset_matches_rpc_setup() {
+    let alice = acct(0x31);
+    let ledger = make_ledger(vec![account_root(alice, 10_000_000_000, 0, 0)]);
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        tx.set_field_issue(
+            sf("sfAsset"),
+            protocol::STIssue::new_with_asset(
+                sf("sfAsset"),
+                protocol::Asset::Issue(protocol::xrp_issue()),
+            ),
+        );
+        tx.set_field_vl(sf("sfData"), b"test");
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::VAULT_CREATE),
+        Ter::TES_SUCCESS,
+    );
+}
+
+#[test]
 fn vault_create_xrp_asset_rejected() {
     let alice = acct(0x11);
     let ledger = make_ledger(vec![account_root(alice, 10_000_000_000, 0, 0)]);
     let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::VAULT_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), alice);
+        // sfAsset must be serialized as an Issue. An Amount-form XRP asset is
+        // malformed even though native Issue-form XRP is valid.
+        tx.set_field_amount(sf("sfAsset"), xrp(0));
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
 
-    let tx = vault_create_tx(alice, xrp(0), 1);
-    let result = full_apply(&mut view, &tx, TxType::VAULT_CREATE);
-    assert_eq!(result, Ter::TEM_MALFORMED);
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::VAULT_CREATE),
+        Ter::TEM_MALFORMED
+    );
 }
 
 /// C++ Vault_test — invalid flags rejected.

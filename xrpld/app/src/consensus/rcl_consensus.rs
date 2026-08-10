@@ -1705,15 +1705,13 @@ impl AppConsensus {
                 // rejected disputes to retriableTxs, then passes the combined
                 // canonical retry set to OpenLedger::accept.
                 retriable_transactions.extend(work.rejected_dispute_retries.iter().cloned());
-                {
-                    root.rebuild_open_ledger_after_consensus(
-                        Arc::clone(&closed),
-                        &retriable_transactions,
-                        !work.rejected_dispute_retries.is_empty(),
-                    );
-                    root.set_status_rpc_current_ledger_index(Some(outcome.next_open_index));
-                    root.set_status_rpc_queue_report(Some(root.tx_q_rpc_report()));
-                }
+                root.rebuild_open_ledger_after_consensus(
+                    Arc::clone(&closed),
+                    &retriable_transactions,
+                    !work.rejected_dispute_retries.is_empty(),
+                );
+                root.set_status_rpc_current_ledger_index(Some(outcome.next_open_index));
+                root.set_status_rpc_queue_report(Some(root.tx_q_rpc_report()));
                 // `RCLConsensus::Adaptor::doAccept` reports fee changes only
                 // after OpenLedger::accept has installed the new open ledger.
                 // Keep the notification on its existing client-fee-change job.

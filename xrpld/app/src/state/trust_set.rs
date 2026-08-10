@@ -35,8 +35,8 @@ const LSF_LOW_NO_RIPPLE: u32 = 0x0010_0000;
 const LSF_HIGH_NO_RIPPLE: u32 = 0x0020_0000;
 const LSF_LOW_FREEZE: u32 = 0x0040_0000;
 const LSF_HIGH_FREEZE: u32 = 0x0080_0000;
-const LSF_LOW_DEEP_FREEZE: u32 = 0x0100_0000;
-const LSF_HIGH_DEEP_FREEZE: u32 = 0x0200_0000;
+const LSF_LOW_DEEP_FREEZE: u32 = 0x0200_0000;
+const LSF_HIGH_DEEP_FREEZE: u32 = 0x0400_0000;
 
 // Account flags
 const LSF_DEFAULT_RIPPLE: u32 = 0x0080_0000;
@@ -127,6 +127,49 @@ pub fn do_trust_set<V: ledger::ApplyView>(
             .flatten()
             .is_some();
         if !line_exists {
+            return Ter::TEC_NO_PERMISSION;
+        }
+    }
+
+    // `TrustSet::preclaim` validates the resulting freeze state before
+    // doApply.  Without this guard a deep-freeze-only line reaches the
+    // invariant checker and becomes tecINVARIANT_FAILED instead of rippled's
+    // tecNO_PERMISSION.
+    if view.rules().enabled(&protocol::feature_id("DeepFreeze")) {
+        let account_no_freeze = (sle.get_field_u32(sf("sfFlags")) & LSF_NO_FREEZE) != 0;
+        if account_no_freeze && (b_set_freeze || b_set_deep_freeze) {
+            return Ter::TEC_NO_PERMISSION;
+        }
+        if (b_set_freeze || b_set_deep_freeze) && (b_clear_freeze || b_clear_deep_freeze) {
+            return Ter::TEC_NO_PERMISSION;
+        }
+
+        let existing_flags = view
+            .peek(protocol::line(account, dst_account_id, currency))
+            .ok()
+            .flatten()
+            .map(|line| line.get_field_u32(sf("sfFlags")))
+            .unwrap_or_default();
+        let projected_flags = compute_freeze_flags(
+            existing_flags,
+            b_high,
+            account_no_freeze,
+            b_set_freeze,
+            b_clear_freeze,
+            b_set_deep_freeze,
+            b_clear_deep_freeze,
+        );
+        let own_freeze = if b_high {
+            LSF_HIGH_FREEZE
+        } else {
+            LSF_LOW_FREEZE
+        };
+        let own_deep_freeze = if b_high {
+            LSF_HIGH_DEEP_FREEZE
+        } else {
+            LSF_LOW_DEEP_FREEZE
+        };
+        if projected_flags & own_deep_freeze != 0 && projected_flags & own_freeze == 0 {
             return Ter::TEC_NO_PERMISSION;
         }
     }

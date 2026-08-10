@@ -403,6 +403,95 @@ fn af_signer_weighted() {
     );
 }
 
+#[test]
+fn af_account_set_wallet_locator_persists_nonzero_value() {
+    let account = acct(0x11);
+    let locator = Uint256::from_array([0xE0; 32]);
+    let ledger = build_ledger(vec![account_root(account, 5_000_000_000, 0, 0)]);
+    let mut view = new_view(ledger);
+    let tx = STTx::new(TxType::ACCOUNT_SET, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_h256(sf("sfWalletLocator"), locator);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::ACCOUNT_SET),
+        Ter::TES_SUCCESS
+    );
+    let account_root = view
+        .peek(protocol::account_keylet(acct_id(account)))
+        .expect("account-root read")
+        .expect("account root");
+    assert!(account_root.is_field_present(sf("sfWalletLocator")));
+    assert_eq!(account_root.get_field_h256(sf("sfWalletLocator")), locator);
+}
+
+#[test]
+fn af_trust_set_deep_freeze_requires_existing_freeze() {
+    let holder = acct(0x11);
+    let issuer = acct(0x22);
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(holder, 5_000_000_000, 0, 0),
+            account_root(issuer, 5_000_000_000, 0, 0),
+            trust_line(holder, issuer, usd_currency(), 0, 1_000, 0),
+        ],
+        vec!["DeepFreeze"],
+    );
+    let mut view = new_view(ledger);
+    let tx = STTx::new(TxType::TRUST_SET, |tx| {
+        tx.set_account_id(sf("sfAccount"), holder);
+        tx.set_field_amount(sf("sfLimitAmount"), iou(issuer, usd_currency(), 1_000));
+        tx.set_field_u32(sf("sfFlags"), 0x0040_0000);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::TRUST_SET),
+        Ter::TEC_NO_PERMISSION
+    );
+}
+
+#[test]
+fn af_trust_set_deep_freeze_on_frozen_side_succeeds() {
+    let holder = acct(0x11);
+    let issuer = acct(0x22);
+    let mut line = trust_line(holder, issuer, usd_currency(), 0, 1_000, 0);
+    line.set_field_u32(sf("sfFlags"), protocol::lsfLowFreeze);
+    let ledger = build_ledger_with_features(
+        vec![
+            account_root(holder, 5_000_000_000, 0, 0),
+            account_root(issuer, 5_000_000_000, 0, 0),
+            line,
+        ],
+        vec!["DeepFreeze"],
+    );
+    let mut view = new_view(ledger);
+    let tx = STTx::new(TxType::TRUST_SET, |tx| {
+        tx.set_account_id(sf("sfAccount"), holder);
+        tx.set_field_amount(sf("sfLimitAmount"), iou(issuer, usd_currency(), 1_000));
+        tx.set_field_u32(sf("sfFlags"), 0x0040_0000);
+        tx.set_field_amount(sf("sfFee"), xrp(10));
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    assert_eq!(
+        full_apply(&mut view, &tx, TxType::TRUST_SET),
+        Ter::TES_SUCCESS
+    );
+    let line = view
+        .peek(protocol::line(holder, issuer, usd_currency()))
+        .expect("line read")
+        .expect("line remains");
+    assert_ne!(
+        line.get_field_u32(sf("sfFlags")) & protocol::lsfLowDeepFreeze,
+        0
+    );
+}
+
 // ─── Regular Key ────────────────────────────────────────────────────────────
 
 #[test]
@@ -420,7 +509,14 @@ fn af_regular_key_set() {
         full_apply(&mut v, &tx, TxType::REGULAR_KEY_SET),
         Ter::TES_SUCCESS
     );
+    let account_root = v
+        .peek(protocol::account_keylet(acct_id(a)))
+        .expect("account root read")
+        .expect("account root exists");
+    assert!(account_root.is_field_present(sf("sfRegularKey")));
+    assert_eq!(account_root.get_account_id(sf("sfRegularKey")), acct(0x99));
 }
+
 #[test]
 fn af_regular_key_clear() {
     let a = acct(0x11);

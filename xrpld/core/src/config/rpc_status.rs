@@ -154,7 +154,7 @@ impl RpcErrorCode {
             Self::UnexpectedLedgerType => "unexpectedLedgerType",
             Self::BadCredentials => "badCredentials",
             Self::StreamMalformed => "malformedStream",
-            Self::NotStandalone => "notStandalone",
+            Self::NotStandalone => "notStandAlone",
             Self::NotImplemented => "notImplemented",
         }
     }
@@ -353,6 +353,16 @@ impl Status {
         } else {
             format!("{}:{}", self.code_string(), self.message())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RpcErrorCode;
+
+    #[test]
+    fn not_standalone_uses_rippled_wire_token() {
+        assert_eq!(RpcErrorCode::NotStandalone.token(), "notStandAlone");
     }
 }
 

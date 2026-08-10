@@ -89,7 +89,7 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
         RegisteredFeatureVote::DefaultNo,
     ),
     RegisteredFeature::new("fixBatchInnerSigs", false, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("LendingProtocol", false, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("LendingProtocol", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "LendingProtocolV1_1",
         false,
@@ -132,7 +132,7 @@ pub const REGISTERED_FEATURES: &[RegisteredFeature] = &[
     RegisteredFeature::new("fixAMMv1_3", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("PermissionedDEX", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new("Batch", true, RegisteredFeatureVote::DefaultNo),
-    RegisteredFeature::new("SingleAssetVault", false, RegisteredFeatureVote::DefaultNo),
+    RegisteredFeature::new("SingleAssetVault", true, RegisteredFeatureVote::DefaultNo),
     RegisteredFeature::new(
         "fixPayChanCancelAfter",
         true,

@@ -10599,6 +10599,79 @@ fn vault_withdraw_sole_shareholder_clean_full_exit_zeroes_vault() {
 }
 
 #[test]
+fn vault_withdraw_sole_shareholder_clean_full_asset_exit_zeroes_vault() {
+    let owner = sample_account(0xFA);
+    let holder = sample_account(0xFB);
+    let pseudo = sample_account(0xFC);
+    let share_id = share_id_for(pseudo, 1);
+    let asset = Asset::Issue(xrp_issue());
+    let vault_id = protocol::vault_keylet(raw_account_id(owner), 29).key;
+    let mut vault = vault_entry_with_share(owner, pseudo, 29, asset, share_id);
+    vault.set_field_number(
+        get_field_by_symbol("sfAssetsTotal"),
+        asset_number(asset, 700),
+    );
+    vault.set_field_number(
+        get_field_by_symbol("sfAssetsAvailable"),
+        asset_number(asset, 700),
+    );
+    let mut ledger = empty_ledger(vec![
+        account_root(owner, 0, 0),
+        account_root_with_balance(holder, 1, 0, 100),
+        account_root_with_balance(pseudo, 1, 0, 700),
+        vault,
+        mpt_issuance_entry(
+            pseudo,
+            1,
+            700,
+            MPT_CAN_ESCROW_FLAG | MPT_CAN_TRADE_FLAG | MPT_CAN_TRANSFER_FLAG,
+        ),
+        mptoken_entry(holder, share_id, 700),
+    ]);
+    ledger.set_rules(protocol::Rules::new([
+        protocol::feature_id("SingleAssetVault"),
+        protocol::feature_id("fixCleanup3_2_0"),
+    ]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    let result = handle_real_dispatch(
+        &mut view,
+        &vault_withdraw_asset_tx(holder, vault_id, 700),
+        TxType::VAULT_WITHDRAW,
+        None,
+    );
+
+    assert_eq!(result, protocol::Ter::TES_SUCCESS);
+    let holder = view
+        .read(account_keylet(raw_account_id(holder)))
+        .expect("holder read should succeed")
+        .expect("holder should remain");
+    assert_eq!(
+        holder
+            .get_field_amount(get_field_by_symbol("sfBalance"))
+            .xrp()
+            .drops(),
+        800
+    );
+    let vault = view
+        .read(protocol::vault_keylet_from_key(vault_id))
+        .expect("vault read should succeed")
+        .expect("vault should remain");
+    assert_eq!(
+        vault
+            .get_field_number(get_field_by_symbol("sfAssetsTotal"))
+            .value(),
+        RuntimeNumber::zero()
+    );
+    assert_eq!(
+        vault
+            .get_field_number(get_field_by_symbol("sfAssetsAvailable"))
+            .value(),
+        RuntimeNumber::zero()
+    );
+}
+
+#[test]
 fn vault_clawback_dispatch_burns_holder_shares() {
     let owner = sample_account(0xDC);
     let holder = sample_account(0xDD);
@@ -11162,6 +11235,47 @@ fn amm_create_rejects_locked_mpt_asset_before_creating_pool() {
     let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_CREATE, None);
 
     assert_eq!(result, Ter::TEC_LOCKED);
+}
+
+#[test]
+fn amm_create_rejects_non_holder_of_requested_iou() {
+    let account = sample_account(0x35);
+    let issuer = sample_account(0x36);
+    let currency = currency_from_string("TST");
+    let issue = Issue::new(currency, issuer);
+    let mut ledger = empty_ledger(vec![
+        account_root_with_balance(account, 0, 0, 1_000_000_000),
+        account_root(issuer, 0, 0),
+        trust_line_entry(account, issuer, currency, 0),
+    ]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("AMM")]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+    let tx = STTx::new(TxType::AMM_CREATE, |tx| {
+        tx.set_account_id(sf("sfAccount"), account);
+        tx.set_field_amount(
+            sf("sfAmount"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10_000_000)),
+        );
+        tx.set_field_amount(sf("sfAmount2"), iou_amount(sf("sfAmount2"), issue, 5_000));
+        tx.set_field_u16(sf("sfTradingFee"), 500);
+        tx.set_field_amount(
+            sf("sfFee"),
+            STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+        );
+        tx.set_field_u32(sf("sfSequence"), 1);
+    });
+
+    let result = handle_real_dispatch(&mut view, &tx, TxType::AMM_CREATE, None);
+
+    assert_eq!(result, Ter::TEC_UNFUNDED_AMM);
+    assert!(
+        view.read(protocol::keylet::amm(
+            Asset::Issue(issue),
+            Asset::Issue(xrp_issue()),
+        ))
+        .expect("AMM read should succeed")
+        .is_none()
+    );
 }
 
 #[test]
@@ -13762,6 +13876,42 @@ fn nftoken_modify_dispatch_rejects_immutable_token() {
 
     let result = handle_real_dispatch(&mut view, &tx, TxType::NFTOKEN_MODIFY, None);
     assert_eq!(result, protocol::Ter::TEC_NO_PERMISSION);
+}
+
+#[test]
+fn nftoken_modify_dispatch_rejects_nftoken_taxon() {
+    let issuer = sample_account(0xA4);
+    let token_id = make_nft_id(protocol::nft::FLAG_MUTABLE, issuer);
+    let page_keylet = protocol::nft_page_max_keylet(raw_account_id(issuer));
+    let page = nft_page_entry(page_keylet, token_id, None, None);
+
+    let mut ledger = empty_ledger(vec![account_root(issuer, 1, 0), page]);
+    ledger.set_rules(protocol::Rules::new([protocol::feature_id("DynamicNFT")]));
+    let mut view = ApplyViewImpl::new(Arc::new(ledger), ApplyFlags::NONE);
+
+    // Build the raw decoded form because `STTx::new` applies NFTokenModify's
+    // template, which deliberately omits `sfNFTokenTaxon` and therefore cannot
+    // represent the malformed wire transaction being tested.
+    let mut object = STObject::new(get_field_by_symbol("sfTransaction"));
+    object.set_field_u16(
+        get_field_by_symbol("sfTransactionType"),
+        TxType::NFTOKEN_MODIFY.into(),
+    );
+    object.set_account_id(get_field_by_symbol("sfAccount"), issuer);
+    object.set_field_h256(get_field_by_symbol("sfNFTokenID"), token_id);
+    object.set_field_u32(get_field_by_symbol("sfNFTokenTaxon"), 10);
+    object.set_field_amount(
+        get_field_by_symbol("sfFee"),
+        STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+    );
+    object.set_field_u32(get_field_by_symbol("sfSequence"), 1);
+    let tx = STTx::from_stobject(object);
+    assert!(tx.is_field_present(get_field_by_symbol("sfNFTokenTaxon")));
+
+    assert_eq!(
+        handle_real_dispatch(&mut view, &tx, TxType::NFTOKEN_MODIFY, None),
+        protocol::Ter::TEM_MALFORMED
+    );
 }
 
 #[test]

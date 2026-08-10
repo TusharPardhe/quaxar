@@ -662,6 +662,17 @@ fn simulate_clones_persistent_open_view_sequence_and_balance() {
     });
     *root.open_ledger_sandbox.lock().expect("sandbox mutex") = Some(live);
 
+    let rpc_current_account = root
+        .current_open_ledger_entry(account_keylet(raw_account_id(source)))
+        .expect("persistent current open view must be published")
+        .expect("current open account read must succeed")
+        .expect("current open source account must exist");
+    assert_eq!(
+        rpc_current_account.get_field_u32(get_field_by_symbol("sfSequence")),
+        2,
+        "current-ledger RPC reads must observe the persistent OpenView mutation"
+    );
+
     let outcome = root.simulate_transaction(Arc::clone(&base), Arc::clone(&second));
     assert_eq!(outcome.result.ter, Ter::TES_SUCCESS);
     assert!(
@@ -686,6 +697,94 @@ fn simulate_clones_persistent_open_view_sequence_and_balance() {
             .drops(),
         live_balance,
         "simulation must clone, never mutate, the persistent open view"
+    );
+}
+
+#[test]
+fn signing_sequence_uses_rebuilt_open_sandbox_not_legacy_cache() {
+    // TransactionSign.cpp reads OpenLedger::current() and then uses TxQ's
+    // nextQueuableSeq. A LocalTx rebase reconstructs this sandbox but does
+    // not reconstruct Quaxar's old monotonic cache; signing must therefore
+    // use the sandbox rather than the cache or it will create duplicates/gaps.
+    let destination = AccountID::from_array([0xC2; 20]);
+    let (source, first) = signed_payment_tx(0xC2, destination, 1, 10);
+    let (_, next) = signed_payment_tx(0xC2, destination, 2, 10);
+    let base = Arc::new(ledger_view(10, source, 1, &[]));
+    let mut sandbox = Sandbox::new(
+        Arc::new(OpenView::new_open(Arc::clone(&base), base.rules().clone())),
+        ApplyFlags::NONE,
+    );
+    let mut open =
+        AppOpenLedgerView::with_parent_hash(11, base.fees().base, *base.header().hash.as_uint256());
+
+    assert_eq!(
+        apply_submit_tx_for_test(&mut open, &mut sandbox, first, 11),
+        ApplyResult::new(Ter::TES_SUCCESS, true, false),
+    );
+    let root = ApplicationRoot::new(0).expect("application root should build");
+    root.open_ledger().modify(|current| {
+        *current = open;
+        true
+    });
+    *root.open_ledger_sandbox.lock().expect("sandbox mutex") = Some(sandbox);
+
+    // Deliberately poison the obsolete cache with a sequence that could never
+    // be derived from the rebuilt OpenView. The signing authority must still
+    // return the sandbox account sequence (2), not the cache's 100.
+    root.note_open_ledger_tx(&source, 99);
+    assert_eq!(root.network_ops_current_account_seq(&source), Some(100));
+    assert_eq!(root.network_ops_next_account_seq_for_tx(&next), Some(2));
+}
+
+#[test]
+fn closed_ledger_notification_preserves_rebuilt_same_parent_submit_sandbox() {
+    // Consensus rebuilds OpenLedger before it notifies the closed-LCL side.
+    // The notification must retain that exact-parent OpenView: TransactionSign
+    // reads it for nextQueuableSeq, and clearing it would make a later submit
+    // reuse a sequence already occupied by the rebuilt current open ledger.
+    let destination = AccountID::from_array([0xC3; 20]);
+    let (source, first) = signed_payment_tx(0xC3, destination, 1, 10);
+    let (_, next) = signed_payment_tx(0xC3, destination, 2, 10);
+    let parent = Arc::new(ledger_view(10, source, 1, &[]));
+    let mut sandbox = Sandbox::new(
+        Arc::new(OpenView::new_open(
+            Arc::clone(&parent),
+            parent.rules().clone(),
+        )),
+        ApplyFlags::NONE,
+    );
+    let mut open = AppOpenLedgerView::with_parent_hash(
+        11,
+        parent.fees().base,
+        *parent.header().hash.as_uint256(),
+    );
+    assert_eq!(
+        apply_submit_tx_for_test(&mut open, &mut sandbox, first, 11),
+        ApplyResult::new(Ter::TES_SUCCESS, true, false),
+    );
+
+    let root = ApplicationRoot::new(0).expect("application root should build");
+    root.open_ledger().modify(|current| {
+        *current = open;
+        true
+    });
+    *root.open_ledger_sandbox.lock().expect("sandbox mutex") = Some(sandbox);
+
+    // This is the order in the accepted-consensus handoff: the rebuilt
+    // same-parent sandbox is live before on_closed_ledger updates LCL state.
+    root.on_closed_ledger(Arc::clone(&parent));
+
+    assert!(
+        root.open_ledger_sandbox
+            .lock()
+            .expect("sandbox mutex")
+            .is_some(),
+        "the exact-parent sandbox must survive closed-ledger notification"
+    );
+    assert_eq!(
+        root.network_ops_next_account_seq_for_tx(&next),
+        Some(2),
+        "autofill must retain the rebuilt current-open sequence rather than reuse 1"
     );
 }
 
@@ -955,6 +1054,148 @@ fn app_open_ledger_queue_apply_view_reads_live_account_and_ticket_facts() {
     assert_eq!(view.reserve_drops(), ledger.fees().account_reserve(0));
     assert_eq!(view.metrics_snapshot(), metrics_snapshot);
     assert_eq!(view.rules(), &ledger.rules().clone());
+}
+
+#[test]
+fn local_replay_txq_persists_sequence_chain_and_later_drains() {
+    // rippled TxQ::apply returns terPRE_SEQ when an account has no queued
+    // predecessor, so it must not be force-queued. Its persistent
+    // sequence-chain path queues the current sequence while the open ledger is
+    // fee-saturated, then queues the next sequence behind that first entry.
+    let destination = AccountID::from_array([0xB2; 20]);
+    let (source, first) = signed_payment_tx(0xB1, destination, 1, 10);
+    let (same_source, deferred) = signed_payment_tx(0xB1, destination, 2, 10);
+    assert_eq!(same_source, source);
+
+    let root = ApplicationRoot::new(0).expect("root should build");
+    let parent = Arc::new(ledger_view(10, source, 1, &[]));
+    root.process_closed_ledger_txq(parent.as_ref(), false);
+    let metrics = root.registry.tx_q.metrics_snapshot();
+    assert!(
+        root.registry.tx_q.current_max_size().is_some(),
+        "closed-ledger maintenance must initialize TxQ admission capacity"
+    );
+
+    let mut open_ledger = AppOpenLedgerView::with_parent_hash(
+        11,
+        parent.fees().base,
+        *parent.header().hash.as_uint256(),
+    );
+    // This count-only saturation makes tryDirectApply fall through to TxQ
+    // admission. Filler transactions never mutate the rebase view.
+    let saturation_count = u32::try_from(metrics.txns_expected.saturating_mul(2).max(2))
+        .expect("test TxQ saturation count must fit in a transaction sequence");
+    for sequence in 1..=saturation_count {
+        open_ledger.push_transaction(Arc::new(STTx::new(TxType::PAYMENT, |tx| {
+            tx.set_account_id(
+                get_field_by_symbol("sfAccount"),
+                AccountID::from_array([0xD1; 20]),
+            );
+            tx.set_account_id(
+                get_field_by_symbol("sfDestination"),
+                AccountID::from_array([0xD2; 20]),
+            );
+            tx.set_field_amount(
+                get_field_by_symbol("sfAmount"),
+                STAmount::new_native(1_000_000, false),
+            );
+            tx.set_field_amount(
+                get_field_by_symbol("sfFee"),
+                STAmount::new_native(10, false),
+            );
+            tx.set_field_u32(get_field_by_symbol("sfSequence"), sequence);
+        })));
+    }
+    let mut rebase_view = Sandbox::new(
+        Arc::new(OpenView::new_open(
+            Arc::clone(&parent),
+            parent.rules().clone(),
+        )),
+        ApplyFlags::NONE,
+    );
+    let mut applied_ids = std::collections::HashSet::new();
+
+    let first_result = root.apply_local_open_ledger_record_with_txq(
+        &mut open_ledger,
+        &mut rebase_view,
+        &mut applied_ids,
+        &super::AppOpenLedgerTxRecord::new(Arc::clone(&first)),
+        ApplyFlags::NONE,
+    );
+    assert_eq!(first_result.ter, Ter::TER_QUEUED);
+    assert!(!first_result.applied);
+
+    let deferred_result = root.apply_local_open_ledger_record_with_txq(
+        &mut open_ledger,
+        &mut rebase_view,
+        &mut applied_ids,
+        &super::AppOpenLedgerTxRecord::new(Arc::clone(&deferred)),
+        ApplyFlags::NONE,
+    );
+    assert_eq!(deferred_result.ter, Ter::TER_QUEUED);
+    assert!(!deferred_result.applied);
+
+    let queued_before = root.registry.tx_q.current_account_txs(source);
+    assert_eq!(
+        queued_before.len(),
+        2,
+        "LocalTx sequence chain must persist in TxQ"
+    );
+    assert_eq!(
+        queued_before[0].tx.get_transaction_id(),
+        first.get_transaction_id()
+    );
+    assert_eq!(
+        queued_before[1].tx.get_transaction_id(),
+        deferred.get_transaction_id()
+    );
+
+    // A new open-ledger rebuild starts without saturation. TxQ::accept must
+    // apply both persisted LocalTxs in sequence order and remove them.
+    open_ledger = AppOpenLedgerView::with_parent_hash(
+        11,
+        parent.fees().base,
+        *parent.header().hash.as_uint256(),
+    );
+    let snapshot = super::AppOpenLedgerTxQAcceptView {
+        open_ledger_tx_count: open_ledger.tx_ids().len(),
+        parent_hash: open_ledger.parent_hash,
+    };
+    let mut runtime = super::AppOpenLedgerTxQAcceptRuntime {
+        root: &root,
+        view: &mut open_ledger,
+        rebase_view: &mut rebase_view,
+        applied_ids: &mut applied_ids,
+        flags: ApplyFlags::NONE,
+    };
+    let mut lock = super::AppTxQLock;
+    let accepted = root
+        .registry
+        .tx_q
+        .accept(&mut lock, &mut runtime, &snapshot);
+    assert!(
+        accepted.ledger_changed,
+        "TxQ::accept must drain the ready LocalTx chain"
+    );
+
+    assert!(
+        root.registry.tx_q.current_account_txs(source).is_empty(),
+        "the drained LocalTx sequence chain must be removed from persistent TxQ"
+    );
+    assert_eq!(
+        open_ledger.tx_ids(),
+        vec![first.get_transaction_id(), deferred.get_transaction_id()],
+        "both queued LocalTxs must be applied to the new open ledger in sequence order"
+    );
+    let source_root = rebase_view
+        .read(account_keylet(raw_account_id(source)))
+        .expect("source account read should succeed")
+        .expect("source account should remain present");
+    assert_eq!(
+        source_root.get_field_u32(get_field_by_symbol("sfSequence")),
+        3,
+        "draining the queued transactions must advance live sequence state"
+    );
 }
 
 #[test]
@@ -2778,6 +3019,42 @@ fn lcl_transition_gate_serializes_authoritative_promotions() {
         .expect("closed-ledger writer should proceed after transition completes");
     writer.join().expect("writer thread should not panic");
     assert_eq!(app.closed_ledger_seq(), Some(11));
+}
+
+#[test]
+fn lcl_transition_gate_serializes_consensus_rebuild_sandbox_publication() {
+    let app = Arc::new(ApplicationRoot::new(0).expect("root shell should build"));
+    let parent = Arc::new(Ledger::from_ledger_seq_and_close_time(10, 1_000, false));
+
+    // Legacy submit holds this gate from sequence lookup through direct
+    // admission. A consensus rebase must wait rather than expose the old
+    // sandbox to the signer and later overwrite the submission's sandbox.
+    let gate = app.lcl_transition_gate().lock();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let rebuild_app = Arc::clone(&app);
+    let rebuild_parent = Arc::clone(&parent);
+    let worker = std::thread::spawn(move || {
+        rebuild_app.rebuild_open_ledger_after_consensus(rebuild_parent, &[], false);
+        done_tx
+            .send(())
+            .expect("rebuild completion should be observed");
+    });
+
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "consensus rebuild must wait for the active sign-and-submit transition"
+    );
+    drop(gate);
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("rebuild should proceed after the sign-and-submit transition");
+    worker.join().expect("rebuild thread should not panic");
+
+    let open = app.open_ledger().current();
+    assert_eq!(open.parent_hash, *parent.header().hash.as_uint256());
+    assert_eq!(open.ledger_current_index, 11);
 }
 
 #[test]

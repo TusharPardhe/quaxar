@@ -257,8 +257,8 @@ impl ConnectAttempt {
                     .map_err(ConnectAttemptError::Io)
             })
             .await?;
-        let response = parse_http_response(&http_response.wire)
-            .map_err(ConnectAttemptError::InvalidHttp)?;
+        let response =
+            parse_http_response(&http_response.wire).map_err(ConnectAttemptError::InvalidHttp)?;
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             if response.status() == StatusCode::SERVICE_UNAVAILABLE
                 && let Some(peers) = parse_redirect_peers(&http_response.wire)
@@ -419,7 +419,8 @@ mod tests {
 
     #[tokio::test]
     async fn http_response_preserves_coalesced_overlay_read_ahead() {
-        let response = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: XRPL/2.2\r\n\r\n";
+        let response =
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: XRPL/2.2\r\n\r\n";
         let frame = [0_u8, 0, 0, 1, 0, 3, 0x08];
         let (mut reader, mut writer) = duplex(2048);
         writer.write_all(response).await.expect("write response");

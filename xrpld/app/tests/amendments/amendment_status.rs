@@ -219,6 +219,8 @@ fn default_amendment_registry_marks_current_mainnet_amendments_supported() {
         feature_id("DynamicNFT"),
         feature_id("Credentials"),
         feature_id("PermissionedDomains"),
+        feature_id("SingleAssetVault"),
+        feature_id("LendingProtocol"),
     ]);
 
     table.do_validated_ledger_with_sets(900_000, &enabled, &BTreeMap::new());

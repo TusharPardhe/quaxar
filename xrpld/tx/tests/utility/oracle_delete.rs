@@ -131,8 +131,8 @@ fn oracle_delete_preclaim_rejects_owner_mismatch() {
         tx_account_matches_owner: false,
     });
 
-    assert_eq!(result, Ter::TEC_INTERNAL);
-    assert_eq!(trans_token(result), "tecINTERNAL");
+    assert_eq!(result, Ter::TEC_NO_PERMISSION);
+    assert_eq!(trans_token(result), "tecNO_PERMISSION");
 }
 
 #[test]
@@ -206,12 +206,12 @@ fn oracle_delete_do_apply_delegates_when_oracle_exists() {
 }
 
 #[test]
-fn oracle_delete_do_apply_maps_missing_oracle_to_internal() {
+fn oracle_delete_do_apply_maps_missing_oracle_to_no_entry() {
     let mut sink = TestApplySink::new();
     sink.oracle_exists = false;
 
     let result = run_oracle_delete_do_apply(&mut sink);
 
-    assert_eq!(result, Ter::TEC_INTERNAL);
+    assert_eq!(result, Ter::TEC_NO_ENTRY);
     assert_eq!(sink.events, ["peek_oracle"]);
 }

@@ -6,8 +6,10 @@
 //! without depending on the higher-level RPC crate.
 
 use protocol::{
-    INNER_BATCH_TRANSACTION_FLAG, NotTec, Permission, Rules, STAmount, STTx, Ter, TxType,
-    equal_tokens, feature_lending_protocol, get_field_by_symbol, is_bad_asset, is_tes_success,
+    INNER_BATCH_TRANSACTION_FLAG, NF_TOKEN_BURNABLE_FLAG, NF_TOKEN_MUTABLE_FLAG,
+    NF_TOKEN_ONLY_XRP_FLAG, NF_TOKEN_TRANSFERABLE_FLAG, NF_TOKEN_TRUST_LINE_FLAG, NotTec,
+    Permission, Rules, STAmount, STTx, Ter, TxType, UNIVERSAL_TRANSACTION_FLAGS, equal_tokens,
+    feature_lending_protocol, get_field_by_symbol, is_bad_asset, is_tes_success,
 };
 
 use crate::{
@@ -206,6 +208,7 @@ fn validate_sttx_typed_semantic_preflight(tx: &STTx, rules: &Rules, txn_type: Tx
         TxType::REGULAR_KEY_SET => validate_set_regular_key_preflight(tx),
         TxType::ESCROW_CREATE => validate_escrow_create_preflight(tx, rules),
         TxType::ACCOUNT_SET => validate_account_set_preflight(tx),
+        TxType::NFTOKEN_MINT => validate_nftoken_mint_preflight(tx, rules),
         // Types with no additional stateless rule still traverse the standalone
         // dispatcher explicitly; unknown types never silently succeed.
         _ if txn_type.is_dispatchable() => validate_sttx_noop_preflight(txn_type),
@@ -471,6 +474,50 @@ fn validate_check_cash_preflight(tx: &STTx) -> NotTec {
     })
 }
 
+/// Mirrors `NFTokenMint::getFlagsMask` and `NFTokenMint::preflight` in
+/// `rippled/src/libxrpl/tx/transactors/nft/NFTokenMint.cpp`.
+fn validate_nftoken_mint_preflight(tx: &STTx, rules: &Rules) -> NotTec {
+    let mut valid_flags = UNIVERSAL_TRANSACTION_FLAGS
+        | NF_TOKEN_BURNABLE_FLAG
+        | NF_TOKEN_ONLY_XRP_FLAG
+        | NF_TOKEN_TRANSFERABLE_FLAG;
+    if !rules.enabled(&protocol::feature_id("fixRemoveNFTokenAutoTrustLine")) {
+        valid_flags |= NF_TOKEN_TRUST_LINE_FLAG;
+    }
+    if rules.enabled(&protocol::feature_id("DynamicNFT")) {
+        valid_flags |= NF_TOKEN_MUTABLE_FLAG;
+    }
+    if tx.get_flags() & !valid_flags != 0 {
+        return Ter::TEM_INVALID_FLAG;
+    }
+
+    if tx.is_field_present(get_field_by_symbol("sfTransferFee")) {
+        let transfer_fee = tx.get_field_u16(get_field_by_symbol("sfTransferFee"));
+        if transfer_fee > 50_000 {
+            return Ter::TEM_BAD_NFTOKEN_TRANSFER_FEE;
+        }
+        if transfer_fee > 0 && tx.get_flags() & NF_TOKEN_TRANSFERABLE_FLAG == 0 {
+            return Ter::TEM_MALFORMED;
+        }
+    }
+
+    if tx.is_field_present(get_field_by_symbol("sfIssuer"))
+        && tx.get_account_id(get_field_by_symbol("sfIssuer"))
+            == tx.get_account_id(get_field_by_symbol("sfAccount"))
+    {
+        return Ter::TEM_MALFORMED;
+    }
+
+    if tx.is_field_present(get_field_by_symbol("sfURI")) {
+        let uri = tx.get_field_vl(get_field_by_symbol("sfURI"));
+        if uri.is_empty() || uri.len() > 256 {
+            return Ter::TEM_MALFORMED;
+        }
+    }
+
+    Ter::TES_SUCCESS
+}
+
 fn validate_set_regular_key_preflight(tx: &STTx) -> NotTec {
     let account = tx.get_account_id(get_field_by_symbol("sfAccount"));
     let regular_key_field = get_field_by_symbol("sfRegularKey");
@@ -559,6 +606,29 @@ mod tests {
         })
     }
 
+    fn nftoken_mint(flags: u32, transfer_fee: Option<u16>) -> STTx {
+        STTx::new(TxType::NFTOKEN_MINT, |tx| {
+            tx.set_account_id(sf("sfAccount"), AccountID::from_array([0xC3; 20]));
+            tx.set_field_u32(sf("sfNFTokenTaxon"), 0);
+            tx.set_field_u32(sf("sfFlags"), flags);
+            tx.set_field_amount(
+                sf("sfFee"),
+                STAmount::from_xrp_amount(XRPAmount::from_drops(10)),
+            );
+            tx.set_field_u32(sf("sfSequence"), 1);
+            if let Some(transfer_fee) = transfer_fee {
+                tx.set_field_u16(sf("sfTransferFee"), transfer_fee);
+            }
+        })
+    }
+
+    fn current_nft_rules() -> Rules {
+        Rules::new([
+            protocol::feature_id("fixRemoveNFTokenAutoTrustLine"),
+            protocol::feature_id("DynamicNFT"),
+        ])
+    }
+
     fn iou(field: &'static protocol::SField, issuer: AccountID, currency_byte: u8) -> STAmount {
         STAmount::from_iou_amount(
             field,
@@ -568,6 +638,33 @@ mod tests {
                 account: issuer,
             },
         )
+    }
+
+    #[test]
+    fn nftoken_mint_preflight_matches_current_rippled_flag_and_fee_rules() {
+        let rules = current_nft_rules();
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(&nftoken_mint(1_048_576, None), &rules),
+            Ter::TEM_INVALID_FLAG,
+            "tfTransferFee is not an NFTokenMint transaction flag",
+        );
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(
+                &nftoken_mint(1 | 2 | 4 | 1_048_576, None),
+                &rules
+            ),
+            Ter::TEM_INVALID_FLAG,
+            "deprecated tfTrustLine and unknown bits must be rejected",
+        );
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(&nftoken_mint(4, None), &rules),
+            Ter::TEM_INVALID_FLAG,
+            "fixRemoveNFTokenAutoTrustLine rejects tfTrustLine",
+        );
+        assert_eq!(
+            validate_sttx_transaction_preflight_with_rules(&nftoken_mint(8, Some(60_000)), &rules),
+            Ter::TEM_BAD_NFTOKEN_TRANSFER_FEE,
+        );
     }
 
     #[test]

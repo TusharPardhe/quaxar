@@ -2,9 +2,8 @@
 //!
 //! This ports the the reference implementation parameter validation and the AMM-entry shaping
 //! that the landed Rust protocol and ledger helpers can support honestly. It
-//! keeps the AMM selector, account/root validation, vote-slot shaping,
-//! auction-slot shaping, and freeze-flag reporting explicit while leaving the
-//! live pool balance math to the still-unported ledger surface.
+//! keeps the AMM selector, account/root validation, pool-balance lookup,
+//! vote-slot shaping, auction-slot shaping, and freeze-flag reporting explicit.
 
 use std::collections::BTreeMap;
 
@@ -188,6 +187,32 @@ fn shape_auction_slot(slot: &STObject) -> JsonValue {
     JsonValue::Object(object)
 }
 
+fn amm_account_holds<S: AmmInfoSource>(
+    source: &S,
+    ledger: &LedgerLookupLedger,
+    amm_account: AccountID,
+    issue: Issue,
+) -> protocol::STAmount {
+    if is_xrp_currency(issue.currency) {
+        return source
+            .read_account_root(ledger, amm_account)
+            .map(|root| root.get_field_amount(get_field_by_symbol("sfBalance")))
+            .unwrap_or_else(|| protocol::STAmount::new_native(0, false));
+    }
+
+    let mut amount = source
+        .read_ledger_entry(ledger, line(amm_account, issue.account, issue.currency).key)
+        .map(|entry| entry.get_field_amount(get_field_by_symbol("sfBalance")))
+        .unwrap_or_else(|| {
+            protocol::STAmount::new_with_asset(get_field_by_symbol("sfBalance"), issue, 0, 0, false)
+        });
+    if amm_account > issue.account {
+        amount.negate();
+    }
+    amount.set_issuer(issue.account);
+    amount
+}
+
 fn shape_amm_json<S: AmmInfoSource>(
     source: &S,
     ledger: &LedgerLookupLedger,
@@ -196,12 +221,16 @@ fn shape_amm_json<S: AmmInfoSource>(
     issue2: Issue,
 ) -> JsonValue {
     let amm_account_id = amm_entry.get_account_id(get_field_by_symbol("sfAccount"));
+    let amount = amm_account_holds(source, ledger, amm_account_id, issue1);
+    let amount2 = amm_account_holds(source, ledger, amm_account_id, issue2);
     let mut object = BTreeMap::new();
 
     object.insert(
         "account".to_owned(),
         JsonValue::String(to_base58(amm_account_id)),
     );
+    object.insert("amount".to_owned(), amount.json(JsonOptions::NONE));
+    object.insert("amount2".to_owned(), amount2.json(JsonOptions::NONE));
     object.insert(
         "trading_fee".to_owned(),
         JsonValue::Unsigned(u64::from(

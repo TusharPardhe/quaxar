@@ -230,9 +230,10 @@ fn account_info_account_data_contains_expected_fields() {
         ledger: Some(ledger),
         ..Default::default()
     };
-    source
-        .account_roots
-        .insert(account, make_account_root(account, 0, None));
+    let regular_key = sample_account(0x31);
+    let mut account_root = make_account_root(account, 0, None);
+    account_root.set_account_id(get_field_by_symbol("sfRegularKey"), regular_key);
+    source.account_roots.insert(account, account_root);
 
     let result = do_account_info(
         &AccountInfoRequest {
@@ -273,6 +274,10 @@ fn account_info_account_data_contains_expected_fields() {
     );
     assert!(account_data.contains_key("Balance"));
     assert!(account_data.contains_key("Flags"));
+    assert_eq!(
+        account_data.get("RegularKey"),
+        Some(&JsonValue::String(to_base58(regular_key)))
+    );
 }
 
 #[test]

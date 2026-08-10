@@ -791,8 +791,8 @@ mod tests {
         )
         .get_buffer(Compressed::Off)
         .to_vec();
-        let session = PeerSessionStarter::new(Box::new(local), stop_rx)
-            .with_initial_buffer(initial);
+        let session =
+            PeerSessionStarter::new(Box::new(local), stop_rx).with_initial_buffer(initial);
         let handle = session.start(
             Arc::clone(&peer),
             hooks.clone(),

@@ -16,11 +16,11 @@ use protocol::{
 };
 use tx::{
     MPT_CAN_ESCROW_FLAG, MPT_CAN_TRADE_FLAG, MPT_CAN_TRANSFER_FLAG, MPT_REQUIRE_AUTH_FLAG,
-    VAULT_PRIVATE_FLAG, VAULT_SHARE_NON_TRANSFERABLE_FLAG, VaultClawbackPreflightFacts,
-    VaultCreatePreflightFacts, VaultDeletePreflightFacts, VaultDepositPreflightFacts,
-    VaultSetPreflightFacts, VaultWithdrawPreflightFacts, run_vault_clawback_preflight,
-    run_vault_create_preflight, run_vault_delete_preflight, run_vault_deposit_preflight,
-    run_vault_set_preflight, run_vault_withdraw_preflight,
+    VAULT_PRIVATE_FLAG, VAULT_SHARE_NON_TRANSFERABLE_FLAG, VAULT_STRATEGY_FIRST_COME_FIRST_SERVE,
+    VaultClawbackPreflightFacts, VaultCreatePreflightFacts, VaultDeletePreflightFacts,
+    VaultDepositPreflightFacts, VaultSetPreflightFacts, VaultWithdrawPreflightFacts,
+    run_vault_clawback_preflight, run_vault_create_preflight, run_vault_delete_preflight,
+    run_vault_deposit_preflight, run_vault_set_preflight, run_vault_withdraw_preflight,
 };
 
 fn sf(name: &str) -> &'static protocol::SField {
@@ -85,7 +85,15 @@ fn vault_create_preflight<V: ApplyView>(view: &V, sttx: &STTx) -> Ter {
         return Ter::TEM_DISABLED;
     }
 
-    let asset = tx_asset_field(sttx, sf("sfAsset"));
+    if sttx
+        .peek_at_pfield(sf("sfAsset"))
+        .map(|value| value.stype())
+        != Some(SerializedTypeId::Issue)
+    {
+        return Ter::TEM_MALFORMED;
+    }
+
+    let asset = sttx.get_field_issue(sf("sfAsset")).asset();
     let facts = VaultCreatePreflightFacts {
         data_len: data_len(sttx, sf("sfData")),
         withdrawal_policy: sttx
@@ -947,7 +955,7 @@ pub fn apply_vault_create<V: ApplyView>(view: &mut V, sttx: &STTx) -> Ter {
         if sttx.is_field_present(sf("sfWithdrawalPolicy")) {
             sttx.get_field_u8(sf("sfWithdrawalPolicy"))
         } else {
-            0
+            VAULT_STRATEGY_FIRST_COME_FIRST_SERVE
         },
     );
     if share_asset_scale != 0 {
