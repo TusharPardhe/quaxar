@@ -12,7 +12,7 @@ use ledger::{
     select_inbound_ledger_reply_peers, FetchPackCache, FetchPackContainer, FetchPackStore,
     InboundLedgerJournal, InboundLedgerLocal, InboundLedgerPacket, InboundLedgerPacketError,
     InboundLedgerPeerScore, InboundLedgerReason, InboundLedgerRequestTrigger, InboundLedgerStore,
-    InboundLedgerTimerResult, Ledger, StateScanParams, INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP,
+    InboundLedgerTimerResult, Ledger, StateScanParams,
 };
 use overlay::{Peer, PeerSet as _};
 use shamap::family::{FullBelowCacheImpl, NullMissingNodeReporter, SHAMapFamily};
@@ -138,14 +138,14 @@ pub(crate) type AcquisitionFailureRecorder = Arc<dyn Fn(Uint256) + Send + Sync +
 pub(crate) type AcquisitionCompletionRecorder =
     Arc<dyn Fn(Uint256, Arc<Ledger>) + Send + Sync + 'static>;
 
-/// Read-only outcome of a bounded state-map traversal slice. The resume value
-/// is intentionally distinct from a read-budget yield: a synchronous deferred
-/// read can produce a locally runnable resume before the read budget is spent.
+/// Read-only outcome of an internal state-map scan pass. The resume value is
+/// intentionally distinct from a read-budget pass: a synchronous deferred
+/// read can produce locally runnable traversal before the read budget is
+/// spent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum StateScanSliceOutcome {
     None = 0,
-    BranchBudget = 1,
     DeferredReadBudget = 2,
     DeferredReadResume = 3,
     MissingNodeLimit = 4,
@@ -156,7 +156,6 @@ impl StateScanSliceOutcome {
     fn name(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::BranchBudget => "branch_budget",
             Self::DeferredReadBudget => "deferred_read_budget",
             Self::DeferredReadResume => "deferred_read_resume",
             Self::MissingNodeLimit => "missing_node_limit",
@@ -166,7 +165,6 @@ impl StateScanSliceOutcome {
 
     fn from_raw(raw: u8) -> Self {
         match raw {
-            1 => Self::BranchBudget,
             2 => Self::DeferredReadBudget,
             3 => Self::DeferredReadResume,
             4 => Self::MissingNodeLimit,
@@ -198,8 +196,6 @@ fn classify_state_scan_slice(
         StateScanSliceOutcome::MissingNodeLimit
     } else if after.complete {
         StateScanSliceOutcome::Complete
-    } else if deltas.branch_steps >= STATE_SCAN_MAX_BRANCHES_PER_TURN as u64 {
-        StateScanSliceOutcome::BranchBudget
     } else if deltas.deferred_reads >= STATE_SCAN_MAX_DEFERRED_READS_PER_TURN as u64 {
         StateScanSliceOutcome::DeferredReadBudget
     } else {
@@ -367,7 +363,6 @@ impl AcquisitionStats {
                 .fetch_add(1, Ordering::Relaxed);
         }
         let outcome_counter = match outcome {
-            StateScanSliceOutcome::BranchBudget => Some(&self.state_scan_branch_budget_yields),
             StateScanSliceOutcome::DeferredReadBudget => {
                 Some(&self.state_scan_deferred_read_budget_yields)
             }
@@ -661,12 +656,6 @@ pub struct AcqMutableState {
     pub(crate) fetch_pack: WorkerFetchPack,
 }
 
-/// One acquisition turn mutates at most this many nodes from its current FIFO
-/// packet. The wire router separately admits at most 12,288 nodes per packet;
-/// the initial full-packet structural validation therefore remains bounded by
-/// that protocol limit, but this is deliberately not a wall-clock guarantee.
-const MAX_PACKET_STEPS_PER_ACQUISITION_TURN: usize = 1;
-const STATE_SCAN_MAX_BRANCHES_PER_TURN: usize = 512;
 /// Matches rippled `SHAMap::getMissingNodes()`'s 512 deferred NodeStore-read
 /// batch for a resumable inbound state scan. Every admitted read is still
 /// synchronously completed before this continuation can be restored.
@@ -689,24 +678,13 @@ impl AcquisitionWorkToken {
     }
 }
 
-/// Scan state is retained between bounded worker turns. The scanner owns no
-/// mutable planner lock while parked; each turn reacquires the ledger under
-/// the one acquisition token before advancing the same deferred scan.
+/// Scan state is retained in the mailbox until its acquisition turn. A
+/// nonterminal advance restores it only after a genuine zero-progress pass;
+/// every locally completed deferred-read batch resumes in that same turn.
 struct ResumableStateScan {
     params: StateScanParams,
     scan: DeferredMissingNodeScan,
     peer: Option<Arc<dyn Peer>>,
-}
-
-/// Packet processing is resumed in FIFO order. `next_node` and accumulated
-/// stats are retained only after the first step has validated the complete
-/// node packet, so resumption cannot make a later malformed node partially
-/// mutate the planner.
-struct ResumableInboundPacket {
-    peer_id: u64,
-    packet: InboundLedgerPacket,
-    next_node: usize,
-    stats: SHAMapAddNode,
 }
 
 /// The sole synchronization point for ingress and acquisition scheduling.
@@ -718,7 +696,6 @@ struct AcquisitionMailbox {
     token: AcquisitionWorkToken,
     pending_timeouts: u32,
     scan: Option<ResumableStateScan>,
-    active_packet: Option<ResumableInboundPacket>,
     // Mirrors rippled `runData`: retain useful-peer scores until the
     // coalesced FIFO batch is observed empty, then prune/sample once before
     // emitting reply triggers. A packet arriving after that observation is a
@@ -734,7 +711,6 @@ impl Default for AcquisitionMailbox {
             token: AcquisitionWorkToken::Idle,
             pending_timeouts: 0,
             scan: None,
-            active_packet: None,
             batch_useful_peer_counts: BTreeMap::new(),
             buffered_packets_high_water: 0,
         }
@@ -743,12 +719,11 @@ impl Default for AcquisitionMailbox {
 
 impl AcquisitionMailbox {
     fn buffered_packet_count(&self) -> usize {
-        self.packets.len() + usize::from(self.active_packet.is_some())
+        self.packets.len()
     }
 
     fn has_work(&self, fetch_pack_ready: bool) -> bool {
         !self.packets.is_empty()
-            || self.active_packet.is_some()
             || self.pending_timeouts != 0
             || self.scan.is_some()
             || fetch_pack_ready
@@ -758,7 +733,6 @@ impl AcquisitionMailbox {
         self.packets.clear();
         self.pending_timeouts = 0;
         self.scan = None;
-        self.active_packet = None;
         self.batch_useful_peer_counts.clear();
         self.token = AcquisitionWorkToken::Idle;
     }
@@ -931,36 +905,14 @@ impl AcquisitionState {
         }
     }
 
-    fn take_packet_for_turn(&self) -> Option<ResumableInboundPacket> {
+    fn take_packet_for_turn(&self) -> Option<(u64, InboundLedgerPacket)> {
         let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-        mailbox.active_packet.take().or_else(|| {
-            let (peer_id, packet) = mailbox.packets.first()?.clone();
-            mailbox.packets.remove(0);
-            Some(ResumableInboundPacket {
-                peer_id,
-                packet,
-                next_node: 0,
-                stats: SHAMapAddNode::default(),
-            })
-        })
-    }
-
-    fn restore_packet_for_turn(&self, packet: ResumableInboundPacket) {
-        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-        if self.is_done() {
-            mailbox.clear_terminal_work();
-            return;
-        }
-        assert!(
-            mailbox.active_packet.is_none(),
-            "one acquisition may own only one packet continuation"
-        );
-        mailbox.active_packet = Some(packet);
+        (!mailbox.packets.is_empty()).then(|| mailbox.packets.remove(0))
     }
 
     /// Record one completed packet's useful nodes and, only after observing
-    /// the active packet plus its coalesced FIFO queue empty under this same
-    /// mailbox lock, prune/sample the entire batch for reply triggers.
+    /// its coalesced FIFO queue empty under this same mailbox lock,
+    /// prune/sample the entire batch for reply triggers.
     fn finish_packet_batch(&self, peer_id: u64, useful_nodes: u64) -> Vec<u64> {
         let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
         if self.is_done() {
@@ -976,7 +928,7 @@ impl AcquisitionState {
                 .or_insert(useful_nodes);
         }
 
-        if mailbox.active_packet.is_some() || !mailbox.packets.is_empty() {
+        if !mailbox.packets.is_empty() {
             return Vec::new();
         }
 
@@ -1216,7 +1168,7 @@ impl AcquisitionState {
         ) = {
             let mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
             (
-                mailbox.active_packet.is_some(),
+                false,
                 mailbox.buffered_packet_count(),
                 mailbox.buffered_packets_high_water,
                 mailbox.token.name(),
@@ -1399,24 +1351,7 @@ impl AcquisitionState {
 
     pub(crate) fn take_buffered_packets(&self) -> Vec<ledger::InboundLedgerReceivedPacket> {
         let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-        let mut packets = std::mem::take(&mut mailbox.packets);
-        if let Some(active) = mailbox.active_packet.take()
-            && active.next_node < active.packet.nodes.len()
-        {
-            // A swept acquisition may have yielded mid-packet. Stash only the
-            // unprocessed tail so stale-data recovery neither drops work nor
-            // replays nodes already accepted into this acquisition's store.
-            packets.insert(
-                0,
-                (
-                    active.peer_id,
-                    InboundLedgerPacket::new(
-                        active.packet.packet_type,
-                        active.packet.nodes[active.next_node..].to_vec(),
-                    ),
-                ),
-            );
-        }
+        let packets = std::mem::take(&mut mailbox.packets);
         packets
             .into_iter()
             .map(|(peer_id, packet)| ledger::InboundLedgerReceivedPacket::new(Some(peer_id), packet))
@@ -1425,7 +1360,7 @@ impl AcquisitionState {
 
     fn has_pending_packets(&self) -> bool {
         let mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-        !mailbox.packets.is_empty() || mailbox.active_packet.is_some()
+        !mailbox.packets.is_empty()
     }
 
     pub(crate) fn update_seq(&self, seq: u32) {
@@ -1770,17 +1705,18 @@ fn process_acquisition_turn(state: &Arc<AcquisitionState>) {
         return;
     }
 
-    // Timeout bookkeeping and packet draining retain their existing order, but
-    // neither may defer a live persisted scan to a later turn. Each live
-    // continuation advances exactly one bounded slice before the token can be
-    // requeued, so continuous ingress or admitted timer events cannot starve
-    // its traversal.
+    // Timeout bookkeeping remains first. Then mirror rippled `runData()` by
+    // draining the FIFO batch already coalesced behind this one acquisition
+    // token before state scanning. A fetch-pack-only pass remains singular so
+    // a no-packet check cannot create an accidental unbounded loop.
     if state.take_admitted_timeout() {
         process_timeout_job(state);
     }
-    if !state.is_done()
-        && (state.fetch_pack_ready.load(Ordering::Acquire) || state.has_pending_packets())
-    {
+    if !state.is_done() && state.has_pending_packets() {
+        while !state.is_done() && state.has_pending_packets() {
+            process_data_job(state);
+        }
+    } else if !state.is_done() && state.fetch_pack_ready.load(Ordering::Acquire) {
         process_data_job(state);
     }
     if !state.is_done() && state.has_state_scan() {
@@ -1794,10 +1730,10 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         return;
     }
 
-    // A packet is retained outside the mailbox only while this one-token turn
-    // owns it. Incomplete node packets are restored before the turn yields,
-    // so ingress cannot reorder or replace their FIFO continuation.
-    let Some(mut packet) = state.take_packet_for_turn() else {
+    // The FIFO owner removes one whole packet per invocation. The enclosing
+    // acquisition turn drains its coalesced batch, matching `InboundLedger::runData()`
+    // without retaining a 128-node continuation in the mailbox.
+    let Some((peer_id, packet)) = state.take_packet_for_turn() else {
         let Some(mut mutable) = state.lock_mutable("data processing") else {
             return;
         };
@@ -1817,8 +1753,8 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
     };
 
     let data_drain_started = Instant::now();
-    let packet_type = packet.packet.packet_type;
-    let mut packet_complete = false;
+    let packet_type = packet.packet_type;
+    let mut packet_stats = SHAMapAddNode::default();
     let mut malformed = None;
     let mut invalid = false;
     let mut had_header = false;
@@ -1840,66 +1776,41 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
             let journal = WorkerJournal;
             let config = ledger::LedgerConfig::default();
             let family = family(state);
-            match inbound.process_packet_step_with_family_and_config(
-                &packet.packet,
-                packet.next_node,
-                INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP
-                    .saturating_mul(MAX_PACKET_STEPS_PER_ACQUISITION_TURN),
+            match inbound.process_packet_with_family_and_config(
+                &packet,
                 &journal,
                 &config,
                 store,
                 fetch_pack,
                 &family,
             ) {
-                Ok(step) => {
-                    packet.stats += step.stats;
-                    inbound.record_packet_progress(step.stats);
-                    if step.complete {
-                        inbound.record_packet_stats_with_family_and_config(
-                            packet.stats,
-                            &journal,
-                            &config,
-                            &family,
-                        );
-                        packet_complete = true;
-                        invalid = packet.stats.is_invalid();
-                    } else {
-                        packet.next_node = step.next_node;
-                    }
+                Ok(stats) => {
+                    packet_stats = stats;
+                    inbound.record_packet_stats_with_family_and_config(
+                        packet_stats,
+                        &journal,
+                        &config,
+                        &family,
+                    );
+                    invalid = packet_stats.is_invalid();
                 }
-                Err(error) => {
-                    packet_complete = true;
-                    malformed = Some(error);
-                }
+                Err(error) => malformed = Some(error),
             }
         }
         terminal = inbound.is_failed() || inbound.is_complete();
     }
 
     let data_drain_us = data_drain_started.elapsed().as_micros() as u64;
-    state
-        .stats
-        .record_data_drain(data_drain_us, usize::from(packet_complete));
+    state.stats.record_data_drain(data_drain_us, 1);
     if state.stats.should_emit_sampled_diagnostic() {
         tracing::debug!(
             target: "inbound_ledger",
             seq = state.seq,
             hash = %state.hash,
             drain_us = data_drain_us,
-            packet_complete,
-            next_node = packet.next_node,
-            node_step_budget = INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP,
-            "sampled bounded inbound data step"
+            nodes = packet.nodes.len(),
+            "sampled full inbound data packet"
         );
-    }
-
-    if !packet_complete {
-        if terminal {
-            finalize_terminal(state);
-        } else {
-            state.restore_packet_for_turn(packet);
-        }
-        return;
     }
 
     if !had_header && !terminal {
@@ -1916,7 +1827,7 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         .packet_steps_completed
         .fetch_add(1, Ordering::Relaxed);
     state.stats.packets.fetch_add(1, Ordering::Relaxed);
-    let useful_nodes = packet.stats.get_good().max(0) as u64;
+    let useful_nodes = packet_stats.get_good().max(0) as u64;
     state
         .stats
         .useful_packets
@@ -1929,7 +1840,7 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
             .state_useful_nodes
             .fetch_add(useful_nodes, Ordering::Relaxed);
         state.stats.state_duplicate_nodes.fetch_add(
-            packet.stats.get_duplicate().max(0) as u64,
+            packet_stats.get_duplicate().max(0) as u64,
             Ordering::Relaxed,
         );
     }
@@ -1940,12 +1851,12 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         .fetch_add(packet_error_count as u64, Ordering::Relaxed);
     if let Some(error) = malformed {
         state.stats.malformed_packets.fetch_add(1, Ordering::Relaxed);
-        charge_malformed_packet(state, packet.peer_id, packet_type, error);
+        charge_malformed_packet(state, peer_id, packet_type, error);
     }
     if invalid {
         charge_invalid_data_packet(
             state,
-            packet.peer_id,
+            peer_id,
             packet_type,
             InboundLedgerPacketError::InvalidData,
         );
@@ -1961,12 +1872,12 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
     if state.is_done() {
         return;
     }
-    // Do not trigger once per completed packet or node chunk. The mailbox
-    // records useful results in FIFO order and returns peers only after it
-    // observed the active packet and its coalesced queue empty under the
-    // same lock; a concurrent later arrival becomes the next batch.
-    for peer_id in state.finish_packet_batch(packet.peer_id, useful_nodes) {
-        if let Some(peer) = state.peer_set.find_peer(peer_id as u32) {
+    // Do not trigger once per completed packet. The mailbox records useful
+    // results in FIFO order and returns peers only after it observed the
+    // coalesced queue empty under the same lock; a concurrent later arrival
+    // becomes the next batch.
+    for reply_peer_id in state.finish_packet_batch(peer_id, useful_nodes) {
+        if let Some(peer) = state.peer_set.find_peer(reply_peer_id as u32) {
             let reason = if peer.is_high_latency() {
                 InboundLedgerRequestTrigger::ReplyHighLatency
             } else {
@@ -1982,8 +1893,9 @@ fn process_state_scan_turn(state: &Arc<AcquisitionState>) {
         return;
     };
     // Once taken, this continuation has exactly two live outcomes: it is
-    // restored below after a bounded incomplete slice, or it is consumed by
-    // result application. Any early return here follows `is_done` or
+    // restored below only after a nonterminal zero-progress advance, or it is
+    // consumed by result application. Every locally completed deferred-read
+    // batch resumes within the helper call. Any early return here follows `is_done` or
     // `lock_mutable`, the latter marking failure, and terminal cleanup clears
     // the mailbox instead of reviving the continuation.
     if state.is_done() {
@@ -2009,7 +1921,7 @@ fn process_state_scan_turn(state: &Arc<AcquisitionState>) {
             fetch_pack,
             &family,
             STATE_SCAN_MAX_DEFERRED_READS_PER_TURN,
-            STATE_SCAN_MAX_BRANCHES_PER_TURN,
+            usize::MAX,
         )
     };
     #[cfg(test)]
@@ -2048,7 +1960,6 @@ fn process_state_scan_turn(state: &Arc<AcquisitionState>) {
                 seq = state.seq,
                 hash = %state.hash,
                 scan_us,
-                branch_budget = STATE_SCAN_MAX_BRANCHES_PER_TURN,
                 read_budget = STATE_SCAN_MAX_DEFERRED_READS_PER_TURN,
                 pending_reads,
                 slice_outcome = slice_outcome.name(),
@@ -2500,7 +2411,7 @@ mod tests {
     use super::super::registry::{AcquireReason, AcquisitionLifecycleCounters};
     use super::super::worker_pool::WorkerPool;
     use super::{
-        ACQUIRE_TIMEOUT, STATE_SCAN_MAX_BRANCHES_PER_TURN, STATE_SCAN_MAX_DEFERRED_READS_PER_TURN,
+        ACQUIRE_TIMEOUT, STATE_SCAN_MAX_DEFERRED_READS_PER_TURN,
         AcquisitionBuilder, AcquisitionCompletionRecorder, AcquisitionFailureRecorder,
         AcquisitionState, StateScanAfterAdvancePause, StateScanSliceOutcome,
         classify_state_scan_slice, peer_has_acquisition_target, publish_completed_ledger,
@@ -2681,10 +2592,6 @@ mod tests {
             STATE_SCAN_MAX_DEFERRED_READS_PER_TURN, 512,
             "resumable inbound state scans must match rippled's deferred-read batch"
         );
-        assert_eq!(
-            STATE_SCAN_MAX_BRANCHES_PER_TURN, 512,
-            "the independent branch fairness cap remains unchanged"
-        );
 
         let worker_pool = Arc::new(WorkerPool::new(0));
         let (wanted_hash, header_packet, state_root_packet) =
@@ -2722,8 +2629,8 @@ mod tests {
             remaining: 8,
             ..Default::default()
         };
-        let branch_budget = DeferredMissingNodeScanProgress {
-            branch_steps: STATE_SCAN_MAX_BRANCHES_PER_TURN as u64,
+        let former_branch_boundary = DeferredMissingNodeScanProgress {
+            branch_steps: 512,
             remaining: 8,
             ..Default::default()
         };
@@ -2746,8 +2653,9 @@ mod tests {
         };
 
         assert_eq!(
-            classify_state_scan_slice(before, branch_budget).0,
-            StateScanSliceOutcome::BranchBudget
+            classify_state_scan_slice(before, former_branch_boundary).0,
+            StateScanSliceOutcome::DeferredReadResume,
+            "512 traversal steps alone must not create a worker-turn boundary"
         );
         assert_eq!(
             classify_state_scan_slice(before, deferred_read_budget).0,
@@ -2911,15 +2819,14 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_data_worker_coalesces_and_resumes_buffered_packets() {
+    fn acquisition_data_worker_drains_coalesced_packets_in_one_fifo_turn() {
         let worker_pool = Arc::new(WorkerPool::new(0));
         let (_dir, state, lifecycle) = timeout_state(Arc::clone(&worker_pool));
         let packet = InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new());
 
         // This is the same buffer-then-dispatch sequence used by registry
-        // routing. Two arrivals before the worker runs must produce one
-        // coalesced data job. The bounded FIFO packet step then schedules
-        // exactly one continuation for the second packet.
+        // routing. Two arrivals before the worker runs produce one coalesced
+        // job, which must drain both whole packets before state scanning.
         state.enqueue_packet(7, packet.clone());
         state.enqueue_packet(7, packet);
 
@@ -2929,15 +2836,9 @@ mod tests {
         assert_eq!(state.diagnostics().buffered_packets, 2);
 
         assert!(worker_pool.run_next_job_for_test());
-        assert_eq!(worker_pool.snapshot().queued_jobs, 1);
-        assert_eq!(state.diagnostics().buffered_packets, 1);
-        assert_eq!(lifecycle.data_jobs_started.load(Ordering::Relaxed), 1);
-        assert_eq!(lifecycle.packet_steps.load(Ordering::Relaxed), 1);
-
-        assert!(worker_pool.run_next_job_for_test());
         assert_eq!(worker_pool.snapshot().queued_jobs, 0);
         assert_eq!(state.diagnostics().buffered_packets, 0);
-        assert_eq!(lifecycle.data_jobs_started.load(Ordering::Relaxed), 2);
+        assert_eq!(lifecycle.data_jobs_started.load(Ordering::Relaxed), 1);
         assert_eq!(lifecycle.packet_steps.load(Ordering::Relaxed), 2);
         assert_eq!(lifecycle.packet_steps_completed.load(Ordering::Relaxed), 2);
         assert_eq!(
@@ -2945,6 +2846,29 @@ mod tests {
             2,
             "the real parser must classify both empty Base packets as malformed"
         );
+    }
+
+    #[test]
+    fn acquisition_node_packet_is_consumed_whole_without_continuation() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (wanted_hash, header_packet, state_root_packet) =
+            header_and_state_root_packets_with_missing_child();
+        let (_dir, state, lifecycle) =
+            timeout_state_with_hash(Arc::clone(&worker_pool), wanted_hash);
+        let node_packet = InboundLedgerPacket::new(
+            InboundLedgerDataType::StateNode,
+            vec![state_root_packet.nodes[0].clone(); 129],
+        );
+
+        state.enqueue_packet(7, header_packet);
+        state.enqueue_packet(7, node_packet);
+        assert!(worker_pool.run_next_job_for_test());
+
+        let diagnostics = state.diagnostics();
+        assert_eq!(lifecycle.packet_steps.load(Ordering::Relaxed), 2);
+        assert_eq!(diagnostics.buffered_packets, 0);
+        assert!(!diagnostics.has_active_packet);
+        assert_eq!(worker_pool.snapshot().queued_jobs, 0);
     }
 
     #[test]

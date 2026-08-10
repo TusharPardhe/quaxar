@@ -1383,6 +1383,13 @@ impl SyncTree {
         )
     }
 
+    /// Advance a resumable scan through its local deferred-read batches.
+    ///
+    /// Each bounded pass admits and synchronously completes no more than
+    /// `max_deferred` NodeStore reads, then this helper resumes the retained
+    /// traversal in the same call. This mirrors rippled `getMissingNodes()`:
+    /// only a missing-node result boundary or true traversal completion ends
+    /// the call. A zero-work bounded pass returns `false` rather than spinning.
     pub fn advance_deferred_missing_node_scan_with_family<CLOCK, S, C, F, MR, NS, R>(
         &mut self,
         scan: &mut DeferredMissingNodeScan,
@@ -1400,40 +1407,52 @@ impl SyncTree {
         MR: MissingNodeReporter,
         R: FnMut() -> u8,
     {
-        scan.run_with_family_bounded(
-            family,
-            filter,
-            max_deferred,
-            max_branch_steps,
-            next_first_child,
-            &mut |_, _| {},
-        );
+        loop {
+            let progress_before = scan.progress();
+            scan.run_with_family_bounded(
+                family,
+                filter,
+                max_deferred,
+                max_branch_steps,
+                next_first_child,
+                &mut |_, _| {},
+            );
 
-        let pending = scan.pending_requests();
-        if !pending.is_empty() {
-            let mut completions_by_hash = BTreeMap::new();
-            for request in &pending {
-                completions_by_hash
-                    .entry(request.hash())
-                    .or_insert_with(|| self.load_node_with_owner_family(request.hash(), family));
+            let pending = scan.pending_requests();
+            if !pending.is_empty() {
+                debug_assert!(
+                    pending.len() <= max_deferred,
+                    "a bounded deferred scan must not complete more reads than it admitted"
+                );
+                let mut completions_by_hash = BTreeMap::new();
+                for request in &pending {
+                    completions_by_hash.entry(request.hash()).or_insert_with(|| {
+                        self.load_node_with_owner_family(request.hash(), family)
+                    });
+                }
+                let completions = pending
+                    .iter()
+                    .map(|request| {
+                        completions_by_hash
+                            .get(&request.hash())
+                            .expect("every deferred request hash must have a completion")
+                            .clone()
+                    })
+                    .collect::<Vec<_>>();
+                scan.complete_pending_reads(completions);
             }
-            let completions = pending
-                .iter()
-                .map(|request| {
-                    completions_by_hash
-                        .get(&request.hash())
-                        .expect("every deferred request hash must have a completion")
-                        .clone()
-                })
-                .collect::<Vec<_>>();
-            scan.complete_pending_reads(completions);
-        }
 
-        let complete = scan.is_complete() || scan.remaining() <= 0;
-        if complete && scan.missing_nodes().is_empty() {
-            self.clear_synching();
+            let complete = scan.is_complete() || scan.remaining() <= 0;
+            if complete {
+                if scan.missing_nodes().is_empty() {
+                    self.clear_synching();
+                }
+                return true;
+            }
+            if scan.progress() == progress_before {
+                return false;
+            }
         }
-        complete
     }
 
     pub fn start_deferred_missing_node_scan_with_family<CLOCK, S, C, F, MR, NS, R>(
@@ -5111,6 +5130,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(child_hash, 90)]
         );
+    }
+
+    #[test]
+    fn advance_deferred_missing_node_scan_with_family_drains_bounded_batches_in_one_call() {
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        for branch in 0..3 {
+            root.set_child_hash(branch, sample_hash(0x80 + branch as u8));
+        }
+        root.update_hash();
+
+        let fetcher = CountingMissingNodeFetcher::default();
+        let family = SHAMapFamily::new(
+            Arc::new(TreeNodeCache::new(
+                "advance-deferred-scan-batches",
+                8,
+                Duration::seconds(1),
+                ManualClock::new(0),
+            )),
+            NullFullBelowCache::new(16),
+            fetcher.clone(),
+            NullMissingNodeReporter,
+        );
+        let mut tree = SyncTree::from_root(root, true, 90, SyncState::Synching);
+        let mut scan = tree.start_deferred_missing_node_scan_with_family(8, &family, &mut || 0);
+        let mut no_filter: Option<&mut dyn SHAMapSyncFilter> = None;
+
+        assert!(tree.advance_deferred_missing_node_scan_with_family(
+            &mut scan,
+            &mut no_filter,
+            &family,
+            1,
+            usize::MAX,
+            &mut || 0,
+        ));
+        assert!(scan.is_complete());
+        assert!(scan.pending_requests().is_empty());
+        assert_eq!(scan.missing_nodes().len(), 3);
+        assert_eq!(scan.progress().deferred_reads, 3);
+        assert_eq!(fetcher.calls(), 3);
     }
 
     #[test]
