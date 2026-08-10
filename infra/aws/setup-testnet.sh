@@ -65,7 +65,8 @@ else
     export PATH="$HOME/.cargo/bin:$PATH"
     rustup toolchain install 1.90.0 --profile minimal
     cd /opt/quaxar
-    cargo +1.90.0 build --release -p xrpld-main
+    ROCKSDB_LIB_DIR=/usr/lib/x86_64-linux-gnu CARGO_BUILD_JOBS=2 CC=clang CXX=clang++ \
+      cargo +1.90.0 build --release -p xrpld-main
   '
   install -m 0755 /opt/quaxar/target/release/quaxar /usr/local/bin/quaxar
 fi
