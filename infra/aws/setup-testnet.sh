@@ -46,7 +46,8 @@ retry apt-get install -y --no-install-recommends \
 if ! id -u xrpld >/dev/null 2>&1; then
   useradd --system --create-home --home-dir /home/xrpld --shell /usr/sbin/nologin xrpld
 fi
-install -d -o xrpld -g xrpld -m 0750 /var/lib/xrpld/db/nudb /var/log/xrpld
+install -d -m 0750 /var/lib/xrpld /var/lib/xrpld/db /var/lib/xrpld/db/nudb /var/log/xrpld
+chown -R xrpld:xrpld /var/lib/xrpld /var/log/xrpld
 if [[ "$SKIP_BUILD" == "1" ]]; then
   test -d /opt/quaxar/.git
   test -x /usr/local/bin/quaxar
@@ -173,7 +174,7 @@ ROTATE
 {
   echo "repository=$QUAXAR_REPOSITORY"
   echo "requested_ref=$QUAXAR_REF"
-  echo "commit=$(git -C /opt/quaxar rev-parse HEAD)"
+  echo "commit=$(runuser -u xrpld -- git -C /opt/quaxar rev-parse HEAD)"
   echo "built_at=$(date -Is)"
 } >/etc/quaxar/build-info
 
