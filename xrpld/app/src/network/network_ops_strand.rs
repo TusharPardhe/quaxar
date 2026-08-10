@@ -533,9 +533,17 @@ fn strand_loop(
                 // Skip consensus timer when disconnected (matching rippled)
                 root.wait_consensus_or_timeout(Duration::from_millis(500));
                 continue;
-            } else if current_mode == NetworkOpsOperatingMode::Disconnected {
-                root.set_network_ops_operating_mode(NetworkOpsOperatingMode::Connected);
-                tracing::info!(target: "consensus", num_peers, "Peer count sufficient — mode set to CONNECTED");
+            } else if let Some(mode_to_reassert) =
+                heartbeat_operating_mode_reassertion(current_mode)
+            {
+                // Match NetworkOPsImp::processHeartbeatTimer: reconnecting
+                // first reasserts CONNECTED, and an already CONNECTED or
+                // SYNCING node re-runs setMode so validated-ledger age can
+                // normalize it in either direction.
+                root.set_network_ops_operating_mode(mode_to_reassert);
+                if current_mode == NetworkOpsOperatingMode::Disconnected {
+                    tracing::info!(target: "consensus", num_peers, "Peer count sufficient — mode set to CONNECTED");
+                }
             }
         }
 
@@ -867,6 +875,20 @@ fn cycle_obsolete_peer_statuses(root: &ApplicationRoot) {
                 peer.cycle_status();
             }
         }
+    }
+}
+
+/// The rippled heartbeat re-applies these modes even when no peer-count
+/// transition occurred, allowing `setMode` to normalize them by validated
+/// ledger age. Other modes are left untouched by this heartbeat branch.
+fn heartbeat_operating_mode_reassertion(
+    current_mode: NetworkOpsOperatingMode,
+) -> Option<NetworkOpsOperatingMode> {
+    match current_mode {
+        NetworkOpsOperatingMode::Disconnected => Some(NetworkOpsOperatingMode::Connected),
+        NetworkOpsOperatingMode::Syncing => Some(NetworkOpsOperatingMode::Syncing),
+        NetworkOpsOperatingMode::Connected => Some(NetworkOpsOperatingMode::Connected),
+        _ => None,
     }
 }
 
@@ -1323,11 +1345,11 @@ fn switch_last_closed_ledger(
     root.process_closed_ledger_txq(ledger.as_ref(), true);
     root.rebuild_open_ledger_after_consensus(Arc::clone(&ledger), &[], false);
     root.on_closed_ledger(Arc::clone(&ledger));
+    // NetworkOPsImp::switchLastClosedLedger delegates to
+    // LedgerMaster::switchLCL, whose non-standalone branch runs
+    // checkAccept(lastClosed) after installing the new closed ledger.
+    root.check_accept_after_lcl_switch(Arc::clone(&ledger));
     root.broadcast_consensus_status_change(ledger.as_ref(), 3, true);
-
-    // rippled's `switchLastClosedLedger` only installs the new closed/open
-    // ledger state and broadcasts `neSWITCHED_LEDGER`; it does not synthesize
-    // a validation-driven `LedgerMaster::checkAccept` call here.
     let proposing = root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full;
     let now = root.shared_time_keeper().close_time();
     let prev_cx = crate::consensus_ledger_from_ledger(&ledger);
@@ -2075,18 +2097,18 @@ fn should_acquire_history(
 mod tests {
     use super::{
         ConsensusJobScheduler, MAX_LEDGER_COMPLETIONS_PER_TURN, MAX_PROPOSALS_PER_TURN,
-        PreferredLclReconciliation, drain_bounded, history_acquire_allowed,
-        history_fetch_pack_requested, persist_completed_inbound_ledger,
+        PreferredLclReconciliation, drain_bounded, heartbeat_operating_mode_reassertion,
+        history_acquire_allowed, history_fetch_pack_requested, persist_completed_inbound_ledger,
         record_completed_inbound_ledger, same_history_fetch_pack_is_suppressed,
         should_promote_operating_mode_at_end_consensus, should_reconcile_preferred_lcl,
         should_run_end_consensus_reconciliation,
     };
-    use crate::ApplicationRoot;
     use crate::consensus::rcl_consensus::PendingAcceptWork;
     use crate::job::job_queue::JobQueue;
     use crate::job::job_types::JobType;
     use crate::ledger::inbound_ledgers::AcquireReason;
     use crate::runtime::component_runtime::ConsensusCommand;
+    use crate::{ApplicationRoot, NetworkOpsOperatingMode};
     use basics::base_uint::Uint256;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::MonotonicClock;
@@ -2185,6 +2207,30 @@ mod tests {
         let in_flight = Some((500, Instant::now() - Duration::from_secs(2)));
         assert!(same_history_fetch_pack_is_suppressed(in_flight, 500));
         assert!(!same_history_fetch_pack_is_suppressed(in_flight, 499));
+    }
+
+    #[test]
+    fn heartbeat_reasserts_only_rippled_normalization_modes() {
+        assert_eq!(
+            heartbeat_operating_mode_reassertion(NetworkOpsOperatingMode::Disconnected),
+            Some(NetworkOpsOperatingMode::Connected)
+        );
+        assert_eq!(
+            heartbeat_operating_mode_reassertion(NetworkOpsOperatingMode::Syncing),
+            Some(NetworkOpsOperatingMode::Syncing)
+        );
+        assert_eq!(
+            heartbeat_operating_mode_reassertion(NetworkOpsOperatingMode::Connected),
+            Some(NetworkOpsOperatingMode::Connected)
+        );
+        assert_eq!(
+            heartbeat_operating_mode_reassertion(NetworkOpsOperatingMode::Tracking),
+            None
+        );
+        assert_eq!(
+            heartbeat_operating_mode_reassertion(NetworkOpsOperatingMode::Full),
+            None
+        );
     }
 
     #[test]

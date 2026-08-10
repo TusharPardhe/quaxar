@@ -46,9 +46,10 @@ fn response_sequence_matches_request(expected_seq: u32, response_seq: u32) -> bo
     expected_seq == 0 || response_seq == 0 || expected_seq == response_seq
 }
 
-/// Rust worker count for the `JtLedgerData`-equivalent queue. This does not
-/// limit the number of tracked acquisitions.
-const WORKER_COUNT: usize = 64;
+/// rippled's `JtLedgerData` JobType permits at most three running jobs.
+/// This bounds packet processing while leaving the inbound registry free to
+/// track any number of hash-deduplicated acquisitions.
+const WORKER_COUNT: usize = 3;
 
 /// Cumulative, process-lifetime counters covering every inbound-ledger
 /// lifecycle boundary. They are sampled by NetworkOPs at most once every five
@@ -1861,7 +1862,7 @@ mod tests {
     }
 
     #[test]
-    fn acquire_async_defers_and_coalesces_initialization_work() {
+    fn acquire_async_initializes_once_before_ledger_data_work() {
         let worker_pool = Arc::new(WorkerPool::new(0));
         let (_dir, registry) = registry_with_manual_worker_pool(Arc::clone(&worker_pool));
         let hash = Uint256::from_array([0xC8; 32]);
@@ -1869,14 +1870,42 @@ mod tests {
         registry.acquire_async(hash, 1, AcquireReason::Consensus);
         registry.acquire_async(hash, 1, AcquireReason::Consensus);
 
-        assert_eq!(registry.lifecycle_snapshot().initialization_jobs, 0);
+        // rippled runs InboundLedger::init from acquire(), so this must not
+        // be a queued JtLedgerData-equivalent job. The only queued work is
+        // the first TimeoutCounter callback armed by initialization.
+        assert_eq!(registry.lifecycle_snapshot().initialization_jobs, 1);
         assert_eq!(
             worker_pool.snapshot().queued_jobs,
             1,
-            "one hash must have one deferred initialization job"
+            "only the timeout callback may remain queued after synchronous initialization"
         );
         assert!(worker_pool.run_next_job_for_test());
         assert_eq!(registry.lifecycle_snapshot().initialization_jobs, 1);
+        registry.stop();
+    }
+
+    #[test]
+    fn acquire_initialization_does_not_starve_timeout_admission() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(Arc::clone(&worker_pool));
+
+        // rippled's acquire() runs InboundLedger::init immediately. Each new
+        // incomplete ledger then asks TimeoutCounter to queue recovery work;
+        // with a five-job admission limit, the first five are live and only
+        // the sixth is deferred. Deferred initialization would instead fill
+        // the ledger-data queue before any timeout callback could be admitted.
+        for suffix in 1..=6u8 {
+            registry.acquire(
+                Uint256::from_array([suffix; 32]),
+                u32::from(suffix),
+                AcquireReason::Consensus,
+            );
+        }
+
+        let lifecycle = registry.lifecycle_snapshot();
+        assert_eq!(lifecycle.initialization_jobs, 6);
+        assert_eq!(worker_pool.snapshot().queued_jobs, 5);
+        assert_eq!(lifecycle.timeout_queue_rejected, 1);
         registry.stop();
     }
 

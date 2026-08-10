@@ -542,23 +542,20 @@ pub struct AcquisitionState {
 }
 
 impl AcquisitionState {
-    /// Queue `InboundLedger::init` on the bounded acquisition pool.
+    /// Initialize an inbound ledger at the acquire boundary.
     ///
-    /// Local-store inspection can traverse a large SHAMap. Unlike rippled,
-    /// Quaxar's callers include the NetworkOPs strand, so executing that work
-    /// inline would starve consensus, completion polling, and LCL recovery.
-    /// Registry insertion/deduplication is complete before this handoff; only
-    /// the expensive initialization phase is asynchronous.
+    /// This matches `InboundLedger::init` in rippled: after the registry has
+    /// installed the per-hash entry, initialization immediately checks local
+    /// storage, selects peers, and sends the first requests. Only later packet
+    /// processing and timeout callbacks occupy the JtLedgerData-equivalent
+    /// queue. In particular, initialization must not consume the timeout
+    /// admission budget used by `TimeoutCounter` recovery jobs.
     pub fn start(self: &Arc<Self>) {
-        let state = Arc::clone(self);
-        self.worker_pool.submit_ledger_data(Box::new(move || {
-            state
-                .lifecycle
-                .initialization_jobs
-                .fetch_add(1, Ordering::Relaxed);
-            state.stats.worker_jobs.fetch_add(1, Ordering::Relaxed);
-            run_acquisition_job(&state, "initialization", || process_init(&state));
-        }));
+        self.lifecycle
+            .initialization_jobs
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats.worker_jobs.fetch_add(1, Ordering::Relaxed);
+        run_acquisition_job(self, "initialization", || process_init(self));
     }
 
     /// Equivalent to `InboundLedger::gotData` dispatch coalescing.

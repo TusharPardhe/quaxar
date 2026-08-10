@@ -8416,6 +8416,15 @@ impl ApplicationRoot {
         self.check_accept_ledger(ledger);
     }
 
+    /// Matches the non-standalone `LedgerMaster::switchLCL` branch: after a
+    /// recovery LCL is installed, evaluate that exact closed ledger against
+    /// current validation quorum. Normal consensus-child installation already
+    /// performs this through `install_consensus_child`; this entry point is
+    /// deliberately limited to the NetworkOPs recovery-switch path.
+    pub(crate) fn check_accept_after_lcl_switch(&self, ledger: Arc<Ledger>) {
+        self.check_accept_ledger(ledger);
+    }
+
     /// Matches rippled's `LedgerMaster::checkAccept(ledger)`
     /// (LedgerMaster.cpp:946-1000): promotes `ledger` to validated if it
     /// has reached quorum among trusted validators.

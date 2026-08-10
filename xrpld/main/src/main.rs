@@ -25,6 +25,7 @@ use app::{
 };
 use basics::base_uint::Uint256;
 use basics::basic_config::BasicConfig;
+use basics::uptime_clock::UptimeClock;
 use indicatif::{ProgressBar, ProgressStyle};
 use overlay::Overlay;
 use overlay::Peer as _;
@@ -1251,6 +1252,10 @@ fn main() -> ExitCode {
 
     tracing::info!(target: "main", version = env!("CARGO_PKG_VERSION"), "QUAXAR starting");
 
+    // rippled starts its cached uptime clock on first use during normal app
+    // initialization. Prime it before potentially long bootstrap work so RPC
+    // uptime is the node process lifetime, not time since the first RPC call.
+    let _ = UptimeClock::now();
     let start_time = Instant::now();
 
     let args: Vec<String> = std::env::args().collect();
