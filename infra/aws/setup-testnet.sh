@@ -126,7 +126,7 @@ advisory_delete = 0
 1
 
 [features]
-$(grep -E '^[0-9A-F]{64}$' /opt/quaxar/infra/aws/testnet-amendments.txt)
+$(grep -E '^[A-Za-z][A-Za-z0-9_]*$' /opt/quaxar/infra/aws/testnet-amendments.txt)
 
 [overlay]
 public_ip = $PUBLIC_IP
@@ -184,5 +184,6 @@ ROTATE
 } >/etc/quaxar/build-info
 
 systemctl daemon-reload
-systemctl enable --now quaxar.service
+systemctl enable quaxar.service
+systemctl restart quaxar.service
 echo "[$(date -Is)] Quaxar bootstrap completed"

@@ -160,11 +160,13 @@ fn object_parse_rejects_duplicate_fields_array_terminators_and_unknown_fields() 
     let obj = STObject::from_serial_iter(&mut iter, sf_generic(), 0);
     assert!(obj.empty());
 
-    // Type UInt16, field id 255 is not allocated. The parser must reject it
-    // rather than accepting a forward-compatible field in consensus data.
-    assert!(protocol::get_field(protocol::field_code_raw(1, 255)).is_invalid());
+    // Public testnet peers currently send this unassigned wire field:
+    // UInt128 (type 4), field 10. Rippled's registry only assigns UInt128
+    // field 1 (EmailHash), so consensus parsing must reject it rather than
+    // treating it as a forward-compatible field.
+    assert!(protocol::get_field(protocol::field_code_raw(4, 10)).is_invalid());
     let mut unknown = Serializer::default();
-    unknown.add_field_id(1, 255);
+    unknown.add_field_id(4, 10);
 
     let mut iter = protocol::SerialIter::new(unknown.data());
     let obj = STObject::from_serial_iter(&mut iter, sf_generic(), 0);

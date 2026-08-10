@@ -4726,10 +4726,11 @@ fn seed_startup_ledger_state(
             // All these modes call startGenesisLedger() in rippled.
             // Normal with no local DB, Fresh, Network, and Snapshot all
             // create a proper genesis ledger with state tree and computed hash.
+            let preset_features = configured_feature_ids(config);
             let genesis_amendments = amendments_from_config(config, options.start_type);
             let genesis_config = LedgerConfig {
                 fees: ledger::CURRENT_DEFAULT_FEES,
-                features: protocol::FeatureSet::new(genesis_amendments.clone()),
+                features: protocol::FeatureSet::new(preset_features),
                 ..LedgerConfig::default()
             };
             Ledger::create_genesis(backed, &genesis_config, genesis_amendments)
@@ -4862,27 +4863,16 @@ fn configured_feature_ids(config: &BasicConfig) -> Vec<Uint256> {
         .values()
         .iter()
         .filter_map(|line| {
-            let value = line.split_whitespace().next()?;
-            if value.len() == 64 {
-                let bytes = str_unhex(value)?;
-                return Uint256::from_slice(&bytes);
-            }
+            let name = line.split_whitespace().next()?;
             REGISTERED_FEATURES
                 .iter()
-                .find(|feature| feature.supported && feature.name == value)
+                .find(|feature| feature.supported && feature.name == name)
                 .map(|feature| feature_id(feature.name))
         })
         .collect()
 }
 
 fn amendments_from_config(config: &BasicConfig, start_type: StartUpType) -> Vec<Uint256> {
-    // A public-network node normally learns amendments from the validated
-    // Amendments SLE. An explicit generated [features] snapshot is an opt-in
-    // bootstrap seed for a known network; acquired ledgers replace it through
-    // Ledger::setup_from_state_map_with_config_and_family.
-    if start_type == StartUpType::Network {
-        return configured_feature_ids(config);
-    }
     if start_type != StartUpType::Fresh {
         return Vec::new();
     }
@@ -5218,11 +5208,11 @@ mod tests {
         MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE, MainRuntime, StartUpType, amendments_from_config,
         build_endpoint_handout, build_validator_list_collection_messages,
         candidate_ledger_data_charge, classify_fetch_pack_request,
-        classify_generic_get_object_request, configured_sweep_interval, fetch_pack_failure_charge,
-        get_ledger_send_queue_is_admissible, get_object_query_send_queue_is_admissible,
-        ledger_data_nodes_are_admissible, ledger_data_sequence_is_admissible,
-        manifest_rate_limit_policy, parse_basic_config_text, relay_accepted_manifest,
-        requested_transaction_envelope, sequence_is_fetchable_at_floor,
+        classify_generic_get_object_request, configured_feature_ids, configured_sweep_interval,
+        fetch_pack_failure_charge, get_ledger_send_queue_is_admissible,
+        get_object_query_send_queue_is_admissible, ledger_data_nodes_are_admissible,
+        ledger_data_sequence_is_admissible, manifest_rate_limit_policy, parse_basic_config_text,
+        relay_accepted_manifest, requested_transaction_envelope, sequence_is_fetchable_at_floor,
         should_schedule_relayed_transaction, spawn_shutdown_watcher,
         transaction_object_request_is_admissible, trusted_first_manifest_payloads,
         validator_list_collection_blobs, validator_list_threshold_from_config,
@@ -5289,16 +5279,38 @@ mod tests {
     }
 
     #[test]
-    fn network_genesis_honors_explicit_raw_feature_snapshot() {
-        let config = parse_basic_config_text(
-            "[features]\n96FD2F293A519AE1DB6F8BED23E4AD9119342DA7CB6BAFD00953D16C54205D8B\n",
-        )
-        .expect("public-network feature snapshot parses");
+    fn network_bootstrap_uses_named_presets_without_genesis_amendments() {
+        let config = parse_basic_config_text("[features]\nPriceOracle\n")
+            .expect("rippled-style named feature preset parses");
+        let presets = configured_feature_ids(&config);
+        let amendments = amendments_from_config(&config, StartUpType::Network);
 
-        assert_eq!(
-            amendments_from_config(&config, StartUpType::Network),
-            vec![protocol::feature_id("PriceOracle")],
-            "an explicit network snapshot must seed the matching testnet amendment"
+        assert_eq!(presets, vec![protocol::feature_id("PriceOracle")]);
+        assert!(
+            amendments.is_empty(),
+            "Network genesis must not synthesize an Amendments SLE from presets"
+        );
+
+        let genesis = ledger::Ledger::create_genesis(
+            false,
+            &ledger::LedgerConfig {
+                features: protocol::FeatureSet::new(presets),
+                ..ledger::LedgerConfig::default()
+            },
+            amendments,
+        )
+        .expect("Network genesis should build");
+        assert!(
+            genesis
+                .rules()
+                .enabled(&protocol::feature_id("PriceOracle"))
+        );
+        assert!(
+            genesis
+                .read(protocol::amendments_keylet())
+                .expect("genesis amendments read should succeed")
+                .is_none(),
+            "rippled Network startup leaves the genesis Amendments SLE absent"
         );
         assert!(amendments_from_config(&config, StartUpType::Normal).is_empty());
     }
