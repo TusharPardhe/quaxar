@@ -16,11 +16,14 @@ use ledger::{
 };
 use overlay::{Peer, PeerSet as _};
 use shamap::family::{FullBelowCacheImpl, NullMissingNodeReporter, SHAMapFamily};
-use shamap::sync::{DeferredMissingNodeScan, DeferredMissingNodeScanStats, SHAMapAddNode};
+use shamap::sync::{
+    DeferredMissingNodeScan, DeferredMissingNodeScanProgress, DeferredMissingNodeScanStats,
+    SHAMapAddNode,
+};
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(test)]
 use std::sync::Condvar;
@@ -135,6 +138,78 @@ pub(crate) type AcquisitionFailureRecorder = Arc<dyn Fn(Uint256) + Send + Sync +
 pub(crate) type AcquisitionCompletionRecorder =
     Arc<dyn Fn(Uint256, Arc<Ledger>) + Send + Sync + 'static>;
 
+/// Read-only outcome of a bounded state-map traversal slice. The resume value
+/// is intentionally distinct from a read-budget yield: a synchronous deferred
+/// read can produce a locally runnable resume before the read budget is spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum StateScanSliceOutcome {
+    None = 0,
+    BranchBudget = 1,
+    DeferredReadBudget = 2,
+    DeferredReadResume = 3,
+    MissingNodeLimit = 4,
+    Complete = 5,
+}
+
+impl StateScanSliceOutcome {
+    fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::BranchBudget => "branch_budget",
+            Self::DeferredReadBudget => "deferred_read_budget",
+            Self::DeferredReadResume => "deferred_read_resume",
+            Self::MissingNodeLimit => "missing_node_limit",
+            Self::Complete => "complete",
+        }
+    }
+
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::BranchBudget,
+            2 => Self::DeferredReadBudget,
+            3 => Self::DeferredReadResume,
+            4 => Self::MissingNodeLimit,
+            5 => Self::Complete,
+            _ => Self::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StateScanSliceDeltas {
+    branch_steps: u64,
+    deferred_reads: u64,
+    deferred_resumes: u64,
+    missing_nodes: u64,
+}
+
+fn classify_state_scan_slice(
+    before: DeferredMissingNodeScanProgress,
+    after: DeferredMissingNodeScanProgress,
+) -> (StateScanSliceOutcome, StateScanSliceDeltas) {
+    let deltas = StateScanSliceDeltas {
+        branch_steps: after.branch_steps.saturating_sub(before.branch_steps),
+        deferred_reads: after.deferred_reads.saturating_sub(before.deferred_reads),
+        deferred_resumes: after.deferred_resumes.saturating_sub(before.deferred_resumes),
+        missing_nodes: after.missing_nodes.saturating_sub(before.missing_nodes),
+    };
+    let outcome = if after.remaining <= 0 {
+        StateScanSliceOutcome::MissingNodeLimit
+    } else if after.complete {
+        StateScanSliceOutcome::Complete
+    } else if deltas.branch_steps >= STATE_SCAN_MAX_BRANCHES_PER_TURN as u64 {
+        StateScanSliceOutcome::BranchBudget
+    } else if deltas.deferred_reads >= STATE_SCAN_MAX_DEFERRED_READS_PER_TURN as u64 {
+        StateScanSliceOutcome::DeferredReadBudget
+    } else {
+        // Deferred NodeStore completions may create a resume after fewer than
+        // the read budget. It remains local work, not a network-wait state.
+        StateScanSliceOutcome::DeferredReadResume
+    };
+    (outcome, deltas)
+}
+
 #[derive(Debug)]
 struct AcquisitionStats {
     started_at: Instant,
@@ -150,6 +225,19 @@ struct AcquisitionStats {
     state_missing_nodes: AtomicU64,
     tx_missing_nodes: AtomicU64,
     state_scan_us: AtomicU64,
+    state_scan_branch_steps: AtomicU64,
+    state_scan_missing_nodes_recorded: AtomicU64,
+    state_scan_positive_progress_slices: AtomicU64,
+    state_scan_branch_budget_yields: AtomicU64,
+    state_scan_deferred_read_budget_yields: AtomicU64,
+    state_scan_deferred_read_resume_yields: AtomicU64,
+    state_scan_missing_node_limit_yields: AtomicU64,
+    state_scan_completed_slices: AtomicU64,
+    state_scan_last_outcome: AtomicU8,
+    state_scan_last_branch_steps: AtomicU64,
+    state_scan_last_deferred_reads: AtomicU64,
+    state_scan_last_deferred_resumes: AtomicU64,
+    state_scan_last_missing_nodes: AtomicU64,
     state_scan_branches_seen: AtomicU64,
     state_scan_duplicate_missing_hashes: AtomicU64,
     state_scan_full_below_hits: AtomicU64,
@@ -191,6 +279,19 @@ impl AcquisitionStats {
             state_missing_nodes: AtomicU64::new(0),
             tx_missing_nodes: AtomicU64::new(0),
             state_scan_us: AtomicU64::new(0),
+            state_scan_branch_steps: AtomicU64::new(0),
+            state_scan_missing_nodes_recorded: AtomicU64::new(0),
+            state_scan_positive_progress_slices: AtomicU64::new(0),
+            state_scan_branch_budget_yields: AtomicU64::new(0),
+            state_scan_deferred_read_budget_yields: AtomicU64::new(0),
+            state_scan_deferred_read_resume_yields: AtomicU64::new(0),
+            state_scan_missing_node_limit_yields: AtomicU64::new(0),
+            state_scan_completed_slices: AtomicU64::new(0),
+            state_scan_last_outcome: AtomicU8::new(StateScanSliceOutcome::None as u8),
+            state_scan_last_branch_steps: AtomicU64::new(0),
+            state_scan_last_deferred_reads: AtomicU64::new(0),
+            state_scan_last_deferred_resumes: AtomicU64::new(0),
+            state_scan_last_missing_nodes: AtomicU64::new(0),
             state_scan_branches_seen: AtomicU64::new(0),
             state_scan_duplicate_missing_hashes: AtomicU64::new(0),
             state_scan_full_below_hits: AtomicU64::new(0),
@@ -246,6 +347,52 @@ impl AcquisitionStats {
             .fetch_add(scan.completed_pending_misses, Ordering::Relaxed);
         self.state_scan_deferred_resumes
             .fetch_add(scan.deferred_resumes, Ordering::Relaxed);
+    }
+
+    fn record_state_scan_slice(
+        &self,
+        outcome: StateScanSliceOutcome,
+        deltas: StateScanSliceDeltas,
+    ) {
+        self.state_scan_branch_steps
+            .fetch_add(deltas.branch_steps, Ordering::Relaxed);
+        self.state_scan_missing_nodes_recorded
+            .fetch_add(deltas.missing_nodes, Ordering::Relaxed);
+        if deltas.branch_steps != 0
+            || deltas.deferred_reads != 0
+            || deltas.deferred_resumes != 0
+            || deltas.missing_nodes != 0
+        {
+            self.state_scan_positive_progress_slices
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let outcome_counter = match outcome {
+            StateScanSliceOutcome::BranchBudget => Some(&self.state_scan_branch_budget_yields),
+            StateScanSliceOutcome::DeferredReadBudget => {
+                Some(&self.state_scan_deferred_read_budget_yields)
+            }
+            StateScanSliceOutcome::DeferredReadResume => {
+                Some(&self.state_scan_deferred_read_resume_yields)
+            }
+            StateScanSliceOutcome::MissingNodeLimit => {
+                Some(&self.state_scan_missing_node_limit_yields)
+            }
+            StateScanSliceOutcome::Complete => Some(&self.state_scan_completed_slices),
+            StateScanSliceOutcome::None => None,
+        };
+        if let Some(counter) = outcome_counter {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        self.state_scan_last_outcome
+            .store(outcome as u8, Ordering::Relaxed);
+        self.state_scan_last_branch_steps
+            .store(deltas.branch_steps, Ordering::Relaxed);
+        self.state_scan_last_deferred_reads
+            .store(deltas.deferred_reads, Ordering::Relaxed);
+        self.state_scan_last_deferred_resumes
+            .store(deltas.deferred_resumes, Ordering::Relaxed);
+        self.state_scan_last_missing_nodes
+            .store(deltas.missing_nodes, Ordering::Relaxed);
     }
 
     fn record_state_scan_buffered_packets(&self, packets: usize) {
@@ -312,6 +459,19 @@ pub(crate) struct AcquisitionSnapshot {
     pub state_missing_nodes: u64,
     pub tx_missing_nodes: u64,
     pub state_scan_us: u64,
+    pub state_scan_branch_steps: u64,
+    pub state_scan_missing_nodes_recorded: u64,
+    pub state_scan_positive_progress_slices: u64,
+    pub state_scan_branch_budget_yields: u64,
+    pub state_scan_deferred_read_budget_yields: u64,
+    pub state_scan_deferred_read_resume_yields: u64,
+    pub state_scan_missing_node_limit_yields: u64,
+    pub state_scan_completed_slices: u64,
+    pub state_scan_last_yield: &'static str,
+    pub state_scan_last_branch_steps: u64,
+    pub state_scan_last_deferred_reads: u64,
+    pub state_scan_last_deferred_resumes: u64,
+    pub state_scan_last_missing_nodes: u64,
     pub state_scan_branches_seen: u64,
     pub state_scan_duplicate_missing_hashes: u64,
     pub state_scan_full_below_hits: u64,
@@ -1086,6 +1246,55 @@ impl AcquisitionState {
             state_missing_nodes: self.stats.state_missing_nodes.load(Ordering::Relaxed),
             tx_missing_nodes: self.stats.tx_missing_nodes.load(Ordering::Relaxed),
             state_scan_us: self.stats.state_scan_us.load(Ordering::Relaxed),
+            state_scan_branch_steps: self.stats.state_scan_branch_steps.load(Ordering::Relaxed),
+            state_scan_missing_nodes_recorded: self
+                .stats
+                .state_scan_missing_nodes_recorded
+                .load(Ordering::Relaxed),
+            state_scan_positive_progress_slices: self
+                .stats
+                .state_scan_positive_progress_slices
+                .load(Ordering::Relaxed),
+            state_scan_branch_budget_yields: self
+                .stats
+                .state_scan_branch_budget_yields
+                .load(Ordering::Relaxed),
+            state_scan_deferred_read_budget_yields: self
+                .stats
+                .state_scan_deferred_read_budget_yields
+                .load(Ordering::Relaxed),
+            state_scan_deferred_read_resume_yields: self
+                .stats
+                .state_scan_deferred_read_resume_yields
+                .load(Ordering::Relaxed),
+            state_scan_missing_node_limit_yields: self
+                .stats
+                .state_scan_missing_node_limit_yields
+                .load(Ordering::Relaxed),
+            state_scan_completed_slices: self
+                .stats
+                .state_scan_completed_slices
+                .load(Ordering::Relaxed),
+            state_scan_last_yield: StateScanSliceOutcome::from_raw(
+                self.stats.state_scan_last_outcome.load(Ordering::Relaxed),
+            )
+            .name(),
+            state_scan_last_branch_steps: self
+                .stats
+                .state_scan_last_branch_steps
+                .load(Ordering::Relaxed),
+            state_scan_last_deferred_reads: self
+                .stats
+                .state_scan_last_deferred_reads
+                .load(Ordering::Relaxed),
+            state_scan_last_deferred_resumes: self
+                .stats
+                .state_scan_last_deferred_resumes
+                .load(Ordering::Relaxed),
+            state_scan_last_missing_nodes: self
+                .stats
+                .state_scan_last_missing_nodes
+                .load(Ordering::Relaxed),
             state_scan_branches_seen: self.stats.state_scan_branches_seen.load(Ordering::Relaxed),
             state_scan_duplicate_missing_hashes: self
                 .stats
@@ -1779,6 +1988,7 @@ fn process_state_scan_turn(state: &Arc<AcquisitionState>) {
     }
 
     let scan_started = Instant::now();
+    let progress_before = continuation.scan.progress();
     let family = family(state);
     let complete = {
         let Some(mut mutable) = state.lock_mutable("resumable state scan") else {
@@ -1801,6 +2011,20 @@ fn process_state_scan_turn(state: &Arc<AcquisitionState>) {
     };
     #[cfg(test)]
     state.pause_after_state_scan_advance_for_test();
+
+    // These before/after values are sampled after synchronous NodeStore reads
+    // have completed, so they describe actual local work and never steer the
+    // retained continuation or mailbox token.
+    let progress_after = continuation.scan.progress();
+    let (slice_outcome, slice_deltas) =
+        classify_state_scan_slice(progress_before, progress_after);
+    let scan_us = scan_started.elapsed().as_micros() as u64;
+    state.stats.state_scan_runs.fetch_add(1, Ordering::Relaxed);
+    state.stats.state_scan_us.fetch_add(scan_us, Ordering::Relaxed);
+    state
+        .stats
+        .record_state_scan_slice(slice_outcome, slice_deltas);
+
     // A registry sweep/remove/clear/stop can set terminal while the exclusive
     // SyncTree advance is in progress. This check is deliberately before any
     // continuation consumption, result application, transaction follow-up,
@@ -1809,10 +2033,6 @@ fn process_state_scan_turn(state: &Arc<AcquisitionState>) {
     if state.is_done() {
         return;
     }
-
-    let scan_us = scan_started.elapsed().as_micros() as u64;
-    state.stats.state_scan_runs.fetch_add(1, Ordering::Relaxed);
-    state.stats.state_scan_us.fetch_add(scan_us, Ordering::Relaxed);
 
     if !complete {
         if state.is_done() {
@@ -1828,6 +2048,11 @@ fn process_state_scan_turn(state: &Arc<AcquisitionState>) {
                 branch_budget = STATE_SCAN_MAX_BRANCHES_PER_TURN,
                 read_budget = STATE_SCAN_MAX_DEFERRED_READS_PER_TURN,
                 pending_reads,
+                slice_outcome = slice_outcome.name(),
+                branch_steps = slice_deltas.branch_steps,
+                deferred_reads = slice_deltas.deferred_reads,
+                deferred_resumes = slice_deltas.deferred_resumes,
+                missing_nodes = slice_deltas.missing_nodes,
                 "sampled resumable state-map scan yielded"
             );
         }
@@ -1855,6 +2080,11 @@ fn process_state_scan_turn(state: &Arc<AcquisitionState>) {
             missing = state_missing.len(),
             branches = scan_stats.branches_seen,
             pending = scan_stats.pending_reads,
+            slice_outcome = slice_outcome.name(),
+            branch_steps = slice_deltas.branch_steps,
+            deferred_reads = slice_deltas.deferred_reads,
+            deferred_resumes = slice_deltas.deferred_resumes,
+            missing_nodes = slice_deltas.missing_nodes,
             "sampled resumable state-map scan completed"
         );
     }
@@ -2267,9 +2497,11 @@ mod tests {
     use super::super::registry::{AcquireReason, AcquisitionLifecycleCounters};
     use super::super::worker_pool::WorkerPool;
     use super::{
-        ACQUIRE_TIMEOUT, AcquisitionBuilder, AcquisitionCompletionRecorder,
-        AcquisitionFailureRecorder, AcquisitionState, StateScanAfterAdvancePause,
-        peer_has_acquisition_target, publish_completed_ledger, record_completed_ledger, trigger,
+        ACQUIRE_TIMEOUT, STATE_SCAN_MAX_BRANCHES_PER_TURN, STATE_SCAN_MAX_DEFERRED_READS_PER_TURN,
+        AcquisitionBuilder, AcquisitionCompletionRecorder, AcquisitionFailureRecorder,
+        AcquisitionState, StateScanAfterAdvancePause, StateScanSliceOutcome,
+        classify_state_scan_slice, peer_has_acquisition_target, publish_completed_ledger,
+        record_completed_ledger, trigger,
     };
     use basics::base_uint::Uint256;
     use basics::basic_config::BasicConfig;
@@ -2284,6 +2516,7 @@ mod tests {
     use overlay::{Peer, PeerImp, PeerSet, ProtocolPayload};
     use protocol::PublicKey;
     use shamap::node_id::SHAMapNodeId;
+    use shamap::sync::DeferredMissingNodeScanProgress;
     use shamap::tree_node::SHAMapTreeNode;
     use shamap::tree_node_cache::TreeNodeCache;
     use std::net::SocketAddr;
@@ -2457,7 +2690,58 @@ mod tests {
         assert!(state.diagnostics().scan_continuation_pending);
         assert_eq!(worker_pool.snapshot().queued_jobs, 1);
         assert!(worker_pool.run_next_job_for_test());
-        assert!(state.diagnostics().state_scan_runs >= 1);
+        let diagnostics = state.diagnostics();
+        assert!(diagnostics.state_scan_runs >= 1);
+        assert_eq!(diagnostics.state_scan_last_yield, "complete");
+        assert_eq!(diagnostics.state_scan_completed_slices, 1);
+        assert!(diagnostics.state_scan_last_branch_steps > 0);
+        assert!(diagnostics.state_scan_positive_progress_slices >= 1);
+    }
+
+    #[test]
+    fn state_scan_slice_outcomes_preserve_progress_contract() {
+        let before = DeferredMissingNodeScanProgress {
+            remaining: 8,
+            ..Default::default()
+        };
+        let branch_budget = DeferredMissingNodeScanProgress {
+            branch_steps: STATE_SCAN_MAX_BRANCHES_PER_TURN as u64,
+            remaining: 8,
+            ..Default::default()
+        };
+        let deferred_read_budget = DeferredMissingNodeScanProgress {
+            deferred_reads: STATE_SCAN_MAX_DEFERRED_READS_PER_TURN as u64,
+            remaining: 8,
+            ..Default::default()
+        };
+        let missing_limit = DeferredMissingNodeScanProgress {
+            missing_nodes: 1,
+            remaining: 0,
+            complete: true,
+            ..Default::default()
+        };
+        let complete = DeferredMissingNodeScanProgress {
+            branch_steps: 1,
+            remaining: 7,
+            complete: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_state_scan_slice(before, branch_budget).0,
+            StateScanSliceOutcome::BranchBudget
+        );
+        assert_eq!(
+            classify_state_scan_slice(before, deferred_read_budget).0,
+            StateScanSliceOutcome::DeferredReadBudget
+        );
+        let (outcome, deltas) = classify_state_scan_slice(before, missing_limit);
+        assert_eq!(outcome, StateScanSliceOutcome::MissingNodeLimit);
+        assert_eq!(deltas.missing_nodes, 1);
+        assert_eq!(
+            classify_state_scan_slice(before, complete).0,
+            StateScanSliceOutcome::Complete
+        );
     }
 
     #[test]

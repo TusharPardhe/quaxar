@@ -2355,6 +2355,9 @@ struct PendingDeferredFetch {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DeferredMissingNodeScanStats {
+    /// Every branch examined, including empty branches. This is the reliable
+    /// bounded-work progress unit used by resumable acquisition diagnostics.
+    pub branch_steps: u64,
     pub branches_seen: u64,
     pub duplicate_missing_hashes: u64,
     pub full_below_hits: u64,
@@ -2400,6 +2403,19 @@ pub struct DeferredMissingNodeScan {
     pending_hashes: BTreeSet<SHAMapHash>,
     deferred_resumes: BTreeMap<usize, DeferredResume>,
     stats: DeferredMissingNodeScanStats,
+}
+
+/// Read-only cumulative scan state sampled around one bounded traversal slice.
+/// Sampling does not mutate the retained traversal, deferred reads, or resume
+/// queue, so callers can compute deltas without changing scan behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeferredMissingNodeScanProgress {
+    pub branch_steps: u64,
+    pub deferred_reads: u64,
+    pub deferred_resumes: u64,
+    pub missing_nodes: u64,
+    pub remaining: i32,
+    pub complete: bool,
 }
 
 impl DeferredMissingNodeScan {
@@ -2470,6 +2486,19 @@ impl DeferredMissingNodeScan {
                 ledger_seq: pending.ledger_seq,
             })
             .collect()
+    }
+
+    /// Return only cumulative counters and completion state for diagnostics.
+    /// This intentionally exposes no mutable traversal internals.
+    pub fn progress(&self) -> DeferredMissingNodeScanProgress {
+        DeferredMissingNodeScanProgress {
+            branch_steps: self.stats.branch_steps,
+            deferred_reads: self.stats.pending_reads,
+            deferred_resumes: self.stats.deferred_resumes,
+            missing_nodes: self.stats.missing_recorded,
+            remaining: self.remaining,
+            complete: self.is_complete(),
+        }
     }
 
     /// Advance without a branch cap for existing whole-scan callers. New
@@ -2569,6 +2598,7 @@ impl DeferredMissingNodeScan {
             let branch = (state.first_child + state.current_child) % BRANCH_FACTOR;
             state.current_child += 1;
             branch_steps += 1;
+            self.stats.branch_steps += 1;
             if state.node().is_empty_branch(branch) {
                 continue;
             }

@@ -381,8 +381,60 @@ fn acquisition_snapshot_json(
             JsonValue::Unsigned(snapshot.state_scan_us),
         ),
         (
+            "state_scan_branch_steps".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_branch_steps),
+        ),
+        (
             "state_scan_branches_seen".to_owned(),
             JsonValue::Unsigned(snapshot.state_scan_branches_seen),
+        ),
+        (
+            "state_scan_missing_nodes_recorded".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_missing_nodes_recorded),
+        ),
+        (
+            "state_scan_positive_progress_slices".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_positive_progress_slices),
+        ),
+        (
+            "state_scan_branch_budget_yields".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_branch_budget_yields),
+        ),
+        (
+            "state_scan_deferred_read_budget_yields".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_deferred_read_budget_yields),
+        ),
+        (
+            "state_scan_deferred_read_resume_yields".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_deferred_read_resume_yields),
+        ),
+        (
+            "state_scan_missing_node_limit_yields".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_missing_node_limit_yields),
+        ),
+        (
+            "state_scan_completed_slices".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_completed_slices),
+        ),
+        (
+            "state_scan_last_yield".to_owned(),
+            JsonValue::String(snapshot.state_scan_last_yield.to_owned()),
+        ),
+        (
+            "state_scan_last_branch_steps".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_last_branch_steps),
+        ),
+        (
+            "state_scan_last_deferred_reads".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_last_deferred_reads),
+        ),
+        (
+            "state_scan_last_deferred_resumes".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_last_deferred_resumes),
+        ),
+        (
+            "state_scan_last_missing_nodes".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_last_missing_nodes),
         ),
         (
             "state_scan_duplicate_missing_hashes".to_owned(),
@@ -2317,6 +2369,19 @@ mod tests {
             state_missing_nodes: 0,
             tx_missing_nodes: 0,
             state_scan_us: 0,
+            state_scan_branch_steps: 0,
+            state_scan_missing_nodes_recorded: 0,
+            state_scan_positive_progress_slices: 0,
+            state_scan_branch_budget_yields: 0,
+            state_scan_deferred_read_budget_yields: 0,
+            state_scan_deferred_read_resume_yields: 0,
+            state_scan_missing_node_limit_yields: 0,
+            state_scan_completed_slices: 0,
+            state_scan_last_yield: "none",
+            state_scan_last_branch_steps: 0,
+            state_scan_last_deferred_reads: 0,
+            state_scan_last_deferred_resumes: 0,
+            state_scan_last_missing_nodes: 0,
             state_scan_branches_seen: 0,
             state_scan_duplicate_missing_hashes: 0,
             state_scan_full_below_hits: 0,
