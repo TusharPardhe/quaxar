@@ -417,6 +417,18 @@ fn acquisition_snapshot_json(
             JsonValue::Unsigned(snapshot.state_scan_deferred_resumes),
         ),
         (
+            "state_scan_yields".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_yields),
+        ),
+        (
+            "state_scan_continuations".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_continuations),
+        ),
+        (
+            "timeout_dispatches".to_owned(),
+            JsonValue::Unsigned(snapshot.timeout_dispatches),
+        ),
+        (
             "state_scan_max_buffered_packets".to_owned(),
             JsonValue::Unsigned(snapshot.state_scan_max_buffered_packets),
         ),
@@ -463,6 +475,22 @@ fn acquisition_snapshot_json(
         (
             "buffered_packets".to_owned(),
             JsonValue::Unsigned(snapshot.buffered_packets as u64),
+        ),
+        (
+            "buffered_packets_high_water".to_owned(),
+            JsonValue::Unsigned(snapshot.buffered_packets_high_water as u64),
+        ),
+        (
+            "mailbox_token".to_owned(),
+            JsonValue::String(snapshot.mailbox_token.to_owned()),
+        ),
+        (
+            "scan_continuation_pending".to_owned(),
+            JsonValue::Bool(snapshot.scan_continuation_pending),
+        ),
+        (
+            "pending_admitted_timeouts".to_owned(),
+            JsonValue::Unsigned(snapshot.pending_admitted_timeouts as u64),
         ),
         (
             "has_active_packet".to_owned(),
@@ -936,14 +964,7 @@ impl InboundLedgers {
             Arc::clone(&entry.state)
         };
 
-        {
-            let mut buf = state.data_buffer.lock().expect("data_buffer push lock");
-            // `InboundLedger::gotData` retains received packets until its
-            // dispatched worker drains them. Preserve this lifecycle rather
-            // than dropping a valid packet at a fixed local count.
-            buf.push((peer_id, packet));
-        }
-        state.submit_data_job();
+        state.enqueue_packet(peer_id, packet);
         self.lifecycle
             .route_accepted
             .fetch_add(1, Ordering::Relaxed);
@@ -1834,27 +1855,31 @@ mod tests {
         assert_eq!(routed.data_jobs_coalesced, 1);
 
         // Initialization refreshes from the absent overlay runtime. Install the
-        // selected live peer after that production setup turn, before the one
-        // queued data drain runs.
+        // selected live peer after that production setup turn, before the
+        // first bounded FIFO packet step runs.
         assert!(worker_pool.run_next_job_for_test());
         state
             .peer_set
             .refresh_peers(vec![Arc::clone(&peer) as Arc<dyn Peer>]);
         state.peer_set.add_peers(1, &mut |_| true, &mut |_| {});
         assert!(worker_pool.run_next_job_for_test());
+        assert!(
+            worker_pool.run_next_job_for_test(),
+            "the first bounded packet step must schedule one continuation"
+        );
 
         let charges = peer.charges();
         assert_eq!(
             charges.len(),
             2,
-            "one worker drain processes both routed packets"
+            "both routed packets are processed in FIFO continuation order"
         );
         for (fee, context) in charges {
             assert_eq!(fee, (*resource::FEE_MALFORMED_REQUEST).clone());
             assert_eq!(context, "ledger_data empty header");
         }
         let drained = registry.lifecycle_snapshot();
-        assert_eq!(drained.data_jobs_started, 1);
+        assert_eq!(drained.data_jobs_started, 2);
         assert_eq!(drained.packet_steps, 2);
         assert_eq!(drained.packet_steps_completed, 2);
         assert_eq!(drained.packet_step_errors, 2);
@@ -2301,6 +2326,9 @@ mod tests {
             state_scan_pending_hits: 0,
             state_scan_pending_misses: 0,
             state_scan_deferred_resumes: 0,
+            state_scan_yields: 0,
+            state_scan_continuations: 0,
+            timeout_dispatches: 0,
             state_scan_max_buffered_packets: 0,
             data_drain_runs: 0,
             data_drain_us: 0,
@@ -2313,6 +2341,10 @@ mod tests {
             node_store_fetch_misses: 0,
             tracked_peers: 0,
             buffered_packets: 0,
+            buffered_packets_high_water: 0,
+            mailbox_token: "idle",
+            scan_continuation_pending: false,
+            pending_admitted_timeouts: 0,
             has_active_packet: false,
         };
 

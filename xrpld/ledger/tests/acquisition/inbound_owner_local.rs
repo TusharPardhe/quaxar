@@ -490,7 +490,7 @@ fn inbound_owner_post_state_scan_can_fall_through_to_transaction_root() {
 }
 
 #[test]
-fn inbound_owner_state_scan_lease_restores_assembled_ledger() {
+fn inbound_owner_state_scan_retains_assembled_ledger() {
     let account_hash = sample_hash(0x86);
     let header = sample_header(904, account_hash, SHAMapHash::default());
     let wanted_hash = calculate_ledger_hash(&header);
@@ -519,15 +519,14 @@ fn inbound_owner_state_scan_lease_restores_assembled_ledger() {
         have_state: false,
     };
 
-    let leased = inbound
-        .take_ledger_for_state_scan(&params)
-        .expect("header acquisition must have an assembled ledger to lease");
-    assert!(inbound.ledger().is_none());
-    assert_eq!(leased.header().seq, 904);
-    assert_eq!(leased.header().account_hash, account_hash);
-
-    inbound.restore_ledger_after_state_scan(leased);
-    assert_eq!(inbound.ledger().expect("ledger restored").header().seq, 904);
+    let _scan = inbound
+        .start_resumable_state_map_scan(&params, &family)
+        .expect("header acquisition must create a persisted state scan");
+    assert_eq!(inbound.ledger().expect("ledger remains owned").header().seq, 904);
+    assert_eq!(
+        inbound.ledger().expect("ledger remains owned").header().account_hash,
+        account_hash
+    );
     assert_eq!(inbound.planner_state(), planner_before);
     assert!(!inbound.is_done());
 }

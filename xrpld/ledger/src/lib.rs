@@ -144,7 +144,8 @@ pub use history_sync::{
 pub use holder::LedgerHolder;
 pub use ledger_fetcher::{
     INBOUND_LEDGER_MAX_NEEDED_STATE_HASHES, INBOUND_LEDGER_MAX_NEEDED_TX_HASHES,
-    INBOUND_LEDGER_MAX_USEFUL_PEERS, InboundLedgerCompletionDisposition, InboundLedgerDataType,
+    INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP, INBOUND_LEDGER_MAX_USEFUL_PEERS,
+    select_inbound_ledger_reply_peers, InboundLedgerCompletionDisposition, InboundLedgerDataType,
     InboundLedgerJournal, InboundLedgerLocal, InboundLedgerNodeData, InboundLedgerObjectType,
     InboundLedgerPacket, InboundLedgerPacketDebugStats, InboundLedgerPacketError,
     InboundLedgerPacketShape, InboundLedgerPeerScore, InboundLedgerPlannerState,

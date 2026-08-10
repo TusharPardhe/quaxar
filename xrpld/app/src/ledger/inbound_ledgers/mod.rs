@@ -8,7 +8,7 @@
 //! - Touch-on-access keeps entries alive
 //! - 60s sweep removes idle entries
 //! - 5-minute failure cooldown prevents retry storms
-//! - Fixed worker pool (8 threads) processes short ticks
+//! - Fixed three-worker pool matches rippled's JtLedgerData running limit and processes bounded acquisition turns
 //! - Each acquisition wraps InboundLedgerLocal (the per-ledger state machine)
 
 mod acquisition;

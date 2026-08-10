@@ -1383,6 +1383,59 @@ impl SyncTree {
         )
     }
 
+    pub fn advance_deferred_missing_node_scan_with_family<CLOCK, S, C, F, MR, NS, R>(
+        &mut self,
+        scan: &mut DeferredMissingNodeScan,
+        filter: &mut Option<&mut dyn SHAMapSyncFilter>,
+        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
+        max_deferred: usize,
+        max_branch_steps: usize,
+        next_first_child: &mut R,
+    ) -> bool
+    where
+        CLOCK: CacheClock,
+        S: BuildHasher + Clone,
+        C: FullBelowCache,
+        F: SHAMapNodeFetcher,
+        MR: MissingNodeReporter,
+        R: FnMut() -> u8,
+    {
+        scan.run_with_family_bounded(
+            family,
+            filter,
+            max_deferred,
+            max_branch_steps,
+            next_first_child,
+            &mut |_, _| {},
+        );
+
+        let pending = scan.pending_requests();
+        if !pending.is_empty() {
+            let mut completions_by_hash = BTreeMap::new();
+            for request in &pending {
+                completions_by_hash
+                    .entry(request.hash())
+                    .or_insert_with(|| self.load_node_with_owner_family(request.hash(), family));
+            }
+            let completions = pending
+                .iter()
+                .map(|request| {
+                    completions_by_hash
+                        .get(&request.hash())
+                        .expect("every deferred request hash must have a completion")
+                        .clone()
+                })
+                .collect::<Vec<_>>();
+            scan.complete_pending_reads(completions);
+        }
+
+        let complete = scan.is_complete() || scan.remaining() <= 0;
+        if complete && scan.missing_nodes().is_empty() {
+            self.clear_synching();
+        }
+        complete
+    }
+
     pub fn start_deferred_missing_node_scan_with_family<CLOCK, S, C, F, MR, NS, R>(
         &self,
         max: i32,
@@ -2419,11 +2472,46 @@ impl DeferredMissingNodeScan {
             .collect()
     }
 
+    /// Advance without a branch cap for existing whole-scan callers. New
+    /// resumable acquisition work uses `run_with_family_bounded` instead.
     pub fn run_with_family<CLOCK, S, FB, F, MR, NS, R, REQ>(
         &mut self,
         family: &SHAMapFamily<CLOCK, S, FB, F, MR, NS>,
         filter: &mut Option<&mut dyn SHAMapSyncFilter>,
         max_deferred: usize,
+        next_first_child: &mut R,
+        request_async_fetch: &mut REQ,
+    ) where
+        CLOCK: CacheClock,
+        S: BuildHasher + Clone,
+        FB: FullBelowCache,
+        F: SHAMapNodeFetcher,
+        MR: MissingNodeReporter,
+        R: FnMut() -> u8,
+        REQ: FnMut(SHAMapHash, u32),
+    {
+        // Legacy whole scans historically admitted one deferred read after
+        // reaching `max_deferred`. Preserve that behavior only on this
+        // compatibility path; resumable acquisition calls the bounded method
+        // directly and receives its declared inclusive limit.
+        self.run_with_family_bounded(
+            family,
+            filter,
+            max_deferred.saturating_add(1),
+            usize::MAX,
+            next_first_child,
+            request_async_fetch,
+        );
+    }
+
+    /// Advance at most `max_branch_steps` branches while retaining all stack,
+    /// pending-read, and missing-node state for the next caller-owned turn.
+    pub fn run_with_family_bounded<CLOCK, S, FB, F, MR, NS, R, REQ>(
+        &mut self,
+        family: &SHAMapFamily<CLOCK, S, FB, F, MR, NS>,
+        filter: &mut Option<&mut dyn SHAMapSyncFilter>,
+        max_deferred: usize,
+        max_branch_steps: usize,
         next_first_child: &mut R,
         request_async_fetch: &mut REQ,
     ) where
@@ -2444,10 +2532,17 @@ impl DeferredMissingNodeScan {
             );
         }
 
+        let mut branch_steps = 0usize;
         while let Some(state) = self.stack.last_mut() {
-            // so a pass is allowed to post one more deferred read after reaching
-            // the threshold. Keep the same boundary here.
-            if self.remaining <= 0 || self.pending_reads.len() > max_deferred {
+            // A continuation yields after a deterministic number of examined
+            // branches. The legacy whole-scan callers pass `usize::MAX`.
+            if branch_steps >= max_branch_steps {
+                break;
+            }
+            // Bounded callers may complete no more than `max_deferred`
+            // synchronous reads in this turn. Legacy whole-scan callers keep
+            // their historic one-extra behavior via the adjusted wrapper.
+            if self.remaining <= 0 || self.pending_reads.len() >= max_deferred {
                 break;
             }
 
@@ -2473,6 +2568,7 @@ impl DeferredMissingNodeScan {
 
             let branch = (state.first_child + state.current_child) % BRANCH_FACTOR;
             state.current_child += 1;
+            branch_steps += 1;
             if state.node().is_empty_branch(branch) {
                 continue;
             }
@@ -4985,6 +5081,55 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(child_hash, 90)]
         );
+    }
+
+    #[test]
+    fn deferred_missing_node_scan_bounded_read_limit_is_eight_and_legacy_keeps_extra_read() {
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        for branch in 0..9 {
+            root.set_child_hash(branch, sample_hash(0x80 + branch));
+        }
+        root.update_hash();
+
+        let tree = SyncTree::from_root(root, true, 90, SyncState::Synching);
+        let family = SHAMapFamily::new(
+            Arc::new(TreeNodeCache::new(
+                "deferred-eight-read-limit",
+                8,
+                Duration::seconds(1),
+                ManualClock::new(0),
+            )),
+            NullFullBelowCache::new(16),
+            NullNodeFetcher,
+            NullMissingNodeReporter,
+        );
+        let full_below = NullFullBelowCache::new(16);
+        let mut no_filter: Option<&mut dyn SHAMapSyncFilter> = None;
+
+        let mut bounded = tree.start_deferred_missing_node_scan(32, &full_below, &mut || 0);
+        let mut bounded_requests = Vec::new();
+        bounded.run_with_family_bounded(
+            &family,
+            &mut no_filter,
+            8,
+            usize::MAX,
+            &mut || 0,
+            &mut |hash, ledger_seq| bounded_requests.push((hash, ledger_seq)),
+        );
+        assert_eq!(bounded_requests.len(), 8);
+        assert_eq!(bounded.pending_requests().len(), 8);
+
+        let mut legacy = tree.start_deferred_missing_node_scan(32, &full_below, &mut || 0);
+        let mut legacy_requests = Vec::new();
+        legacy.run_with_family(
+            &family,
+            &mut no_filter,
+            8,
+            &mut || 0,
+            &mut |hash, ledger_seq| legacy_requests.push((hash, ledger_seq)),
+        );
+        assert_eq!(legacy_requests.len(), 9);
+        assert_eq!(legacy.pending_requests().len(), 9);
     }
 
     #[test]

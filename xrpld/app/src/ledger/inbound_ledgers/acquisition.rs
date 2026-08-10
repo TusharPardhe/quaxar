@@ -9,19 +9,21 @@ use basics::hardened_hash::HardenedHashBuilder;
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::MonotonicClock;
 use ledger::{
-    FetchPackCache, FetchPackContainer, FetchPackStore, InboundLedgerJournal, InboundLedgerLocal,
-    InboundLedgerPacket, InboundLedgerPacketError, InboundLedgerReason,
-    InboundLedgerRequestTrigger, InboundLedgerStore, InboundLedgerTimerResult, Ledger,
+    select_inbound_ledger_reply_peers, FetchPackCache, FetchPackContainer, FetchPackStore,
+    InboundLedgerJournal, InboundLedgerLocal, InboundLedgerPacket, InboundLedgerPacketError,
+    InboundLedgerPeerScore, InboundLedgerReason, InboundLedgerRequestTrigger, InboundLedgerStore,
+    InboundLedgerTimerResult, Ledger, StateScanParams, INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP,
 };
 use overlay::{Peer, PeerSet as _};
 use shamap::family::{FullBelowCacheImpl, NullMissingNodeReporter, SHAMapFamily};
-use shamap::sync::DeferredMissingNodeScanStats;
+use shamap::sync::{DeferredMissingNodeScan, DeferredMissingNodeScanStats, SHAMapAddNode};
 use shamap::tree_node_cache::TreeNodeCache;
+use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 #[cfg(test)]
-use std::sync::{Condvar, OnceLock};
+use std::sync::Condvar;
 use std::time::{Duration, Instant};
 
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
@@ -35,60 +37,46 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[cfg(test)]
 #[derive(Default)]
-struct DetachedStateScanPauseState {
+struct StateScanAfterAdvancePauseState {
     entered: bool,
     released: bool,
 }
 
-/// Test-only synchronization seam placed after `trigger` has leased the real
-/// ledger and marked the detached state scan active. Release builds do not
-/// compile this state or call site.
+/// Per-acquisition test seam placed after a bounded state-scan advance and
+/// before the production terminal guard. It is compiled only for the private
+/// module tests, so independent tests cannot pause an unrelated acquisition.
 #[cfg(test)]
 #[derive(Default)]
-struct DetachedStateScanPause {
-    state: Mutex<DetachedStateScanPauseState>,
+struct StateScanAfterAdvancePause {
+    state: Mutex<StateScanAfterAdvancePauseState>,
     wake: Condvar,
 }
 
 #[cfg(test)]
-impl DetachedStateScanPause {
+impl StateScanAfterAdvancePause {
     fn wait_until_entered(&self) {
-        let state = self.state.lock().expect("detached scan pause lock");
+        let state = self.state.lock().expect("state scan pause lock");
         let (state, timeout) = self
             .wake
             .wait_timeout_while(state, Duration::from_secs(5), |state| !state.entered)
-            .expect("detached scan pause wait");
-        assert!(state.entered, "detached state scan did not reach its pause");
-        assert!(!timeout.timed_out(), "detached state scan pause timed out");
+            .expect("state scan pause wait");
+        assert!(state.entered, "state scan did not reach its post-advance pause");
+        assert!(!timeout.timed_out(), "state scan post-advance pause timed out");
+    }
+
+    fn pause_after_advance(&self) {
+        let mut state = self.state.lock().expect("state scan pause lock");
+        state.entered = true;
+        self.wake.notify_all();
+        while !state.released {
+            state = self.wake.wait(state).expect("state scan pause wait");
+        }
     }
 
     fn release(&self) {
-        let mut state = self.state.lock().expect("detached scan pause lock");
+        let mut state = self.state.lock().expect("state scan pause lock");
         state.released = true;
         self.wake.notify_all();
-    }
-}
-
-#[cfg(test)]
-fn detached_state_scan_pause_slot() -> &'static Mutex<Option<Arc<DetachedStateScanPause>>> {
-    static SLOT: OnceLock<Mutex<Option<Arc<DetachedStateScanPause>>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
-}
-
-#[cfg(test)]
-fn pause_detached_state_scan_for_test() {
-    let pause = detached_state_scan_pause_slot()
-        .lock()
-        .expect("detached scan pause slot lock")
-        .clone();
-    let Some(pause) = pause else {
-        return;
-    };
-    let mut state = pause.state.lock().expect("detached scan pause lock");
-    state.entered = true;
-    pause.wake.notify_all();
-    while !state.released {
-        state = pause.wake.wait(state).expect("detached scan pause wait");
     }
 }
 
@@ -171,6 +159,9 @@ struct AcquisitionStats {
     state_scan_pending_hits: AtomicU64,
     state_scan_pending_misses: AtomicU64,
     state_scan_deferred_resumes: AtomicU64,
+    state_scan_yields: AtomicU64,
+    state_scan_continuations: AtomicU64,
+    timeout_dispatches: AtomicU64,
     state_scan_max_buffered_packets: AtomicU64,
     data_drain_runs: AtomicU64,
     data_drain_us: AtomicU64,
@@ -209,6 +200,9 @@ impl AcquisitionStats {
             state_scan_pending_hits: AtomicU64::new(0),
             state_scan_pending_misses: AtomicU64::new(0),
             state_scan_deferred_resumes: AtomicU64::new(0),
+            state_scan_yields: AtomicU64::new(0),
+            state_scan_continuations: AtomicU64::new(0),
+            timeout_dispatches: AtomicU64::new(0),
             state_scan_max_buffered_packets: AtomicU64::new(0),
             data_drain_runs: AtomicU64::new(0),
             data_drain_us: AtomicU64::new(0),
@@ -327,6 +321,9 @@ pub(crate) struct AcquisitionSnapshot {
     pub state_scan_pending_hits: u64,
     pub state_scan_pending_misses: u64,
     pub state_scan_deferred_resumes: u64,
+    pub state_scan_yields: u64,
+    pub state_scan_continuations: u64,
+    pub timeout_dispatches: u64,
     pub state_scan_max_buffered_packets: u64,
     pub data_drain_runs: u64,
     pub data_drain_us: u64,
@@ -339,6 +336,10 @@ pub(crate) struct AcquisitionSnapshot {
     pub node_store_fetch_misses: u64,
     pub tracked_peers: usize,
     pub buffered_packets: usize,
+    pub buffered_packets_high_water: usize,
+    pub mailbox_token: &'static str,
+    pub scan_continuation_pending: bool,
+    pub pending_admitted_timeouts: u32,
     pub has_active_packet: bool,
 }
 
@@ -500,12 +501,111 @@ pub struct AcqMutableState {
     pub(crate) fetch_pack: WorkerFetchPack,
 }
 
-/// Peer packets retained until the acquisition's dispatched worker drains them,
-/// matching rippled `InboundLedger::receivedData_`.
+/// One acquisition turn mutates at most this many nodes from its current FIFO
+/// packet. The wire router separately admits at most 12,288 nodes per packet;
+/// the initial full-packet structural validation therefore remains bounded by
+/// that protocol limit, but this is deliberately not a wall-clock guarantee.
+const MAX_PACKET_STEPS_PER_ACQUISITION_TURN: usize = 1;
+const STATE_SCAN_MAX_BRANCHES_PER_TURN: usize = 512;
+const STATE_SCAN_MAX_DEFERRED_READS_PER_TURN: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcquisitionWorkToken {
+    Idle,
+    Queued,
+    Running,
+}
+
+impl AcquisitionWorkToken {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Queued => "queued",
+            Self::Running => "running",
+        }
+    }
+}
+
+/// Scan state is retained between bounded worker turns. The scanner owns no
+/// mutable planner lock while parked; each turn reacquires the ledger under
+/// the one acquisition token before advancing the same deferred scan.
+struct ResumableStateScan {
+    params: StateScanParams,
+    scan: DeferredMissingNodeScan,
+    peer: Option<Arc<dyn Peer>>,
+}
+
+/// Packet processing is resumed in FIFO order. `next_node` and accumulated
+/// stats are retained only after the first step has validated the complete
+/// node packet, so resumption cannot make a later malformed node partially
+/// mutate the planner.
+struct ResumableInboundPacket {
+    peer_id: u64,
+    packet: InboundLedgerPacket,
+    next_node: usize,
+    stats: SHAMapAddNode,
+}
+
+/// The sole synchronization point for ingress and acquisition scheduling.
+/// A token is either idle, queued, or running. A persisted scan continuation
+/// is itself work, so `finish_acquisition_turn` never returns the token idle
+/// while packets, timeouts, or a continuation are present.
+struct AcquisitionMailbox {
+    packets: Vec<(u64, InboundLedgerPacket)>,
+    token: AcquisitionWorkToken,
+    pending_timeouts: u32,
+    scan: Option<ResumableStateScan>,
+    active_packet: Option<ResumableInboundPacket>,
+    // Mirrors rippled `runData`: retain useful-peer scores until the
+    // coalesced FIFO batch is observed empty, then prune/sample once before
+    // emitting reply triggers. A packet arriving after that observation is a
+    // new mailbox batch and cannot be folded into the already-selected peers.
+    batch_useful_peer_counts: BTreeMap<u64, i32>,
+    buffered_packets_high_water: usize,
+}
+
+impl Default for AcquisitionMailbox {
+    fn default() -> Self {
+        Self {
+            packets: Vec::new(),
+            token: AcquisitionWorkToken::Idle,
+            pending_timeouts: 0,
+            scan: None,
+            active_packet: None,
+            batch_useful_peer_counts: BTreeMap::new(),
+            buffered_packets_high_water: 0,
+        }
+    }
+}
+
+impl AcquisitionMailbox {
+    fn buffered_packet_count(&self) -> usize {
+        self.packets.len() + usize::from(self.active_packet.is_some())
+    }
+
+    fn has_work(&self, fetch_pack_ready: bool) -> bool {
+        !self.packets.is_empty()
+            || self.active_packet.is_some()
+            || self.pending_timeouts != 0
+            || self.scan.is_some()
+            || fetch_pack_ready
+    }
+
+    fn clear_terminal_work(&mut self) {
+        self.packets.clear();
+        self.pending_timeouts = 0;
+        self.scan = None;
+        self.active_packet = None;
+        self.batch_useful_peer_counts.clear();
+        self.token = AcquisitionWorkToken::Idle;
+    }
+}
 
 /// Per-ledger state owned by the registry.
 pub struct AcquisitionState {
-    pub data_buffer: Mutex<Vec<(u64, InboundLedgerPacket)>>,
+    mailbox: Mutex<AcquisitionMailbox>,
+    #[cfg(test)]
+    state_scan_after_advance_pause: Mutex<Option<Arc<StateScanAfterAdvancePause>>>,
     pub mutable: Mutex<AcqMutableState>,
     pub hash: SHAMapHash,
     pub acquisition_id: u64,
@@ -532,10 +632,6 @@ pub struct AcquisitionState {
     // caller owns expensive successful-terminal finalization.
     finalization_claimed: AtomicBool,
     pub fetch_pack_ready: AtomicBool,
-    /// True while the mutable Ledger is leased to an out-of-lock state scan.
-    /// Router ingress remains buffered until the ledger is restored.
-    state_scan_in_progress: AtomicBool,
-    data_job_queued: AtomicBool,
     timer_armed: AtomicBool,
     worker_pool: Arc<WorkerPool>,
     lifecycle: Arc<AcquisitionLifecycleCounters>,
@@ -555,24 +651,73 @@ impl AcquisitionState {
             .initialization_jobs
             .fetch_add(1, Ordering::Relaxed);
         self.stats.worker_jobs.fetch_add(1, Ordering::Relaxed);
+        // Initialization remains synchronous and precedes its first mailbox
+        // token. If it creates a scan, `trigger` installs that continuation
+        // before requesting the token; ingress that arrives afterward only
+        // coalesces behind that established work.
         run_acquisition_job(self, "initialization", || process_init(self));
     }
 
-    /// Equivalent to `InboundLedger::gotData` dispatch coalescing.
+    /// Request a single runnable acquisition turn. The mailbox lock makes the
+    /// idle-to-queued transition atomic with respect to ingress, timer jobs,
+    /// and scan continuation persistence; all later events coalesce behind the
+    /// same token.
     pub fn submit_data_job(self: &Arc<Self>) {
+        if self.request_acquisition_turn() {
+            self.enqueue_acquisition_turn();
+        }
+    }
+
+    /// Append a routed response and schedule only when the shared work token
+    /// moves from idle to queued. Router ingress never touches the mutable
+    /// planner or the SyncTree.
+    pub fn enqueue_packet(self: &Arc<Self>, peer_id: u64, packet: InboundLedgerPacket) {
         if self.is_done() {
             return;
         }
-        if self
-            .data_job_queued
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        let (should_enqueue, buffered_during_scan) = {
+            let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+            mailbox.packets.push((peer_id, packet));
+            mailbox.buffered_packets_high_water = mailbox
+                .buffered_packets_high_water
+                .max(mailbox.buffered_packet_count());
+            let buffered_during_scan = mailbox.scan.as_ref().map(|_| mailbox.buffered_packet_count());
+            let should_enqueue = if mailbox.token == AcquisitionWorkToken::Idle {
+                mailbox.token = AcquisitionWorkToken::Queued;
+                true
+            } else {
+                self.lifecycle
+                    .data_jobs_coalesced
+                    .fetch_add(1, Ordering::Relaxed);
+                false
+            };
+            (should_enqueue, buffered_during_scan)
+        };
+        if let Some(buffered_packets) = buffered_during_scan {
+            self.stats.record_state_scan_buffered_packets(buffered_packets);
+        }
+        if should_enqueue {
+            self.enqueue_acquisition_turn();
+        }
+    }
+
+    fn request_acquisition_turn(&self) -> bool {
+        if self.is_done() {
+            return false;
+        }
+        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        if mailbox.token == AcquisitionWorkToken::Idle {
+            mailbox.token = AcquisitionWorkToken::Queued;
+            true
+        } else {
             self.lifecycle
                 .data_jobs_coalesced
                 .fetch_add(1, Ordering::Relaxed);
-            return;
+            false
         }
+    }
+
+    fn enqueue_acquisition_turn(self: &Arc<Self>) {
         self.lifecycle
             .data_jobs_submitted
             .fetch_add(1, Ordering::Relaxed);
@@ -588,8 +733,249 @@ impl AcquisitionState {
                 .stats
                 .worker_queue_wait_us
                 .fetch_add(queued_at.elapsed().as_micros() as u64, Ordering::Relaxed);
-            run_acquisition_job(&state, "data", || process_data_job(&state));
+            run_acquisition_job(&state, "mailbox", || process_acquisition_turn(&state));
         }));
+    }
+
+    fn begin_acquisition_turn(&self) -> bool {
+        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        if mailbox.token != AcquisitionWorkToken::Queued {
+            return false;
+        }
+        mailbox.token = AcquisitionWorkToken::Running;
+        true
+    }
+
+    /// Return a running token to queued only when work was observed under the
+    /// same mailbox lock. Ingress that arrives before the observation is seen;
+    /// ingress that arrives after it sees queued or idle and schedules itself.
+    fn finish_acquisition_turn(self: &Arc<Self>) {
+        let should_enqueue = {
+            let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+            if self.is_done() {
+                mailbox.clear_terminal_work();
+                false
+            } else if mailbox.has_work(self.fetch_pack_ready.load(Ordering::Acquire)) {
+                mailbox.token = AcquisitionWorkToken::Queued;
+                true
+            } else {
+                mailbox.token = AcquisitionWorkToken::Idle;
+                false
+            }
+        };
+        if should_enqueue {
+            self.enqueue_acquisition_turn();
+        }
+    }
+
+    fn take_packet_for_turn(&self) -> Option<ResumableInboundPacket> {
+        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        mailbox.active_packet.take().or_else(|| {
+            let (peer_id, packet) = mailbox.packets.first()?.clone();
+            mailbox.packets.remove(0);
+            Some(ResumableInboundPacket {
+                peer_id,
+                packet,
+                next_node: 0,
+                stats: SHAMapAddNode::default(),
+            })
+        })
+    }
+
+    fn restore_packet_for_turn(&self, packet: ResumableInboundPacket) {
+        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        if self.is_done() {
+            mailbox.clear_terminal_work();
+            return;
+        }
+        assert!(
+            mailbox.active_packet.is_none(),
+            "one acquisition may own only one packet continuation"
+        );
+        mailbox.active_packet = Some(packet);
+    }
+
+    /// Record one completed packet's useful nodes and, only after observing
+    /// the active packet plus its coalesced FIFO queue empty under this same
+    /// mailbox lock, prune/sample the entire batch for reply triggers.
+    fn finish_packet_batch(&self, peer_id: u64, useful_nodes: u64) -> Vec<u64> {
+        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        if self.is_done() {
+            mailbox.clear_terminal_work();
+            return Vec::new();
+        }
+        if useful_nodes != 0 {
+            let useful_nodes = useful_nodes.min(i32::MAX as u64) as i32;
+            mailbox
+                .batch_useful_peer_counts
+                .entry(peer_id)
+                .and_modify(|count| *count = (*count).max(useful_nodes))
+                .or_insert(useful_nodes);
+        }
+
+        if mailbox.active_packet.is_some() || !mailbox.packets.is_empty() {
+            return Vec::new();
+        }
+
+        let scores: Vec<_> = mailbox
+            .batch_useful_peer_counts
+            .iter()
+            .map(|(&peer_id, &useful_count)| InboundLedgerPeerScore {
+                peer_id,
+                useful_count,
+            })
+            .collect();
+        mailbox.batch_useful_peer_counts.clear();
+        select_inbound_ledger_reply_peers(&scores)
+    }
+
+    fn take_admitted_timeout(&self) -> bool {
+        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        if mailbox.pending_timeouts == 0 {
+            return false;
+        }
+        mailbox.pending_timeouts -= 1;
+        true
+    }
+
+    fn record_admitted_timeout(self: &Arc<Self>) {
+        if self.is_done() {
+            return;
+        }
+        let (should_enqueue, pending_timeouts, scan_pending, buffered_packets) = {
+            let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+            mailbox.pending_timeouts = mailbox.pending_timeouts.saturating_add(1);
+            let should_enqueue = if mailbox.token == AcquisitionWorkToken::Idle {
+                mailbox.token = AcquisitionWorkToken::Queued;
+                true
+            } else {
+                false
+            };
+            (
+                should_enqueue,
+                mailbox.pending_timeouts,
+                mailbox.scan.is_some(),
+                mailbox.buffered_packet_count(),
+            )
+        };
+        if self.stats.should_emit_sampled_diagnostic() {
+            tracing::debug!(
+                target: "inbound_ledger",
+                seq = self.seq,
+                hash = %self.hash,
+                pending_timeouts,
+                scan_pending,
+                buffered_packets,
+                "sampled admitted timeout parked in acquisition mailbox"
+            );
+        }
+        if should_enqueue {
+            self.enqueue_acquisition_turn();
+        }
+    }
+
+    fn install_state_scan(&self, scan: ResumableStateScan) -> bool {
+        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        if self.is_done() {
+            mailbox.clear_terminal_work();
+            return false;
+        }
+        assert!(mailbox.scan.is_none(), "one acquisition may own only one state scan");
+        mailbox.scan = Some(scan);
+        self.stats
+            .state_scan_continuations
+            .fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn take_state_scan(&self) -> Option<ResumableStateScan> {
+        self.mailbox
+            .lock()
+            .expect("acquisition mailbox lock")
+            .scan
+            .take()
+    }
+
+    #[cfg(test)]
+    fn pause_after_state_scan_advance_for_test(&self) {
+        if let Some(pause) = self
+            .state_scan_after_advance_pause
+            .lock()
+            .expect("state scan pause slot lock")
+            .clone()
+        {
+            pause.pause_after_advance();
+        }
+    }
+
+    fn restore_state_scan(&self, scan: ResumableStateScan) {
+        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        if self.is_done() {
+            mailbox.clear_terminal_work();
+            return;
+        }
+        assert!(mailbox.scan.is_none(), "state scan continuation must have one owner");
+        mailbox.scan = Some(scan);
+        self.stats.state_scan_yields.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .state_scan_continuations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Merge a trigger into a persisted scan without weakening request
+    /// semantics. Priority is `Timeout > ReplyHighLatency > Reply > Added >
+    /// Blind`; an equal non-timeout trigger keeps the newest peer target. A
+    /// Timeout is special: it is always broadcast (`peer = None`) and forces
+    /// `query_type = qtINDIRECT`, so later peer-specific triggers cannot turn
+    /// a timeout retry into a directed, duplicate-suppressed reply request.
+    fn retarget_state_scan(
+        &self,
+        reason: InboundLedgerRequestTrigger,
+        peer: Option<Arc<dyn Peer>>,
+    ) -> bool {
+        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        let Some(scan) = mailbox.scan.as_mut() else {
+            return false;
+        };
+
+        if reason == InboundLedgerRequestTrigger::Timeout {
+            scan.params.reason = InboundLedgerRequestTrigger::Timeout;
+            scan.params.query_depth = 0;
+            scan.params.query_type = Some(0);
+            scan.peer = None;
+            return true;
+        }
+        if scan.params.reason == InboundLedgerRequestTrigger::Timeout {
+            return true;
+        }
+
+        let priority = |trigger| match trigger {
+            InboundLedgerRequestTrigger::Timeout => 4,
+            InboundLedgerRequestTrigger::ReplyHighLatency => 3,
+            InboundLedgerRequestTrigger::Reply => 2,
+            InboundLedgerRequestTrigger::Added => 1,
+            InboundLedgerRequestTrigger::Blind => 0,
+        };
+        if priority(reason) >= priority(scan.params.reason) {
+            scan.params.reason = reason;
+            scan.params.query_depth = match reason {
+                InboundLedgerRequestTrigger::Reply => 1,
+                InboundLedgerRequestTrigger::ReplyHighLatency => 2,
+                InboundLedgerRequestTrigger::Timeout
+                | InboundLedgerRequestTrigger::Added
+                | InboundLedgerRequestTrigger::Blind => 0,
+            };
+            scan.peer = peer;
+        }
+        true
+    }
+
+    fn has_state_scan(&self) -> bool {
+        self.mailbox
+            .lock()
+            .expect("acquisition mailbox lock")
+            .scan
+            .is_some()
     }
 
     fn queue_timeout_job(self: &Arc<Self>) {
@@ -598,7 +984,9 @@ impl AcquisitionState {
         }
         let state = Arc::clone(self);
         if !self.worker_pool.try_submit_timeout(Box::new(move || {
-            run_acquisition_job(&state, "timeout", || process_timeout_job(&state));
+            // Admission was decided by WorkerPool's unchanged aggregate < 5
+            // gate. Delivery is mailbox work so a scan can never discard it.
+            state.record_admitted_timeout();
         })) {
             self.lifecycle
                 .timeout_queue_rejected
@@ -655,12 +1043,24 @@ impl AcquisitionState {
                 )
             })
             .unwrap_or((self.seq, Default::default(), 0));
-        let has_active_packet = false;
-        let buffered_packets = self
-            .data_buffer
-            .lock()
-            .expect("acquisition data_buffer lock")
-            .len();
+        let (
+            has_active_packet,
+            buffered_packets,
+            buffered_packets_high_water,
+            mailbox_token,
+            scan_continuation_pending,
+            pending_admitted_timeouts,
+        ) = {
+            let mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+            (
+                mailbox.active_packet.is_some(),
+                mailbox.buffered_packet_count(),
+                mailbox.buffered_packets_high_water,
+                mailbox.token.name(),
+                mailbox.scan.is_some(),
+                mailbox.pending_timeouts,
+            )
+        };
         let header_after_ms = self
             .stats
             .first_header_at
@@ -710,6 +1110,12 @@ impl AcquisitionState {
                 .stats
                 .state_scan_deferred_resumes
                 .load(Ordering::Relaxed),
+            state_scan_yields: self.stats.state_scan_yields.load(Ordering::Relaxed),
+            state_scan_continuations: self
+                .stats
+                .state_scan_continuations
+                .load(Ordering::Relaxed),
+            timeout_dispatches: self.stats.timeout_dispatches.load(Ordering::Relaxed),
             state_scan_max_buffered_packets: self
                 .stats
                 .state_scan_max_buffered_packets
@@ -725,6 +1131,10 @@ impl AcquisitionState {
             node_store_fetch_misses: self.stats.node_store_fetch_misses.load(Ordering::Relaxed),
             tracked_peers: self.peer_set.peer_count(),
             buffered_packets,
+            buffered_packets_high_water,
+            mailbox_token,
+            scan_continuation_pending,
+            pending_admitted_timeouts,
             has_active_packet,
         }
     }
@@ -776,47 +1186,34 @@ impl AcquisitionState {
     }
 
     pub(crate) fn take_buffered_packets(&self) -> Vec<ledger::InboundLedgerReceivedPacket> {
-        std::mem::take(
-            &mut *self
-                .data_buffer
-                .lock()
-                .expect("acquisition data buffer lock"),
-        )
-        .into_iter()
-        .map(|(peer_id, packet)| ledger::InboundLedgerReceivedPacket::new(Some(peer_id), packet))
-        .collect()
-    }
-
-    fn has_pending_data(&self) -> bool {
-        !self
-            .data_buffer
-            .lock()
-            .expect("acquisition data buffer lock")
-            .is_empty()
-    }
-
-    fn finish_data_job(self: &Arc<Self>) {
-        self.data_job_queued.store(false, Ordering::Release);
-        if !self.is_done() && self.has_pending_data() {
-            self.submit_data_job();
+        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        let mut packets = std::mem::take(&mut mailbox.packets);
+        if let Some(active) = mailbox.active_packet.take()
+            && active.next_node < active.packet.nodes.len()
+        {
+            // A swept acquisition may have yielded mid-packet. Stash only the
+            // unprocessed tail so stale-data recovery neither drops work nor
+            // replays nodes already accepted into this acquisition's store.
+            packets.insert(
+                0,
+                (
+                    active.peer_id,
+                    InboundLedgerPacket::new(
+                        active.packet.packet_type,
+                        active.packet.nodes[active.next_node..].to_vec(),
+                    ),
+                ),
+            );
         }
+        packets
+            .into_iter()
+            .map(|(peer_id, packet)| ledger::InboundLedgerReceivedPacket::new(Some(peer_id), packet))
+            .collect()
     }
 
-    /// Complete an exclusive state-map scan after its leased ledger has been
-    /// restored under `mutable`. This schedules exactly one delayed buffer
-    /// drain, rather than spinning data workers while the scan owns the tree.
-    fn finish_detached_state_scan(self: &Arc<Self>) {
-        self.state_scan_in_progress.store(false, Ordering::Release);
-        let buffered_packets = self
-            .data_buffer
-            .lock()
-            .expect("acquisition data buffer lock")
-            .len();
-        self.stats
-            .record_state_scan_buffered_packets(buffered_packets);
-        if !self.is_done() && buffered_packets != 0 {
-            self.submit_data_job();
-        }
+    fn has_pending_packets(&self) -> bool {
+        let mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        !mailbox.packets.is_empty() || mailbox.active_packet.is_some()
     }
 
     pub(crate) fn update_seq(&self, seq: u32) {
@@ -870,7 +1267,9 @@ impl AcquisitionBuilder {
         };
         let stats = Arc::new(AcquisitionStats::new());
         Arc::new(AcquisitionState {
-            data_buffer: Mutex::new(Vec::new()),
+            mailbox: Mutex::new(AcquisitionMailbox::default()),
+            #[cfg(test)]
+            state_scan_after_advance_pause: Mutex::new(None),
             mutable: Mutex::new(AcqMutableState {
                 inbound: InboundLedgerLocal::new_with_reason(self.hash, self.seq, reason),
                 store: WorkerStore {
@@ -907,8 +1306,6 @@ impl AcquisitionBuilder {
             failure_claimed: AtomicBool::new(false),
             finalization_claimed: AtomicBool::new(false),
             fetch_pack_ready: AtomicBool::new(false),
-            state_scan_in_progress: AtomicBool::new(false),
-            data_job_queued: AtomicBool::new(false),
             timer_armed: AtomicBool::new(false),
             worker_pool: self.worker_pool,
             lifecycle: self.lifecycle,
@@ -936,6 +1333,7 @@ fn run_acquisition_job(state: &Arc<AcquisitionState>, operation: &'static str, j
             "acquisition job panicked; failing acquisition"
         );
         state.mark_failed();
+        state.finish_acquisition_turn();
     }
 }
 
@@ -965,24 +1363,22 @@ fn trigger(
     reason: InboundLedgerRequestTrigger,
     peer: Option<Arc<dyn Peer>>,
 ) {
-    if state.is_done() || state.state_scan_in_progress.load(Ordering::Acquire) {
+    if state.is_done() {
         return;
     }
     state
         .lifecycle
         .request_triggers
         .fetch_add(1, Ordering::Relaxed);
+    if state.retarget_state_scan(reason, peer.clone()) {
+        // A timeout or reply arriving between scan slices updates the eventual
+        // request semantics without restarting the expensive traversal.
+        return;
+    }
 
-    // rippled releases InboundLedger's mutex for the large state-map walk.
-    // SyncTree's walk mutates the tree, so lease the entire Ledger instead of
-    // sharing a mutable tree across threads. Packets remain buffered while the
-    // lease is outstanding and the exact Ledger is restored before recheck.
     let Some(mut mutable) = state.lock_mutable("trigger") else {
         return;
     };
-    if state.state_scan_in_progress.load(Ordering::Acquire) {
-        return;
-    }
     let AcqMutableState {
         inbound,
         store,
@@ -993,7 +1389,16 @@ fn trigger(
     let family = family(state);
     let setup = inbound.prepare_trigger(reason, &journal, &config, store, fetch_pack, &family);
 
+    // Registry sweep/remove/clear/stop can become terminal after planner
+    // mutation but before this trigger emits its deferred requests. Do not
+    // create a scan continuation or send any request once that is observed.
+    if state.is_done() {
+        return;
+    }
     for msg in &setup.messages_to_send {
+        if state.is_done() {
+            return;
+        }
         state
             .lifecycle
             .request_messages
@@ -1002,131 +1407,17 @@ fn trigger(
     }
 
     if let Some(params) = setup.state_scan {
-        let Some(mut leased_ledger) = inbound.take_ledger_for_state_scan(&params) else {
+        if state.is_done() {
+            return;
+        }
+        let Some(scan) = inbound.start_resumable_state_map_scan(&params, &family) else {
             return;
         };
-        let mut scan_store = store.clone();
-        let mut scan_fetch_pack = fetch_pack.clone();
-        state.state_scan_in_progress.store(true, Ordering::Release);
-        #[cfg(test)]
-        pause_detached_state_scan_for_test();
-        drop(mutable);
-
-        let state_scan_started = Instant::now();
-        let scan_result = catch_unwind(AssertUnwindSafe(|| {
-            InboundLedgerLocal::do_state_map_scan_for_ledger(
-                &mut leased_ledger,
-                &params,
-                &mut scan_store,
-                &mut scan_fetch_pack,
-                &family,
-            )
-        }));
-        let state_scan_us = state_scan_started.elapsed().as_micros() as u64;
-
-        let Some(mut mutable) = state.lock_mutable("state scan restore") else {
-            state.finish_detached_state_scan();
-            return;
-        };
-        mutable
-            .inbound
-            .restore_ledger_after_state_scan(leased_ledger);
-        state.stats.state_scan_runs.fetch_add(1, Ordering::Relaxed);
-        state
-            .stats
-            .state_scan_us
-            .fetch_add(state_scan_us, Ordering::Relaxed);
-        let state_missing = match scan_result {
-            Ok((missing, scan_stats)) => {
-                state.stats.record_state_scan(&scan_stats);
-                if state.stats.should_emit_sampled_diagnostic() {
-                    tracing::debug!(
-                        target: "inbound_ledger",
-                        seq = state.seq,
-                        hash = %state.hash,
-                        scan_us = state_scan_us,
-                        missing = missing.len(),
-                        branches = scan_stats.branches_seen,
-                        duplicate_missing = scan_stats.duplicate_missing_hashes,
-                        pending = scan_stats.pending_reads,
-                        max_pending = scan_stats.max_pending_reads,
-                        pending_hits = scan_stats.completed_pending_reads,
-                        pending_misses = scan_stats.completed_pending_misses,
-                        "sampled state-map scan"
-                    );
-                }
-                missing
-            }
-            Err(payload) => {
-                drop(mutable);
-                state.finish_detached_state_scan();
-                std::panic::resume_unwind(payload);
-            }
-        };
-        state
-            .stats
-            .state_missing_nodes
-            .store(state_missing.len() as u64, Ordering::Relaxed);
-        let mut send_fn = |message: overlay::ProtocolMessage| {
-            state
-                .lifecycle
-                .request_messages
-                .fetch_add(1, Ordering::Relaxed);
-            // rippled broadcasts TMGetObjectByHash to ALL tracked peers
-            // (InboundLedger.cpp:542-548) regardless of trigger source.
-            let target = if matches!(message.payload, overlay::ProtocolPayload::GetObjects(_)) {
-                None
-            } else {
-                peer.as_ref()
-            };
-            state.peer_set.send_request(&message, target);
-        };
-        let state_request_sent =
-            mutable
-                .inbound
-                .apply_state_scan_results(state_missing, &params, &family, &mut send_fn);
-
-        // State requests return early in rippled. Only an empty/filtered state
-        // result falls through to transaction work in this same trigger.
-        if !state_request_sent {
-            let tx_setup = mutable.inbound.prepare_tx_after_state_scan(reason);
-            for message in tx_setup.messages_to_send {
-                send_fn(message);
-            }
-            if let Some(tx_params) = tx_setup.tx_scan.as_ref() {
-                let tx_scan_started = Instant::now();
-                let tx_missing = {
-                    let AcqMutableState {
-                        inbound,
-                        store,
-                        fetch_pack,
-                    } = &mut *mutable;
-                    inbound.do_tx_map_scan(tx_params, store, fetch_pack, &family)
-                };
-                state
-                    .stats
-                    .tx_missing_nodes
-                    .store(tx_missing.len() as u64, Ordering::Relaxed);
-                state.stats.tx_scan_us.fetch_add(
-                    tx_scan_started.elapsed().as_micros() as u64,
-                    Ordering::Relaxed,
-                );
-                mutable
-                    .inbound
-                    .apply_tx_scan_results(tx_missing, tx_params, &family, &mut send_fn);
-            }
-        }
-        if mutable.inbound.planner_state().have_header
-            && mutable.inbound.planner_state().have_state
-            && mutable.inbound.planner_state().have_transactions
-        {
-            mutable.inbound.set_complete();
-        }
-        let terminal = mutable.inbound.is_failed() || mutable.inbound.is_complete();
-        drop(mutable);
-        state.finish_detached_state_scan();
-        if terminal {
-            finalize_terminal(state);
+        // The acquisition turn still owns the token. Retain traversal state
+        // rather than leasing a Ledger to a whole worker job; the next turn
+        // advances this exact stack and pending-read set within fixed bounds.
+        if state.install_state_scan(ResumableStateScan { params, scan, peer }) {
+            state.submit_data_job();
         }
         return;
     }
@@ -1135,6 +1426,9 @@ fn trigger(
     // complete, invalid, or setup emitted a state-root request.
     let state_request_sent = setup.state_request_pending;
     if !state_request_sent {
+        if state.is_done() {
+            return;
+        }
         if let Some(params) = setup.tx_scan.as_ref() {
             let tx_scan_started = Instant::now();
             let tx_missing = inbound.do_tx_map_scan(params, store, fetch_pack, &family);
@@ -1146,7 +1440,13 @@ fn trigger(
                 tx_scan_started.elapsed().as_micros() as u64,
                 Ordering::Relaxed,
             );
+            if state.is_done() {
+                return;
+            }
             let mut send_fn = |message: overlay::ProtocolMessage| {
+                if state.is_done() {
+                    return;
+                }
                 state
                     .lifecycle
                     .request_messages
@@ -1249,153 +1549,393 @@ fn process_init(state: &Arc<AcquisitionState>) {
     state.queue_timeout_job();
 }
 
+fn process_acquisition_turn(state: &Arc<AcquisitionState>) {
+    if !state.begin_acquisition_turn() {
+        return;
+    }
+    if state.is_done() {
+        state.finish_acquisition_turn();
+        return;
+    }
+
+    // Timeout bookkeeping and packet draining retain their existing order, but
+    // neither may defer a live persisted scan to a later turn. Each live
+    // continuation advances exactly one bounded slice before the token can be
+    // requeued, so continuous ingress or admitted timer events cannot starve
+    // its traversal.
+    if state.take_admitted_timeout() {
+        process_timeout_job(state);
+    }
+    if !state.is_done()
+        && (state.fetch_pack_ready.load(Ordering::Acquire) || state.has_pending_packets())
+    {
+        process_data_job(state);
+    }
+    if !state.is_done() && state.has_state_scan() {
+        process_state_scan_turn(state);
+    }
+    state.finish_acquisition_turn();
+}
+
 fn process_data_job(state: &Arc<AcquisitionState>) {
     if state.is_done() {
-        state.data_job_queued.store(false, Ordering::Release);
-        return;
-    }
-    if state.state_scan_in_progress.load(Ordering::Acquire) {
-        // The scan completion path restores the ledger and schedules one
-        // buffer drain. Do not turn buffered ingress into worker churn here.
-        state.data_job_queued.store(false, Ordering::Release);
         return;
     }
 
-    let Some(mut mutable) = state.lock_mutable("data processing") else {
-        state.finish_data_job();
+    // A packet is retained outside the mailbox only while this one-token turn
+    // owns it. Incomplete node packets are restored before the turn yields,
+    // so ingress cannot reorder or replace their FIFO continuation.
+    let Some(mut packet) = state.take_packet_for_turn() else {
+        let Some(mut mutable) = state.lock_mutable("data processing") else {
+            return;
+        };
+        let data_drain_started = Instant::now();
+        if state.fetch_pack_ready.swap(false, Ordering::AcqRel) {
+            check_local(state, &mut mutable);
+        }
+        let terminal = mutable.inbound.is_failed() || mutable.inbound.is_complete();
+        drop(mutable);
+        state
+            .stats
+            .record_data_drain(data_drain_started.elapsed().as_micros() as u64, 0);
+        if terminal {
+            finalize_terminal(state);
+        }
         return;
     };
-    if state.state_scan_in_progress.load(Ordering::Acquire) {
-        drop(mutable);
-        state.data_job_queued.store(false, Ordering::Release);
-        return;
-    }
-    if state.fetch_pack_ready.swap(false, Ordering::AcqRel) {
-        check_local(state, &mut mutable);
-    }
-    if mutable.inbound.is_failed() || mutable.inbound.is_complete() {
-        drop(mutable);
-        finalize_terminal(state);
-        state.finish_data_job();
-        return;
-    }
 
-    // Match rippled InboundLedger::runData: one coalesced dispatch repeatedly
-    // drains everything received while it runs, then samples useful peers once
-    // for the next reply-triggered request round. The refill closure closes the
-    // race with concurrent router ingress without holding the buffer lock while
-    // packet processing or NodeStore writes occur.
-    let had_header = mutable.inbound.planner_state().have_header;
-    let journal = WorkerJournal;
-    let config = ledger::LedgerConfig::default();
-    let family = family(state);
     let data_drain_started = Instant::now();
-    let result = {
+    let packet_type = packet.packet.packet_type;
+    let mut packet_complete = false;
+    let mut malformed = None;
+    let mut invalid = false;
+    let mut had_header = false;
+    let terminal;
+    {
+        let Some(mut mutable) = state.lock_mutable("data processing") else {
+            return;
+        };
+        if state.fetch_pack_ready.swap(false, Ordering::AcqRel) {
+            check_local(state, &mut mutable);
+        }
         let AcqMutableState {
             inbound,
             store,
             fetch_pack,
         } = &mut *mutable;
-        let mut refill = || state.take_buffered_packets();
-        inbound.run_data_with_family_and_config_and_refill(
-            &journal,
-            &config,
-            store,
-            fetch_pack,
-            &family,
-            &mut refill,
-        )
-    };
+        if !(inbound.is_failed() || inbound.is_complete()) {
+            had_header = inbound.planner_state().have_header;
+            let journal = WorkerJournal;
+            let config = ledger::LedgerConfig::default();
+            let family = family(state);
+            match inbound.process_packet_step_with_family_and_config(
+                &packet.packet,
+                packet.next_node,
+                INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP
+                    .saturating_mul(MAX_PACKET_STEPS_PER_ACQUISITION_TURN),
+                &journal,
+                &config,
+                store,
+                fetch_pack,
+                &family,
+            ) {
+                Ok(step) => {
+                    packet.stats += step.stats;
+                    inbound.record_packet_progress(step.stats);
+                    if step.complete {
+                        inbound.record_packet_stats_with_family_and_config(
+                            packet.stats,
+                            &journal,
+                            &config,
+                            &family,
+                        );
+                        packet_complete = true;
+                        invalid = packet.stats.is_invalid();
+                    } else {
+                        packet.next_node = step.next_node;
+                    }
+                }
+                Err(error) => {
+                    packet_complete = true;
+                    malformed = Some(error);
+                }
+            }
+        }
+        terminal = inbound.is_failed() || inbound.is_complete();
+    }
+
     let data_drain_us = data_drain_started.elapsed().as_micros() as u64;
     state
         .stats
-        .record_data_drain(data_drain_us, result.processed_packets);
+        .record_data_drain(data_drain_us, usize::from(packet_complete));
     if state.stats.should_emit_sampled_diagnostic() {
         tracing::debug!(
             target: "inbound_ledger",
             seq = state.seq,
             hash = %state.hash,
             drain_us = data_drain_us,
-            packets = result.processed_packets,
-            useful_packets = result.useful_packets,
-            useful_nodes = result.useful_nodes,
-            state_packets = result.state_packets,
-            state_nodes = result.state_useful_nodes,
-            "sampled inbound data drain"
+            packet_complete,
+            next_node = packet.next_node,
+            node_step_budget = INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP,
+            "sampled bounded inbound data step"
         );
     }
 
-    if !had_header && mutable.inbound.planner_state().have_header {
-        state.stats.mark_header_received();
+    if !packet_complete {
+        if terminal {
+            finalize_terminal(state);
+        } else {
+            state.restore_packet_for_turn(packet);
+        }
+        return;
     }
-    state
-        .lifecycle
-        .packet_steps
-        .fetch_add(result.processed_packets as u64, Ordering::Relaxed);
+
+    if !had_header && !terminal {
+        let has_header = state
+            .lock_mutable("data header diagnostics")
+            .is_some_and(|mutable| mutable.inbound.planner_state().have_header);
+        if has_header {
+            state.stats.mark_header_received();
+        }
+    }
+    state.lifecycle.packet_steps.fetch_add(1, Ordering::Relaxed);
     state
         .lifecycle
         .packet_steps_completed
-        .fetch_add(result.processed_packets as u64, Ordering::Relaxed);
-    state
-        .stats
-        .packets
-        .fetch_add(result.processed_packets as u64, Ordering::Relaxed);
+        .fetch_add(1, Ordering::Relaxed);
+    state.stats.packets.fetch_add(1, Ordering::Relaxed);
+    let useful_nodes = packet.stats.get_good().max(0) as u64;
     state
         .stats
         .useful_packets
-        .fetch_add(result.useful_packets as u64, Ordering::Relaxed);
-    state
-        .stats
-        .useful_nodes
-        .fetch_add(result.useful_nodes, Ordering::Relaxed);
-    state
-        .stats
-        .state_packets
-        .fetch_add(result.state_packets as u64, Ordering::Relaxed);
-    state
-        .stats
-        .state_useful_nodes
-        .fetch_add(result.state_useful_nodes, Ordering::Relaxed);
-    state
-        .stats
-        .state_duplicate_nodes
-        .fetch_add(result.state_duplicate_nodes, Ordering::Relaxed);
-    state.lifecycle.packet_step_errors.fetch_add(
-        (result.malformed_packets.len() + result.invalid_packets.len()) as u64,
-        Ordering::Relaxed,
-    );
-    state
-        .stats
-        .malformed_packets
-        .fetch_add(result.malformed_packets.len() as u64, Ordering::Relaxed);
-    for (peer_id, packet_type, error) in result.malformed_packets {
-        charge_malformed_packet(state, peer_id, packet_type, error);
+        .fetch_add(u64::from(useful_nodes != 0), Ordering::Relaxed);
+    state.stats.useful_nodes.fetch_add(useful_nodes, Ordering::Relaxed);
+    if packet_type == ledger::InboundLedgerDataType::StateNode {
+        state.stats.state_packets.fetch_add(1, Ordering::Relaxed);
+        state
+            .stats
+            .state_useful_nodes
+            .fetch_add(useful_nodes, Ordering::Relaxed);
+        state.stats.state_duplicate_nodes.fetch_add(
+            packet.stats.get_duplicate().max(0) as u64,
+            Ordering::Relaxed,
+        );
     }
-    for (peer_id, packet_type, error) in result.invalid_packets {
-        charge_invalid_data_packet(state, peer_id, packet_type, error);
+    let packet_error_count = usize::from(malformed.is_some()) + usize::from(invalid);
+    state
+        .lifecycle
+        .packet_step_errors
+        .fetch_add(packet_error_count as u64, Ordering::Relaxed);
+    if let Some(error) = malformed {
+        state.stats.malformed_packets.fetch_add(1, Ordering::Relaxed);
+        charge_malformed_packet(state, packet.peer_id, packet_type, error);
+    }
+    if invalid {
+        charge_invalid_data_packet(
+            state,
+            packet.peer_id,
+            packet_type,
+            InboundLedgerPacketError::InvalidData,
+        );
     }
 
-    let reply_requests: Vec<_> = result
-        .triggered_peer_ids
-        .into_iter()
-        .filter_map(|peer_id| {
-            let peer = state.peer_set.find_peer(peer_id as u32)?;
+    if terminal {
+        finalize_terminal(state);
+        return;
+    }
+    // A registry terminal transition can race after the packet mutation lock
+    // is released. It must suppress this packet's deferred reply triggers;
+    // `finish_acquisition_turn` performs the ordinary mailbox cleanup.
+    if state.is_done() {
+        return;
+    }
+    // Do not trigger once per completed packet or node chunk. The mailbox
+    // records useful results in FIFO order and returns peers only after it
+    // observed the active packet and its coalesced queue empty under the
+    // same lock; a concurrent later arrival becomes the next batch.
+    for peer_id in state.finish_packet_batch(packet.peer_id, useful_nodes) {
+        if let Some(peer) = state.peer_set.find_peer(peer_id as u32) {
             let reason = if peer.is_high_latency() {
                 InboundLedgerRequestTrigger::ReplyHighLatency
             } else {
                 InboundLedgerRequestTrigger::Reply
             };
-            Some((reason, peer))
-        })
-        .collect();
+            trigger(state, reason, Some(peer));
+        }
+    }
+}
+
+fn process_state_scan_turn(state: &Arc<AcquisitionState>) {
+    let Some(mut continuation) = state.take_state_scan() else {
+        return;
+    };
+    // Once taken, this continuation has exactly two live outcomes: it is
+    // restored below after a bounded incomplete slice, or it is consumed by
+    // result application. Any early return here follows `is_done` or
+    // `lock_mutable`, the latter marking failure, and terminal cleanup clears
+    // the mailbox instead of reviving the continuation.
+    if state.is_done() {
+        return;
+    }
+
+    let scan_started = Instant::now();
+    let family = family(state);
+    let complete = {
+        let Some(mut mutable) = state.lock_mutable("resumable state scan") else {
+            return;
+        };
+        let AcqMutableState {
+            inbound,
+            store,
+            fetch_pack,
+        } = &mut *mutable;
+        inbound.advance_resumable_state_map_scan(
+            &mut continuation.scan,
+            &continuation.params,
+            store,
+            fetch_pack,
+            &family,
+            STATE_SCAN_MAX_DEFERRED_READS_PER_TURN,
+            STATE_SCAN_MAX_BRANCHES_PER_TURN,
+        )
+    };
+    #[cfg(test)]
+    state.pause_after_state_scan_advance_for_test();
+    // A registry sweep/remove/clear/stop can set terminal while the exclusive
+    // SyncTree advance is in progress. This check is deliberately before any
+    // continuation consumption, result application, transaction follow-up,
+    // or peer request. Dropping the local continuation lets the normal turn
+    // finalizer clear the mailbox; terminal work is never restored.
+    if state.is_done() {
+        return;
+    }
+
+    let scan_us = scan_started.elapsed().as_micros() as u64;
+    state.stats.state_scan_runs.fetch_add(1, Ordering::Relaxed);
+    state.stats.state_scan_us.fetch_add(scan_us, Ordering::Relaxed);
+
+    if !complete {
+        if state.is_done() {
+            return;
+        }
+        let pending_reads = continuation.scan.pending_requests().len();
+        if state.stats.should_emit_sampled_diagnostic() {
+            tracing::debug!(
+                target: "inbound_ledger",
+                seq = state.seq,
+                hash = %state.hash,
+                scan_us,
+                branch_budget = STATE_SCAN_MAX_BRANCHES_PER_TURN,
+                read_budget = STATE_SCAN_MAX_DEFERRED_READS_PER_TURN,
+                pending_reads,
+                "sampled resumable state-map scan yielded"
+            );
+        }
+        state.restore_state_scan(continuation);
+        return;
+    }
+
+    // Do not consume final scan results if terminal was published after the
+    // bounded advance but before this final-slice handoff.
+    if state.is_done() {
+        return;
+    }
+    let (state_missing, scan_stats) = continuation.scan.into_missing_nodes_and_stats();
+    state.stats.record_state_scan(&scan_stats);
+    state
+        .stats
+        .state_missing_nodes
+        .store(state_missing.len() as u64, Ordering::Relaxed);
+    if state.stats.should_emit_sampled_diagnostic() {
+        tracing::debug!(
+            target: "inbound_ledger",
+            seq = state.seq,
+            hash = %state.hash,
+            scan_us,
+            missing = state_missing.len(),
+            branches = scan_stats.branches_seen,
+            pending = scan_stats.pending_reads,
+            "sampled resumable state-map scan completed"
+        );
+    }
+
+    let Some(mut mutable) = state.lock_mutable("state scan results") else {
+        return;
+    };
+    // The mutable lock can be contended while registry terminal state changes,
+    // so recheck directly before applying the already-computed scan results.
+    if state.is_done() {
+        return;
+    }
+    let mut send_fn = |message: overlay::ProtocolMessage| {
+        if state.is_done() {
+            return;
+        }
+        state
+            .lifecycle
+            .request_messages
+            .fetch_add(1, Ordering::Relaxed);
+        let target = if matches!(message.payload, overlay::ProtocolPayload::GetObjects(_)) {
+            None
+        } else {
+            continuation.peer.as_ref()
+        };
+        state.peer_set.send_request(&message, target);
+    };
+    let state_request_sent = mutable.inbound.apply_state_scan_results(
+        state_missing,
+        &continuation.params,
+        &family,
+        &mut send_fn,
+    );
+
+    // State remains first. A terminal state observed after result application
+    // must still suppress transaction follow-up and every deferred send.
+    if state.is_done() {
+        return;
+    }
+    // Only no-request state results fall through to the existing transaction
+    // logic, preserving request filtering and completion.
+    if !state_request_sent {
+        let tx_setup = mutable
+            .inbound
+            .prepare_tx_after_state_scan(continuation.params.reason);
+        for message in tx_setup.messages_to_send {
+            send_fn(message);
+        }
+        if let Some(tx_params) = tx_setup.tx_scan.as_ref() {
+            let tx_started = Instant::now();
+            let tx_missing = {
+                let AcqMutableState {
+                    inbound,
+                    store,
+                    fetch_pack,
+                } = &mut *mutable;
+                inbound.do_tx_map_scan(tx_params, store, fetch_pack, &family)
+            };
+            state
+                .stats
+                .tx_missing_nodes
+                .store(tx_missing.len() as u64, Ordering::Relaxed);
+            state.stats.tx_scan_us.fetch_add(
+                tx_started.elapsed().as_micros() as u64,
+                Ordering::Relaxed,
+            );
+            mutable
+                .inbound
+                .apply_tx_scan_results(tx_missing, tx_params, &family, &mut send_fn);
+        }
+    }
+    if mutable.inbound.planner_state().have_header
+        && mutable.inbound.planner_state().have_state
+        && mutable.inbound.planner_state().have_transactions
+    {
+        mutable.inbound.set_complete();
+    }
     let terminal = mutable.inbound.is_failed() || mutable.inbound.is_complete();
     drop(mutable);
     if terminal {
         finalize_terminal(state);
-    }
-    state.finish_data_job();
-    for (reason, peer) in reply_requests {
-        trigger(state, reason, Some(peer));
     }
 }
 
@@ -1447,11 +1987,18 @@ fn process_timeout_job(state: &Arc<AcquisitionState>) {
     if state.is_done() {
         return;
     }
-    if state.state_scan_in_progress.load(Ordering::Acquire) {
-        // rippled's timer cannot mutate the inbound planner until the map walk
-        // releases its lock; re-arm rather than treating this as no progress.
-        state.arm_timer();
-        return;
+    // This function runs only after `take_admitted_timeout` consumes one
+    // mailbox event. The one acquisition token makes the mutable planner safe
+    // without a scan-active discard/re-arm branch.
+    state.stats.timeout_dispatches.fetch_add(1, Ordering::Relaxed);
+    if state.stats.should_emit_sampled_diagnostic() {
+        tracing::debug!(
+            target: "inbound_ledger",
+            seq = state.seq,
+            hash = %state.hash,
+            timeout_dispatches = state.stats.timeout_dispatches.load(Ordering::Relaxed),
+            "sampled admitted timeout dispatched from acquisition mailbox"
+        );
     }
     state.lifecycle.timeout_jobs.fetch_add(1, Ordering::Relaxed);
 
@@ -1490,6 +2037,12 @@ fn process_timeout_job(state: &Arc<AcquisitionState>) {
 
     if failed || finalize {
         finalize_terminal(state);
+        return;
+    }
+    // Timeout recovery mutates planner state before it fans out requests. A
+    // concurrent registry terminal transition must stop that follow-up; the
+    // running turn will perform mailbox cleanup.
+    if state.is_done() {
         return;
     }
     if retry {
@@ -1715,9 +2268,8 @@ mod tests {
     use super::super::worker_pool::WorkerPool;
     use super::{
         ACQUIRE_TIMEOUT, AcquisitionBuilder, AcquisitionCompletionRecorder,
-        AcquisitionFailureRecorder, AcquisitionState, DetachedStateScanPause,
-        detached_state_scan_pause_slot, peer_has_acquisition_target, publish_completed_ledger,
-        record_completed_ledger, trigger,
+        AcquisitionFailureRecorder, AcquisitionState, StateScanAfterAdvancePause,
+        peer_has_acquisition_target, publish_completed_ledger, record_completed_ledger, trigger,
     };
     use basics::base_uint::Uint256;
     use basics::basic_config::BasicConfig;
@@ -1834,24 +2386,28 @@ mod tests {
         )
     }
 
-    fn state_scan_pause() -> Arc<DetachedStateScanPause> {
-        let pause = Arc::new(DetachedStateScanPause::default());
-        let mut slot = detached_state_scan_pause_slot()
+    fn install_state_scan_after_advance_pause(
+        state: &AcquisitionState,
+    ) -> Arc<StateScanAfterAdvancePause> {
+        let pause = Arc::new(StateScanAfterAdvancePause::default());
+        let mut slot = state
+            .state_scan_after_advance_pause
             .lock()
-            .expect("detached scan pause slot lock");
-        assert!(
-            slot.is_none(),
-            "a detached state scan pause is already installed"
-        );
+            .expect("state scan pause slot lock");
+        assert!(slot.is_none(), "an acquisition already has a scan pause");
         *slot = Some(Arc::clone(&pause));
         pause
     }
 
-    fn clear_state_scan_pause(pause: &DetachedStateScanPause) {
+    fn clear_state_scan_after_advance_pause(
+        state: &AcquisitionState,
+        pause: &StateScanAfterAdvancePause,
+    ) {
         pause.release();
-        *detached_state_scan_pause_slot()
+        *state
+            .state_scan_after_advance_pause
             .lock()
-            .expect("detached scan pause slot lock") = None;
+            .expect("state scan pause slot lock") = None;
     }
 
     fn header_and_state_root_packets_with_missing_child()
@@ -1884,94 +2440,168 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_real_detached_state_scan_defers_and_then_drains_packet() {
+    fn acquisition_state_scan_is_mailbox_continuation_work() {
         let worker_pool = Arc::new(WorkerPool::new(0));
         let (wanted_hash, header_packet, state_root_packet) =
             header_and_state_root_packets_with_missing_child();
-        let (_dir, state, lifecycle) =
+        let (_dir, state, _lifecycle) =
             timeout_state_with_hash(Arc::clone(&worker_pool), wanted_hash);
 
-        state
-            .data_buffer
-            .lock()
-            .expect("data buffer lock")
-            .push((7, header_packet));
-        state
-            .data_buffer
-            .lock()
-            .expect("data buffer lock")
-            .push((7, state_root_packet));
-        state.submit_data_job();
+        state.enqueue_packet(7, header_packet);
+        state.enqueue_packet(7, state_root_packet);
         assert!(worker_pool.run_next_job_for_test());
         assert!(state.diagnostics().have_header);
         assert!(!state.diagnostics().have_state);
 
-        let pause = state_scan_pause();
-        let scan_state = Arc::clone(&state);
-        let scan_thread = thread::spawn(move || {
-            trigger(&scan_state, InboundLedgerRequestTrigger::Timeout, None);
-        });
-        pause.wait_until_entered();
-        assert!(state.state_scan_in_progress.load(Ordering::Acquire));
-
-        let buffered = InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new());
-        state
-            .data_buffer
-            .lock()
-            .expect("data buffer lock")
-            .push((7, buffered));
-        state.submit_data_job();
-        assert!(worker_pool.run_next_job_for_test());
-        let buffered_packets = state.data_buffer.lock().expect("data buffer lock").len();
-        assert_eq!(buffered_packets, 1);
-        assert_eq!(lifecycle.packet_steps.load(Ordering::Relaxed), 2);
-
-        clear_state_scan_pause(&pause);
-        scan_thread.join().expect("detached state scan thread");
-        assert_eq!(state.diagnostics().state_scan_runs, 1);
-        assert!(!state.state_scan_in_progress.load(Ordering::Acquire));
+        trigger(&state, InboundLedgerRequestTrigger::Timeout, None);
+        assert!(state.diagnostics().scan_continuation_pending);
         assert_eq!(worker_pool.snapshot().queued_jobs, 1);
-
         assert!(worker_pool.run_next_job_for_test());
-        assert_eq!(state.diagnostics().buffered_packets, 0);
-        assert_eq!(lifecycle.packet_steps.load(Ordering::Relaxed), 3);
-        assert_eq!(lifecycle.packet_step_errors.load(Ordering::Relaxed), 1);
+        assert!(state.diagnostics().state_scan_runs >= 1);
     }
 
     #[test]
-    fn acquisition_buffered_packet_waits_for_detached_scan_completion() {
+    fn acquisition_turn_advances_scan_with_pending_packet_and_timeout() {
         let worker_pool = Arc::new(WorkerPool::new(0));
-        let (_dir, state, lifecycle) = timeout_state(Arc::clone(&worker_pool));
-        let packet = InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new());
+        let (wanted_hash, header_packet, _) = header_and_state_root_packets_with_missing_child();
+        let (_dir, state, lifecycle) =
+            timeout_state_with_hash(Arc::clone(&worker_pool), wanted_hash);
 
-        // Model the production interval in which trigger has leased the
-        // mutable ledger to its out-of-lock state-map walk. Router ingress
-        // remains live, but its worker must not access the leased planner.
-        state.state_scan_in_progress.store(true, Ordering::Release);
-        state
-            .data_buffer
-            .lock()
-            .expect("data buffer lock")
-            .push((7, packet));
-        state.submit_data_job();
+        state.enqueue_packet(7, header_packet);
+        assert!(worker_pool.run_next_job_for_test());
+        trigger(&state, InboundLedgerRequestTrigger::Reply, None);
+        assert!(state.diagnostics().scan_continuation_pending);
+
+        state.enqueue_packet(
+            7,
+            InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new()),
+        );
+        state.record_admitted_timeout();
         assert_eq!(worker_pool.snapshot().queued_jobs, 1);
 
         assert!(worker_pool.run_next_job_for_test());
-        assert_eq!(lifecycle.data_jobs_started.load(Ordering::Relaxed), 1);
-        assert_eq!(state.diagnostics().buffered_packets, 1);
-        assert_eq!(lifecycle.packet_steps.load(Ordering::Relaxed), 0);
-        assert_eq!(worker_pool.snapshot().queued_jobs, 0);
+        assert_eq!(lifecycle.timeout_jobs.load(Ordering::Relaxed), 1);
+        assert_eq!(lifecycle.packet_steps.load(Ordering::Relaxed), 2);
+        assert!(
+            state.diagnostics().state_scan_runs >= 1,
+            "a persisted scan receives a slice despite packet and timeout work"
+        );
+    }
 
-        // This is the production completion edge after the detached scan has
-        // restored the ledger. It must schedule one delayed buffer drain.
-        state.finish_detached_state_scan();
-        assert_eq!(worker_pool.snapshot().queued_jobs, 1);
-        assert_eq!(
-            lifecycle.data_jobs_submitted.load(Ordering::Relaxed),
-            2,
-            "scan completion must enqueue exactly one follow-up data drain"
+    #[test]
+    fn acquisition_timeout_retarget_is_strongest_and_remains_broadcast() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (wanted_hash, header_packet, _) = header_and_state_root_packets_with_missing_child();
+        let (_dir, state, _lifecycle) =
+            timeout_state_with_hash(Arc::clone(&worker_pool), wanted_hash);
+        let peer: Arc<dyn Peer> = PeerImp::new(
+            71,
+            SocketAddr::from(([127, 0, 0, 1], 51235)),
+            PublicKey::from_bytes([0x02; 33]),
+            "retarget-peer",
         );
 
+        state.enqueue_packet(7, header_packet);
+        assert!(worker_pool.run_next_job_for_test());
+        trigger(
+            &state,
+            InboundLedgerRequestTrigger::Reply,
+            Some(Arc::clone(&peer)),
+        );
+        trigger(&state, InboundLedgerRequestTrigger::Timeout, None);
+        trigger(
+            &state,
+            InboundLedgerRequestTrigger::ReplyHighLatency,
+            Some(peer),
+        );
+
+        let mailbox = state.mailbox.lock().expect("acquisition mailbox lock");
+        let scan = mailbox.scan.as_ref().expect("persisted scan continuation");
+        assert_eq!(scan.params.reason, InboundLedgerRequestTrigger::Timeout);
+        assert_eq!(scan.params.query_depth, 0);
+        assert_eq!(scan.params.query_type, Some(0));
+        assert!(scan.peer.is_none(), "Timeout remains broadcast after retargets");
+    }
+
+    #[test]
+    fn acquisition_batch_reply_selection_waits_for_mailbox_emptiness() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, state, _lifecycle) = timeout_state(Arc::clone(&worker_pool));
+        {
+            let mut mailbox = state.mailbox.lock().expect("acquisition mailbox lock");
+            mailbox.packets.push((
+                8,
+                InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new()),
+            ));
+        }
+
+        assert!(
+            state.finish_packet_batch(7, 4).is_empty(),
+            "reply peers must remain buffered while the mailbox batch has packets"
+        );
+        state
+            .mailbox
+            .lock()
+            .expect("acquisition mailbox lock")
+            .packets
+            .clear();
+        assert_eq!(
+            state.finish_packet_batch(7, 0),
+            vec![7],
+            "the same batch becomes triggerable only after empty observation"
+        );
+    }
+
+    #[test]
+    fn acquisition_stopped_after_scan_advance_sends_no_request_or_continuation() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (wanted_hash, header_packet, _) = header_and_state_root_packets_with_missing_child();
+        let (_dir, state, _lifecycle) =
+            timeout_state_with_hash(Arc::clone(&worker_pool), wanted_hash);
+        let peer = PeerImp::new(
+            72,
+            SocketAddr::from(([127, 0, 0, 1], 51235)),
+            PublicKey::from_bytes([0x03; 33]),
+            "post-scan-stop-peer",
+        );
+        peer.record_ledger(*wanted_hash.as_uint256(), 1);
+        state
+            .peer_set
+            .refresh_peers(vec![Arc::clone(&peer) as Arc<dyn Peer>]);
+        state.peer_set.add_peers(1, &mut |_| true, &mut |_| {});
+
+        state.enqueue_packet(72, header_packet);
+        assert!(worker_pool.run_next_job_for_test());
+        trigger(&state, InboundLedgerRequestTrigger::Timeout, None);
+        assert!(state.diagnostics().scan_continuation_pending);
+        let sent_before_scan = peer.queued_messages().len();
+        let pause = install_state_scan_after_advance_pause(&state);
+
+        let advancing_pool = Arc::clone(&worker_pool);
+        let advancing = thread::spawn(move || {
+            assert!(advancing_pool.run_next_job_for_test());
+        });
+        pause.wait_until_entered();
+        state.stopped.store(true, Ordering::Release);
+        pause.release();
+        advancing.join().expect("bounded scan worker thread");
+        clear_state_scan_after_advance_pause(&state, &pause);
+
+        assert_eq!(peer.queued_messages().len(), sent_before_scan);
+        let diagnostics = state.diagnostics();
+        assert!(!diagnostics.scan_continuation_pending);
+        assert_eq!(diagnostics.mailbox_token, "idle");
+    }
+
+    #[test]
+    fn acquisition_mailbox_packet_is_processed_without_scan_active_noop() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, state, lifecycle) = timeout_state(Arc::clone(&worker_pool));
+        state.enqueue_packet(
+            7,
+            InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new()),
+        );
+        assert_eq!(worker_pool.snapshot().queued_jobs, 1);
         assert!(worker_pool.run_next_job_for_test());
         assert_eq!(state.diagnostics().buffered_packets, 0);
         assert_eq!(lifecycle.packet_steps.load(Ordering::Relaxed), 1);
@@ -1979,26 +2609,17 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_data_worker_coalesces_and_drains_buffered_packets() {
+    fn acquisition_data_worker_coalesces_and_resumes_buffered_packets() {
         let worker_pool = Arc::new(WorkerPool::new(0));
         let (_dir, state, lifecycle) = timeout_state(Arc::clone(&worker_pool));
         let packet = InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new());
 
         // This is the same buffer-then-dispatch sequence used by registry
         // routing. Two arrivals before the worker runs must produce one
-        // coalesced data job, then that job must drain both packets.
-        state
-            .data_buffer
-            .lock()
-            .expect("data buffer lock")
-            .push((7, packet.clone()));
-        state.submit_data_job();
-        state
-            .data_buffer
-            .lock()
-            .expect("data buffer lock")
-            .push((7, packet));
-        state.submit_data_job();
+        // coalesced data job. The bounded FIFO packet step then schedules
+        // exactly one continuation for the second packet.
+        state.enqueue_packet(7, packet.clone());
+        state.enqueue_packet(7, packet);
 
         assert_eq!(worker_pool.snapshot().queued_jobs, 1);
         assert_eq!(lifecycle.data_jobs_submitted.load(Ordering::Relaxed), 1);
@@ -2006,9 +2627,15 @@ mod tests {
         assert_eq!(state.diagnostics().buffered_packets, 2);
 
         assert!(worker_pool.run_next_job_for_test());
+        assert_eq!(worker_pool.snapshot().queued_jobs, 1);
+        assert_eq!(state.diagnostics().buffered_packets, 1);
+        assert_eq!(lifecycle.data_jobs_started.load(Ordering::Relaxed), 1);
+        assert_eq!(lifecycle.packet_steps.load(Ordering::Relaxed), 1);
+
+        assert!(worker_pool.run_next_job_for_test());
         assert_eq!(worker_pool.snapshot().queued_jobs, 0);
         assert_eq!(state.diagnostics().buffered_packets, 0);
-        assert_eq!(lifecycle.data_jobs_started.load(Ordering::Relaxed), 1);
+        assert_eq!(lifecycle.data_jobs_started.load(Ordering::Relaxed), 2);
         assert_eq!(lifecycle.packet_steps.load(Ordering::Relaxed), 2);
         assert_eq!(lifecycle.packet_steps_completed.load(Ordering::Relaxed), 2);
         assert_eq!(
@@ -2056,11 +2683,10 @@ mod tests {
         );
         assert_eq!(request.ledger_seq, Some(1));
 
-        state.data_buffer.lock().expect("data buffer lock").push((
+        state.enqueue_packet(
             73,
             InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new()),
-        ));
-        state.submit_data_job();
+        );
         assert!(worker_pool.run_next_job_for_test());
 
         let charges = peer.charges();
@@ -2070,30 +2696,34 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_start_queues_initialization_before_timeout_work() {
+    fn acquisition_start_initializes_synchronously_before_timeout_work() {
         let worker_pool = Arc::new(WorkerPool::new(0));
         let (_dir, state, lifecycle) = timeout_state(Arc::clone(&worker_pool));
 
         state.start();
 
-        assert_eq!(lifecycle.initialization_jobs.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            lifecycle.initialization_jobs.load(Ordering::Relaxed),
+            1,
+            "initialization runs synchronously before the first mailbox token"
+        );
         assert_eq!(
             worker_pool.snapshot().queued_jobs,
             1,
-            "initialization must be handed to the worker instead of the caller"
+            "synchronous initialization admits only its first timeout callback"
         );
+        assert_eq!(state.diagnostics().pending_admitted_timeouts, 0);
+
+        // The first queued timeout callback only parks the admitted event and
+        // queues the acquisition turn that will perform recovery.
         assert!(worker_pool.run_next_job_for_test());
-        assert_eq!(lifecycle.initialization_jobs.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            worker_pool.snapshot().queued_jobs,
-            1,
-            "initialization must enqueue the first timeout only after its worker turn"
-        );
+        assert_eq!(state.diagnostics().pending_admitted_timeouts, 1);
+        assert_eq!(worker_pool.snapshot().queued_jobs, 1);
         worker_pool.stop();
     }
 
     #[test]
-    fn acquisition_timeout_timer_queues_worker_recovery_and_rearms_after_drain() {
+    fn acquisition_timeout_timer_parks_then_dispatches_recovery_and_rearms() {
         let worker_pool = Arc::new(WorkerPool::new(0));
         let (_dir, state, lifecycle) = timeout_state(Arc::clone(&worker_pool));
 
@@ -2117,9 +2747,15 @@ mod tests {
         );
         assert_eq!(worker_pool.snapshot().queued_jobs, 1);
 
-        // Draining the real queued timeout calls process_timeout_job, performs
-        // the local-store check, applies the no-progress retry policy, and
-        // arms the next three-second timer.
+        // The admitted timeout closure only parks one mailbox event and queues
+        // an acquisition turn; it must not execute recovery itself.
+        assert!(worker_pool.run_next_job_for_test());
+        assert_eq!(lifecycle.timeout_jobs.load(Ordering::Relaxed), 0);
+        assert_eq!(state.diagnostics().pending_admitted_timeouts, 1);
+        assert_eq!(worker_pool.snapshot().queued_jobs, 1);
+
+        // The following acquisition turn consumes the parked event, performs
+        // the local-store check and retry policy, then arms the next timer.
         assert!(worker_pool.run_next_job_for_test());
         assert_eq!(lifecycle.timeout_jobs.load(Ordering::Relaxed), 1);
         assert_eq!(lifecycle.timeout_no_progress.load(Ordering::Relaxed), 1);

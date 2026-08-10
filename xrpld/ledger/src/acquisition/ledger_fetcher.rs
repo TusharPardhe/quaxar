@@ -23,7 +23,9 @@ use overlay::{ProtocolMessage, ProtocolPayload, TmGetLedger, TmGetObjectByHash};
 use protocol::JsonValue;
 use shamap::family::{FullBelowCache, MissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher};
 use shamap::fetch::SHAMapSyncFilter;
-use shamap::sync::{MissingNodeRef, SHAMapAddNode, SHAMapMissingNode, SHAMapType, SyncTree};
+use shamap::sync::{
+    DeferredMissingNodeScan, MissingNodeRef, SHAMapAddNode, SHAMapMissingNode, SHAMapType, SyncTree,
+};
 use std::collections::BTreeMap;
 use std::hash::BuildHasher;
 use time::Duration;
@@ -1679,9 +1681,35 @@ impl InboundLedgerLocal {
         if packet.nodes.is_empty() {
             return Err(InboundLedgerPacketError::EmptyNodes);
         }
-        if next_node == 0 && packet.nodes.iter().any(|node| node.node_id.is_none()) {
-            journal.warn("Got bad node");
-            return Err(InboundLedgerPacketError::MissingNodeId);
+        if next_node == 0 {
+            // A resumable packet must reject any malformed later node before
+            // its first chunk mutates a SHAMap. Subsequent chunks re-use this
+            // admission result and retain the same error semantics as the
+            // former whole-packet path.
+            if packet.nodes.iter().any(|node| node.node_id.is_none()) {
+                journal.warn("Got bad node");
+                return Err(InboundLedgerPacketError::MissingNodeId);
+            }
+            if packet.nodes.iter().any(|node| node.node_data.is_empty()) {
+                journal.warn("Got empty node data");
+                return Err(InboundLedgerPacketError::EmptyNodeData);
+            }
+            if packet.nodes.iter().any(|node| {
+                node.node_id.as_deref().is_none_or(|node_id| {
+                    shamap::node_id::deserialize_shamap_node_id(node_id).is_none()
+                })
+            }) {
+                journal.warn("Got invalid node id");
+                return Err(InboundLedgerPacketError::InvalidNodeId);
+            }
+            if packet
+                .nodes
+                .iter()
+                .any(|node| SHAMapTreeNode::make_from_wire(&node.node_data).is_err())
+            {
+                journal.warn("Got invalid node data");
+                return Err(InboundLedgerPacketError::InvalidNodeData);
+            }
         }
         if next_node >= packet.nodes.len() {
             return Ok(InboundLedgerPacketStep {
@@ -3029,41 +3057,49 @@ impl InboundLedgerLocal {
         }
     }
 
-    /// Move the assembled ledger into an exclusive state-scan lease. While
-    /// leased, callers must buffer incoming packets rather than mutate either
-    /// SHAMap. The app restores the exact ledger before applying the scan
-    /// result, which gives the same unlock/recheck boundary as rippled without
-    /// sharing mutable `SyncTree` state across threads.
-    pub fn take_ledger_for_state_scan(&mut self, params: &StateScanParams) -> Option<Ledger> {
-        if params.have_state || self.failed || self.complete {
+    /// Start a state-map scan whose traversal state can be retained across
+    /// acquisition turns. The scan borrows no planner data after construction.
+    pub fn start_resumable_state_map_scan<CLOCK, S, C, F, MR, NS>(
+        &mut self,
+        params: &StateScanParams,
+        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
+    ) -> Option<DeferredMissingNodeScan>
+    where
+        CLOCK: basics::tagged_cache::CacheClock,
+        S: std::hash::BuildHasher + Clone,
+        C: shamap::family::FullBelowCache,
+        F: shamap::family::SHAMapNodeFetcher,
+        MR: shamap::family::MissingNodeReporter,
+    {
+        if params.have_state || self.failed || self.complete || params.map_hash.is_zero() {
             return None;
         }
-        self.ledger.take()
+        let ledger = self.ledger.as_ref()?;
+        Some(
+            ledger
+                .state_map()
+                .start_deferred_missing_node_scan_with_family(
+                    params.missing_limit,
+                    family,
+                    &mut next_missing_scan_first_child,
+                ),
+        )
     }
 
-    /// Restore a ledger previously taken by `take_ledger_for_state_scan`.
-    /// A detached scan has exclusive ownership, so replacing an existing ledger
-    /// would indicate an invalid concurrent mutation rather than a recoverable
-    /// acquisition state.
-    pub fn restore_ledger_after_state_scan(&mut self, ledger: Ledger) {
-        assert!(
-            self.ledger.is_none(),
-            "state scan lease must restore into an empty inbound ledger slot"
-        );
-        self.ledger = Some(ledger);
-    }
-
-    /// Perform a state-map scan against an exclusively leased ledger.
-    pub fn do_state_map_scan_for_ledger<CLOCK, S, C, F, MR, NS, DB, FP>(
-        ledger: &mut Ledger,
+    /// Advance a previously created state-map scan by a bounded number of
+    /// branches and synchronous deferred reads. `true` means the scan reached
+    /// the same completion boundary as the former whole-scan loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_resumable_state_map_scan<CLOCK, S, C, F, MR, NS, DB, FP>(
+        &mut self,
+        scan: &mut DeferredMissingNodeScan,
         params: &StateScanParams,
         store: &mut DB,
         fetch_pack: &mut FP,
         family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-    ) -> (
-        Vec<(shamap::node_id::SHAMapNodeId, Uint256)>,
-        shamap::sync::DeferredMissingNodeScanStats,
-    )
+        max_deferred_reads: usize,
+        max_branch_steps: usize,
+    ) -> bool
     where
         CLOCK: basics::tagged_cache::CacheClock,
         S: std::hash::BuildHasher + Clone,
@@ -3073,56 +3109,24 @@ impl InboundLedgerLocal {
         DB: InboundLedgerStore,
         FP: FetchPackContainer,
     {
-        if params.have_state || params.map_hash.is_zero() {
-            return (Vec::new(), Default::default());
+        if params.have_state || self.failed || self.complete {
+            return true;
         }
-
+        let Some(ledger) = self.ledger.as_mut() else {
+            return true;
+        };
         let mut filter = AccountStateSF::new(InboundLedgerSyncStore(&mut *store), &mut *fetch_pack);
         let mut filter_ref: Option<&mut dyn shamap::fetch::SHAMapSyncFilter> = Some(&mut filter);
         ledger
             .state_map_mut()
-            .get_missing_nodes_with_family_diagnostics(
-                params.missing_limit,
+            .advance_deferred_missing_node_scan_with_family(
+                scan,
                 &mut filter_ref,
                 family,
+                max_deferred_reads,
+                max_branch_steps,
                 &mut next_missing_scan_first_child,
             )
-    }
-
-    /// Perform the expensive state map walk.
-    ///
-    /// NOTE: In rippled, the acquisition lock is released during this walk
-    /// (`InboundLedger.cpp:620-622`). In our Rust architecture, the Ledger is
-    /// owned by `InboundLedgerLocal` (not Arc'd), and `get_missing_nodes_with_family`
-    /// requires `&mut SyncTree`, so the caller's lock cannot be released.
-    /// When the Ledger is refactored to `Arc<Ledger>`, the caller can release
-    /// its lock around this call.
-    pub fn do_state_map_scan<CLOCK, S, C, F, MR, NS, DB, FP>(
-        &mut self,
-        params: &StateScanParams,
-        store: &mut DB,
-        fetch_pack: &mut FP,
-        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-    ) -> (
-        Vec<(shamap::node_id::SHAMapNodeId, Uint256)>,
-        shamap::sync::DeferredMissingNodeScanStats,
-    )
-    where
-        CLOCK: basics::tagged_cache::CacheClock,
-        S: std::hash::BuildHasher + Clone,
-        C: shamap::family::FullBelowCache,
-        F: shamap::family::SHAMapNodeFetcher,
-        MR: shamap::family::MissingNodeReporter,
-        DB: InboundLedgerStore,
-        FP: FetchPackContainer,
-    {
-        let Some(ledger) = self.ledger.as_mut() else {
-            return (Vec::new(), Default::default());
-        };
-        if self.failed {
-            return (Vec::new(), Default::default());
-        }
-        Self::do_state_map_scan_for_ledger(ledger, params, store, fetch_pack, family)
     }
 
     /// Apply state-map scan results and build the corresponding peer requests.
@@ -3497,6 +3501,26 @@ impl InboundLedgerPeerDataCounts {
 
 fn sample_peer_ids(scores: &[InboundLedgerPeerScore], max: usize) -> Vec<u64> {
     sample_peer_ids_with(scores, max, &mut |len| rand_int_to(len - 1))
+}
+
+/// Apply the same useful-peer pruning and bounded sampling used by
+/// `InboundLedger::runData`: retain scores at least half the batch maximum,
+/// then choose no more than the reference useful-peer limit. The mailbox
+/// acquisition path calls this only after it has observed its FIFO batch
+/// empty, rather than once per bounded packet step.
+pub fn select_inbound_ledger_reply_peers(scores: &[InboundLedgerPeerScore]) -> Vec<u64> {
+    let max_useful_count = scores
+        .iter()
+        .map(|score| score.useful_count)
+        .max()
+        .unwrap_or_default();
+    let threshold = max_useful_count / 2;
+    let pruned: Vec<_> = scores
+        .iter()
+        .copied()
+        .filter(|score| score.useful_count >= threshold)
+        .collect();
+    sample_peer_ids(&pruned, INBOUND_LEDGER_MAX_USEFUL_PEERS)
 }
 
 fn sample_peer_ids_with<PICK>(
