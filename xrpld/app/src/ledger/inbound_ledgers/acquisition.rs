@@ -667,7 +667,10 @@ pub struct AcqMutableState {
 /// that protocol limit, but this is deliberately not a wall-clock guarantee.
 const MAX_PACKET_STEPS_PER_ACQUISITION_TURN: usize = 1;
 const STATE_SCAN_MAX_BRANCHES_PER_TURN: usize = 512;
-const STATE_SCAN_MAX_DEFERRED_READS_PER_TURN: usize = 8;
+/// Matches rippled `SHAMap::getMissingNodes()`'s 512 deferred NodeStore-read
+/// batch for a resumable inbound state scan. Every admitted read is still
+/// synchronously completed before this continuation can be restored.
+const STATE_SCAN_MAX_DEFERRED_READS_PER_TURN: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AcquisitionWorkToken {
@@ -2673,7 +2676,16 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_state_scan_is_mailbox_continuation_work() {
+    fn acquisition_state_scan_uses_parity_batch_and_preserves_missing_results() {
+        assert_eq!(
+            STATE_SCAN_MAX_DEFERRED_READS_PER_TURN, 512,
+            "resumable inbound state scans must match rippled's deferred-read batch"
+        );
+        assert_eq!(
+            STATE_SCAN_MAX_BRANCHES_PER_TURN, 512,
+            "the independent branch fairness cap remains unchanged"
+        );
+
         let worker_pool = Arc::new(WorkerPool::new(0));
         let (wanted_hash, header_packet, state_root_packet) =
             header_and_state_root_packets_with_missing_child();
@@ -2694,6 +2706,12 @@ mod tests {
         assert!(diagnostics.state_scan_runs >= 1);
         assert_eq!(diagnostics.state_scan_last_yield, "complete");
         assert_eq!(diagnostics.state_scan_completed_slices, 1);
+        assert_eq!(
+            diagnostics.state_missing_nodes, 1,
+            "a completed scan hands its missing result to the existing request boundary"
+        );
+        assert_eq!(diagnostics.state_scan_last_missing_nodes, 1);
+        assert!(!diagnostics.scan_continuation_pending);
         assert!(diagnostics.state_scan_last_branch_steps > 0);
         assert!(diagnostics.state_scan_positive_progress_slices >= 1);
     }
