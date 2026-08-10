@@ -6,6 +6,7 @@ set -Eeuo pipefail
 QUAXAR_REF="__QUAXAR_REF__"
 PUBLIC_IP="__PUBLIC_IP__"
 QUAXAR_REPOSITORY="https://github.com/TusharPardhe/quaxar.git"
+SKIP_BUILD="${SKIP_BUILD:-0}"
 
 if [[ ! "$QUAXAR_REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
   echo "Invalid Quaxar branch or tag: $QUAXAR_REF" >&2
@@ -13,6 +14,10 @@ if [[ ! "$QUAXAR_REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
 fi
 if [[ ! "$PUBLIC_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
   echo "Invalid public IPv4 address: $PUBLIC_IP" >&2
+  exit 64
+fi
+if [[ "$SKIP_BUILD" != "0" && "$SKIP_BUILD" != "1" ]]; then
+  echo "SKIP_BUILD must be 0 or 1" >&2
   exit 64
 fi
 
@@ -42,23 +47,35 @@ if ! id -u xrpld >/dev/null 2>&1; then
   useradd --system --create-home --home-dir /home/xrpld --shell /usr/sbin/nologin xrpld
 fi
 install -d -o xrpld -g xrpld -m 0750 /var/lib/xrpld/db/nudb /var/log/xrpld
-rm -rf /opt/quaxar
-install -d -o xrpld -g xrpld -m 0755 /opt
-runuser -u xrpld -- git clone --depth 1 --branch "$QUAXAR_REF" --single-branch \
-  "$QUAXAR_REPOSITORY" /opt/quaxar
+if [[ "$SKIP_BUILD" == "1" ]]; then
+  test -d /opt/quaxar/.git
+  test -x /usr/local/bin/quaxar
+  echo "[$(date -Is)] reusing existing Quaxar build"
+else
+  rm -rf /opt/quaxar
+  install -d -o xrpld -g xrpld -m 0755 /opt
+  runuser -u xrpld -- git clone --depth 1 --branch "$QUAXAR_REF" --single-branch \
+    "$QUAXAR_REPOSITORY" /opt/quaxar
 
-runuser -u xrpld -- bash -lc '
-  set -Eeuo pipefail
-  curl --fail --silent --show-error --proto "=https" --tlsv1.2 https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --default-toolchain 1.90.0
-  export PATH="$HOME/.cargo/bin:$PATH"
-  rustup toolchain install 1.90.0 --profile minimal
-  cd /opt/quaxar
-  cargo +1.90.0 build --release -p xrpld-main
-'
-install -m 0755 /opt/quaxar/target/release/quaxar /usr/local/bin/quaxar
-install -m 0644 /opt/quaxar/validators-testnet.txt /etc/quaxar-validators-testnet.txt
+  runuser -u xrpld -- bash -lc '
+    set -Eeuo pipefail
+    curl --fail --silent --show-error --proto "=https" --tlsv1.2 https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain 1.90.0
+    export PATH="$HOME/.cargo/bin:$PATH"
+    rustup toolchain install 1.90.0 --profile minimal
+    cd /opt/quaxar
+    cargo +1.90.0 build --release -p xrpld-main
+  '
+  install -m 0755 /opt/quaxar/target/release/quaxar /usr/local/bin/quaxar
+fi
 install -d -m 0755 /etc/quaxar
+install -m 0644 /dev/stdin /etc/quaxar-validators-testnet.txt <<'VALIDATORS'
+[validator_list_sites]
+https://vl.altnet.rippletest.net
+
+[validator_list_keys]
+ED264807102805220DA0F312E71FC2C69E1552C9C5790F6C25E3729DEB573D5860
+VALIDATORS
 
 cat >/etc/quaxar/xrpld.cfg <<CONFIG
 [server]
