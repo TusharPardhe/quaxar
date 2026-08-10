@@ -186,9 +186,20 @@ impl STObject {
                 break;
             }
 
-            let field = crate::get_field(crate::field_code_raw(type_id, field_id));
+            let raw_field_code = crate::field_code_raw(type_id, field_id);
+            let field = crate::get_field(raw_field_code);
             if field.is_invalid() {
-                tracing::warn!(target: "protocol", "Unknown field in serialized object");
+                // Match rippled's STObject diagnostic while retaining enough
+                // context to identify an unsupported public-network SField.
+                tracing::warn!(
+                    target: "protocol",
+                    serialized_type_id = type_id,
+                    field_id,
+                    raw_field_code,
+                    object_field = self.fname().name(),
+                    depth,
+                    "Unknown field in serialized object"
+                );
                 error = true;
                 break;
             }

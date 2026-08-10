@@ -4856,12 +4856,37 @@ fn seed_startup_ledger_state(
     Ok(())
 }
 
+fn configured_feature_ids(config: &BasicConfig) -> Vec<Uint256> {
+    config
+        .section("features")
+        .values()
+        .iter()
+        .filter_map(|line| {
+            let value = line.split_whitespace().next()?;
+            if value.len() == 64 {
+                let bytes = str_unhex(value)?;
+                return Uint256::from_slice(&bytes);
+            }
+            REGISTERED_FEATURES
+                .iter()
+                .find(|feature| feature.supported && feature.name == value)
+                .map(|feature| feature_id(feature.name))
+        })
+        .collect()
+}
+
 fn amendments_from_config(config: &BasicConfig, start_type: StartUpType) -> Vec<Uint256> {
-    // Rippld startGenesisLedger uses amendmentTable desired amendments only
-    // for Fresh. Normal, Network and Snapshot genesis starts use none.
+    // A public-network node normally learns amendments from the validated
+    // Amendments SLE. An explicit generated [features] snapshot is an opt-in
+    // bootstrap seed for a known network; acquired ledgers replace it through
+    // Ledger::setup_from_state_map_with_config_and_family.
+    if start_type == StartUpType::Network {
+        return configured_feature_ids(config);
+    }
     if start_type != StartUpType::Fresh {
         return Vec::new();
     }
+
     let section = config.section("amendments");
     let values = section.values();
     if !values.is_empty() {
@@ -4882,18 +4907,9 @@ fn amendments_from_config(config: &BasicConfig, start_type: StartUpType) -> Vec<
     // than a hexadecimal [amendments] section. Preserve that explicit desired
     // set at Fresh genesis; falling through to every supported feature changes
     // the harness contract and left the full nodes with a no-amendment ledger.
-    let named_features = config.section("features").values();
-    if !named_features.is_empty() {
-        return named_features
-            .iter()
-            .filter_map(|line| {
-                let name = line.split_whitespace().next()?;
-                REGISTERED_FEATURES
-                    .iter()
-                    .find(|feature| feature.supported && feature.name == name)
-                    .map(|feature| feature_id(feature.name))
-            })
-            .collect();
+    let configured = configured_feature_ids(config);
+    if !configured.is_empty() {
+        return configured;
     }
 
     REGISTERED_FEATURES
@@ -5270,6 +5286,21 @@ mod tests {
             amendments_from_config(&config, StartUpType::Normal).is_empty(),
             "only Fresh genesis applies configured amendment desires"
         );
+    }
+
+    #[test]
+    fn network_genesis_honors_explicit_raw_feature_snapshot() {
+        let config = parse_basic_config_text(
+            "[features]\n96FD2F293A519AE1DB6F8BED23E4AD9119342DA7CB6BAFD00953D16C54205D8B\n",
+        )
+        .expect("public-network feature snapshot parses");
+
+        assert_eq!(
+            amendments_from_config(&config, StartUpType::Network),
+            vec![protocol::feature_id("PriceOracle")],
+            "an explicit network snapshot must seed the matching testnet amendment"
+        );
+        assert!(amendments_from_config(&config, StartUpType::Normal).is_empty());
     }
 
     #[test]

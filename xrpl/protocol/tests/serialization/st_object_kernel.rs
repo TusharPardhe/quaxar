@@ -138,7 +138,7 @@ fn object_serialization_sorts_fields_and_appends_nested_terminators() {
 }
 
 #[test]
-fn object_parse_rejects_duplicate_fields_and_array_terminators() {
+fn object_parse_rejects_duplicate_fields_array_terminators_and_unknown_fields() {
     // Duplicate fields: deserializer returns false (failure) instead of panicking
     let mut duplicate = Serializer::default();
     duplicate.add_field_id(2, 4);
@@ -157,6 +157,16 @@ fn object_parse_rejects_duplicate_fields_and_array_terminators() {
     illegal.add_field_id(15, 1);
 
     let mut iter = protocol::SerialIter::new(illegal.data());
+    let obj = STObject::from_serial_iter(&mut iter, sf_generic(), 0);
+    assert!(obj.empty());
+
+    // Type UInt16, field id 255 is not allocated. The parser must reject it
+    // rather than accepting a forward-compatible field in consensus data.
+    assert!(protocol::get_field(protocol::field_code_raw(1, 255)).is_invalid());
+    let mut unknown = Serializer::default();
+    unknown.add_field_id(1, 255);
+
+    let mut iter = protocol::SerialIter::new(unknown.data());
     let obj = STObject::from_serial_iter(&mut iter, sf_generic(), 0);
     assert!(obj.empty());
 }

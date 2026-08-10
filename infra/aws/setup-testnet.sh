@@ -70,6 +70,7 @@ else
   install -m 0755 /opt/quaxar/target/release/quaxar /usr/local/bin/quaxar
 fi
 install -d -m 0755 /etc/quaxar
+test -r /opt/quaxar/infra/aws/testnet-amendments.txt
 install -m 0644 /dev/stdin /etc/quaxar-validators-testnet.txt <<'VALIDATORS'
 [validator_list_sites]
 https://vl.altnet.rippletest.net
@@ -122,6 +123,9 @@ advisory_delete = 0
 
 [network_id]
 1
+
+[features]
+$(grep -E '^[0-9A-F]{64}$' /opt/quaxar/infra/aws/testnet-amendments.txt)
 
 [overlay]
 public_ip = $PUBLIC_IP
