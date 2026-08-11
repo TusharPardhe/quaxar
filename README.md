@@ -286,7 +286,6 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design document.
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | Complete runtime configuration reference. |
 | [CLI.md](docs/CLI.md) | Full command line reference. |
 | [SYNCING.md](docs/SYNCING.md) | Sync behavior, acquisition flow, and operator checks. |
-| [INBOUND_LEDGER_ACQUISITION.md](docs/INBOUND_LEDGER_ACQUISITION.md) | Visual inbound-acquisition architecture, limits, remediation, and rippled comparison. |
 | [VALIDATORS.md](docs/VALIDATORS.md) | Validator key and token guidance. |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout and runtime design. |
 | [OPTIMIZATIONS.md](docs/OPTIMIZATIONS.md) | Performance characteristics and tuning notes. |
