@@ -758,6 +758,32 @@ impl ActorTreePlan {
     }
 }
 
+/// A `Ready` result may be requeued only if the retained continuation actually
+/// consumed a branch during this actor turn. This is deliberately checked at
+/// the actor boundary: a stale/inconsistent continuation must become idle
+/// rather than consume every worker with zero-work successor turns.
+fn ready_turn_can_requeue(plan: &TreePlan, branch_steps_before: u64) -> bool {
+    plan.has_runnable_frontier() && plan.branch_steps() > branch_steps_before
+}
+
+const SCAN_OUTCOME_NOT_RUN: u8 = 0;
+const SCAN_OUTCOME_READY: u8 = 1;
+const SCAN_OUTCOME_NEEDS_READS: u8 = 2;
+const SCAN_OUTCOME_NEEDS_NETWORK: u8 = 3;
+const SCAN_OUTCOME_COMPLETE: u8 = 4;
+const SCAN_OUTCOME_INVALID: u8 = 5;
+
+fn scan_outcome_name(outcome: u8) -> &'static str {
+    match outcome {
+        SCAN_OUTCOME_READY => "ready",
+        SCAN_OUTCOME_NEEDS_READS => "needs_reads",
+        SCAN_OUTCOME_NEEDS_NETWORK => "needs_network",
+        SCAN_OUTCOME_COMPLETE => "complete",
+        SCAN_OUTCOME_INVALID => "invalid",
+        SCAN_OUTCOME_NOT_RUN | _ => "not_run",
+    }
+}
+
 /// Fully-owned peer work emitted by an actor turn. The target is cloned while
 /// the detached plan is still available, so no plan/actor borrow survives the
 /// outbound boundary.
@@ -1682,7 +1708,9 @@ impl AcquisitionState {
                 .stats
                 .state_scan_completed_slices
                 .load(Ordering::Relaxed),
-            state_scan_last_yield: "actor",
+            state_scan_last_yield: scan_outcome_name(
+                self.stats.state_scan_last_outcome.load(Ordering::Relaxed),
+            ),
             state_scan_last_branch_steps: self
                 .stats
                 .state_scan_last_branch_steps
@@ -2691,6 +2719,8 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
         return;
     };
     let started = Instant::now();
+    let scan_before = actor_plan.plan.scan_stats();
+    let branch_steps_before = scan_before.branch_steps;
     let mut resident = ActorResident {
         cache: &state.shared_tree_cache,
     };
@@ -2700,7 +2730,146 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
         &mut resident,
         &mut || basics::random::rand_int_to(255u8),
     );
+    let scan_after = actor_plan.plan.scan_stats();
+    let branch_steps_after = scan_after.branch_steps;
+    let branch_steps_delta = branch_steps_after.saturating_sub(branch_steps_before);
+    let deferred_reads_delta = scan_after
+        .pending_reads
+        .saturating_sub(scan_before.pending_reads);
+    let deferred_resumes_delta = scan_after
+        .deferred_resumes
+        .saturating_sub(scan_before.deferred_resumes);
+    let missing_nodes_delta = scan_after
+        .missing_recorded
+        .saturating_sub(scan_before.missing_recorded);
+    let outcome = match &advance {
+        TreeAdvance::Ready => SCAN_OUTCOME_READY,
+        TreeAdvance::NeedsReads(_) => SCAN_OUTCOME_NEEDS_READS,
+        TreeAdvance::NeedsNetwork(_) => SCAN_OUTCOME_NEEDS_NETWORK,
+        TreeAdvance::Complete => SCAN_OUTCOME_COMPLETE,
+        TreeAdvance::Invalid => SCAN_OUTCOME_INVALID,
+    };
     state.stats.state_scan_runs.fetch_add(1, Ordering::Relaxed);
+    state
+        .stats
+        .state_scan_last_outcome
+        .store(outcome, Ordering::Relaxed);
+    state
+        .stats
+        .state_scan_branch_steps
+        .fetch_add(branch_steps_delta, Ordering::Relaxed);
+    state
+        .stats
+        .state_scan_missing_nodes_recorded
+        .fetch_add(missing_nodes_delta, Ordering::Relaxed);
+    state
+        .stats
+        .state_missing_nodes
+        .fetch_add(missing_nodes_delta, Ordering::Relaxed);
+    state.stats.state_scan_branches_seen.fetch_add(
+        scan_after
+            .branches_seen
+            .saturating_sub(scan_before.branches_seen),
+        Ordering::Relaxed,
+    );
+    state.stats.state_scan_duplicate_missing_hashes.fetch_add(
+        scan_after
+            .duplicate_missing_hashes
+            .saturating_sub(scan_before.duplicate_missing_hashes),
+        Ordering::Relaxed,
+    );
+    state.stats.state_scan_full_below_hits.fetch_add(
+        scan_after
+            .full_below_hits
+            .saturating_sub(scan_before.full_below_hits),
+        Ordering::Relaxed,
+    );
+    state.stats.state_scan_loaded_or_cached_children.fetch_add(
+        scan_after
+            .loaded_or_cached_children
+            .saturating_sub(scan_before.loaded_or_cached_children),
+        Ordering::Relaxed,
+    );
+    state.stats.state_scan_pending_hits.fetch_add(
+        scan_after
+            .completed_pending_reads
+            .saturating_sub(scan_before.completed_pending_reads),
+        Ordering::Relaxed,
+    );
+    state.stats.state_scan_pending_misses.fetch_add(
+        scan_after
+            .completed_pending_misses
+            .saturating_sub(scan_before.completed_pending_misses),
+        Ordering::Relaxed,
+    );
+    state
+        .stats
+        .state_scan_deferred_resumes
+        .fetch_add(deferred_resumes_delta, Ordering::Relaxed);
+    state
+        .stats
+        .state_scan_max_pending_reads
+        .fetch_max(scan_after.max_pending_reads, Ordering::Relaxed);
+    state
+        .stats
+        .state_scan_pending_reads
+        .store(actor_plan.plan.pending_hashes() as u64, Ordering::Relaxed);
+    state
+        .stats
+        .state_scan_last_branch_steps
+        .store(branch_steps_delta, Ordering::Relaxed);
+    state
+        .stats
+        .state_scan_last_deferred_reads
+        .store(deferred_reads_delta, Ordering::Relaxed);
+    state
+        .stats
+        .state_scan_last_deferred_resumes
+        .store(deferred_resumes_delta, Ordering::Relaxed);
+    state
+        .stats
+        .state_scan_last_missing_nodes
+        .store(missing_nodes_delta, Ordering::Relaxed);
+    if branch_steps_delta != 0 {
+        state
+            .stats
+            .state_scan_positive_progress_slices
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    match &advance {
+        TreeAdvance::Ready | TreeAdvance::NeedsReads(_) | TreeAdvance::NeedsNetwork(_) => {
+            state
+                .stats
+                .state_scan_yields
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        TreeAdvance::Complete => {
+            state
+                .stats
+                .state_scan_completed_slices
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        TreeAdvance::Invalid => {}
+    }
+    if outcome == SCAN_OUTCOME_READY && branch_steps_delta == ACQ_TURN_MAX_BRANCH_STEPS as u64 {
+        state
+            .stats
+            .state_scan_branch_budget_yields
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if outcome == SCAN_OUTCOME_NEEDS_READS && deferred_reads_delta == ACQ_TURN_MAX_NEW_READS as u64
+    {
+        state
+            .stats
+            .state_scan_deferred_read_budget_yields
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    if deferred_resumes_delta != 0 && outcome == SCAN_OUTCOME_READY {
+        state
+            .stats
+            .state_scan_deferred_read_resume_yields
+            .fetch_add(1, Ordering::Relaxed);
+    }
     state
         .stats
         .state_scan_us
@@ -2857,7 +3026,7 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
             );
         }
         TreeAdvance::Ready => {
-            actor_plan.runnable = actor_plan.plan.has_runnable_frontier();
+            actor_plan.runnable = ready_turn_can_requeue(&actor_plan.plan, branch_steps_before);
             state.restore_tree_plan(actor_plan);
         }
     }
@@ -3193,6 +3362,69 @@ mod actor_mailbox_tests {
             next_node: 0,
             bytes,
         }
+    }
+
+    #[test]
+    fn ready_without_branch_progress_is_not_requeued() {
+        use basics::intrusive_pointer::make_shared_intrusive;
+        use shamap::sync::{SHAMapType, SyncState, SyncTree};
+        use shamap::tree_node::SHAMapTreeNode;
+
+        struct NoResident;
+        impl MissingNodeResidentLookup for NoResident {
+            fn load_resident(
+                &mut self,
+                _hash: SHAMapHash,
+                _ledger_seq: u32,
+            ) -> Option<basics::intrusive_pointer::SharedIntrusive<SHAMapTreeNode>> {
+                None
+            }
+        }
+
+        // The stack is intentionally retained and CPU-runnable, but a zero
+        // branch budget produces `Ready` before the continuation can select a
+        // branch. This is the actor-side shape that previously self-requeued
+        // solely from `has_runnable_frontier()`.
+        let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        child.set_child_hash(0, SHAMapHash::new(Uint256::from_array([0x51; 32])));
+        child.update_hash();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, child.get_hash());
+        root.canonicalize_child(0, child);
+        root.update_hash();
+        let tree = SyncTree::from_root_with_type(
+            root.clone(),
+            SHAMapType::State,
+            true,
+            77,
+            SyncState::Synching,
+        );
+        let mut first_child = || 0;
+        let mut plan = TreePlan::new(
+            TreePlanId::new(93),
+            TreeKind::State,
+            &tree,
+            root.get_hash(),
+            16,
+            9,
+            &mut first_child,
+        );
+        let mut resident = NoResident;
+        let branch_steps_before = plan.branch_steps();
+
+        assert!(matches!(
+            plan.advance(0, ACQ_TURN_MAX_NEW_READS, &mut resident, &mut first_child),
+            TreeAdvance::Ready
+        ));
+        assert!(
+            plan.has_runnable_frontier(),
+            "the retained stack still has CPU work"
+        );
+        assert_eq!(plan.branch_steps(), branch_steps_before);
+        assert!(
+            !ready_turn_can_requeue(&plan, branch_steps_before),
+            "a no-progress Ready turn must leave the mailbox idle"
+        );
     }
 
     #[test]

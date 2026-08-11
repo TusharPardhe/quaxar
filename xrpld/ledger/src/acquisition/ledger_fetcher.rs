@@ -24,9 +24,9 @@ use protocol::JsonValue;
 use shamap::family::{FullBelowCache, MissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher};
 use shamap::fetch::SHAMapSyncFilter;
 use shamap::sync::{
-    MissingNodeAdvance, MissingNodeContinuation, MissingNodePlanId, MissingNodeReadApply,
-    MissingNodeReadOutcome, MissingNodeRef, MissingNodeResidentLookup, ReadNeed, SHAMapAddNode,
-    SHAMapMissingNode, SHAMapType, SyncTree,
+    DeferredMissingNodeScanStats, MissingNodeAdvance, MissingNodeContinuation, MissingNodePlanId,
+    MissingNodeReadApply, MissingNodeReadOutcome, MissingNodeRef, MissingNodeResidentLookup,
+    ReadNeed, SHAMapAddNode, SHAMapMissingNode, SHAMapType, SyncTree,
 };
 use std::collections::BTreeMap;
 use std::hash::BuildHasher;
@@ -171,6 +171,20 @@ impl TreePlan {
     /// do not make a plan runnable.
     pub fn has_runnable_frontier(&self) -> bool {
         self.continuation.has_runnable_frontier()
+    }
+
+    /// Total branch selections consumed by the retained continuation. Actor
+    /// scheduling uses this to reject a `Ready` result that made no CPU
+    /// progress instead of manufacturing another worker turn.
+    pub fn branch_steps(&self) -> u64 {
+        self.continuation.stats().branch_steps
+    }
+
+    /// Immutable cumulative diagnostics for the retained continuation. The
+    /// acquisition actor samples this around every bounded turn and publishes
+    /// deltas through `fetch_info` without walking the tree.
+    pub fn scan_stats(&self) -> DeferredMissingNodeScanStats {
+        self.continuation.stats()
     }
 
     pub fn advance<L, R>(

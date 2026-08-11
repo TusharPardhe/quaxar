@@ -6075,9 +6075,11 @@ mod native_missing_node_continuation_tests {
 
     #[test]
     fn duplicate_edges_emit_one_read_and_one_network_candidate() {
-        let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
-        child.set_child_hash(0, hash(0x12));
-        child.update_hash();
+        let child = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            crate::tree_node::SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0x12; 32]), vec![0x12; 12]),
+            1,
+        ));
         let child_hash = child.get_hash();
         let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
         root.set_child_hash(1, child_hash);
@@ -6181,6 +6183,36 @@ mod native_missing_node_continuation_tests {
         assert!(
             !continuation.has_runnable_frontier(),
             "a Ready result must not manufacture a successor actor turn while budget remains exhausted"
+        );
+    }
+
+    #[test]
+    fn runnable_ready_turn_always_consumes_a_branch_step() {
+        let unloaded_grandchild = hash(0x51);
+        let loaded_child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        loaded_child.set_child_hash(0, unloaded_grandchild);
+        loaded_child.update_hash();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, loaded_child.get_hash());
+        root.canonicalize_child(0, loaded_child);
+        root.update_hash();
+        let mut continuation = continuation(&root, 51);
+        let mut resident = EmptyResident;
+
+        let before = continuation.stats().branch_steps;
+        assert!(matches!(
+            continuation.advance(1, 16, &mut resident, &mut || 0),
+            MissingNodeAdvance::Ready
+        ));
+        let after = continuation.stats().branch_steps;
+        assert!(
+            continuation.has_runnable_frontier(),
+            "the loaded child leaves bounded CPU work for the next actor turn"
+        );
+        assert_eq!(
+            after,
+            before + 1,
+            "a Ready continuation may be requeued only after it advances its branch cursor"
         );
     }
 
