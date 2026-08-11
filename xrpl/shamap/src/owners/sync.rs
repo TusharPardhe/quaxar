@@ -2976,7 +2976,7 @@ impl MissingNodeContinuation {
     /// `pending_*` alone must not manufacture another worker turn.
     pub fn has_runnable_frontier(&self) -> bool {
         !self.invalid
-            && (!self.stack.is_empty()
+            && ((!self.stack.is_empty() && self.remaining > 0)
                 || !self.deferred_resumes.is_empty()
                 || !self.unannounced_reads.is_empty()
                 || !self.unannounced_network.is_empty())
@@ -6076,6 +6076,7 @@ mod native_missing_node_continuation_tests {
     #[test]
     fn duplicate_edges_emit_one_read_and_one_network_candidate() {
         let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        child.set_child_hash(0, hash(0x12));
         child.update_hash();
         let child_hash = child.get_hash();
         let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
@@ -6123,6 +6124,64 @@ mod native_missing_node_continuation_tests {
             continuation.advance(32, 4, &mut resident, &mut || 0),
             MissingNodeAdvance::Complete
         ));
+    }
+
+    #[test]
+    fn exhausted_missing_budget_waits_for_admitted_read_without_spinning() {
+        let missing_hash = hash(0x41);
+        let loaded_child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        loaded_child.set_child_hash(0, hash(0x43));
+        loaded_child.update_hash();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, missing_hash);
+        root.set_child_hash(1, loaded_child.get_hash());
+        root.canonicalize_child(1, loaded_child);
+        root.update_hash();
+        let mut continuation = MissingNodeContinuation::new(
+            MissingNodePlanId::new(41),
+            &root,
+            1,
+            true,
+            77,
+            9,
+            &mut || 0,
+        );
+        let mut resident = EmptyResident;
+
+        let MissingNodeAdvance::NeedsReads(needs) =
+            continuation.advance(2, 16, &mut resident, &mut || 0)
+        else {
+            panic!("expected the sole brokered read");
+        };
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].hash(), missing_hash);
+        assert!(matches!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(41),
+                missing_hash,
+                MissingNodeReadOutcome::Miss,
+            ),
+            MissingNodeReadApply::Applied {
+                attached_edges: 0,
+                missing_edges: 1,
+            }
+        ));
+        assert!(matches!(
+            continuation.advance(2, 16, &mut resident, &mut || 0),
+            MissingNodeAdvance::NeedsNetwork(_)
+        ));
+        assert!(
+            !continuation.has_runnable_frontier(),
+            "a retained stack with no remaining discovery budget must wait for its peer result"
+        );
+        assert!(matches!(
+            continuation.advance(2, 16, &mut resident, &mut || 0),
+            MissingNodeAdvance::Ready
+        ));
+        assert!(
+            !continuation.has_runnable_frontier(),
+            "a Ready result must not manufacture a successor actor turn while budget remains exhausted"
+        );
     }
 
     #[test]
