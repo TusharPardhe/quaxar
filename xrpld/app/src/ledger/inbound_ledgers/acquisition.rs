@@ -72,6 +72,10 @@ struct LocalProbe {
 /// pending, so a packet flood cannot monopolize a ledger-data worker.
 pub const ACQ_TURN_MAX_BRANCH_STEPS: usize = 256;
 pub const ACQ_TURN_MAX_NEW_READS: usize = 16;
+/// Maximum settled broker completions reduced in one actor turn. This remains
+/// below the per-acquisition logical-read limit so a full mailbox yields after
+/// at most two turns instead of monopolizing a ledger-data worker.
+pub const ACQ_TURN_MAX_READ_EVENTS: usize = 8;
 pub const ACQ_MAILBOX_PACKET_CAPACITY: usize = 128;
 pub const ACQ_MAILBOX_BYTE_CAPACITY: usize = 4 * 1024 * 1024;
 
@@ -856,8 +860,9 @@ fn send_owned_outbound_request(state: &AcquisitionState, outbound: OwnedOutbound
 }
 
 /// The bounded actor mailbox. Its reducer consumes, in order, one timeout,
-/// one packet step, one broker result, and one tree CPU step before yielding.
-/// No tree plan owns NodeStore I/O or a peer send.
+/// one packet step, one persistence event, up to a fixed number of settled
+/// broker results, and one tree CPU step before yielding. No tree plan owns
+/// NodeStore I/O or a peer send.
 struct AcquisitionMailbox {
     packets: VecDeque<PacketWork>,
     packet_bytes: usize,
@@ -932,6 +937,25 @@ impl AcquisitionMailbox {
 
     fn record_late_read_event(&mut self) {
         self.stale_events += 1;
+    }
+
+    /// Finish one running actor turn. The caller submits exactly one successor
+    /// when this reports remaining work, preserving ingress coalescing.
+    fn finish_turn(&mut self, fetch_pack_ready: bool) -> bool {
+        if self.has_work(fetch_pack_ready) {
+            self.token = AcquisitionWorkToken::Queued;
+            true
+        } else {
+            self.token = AcquisitionWorkToken::Idle;
+            false
+        }
+    }
+
+    /// Pop one settled completion and release exactly its pre-reserved slot.
+    fn take_read_event(&mut self) -> Option<ReadReady> {
+        let event = self.events.pop_front()?;
+        self.read_event_reservations = self.read_event_reservations.saturating_sub(1);
+        Some(event)
     }
 
     fn clear_terminal_work(&mut self) -> Vec<ReadTicket> {
@@ -1167,12 +1191,11 @@ impl AcquisitionState {
             let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
             if self.is_done() {
                 (false, mailbox.clear_terminal_work())
-            } else if mailbox.has_work(self.fetch_pack_ready.load(Ordering::Acquire)) {
-                mailbox.token = AcquisitionWorkToken::Queued;
-                (true, Vec::new())
             } else {
-                mailbox.token = AcquisitionWorkToken::Idle;
-                (false, Vec::new())
+                (
+                    mailbox.finish_turn(self.fetch_pack_ready.load(Ordering::Acquire)),
+                    Vec::new(),
+                )
             }
         };
         for ticket in cancelled {
@@ -1204,10 +1227,10 @@ impl AcquisitionState {
     }
 
     fn take_read_event(&self) -> Option<ReadReady> {
-        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-        let event = mailbox.events.pop_front()?;
-        mailbox.read_event_reservations = mailbox.read_event_reservations.saturating_sub(1);
-        Some(event)
+        self.mailbox
+            .lock()
+            .expect("acquisition mailbox lock")
+            .take_read_event()
     }
 
     fn reserve_read_event_slot(&self) -> bool {
@@ -2312,7 +2335,7 @@ fn process_acquisition_turn(state: &Arc<AcquisitionState>) {
         process_persistence_event(state);
     }
     if !state.is_done() {
-        process_read_event(state);
+        process_read_events(state);
     }
     if !state.is_done() && state.has_tree_plan() {
         process_tree_plan_turn(state);
@@ -2725,28 +2748,52 @@ fn process_local_probe(state: &Arc<AcquisitionState>, probe: LocalProbe, ready: 
     }
 }
 
-fn process_read_event(state: &Arc<AcquisitionState>) {
+/// Drain a fixed number of settled read completions without holding the
+/// mailbox lock while their actor-owned plan, persistence, or peer state is
+/// reduced. A false result means the mailbox has no more safely runnable work.
+fn drain_bounded_read_events(mut reduce_one: impl FnMut() -> bool) -> usize {
+    let mut reduced = 0;
+    for _ in 0..ACQ_TURN_MAX_READ_EVENTS {
+        if !reduce_one() {
+            break;
+        }
+        reduced += 1;
+    }
+    reduced
+}
+
+fn process_read_events(state: &Arc<AcquisitionState>) {
+    let _ = drain_bounded_read_events(|| process_one_read_event(state));
+}
+
+/// Reduce one settled completion. Returning false leaves the mailbox untouched;
+/// returning true means precisely one reservation was released and its event
+/// was handled, including stale and terminal paths.
+fn process_one_read_event(state: &Arc<AcquisitionState>) -> bool {
+    if state.is_done() {
+        return false;
+    }
     let Some(ready) = state.take_read_event() else {
-        return;
+        return false;
     };
     if ready.ticket.acquisition_id() != state.acquisition_id {
         state.record_stale_event();
-        return;
+        return true;
     }
     if let Some(probe) = state.take_local_probe(&ready) {
         process_local_probe(state, probe, ready);
-        return;
+        return true;
     }
     let Some(mut actor_plan) = state.take_tree_plan() else {
         state.record_stale_event();
-        return;
+        return true;
     };
     if ready.ticket.acquisition_id() != state.acquisition_id
         || actor_plan.plan.id().get() != ready.ticket.plan_id()
     {
         state.record_stale_event();
         state.restore_tree_plan(actor_plan);
-        return;
+        return true;
     }
     let hash = SHAMapHash::new(ready.ticket.key().hash);
     actor_plan.tickets.remove(&hash);
@@ -2756,7 +2803,7 @@ fn process_read_event(state: &Arc<AcquisitionState>) {
                 Ok(node) => MissingNodeReadOutcome::Found(node),
                 Err(_) => {
                     fail_actor_plan(state, actor_plan);
-                    return;
+                    return true;
                 }
             }
         }
@@ -2764,7 +2811,7 @@ fn process_read_event(state: &Arc<AcquisitionState>) {
         ReadOutcome::Cancelled => MissingNodeReadOutcome::Cancelled,
         ReadOutcome::Fault(_) => {
             fail_actor_plan(state, actor_plan);
-            return;
+            return true;
         }
     };
     match actor_plan
@@ -2799,6 +2846,7 @@ fn process_read_event(state: &Arc<AcquisitionState>) {
             state.restore_tree_plan(actor_plan);
         }
     }
+    true
 }
 
 /// Admit retained TreePlan reads while there is mailbox completion capacity.
@@ -3970,6 +4018,67 @@ mod actor_mailbox_tests {
             !mailbox.has_work(false),
             "reservations alone are waiting work, not a spin token"
         );
+    }
+
+    #[test]
+    fn ready_read_events_drain_in_bounded_turns() {
+        use super::super::read_broker::ReadBrokerConfig;
+
+        let broker = NodeReadBroker::new(ReadBrokerConfig::default()).expect("valid broker config");
+        let delivered = Arc::new(Mutex::new(Vec::<ReadReady>::new()));
+        let sink: ReadReadySink = {
+            let delivered = Arc::clone(&delivered);
+            Arc::new(move |ready| {
+                delivered
+                    .lock()
+                    .expect("read event fixture lock")
+                    .push(ready);
+            })
+        };
+        let event_count = ACQ_TURN_MAX_READ_EVENTS * 2;
+        for index in 0..event_count {
+            let key = ReadKey::new(Uint256::from_array([index as u8; 32]), 77, 0);
+            assert!(matches!(
+                broker.request(key, 41, 7, Arc::clone(&sink)),
+                ReadAdmission::Accepted(_)
+            ));
+            assert!(broker.complete(key, ReadOutcome::Miss));
+        }
+        let delivered = std::mem::take(&mut *delivered.lock().expect("read event fixture lock"));
+        assert_eq!(delivered.len(), event_count);
+        let retained_ticket = delivered[ACQ_TURN_MAX_READ_EVENTS].ticket;
+
+        let mut mailbox = AcquisitionMailbox {
+            events: VecDeque::from(delivered),
+            read_event_reservations: event_count,
+            token: AcquisitionWorkToken::Running,
+            ..AcquisitionMailbox::default()
+        };
+        let first_turn = drain_bounded_read_events(|| mailbox.take_read_event().is_some());
+        assert_eq!(first_turn, ACQ_TURN_MAX_READ_EVENTS);
+        assert_eq!(mailbox.events.len(), ACQ_TURN_MAX_READ_EVENTS);
+        assert_eq!(mailbox.read_event_reservations, ACQ_TURN_MAX_READ_EVENTS);
+        assert_eq!(
+            mailbox.events.front().expect("retained event").ticket,
+            retained_ticket,
+            "the next settled completion remains FIFO-owned for the successor"
+        );
+        assert!(
+            mailbox.finish_turn(false),
+            "remaining settled completions schedule one successor turn"
+        );
+        assert_eq!(mailbox.token, AcquisitionWorkToken::Queued);
+
+        mailbox.token = AcquisitionWorkToken::Running;
+        let second_turn = drain_bounded_read_events(|| mailbox.take_read_event().is_some());
+        assert_eq!(second_turn, ACQ_TURN_MAX_READ_EVENTS);
+        assert!(mailbox.events.is_empty());
+        assert_eq!(mailbox.read_event_reservations, 0);
+        assert!(
+            !mailbox.finish_turn(false),
+            "an empty mailbox must not submit an extra successor"
+        );
+        assert_eq!(mailbox.token, AcquisitionWorkToken::Idle);
     }
 
     fn network_waiting_actor_plan(
