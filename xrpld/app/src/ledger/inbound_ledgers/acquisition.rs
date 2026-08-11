@@ -804,9 +804,10 @@ fn ready_turn_can_requeue(plan: &TreePlan, branch_steps_before: u64) -> bool {
     plan.has_runnable_frontier() && plan.branch_steps() > branch_steps_before
 }
 
-/// A rejected read admission means existing tickets already own all available
-/// completion slots. Its hash remains unannounced for a later retry, but that
-/// is waiting work: it must not manufacture an immediate successor turn.
+/// A deferred or rejected read admission leaves work waiting on the broker.
+/// Deferred tickets retain a callback-bearing broker subscription; rejected
+/// needs remain in the actor FIFO for a later retry. Neither may manufacture
+/// an immediate successor turn.
 fn needs_reads_turn_can_requeue(plan: &TreePlan, read_admission_blocked: bool) -> bool {
     !read_admission_blocked && plan.has_runnable_frontier()
 }
@@ -2890,6 +2891,10 @@ fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: 
                 actor_plan.tickets.insert(need.hash(), ticket);
             }
             ReadAdmission::Deferred(ticket) => {
+                // A Deferred ticket is callback-bearing waiting work in the
+                // broker FIFO. Do not self-requeue retained TreePlan frontier
+                // before its matching ReadReady can make progress.
+                read_admission_blocked = true;
                 state
                     .stats
                     .state_scan_read_admission_deferred
@@ -2923,8 +2928,9 @@ fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: 
             }
         }
     }
-    // A nonempty FIFO is waiting work, not a runnable TreePlan frontier. It
-    // is woken only by a real read completion (or another existing trigger).
+    // A nonempty FIFO, a Deferred ticket, or a rejection is waiting work,
+    // not a runnable TreePlan frontier. It is woken by ReadReady or an
+    // existing external trigger such as timeout recovery.
     actor_plan.runnable = actor_plan.read_admission_backlog.is_empty()
         && needs_reads_turn_can_requeue(&actor_plan.plan, read_admission_blocked);
     state.restore_tree_plan(actor_plan);
@@ -3646,6 +3652,116 @@ mod actor_mailbox_tests {
             plan.branch_steps(),
             branch_steps_before,
             "extracting a retained batch must not run another TreePlan scan"
+        );
+    }
+
+    #[test]
+    fn deferred_ticket_with_runnable_frontier_parks_until_read_ready() {
+        use super::super::read_broker::ReadBrokerConfig;
+        use basics::intrusive_pointer::make_shared_intrusive;
+        use shamap::sync::{SHAMapType, SyncState, SyncTree};
+        use shamap::tree_node::SHAMapTreeNode;
+
+        struct NoResident;
+        impl MissingNodeResidentLookup for NoResident {
+            fn load_resident(
+                &mut self,
+                _hash: SHAMapHash,
+                _ledger_seq: u32,
+            ) -> Option<basics::intrusive_pointer::SharedIntrusive<SHAMapTreeNode>> {
+                None
+            }
+        }
+
+        // A two-level, 256-leaf tree has more missing children than one
+        // bounded read batch, leaving retained CPU frontier after the first
+        // `NeedsReads` result.
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        for parent_branch in 0..16 {
+            let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+            for child_branch in 0..16 {
+                let byte = (parent_branch * 16 + child_branch + 1) as u8;
+                child.set_child_hash(
+                    child_branch,
+                    SHAMapHash::new(Uint256::from_array([byte; 32])),
+                );
+            }
+            child.update_hash();
+            root.set_child_hash(parent_branch, child.get_hash());
+            root.canonicalize_child(parent_branch, child);
+        }
+        root.update_hash();
+        let tree = SyncTree::from_root_with_type(
+            root.clone(),
+            SHAMapType::State,
+            true,
+            77,
+            SyncState::Synching,
+        );
+        let mut first_child = || 0;
+        let mut plan = TreePlan::new(
+            TreePlanId::new(96),
+            TreeKind::State,
+            &tree,
+            root.get_hash(),
+            256,
+            9,
+            &mut first_child,
+        );
+        let mut resident = NoResident;
+        let TreeAdvance::NeedsReads(reads) = plan.advance(
+            ACQ_TURN_MAX_BRANCH_STEPS,
+            ACQ_TURN_MAX_NEW_READS,
+            &mut resident,
+            &mut first_child,
+        ) else {
+            panic!("expected bounded local-read needs");
+        };
+        assert_eq!(reads.len(), ACQ_TURN_MAX_NEW_READS);
+        assert!(
+            plan.has_runnable_frontier(),
+            "remaining branches keep the TreePlan frontier runnable"
+        );
+
+        let broker = NodeReadBroker::new(ReadBrokerConfig {
+            global_in_flight: 1,
+            per_acquisition_in_flight: ACQ_TURN_MAX_NEW_READS,
+            waiters_per_key: 4,
+        })
+        .expect("valid broker config");
+        let delivered = Arc::new(Mutex::new(Vec::<ReadReady>::new()));
+        let sink: ReadReadySink = {
+            let delivered = Arc::clone(&delivered);
+            Arc::new(move |ready| delivered.lock().expect("read events lock").push(ready))
+        };
+        let first = &reads[0];
+        let second = &reads[1];
+        assert!(matches!(
+            broker.request(
+                ReadKey::new(*first.hash().as_uint256(), first.ledger_seq(), 0),
+                41,
+                plan.id().get(),
+                Arc::clone(&sink),
+            ),
+            ReadAdmission::Accepted(_)
+        ));
+        assert!(matches!(
+            broker.request(
+                ReadKey::new(*second.hash().as_uint256(), second.ledger_seq(), 0),
+                41,
+                plan.id().get(),
+                sink,
+            ),
+            ReadAdmission::Deferred(_)
+        ));
+        assert!(
+            delivered.lock().expect("read events lock").is_empty(),
+            "a Deferred ticket has not delivered ReadReady"
+        );
+        assert_eq!(broker.take_ready_dispatches().len(), 1);
+        assert!(
+            !needs_reads_turn_can_requeue(&plan, true),
+            "a Deferred ticket must park retained frontier until ReadReady"
         );
     }
 
