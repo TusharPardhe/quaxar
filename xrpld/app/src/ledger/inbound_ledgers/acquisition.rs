@@ -3493,6 +3493,10 @@ fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
 
     let ledger = Arc::new(ledger);
     let ledger_seq = ledger.header().seq;
+    let ledger_hash = *ledger.header().hash.as_uint256();
+    let target_hash = *state.hash.as_uint256();
+    let state_synching = ledger.state_map().is_synching();
+    let tx_synching = ledger.tx_map().is_synching();
     if !publish_completed_ledger(
         *state.hash.as_uint256(),
         state.acquisition_id,
@@ -3509,7 +3513,27 @@ fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
         .lifecycle
         .terminal_completed
         .fetch_add(1, Ordering::Relaxed);
-    tracing::info!(target: "inbound_ledger", seq = ledger_seq, "LEDGER ACQUIRED");
+    tracing::info!(
+        target: "lcl_trace",
+        event = "inbound_durable_complete",
+        target_hash = %target_hash,
+        ledger_hash = %ledger_hash,
+        target_matches_header = target_hash == ledger_hash,
+        ledger_seq,
+        acquisition_id = state.acquisition_id,
+        reason = ?state.reason,
+        state_synching,
+        tx_synching,
+        "LCL trace: inbound acquisition completed durable tree finalization"
+    );
+    tracing::info!(
+        target: "inbound_ledger",
+        seq = ledger_seq,
+        hash = %ledger_hash,
+        acquisition_id = state.acquisition_id,
+        reason = ?state.reason,
+        "LEDGER ACQUIRED"
+    );
 }
 /// Stash state nodes from an unroutable response in the fetch pack, matching
 /// `InboundLedgersImp::gotStaleData`.

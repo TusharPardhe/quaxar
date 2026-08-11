@@ -682,7 +682,14 @@ fn strand_loop(
                 // a completed ledger into a redundant Generic acquisition.
                 root.validations().register_ledger(&ledger);
                 root.check_accept_completed_inbound_ledger(Arc::clone(&ledger));
-                trace_completed_inbound_handoff("registry_ready", &lm, &ledger, reason, persisted);
+                trace_completed_inbound_handoff(
+                    "registry_ready",
+                    &lm,
+                    &ledger,
+                    reason,
+                    acquisition_id,
+                    persisted,
+                );
                 // The queue item is acknowledged only after persistence,
                 // canonical resolver publication, and acceptance dispatch.
                 // A failed persistence remains ready for a fair later retry.
@@ -982,8 +989,13 @@ fn reconcile_preferred_lcl(
         &peer_counts,
     );
     let preferred_hash = preference_diagnostic.selected;
-    let selected_preferred_resident = root
-        .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash))
+    // Preserve the exact resolver result for this Accepted pass. Reusing it
+    // below distinguishes a true resolver hit from an inbound-registry hit
+    // and avoids a second lookup obscuring a cache/sweep race in diagnostics.
+    let preferred_resident =
+        root.resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash));
+    let selected_preferred_resident = preferred_resident
+        .as_ref()
         .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
     tracing::info!(
         target: "lcl_trace",
@@ -1073,13 +1085,25 @@ fn reconcile_preferred_lcl(
         return PreferredLclReconciliation::NoChange;
     }
 
-    let candidate = root
-        .resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash))
-        // `checkLastClosedLedger` immediately asks InboundLedgers for a
-        // resolver miss. A completed entry can therefore be admitted and
-        // switched in this endConsensus pass; only a still-unavailable entry
-        // proceeds to generic WrongLedger recovery.
-        .or_else(|| shared_inbound.acquire(preferred_hash, 0, AcquireReason::Consensus));
+    // `checkLastClosedLedger` immediately asks InboundLedgers for a resolver
+    // miss. Preserve the source of a successful candidate so a live trace can
+    // distinguish history-residency from a registry-resident completion.
+    let (candidate, candidate_source) = match preferred_resident {
+        Some(ledger) => (Some(ledger), "resolver"),
+        None => (
+            shared_inbound.acquire(preferred_hash, 0, AcquireReason::Consensus),
+            "inbound_registry",
+        ),
+    };
+    tracing::info!(
+        target: "lcl_trace",
+        event = "preferred_lcl_candidate_lookup",
+        preferred_lcl_hash = %preferred_hash,
+        source = candidate_source,
+        candidate_available = candidate.is_some(),
+        candidate_seq = candidate.as_ref().map(|ledger| ledger.header().seq),
+        "LCL trace: preferred target lookup completed"
+    );
     let Some(candidate) = candidate else {
         // Rippled re-invokes InboundLedgers::acquire(hash, 0, CONSENSUS) on
         // every endConsensus pass (NetworkOPs.cpp:1979-1981) unconditionally.
@@ -1090,9 +1114,10 @@ fn reconcile_preferred_lcl(
             target: "lcl_trace",
             event = "preferred_lcl_resolver_miss",
             preferred_lcl_hash = %preferred_hash,
+            candidate_source,
             local_lcl_hash = %our_hash,
             local_lcl_seq = our_closed.header().seq,
-            "LCL trace: preferred LCL is not resolver-visible; requesting consensus acquisition"
+            "LCL trace: preferred LCL is unavailable after resolver and registry lookup"
         );
         shared_inbound.record_recovery_lcl_decision(
             preferred_hash,
@@ -1761,6 +1786,7 @@ fn trace_completed_inbound_handoff(
     lm: &ledger::LedgerMaster,
     ledger: &Arc<ledger::Ledger>,
     reason: AcquireReason,
+    acquisition_id: u64,
     persisted: CompletionPersistence,
 ) {
     let cache_visible_after = lm
@@ -1772,6 +1798,7 @@ fn trace_completed_inbound_handoff(
         event = "inbound_completion_persisted",
         source,
         reason = ?reason,
+        acquisition_id,
         ledger_hash = %ledger.header().hash,
         ledger_seq = ledger.header().seq,
         immutable = ledger.is_immutable(),

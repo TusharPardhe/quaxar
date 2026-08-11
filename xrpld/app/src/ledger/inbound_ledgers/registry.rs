@@ -802,7 +802,29 @@ impl InboundLedgers {
             self.lifecycle
                 .acquisition_existing
                 .fetch_add(1, Ordering::Relaxed);
-            if entry.failed || entry.state.failed.load(Ordering::Acquire) {
+            let entry_failed = entry.failed || entry.state.failed.load(Ordering::Acquire);
+            let entry_id = entry.id;
+            let entry_reason = entry.reason;
+            let completion_acknowledged = entry.completion_acknowledged;
+            if entry_failed {
+                if reason == AcquireReason::Consensus {
+                    tracing::info!(
+                        target: "lcl_trace",
+                        event = "preferred_lcl_registry_existing",
+                        %hash,
+                        requested_seq = seq,
+                        requested_reason = ?reason,
+                        acquisition_id = entry_id,
+                        entry_reason = ?entry_reason,
+                        entry_seq = entry.seq,
+                        completed = entry.completed_ledger.is_some()
+                            || entry.state.completed.load(Ordering::Acquire),
+                        failed = true,
+                        completion_acknowledged,
+                        returned_ledger = false,
+                        "LCL trace: preferred target found as failed inbound entry"
+                    );
+                }
                 return None;
             }
             entry.last_touched = Instant::now();
@@ -810,6 +832,7 @@ impl InboundLedgers {
             if let Some(update_seq) = update_seq {
                 entry.seq = update_seq;
             }
+            let entry_seq = entry.seq;
             let is_completed = entry.state.completed.load(Ordering::Acquire);
             let completed_ledger = entry.completed_ledger.clone();
             let state = Arc::clone(&entry.state);
@@ -821,11 +844,30 @@ impl InboundLedgers {
             if let Some(update_seq) = update_seq {
                 state.update_seq(update_seq);
             }
-            return if is_completed {
+            let result = if is_completed {
                 completed_ledger.or_else(|| state.completed_ledger())
             } else {
                 completed_ledger
             };
+            if reason == AcquireReason::Consensus {
+                tracing::info!(
+                    target: "lcl_trace",
+                    event = "preferred_lcl_registry_existing",
+                    %hash,
+                    requested_seq = seq,
+                    requested_reason = ?reason,
+                    acquisition_id = entry_id,
+                    entry_reason = ?entry_reason,
+                    entry_seq,
+                    completed = is_completed,
+                    failed = false,
+                    completion_acknowledged,
+                    returned_ledger = result.is_some(),
+                    returned_seq = result.as_ref().map(|ledger| ledger.header().seq),
+                    "LCL trace: preferred target found in inbound registry"
+                );
+            }
+            return result;
         }
 
         // Match rippled InboundLedgers::acquire: retain one acquisition per
@@ -860,6 +902,7 @@ impl InboundLedgers {
             })
         };
         let initial_peers = peer_provider();
+        let initial_peer_count = initial_peers.len();
         let acquisition_id = self.next_acquisition_id.fetch_add(1, Ordering::Relaxed);
         let failure_recorder: AcquisitionFailureRecorder = {
             let inner = Arc::clone(&self.inner);
@@ -947,7 +990,19 @@ impl InboundLedgers {
         );
         drop(inner);
 
-        tracing::info!(target: "inbound_ledger", seq, %hash, "Acquisition started");
+        if reason == AcquireReason::Consensus {
+            tracing::info!(
+                target: "lcl_trace",
+                event = "preferred_lcl_registry_started",
+                %hash,
+                seq,
+                reason = ?reason,
+                acquisition_id,
+                initial_peer_count,
+                "LCL trace: started a new preferred-target inbound acquisition"
+            );
+        }
+        tracing::info!(target: "inbound_ledger", seq, %hash, reason = ?reason, acquisition_id, "Acquisition started");
         self.lifecycle
             .acquisition_starts
             .fetch_add(1, Ordering::Relaxed);
