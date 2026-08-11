@@ -1024,17 +1024,20 @@ impl InboundLedgerLocal {
         )
     }
 
-    /// Canonical pre-header request: `getNeededHashes` yields exactly the
-    /// ledger hash as one `otLEDGER` by-hash object. This is intentionally not
-    /// the older GetLedger base request; after the header, state then
-    /// transaction planning takes over.
+    /// Match rippled's normal absent-header request: `TMGetLedger(liBASE)`.
+    /// The timeout-driven aggressive by-hash request remains selected by the
+    /// caller only after the normal retry threshold is exceeded.
     pub fn make_header_request(&self) -> ProtocolMessage {
-        make_inbound_needed_by_hash_request(
-            self.hash,
-            self.seq,
-            &[(InboundLedgerObjectType::Ledger, *self.hash.as_uint256())],
-        )
-        .expect("one ledger hash always builds a by-hash request")
+        ProtocolMessage::new(ProtocolPayload::GetLedger(TmGetLedger {
+            itype: TM_GET_LEDGER_BASE,
+            ltype: None,
+            ledger_hash: Some(self.hash.as_uint256().data().to_vec()),
+            ledger_seq: (self.seq != 0).then_some(self.seq),
+            node_i_ds: Vec::new(),
+            request_cookie: None,
+            query_type: (self.timeouts != 0).then_some(TM_QUERY_INDIRECT),
+            query_depth: None,
+        }))
     }
 
     pub fn make_needed_by_hash_request<CLOCK, S, C, F, MR, NS>(
