@@ -21,7 +21,8 @@ use ledger::{
 use overlay::{Peer, PeerSet as _};
 use shamap::family::{FullBelowCache, FullBelowCacheImpl, NullMissingNodeReporter, SHAMapFamily};
 use shamap::sync::{
-    MissingNodeReadApply, MissingNodeReadOutcome, MissingNodeResidentLookup, SHAMapAddNode,
+    MissingNodeReadApply, MissingNodeReadOutcome, MissingNodeResidentLookup, ReadNeed,
+    SHAMapAddNode,
 };
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -35,7 +36,8 @@ use std::time::{Duration, Instant};
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 
 use super::read_broker::{
-    NodeReadBroker, ReadAdmission, ReadKey, ReadOutcome, ReadReady, ReadReadySink, ReadTicket,
+    NodeReadBroker, ReadAdmission, ReadKey, ReadOutcome, ReadReady, ReadReadySink,
+    ReadRejectReason, ReadTicket,
 };
 use super::registry::{AcquireReason, AcquisitionLifecycleCounters, CompletedInboundLedger};
 use super::worker_pool::WorkerPool;
@@ -729,6 +731,11 @@ struct ActorTreePlan {
     reason: InboundLedgerRequestTrigger,
     peer: Option<Arc<dyn Peer>>,
     tickets: BTreeMap<SHAMapHash, ReadTicket>,
+    /// Read needs removed from TreePlan's unannounced set but not yet admitted
+    /// to the broker. This FIFO is the actor-owned admission backlog: it
+    /// prevents a full completion mailbox from reannouncing the same hashes
+    /// and repeatedly re-entering `TreePlan::advance` with zero branch work.
+    read_admission_backlog: VecDeque<ReadNeed>,
     /// A plan is runnable only when it has retained CPU frontier. Pending
     /// broker/network work is deliberately waiting, not self-rescheduling.
     runnable: bool,
@@ -755,15 +762,26 @@ impl ActorTreePlan {
             self.reason = reason;
             self.peer = None;
             self.plan.clear_recent_requests();
-            let retried = self
-                .plan
-                .network_candidates()
-                .into_iter()
-                .filter(|(_, hash)| self.plan.retry_network_candidate(SHAMapHash::new(*hash)))
-                .count();
+            let admission_backlog_waiting = !self.read_admission_backlog.is_empty();
+            let retried = (!admission_backlog_waiting)
+                .then(|| {
+                    self.plan
+                        .network_candidates()
+                        .into_iter()
+                        .filter(|(_, hash)| {
+                            self.plan.retry_network_candidate(SHAMapHash::new(*hash))
+                        })
+                        .count()
+                })
+                .unwrap_or_default();
             // A lost peer reply wakes only the retained verified network
             // frontier. No plan is rebuilt and an empty frontier stays idle.
-            self.runnable |= retried != 0;
+            // A callback-less broker rejection leaves no ticket to wake this
+            // actor. Timeout is its bounded retry source; it drains the FIFO
+            // directly without re-running TreePlan for the same hashes. Do
+            // not append network retries while that FIFO remains blocked:
+            // they cannot be emitted until the local read gate reopens.
+            self.runnable |= retried != 0 || admission_backlog_waiting;
             self.aggressive_by_hash = aggressive_by_hash && retried != 0;
         } else if self.reason != InboundLedgerRequestTrigger::Timeout
             && priority(reason) >= priority(self.reason)
@@ -1519,10 +1537,28 @@ impl AcquisitionState {
     }
 
     fn restore_tree_plan(&self, plan: ActorTreePlan) {
-        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-        if !self.is_done() && mailbox.plan.is_none() {
-            mailbox.plan = Some(plan);
-            self.stats.state_scan_yields.fetch_add(1, Ordering::Relaxed);
+        let mut pending = Some(plan);
+        let rejected_tickets = {
+            let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+            if !self.is_done() && mailbox.plan.is_none() {
+                mailbox.plan = pending.take();
+                self.stats.state_scan_yields.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            } else {
+                // A terminal transition can race while the actor temporarily
+                // owns its plan. Never drop newly admitted/deferred broker
+                // tickets in that gap; settle them after releasing the
+                // mailbox lock just like ordinary terminal teardown.
+                pending
+                    .take()
+                    .expect("detached tree plan must remain owned until restoration")
+                    .tickets
+                    .into_values()
+                    .collect::<Vec<_>>()
+            }
+        };
+        for ticket in rejected_tickets {
+            self.read_broker.cancel(ticket);
         }
     }
 
@@ -1541,7 +1577,7 @@ impl AcquisitionState {
         &self,
         reason: InboundLedgerRequestTrigger,
         peer: Option<Arc<dyn Peer>>,
-    ) -> bool {
+    ) -> Option<bool> {
         // Query the planner before taking the mailbox lock. This retains the
         // exact `> 4`, no-progress, by-hash gate used by `prepare_trigger`
         // without re-entering its whole-map request scan or replacing a plan.
@@ -1551,10 +1587,10 @@ impl AcquisitionState {
                 .is_some_and(|mutable| mutable.inbound.should_use_aggressive_by_hash());
         let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
         let Some(plan) = mailbox.plan.as_mut() else {
-            return false;
+            return None;
         };
         plan.retarget(reason, peer, aggressive_by_hash);
-        true
+        Some(plan.runnable)
     }
 
     fn has_tree_plan(&self) -> bool {
@@ -2099,7 +2135,13 @@ fn trigger(
         .lifecycle
         .request_triggers
         .fetch_add(1, Ordering::Relaxed);
-    if state.retarget_tree_plan(reason, peer.clone()) {
+    if let Some(should_wake) = state.retarget_tree_plan(reason, peer.clone()) {
+        if should_wake {
+            // If the trigger arrived while idle, claim one bounded actor turn.
+            // A running turn coalesces this wake and observes `runnable` in
+            // `finish_acquisition_turn`.
+            state.wake_tree_plan();
+        }
         return;
     }
 
@@ -2138,6 +2180,7 @@ fn trigger(
                 reason,
                 peer: peer.clone(),
                 tickets: BTreeMap::new(),
+                read_admission_backlog: VecDeque::new(),
                 runnable: true,
                 aggressive_by_hash: false,
             });
@@ -2737,11 +2780,15 @@ fn process_read_event(state: &Arc<AcquisitionState>) {
                     mutable.inbound.record_verified_progress();
                 }
             }
-            actor_plan.runnable = actor_plan.plan.has_runnable_frontier();
+            // `take_read_event` released one reserved completion slot. If the
+            // actor owns unadmitted needs, consume that freed capacity directly
+            // instead of asking TreePlan to reannounce the same batch.
+            actor_plan.runnable = !actor_plan.read_admission_backlog.is_empty()
+                || actor_plan.plan.has_runnable_frontier();
             state.restore_tree_plan(actor_plan);
         }
         MissingNodeReadApply::Requeued => {
-            actor_plan.runnable = true;
+            actor_plan.runnable = !actor_plan.read_admission_backlog.is_empty();
             state.restore_tree_plan(actor_plan);
         }
         MissingNodeReadApply::Cancelled => {
@@ -2754,10 +2801,100 @@ fn process_read_event(state: &Arc<AcquisitionState>) {
     }
 }
 
+/// Admit retained TreePlan reads while there is mailbox completion capacity.
+///
+/// `TreePlan::advance` removes emitted needs from its unannounced set. When
+/// admission is full, ownership moves to `read_admission_backlog`; those needs
+/// are not converted back to `Rejected`, so the next completion retries this
+/// FIFO directly and cannot create a zero-branch TreePlan turn.
+fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: ActorTreePlan) {
+    let plan_id = actor_plan.plan.id();
+    let mut read_admission_blocked = false;
+    while let Some(need) = actor_plan.read_admission_backlog.pop_front() {
+        // Reserve delivery capacity before accepting a broker ticket. Keep the
+        // need in the actor FIFO when full; a later real completion releases a
+        // reservation and wakes exactly one bounded admission attempt.
+        if !state.reserve_read_event_slot() {
+            read_admission_blocked = true;
+            state
+                .stats
+                .state_scan_read_slot_full
+                .fetch_add(1, Ordering::Relaxed);
+            actor_plan.read_admission_backlog.push_front(need);
+            break;
+        }
+        let key = ReadKey::new(*need.hash().as_uint256(), need.ledger_seq(), 0);
+        let weak = Arc::downgrade(state);
+        let sink: ReadReadySink = Arc::new(move |ready| {
+            if let Some(state) = weak.upgrade() {
+                state.enqueue_read_ready(ready);
+            }
+        });
+        match state
+            .read_broker
+            .request(key, state.acquisition_id, plan_id.get(), sink)
+        {
+            ReadAdmission::Accepted(ticket) => {
+                state
+                    .stats
+                    .state_scan_read_admission_accepted
+                    .fetch_add(1, Ordering::Relaxed);
+                actor_plan.tickets.insert(need.hash(), ticket);
+            }
+            ReadAdmission::Deferred(ticket) => {
+                state
+                    .stats
+                    .state_scan_read_admission_deferred
+                    .fetch_add(1, Ordering::Relaxed);
+                actor_plan.tickets.insert(need.hash(), ticket);
+            }
+            ReadAdmission::Attached(ticket) => {
+                state
+                    .stats
+                    .state_scan_read_admission_attached
+                    .fetch_add(1, Ordering::Relaxed);
+                actor_plan.tickets.insert(need.hash(), ticket);
+            }
+            ReadAdmission::Rejected(ReadRejectReason::Stopped) => {
+                // A stopped broker cannot deliver a callback to drain this
+                // FIFO. Settle all actor-owned tickets through terminal
+                // failure rather than retaining unreachable local reads.
+                state.release_read_event_slot();
+                fail_actor_plan(state, actor_plan);
+                return;
+            }
+            ReadAdmission::Rejected(_) => {
+                read_admission_blocked = true;
+                state
+                    .stats
+                    .state_scan_read_broker_rejected
+                    .fetch_add(1, Ordering::Relaxed);
+                state.release_read_event_slot();
+                actor_plan.read_admission_backlog.push_front(need);
+                break;
+            }
+        }
+    }
+    // A nonempty FIFO is waiting work, not a runnable TreePlan frontier. It
+    // is woken only by a real read completion (or another existing trigger).
+    actor_plan.runnable = actor_plan.read_admission_backlog.is_empty()
+        && needs_reads_turn_can_requeue(&actor_plan.plan, read_admission_blocked);
+    state.restore_tree_plan(actor_plan);
+    // The broker owns physical I/O and runs submission after the actor plan
+    // has been returned to the mailbox.
+    state
+        .read_broker
+        .submit_ready_to_node_store(&state.node_store);
+}
+
 fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
     let Some(mut actor_plan) = state.take_tree_plan() else {
         return;
     };
+    if !actor_plan.read_admission_backlog.is_empty() {
+        submit_read_admission_backlog(state, actor_plan);
+        return;
+    }
     let started = Instant::now();
     let scan_before = actor_plan.plan.scan_stats();
     let branch_steps_before = scan_before.branch_steps;
@@ -2931,80 +3068,8 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
             }
         }
         TreeAdvance::NeedsReads(reads) => {
-            let plan_id = actor_plan.plan.id();
-            let mut read_admission_blocked = false;
-            for need in reads {
-                // Reserve delivery capacity before accepting a broker ticket.
-                // The per-acquisition broker limit and this mailbox limit are
-                // equal, making an accepted completion non-droppable.
-                if !state.reserve_read_event_slot() {
-                    read_admission_blocked = true;
-                    state
-                        .stats
-                        .state_scan_read_slot_full
-                        .fetch_add(1, Ordering::Relaxed);
-                    let _ = actor_plan.plan.apply_read_result(
-                        plan_id,
-                        need.hash(),
-                        MissingNodeReadOutcome::Rejected,
-                    );
-                    continue;
-                }
-                let key = ReadKey::new(*need.hash().as_uint256(), need.ledger_seq(), 0);
-                let weak = Arc::downgrade(state);
-                let sink: ReadReadySink = Arc::new(move |ready| {
-                    if let Some(state) = weak.upgrade() {
-                        state.enqueue_read_ready(ready);
-                    }
-                });
-                match state
-                    .read_broker
-                    .request(key, state.acquisition_id, plan_id.get(), sink)
-                {
-                    ReadAdmission::Accepted(ticket) => {
-                        state
-                            .stats
-                            .state_scan_read_admission_accepted
-                            .fetch_add(1, Ordering::Relaxed);
-                        actor_plan.tickets.insert(need.hash(), ticket);
-                    }
-                    ReadAdmission::Deferred(ticket) => {
-                        state
-                            .stats
-                            .state_scan_read_admission_deferred
-                            .fetch_add(1, Ordering::Relaxed);
-                        actor_plan.tickets.insert(need.hash(), ticket);
-                    }
-                    ReadAdmission::Attached(ticket) => {
-                        state
-                            .stats
-                            .state_scan_read_admission_attached
-                            .fetch_add(1, Ordering::Relaxed);
-                        actor_plan.tickets.insert(need.hash(), ticket);
-                    }
-                    ReadAdmission::Rejected(_) => {
-                        read_admission_blocked = true;
-                        state
-                            .stats
-                            .state_scan_read_broker_rejected
-                            .fetch_add(1, Ordering::Relaxed);
-                        state.release_read_event_slot();
-                        let _ = actor_plan.plan.apply_read_result(
-                            plan_id,
-                            need.hash(),
-                            MissingNodeReadOutcome::Rejected,
-                        );
-                    }
-                }
-            }
-            actor_plan.runnable =
-                needs_reads_turn_can_requeue(&actor_plan.plan, read_admission_blocked);
-            state.restore_tree_plan(actor_plan);
-            // The broker owns physical I/O and runs submission after the actor
-            // plan has been returned to the mailbox.
-            state
-                .read_broker
-                .submit_ready_to_node_store(&state.node_store);
+            actor_plan.read_admission_backlog.extend(reads);
+            submit_read_admission_backlog(state, actor_plan);
         }
         TreeAdvance::NeedsNetwork(candidates) => {
             let limit = match actor_plan.reason {
@@ -3487,39 +3552,84 @@ mod actor_mailbox_tests {
         ) else {
             panic!("expected the initial 16 local-read needs");
         };
-        assert_eq!(initial_reads.len(), 16);
-        for need in initial_reads {
-            assert_eq!(
-                plan.apply_read_result(plan.id(), need.hash(), MissingNodeReadOutcome::Rejected),
-                MissingNodeReadApply::Requeued
-            );
-        }
+        // TreePlan has removed these needs from its unannounced set. A full
+        // completion mailbox transfers them to the actor FIFO rather than
+        // applying `Rejected`, which would recreate the zero-branch batch.
+        let read_admission_backlog = VecDeque::from(initial_reads);
+        assert_eq!(read_admission_backlog.len(), 16);
+        assert!(
+            !plan.has_runnable_frontier(),
+            "broker-pending hashes alone cannot manufacture another scan"
+        );
 
         let branch_steps_before = plan.branch_steps();
-        let TreeAdvance::NeedsReads(retried_reads) = plan.advance(
-            ACQ_TURN_MAX_BRANCH_STEPS,
-            ACQ_TURN_MAX_NEW_READS,
-            &mut resident,
-            &mut first_child,
-        ) else {
-            panic!("expected the reannounced local-read needs");
-        };
-        assert_eq!(retried_reads.len(), 16);
+        assert!(matches!(
+            plan.advance(
+                ACQ_TURN_MAX_BRANCH_STEPS,
+                ACQ_TURN_MAX_NEW_READS,
+                &mut resident,
+                &mut first_child,
+            ),
+            TreeAdvance::Ready
+        ));
         assert_eq!(plan.branch_steps(), branch_steps_before);
-        for need in retried_reads {
-            assert_eq!(
-                plan.apply_read_result(plan.id(), need.hash(), MissingNodeReadOutcome::Rejected),
-                MissingNodeReadApply::Requeued
-            );
-        }
         assert!(
-            plan.has_runnable_frontier(),
-            "the old actor path would immediately requeue unannounced reads"
+            !needs_reads_turn_can_requeue(&plan, false),
+            "the plan itself remains idle while its actor-owned FIFO waits"
+        );
+
+        let mut actor_plan = ActorTreePlan {
+            plan,
+            reason: InboundLedgerRequestTrigger::Blind,
+            peer: None,
+            tickets: BTreeMap::new(),
+            read_admission_backlog,
+            runnable: false,
+            aggressive_by_hash: false,
+        };
+        actor_plan.retarget(InboundLedgerRequestTrigger::Timeout, None, false);
+        assert!(
+            actor_plan.runnable,
+            "a timeout must retry a callback-less broker-rejected FIFO"
         );
         assert!(
-            !needs_reads_turn_can_requeue(&plan, true),
-            "full read-admission capacity must wait for an existing completion"
+            !actor_plan.aggressive_by_hash,
+            "a blocked local-read FIFO must not append a peer retry"
         );
+        let ActorTreePlan {
+            mut plan,
+            read_admission_backlog,
+            ..
+        } = actor_plan;
+        let mut read_admission_backlog = read_admission_backlog;
+
+        // One real completion releases a reservation. The actor takes exactly
+        // one FIFO entry for admission; the remaining needs stay retained and
+        // do not reappear as another TreePlan NeedsReads result.
+        let admitted_after_completion = read_admission_backlog
+            .pop_front()
+            .expect("retained FIFO must supply the freed completion slot");
+        assert_eq!(read_admission_backlog.len(), 15);
+        assert!(matches!(
+            plan.apply_read_result(
+                plan.id(),
+                admitted_after_completion.hash(),
+                MissingNodeReadOutcome::Miss,
+            ),
+            MissingNodeReadApply::Applied {
+                attached_edges: 0,
+                missing_edges: 1,
+            }
+        ));
+        assert!(matches!(
+            plan.advance(
+                ACQ_TURN_MAX_BRANCH_STEPS,
+                ACQ_TURN_MAX_NEW_READS,
+                &mut resident,
+                &mut first_child,
+            ),
+            TreeAdvance::NeedsNetwork(_)
+        ));
     }
 
     #[test]
@@ -3652,6 +3762,7 @@ mod actor_mailbox_tests {
             reason: InboundLedgerRequestTrigger::Blind,
             peer: None,
             tickets: BTreeMap::new(),
+            read_admission_backlog: VecDeque::new(),
             runnable: false,
             aggressive_by_hash: false,
         };
@@ -3844,6 +3955,7 @@ mod actor_mailbox_tests {
             reason,
             peer: None,
             tickets: BTreeMap::new(),
+            read_admission_backlog: VecDeque::new(),
             runnable: false,
             aggressive_by_hash,
         }
@@ -3955,6 +4067,7 @@ mod actor_mailbox_tests {
             reason: InboundLedgerRequestTrigger::Blind,
             peer: None,
             tickets: BTreeMap::new(),
+            read_admission_backlog: VecDeque::new(),
             runnable: false,
             aggressive_by_hash: false,
         };
