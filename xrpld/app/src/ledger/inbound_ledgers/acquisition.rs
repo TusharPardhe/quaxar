@@ -8,6 +8,8 @@ use basics::base_uint::Uint256;
 use basics::hardened_hash::HardenedHashBuilder;
 use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::MonotonicClock;
+#[cfg(test)]
+use ledger::uses_aggressive_by_hash_timeout;
 use ledger::{
     FetchPackCache, FetchPackContainer, FetchPackStore, InboundLedgerDataType,
     InboundLedgerJournal, InboundLedgerLocal, InboundLedgerObjectType, InboundLedgerPacket,
@@ -15,7 +17,6 @@ use ledger::{
     InboundLedgerRequestTrigger, InboundLedgerStore, InboundLedgerTimerResult, Ledger, TreeAdvance,
     TreeKind, TreePlan, TreePlanId, make_get_ledger_with_node_ids,
     make_inbound_needed_by_hash_request, select_inbound_ledger_reply_peers,
-    uses_aggressive_by_hash_timeout,
 };
 use overlay::{Peer, PeerSet as _};
 use shamap::family::{FullBelowCache, FullBelowCacheImpl, NullMissingNodeReporter, SHAMapFamily};
@@ -211,6 +212,11 @@ struct AcquisitionStats {
     state_scan_full_below_hits: AtomicU64,
     state_scan_loaded_or_cached_children: AtomicU64,
     state_scan_pending_reads: AtomicU64,
+    state_scan_read_slot_full: AtomicU64,
+    state_scan_read_admission_accepted: AtomicU64,
+    state_scan_read_admission_deferred: AtomicU64,
+    state_scan_read_admission_attached: AtomicU64,
+    state_scan_read_broker_rejected: AtomicU64,
     state_scan_max_pending_reads: AtomicU64,
     state_scan_pending_hits: AtomicU64,
     state_scan_pending_misses: AtomicU64,
@@ -265,6 +271,11 @@ impl AcquisitionStats {
             state_scan_full_below_hits: AtomicU64::new(0),
             state_scan_loaded_or_cached_children: AtomicU64::new(0),
             state_scan_pending_reads: AtomicU64::new(0),
+            state_scan_read_slot_full: AtomicU64::new(0),
+            state_scan_read_admission_accepted: AtomicU64::new(0),
+            state_scan_read_admission_deferred: AtomicU64::new(0),
+            state_scan_read_admission_attached: AtomicU64::new(0),
+            state_scan_read_broker_rejected: AtomicU64::new(0),
             state_scan_max_pending_reads: AtomicU64::new(0),
             state_scan_pending_hits: AtomicU64::new(0),
             state_scan_pending_misses: AtomicU64::new(0),
@@ -378,6 +389,11 @@ pub(crate) struct AcquisitionSnapshot {
     pub state_scan_full_below_hits: u64,
     pub state_scan_loaded_or_cached_children: u64,
     pub state_scan_pending_reads: u64,
+    pub state_scan_read_slot_full: u64,
+    pub state_scan_read_admission_accepted: u64,
+    pub state_scan_read_admission_deferred: u64,
+    pub state_scan_read_admission_attached: u64,
+    pub state_scan_read_broker_rejected: u64,
     pub state_scan_max_pending_reads: u64,
     pub state_scan_pending_hits: u64,
     pub state_scan_pending_misses: u64,
@@ -764,6 +780,13 @@ impl ActorTreePlan {
 /// rather than consume every worker with zero-work successor turns.
 fn ready_turn_can_requeue(plan: &TreePlan, branch_steps_before: u64) -> bool {
     plan.has_runnable_frontier() && plan.branch_steps() > branch_steps_before
+}
+
+/// A rejected read admission means existing tickets already own all available
+/// completion slots. Its hash remains unannounced for a later retry, but that
+/// is waiting work: it must not manufacture an immediate successor turn.
+fn needs_reads_turn_can_requeue(plan: &TreePlan, read_admission_blocked: bool) -> bool {
+    !read_admission_blocked && plan.has_runnable_frontier()
 }
 
 const SCAN_OUTCOME_NOT_RUN: u8 = 0;
@@ -1741,6 +1764,23 @@ impl AcquisitionState {
                 .state_scan_loaded_or_cached_children
                 .load(Ordering::Relaxed),
             state_scan_pending_reads: self.stats.state_scan_pending_reads.load(Ordering::Relaxed),
+            state_scan_read_slot_full: self.stats.state_scan_read_slot_full.load(Ordering::Relaxed),
+            state_scan_read_admission_accepted: self
+                .stats
+                .state_scan_read_admission_accepted
+                .load(Ordering::Relaxed),
+            state_scan_read_admission_deferred: self
+                .stats
+                .state_scan_read_admission_deferred
+                .load(Ordering::Relaxed),
+            state_scan_read_admission_attached: self
+                .stats
+                .state_scan_read_admission_attached
+                .load(Ordering::Relaxed),
+            state_scan_read_broker_rejected: self
+                .stats
+                .state_scan_read_broker_rejected
+                .load(Ordering::Relaxed),
             state_scan_max_pending_reads: self
                 .stats
                 .state_scan_max_pending_reads
@@ -2892,11 +2932,17 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
         }
         TreeAdvance::NeedsReads(reads) => {
             let plan_id = actor_plan.plan.id();
+            let mut read_admission_blocked = false;
             for need in reads {
                 // Reserve delivery capacity before accepting a broker ticket.
                 // The per-acquisition broker limit and this mailbox limit are
                 // equal, making an accepted completion non-droppable.
                 if !state.reserve_read_event_slot() {
+                    read_admission_blocked = true;
+                    state
+                        .stats
+                        .state_scan_read_slot_full
+                        .fetch_add(1, Ordering::Relaxed);
                     let _ = actor_plan.plan.apply_read_result(
                         plan_id,
                         need.hash(),
@@ -2915,12 +2961,33 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
                     .read_broker
                     .request(key, state.acquisition_id, plan_id.get(), sink)
                 {
-                    ReadAdmission::Accepted(ticket)
-                    | ReadAdmission::Deferred(ticket)
-                    | ReadAdmission::Attached(ticket) => {
+                    ReadAdmission::Accepted(ticket) => {
+                        state
+                            .stats
+                            .state_scan_read_admission_accepted
+                            .fetch_add(1, Ordering::Relaxed);
+                        actor_plan.tickets.insert(need.hash(), ticket);
+                    }
+                    ReadAdmission::Deferred(ticket) => {
+                        state
+                            .stats
+                            .state_scan_read_admission_deferred
+                            .fetch_add(1, Ordering::Relaxed);
+                        actor_plan.tickets.insert(need.hash(), ticket);
+                    }
+                    ReadAdmission::Attached(ticket) => {
+                        state
+                            .stats
+                            .state_scan_read_admission_attached
+                            .fetch_add(1, Ordering::Relaxed);
                         actor_plan.tickets.insert(need.hash(), ticket);
                     }
                     ReadAdmission::Rejected(_) => {
+                        read_admission_blocked = true;
+                        state
+                            .stats
+                            .state_scan_read_broker_rejected
+                            .fetch_add(1, Ordering::Relaxed);
                         state.release_read_event_slot();
                         let _ = actor_plan.plan.apply_read_result(
                             plan_id,
@@ -2930,7 +2997,8 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
                     }
                 }
             }
-            actor_plan.runnable = actor_plan.plan.has_runnable_frontier();
+            actor_plan.runnable =
+                needs_reads_turn_can_requeue(&actor_plan.plan, read_admission_blocked);
             state.restore_tree_plan(actor_plan);
             // The broker owns physical I/O and runs submission after the actor
             // plan has been returned to the mailbox.
@@ -3362,6 +3430,96 @@ mod actor_mailbox_tests {
             next_node: 0,
             bytes,
         }
+    }
+
+    #[test]
+    fn read_admission_backpressure_waits_instead_of_spinning_zero_branch_needs_reads() {
+        use basics::intrusive_pointer::make_shared_intrusive;
+        use shamap::sync::{SHAMapType, SyncState, SyncTree};
+        use shamap::tree_node::SHAMapTreeNode;
+
+        struct NoResident;
+        impl MissingNodeResidentLookup for NoResident {
+            fn load_resident(
+                &mut self,
+                _hash: SHAMapHash,
+                _ledger_seq: u32,
+            ) -> Option<basics::intrusive_pointer::SharedIntrusive<SHAMapTreeNode>> {
+                None
+            }
+        }
+
+        // One inner root produces exactly 16 local-read needs. Simulating
+        // admission rejection reannounces those same needs. Its stack is then
+        // exhausted, so a retry returns `NeedsReads` with zero branch work:
+        // this matches the live high-rate telemetry shape.
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        for branch in 0..16 {
+            root.set_child_hash(
+                branch,
+                SHAMapHash::new(Uint256::from_array([(branch + 1) as u8; 32])),
+            );
+        }
+        root.update_hash();
+        let tree = SyncTree::from_root_with_type(
+            root.clone(),
+            SHAMapType::State,
+            true,
+            77,
+            SyncState::Synching,
+        );
+        let mut first_child = || 0;
+        let mut plan = TreePlan::new(
+            TreePlanId::new(94),
+            TreeKind::State,
+            &tree,
+            root.get_hash(),
+            16,
+            9,
+            &mut first_child,
+        );
+        let mut resident = NoResident;
+        let TreeAdvance::NeedsReads(initial_reads) = plan.advance(
+            ACQ_TURN_MAX_BRANCH_STEPS,
+            ACQ_TURN_MAX_NEW_READS,
+            &mut resident,
+            &mut first_child,
+        ) else {
+            panic!("expected the initial 16 local-read needs");
+        };
+        assert_eq!(initial_reads.len(), 16);
+        for need in initial_reads {
+            assert_eq!(
+                plan.apply_read_result(plan.id(), need.hash(), MissingNodeReadOutcome::Rejected),
+                MissingNodeReadApply::Requeued
+            );
+        }
+
+        let branch_steps_before = plan.branch_steps();
+        let TreeAdvance::NeedsReads(retried_reads) = plan.advance(
+            ACQ_TURN_MAX_BRANCH_STEPS,
+            ACQ_TURN_MAX_NEW_READS,
+            &mut resident,
+            &mut first_child,
+        ) else {
+            panic!("expected the reannounced local-read needs");
+        };
+        assert_eq!(retried_reads.len(), 16);
+        assert_eq!(plan.branch_steps(), branch_steps_before);
+        for need in retried_reads {
+            assert_eq!(
+                plan.apply_read_result(plan.id(), need.hash(), MissingNodeReadOutcome::Rejected),
+                MissingNodeReadApply::Requeued
+            );
+        }
+        assert!(
+            plan.has_runnable_frontier(),
+            "the old actor path would immediately requeue unannounced reads"
+        );
+        assert!(
+            !needs_reads_turn_can_requeue(&plan, true),
+            "full read-admission capacity must wait for an existing completion"
+        );
     }
 
     #[test]

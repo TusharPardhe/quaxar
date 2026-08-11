@@ -454,6 +454,26 @@ fn acquisition_snapshot_json(
             JsonValue::Unsigned(snapshot.state_scan_pending_reads),
         ),
         (
+            "state_scan_read_slot_full".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_read_slot_full),
+        ),
+        (
+            "state_scan_read_admission_accepted".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_read_admission_accepted),
+        ),
+        (
+            "state_scan_read_admission_deferred".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_read_admission_deferred),
+        ),
+        (
+            "state_scan_read_admission_attached".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_read_admission_attached),
+        ),
+        (
+            "state_scan_read_broker_rejected".to_owned(),
+            JsonValue::Unsigned(snapshot.state_scan_read_broker_rejected),
+        ),
+        (
             "state_scan_max_pending_reads".to_owned(),
             JsonValue::Unsigned(snapshot.state_scan_max_pending_reads),
         ),
@@ -2428,6 +2448,11 @@ mod tests {
             state_scan_full_below_hits: 0,
             state_scan_loaded_or_cached_children: 0,
             state_scan_pending_reads: 0,
+            state_scan_read_slot_full: 0,
+            state_scan_read_admission_accepted: 0,
+            state_scan_read_admission_deferred: 0,
+            state_scan_read_admission_attached: 0,
+            state_scan_read_broker_rejected: 0,
             state_scan_max_pending_reads: 0,
             state_scan_pending_hits: 0,
             state_scan_pending_misses: 0,
