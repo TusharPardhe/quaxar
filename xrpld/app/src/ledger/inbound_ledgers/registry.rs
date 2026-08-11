@@ -271,6 +271,32 @@ struct RecoveryLclDecision {
     decision: String,
 }
 
+/// Latest preferred-LCL identity observed by the NetworkOps strand. This is
+/// diagnostic-only: it never changes broker admission or acquisition order.
+#[derive(Clone, Copy)]
+struct PreferredLclTargetSnapshot {
+    hash: Uint256,
+    epoch: u64,
+    observed_at: Instant,
+}
+
+fn process_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()?
+            .lines()
+            .find_map(|line| {
+                let value = line.strip_prefix("VmRSS:")?.split_whitespace().next()?;
+                value.parse::<u64>().ok()?.checked_mul(1024)
+            })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 fn acquire_reason_name(reason: AcquireReason) -> &'static str {
     match reason {
         AcquireReason::Consensus => "consensus",
@@ -286,8 +312,34 @@ fn acquisition_snapshot_json(
     idle_ms: u64,
     complete: bool,
     failed: bool,
+    is_current_preferred_target: bool,
     snapshot: AcquisitionSnapshot,
 ) -> JsonValue {
+    let broker_tree_cache_reuse_ppm = (snapshot.broker_tree_nodes_decoded != 0).then(|| {
+        snapshot
+            .broker_tree_cache_reused
+            .saturating_mul(1_000_000)
+            .saturating_div(snapshot.broker_tree_nodes_decoded)
+    });
+    let broker_reads_per_new_shared_tree_node_ppm = (snapshot.broker_tree_cache_inserted != 0)
+        .then(|| {
+            snapshot
+                .broker_tree_nodes_decoded
+                .saturating_mul(1_000_000)
+                .saturating_div(snapshot.broker_tree_cache_inserted)
+        });
+    let broker_tree_nodes_decoded_per_second = (snapshot.age_ms != 0).then(|| {
+        snapshot
+            .broker_tree_nodes_decoded
+            .saturating_mul(1_000)
+            .saturating_div(snapshot.age_ms)
+    });
+    let new_shared_tree_nodes_per_second = (snapshot.age_ms != 0).then(|| {
+        snapshot
+            .broker_tree_cache_inserted
+            .saturating_mul(1_000)
+            .saturating_div(snapshot.age_ms)
+    });
     let lookup_total = snapshot
         .node_store_fetch_hits
         .saturating_add(snapshot.node_store_fetch_misses);
@@ -317,6 +369,10 @@ fn acquisition_snapshot_json(
         ("idle_ms".to_owned(), JsonValue::Unsigned(idle_ms)),
         ("complete".to_owned(), JsonValue::Bool(complete)),
         ("failed".to_owned(), JsonValue::Bool(failed)),
+        (
+            "is_current_preferred_target".to_owned(),
+            JsonValue::Bool(is_current_preferred_target),
+        ),
         (
             "have_header".to_owned(),
             JsonValue::Bool(snapshot.have_header),
@@ -441,6 +497,18 @@ fn acquisition_snapshot_json(
         (
             "state_scan_loaded_or_cached_children".to_owned(),
             JsonValue::Unsigned(snapshot.state_scan_loaded_or_cached_children),
+        ),
+        (
+            "broker_tree_nodes_decoded".to_owned(),
+            JsonValue::Unsigned(snapshot.broker_tree_nodes_decoded),
+        ),
+        (
+            "broker_tree_cache_reused".to_owned(),
+            JsonValue::Unsigned(snapshot.broker_tree_cache_reused),
+        ),
+        (
+            "broker_tree_cache_inserted".to_owned(),
+            JsonValue::Unsigned(snapshot.broker_tree_cache_inserted),
         ),
         (
             "state_scan_pending_reads".to_owned(),
@@ -577,6 +645,30 @@ fn acquisition_snapshot_json(
             .unwrap_or(JsonValue::Null),
     );
     values.insert(
+        "broker_tree_cache_reuse_ppm".to_owned(),
+        broker_tree_cache_reuse_ppm
+            .map(JsonValue::Unsigned)
+            .unwrap_or(JsonValue::Null),
+    );
+    values.insert(
+        "broker_reads_per_new_shared_tree_node_ppm".to_owned(),
+        broker_reads_per_new_shared_tree_node_ppm
+            .map(JsonValue::Unsigned)
+            .unwrap_or(JsonValue::Null),
+    );
+    values.insert(
+        "broker_tree_nodes_decoded_per_second".to_owned(),
+        broker_tree_nodes_decoded_per_second
+            .map(JsonValue::Unsigned)
+            .unwrap_or(JsonValue::Null),
+    );
+    values.insert(
+        "new_shared_tree_nodes_per_second".to_owned(),
+        new_shared_tree_nodes_per_second
+            .map(JsonValue::Unsigned)
+            .unwrap_or(JsonValue::Null),
+    );
+    values.insert(
         "average_worker_queue_wait_us".to_owned(),
         average_worker_queue_wait_us
             .map(JsonValue::Unsigned)
@@ -639,6 +731,9 @@ pub struct InboundLedgers {
     /// Last preferred-LCL selection outcome, retained solely for bounded
     /// operator diagnostics.
     recovery_lcl_decision: Mutex<Option<RecoveryLclDecision>>,
+    /// Current preferred target identity, observed by NetworkOps only for
+    /// fetch-info classification. It does not affect acquisition scheduling.
+    preferred_lcl_target: Mutex<Option<PreferredLclTargetSnapshot>>,
     /// Shared lifecycle counters incremented at request, wire, worker, retry,
     /// and terminal boundaries. The sampled snapshot never mutates state.
     lifecycle: Arc<AcquisitionLifecycleCounters>,
@@ -691,6 +786,7 @@ impl InboundLedgers {
             pending_acquires: Arc::new(Mutex::new(HashSet::new())),
             next_acquisition_id: AtomicU64::new(1),
             recovery_lcl_decision: Mutex::new(None),
+            preferred_lcl_target: Mutex::new(None),
             lifecycle: Arc::new(AcquisitionLifecycleCounters::default()),
         }
     }
@@ -1178,6 +1274,21 @@ impl InboundLedgers {
         }
     }
 
+    /// Publish the currently selected preferred-LCL identity for diagnostics.
+    /// This is intentionally observational; rippled does not prioritize local
+    /// NodeStore capacity by acquisition reason, and neither does Quaxar.
+    pub fn observe_preferred_lcl_target(&self, hash: Uint256, epoch: u64) {
+        let mut target = self
+            .preferred_lcl_target
+            .lock()
+            .expect("preferred_lcl_target lock");
+        *target = (!hash.is_zero()).then_some(PreferredLclTargetSnapshot {
+            hash,
+            epoch,
+            observed_at: Instant::now(),
+        });
+    }
+
     /// Record a preferred-LCL request, selection, installation, or rejection
     /// without mutating acquisition or consensus state. `fetch_info` exposes
     /// only this most recent decision so normal recovery does not allocate an
@@ -1210,7 +1321,12 @@ impl InboundLedgers {
     /// selection state.
     pub fn fetch_info_bounded(&self, limit: usize) -> JsonValue {
         let limit = limit.min(FETCH_INFO_MAX_ACQUISITIONS);
-        let (entries, active, completed, failed, recent_failures, decision) = {
+        let preferred_target = *self
+            .preferred_lcl_target
+            .lock()
+            .expect("preferred_lcl_target lock");
+        let preferred_hash = preferred_target.map(|target| target.hash);
+        let (entries, active, completed, failed, recent_failures, decision, preferred_active) = {
             let inner = self.inner.lock().expect("inbound_ledgers lock");
             let mut active = 0u64;
             let mut completed = 0u64;
@@ -1226,23 +1342,40 @@ impl InboundLedgers {
                     active += 1;
                 }
             }
-            let entries = inner
-                .entries
-                .iter()
-                .take(limit)
-                .map(|(hash, entry)| {
-                    (
-                        *hash,
-                        entry.seq,
-                        entry.reason,
-                        entry.last_touched.elapsed().as_millis() as u64,
-                        entry.completed_ledger.is_some()
-                            || entry.state.completed.load(Ordering::Acquire),
-                        entry.failed || entry.state.failed.load(Ordering::Acquire),
-                        Arc::clone(&entry.state),
-                    )
-                })
-                .collect::<Vec<_>>();
+            let mut entries = Vec::with_capacity(limit);
+            let snapshot_entry = |hash: Uint256, entry: &Entry| {
+                (
+                    hash,
+                    entry.seq,
+                    entry.reason,
+                    entry.last_touched.elapsed().as_millis() as u64,
+                    entry.completed_ledger.is_some()
+                        || entry.state.completed.load(Ordering::Acquire),
+                    entry.failed || entry.state.failed.load(Ordering::Acquire),
+                    Arc::clone(&entry.state),
+                )
+            };
+            if let Some(hash) = preferred_hash
+                && let Some(entry) = inner.entries.get(&hash)
+            {
+                entries.push(snapshot_entry(hash, entry));
+            }
+            entries.extend(
+                inner
+                    .entries
+                    .iter()
+                    .filter(|(hash, _)| Some(**hash) != preferred_hash)
+                    .take(limit.saturating_sub(entries.len()))
+                    .map(|(hash, entry)| snapshot_entry(*hash, entry)),
+            );
+            let preferred_active = preferred_hash
+                .and_then(|hash| inner.entries.get(&hash))
+                .is_some_and(|entry| {
+                    !entry.failed
+                        && !entry.state.failed.load(Ordering::Acquire)
+                        && entry.completed_ledger.is_none()
+                        && !entry.state.completed.load(Ordering::Acquire)
+                });
             (
                 entries,
                 active,
@@ -1253,6 +1386,7 @@ impl InboundLedgers {
                     .lock()
                     .expect("recovery_lcl_decision lock")
                     .clone(),
+                preferred_active,
             )
         };
 
@@ -1267,6 +1401,7 @@ impl InboundLedgers {
                         idle_ms,
                         complete,
                         failed,
+                        Some(hash) == preferred_hash,
                         state.diagnostics(),
                     )
                 },
@@ -1316,6 +1451,57 @@ impl InboundLedgers {
         result.insert(
             "lifecycle".to_owned(),
             JsonValue::String(format!("{lifecycle:?}")),
+        );
+        result.insert(
+            "preferred_lcl_target".to_owned(),
+            preferred_target
+                .map(|target| {
+                    JsonValue::Object(BTreeMap::from([
+                        (
+                            "hash".to_owned(),
+                            JsonValue::String(target.hash.to_string()),
+                        ),
+                        ("epoch".to_owned(), JsonValue::Unsigned(target.epoch)),
+                        (
+                            "age_ms".to_owned(),
+                            JsonValue::Unsigned(target.observed_at.elapsed().as_millis() as u64),
+                        ),
+                        ("active".to_owned(), JsonValue::Bool(preferred_active)),
+                        (
+                            "obsolete_active_acquisitions".to_owned(),
+                            JsonValue::Unsigned(active.saturating_sub(u64::from(preferred_active))),
+                        ),
+                    ]))
+                })
+                .unwrap_or(JsonValue::Null),
+        );
+        let shared_tree_cache_entries = self.tree_cache.size() as u64;
+        let process_rss_bytes = process_rss_bytes();
+        result.insert(
+            "shamap_materialization".to_owned(),
+            JsonValue::Object(BTreeMap::from([
+                (
+                    "shared_tree_cache_entries".to_owned(),
+                    JsonValue::Unsigned(shared_tree_cache_entries),
+                ),
+                (
+                    "shared_tree_cache_tracked_entries".to_owned(),
+                    JsonValue::Unsigned(self.tree_cache.get_track_size() as u64),
+                ),
+                (
+                    "process_rss_bytes".to_owned(),
+                    process_rss_bytes
+                        .map(JsonValue::Unsigned)
+                        .unwrap_or(JsonValue::Null),
+                ),
+                (
+                    "rss_bytes_per_shared_tree_cache_entry".to_owned(),
+                    process_rss_bytes
+                        .filter(|_| shared_tree_cache_entries != 0)
+                        .map(|rss| JsonValue::Unsigned(rss / shared_tree_cache_entries))
+                        .unwrap_or(JsonValue::Null),
+                ),
+            ])),
         );
         result.insert(
             "last_recovery_lcl_decision".to_owned(),
@@ -2524,6 +2710,9 @@ mod tests {
             state_scan_duplicate_missing_hashes: 0,
             state_scan_full_below_hits: 0,
             state_scan_loaded_or_cached_children: 0,
+            broker_tree_nodes_decoded: 0,
+            broker_tree_cache_reused: 0,
+            broker_tree_cache_inserted: 0,
             state_scan_pending_reads: 0,
             state_scan_read_slot_full: 0,
             state_scan_read_admission_accepted: 0,
@@ -2574,6 +2763,7 @@ mod tests {
             0,
             false,
             false,
+            false,
             snapshot,
         ) else {
             panic!("acquisition diagnostics must be an object");
@@ -2594,6 +2784,22 @@ mod tests {
             Some(&JsonValue::Unsigned(0))
         );
         assert_eq!(values.get("data_drain_runs"), Some(&JsonValue::Unsigned(0)));
+        assert_eq!(
+            values.get("broker_tree_nodes_decoded"),
+            Some(&JsonValue::Unsigned(0))
+        );
+        assert_eq!(
+            values.get("broker_tree_cache_reuse_ppm"),
+            Some(&JsonValue::Null)
+        );
+        assert_eq!(
+            values.get("broker_reads_per_new_shared_tree_node_ppm"),
+            Some(&JsonValue::Null)
+        );
+        assert_eq!(
+            values.get("is_current_preferred_target"),
+            Some(&JsonValue::Bool(false))
+        );
         assert_eq!(
             values.get("node_store_lookup_hit_rate_ppm"),
             Some(&JsonValue::Null)

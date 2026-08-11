@@ -225,6 +225,12 @@ struct AcquisitionStats {
     state_scan_duplicate_missing_hashes: AtomicU64,
     state_scan_full_below_hits: AtomicU64,
     state_scan_loaded_or_cached_children: AtomicU64,
+    /// Decoded descendants delivered through the asynchronous NodeStore broker.
+    broker_tree_nodes_decoded: AtomicU64,
+    /// Broker-decoded nodes replaced by an existing shared TreeNodeCache node.
+    broker_tree_cache_reused: AtomicU64,
+    /// Broker-decoded nodes newly admitted to the shared TreeNodeCache.
+    broker_tree_cache_inserted: AtomicU64,
     state_scan_pending_reads: AtomicU64,
     state_scan_read_slot_full: AtomicU64,
     state_scan_read_admission_accepted: AtomicU64,
@@ -284,6 +290,9 @@ impl AcquisitionStats {
             state_scan_duplicate_missing_hashes: AtomicU64::new(0),
             state_scan_full_below_hits: AtomicU64::new(0),
             state_scan_loaded_or_cached_children: AtomicU64::new(0),
+            broker_tree_nodes_decoded: AtomicU64::new(0),
+            broker_tree_cache_reused: AtomicU64::new(0),
+            broker_tree_cache_inserted: AtomicU64::new(0),
             state_scan_pending_reads: AtomicU64::new(0),
             state_scan_read_slot_full: AtomicU64::new(0),
             state_scan_read_admission_accepted: AtomicU64::new(0),
@@ -402,6 +411,12 @@ pub(crate) struct AcquisitionSnapshot {
     pub state_scan_duplicate_missing_hashes: u64,
     pub state_scan_full_below_hits: u64,
     pub state_scan_loaded_or_cached_children: u64,
+    /// Cumulative successfully decoded broker-delivered descendant nodes.
+    pub broker_tree_nodes_decoded: u64,
+    /// Of broker-delivered decoded nodes, those replaced with a shared cached node.
+    pub broker_tree_cache_reused: u64,
+    /// Of broker-delivered decoded nodes, those newly admitted to the shared cache.
+    pub broker_tree_cache_inserted: u64,
     pub state_scan_pending_reads: u64,
     pub state_scan_read_slot_full: u64,
     pub state_scan_read_admission_accepted: u64,
@@ -1895,6 +1910,12 @@ impl AcquisitionState {
                 .stats
                 .state_scan_loaded_or_cached_children
                 .load(Ordering::Relaxed),
+            broker_tree_nodes_decoded: self.stats.broker_tree_nodes_decoded.load(Ordering::Relaxed),
+            broker_tree_cache_reused: self.stats.broker_tree_cache_reused.load(Ordering::Relaxed),
+            broker_tree_cache_inserted: self
+                .stats
+                .broker_tree_cache_inserted
+                .load(Ordering::Relaxed),
             state_scan_pending_reads: self.stats.state_scan_pending_reads.load(Ordering::Relaxed),
             state_scan_read_slot_full: self.stats.state_scan_read_slot_full.load(Ordering::Relaxed),
             state_scan_read_admission_accepted: self
@@ -2897,6 +2918,28 @@ fn process_read_events(state: &Arc<AcquisitionState>) {
     let _ = drain_bounded_read_events(|| process_one_read_event(state));
 }
 
+/// Decode one broker-delivered NodeStore object and replace it with the shared
+/// canonical node if another acquisition has already materialized this hash.
+/// This is the asynchronous equivalent of rippled's SHAMap::finishFetch /
+/// canonicalize path: every locally hydrated descendant becomes reusable by
+/// all backed SHAMaps, not only by the plan that first received the callback.
+fn decode_and_canonicalize_brokered_tree_node(
+    cache: &TreeNodeCache<MonotonicClock>,
+    data: &[u8],
+    hash: SHAMapHash,
+) -> Result<
+    (
+        basics::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>,
+        bool,
+    ),
+    (),
+> {
+    let mut node =
+        shamap::tree_node::SHAMapTreeNode::make_from_prefix(data, hash).map_err(|_| ())?;
+    let reused = cache.canonicalize_replace_client(hash.as_uint256(), &mut node);
+    Ok((node, reused))
+}
+
 /// Reduce one settled completion. Returning false leaves the mailbox untouched;
 /// returning true means precisely one reservation was released and its event
 /// was handled, including stale and terminal paths.
@@ -2930,9 +2973,31 @@ fn process_one_read_event(state: &Arc<AcquisitionState>) -> bool {
     actor_plan.tickets.remove(&hash);
     let outcome = match ready.outcome {
         ReadOutcome::Found(object) => {
-            match shamap::tree_node::SHAMapTreeNode::make_from_prefix(object.data(), hash) {
-                Ok(node) => MissingNodeReadOutcome::Found(node),
-                Err(_) => {
+            state.stats.record_node_store_fetch(true);
+            match decode_and_canonicalize_brokered_tree_node(
+                &state.shared_tree_cache,
+                object.data(),
+                hash,
+            ) {
+                Ok((node, reused)) => {
+                    state
+                        .stats
+                        .broker_tree_nodes_decoded
+                        .fetch_add(1, Ordering::Relaxed);
+                    if reused {
+                        state
+                            .stats
+                            .broker_tree_cache_reused
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        state
+                            .stats
+                            .broker_tree_cache_inserted
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    MissingNodeReadOutcome::Found(node)
+                }
+                Err(()) => {
                     tracing::trace!(
                         target: "inbound_ledger",
                         seq = state.seq,
@@ -2944,9 +3009,13 @@ fn process_one_read_event(state: &Arc<AcquisitionState>) -> bool {
                 }
             }
         }
-        ReadOutcome::Miss => MissingNodeReadOutcome::Miss,
+        ReadOutcome::Miss => {
+            state.stats.record_node_store_fetch(false);
+            MissingNodeReadOutcome::Miss
+        }
         ReadOutcome::Cancelled => MissingNodeReadOutcome::Cancelled,
         ReadOutcome::Fault(_) => {
+            state.stats.record_node_store_fetch(false);
             tracing::warn!(
                 target: "inbound_ledger",
                 seq = state.seq,
@@ -3728,6 +3797,44 @@ where
 #[cfg(test)]
 mod actor_mailbox_tests {
     use super::*;
+
+    #[test]
+    fn broker_decoded_descendant_is_canonicalized_into_the_shared_tree_cache() {
+        use basics::intrusive_pointer::make_shared_intrusive;
+        use shamap::tree_node::SHAMapTreeNode;
+
+        let cache = TreeNodeCache::new(
+            "brokered-descendant-cache",
+            16,
+            time::Duration::seconds(60),
+            MonotonicClock::default(),
+        );
+        let source = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        source.set_child_hash(0, SHAMapHash::new(Uint256::from_array([0xA5; 32])));
+        source.update_hash();
+        let hash = source.get_hash();
+        let data = source
+            .serialize_with_prefix()
+            .expect("inner node must serialize with its NodeStore prefix");
+
+        let (first, first_reused) = decode_and_canonicalize_brokered_tree_node(&cache, &data, hash)
+            .expect("first broker decode must succeed");
+        assert!(
+            !first_reused,
+            "first decoded node must populate the shared cache"
+        );
+        assert_eq!(cache.size(), 1);
+
+        let (second, second_reused) =
+            decode_and_canonicalize_brokered_tree_node(&cache, &data, hash)
+                .expect("second broker decode must succeed");
+        assert!(
+            second_reused,
+            "second decode must reuse the shared canonical node"
+        );
+        assert_eq!(first.get_hash(), second.get_hash());
+        assert_eq!(cache.size(), 1);
+    }
 
     fn packet_work(peer_id: u64, bytes: usize) -> PacketWork {
         PacketWork {

@@ -998,6 +998,7 @@ fn reconcile_preferred_lcl(
     );
     let preferred_hash = preference_diagnostic.selected;
     let preferred_epoch = preferred_lcl_target.observe(preferred_hash);
+    shared_inbound.observe_preferred_lcl_target(preferred_hash, preferred_epoch);
     // Preserve the exact resolver result for this Accepted pass. Reusing it
     // below distinguishes a true resolver hit from an inbound-registry hit
     // and avoids a second lookup obscuring a cache/sweep race in diagnostics.
