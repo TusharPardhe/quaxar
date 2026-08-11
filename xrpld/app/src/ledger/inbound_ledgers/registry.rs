@@ -849,7 +849,13 @@ impl InboundLedgers {
             } else {
                 completed_ledger
             };
-            if reason == AcquireReason::Consensus {
+            // An in-progress entry is already correlated by the single
+            // `preferred_lcl_registry_started` event and the periodic
+            // `preferred_lcl_candidate_lookup` result. Logging every
+            // consensus caller that observes it produces an unbounded trace
+            // storm without adding a lifecycle transition. Emit this event
+            // only when the registry can actually return the completed ledger.
+            if reason == AcquireReason::Consensus && result.is_some() {
                 tracing::info!(
                     target: "lcl_trace",
                     event = "preferred_lcl_registry_existing",
