@@ -11,8 +11,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 // `TimeoutCounter` admits recovery work only while fewer than this many
-// JtLedgerData-equivalent jobs are live (queued or executing).
-const LEDGER_DATA_JOB_LIMIT: usize = 5;
+// JtLedgerData-equivalent jobs are live (queued or executing). The isolated
+// throughput experiment permits a bounded recovery backlog alongside eight
+// workers; ordinary packet jobs remain independently coalesced.
+const LEDGER_DATA_JOB_LIMIT: usize = 16;
 
 type Job = Box<dyn FnOnce() + Send>;
 

@@ -12,10 +12,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 
-/// Maximum physical NodeStore reads owned by all inbound acquisitions.
-pub const ACQ_READS_GLOBAL: usize = 64;
-/// Maximum dispatched read subscriptions attributable to one acquisition.
-pub const ACQ_READS_PER_ACQUISITION: usize = 16;
+/// Maximum physical NodeStore reads owned by all inbound acquisitions in the
+/// isolated high-throughput experiment.
+pub const ACQ_READS_GLOBAL: usize = 128;
+/// Maximum dispatched read subscriptions attributable to one acquisition in
+/// the isolated high-throughput experiment.
+pub const ACQ_READS_PER_ACQUISITION: usize = 32;
 /// Maximum acquisitions/plans that may wait on one unique key.
 pub const ACQ_READ_WAITERS_PER_KEY: usize = 32;
 

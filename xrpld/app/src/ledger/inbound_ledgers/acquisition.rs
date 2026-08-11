@@ -67,15 +67,19 @@ struct LocalProbe {
     peer: Option<Arc<dyn Peer>>,
 }
 
-/// Bounded actor CPU admission. These are intentionally separate from the
-/// broker limits: a plan yields after this many branches even when no I/O is
-/// pending, so a packet flood cannot monopolize a ledger-data worker.
-pub const ACQ_TURN_MAX_BRANCH_STEPS: usize = 256;
-pub const ACQ_TURN_MAX_NEW_READS: usize = 16;
-/// Maximum settled broker completions reduced in one actor turn. This remains
-/// below the per-acquisition logical-read limit so a full mailbox yields after
-/// at most two turns instead of monopolizing a ledger-data worker.
-pub const ACQ_TURN_MAX_READ_EVENTS: usize = 8;
+/// Bounded actor CPU admission for the isolated high-throughput experiment.
+/// These remain separate from broker limits and preserve an explicit yield so
+/// a packet flood cannot monopolize a ledger-data worker.
+pub const ACQ_TURN_MAX_BRANCH_STEPS: usize = 512;
+pub const ACQ_TURN_MAX_NEW_READS: usize = 32;
+/// Maximum settled broker completions reduced in one actor turn. This is half
+/// the experiment's per-acquisition logical-read limit, preserving a bounded
+/// successor turn when the completion mailbox is full.
+pub const ACQ_TURN_MAX_READ_EVENTS: usize = 16;
+/// A persistence command is one bounded NodeStore batch. The lower NodeStore
+/// writer batches further across acquisitions; this batch removes one worker
+/// dispatch and acknowledgement round-trip per individual node write.
+const PERSISTENCE_WRITE_BATCH_SIZE: usize = 256;
 pub const ACQ_MAILBOX_PACKET_CAPACITY: usize = 128;
 pub const ACQ_MAILBOX_BYTE_CAPACITY: usize = 4 * 1024 * 1024;
 
@@ -455,22 +459,35 @@ struct PersistenceWrite {
     data: Vec<u8>,
 }
 
-#[derive(Clone)]
 enum PersistenceCommand {
-    Write { id: u64, write: PersistenceWrite },
-    DurabilityBarrier { id: u64 },
+    Writes {
+        id: u64,
+        writes: Vec<PersistenceWrite>,
+    },
+    DurabilityBarrier {
+        id: u64,
+    },
 }
 
 impl PersistenceCommand {
     fn id(&self) -> u64 {
         match self {
-            Self::Write { id, .. } | Self::DurabilityBarrier { id } => *id,
+            Self::Writes { id, .. } | Self::DurabilityBarrier { id } => *id,
         }
     }
 
     fn is_durability_barrier(&self) -> bool {
         matches!(self, Self::DurabilityBarrier { .. })
     }
+}
+
+/// The actor retains only completion identity while a worker owns the write
+/// payload. That avoids cloning each node's bytes merely to preserve FIFO ack
+/// ordering.
+#[derive(Clone, Copy)]
+struct InFlightPersistenceCommand {
+    id: u64,
+    durability_barrier: bool,
 }
 
 #[derive(Clone)]
@@ -499,7 +516,7 @@ enum PersistenceSettlement {
 struct PersistenceQueue {
     next_id: u64,
     queued: VecDeque<PersistenceCommand>,
-    in_flight: Option<PersistenceCommand>,
+    in_flight: Option<InFlightPersistenceCommand>,
     accepted: BTreeSet<PersistenceKey>,
     settled: BTreeMap<u64, PersistenceSettlement>,
     barrier_enqueued: bool,
@@ -523,19 +540,37 @@ impl Default for PersistenceQueue {
 }
 
 impl PersistenceQueue {
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("persistence command id overflow");
+        id
+    }
+
     fn enqueue_writes(&mut self, writes: Vec<PersistenceWrite>) {
+        let mut batch = Vec::with_capacity(PERSISTENCE_WRITE_BATCH_SIZE);
         for write in writes {
-            let id = self.next_id;
-            self.next_id = self
-                .next_id
-                .checked_add(1)
-                .expect("persistence command id overflow");
             if !self.accepted.insert(write.key) {
+                let id = self.next_id();
                 self.settled.insert(id, PersistenceSettlement::Duplicate);
                 continue;
             }
+            batch.push(write);
+            if batch.len() == PERSISTENCE_WRITE_BATCH_SIZE {
+                let id = self.next_id();
+                self.queued.push_back(PersistenceCommand::Writes {
+                    id,
+                    writes: std::mem::take(&mut batch),
+                });
+                batch = Vec::with_capacity(PERSISTENCE_WRITE_BATCH_SIZE);
+            }
+        }
+        if !batch.is_empty() {
+            let id = self.next_id();
             self.queued
-                .push_back(PersistenceCommand::Write { id, write });
+                .push_back(PersistenceCommand::Writes { id, writes: batch });
         }
     }
 
@@ -544,11 +579,7 @@ impl PersistenceQueue {
             return;
         }
         self.barrier_enqueued = true;
-        let id = self.next_id;
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .expect("persistence command id overflow");
+        let id = self.next_id();
         self.queued
             .push_back(PersistenceCommand::DurabilityBarrier { id });
     }
@@ -560,7 +591,10 @@ impl PersistenceQueue {
             return None;
         }
         let command = self.queued.pop_front()?;
-        self.in_flight = Some(command.clone());
+        self.in_flight = Some(InFlightPersistenceCommand {
+            id: command.id(),
+            durability_barrier: command.is_durability_barrier(),
+        });
         Some(command)
     }
 
@@ -568,24 +602,22 @@ impl PersistenceQueue {
         let Some(command) = self.in_flight.take() else {
             return false;
         };
-        if command.id() != ready.id || command.is_durability_barrier() != ready.durability_barrier {
+        if command.id != ready.id || command.durability_barrier != ready.durability_barrier {
             self.in_flight = Some(command);
             return false;
         }
         match &ready.result {
             Ok(()) => {
                 self.settled
-                    .insert(command.id(), PersistenceSettlement::Written);
+                    .insert(command.id, PersistenceSettlement::Written);
                 if ready.durability_barrier {
                     self.barrier_acknowledged = true;
                 }
             }
             Err(error) => {
                 self.failed = Some(Arc::clone(error));
-                self.settled.insert(
-                    command.id(),
-                    PersistenceSettlement::Failed(Arc::clone(error)),
-                );
+                self.settled
+                    .insert(command.id, PersistenceSettlement::Failed(Arc::clone(error)));
             }
         }
         true
@@ -597,7 +629,7 @@ impl PersistenceQueue {
     fn cancel(&mut self) {
         if let Some(command) = self.in_flight.take() {
             self.settled
-                .insert(command.id(), PersistenceSettlement::Cancelled);
+                .insert(command.id, PersistenceSettlement::Cancelled);
         }
         for command in self.queued.drain(..) {
             self.settled
@@ -1424,8 +1456,8 @@ impl AcquisitionState {
         let node_store = state.node_store.clone();
         self.worker_pool.submit_ledger_data(Box::new(move || {
             let (id, durability_barrier, result) = match command {
-                PersistenceCommand::Write { id, write } => {
-                    let result = match &node_store {
+                PersistenceCommand::Writes { id, writes } => {
+                    let result = writes.into_iter().try_for_each(|write| match &node_store {
                         SHAMapStoreNodeStore::Single(database) => database.store(
                             write.object_type,
                             write.data,
@@ -1438,7 +1470,7 @@ impl AcquisitionState {
                             write.key.hash,
                             write.key.ledger_seq,
                         ),
-                    };
+                    });
                     (id, false, result.map_err(|error| Arc::from(error.as_str())))
                 }
                 PersistenceCommand::DurabilityBarrier { id } => {
@@ -4445,7 +4477,7 @@ mod actor_mailbox_tests {
             "an in-flight command cannot dispatch twice"
         );
         assert_eq!(
-            queue.in_flight.as_ref().map(PersistenceCommand::id),
+            queue.in_flight.as_ref().map(|command| command.id),
             Some(first.id())
         );
         assert_eq!(queue.settlement(2), Some(&PersistenceSettlement::Duplicate));
@@ -4458,6 +4490,56 @@ mod actor_mailbox_tests {
             queue.settlement(first.id()),
             Some(&PersistenceSettlement::Written)
         );
+        assert!(matches!(
+            queue.take_next(),
+            Some(PersistenceCommand::DurabilityBarrier { .. })
+        ));
+    }
+
+    #[test]
+    fn persistence_queue_batches_writes_before_the_durability_barrier() {
+        let mut queue = PersistenceQueue::default();
+        let writes = (0..=PERSISTENCE_WRITE_BATCH_SIZE)
+            .map(|index| {
+                let mut hash = [0; 32];
+                hash[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                PersistenceWrite {
+                    key: PersistenceKey {
+                        hash: Uint256::from_array(hash),
+                        ledger_seq: 14,
+                        object_type: 3,
+                    },
+                    object_type: nodestore::NodeObjectType::Ledger,
+                    data: vec![index as u8],
+                }
+            })
+            .collect();
+        queue.enqueue_writes(writes);
+        queue.enqueue_barrier();
+
+        let first = queue.take_next().expect("first write batch");
+        let (first_id, first_count) = match first {
+            PersistenceCommand::Writes { id, writes } => (id, writes.len()),
+            PersistenceCommand::DurabilityBarrier { .. } => panic!("expected write batch"),
+        };
+        assert_eq!(first_count, PERSISTENCE_WRITE_BATCH_SIZE);
+        assert!(queue.acknowledge(&PersistenceReady {
+            id: first_id,
+            result: Ok(()),
+            durability_barrier: false,
+        }));
+
+        let second = queue.take_next().expect("tail write batch");
+        let (second_id, second_count) = match second {
+            PersistenceCommand::Writes { id, writes } => (id, writes.len()),
+            PersistenceCommand::DurabilityBarrier { .. } => panic!("expected tail write batch"),
+        };
+        assert_eq!(second_count, 1);
+        assert!(queue.acknowledge(&PersistenceReady {
+            id: second_id,
+            result: Ok(()),
+            durability_barrier: false,
+        }));
         assert!(matches!(
             queue.take_next(),
             Some(PersistenceCommand::DurabilityBarrier { .. })
@@ -4532,7 +4614,7 @@ mod actor_mailbox_tests {
         queue.enqueue_writes(vec![write]);
         queue.enqueue_barrier();
         let first = queue.take_next().expect("write command");
-        assert!(matches!(first, PersistenceCommand::Write { .. }));
+        assert!(matches!(first, PersistenceCommand::Writes { .. }));
         assert!(queue.acknowledge(&PersistenceReady {
             id: first.id(),
             result: Ok(()),
@@ -4565,7 +4647,7 @@ mod actor_mailbox_tests {
         }]);
         queue.enqueue_barrier();
         let write = queue.take_next().expect("write command");
-        assert!(matches!(write, PersistenceCommand::Write { .. }));
+        assert!(matches!(write, PersistenceCommand::Writes { .. }));
         assert!(queue.acknowledge(&PersistenceReady {
             id: write.id(),
             result: Err(Arc::from("store fault")),

@@ -47,10 +47,10 @@ fn response_sequence_matches_request(expected_seq: u32, response_seq: u32) -> bo
     expected_seq == 0 || response_seq == 0 || expected_seq == response_seq
 }
 
-/// rippled's `JtLedgerData` JobType permits at most three running jobs.
-/// This bounds packet processing while leaving the inbound registry free to
-/// track any number of hash-deduplicated acquisitions.
-const WORKER_COUNT: usize = 3;
+/// Isolated throughput experiment: use the host's eight vCPUs for independent
+/// bounded acquisition jobs. The actor/mailbox bounds remain responsible for
+/// fairness; this does not alter the production registry.
+const WORKER_COUNT: usize = 8;
 
 /// Cumulative, process-lifetime counters covering every inbound-ledger
 /// lifecycle boundary. They are sampled by NetworkOPs at most once every five
