@@ -26,6 +26,7 @@ use super::acquisition::{
     AcquisitionBuilder, AcquisitionCompletionRecorder, AcquisitionFailureRecorder,
     AcquisitionPeerProvider, AcquisitionSnapshot, AcquisitionState,
 };
+use super::read_broker::{NodeReadBroker, ReadBrokerConfig};
 use super::worker_pool::WorkerPool;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -611,6 +612,7 @@ fn recovery_lcl_decision_json(decision: Option<RecoveryLclDecision>) -> JsonValu
 pub struct InboundLedgers {
     inner: Arc<Mutex<RegistryInner>>,
     worker_pool: Arc<WorkerPool>,
+    read_broker: NodeReadBroker,
     // Shared resources for creating acquisitions
     node_store: Arc<RwLock<Option<SHAMapStoreNodeStore>>>,
     tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
@@ -667,6 +669,8 @@ impl InboundLedgers {
                 completed_ready: VecDeque::new(),
             })),
             worker_pool,
+            read_broker: NodeReadBroker::new(ReadBrokerConfig::default())
+                .expect("default inbound read broker bounds are valid"),
             node_store: Arc::new(RwLock::new(None)),
             tree_cache,
             full_below,
@@ -892,6 +896,7 @@ impl InboundLedgers {
             seq,
             reason,
             node_store: ns,
+            read_broker: self.read_broker.clone(),
             tree_cache: Arc::clone(&self.tree_cache),
             fetch_pack: Arc::clone(&self.fetch_pack),
             store_tx: self.completed_ledgers_tx.clone(),
@@ -1016,12 +1021,19 @@ impl InboundLedgers {
             Arc::clone(&entry.state)
         };
 
-        state.enqueue_packet(peer_id, packet);
-        self.lifecycle
-            .route_accepted
-            .fetch_add(1, Ordering::Relaxed);
-        tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: registry hit");
-        true
+        if state.enqueue_packet(peer_id, packet) {
+            self.lifecycle
+                .route_accepted
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: registry hit");
+            true
+        } else {
+            self.lifecycle
+                .route_terminal
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(target: "inbound_ledger", %hash, peer_id, "route_response: acquisition mailbox overloaded or terminal");
+            false
+        }
     }
 
     /// Remove entries idle for more than one minute, matching
@@ -1091,8 +1103,9 @@ impl InboundLedgers {
         // Mirrors InboundLedger destruction: useful state-node packets that
         // were received but not yet processed can seed a later acquisition.
         for state in swept_states {
-            state.stopped.store(true, Ordering::Release);
-            for received in state.take_buffered_packets() {
+            let buffered = state.take_buffered_packets();
+            state.cancel();
+            for received in buffered {
                 if received.packet.packet_type == ledger::InboundLedgerDataType::StateNode {
                     let stored = self.stash_stale_packet(&received.packet);
                     self.note_stale_packet_result(stored);
@@ -1284,10 +1297,16 @@ impl InboundLedgers {
 
     /// Notify that a ledger acquisition failed.
     pub fn on_failed(&self, hash: Uint256) {
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        record_recent_failure(&mut inner, hash, None);
-        if let Some(entry) = inner.entries.get(&hash) {
-            entry.state.stopped.store(true, Ordering::Release);
+        let state = {
+            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            record_recent_failure(&mut inner, hash, None);
+            inner
+                .entries
+                .get(&hash)
+                .map(|entry| Arc::clone(&entry.state))
+        };
+        if let Some(state) = state {
+            state.cancel();
         }
     }
 
@@ -1320,7 +1339,7 @@ impl InboundLedgers {
             std::mem::take(&mut inner.entries)
         };
         for entry in entries.into_values() {
-            entry.state.stopped.store(true, Ordering::Release);
+            entry.state.cancel();
         }
     }
 
@@ -1395,12 +1414,18 @@ impl InboundLedgers {
 
     /// Remove a specific entry.
     pub fn remove(&self, hash: &Uint256) {
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        if let Some(entry) = inner.entries.remove(hash) {
-            entry.state.stopped.store(true, Ordering::Release);
-            inner
-                .completed_ready
-                .retain(|(ready_hash, _)| ready_hash != hash);
+        let state = {
+            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let state = inner.entries.remove(hash).map(|entry| entry.state);
+            if state.is_some() {
+                inner
+                    .completed_ready
+                    .retain(|(ready_hash, _)| ready_hash != hash);
+            }
+            state
+        };
+        if let Some(state) = state {
+            state.cancel();
         }
     }
 
@@ -1408,15 +1433,17 @@ impl InboundLedgers {
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
 
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        let entries = std::mem::take(&mut inner.entries);
+        let entries = {
+            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let entries = std::mem::take(&mut inner.entries);
+            inner.recent_failures.clear();
+            inner.completed_ready.clear();
+            entries
+        };
         for (_, entry) in entries {
-            entry.state.stopped.store(true, Ordering::Release);
+            entry.state.cancel();
         }
-        inner.recent_failures.clear();
-        inner.completed_ready.clear();
-        drop(inner);
-
+        self.read_broker.stop();
         self.worker_pool.stop();
     }
 
@@ -1540,25 +1567,32 @@ impl InboundLedgers {
         if min_seq <= 1 {
             return 0;
         }
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        let stale: Vec<Uint256> = inner
-            .entries
-            .iter()
-            .filter(|(_, entry)| {
-                (entry.completed_ledger.is_some() || entry.failed)
-                    && entry.seq > 1
-                    && entry.seq < min_seq
-            })
-            .map(|(hash, _)| *hash)
-            .collect();
-        let count = stale.len();
-        for hash in stale {
-            if let Some(entry) = inner.entries.remove(&hash) {
-                entry.state.stopped.store(true, Ordering::Release);
-                inner
-                    .completed_ready
-                    .retain(|(ready_hash, _)| *ready_hash != hash);
+        let (count, states) = {
+            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let stale: Vec<Uint256> = inner
+                .entries
+                .iter()
+                .filter(|(_, entry)| {
+                    (entry.completed_ledger.is_some() || entry.failed)
+                        && entry.seq > 1
+                        && entry.seq < min_seq
+                })
+                .map(|(hash, _)| *hash)
+                .collect();
+            let count = stale.len();
+            let mut states = Vec::with_capacity(count);
+            for hash in stale {
+                if let Some(entry) = inner.entries.remove(&hash) {
+                    inner
+                        .completed_ready
+                        .retain(|(ready_hash, _)| *ready_hash != hash);
+                    states.push(entry.state);
+                }
             }
+            (count, states)
+        };
+        for state in states {
+            state.cancel();
         }
         count
     }
@@ -1631,25 +1665,32 @@ impl InboundLedgers {
     /// Returns the number of entries removed.
     pub fn remove_stale_no_progress(&self, idle_timeout: Duration) -> Vec<(Uint256, u32)> {
         let now = Instant::now();
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        let stale: Vec<(Uint256, u32)> = inner
-            .entries
-            .iter()
-            .filter(|(_, e)| {
-                !e.failed
-                    && e.completed_ledger.is_none()
-                    && !e.state.completed.load(Ordering::Acquire)
-                    && now.duration_since(e.last_touched) > idle_timeout
-            })
-            .map(|(hash, e)| (*hash, e.seq))
-            .collect();
-        for (hash, _) in &stale {
-            if let Some(entry) = inner.entries.remove(hash) {
-                entry.state.stopped.store(true, Ordering::Release);
-                inner
-                    .completed_ready
-                    .retain(|(ready_hash, _)| ready_hash != hash);
+        let (stale, states) = {
+            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let stale: Vec<(Uint256, u32)> = inner
+                .entries
+                .iter()
+                .filter(|(_, e)| {
+                    !e.failed
+                        && e.completed_ledger.is_none()
+                        && !e.state.completed.load(Ordering::Acquire)
+                        && now.duration_since(e.last_touched) > idle_timeout
+                })
+                .map(|(hash, e)| (*hash, e.seq))
+                .collect();
+            let mut states = Vec::with_capacity(stale.len());
+            for (hash, _) in &stale {
+                if let Some(entry) = inner.entries.remove(hash) {
+                    inner
+                        .completed_ready
+                        .retain(|(ready_hash, _)| ready_hash != hash);
+                    states.push(entry.state);
+                }
             }
+            (stale, states)
+        };
+        for state in states {
+            state.cancel();
         }
         stale
     }
@@ -2407,6 +2448,17 @@ mod tests {
             tracked_peers: 0,
             buffered_packets: 0,
             buffered_packets_high_water: 0,
+            mailbox_bytes: 0,
+            mailbox_bytes_high_water: 0,
+            mailbox_events: 0,
+            stale_events: 0,
+            overload_rejections: 0,
+            active_plan_id: None,
+            active_plan_kind: None,
+            plan_pending_hashes: 0,
+            plan_pending_edges: 0,
+            broker_queued_keys: 0,
+            broker_in_flight_keys: 0,
             mailbox_token: "idle",
             scan_continuation_pending: false,
             pending_admitted_timeouts: 0,

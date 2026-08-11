@@ -6,7 +6,7 @@ use basics::tagged_cache::ManualClock;
 use ledger::{
     FetchPackContainer, InboundLedgerCompletionDisposition, InboundLedgerJournal,
     InboundLedgerLocal, InboundLedgerObjectType, InboundLedgerReason, InboundLedgerRequestTrigger,
-    InboundLedgerStore, LedgerConfig, LedgerHeader, StateScanParams, calculate_ledger_hash,
+    InboundLedgerStore, LedgerConfig, LedgerHeader, calculate_ledger_hash,
     make_inbound_get_ledger_request, make_inbound_needed_by_hash_request,
     serialize_prefixed_ledger_header,
 };
@@ -436,8 +436,8 @@ fn inbound_owner_state_root_request_precedes_transaction_work() {
     );
 
     assert!(setup.state_request_pending);
-    assert!(setup.state_scan.is_none());
-    assert!(setup.tx_scan.is_none());
+    assert!(!setup.state_plan);
+    assert!(!setup.tx_plan);
     assert_eq!(setup.messages_to_send.len(), 1);
     match &setup.messages_to_send[0].payload {
         ProtocolPayload::GetLedger(message) => {
@@ -447,88 +447,6 @@ fn inbound_owner_state_root_request_precedes_transaction_work() {
         }
         payload => panic!("expected state-node GetLedger request, got {payload:?}"),
     }
-}
-
-#[test]
-fn inbound_owner_post_state_scan_can_fall_through_to_transaction_root() {
-    let account_hash = sample_hash(0x87);
-    let tx_hash = sample_hash(0x88);
-    let header = sample_header(905, account_hash, tx_hash);
-    let wanted_hash = calculate_ledger_hash(&header);
-    let mut store = RecordingInboundStore::default();
-    store.headers.borrow_mut().insert(
-        *wanted_hash.as_uint256(),
-        serialize_prefixed_ledger_header(&header, false),
-    );
-    let family = family("inbound-owner-state-fall-through");
-    let journal = RecordingJournal;
-    let mut inbound = InboundLedgerLocal::new(wanted_hash, 0);
-    inbound.check_local_with_family_and_config(
-        &journal,
-        &LedgerConfig::default(),
-        &mut store,
-        &mut RecordingFetchPack::default(),
-        &family,
-    );
-    assert!(!inbound.planner_state().have_state);
-
-    let setup = inbound.prepare_tx_after_state_scan(InboundLedgerRequestTrigger::Reply);
-    assert!(setup.state_scan.is_none());
-    assert!(setup.tx_scan.is_none());
-    assert_eq!(setup.messages_to_send.len(), 1);
-    match &setup.messages_to_send[0].payload {
-        ProtocolPayload::GetLedger(message) => {
-            assert_eq!(
-                message.itype, 1,
-                "transaction root follows filtered state work"
-            );
-            assert_eq!(message.query_depth, Some(1));
-            assert_eq!(message.ledger_seq, Some(905));
-        }
-        payload => panic!("expected transaction-node GetLedger request, got {payload:?}"),
-    }
-}
-
-#[test]
-fn inbound_owner_state_scan_retains_assembled_ledger() {
-    let account_hash = sample_hash(0x86);
-    let header = sample_header(904, account_hash, SHAMapHash::default());
-    let wanted_hash = calculate_ledger_hash(&header);
-    let mut store = RecordingInboundStore::default();
-    store.headers.borrow_mut().insert(
-        *wanted_hash.as_uint256(),
-        serialize_prefixed_ledger_header(&header, false),
-    );
-    let family = family("inbound-owner-state-scan-lease");
-    let journal = RecordingJournal;
-    let mut inbound = InboundLedgerLocal::new(wanted_hash, 0);
-    inbound.check_local_with_family_and_config(
-        &journal,
-        &LedgerConfig::default(),
-        &mut store,
-        &mut RecordingFetchPack::default(),
-        &family,
-    );
-    let planner_before = inbound.planner_state();
-    let params = StateScanParams {
-        missing_limit: 256,
-        map_hash: account_hash,
-        reason: InboundLedgerRequestTrigger::Reply,
-        query_depth: 1,
-        query_type: None,
-        have_state: false,
-    };
-
-    let _scan = inbound
-        .start_resumable_state_map_scan(&params, &family)
-        .expect("header acquisition must create a persisted state scan");
-    assert_eq!(inbound.ledger().expect("ledger remains owned").header().seq, 904);
-    assert_eq!(
-        inbound.ledger().expect("ledger remains owned").header().account_hash,
-        account_hash
-    );
-    assert_eq!(inbound.planner_state(), planner_before);
-    assert!(!inbound.is_done());
 }
 
 #[test]

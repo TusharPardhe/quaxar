@@ -24,7 +24,9 @@ use protocol::JsonValue;
 use shamap::family::{FullBelowCache, MissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher};
 use shamap::fetch::SHAMapSyncFilter;
 use shamap::sync::{
-    DeferredMissingNodeScan, MissingNodeRef, SHAMapAddNode, SHAMapMissingNode, SHAMapType, SyncTree,
+    MissingNodeAdvance, MissingNodeContinuation, MissingNodePlanId, MissingNodeReadApply,
+    MissingNodeReadOutcome, MissingNodeRef, MissingNodeResidentLookup, ReadNeed, SHAMapAddNode,
+    SHAMapMissingNode, SHAMapType, SyncTree,
 };
 use std::collections::BTreeMap;
 use std::hash::BuildHasher;
@@ -59,10 +61,178 @@ fn next_missing_scan_first_child() -> u8 {
 
 // Acquisition constants
 const INBOUND_LEDGER_TIMEOUT_RETRIES_MAX: u32 = 6;
-const INBOUND_LEDGER_BECOME_AGGRESSIVE: u32 = 4;
+/// Match rippled's `InboundLedger::trigger` switch to `TMGetObjectByHash`.
+/// Retained actor plans use this same threshold when they re-advertise an
+/// already verified network frontier after a timeout.
+pub const INBOUND_LEDGER_BECOME_AGGRESSIVE: u32 = 4;
+
+/// The protocol deliberately becomes aggressive only *after* the fourth
+/// no-progress timeout, not at it.
+pub const fn uses_aggressive_by_hash_timeout(timeouts: u32) -> bool {
+    timeouts > INBOUND_LEDGER_BECOME_AGGRESSIVE
+}
 const MISSING_NODES_FIND: i32 = 256;
 const REQ_NODES_REPLY: usize = 128;
 const REQ_NODES: usize = 12;
+
+/// Stable identity of one tree traversal. A replacement header/root gets a
+/// new ID; ordinary yields, packets, and timer events retain the same ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TreePlanId(u64);
+
+impl TreePlanId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeKind {
+    State,
+    Transaction,
+}
+
+/// Actor-neutral result from one bounded tree-plan CPU turn. It deliberately
+/// contains work commands, never a NodeStore callback or peer send.
+#[derive(Debug, Clone)]
+pub enum TreeAdvance {
+    Ready,
+    NeedsReads(Vec<ReadNeed>),
+    NeedsNetwork(Vec<(shamap::node_id::SHAMapNodeId, Uint256)>),
+    Complete,
+    Invalid,
+}
+
+/// Retained plan state used by the inbound actor. It owns no database or
+/// network reference, so callers must submit its returned work only after
+/// releasing actor/planner mutation.
+#[derive(Debug, Clone)]
+pub struct TreePlan {
+    id: TreePlanId,
+    kind: TreeKind,
+    root_hash: SHAMapHash,
+    continuation: MissingNodeContinuation,
+    requested_recent: std::collections::BTreeSet<Uint256>,
+}
+
+impl TreePlan {
+    pub fn new<R>(
+        id: TreePlanId,
+        kind: TreeKind,
+        tree: &SyncTree,
+        root_hash: SHAMapHash,
+        max_missing: i32,
+        full_below_generation: u32,
+        next_first_child: &mut R,
+    ) -> Self
+    where
+        R: FnMut() -> u8,
+    {
+        Self {
+            id,
+            kind,
+            root_hash,
+            continuation: tree.start_missing_node_continuation(
+                MissingNodePlanId::new(id.get()),
+                max_missing,
+                full_below_generation,
+                next_first_child,
+            ),
+            requested_recent: std::collections::BTreeSet::new(),
+        }
+    }
+
+    pub const fn id(&self) -> TreePlanId {
+        self.id
+    }
+
+    pub const fn kind(&self) -> TreeKind {
+        self.kind
+    }
+
+    pub fn root_hash(&self) -> SHAMapHash {
+        self.root_hash
+    }
+
+    pub fn pending_hashes(&self) -> usize {
+        self.continuation.pending_hashes()
+    }
+
+    pub fn pending_edges(&self) -> usize {
+        self.continuation.pending_edges()
+    }
+
+    /// True only while an actor CPU turn can make progress without a broker
+    /// completion or peer response. Pending read/network edges intentionally
+    /// do not make a plan runnable.
+    pub fn has_runnable_frontier(&self) -> bool {
+        self.continuation.has_runnable_frontier()
+    }
+
+    pub fn advance<L, R>(
+        &mut self,
+        max_branch_steps: usize,
+        max_new_reads: usize,
+        resident: &mut L,
+        next_first_child: &mut R,
+    ) -> TreeAdvance
+    where
+        L: MissingNodeResidentLookup,
+        R: FnMut() -> u8,
+    {
+        match self
+            .continuation
+            .advance(max_branch_steps, max_new_reads, resident, next_first_child)
+        {
+            MissingNodeAdvance::Ready => TreeAdvance::Ready,
+            MissingNodeAdvance::NeedsReads(reads) => TreeAdvance::NeedsReads(reads),
+            MissingNodeAdvance::NeedsNetwork(nodes) => TreeAdvance::NeedsNetwork(nodes),
+            MissingNodeAdvance::Complete => TreeAdvance::Complete,
+            MissingNodeAdvance::Invalid => TreeAdvance::Invalid,
+        }
+    }
+
+    pub fn apply_read_result(
+        &mut self,
+        plan_id: TreePlanId,
+        hash: SHAMapHash,
+        outcome: MissingNodeReadOutcome,
+    ) -> MissingNodeReadApply {
+        self.continuation
+            .apply_read_result(MissingNodePlanId::new(plan_id.get()), hash, outcome)
+    }
+
+    pub fn apply_network_node(
+        &mut self,
+        plan_id: TreePlanId,
+        hash: SHAMapHash,
+        node: basics::intrusive_pointer::SharedIntrusive<SHAMapTreeNode>,
+    ) -> MissingNodeReadApply {
+        self.continuation
+            .apply_network_node(MissingNodePlanId::new(plan_id.get()), hash, node)
+    }
+
+    pub fn network_candidates(&self) -> Vec<(shamap::node_id::SHAMapNodeId, Uint256)> {
+        self.continuation.network_candidates()
+    }
+
+    pub fn retry_network_candidate(&mut self, hash: SHAMapHash) -> bool {
+        self.continuation.retry_network_candidate(hash)
+    }
+
+    /// Recent-request suppression belongs to the plan, not a global scan epoch.
+    pub fn mark_request_candidate(&mut self, hash: Uint256) -> bool {
+        self.requested_recent.insert(hash)
+    }
+
+    pub fn clear_recent_requests(&mut self) {
+        self.requested_recent.clear();
+    }
+}
 
 fn full_sync_debug_enabled() -> bool {
     std::env::var("XRPLD_FULL_SYNC_DEBUG")
@@ -465,33 +635,13 @@ where
     }
 }
 
-/// Parameters captured before releasing the acquisition lock for the state map
-/// walk, mirroring rippled's `InboundLedger.cpp:620-622` unlock pattern.
-pub struct StateScanParams {
-    pub missing_limit: i32,
-    pub map_hash: SHAMapHash,
-    pub reason: InboundLedgerRequestTrigger,
-    pub query_depth: u32,
-    pub query_type: Option<i32>,
-    pub have_state: bool,
-}
-
-/// Parameters captured before releasing the acquisition lock for the tx map
-/// walk, mirroring rippled's `InboundLedger.cpp:620-622` unlock pattern.
-pub struct TxScanParams {
-    pub missing_limit: i32,
-    pub map_hash: SHAMapHash,
-    pub reason: InboundLedgerRequestTrigger,
-    pub query_depth: u32,
-    pub query_type: Option<i32>,
-    pub have_transactions: bool,
-}
-
-/// Result of `prepare_trigger` — bundles everything the caller needs to
-/// orchestrate the lock-release pattern around the expensive map walks.
+/// Result of `prepare_trigger` — it emits peer commands and identifies which
+/// retained actor-owned tree plan may begin after local probe resolution.
 pub struct TriggerSetup {
-    pub state_scan: Option<StateScanParams>,
-    pub tx_scan: Option<TxScanParams>,
+    /// The state tree has a locally installed root and must start one actor
+    /// owned `TreePlan`; it is never a detached synchronous scan.
+    pub state_plan: bool,
+    pub tx_plan: bool,
     pub messages_to_send: Vec<ProtocolMessage>,
     /// True when setup already emitted a state-root or by-hash request and
     /// rippled would return before considering transaction work.
@@ -597,6 +747,76 @@ impl InboundLedgerLocal {
         self.planner_state
     }
 
+    /// Create one retained, actor-owned traversal for a tree that is already
+    /// rooted locally. The plan owns only traversal state; NodeStore reads and
+    /// peer requests are deliberately emitted by the application actor after
+    /// it has released its ledger mutation borrow.
+    pub fn start_tree_plan(
+        &self,
+        kind: TreeKind,
+        id: TreePlanId,
+        full_below_generation: u32,
+    ) -> Option<TreePlan> {
+        if self.failed || self.complete {
+            return None;
+        }
+        let ledger = self.ledger.as_ref()?;
+        let (tree, root_hash, already_complete) = match kind {
+            TreeKind::State => (
+                ledger.state_map(),
+                ledger.header().account_hash,
+                self.planner_state.have_state,
+            ),
+            TreeKind::Transaction => (
+                ledger.tx_map(),
+                ledger.header().tx_hash,
+                self.planner_state.have_transactions,
+            ),
+        };
+        (!already_complete && !root_hash.is_zero()).then(|| {
+            TreePlan::new(
+                id,
+                kind,
+                tree,
+                root_hash,
+                MISSING_NODES_FIND,
+                full_below_generation,
+                &mut next_missing_scan_first_child,
+            )
+        })
+    }
+
+    /// Commit a completed actor plan only after its retained traversal has
+    /// verified that there are no missing descendants. This is intentionally
+    /// independent of ordinary packet receipt, so an old plan cannot make a
+    /// newer root look complete.
+    pub fn complete_tree_plan(&mut self, kind: TreeKind) -> bool {
+        let Some(ledger) = self.ledger.as_ref() else {
+            self.failed = true;
+            return false;
+        };
+        let valid = match kind {
+            TreeKind::State => ledger.state_map().is_valid(),
+            TreeKind::Transaction => ledger.tx_map().is_valid(),
+        };
+        if !valid {
+            self.failed = true;
+            self.complete = false;
+            return false;
+        }
+        match kind {
+            TreeKind::State => self.planner_state.have_state = true,
+            TreeKind::Transaction => self.planner_state.have_transactions = true,
+        }
+        if self.planner_state.have_header
+            && self.planner_state.have_state
+            && self.planner_state.have_transactions
+        {
+            self.complete = true;
+        }
+        true
+    }
+
     pub fn is_failed(&self) -> bool {
         self.failed
     }
@@ -665,6 +885,16 @@ impl InboundLedgerLocal {
     /// Enter the by-hash fallback mode used after a no-progress timeout.
     pub fn set_by_hash(&mut self, by_hash: bool) {
         self.by_hash = by_hash;
+    }
+
+    /// Whether this timeout cycle must use the aggressive by-hash protocol.
+    /// This is intentionally the one predicate shared by ordinary trigger
+    /// setup and the retained TreePlan timeout path.
+    pub fn should_use_aggressive_by_hash(&self) -> bool {
+        self.timeouts > 0
+            && !self.progress
+            && self.by_hash
+            && uses_aggressive_by_hash_timeout(self.timeouts)
     }
 
     /// Clear recent_nodes filter — matches reference onTimer which always clears
@@ -808,12 +1038,15 @@ impl InboundLedgerLocal {
 
         if self.planner_state.have_state && !ledger.header().account_hash.is_zero() {
             let mut missing = Vec::new();
-            ledger.state_map().walk_map_with_family(
-                SHAMapType::State,
-                &mut missing,
-                MISSING_NODES_FIND,
-                family,
-            );
+            {
+                let state_map = ledger.state_map();
+                state_map.walk_map_with_family(
+                    SHAMapType::State,
+                    &mut missing,
+                    MISSING_NODES_FIND,
+                    family,
+                );
+            }
             if !missing.is_empty() {
                 needed.extend(missing_hashes_from_walk(
                     missing,
@@ -826,12 +1059,15 @@ impl InboundLedgerLocal {
 
         if self.planner_state.have_transactions && !ledger.header().tx_hash.is_zero() {
             let mut missing = Vec::new();
-            ledger.tx_map().walk_map_with_family(
-                SHAMapType::Transaction,
-                &mut missing,
-                MISSING_NODES_FIND,
-                family,
-            );
+            {
+                let tx_map = ledger.tx_map();
+                tx_map.walk_map_with_family(
+                    SHAMapType::Transaction,
+                    &mut missing,
+                    MISSING_NODES_FIND,
+                    family,
+                );
+            }
             if !missing.is_empty() {
                 needed.extend(missing_hashes_from_walk(
                     missing,
@@ -1054,6 +1290,13 @@ impl InboundLedgerLocal {
         if stats.is_useful() {
             self.progress = true;
         }
+    }
+
+    /// Mark verified non-packet work, such as a matching brokered local read,
+    /// as timeout progress. Callers must invoke this only after the result has
+    /// been hash-validated and attached to the retained plan.
+    pub fn record_verified_progress(&mut self) {
+        self.progress = true;
     }
 
     pub fn record_packet_stats_with_family_and_config<CLOCK, S, C, F, MR, NS, J>(
@@ -1978,6 +2221,26 @@ impl InboundLedgerLocal {
         }
     }
 
+    /// Apply a header returned by the acquisition read broker. The caller owns
+    /// hash/plan identity and invokes this before any peer header request.
+    pub fn apply_brokered_header<DB, J>(
+        &mut self,
+        data: Blob,
+        config: &LedgerConfig,
+        store: &mut DB,
+        journal: &J,
+    ) -> bool
+    where
+        DB: InboundLedgerStore,
+        J: InboundLedgerJournal,
+    {
+        if self.planner_state.have_header || self.failed || self.complete {
+            return false;
+        }
+        self.try_load_header_from_bytes(data, config, store, false, journal);
+        self.planner_state.have_header && !self.failed
+    }
+
     fn try_load_header_from_bytes<DB, J>(
         &mut self,
         data: Blob,
@@ -2351,11 +2614,7 @@ impl InboundLedgerLocal {
         }
 
         // By-hash fallback after threshold timeouts
-        if self.timeouts > 0
-            && !self.progress
-            && self.by_hash
-            && self.timeouts > INBOUND_LEDGER_BECOME_AGGRESSIVE
-        {
+        if self.should_use_aggressive_by_hash() {
             let mut state_filter = None;
             let mut tx_filter = None;
             if let Some(request) =
@@ -2732,16 +2991,10 @@ impl InboundLedgerLocal {
         }
     }
 
-    /// Prepare the trigger scan by doing all non-scan setup and computing the
-    /// parameters for the expensive state/tx map walks.
+    /// Prepare the trigger and emit any immediate header or root-node requests.
     ///
-    /// Returns a `TriggerSetup` containing scan parameters, messages to send,
-    /// and a completion flag. The caller should:
-    /// 1. Send any `messages_to_send` (header request, root node requests).
-    /// 2. Release the acquisition lock.
-    /// 3. Call `do_state_map_scan` / `apply_state_scan_results` for each scan.
-    /// 4. Call `do_tx_map_scan` / `apply_tx_scan_results` for each scan.
-    /// 5. Re-acquire the lock and check `complete`.
+    /// The caller starts the actor-native tree plans indicated by `TriggerSetup`
+    /// and then sends `messages_to_send`.
     pub fn prepare_trigger<CLOCK, S, C, F, MR, NS, DB, FP, J>(
         &mut self,
         reason: InboundLedgerRequestTrigger,
@@ -2763,8 +3016,8 @@ impl InboundLedgerLocal {
     {
         if self.is_done() {
             return TriggerSetup {
-                state_scan: None,
-                tx_scan: None,
+                state_plan: false,
+                tx_plan: false,
                 messages_to_send: Vec::new(),
                 state_request_pending: false,
                 complete: false,
@@ -2776,8 +3029,8 @@ impl InboundLedgerLocal {
             self.try_db_with_family_and_config(journal, config, store, fetch_pack, family);
             if self.failed || self.is_done() {
                 return TriggerSetup {
-                    state_scan: None,
-                    tx_scan: None,
+                    state_plan: false,
+                    tx_plan: false,
                     messages_to_send: Vec::new(),
                     state_request_pending: false,
                     complete: false,
@@ -2788,11 +3041,7 @@ impl InboundLedgerLocal {
         let mut messages_to_send = Vec::new();
 
         // By-hash fallback after threshold timeouts
-        if self.timeouts > 0
-            && !self.progress
-            && self.by_hash
-            && self.timeouts > INBOUND_LEDGER_BECOME_AGGRESSIVE
-        {
+        if self.should_use_aggressive_by_hash() {
             let mut state_filter = None;
             let mut tx_filter = None;
             if let Some(request) =
@@ -2801,8 +3050,8 @@ impl InboundLedgerLocal {
                 self.by_hash = false;
                 messages_to_send.push(request);
                 return TriggerSetup {
-                    state_scan: None,
-                    tx_scan: None,
+                    state_plan: false,
+                    tx_plan: false,
                     messages_to_send,
                     state_request_pending: false,
                     complete: false,
@@ -2832,8 +3081,8 @@ impl InboundLedgerLocal {
         if !self.planner_state.have_header && !self.failed {
             messages_to_send.push(self.make_header_request());
             return TriggerSetup {
-                state_scan: None,
-                tx_scan: None,
+                state_plan: false,
+                tx_plan: false,
                 messages_to_send,
                 state_request_pending: false,
                 complete: false,
@@ -2841,7 +3090,7 @@ impl InboundLedgerLocal {
         }
 
         // Compute state scan parameters and handle root node request
-        let state_scan = if !self.planner_state.have_state && !self.failed {
+        let state_plan = if !self.planner_state.have_state && !self.failed {
             if let Some(ledger) = self.ledger.as_mut() {
                 let map_hash = ledger.state_map_mut().hash();
                 if map_hash.is_zero() {
@@ -2850,8 +3099,8 @@ impl InboundLedgerLocal {
                     if account_hash.is_zero() {
                         self.failed = true;
                         return TriggerSetup {
-                            state_scan: None,
-                            tx_scan: None,
+                            state_plan: false,
+                            tx_plan: false,
                             messages_to_send,
                             state_request_pending: false,
                             complete: false,
@@ -2880,33 +3129,26 @@ impl InboundLedgerLocal {
                         query_type,
                     ));
                     return TriggerSetup {
-                        state_scan: None,
-                        tx_scan: None,
+                        state_plan: false,
+                        tx_plan: false,
                         messages_to_send,
                         state_request_pending: true,
                         complete: false,
                     };
                 } else {
-                    Some(StateScanParams {
-                        missing_limit: MISSING_NODES_FIND,
-                        map_hash,
-                        reason,
-                        query_depth,
-                        query_type,
-                        have_state: self.planner_state.have_state,
-                    })
+                    true
                 }
             } else {
-                None
+                false
             }
         } else {
-            None
+            false
         };
 
         // Rippled prioritizes the account-state tree and only considers
         // transaction work after state completes. Do not pre-queue TX root or
         // node requests while state remains incomplete.
-        let tx_scan = if self.planner_state.have_state
+        let tx_plan = if self.planner_state.have_state
             && !self.planner_state.have_transactions
             && !self.failed
         {
@@ -2915,7 +3157,7 @@ impl InboundLedgerLocal {
                 let tx_hash = ledger.header().tx_hash;
                 if tx_hash.is_zero() {
                     self.planner_state.have_transactions = true;
-                    None
+                    false
                 } else if map_hash.is_zero() {
                     let node_ids = [shamap::node_id::SHAMapNodeId::default()];
                     log_acq_request_nodes(
@@ -2939,22 +3181,15 @@ impl InboundLedgerLocal {
                         query_depth,
                         query_type,
                     ));
-                    None
+                    false
                 } else {
-                    Some(TxScanParams {
-                        missing_limit: MISSING_NODES_FIND,
-                        map_hash,
-                        reason,
-                        query_depth,
-                        query_type,
-                        have_transactions: self.planner_state.have_transactions,
-                    })
+                    true
                 }
             } else {
-                None
+                false
             }
         } else {
-            None
+            false
         };
 
         let complete = self.planner_state.have_header
@@ -2962,406 +3197,11 @@ impl InboundLedgerLocal {
             && self.planner_state.have_transactions;
 
         TriggerSetup {
-            state_scan,
-            tx_scan,
+            state_plan,
+            tx_plan,
             messages_to_send,
             state_request_pending: false,
             complete,
-        }
-    }
-
-    /// Prepare the transaction half of `trigger` after a state scan produced
-    /// no outbound state request. rippled falls through in this case even when
-    /// state is still incomplete because all current state candidates were
-    /// filtered as recent; keeping this separate prevents concurrent state and
-    /// transaction requests during the ordinary state-first path.
-    pub fn prepare_tx_after_state_scan(
-        &mut self,
-        reason: InboundLedgerRequestTrigger,
-    ) -> TriggerSetup {
-        if self.is_done() || !self.planner_state.have_header || self.failed {
-            return TriggerSetup {
-                state_scan: None,
-                tx_scan: None,
-                messages_to_send: Vec::new(),
-                state_request_pending: false,
-                complete: false,
-            };
-        }
-
-        let query_depth = match reason {
-            InboundLedgerRequestTrigger::Timeout
-            | InboundLedgerRequestTrigger::Added
-            | InboundLedgerRequestTrigger::Blind => 0,
-            InboundLedgerRequestTrigger::Reply => 1,
-            InboundLedgerRequestTrigger::ReplyHighLatency => 2,
-        };
-        let query_type = (self.timeouts > 0).then_some(TM_QUERY_INDIRECT);
-        let mut messages_to_send = Vec::new();
-        let tx_scan = if !self.planner_state.have_transactions {
-            if let Some(ledger) = self.ledger.as_mut() {
-                let map_hash = ledger.tx_map_mut().hash();
-                let tx_hash = ledger.header().tx_hash;
-                if tx_hash.is_zero() {
-                    self.planner_state.have_transactions = true;
-                    None
-                } else if map_hash.is_zero() {
-                    let node_ids = [shamap::node_id::SHAMapNodeId::default()];
-                    log_acq_request_nodes(
-                        self.seq,
-                        "tx",
-                        tx_hash,
-                        1,
-                        1,
-                        1,
-                        reason,
-                        self.recent_nodes.len(),
-                        query_depth,
-                        query_type,
-                        &node_ids,
-                    );
-                    messages_to_send.push(make_get_ledger_with_node_ids(
-                        self.hash,
-                        self.seq,
-                        TM_GET_LEDGER_TX_NODE,
-                        &node_ids,
-                        query_depth,
-                        query_type,
-                    ));
-                    None
-                } else {
-                    Some(TxScanParams {
-                        missing_limit: MISSING_NODES_FIND,
-                        map_hash,
-                        reason,
-                        query_depth,
-                        query_type,
-                        have_transactions: self.planner_state.have_transactions,
-                    })
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        TriggerSetup {
-            state_scan: None,
-            tx_scan,
-            messages_to_send,
-            state_request_pending: false,
-            complete: self.planner_state.have_header
-                && self.planner_state.have_state
-                && self.planner_state.have_transactions,
-        }
-    }
-
-    /// Start a state-map scan whose traversal state can be retained across
-    /// acquisition turns. The scan borrows no planner data after construction.
-    pub fn start_resumable_state_map_scan<CLOCK, S, C, F, MR, NS>(
-        &mut self,
-        params: &StateScanParams,
-        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-    ) -> Option<DeferredMissingNodeScan>
-    where
-        CLOCK: basics::tagged_cache::CacheClock,
-        S: std::hash::BuildHasher + Clone,
-        C: shamap::family::FullBelowCache,
-        F: shamap::family::SHAMapNodeFetcher,
-        MR: shamap::family::MissingNodeReporter,
-    {
-        if params.have_state || self.failed || self.complete || params.map_hash.is_zero() {
-            return None;
-        }
-        let ledger = self.ledger.as_ref()?;
-        Some(
-            ledger
-                .state_map()
-                .start_deferred_missing_node_scan_with_family(
-                    params.missing_limit,
-                    family,
-                    &mut next_missing_scan_first_child,
-                ),
-        )
-    }
-
-    /// Advance a previously created state-map scan by a bounded number of
-    /// branches and synchronous deferred reads. `true` means the scan reached
-    /// the same completion boundary as the former whole-scan loop.
-    #[allow(clippy::too_many_arguments)]
-    pub fn advance_resumable_state_map_scan<CLOCK, S, C, F, MR, NS, DB, FP>(
-        &mut self,
-        scan: &mut DeferredMissingNodeScan,
-        params: &StateScanParams,
-        store: &mut DB,
-        fetch_pack: &mut FP,
-        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-        max_deferred_reads: usize,
-        max_branch_steps: usize,
-    ) -> bool
-    where
-        CLOCK: basics::tagged_cache::CacheClock,
-        S: std::hash::BuildHasher + Clone,
-        C: shamap::family::FullBelowCache,
-        F: shamap::family::SHAMapNodeFetcher,
-        MR: shamap::family::MissingNodeReporter,
-        DB: InboundLedgerStore,
-        FP: FetchPackContainer,
-    {
-        if params.have_state || self.failed || self.complete {
-            return true;
-        }
-        let Some(ledger) = self.ledger.as_mut() else {
-            return true;
-        };
-        let mut filter = AccountStateSF::new(InboundLedgerSyncStore(&mut *store), &mut *fetch_pack);
-        let mut filter_ref: Option<&mut dyn shamap::fetch::SHAMapSyncFilter> = Some(&mut filter);
-        ledger
-            .state_map_mut()
-            .advance_deferred_missing_node_scan_with_family(
-                scan,
-                &mut filter_ref,
-                family,
-                max_deferred_reads,
-                max_branch_steps,
-                &mut next_missing_scan_first_child,
-            )
-    }
-
-    /// Apply state-map scan results and build the corresponding peer requests.
-    ///
-    /// Called after `do_state_map_scan` returns, once the acquisition lock
-    /// has been re-acquired.
-    pub fn apply_state_scan_results<CLOCK, S, C, F, MR, NS>(
-        &mut self,
-        missing: Vec<(shamap::node_id::SHAMapNodeId, Uint256)>,
-        params: &StateScanParams,
-        _family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-        send_fn: &mut dyn FnMut(ProtocolMessage),
-    ) -> bool
-    where
-        CLOCK: basics::tagged_cache::CacheClock,
-        S: std::hash::BuildHasher + Clone,
-        C: shamap::family::FullBelowCache,
-        F: shamap::family::SHAMapNodeFetcher,
-        MR: shamap::family::MissingNodeReporter,
-    {
-        let Some(ledger) = self.ledger.as_mut() else {
-            return false;
-        };
-        if params.have_state || self.failed {
-            return false;
-        }
-
-        if missing.is_empty() {
-            if !ledger.state_map().is_valid() {
-                self.failed = true;
-                return false;
-            }
-            if ledger.state_map().is_valid() {
-                self.planner_state.have_state = true;
-                if full_sync_debug_enabled() {
-                    tracing::debug!(target: "ledger",
-                        "[full_debug][acq_have_map] seq={} map=state root={} valid=true",
-                        self.seq, params.map_hash
-                    );
-                }
-            }
-        } else {
-            let limit = match params.reason {
-                InboundLedgerRequestTrigger::Reply
-                | InboundLedgerRequestTrigger::ReplyHighLatency => REQ_NODES_REPLY,
-                _ => REQ_NODES,
-            };
-            let mut fresh: Vec<_> = missing
-                .iter()
-                .filter(|(_, h)| !self.recent_nodes.contains(h))
-                .collect();
-            if fresh.is_empty() {
-                if params.reason == InboundLedgerRequestTrigger::Timeout {
-                    fresh = missing.iter().collect();
-                }
-            }
-            if full_sync_debug_enabled() {
-                tracing::debug!(target: "ledger",
-                    "[full_debug][acq_request_nodes] seq={} map=state root={} missing={} fresh={} limit={} reason={:?} recent_nodes={}",
-                    self.seq,
-                    params.map_hash,
-                    missing.len(),
-                    fresh.len(),
-                    limit,
-                    params.reason,
-                    self.recent_nodes.len()
-                );
-            }
-            if !fresh.is_empty() {
-                let node_ids: Vec<_> = fresh.iter().take(limit).map(|(id, _)| *id).collect();
-                log_acq_request_nodes(
-                    self.seq,
-                    "state",
-                    params.map_hash,
-                    missing.len(),
-                    fresh.len(),
-                    limit,
-                    params.reason,
-                    self.recent_nodes.len(),
-                    params.query_depth,
-                    params.query_type,
-                    &node_ids,
-                );
-                for (_, h) in fresh.iter().take(limit) {
-                    self.recent_nodes.insert(*h);
-                }
-                let request = make_get_ledger_with_node_ids(
-                    self.hash,
-                    self.seq,
-                    TM_GET_LEDGER_AS_NODE,
-                    &node_ids,
-                    params.query_depth,
-                    params.query_type,
-                );
-                send_fn(request);
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Perform the expensive transaction map walk.
-    ///
-    /// NOTE: Same architectural constraint as `do_state_map_scan` — the caller's
-    /// lock cannot be released until the Ledger is refactored to `Arc<Ledger>`.
-    pub fn do_tx_map_scan<CLOCK, S, C, F, MR, NS, DB, FP>(
-        &mut self,
-        params: &TxScanParams,
-        store: &mut DB,
-        fetch_pack: &mut FP,
-        family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-    ) -> Vec<(shamap::node_id::SHAMapNodeId, Uint256)>
-    where
-        CLOCK: basics::tagged_cache::CacheClock,
-        S: std::hash::BuildHasher + Clone,
-        C: shamap::family::FullBelowCache,
-        F: shamap::family::SHAMapNodeFetcher,
-        MR: shamap::family::MissingNodeReporter,
-        DB: InboundLedgerStore,
-        FP: FetchPackContainer,
-    {
-        let Some(ledger) = self.ledger.as_mut() else {
-            return Vec::new();
-        };
-        if params.have_transactions || self.failed {
-            return Vec::new();
-        }
-        if params.map_hash.is_zero() {
-            return Vec::new();
-        }
-
-        let mut filter =
-            TransactionStateSF::new(InboundLedgerSyncStore(&mut *store), &mut *fetch_pack);
-        let mut filter_ref: Option<&mut dyn shamap::fetch::SHAMapSyncFilter> = Some(&mut filter);
-        ledger.tx_map_mut().get_missing_nodes_with_family(
-            params.missing_limit,
-            &mut filter_ref,
-            family,
-            &mut next_missing_scan_first_child,
-        )
-    }
-
-    /// Apply transaction-map scan results and build the corresponding peer requests.
-    ///
-    /// Called after `do_tx_map_scan` returns, once the acquisition lock
-    /// has been re-acquired.
-    pub fn apply_tx_scan_results<CLOCK, S, C, F, MR, NS>(
-        &mut self,
-        missing: Vec<(shamap::node_id::SHAMapNodeId, Uint256)>,
-        params: &TxScanParams,
-        _family: &SHAMapFamily<CLOCK, S, C, F, MR, NS>,
-        send_fn: &mut dyn FnMut(ProtocolMessage),
-    ) where
-        CLOCK: basics::tagged_cache::CacheClock,
-        S: std::hash::BuildHasher + Clone,
-        C: shamap::family::FullBelowCache,
-        F: shamap::family::SHAMapNodeFetcher,
-        MR: shamap::family::MissingNodeReporter,
-    {
-        let Some(ledger) = self.ledger.as_mut() else {
-            return;
-        };
-        if params.have_transactions || self.failed {
-            return;
-        }
-
-        if missing.is_empty() {
-            if !ledger.tx_map().is_valid() {
-                self.failed = true;
-                return;
-            }
-            if ledger.tx_map().is_valid() {
-                self.planner_state.have_transactions = true;
-                if full_sync_debug_enabled() {
-                    tracing::debug!(target: "ledger",
-                        "[full_debug][acq_have_map] seq={} map=tx root={} valid=true",
-                        self.seq, params.map_hash
-                    );
-                }
-            }
-        } else {
-            let limit = match params.reason {
-                InboundLedgerRequestTrigger::Reply
-                | InboundLedgerRequestTrigger::ReplyHighLatency => REQ_NODES_REPLY,
-                _ => REQ_NODES,
-            };
-            let mut fresh: Vec<_> = missing
-                .iter()
-                .filter(|(_, h)| !self.recent_nodes.contains(h))
-                .collect();
-            if fresh.is_empty() {
-                if params.reason == InboundLedgerRequestTrigger::Timeout {
-                    fresh = missing.iter().collect();
-                }
-            }
-            if full_sync_debug_enabled() {
-                tracing::debug!(target: "ledger",
-                    "[full_debug][acq_request_nodes] seq={} map=tx root={} missing={} fresh={} limit={} reason={:?} recent_nodes={}",
-                    self.seq,
-                    params.map_hash,
-                    missing.len(),
-                    fresh.len(),
-                    limit,
-                    params.reason,
-                    self.recent_nodes.len()
-                );
-            }
-            if !fresh.is_empty() {
-                let node_ids: Vec<_> = fresh.iter().take(limit).map(|(id, _)| *id).collect();
-                log_acq_request_nodes(
-                    self.seq,
-                    "tx",
-                    params.map_hash,
-                    missing.len(),
-                    fresh.len(),
-                    limit,
-                    params.reason,
-                    self.recent_nodes.len(),
-                    params.query_depth,
-                    params.query_type,
-                    &node_ids,
-                );
-                for (_, h) in fresh.iter().take(limit) {
-                    self.recent_nodes.insert(*h);
-                }
-                let request = make_get_ledger_with_node_ids(
-                    self.hash,
-                    self.seq,
-                    TM_GET_LEDGER_TX_NODE,
-                    &node_ids,
-                    params.query_depth,
-                    params.query_type,
-                );
-                send_fn(request);
-            }
         }
     }
 

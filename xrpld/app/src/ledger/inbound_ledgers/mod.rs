@@ -12,10 +12,16 @@
 //! - Each acquisition wraps InboundLedgerLocal (the per-ledger state machine)
 
 mod acquisition;
+mod read_broker;
 mod registry;
 mod worker_pool;
 
 pub use self::acquisition::{AcquisitionState, stash_stale_packet};
+pub use self::read_broker::{
+    ACQ_READ_WAITERS_PER_KEY, ACQ_READS_GLOBAL, ACQ_READS_PER_ACQUISITION, NodeReadBroker,
+    ReadAdmission, ReadBrokerConfig, ReadBrokerMetrics, ReadBrokerSnapshot, ReadDispatch, ReadKey,
+    ReadOutcome, ReadReady, ReadRejectReason, ReadTicket, ReadTicketId,
+};
 pub use self::registry::{AcquireReason, CompletedInboundLedger, InboundLedgers};
 pub use self::worker_pool::WorkerPool;
 
