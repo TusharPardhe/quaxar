@@ -2895,6 +2895,14 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
         submit_read_admission_backlog(state, actor_plan);
         return;
     }
+    let retained_reads = actor_plan
+        .plan
+        .take_read_admission_batch(ACQ_TURN_MAX_NEW_READS);
+    if !retained_reads.is_empty() {
+        actor_plan.read_admission_backlog.extend(retained_reads);
+        submit_read_admission_backlog(state, actor_plan);
+        return;
+    }
     let started = Instant::now();
     let scan_before = actor_plan.plan.scan_stats();
     let branch_steps_before = scan_before.branch_steps;
@@ -3495,6 +3503,78 @@ mod actor_mailbox_tests {
             next_node: 0,
             bytes,
         }
+    }
+
+    #[test]
+    fn retained_tree_read_batches_drain_without_another_branch_scan() {
+        use basics::intrusive_pointer::make_shared_intrusive;
+        use shamap::sync::{SHAMapType, SyncState, SyncTree};
+        use shamap::tree_node::SHAMapTreeNode;
+
+        struct NoResident;
+        impl MissingNodeResidentLookup for NoResident {
+            fn load_resident(
+                &mut self,
+                _hash: SHAMapHash,
+                _ledger_seq: u32,
+            ) -> Option<basics::intrusive_pointer::SharedIntrusive<SHAMapTreeNode>> {
+                None
+            }
+        }
+
+        // A two-level inner tree has far more distinct missing leaves than the
+        // 16-read actor admission batch. One bounded advance retains later
+        // batches internally after returning the first batch.
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        for parent_branch in 0..16 {
+            let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+            for child_branch in 0..16 {
+                let byte = (parent_branch * 16 + child_branch + 1) as u8;
+                child.set_child_hash(
+                    child_branch,
+                    SHAMapHash::new(Uint256::from_array([byte; 32])),
+                );
+            }
+            child.update_hash();
+            root.set_child_hash(parent_branch, child.get_hash());
+            root.canonicalize_child(parent_branch, child);
+        }
+        root.update_hash();
+        let tree = SyncTree::from_root_with_type(
+            root.clone(),
+            SHAMapType::State,
+            true,
+            77,
+            SyncState::Synching,
+        );
+        let mut first_child = || 0;
+        let mut plan = TreePlan::new(
+            TreePlanId::new(95),
+            TreeKind::State,
+            &tree,
+            root.get_hash(),
+            256,
+            9,
+            &mut first_child,
+        );
+        let mut resident = NoResident;
+        let TreeAdvance::NeedsReads(initial_reads) = plan.advance(
+            ACQ_TURN_MAX_BRANCH_STEPS,
+            ACQ_TURN_MAX_NEW_READS,
+            &mut resident,
+            &mut first_child,
+        ) else {
+            panic!("expected the first bounded local-read batch");
+        };
+        assert_eq!(initial_reads.len(), ACQ_TURN_MAX_NEW_READS);
+        let branch_steps_before = plan.branch_steps();
+        let retained_reads = plan.take_read_admission_batch(ACQ_TURN_MAX_NEW_READS);
+        assert_eq!(retained_reads.len(), ACQ_TURN_MAX_NEW_READS);
+        assert_eq!(
+            plan.branch_steps(),
+            branch_steps_before,
+            "extracting a retained batch must not run another TreePlan scan"
+        );
     }
 
     #[test]

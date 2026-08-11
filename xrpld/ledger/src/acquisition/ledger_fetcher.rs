@@ -210,6 +210,12 @@ impl TreePlan {
         }
     }
 
+    /// Take a bounded batch of read needs previously discovered by an earlier
+    /// scan without consuming another branch-selection turn.
+    pub fn take_read_admission_batch(&mut self, max_new_reads: usize) -> Vec<ReadNeed> {
+        self.continuation.take_unannounced_reads(max_new_reads)
+    }
+
     pub fn apply_read_result(
         &mut self,
         plan_id: TreePlanId,

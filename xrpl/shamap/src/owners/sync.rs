@@ -3316,7 +3316,12 @@ impl MissingNodeContinuation {
         true
     }
 
-    fn take_unannounced_reads(&mut self, max_new_reads: usize) -> Vec<ReadNeed> {
+    /// Transfer a bounded FIFO batch of already-discovered local-read needs
+    /// without advancing the traversal. The acquisition actor uses this when
+    /// a previous bounded scan found more hashes than its completion mailbox
+    /// could admit, avoiding a zero-branch scan merely to extract the next
+    /// batch.
+    pub fn take_unannounced_reads(&mut self, max_new_reads: usize) -> Vec<ReadNeed> {
         if max_new_reads == 0 {
             return Vec::new();
         }
