@@ -12,11 +12,14 @@ use basics::tagged_cache::MonotonicClock;
 use ledger::uses_aggressive_by_hash_timeout;
 use ledger::{
     FetchPackCache, FetchPackContainer, FetchPackStore, InboundLedgerDataType,
-    InboundLedgerJournal, InboundLedgerLocal, InboundLedgerObjectType, InboundLedgerPacket,
+    InboundLedgerJournal, InboundLedgerLocal, InboundLedgerNodeAdmission, InboundLedgerObjectType, InboundLedgerPacket,
     InboundLedgerPacketError, InboundLedgerPeerScore, InboundLedgerReason,
     InboundLedgerRequestTrigger, InboundLedgerStore, InboundLedgerTimerResult, Ledger, TreeAdvance,
     TreeKind, TreePlan, TreePlanId, make_get_ledger_with_node_ids,
     make_inbound_needed_by_hash_request, select_inbound_ledger_reply_peers,
+};
+use ledger::ledger_fetcher::{
+    INBOUND_LEDGER_NORMAL_NODE_REQUEST_CAP, INBOUND_LEDGER_REPLY_NODE_REQUEST_CAP,
 };
 use overlay::{Peer, PeerSet as _};
 use shamap::family::{FullBelowCache, FullBelowCacheImpl, NullMissingNodeReporter, SHAMapFamily};
@@ -39,7 +42,7 @@ use super::read_broker::{
     NodeReadBroker, ReadAdmission, ReadKey, ReadOutcome, ReadReady, ReadReadySink,
     ReadRejectReason, ReadTicket,
 };
-use super::registry::{AcquireReason, AcquisitionLifecycleCounters, CompletedInboundLedger};
+use super::registry::{AcquireReason, AcquisitionLifecycleCounters};
 use super::worker_pool::WorkerPool;
 
 const PEER_COUNT_START: usize = 5;
@@ -67,7 +70,8 @@ struct LocalProbe {
     peer: Option<Arc<dyn Peer>>,
 }
 
-/// Bounded actor CPU admission for the isolated high-throughput experiment.
+/// Bounded actor CPU admission. These caps only yield between turns; they do
+/// not alter packet-batch accounting, peer selection, or retry semantics.
 /// These remain separate from broker limits and preserve an explicit yield so
 /// a packet flood cannot monopolize a ledger-data worker.
 pub const ACQ_TURN_MAX_BRANCH_STEPS: usize = 512;
@@ -642,16 +646,20 @@ impl PersistenceQueue {
     }
 }
 
-/// The acquisition family is intentionally read-through disabled. Every
-/// NodeStore acquisition read belongs to `NodeReadBroker`; packet and planner
-/// code may use only resident cache/fetch-pack data. `WorkerStore` is a pure
-/// command collector: it never calls `Database::store` or `sync_result`.
-pub struct WorkerStore {
+/// Local acquisition storage facade. It is the only synchronous local source
+/// exposed to `InboundLedgerLocal`: validated fetch-pack/resident objects are
+/// read through this adapter, while physical NodeStore reads arrive as typed
+/// `NodeReadBroker` completions and are reduced by the same SHAMap validators.
+///
+/// It deliberately does not own NodeStore I/O. The broker may coalesce or
+/// defer reads, but it cannot create a second semantic local-read path.
+pub struct LocalHydratorStore {
     pending_writes: Vec<PersistenceWrite>,
     pending_keys: BTreeSet<PersistenceKey>,
+    cache: Arc<FetchPackCache>,
 }
 
-impl WorkerStore {
+impl LocalHydratorStore {
     fn take_pending_writes(&mut self) -> Vec<PersistenceWrite> {
         self.pending_keys.clear();
         std::mem::take(&mut self.pending_writes)
@@ -685,11 +693,13 @@ impl WorkerStore {
     }
 }
 
-impl InboundLedgerStore for WorkerStore {
-    fn fetch_ledger_header(&mut self, _hash: SHAMapHash, _seq: u32) -> Option<Vec<u8>> {
-        // Header lookup is also broker/packet driven. Returning a synchronous
-        // NodeStore result here would reintroduce I/O under actor ownership.
-        None
+impl InboundLedgerStore for LocalHydratorStore {
+    fn fetch_ledger_header(&mut self, hash: SHAMapHash, _seq: u32) -> Option<Vec<u8>> {
+        // Fetch-pack headers take the same `try_load_header_from_bytes`
+        // validation path as every other local header. NodeStore headers are
+        // delivered by the broker into `process_local_probe` instead of being
+        // read synchronously under actor ownership.
+        self.cache.get_fetch_pack(*hash.as_uint256())
     }
 
     fn store_ledger_header(&mut self, data: Vec<u8>, hash: SHAMapHash, seq: u32) {
@@ -723,15 +733,17 @@ impl InboundLedgerStore for WorkerStore {
         true
     }
 
-    fn fetch_node_data(&self, _hash: Uint256) -> Option<basics::blob::Blob> {
-        // See `fetch_ledger_header`: local reads are brokered, never direct.
-        None
+    fn fetch_node_data(&self, hash: Uint256) -> Option<basics::blob::Blob> {
+        // The sync filter still validates content/path before it becomes map
+        // state. This is the same local object source used by fetch-pack and
+        // stale-state reuse, not a bypass around SHAMap admission.
+        self.cache.get_fetch_pack(hash)
     }
 }
 
 pub struct AcqMutableState {
     pub inbound: InboundLedgerLocal,
-    pub store: WorkerStore,
+    pub store: LocalHydratorStore,
     pub(crate) fetch_pack: WorkerFetchPack,
 }
 
@@ -909,6 +921,10 @@ struct AcquisitionMailbox {
     token: AcquisitionWorkToken,
     pending_timeouts: u32,
     plan: Option<ActorTreePlan>,
+    /// Number of packets captured at the current `runData` batch boundary.
+    /// Packets arriving after the first packet is claimed start the next epoch
+    /// and cannot alter this batch's credit/prune/sample result.
+    batch_packets_remaining: usize,
     batch_useful_peer_counts: BTreeMap<u64, i32>,
     buffered_packets_high_water: usize,
     buffered_bytes_high_water: usize,
@@ -929,6 +945,7 @@ impl Default for AcquisitionMailbox {
             token: AcquisitionWorkToken::Idle,
             pending_timeouts: 0,
             plan: None,
+            batch_packets_remaining: 0,
             batch_useful_peer_counts: BTreeMap::new(),
             buffered_packets_high_water: 0,
             buffered_bytes_high_water: 0,
@@ -941,6 +958,13 @@ impl Default for AcquisitionMailbox {
 impl AcquisitionMailbox {
     fn buffered_packet_count(&self) -> usize {
         self.packets.len()
+    }
+
+    /// A runData batch owns the actor until its snapshotted packets have all
+    /// reduced. Newly queued packets likewise begin a batch before unrelated
+    /// timeout, persistence, broker, or tree-plan work can interleave.
+    fn has_active_packet_batch(&self) -> bool {
+        self.batch_packets_remaining != 0 || !self.packets.is_empty()
     }
 
     fn has_work(&self, fetch_pack_ready: bool) -> bool {
@@ -1009,6 +1033,7 @@ impl AcquisitionMailbox {
         self.local_probes.clear();
         self.completed_local_probes.clear();
         self.pending_timeouts = 0;
+        self.batch_packets_remaining = 0;
         self.batch_useful_peer_counts.clear();
         self.token = AcquisitionWorkToken::Idle;
         tickets
@@ -1037,7 +1062,6 @@ pub struct AcquisitionState {
     draining: AtomicBool,
     next_plan_id: AtomicU64,
     pub shared_tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
-    pub store_tx: std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     failure_recorder: AcquisitionFailureRecorder,
     completion_recorder: AcquisitionCompletionRecorder,
     pub stopped: AtomicBool,
@@ -1241,6 +1265,11 @@ impl AcquisitionState {
 
     fn take_packet_for_turn(&self) -> Option<PacketWork> {
         let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        if mailbox.batch_packets_remaining == 0 {
+            // Snapshot the batch before removing its first packet. Concurrent
+            // ingress after this point is intentionally a later runData epoch.
+            mailbox.batch_packets_remaining = mailbox.packets.len();
+        }
         let packet = mailbox.packets.pop_front()?;
         mailbox.packet_bytes = mailbox.packet_bytes.saturating_sub(packet.bytes);
         Some(packet)
@@ -1492,7 +1521,12 @@ impl AcquisitionState {
     /// Record one completed packet's useful nodes and, only after observing
     /// its coalesced FIFO queue empty under this same mailbox lock,
     /// prune/sample the entire batch for reply triggers.
-    fn finish_packet_batch(&self, peer_id: u64, useful_nodes: u64) -> Vec<u64> {
+    fn finish_packet_batch(
+        &self,
+        peer_id: u64,
+        useful_nodes: u64,
+        packet_complete: bool,
+    ) -> Vec<u64> {
         let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
         if self.is_done() {
             let cancelled = mailbox.clear_terminal_work();
@@ -1511,7 +1545,13 @@ impl AcquisitionState {
                 .or_insert(useful_nodes);
         }
 
-        if !mailbox.packets.is_empty() {
+        if !packet_complete {
+            return Vec::new();
+        }
+        // This decrements only for a fully reduced packet. A bounded 128-node
+        // actor turn is an implementation yield, never a peer-credit boundary.
+        mailbox.batch_packets_remaining = mailbox.batch_packets_remaining.saturating_sub(1);
+        if mailbox.batch_packets_remaining != 0 {
             return Vec::new();
         }
 
@@ -2013,9 +2053,11 @@ impl AcquisitionState {
             .collect()
     }
 
-    fn has_pending_packets(&self) -> bool {
-        let mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-        !mailbox.packets.is_empty()
+    fn has_active_packet_batch(&self) -> bool {
+        self.mailbox
+            .lock()
+            .expect("acquisition mailbox lock")
+            .has_active_packet_batch()
     }
 
     pub(crate) fn update_seq(&self, seq: u32) {
@@ -2051,7 +2093,6 @@ pub struct AcquisitionBuilder {
     pub read_broker: NodeReadBroker,
     pub tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
     pub fetch_pack: Arc<FetchPackCache>,
-    pub store_tx: std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     pub failure_recorder: AcquisitionFailureRecorder,
     pub completion_recorder: AcquisitionCompletionRecorder,
     pub full_below_generation: u32,
@@ -2075,9 +2116,10 @@ impl AcquisitionBuilder {
             state_scan_after_advance_pause: Mutex::new(None),
             mutable: Mutex::new(AcqMutableState {
                 inbound: InboundLedgerLocal::new_with_reason(self.hash, self.seq, reason),
-                store: WorkerStore {
+                store: LocalHydratorStore {
                     pending_writes: Vec::new(),
                     pending_keys: BTreeSet::new(),
+                    cache: Arc::clone(&self.fetch_pack),
                 },
                 fetch_pack: WorkerFetchPack {
                     cache: self.fetch_pack,
@@ -2102,7 +2144,6 @@ impl AcquisitionBuilder {
             draining: AtomicBool::new(false),
             next_plan_id: AtomicU64::new(1),
             shared_tree_cache: self.tree_cache,
-            store_tx: self.store_tx,
             failure_recorder: self.failure_recorder,
             completion_recorder: self.completion_recorder,
             stopped: AtomicBool::new(false),
@@ -2354,14 +2395,20 @@ fn process_acquisition_turn(state: &Arc<AcquisitionState>) {
         return;
     }
 
-    // Event-first fairness: recovery is never disabled by pending reads; one
-    // packet step and one plan advance then yield to the shared worker queue.
+    // `runData` owns its snapshotted packet batch through max-peer credit,
+    // prune, and reply sampling. Reduce exactly one chunk, then yield without
+    // allowing timeout, persistence, broker, or planner work to interleave.
+    if state.has_active_packet_batch() {
+        process_data_job(state);
+        state.finish_acquisition_turn();
+        return;
+    }
+
+    // Event-first fairness applies only between complete packet-batch epochs.
     if state.take_admitted_timeout() {
         process_timeout_job(state);
     }
-    if !state.is_done() && state.has_pending_packets() {
-        process_data_job(state);
-    } else if !state.is_done() && state.fetch_pack_ready.load(Ordering::Acquire) {
+    if !state.is_done() && state.fetch_pack_ready.load(Ordering::Acquire) {
         process_data_job(state);
     }
     if !state.is_done() {
@@ -2460,15 +2507,17 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         return;
     };
 
-    let step_start = work.next_node;
     let mut accepted_nodes = Vec::new();
     let data_drain_started = Instant::now();
     let packet_type = work.packet.packet_type;
     let peer_id = work.peer_id;
     let mut packet_stats = SHAMapAddNode::default();
+    let mut node_failures = Vec::new();
     let mut packet_complete = false;
     let mut malformed = None;
-    let mut invalid = false;
+    // Base packets retain their atomic header/root semantics. Node-packet
+    // failures are represented by typed per-node outcomes and charged below.
+    let mut base_packet_invalid = false;
     let mut had_header = false;
     let terminal;
     let persistence_writes;
@@ -2476,9 +2525,6 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         let Some(mut mutable) = state.lock_mutable("data processing") else {
             return;
         };
-        if state.fetch_pack_ready.swap(false, Ordering::AcqRel) {
-            check_local(state, &mut mutable);
-        }
         let AcqMutableState {
             inbound,
             store,
@@ -2503,18 +2549,36 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
                     packet_stats = step.stats;
                     work.next_node = step.next_node;
                     packet_complete = step.complete;
-                    if !step.stats.is_invalid() {
-                        accepted_nodes.extend(
-                            work.packet.nodes[step_start..work.next_node]
-                                .iter()
-                                .filter_map(|node| {
-                                    shamap::tree_node::SHAMapTreeNode::make_from_wire(
-                                        &node.node_data,
-                                    )
-                                    .ok()
-                                    .flatten()
-                                }),
-                        );
+                    if packet_type == InboundLedgerDataType::Base {
+                        // A liBASE packet is one atomic header/root admission;
+                        // preserve its packet-level invalid-data semantics.
+                        base_packet_invalid = packet_stats.is_invalid();
+                    } else {
+                        for admission in step.node_admissions {
+                            match admission {
+                                InboundLedgerNodeAdmission::Accepted { index } => {
+                                    // This decode is only a conversion for the
+                                    // retained plan. Acceptance was decided by
+                                    // SHAMap mutation above, never by wire shape.
+                                    if let Some(node) = work.packet.nodes.get(index)
+                                        && let Ok(Some(node)) = shamap::tree_node::SHAMapTreeNode::make_from_wire(&node.node_data)
+                                    {
+                                        accepted_nodes.push(node);
+                                    } else {
+                                        // An accepted mutation must have a
+                                        // decodable tree node. Do not convert
+                                        // this impossible mismatch into a plan
+                                        // attachment; make it a peer-attributable
+                                        // invalid-node failure instead.
+                                        node_failures.push(InboundLedgerPacketError::InvalidNodeData);
+                                    }
+                                }
+                                InboundLedgerNodeAdmission::Duplicate { .. } => {}
+                                InboundLedgerNodeAdmission::Rejected { error, .. } => {
+                                    node_failures.push(error);
+                                }
+                            }
+                        }
                     }
                     inbound.record_packet_stats_with_family_and_config(
                         packet_stats,
@@ -2522,7 +2586,6 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
                         &config,
                         &family,
                     );
-                    invalid = packet_stats.is_invalid();
                 }
                 Err(error) => {
                     malformed = Some(error);
@@ -2552,7 +2615,10 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         );
     }
 
-    if !accepted_nodes.is_empty() && !invalid && malformed.is_none() {
+    // Valid siblings survive a packet fault. The fetcher has already recorded
+    // the bad node in `packet_stats`; this plan update is content-addressed and
+    // filters malformed wire nodes independently.
+    if !accepted_nodes.is_empty() {
         apply_packet_nodes_to_plan(state, packet_type, accepted_nodes);
     }
     if !had_header && !terminal {
@@ -2593,7 +2659,9 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
             Ordering::Relaxed,
         );
     }
-    let packet_error_count = usize::from(malformed.is_some()) + usize::from(invalid);
+    let packet_error_count = usize::from(malformed.is_some())
+        + usize::from(base_packet_invalid)
+        + node_failures.len();
     state
         .lifecycle
         .packet_step_errors
@@ -2605,7 +2673,10 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
             .fetch_add(1, Ordering::Relaxed);
         charge_malformed_packet(state, peer_id, packet_type, error);
     }
-    if invalid {
+    for error in node_failures {
+        charge_rejected_node(state, peer_id, packet_type, error);
+    }
+    if base_packet_invalid {
         charge_invalid_data_packet(
             state,
             peer_id,
@@ -2628,7 +2699,7 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
     // results in FIFO order and returns peers only after it observed the
     // coalesced queue empty under the same lock; a concurrent later arrival
     // becomes the next batch.
-    for reply_peer_id in state.finish_packet_batch(peer_id, useful_nodes) {
+    for reply_peer_id in state.finish_packet_batch(peer_id, useful_nodes, packet_complete) {
         if let Some(peer) = state.peer_set.find_peer(reply_peer_id as u32) {
             let reason = if peer.is_high_latency() {
                 InboundLedgerRequestTrigger::ReplyHighLatency
@@ -2693,7 +2764,6 @@ fn process_local_probe(state: &Arc<AcquisitionState>, probe: LocalProbe, ready: 
         return;
     };
     let mut verified = false;
-    let mut invalid_local_root = false;
     let writes = match probe.kind {
         LocalProbeKind::Header => {
             let Some(mut mutable) = state.lock_mutable("brokered local header") else {
@@ -2711,64 +2781,92 @@ fn process_local_probe(state: &Arc<AcquisitionState>, probe: LocalProbe, ready: 
         }
         LocalProbeKind::StateRoot | LocalProbeKind::TransactionRoot => {
             let hash = SHAMapHash::new(ready.ticket.key().hash);
-            let Ok(node) = shamap::tree_node::SHAMapTreeNode::make_from_prefix(object.data(), hash)
-            else {
-                state.mark_failed();
-                return;
-            };
-            let Ok(wire) = node.serialize_for_wire() else {
-                state.mark_failed();
-                return;
-            };
             let packet_type = match probe.kind {
                 LocalProbeKind::StateRoot => InboundLedgerDataType::StateNode,
                 LocalProbeKind::TransactionRoot => InboundLedgerDataType::TransactionNode,
                 LocalProbeKind::Header => unreachable!(),
             };
-            let packet = InboundLedgerPacket::new(
-                packet_type,
-                vec![ledger::InboundLedgerNodeData::new(
-                    Some(shamap::node_id::SHAMapNodeId::default().get_raw_string()),
-                    wire,
-                )],
-            );
-            let Some(mut mutable) = state.lock_mutable("brokered local root") else {
-                return;
-            };
-            let journal = WorkerJournal;
-            let config = ledger::LedgerConfig::default();
-            let family = family(state);
-            let AcqMutableState {
-                inbound,
-                store,
-                fetch_pack,
-            } = &mut *mutable;
-            match inbound.process_packet_step_with_family_and_config(
-                &packet,
-                0,
-                ledger::INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP,
-                &journal,
-                &config,
-                store,
-                fetch_pack,
-                &family,
-            ) {
-                Ok(step) if !step.stats.is_invalid() => {
-                    inbound.record_packet_stats_with_family_and_config(
-                        step.stats, &journal, &config, &family,
+            let packet = match shamap::tree_node::SHAMapTreeNode::make_from_prefix(object.data(), hash) {
+                Ok(node) => match node.serialize_for_wire() {
+                    Ok(wire) => Some(InboundLedgerPacket::new(
+                        packet_type,
+                        vec![ledger::InboundLedgerNodeData::new(
+                            Some(shamap::node_id::SHAMapNodeId::default().get_raw_string()),
+                            wire,
+                        )],
+                    )),
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "inbound_ledger",
+                            seq = state.seq,
+                            hash = %state.hash,
+                            probe = ?probe.kind,
+                            "local root could not serialize for validation; continuing peer acquisition"
+                        );
+                        None
+                    }
+                },
+                Err(_) => {
+                    tracing::warn!(
+                        target: "inbound_ledger",
+                        seq = state.seq,
+                        hash = %state.hash,
+                        probe = ?probe.kind,
+                        "local root could not decode for validation; continuing peer acquisition"
                     );
-                    verified = step.stats.is_useful();
+                    None
                 }
-                Ok(_) | Err(_) => invalid_local_root = true,
+            };
+            if let Some(packet) = packet {
+                let Some(mut mutable) = state.lock_mutable("brokered local root") else {
+                    return;
+                };
+                let journal = WorkerJournal;
+                let config = ledger::LedgerConfig::default();
+                let family = family(state);
+                let AcqMutableState {
+                    inbound,
+                    store,
+                    fetch_pack,
+                } = &mut *mutable;
+                match inbound.process_packet_step_with_family_and_config(
+                    &packet,
+                    0,
+                    ledger::INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP,
+                    &journal,
+                    &config,
+                    store,
+                    fetch_pack,
+                    &family,
+                ) {
+                    Ok(step) if !step.stats.is_invalid() => {
+                        inbound.record_packet_stats_with_family_and_config(
+                            step.stats, &journal, &config, &family,
+                        );
+                        verified = step.stats.is_useful();
+                    }
+                    Ok(_) => tracing::warn!(
+                        target: "inbound_ledger",
+                        seq = state.seq,
+                        hash = %state.hash,
+                        probe = ?probe.kind,
+                        "local root failed SHAMap validation; continuing peer acquisition"
+                    ),
+                    Err(_) => tracing::warn!(
+                        target: "inbound_ledger",
+                        seq = state.seq,
+                        hash = %state.hash,
+                        probe = ?probe.kind,
+                        "local root could not complete SHAMap validation; continuing peer acquisition"
+                    ),
+                }
+                store.take_pending_writes()
+            } else {
+                Vec::new()
             }
-            store.take_pending_writes()
         }
     };
     state.submit_persistence_writes(writes);
-    if invalid_local_root {
-        state.mark_failed();
-        return;
-    }
     if verified {
         if let Some(mut mutable) = state.lock_mutable("verified local probe progress") {
             mutable.inbound.record_verified_progress();
@@ -2835,16 +2933,28 @@ fn process_one_read_event(state: &Arc<AcquisitionState>) -> bool {
             match shamap::tree_node::SHAMapTreeNode::make_from_prefix(object.data(), hash) {
                 Ok(node) => MissingNodeReadOutcome::Found(node),
                 Err(_) => {
-                    fail_actor_plan(state, actor_plan);
-                    return true;
+                    tracing::trace!(
+                        target: "inbound_ledger",
+                        seq = state.seq,
+                        hash = %state.hash,
+                        node_hash = %hash,
+                        "brokered local descendant was unusable; reducing as a local miss"
+                    );
+                    MissingNodeReadOutcome::Miss
                 }
             }
         }
         ReadOutcome::Miss => MissingNodeReadOutcome::Miss,
         ReadOutcome::Cancelled => MissingNodeReadOutcome::Cancelled,
         ReadOutcome::Fault(_) => {
-            fail_actor_plan(state, actor_plan);
-            return true;
+            tracing::warn!(
+                target: "inbound_ledger",
+                seq = state.seq,
+                hash = %state.hash,
+                node_hash = %hash,
+                "brokered local descendant faulted; reducing as a local miss"
+            );
+            MissingNodeReadOutcome::Miss
         }
     };
     match actor_plan
@@ -3168,8 +3278,10 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
         TreeAdvance::NeedsNetwork(candidates) => {
             let limit = match actor_plan.reason {
                 InboundLedgerRequestTrigger::Reply
-                | InboundLedgerRequestTrigger::ReplyHighLatency => 128,
-                _ => 12,
+                | InboundLedgerRequestTrigger::ReplyHighLatency => {
+                    INBOUND_LEDGER_REPLY_NODE_REQUEST_CAP
+                }
+                _ => INBOUND_LEDGER_NORMAL_NODE_REQUEST_CAP,
             };
             let candidates = candidates
                 .into_iter()
@@ -3255,6 +3367,30 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
         TreeAdvance::Ready => {
             actor_plan.runnable = ready_turn_can_requeue(&actor_plan.plan, branch_steps_before);
             state.restore_tree_plan(actor_plan);
+        }
+    }
+}
+
+/// Charge one peer-attributable node failure after the corresponding SHAMap
+/// admission has settled. Unlike a base packet, a bad node never erases a
+/// useful sibling or turns that sibling's peer credit into a packet-wide fee.
+fn charge_rejected_node(
+    state: &AcquisitionState,
+    peer_id: u64,
+    packet_type: ledger::InboundLedgerDataType,
+    error: InboundLedgerPacketError,
+) {
+    match error {
+        InboundLedgerPacketError::MissingNodeId
+        | InboundLedgerPacketError::EmptyNodeData
+        | InboundLedgerPacketError::InvalidNodeId
+        | InboundLedgerPacketError::InvalidNodeData => {
+            charge_malformed_packet(state, peer_id, packet_type, error);
+        }
+        InboundLedgerPacketError::InvalidData
+        | InboundLedgerPacketError::EmptyNodes
+        | InboundLedgerPacketError::InvalidHeader => {
+            charge_invalid_data_packet(state, peer_id, packet_type, error);
         }
     }
 }
@@ -3418,7 +3554,6 @@ fn record_completed_ledger(
     acquisition_id: u64,
     completed: &AtomicBool,
     completed_ledger: &Mutex<Option<Arc<Ledger>>>,
-    store_tx: &std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     reason: AcquireReason,
     ledger: Arc<Ledger>,
 ) -> bool {
@@ -3435,13 +3570,10 @@ fn record_completed_ledger(
     *cached = Some(Arc::clone(&ledger));
     drop(cached);
 
-    // This channel only wakes a consumer; failure must not revoke a completed
-    // acquisition or make the ledger unrecoverable through the registry.
-    let _ = store_tx.try_send(CompletedInboundLedger {
-        ledger,
-        reason,
-        acquisition_id,
-    });
+    // Registry completion recording is the sole durable handoff. It runs
+    // before this state becomes observable as completed and retains the exact
+    // acquisition identity until the strand acknowledges successful handling.
+    let _ = (reason, acquisition_id, ledger);
     true
 }
 
@@ -3451,7 +3583,6 @@ fn publish_completed_ledger(
     completion_recorder: &AcquisitionCompletionRecorder,
     completed: &AtomicBool,
     completed_ledger: &Mutex<Option<Arc<Ledger>>>,
-    store_tx: &std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     reason: AcquireReason,
     ledger: Arc<Ledger>,
 ) -> bool {
@@ -3463,7 +3594,6 @@ fn publish_completed_ledger(
         acquisition_id,
         completed,
         completed_ledger,
-        store_tx,
         reason,
         ledger,
     )
@@ -3541,7 +3671,6 @@ fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
         &state.completion_recorder,
         &state.completed,
         &state.completed_ledger,
-        &state.store_tx,
         state.reason,
         ledger,
     ) {

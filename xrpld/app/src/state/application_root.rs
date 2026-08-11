@@ -492,10 +492,6 @@ pub struct ApplicationRoot {
     shared_consensus_rt: Arc<std::sync::RwLock<Option<Arc<AppConsensusRuntime>>>>,
     /// Shared network ops runtime reference. Populated by bind_default_component_runtimes.
     shared_network_ops_rt: Arc<std::sync::RwLock<Option<Arc<AppNetworkOpsRuntime>>>>,
-    /// Signal from bootstrap/consensus loop to InboundLedger workers that
-    /// the shared fetch-pack cache was populated. Workers should re-check
-    /// local storage immediately (matching rippled gotFetchPack).
-    fetch_pack_ready: Arc<std::sync::atomic::AtomicBool>,
     /// A replay request whose historical parent is known locally by header
     /// but lacks reachable SHAMap nodes. It is consumed only after inbound
     /// history acquisition has durably completed.
@@ -4084,7 +4080,6 @@ impl ApplicationRoot {
             shared_consensus_node_store: Arc::new(std::sync::RwLock::new(None)),
             shared_consensus_rt: Arc::new(std::sync::RwLock::new(None)),
             shared_network_ops_rt: Arc::new(std::sync::RwLock::new(None)),
-            fetch_pack_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_replay_startup: Arc::new(Mutex::new(None)),
             open_ledger_account_seqs: Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -4115,19 +4110,6 @@ impl ApplicationRoot {
 
     pub fn basic_app(&self) -> &BasicApp {
         &self.basic_app
-    }
-
-    /// Signal that the shared fetch-pack cache was populated.
-    /// InboundLedger workers should re-check local storage.
-    pub fn signal_fetch_pack_ready(&self) {
-        self.fetch_pack_ready
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Check and clear the fetch-pack-ready flag. Returns true if it was set.
-    pub fn take_fetch_pack_ready(&self) -> bool {
-        self.fetch_pack_ready
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Park replay startup until the exact historical parent has completed
@@ -7136,18 +7118,6 @@ impl ApplicationRoot {
     pub fn set_need_network_ledger(&self, need_network_ledger: bool) {
         self.network_ops_state
             .set_need_network_ledger(need_network_ledger);
-    }
-
-    pub fn set_completed_ledgers_rx(
-        &self,
-        rx: std::sync::mpsc::Receiver<crate::ledger::inbound_ledgers::CompletedInboundLedger>,
-    ) {
-        if let Some(lm_rt) = self.ledger_master_runtime() {
-            *lm_rt
-                .completed_ledgers_rx
-                .lock()
-                .expect("completed_ledgers_rx") = Some(rx);
-        }
     }
 
     pub fn need_network_ledger(&self) -> bool {

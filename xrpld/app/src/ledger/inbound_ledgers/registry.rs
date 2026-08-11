@@ -15,7 +15,6 @@ use shamap::family::{FullBelowCache, FullBelowCacheImpl};
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -47,10 +46,14 @@ fn response_sequence_matches_request(expected_seq: u32, response_seq: u32) -> bo
     expected_seq == 0 || response_seq == 0 || expected_seq == response_seq
 }
 
-/// Isolated throughput experiment: use the host's eight vCPUs for independent
-/// bounded acquisition jobs. The actor/mailbox bounds remain responsible for
-/// fairness; this does not alter the production registry.
-const WORKER_COUNT: usize = 8;
+/// The worker pool is an implementation detail for dispatching actor-external
+/// jobs. Its capacity follows host scheduler capacity; protocol admission is
+/// governed separately by the canonical JtLedgerData-equivalent limit of five.
+fn inbound_worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+}
 
 /// Cumulative, process-lifetime counters covering every inbound-ledger
 /// lifecycle boundary. They are sampled by NetworkOPs at most once every five
@@ -173,16 +176,6 @@ pub enum AcquireReason {
     Generic,
     /// History fill, sequential catchup.
     History,
-}
-
-/// A completed acquisition retains its origin until LedgerMaster consumes it.
-/// This distinguishes rippled's non-validating `storeLedger` paths from its
-/// history-only `setFullLedger` path.
-#[derive(Debug, Clone)]
-pub struct CompletedInboundLedger {
-    pub ledger: Arc<Ledger>,
-    pub reason: AcquireReason,
-    pub acquisition_id: u64,
 }
 
 // ─── Entry ───────────────────────────────────────────────────────────────────
@@ -639,7 +632,6 @@ pub struct InboundLedgers {
     full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
     fetch_pack: Arc<FetchPackCache>,
     overlay_rt: Arc<RwLock<Option<Arc<AppOverlayRuntime>>>>,
-    completed_ledgers_tx: SyncSender<CompletedInboundLedger>,
     stopping: AtomicBool,
     need_network_ledger: Arc<AtomicBool>,
     pending_acquires: Arc<Mutex<HashSet<Uint256>>>,
@@ -658,27 +650,25 @@ impl InboundLedgers {
         tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
         full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
         fetch_pack: Arc<FetchPackCache>,
-        completed_ledgers_tx: SyncSender<CompletedInboundLedger>,
         need_network_ledger: Arc<AtomicBool>,
     ) -> Self {
         Self::with_worker_pool(
             tree_cache,
             full_below,
             fetch_pack,
-            completed_ledgers_tx,
             need_network_ledger,
-            Arc::new(WorkerPool::new(WORKER_COUNT)),
+            Arc::new(WorkerPool::new(inbound_worker_count())),
         )
     }
 
-    /// Construct the registry around its worker queue. Production always uses
-    /// the fixed-size pool above; tests provide a zero-worker pool so they can
-    /// prove real ingress scheduling and draining without timing races.
+    /// Construct the registry around its worker queue. Production uses the
+    /// host-sized dispatch pool while protocol admission remains bounded by
+    /// `WorkerPool`'s rippled-mapped ledger-data limit; tests provide a
+    /// zero-worker pool to prove ingress scheduling/draining deterministically.
     fn with_worker_pool(
         tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
         full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
         fetch_pack: Arc<FetchPackCache>,
-        completed_ledgers_tx: SyncSender<CompletedInboundLedger>,
         need_network_ledger: Arc<AtomicBool>,
         worker_pool: Arc<WorkerPool>,
     ) -> Self {
@@ -696,7 +686,6 @@ impl InboundLedgers {
             full_below,
             fetch_pack,
             overlay_rt: Arc::new(RwLock::new(None)),
-            completed_ledgers_tx,
             stopping: AtomicBool::new(false),
             need_network_ledger,
             pending_acquires: Arc::new(Mutex::new(HashSet::new())),
@@ -968,7 +957,6 @@ impl InboundLedgers {
             read_broker: self.read_broker.clone(),
             tree_cache: Arc::clone(&self.tree_cache),
             fetch_pack: Arc::clone(&self.fetch_pack),
-            store_tx: self.completed_ledgers_tx.clone(),
             failure_recorder,
             completion_recorder,
             full_below_generation: full_below_gen,
@@ -1040,11 +1028,6 @@ impl InboundLedgers {
     /// acquisition key.
     pub fn acquire_closed_ledger_async(&self, hash: Uint256, reason: AcquireReason) {
         self.acquire_async(hash, 0, reason);
-    }
-
-    /// Route a TMLedgerData response to the correct acquisition.
-    pub fn route_response(&self, hash: &Uint256, peer_id: u64, packet: InboundLedgerPacket) {
-        let _ = self.route_response_with_seq(hash, peer_id, None, packet);
     }
 
     /// Route a response while checking the sequence advertised on the wire.
@@ -1357,7 +1340,8 @@ impl InboundLedgers {
             .count()
     }
 
-    /// Notify that a ledger was completed (called externally or by sweep).
+    /// Notify that a ledger was completed (test-only direct lifecycle injector).
+    #[cfg(test)]
     pub fn on_complete(&self, hash: Uint256, ledger: Arc<Ledger>) {
         let mut inner = self.inner.lock().expect("inbound_ledgers lock");
         let completion_id = if let Some(entry) = inner.entries.get_mut(&hash) {
@@ -1376,7 +1360,8 @@ impl InboundLedgers {
         }
     }
 
-    /// Notify that a ledger acquisition failed.
+    /// Notify that a ledger acquisition failed (test-only direct lifecycle injector).
+    #[cfg(test)]
     pub fn on_failed(&self, hash: Uint256) {
         let state = {
             let mut inner = self.inner.lock().expect("inbound_ledgers lock");
@@ -1530,13 +1515,6 @@ impl InboundLedgers {
 
     // ─── Catchup loop compatibility API ──────────────────────────────────
 
-    /// Poll all completed acquisitions. Prefer `poll_results_bounded` from
-    /// timer-driven consensus paths so a completion flood cannot starve the
-    /// heartbeat.
-    pub fn poll_results(&self) -> Vec<(Uint256, u64, Ledger, AcquireReason)> {
-        self.poll_results_bounded(usize::MAX)
-    }
-
     /// Poll at most `budget` successful terminal handoffs. A completion is
     /// enqueued by its terminal callback after it has been made registry-
     /// visible; polling therefore never scans arbitrary in-progress entries.
@@ -1632,6 +1610,46 @@ impl InboundLedgers {
                 "LCL trace: completion acknowledgement found no completed registry entry"
             );
         }
+    }
+
+    /// Retract one unacknowledged completed handoff after a downstream durable
+    /// save failed. This is the only path that removes a successfully acquired
+    /// registry entry without acknowledgement: it clears the ready identity,
+    /// cancels the finished actor, and returns the exact reason/sequence for a
+    /// fresh canonical acquisition.
+    pub fn retract_completed_for_retry(
+        &self,
+        hash: &Uint256,
+        acquisition_id: u64,
+    ) -> Option<(u32, AcquireReason)> {
+        let entry = {
+            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let eligible = inner.entries.get(hash).is_some_and(|entry| {
+                entry.id == acquisition_id
+                    && !entry.completion_acknowledged
+                    && !entry.failed
+                    && (entry.completed_ledger.is_some()
+                        || entry.state.completed.load(Ordering::Acquire))
+            });
+            if !eligible {
+                return None;
+            }
+            inner.completed_ready.retain(|(ready_hash, ready_id)| {
+                *ready_hash != *hash || *ready_id != acquisition_id
+            });
+            inner.entries.remove(hash)
+        };
+        let entry = entry.expect("eligible completed entry must remain resident");
+        entry.state.cancel();
+        tracing::warn!(
+            target: "inbound_ledger",
+            %hash,
+            seq = entry.seq,
+            reason = ?entry.reason,
+            acquisition_id,
+            "retracted completed inbound ledger after failed downstream save; reacquiring"
+        );
+        Some((entry.seq, entry.reason))
     }
 
     /// Check if a specific hash is currently in-progress (not completed, not failed).
@@ -1920,7 +1938,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
@@ -1954,7 +1972,6 @@ mod tests {
 
     fn registry_with_manual_worker_pool(worker_pool: Arc<WorkerPool>) -> (TempDir, InboundLedgers) {
         let (dir, node_store) = test_node_store();
-        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
         let registry = InboundLedgers::with_worker_pool(
             Arc::new(TreeNodeCache::new(
                 "registry-ingress-test",
@@ -1973,7 +1990,6 @@ mod tests {
                 time::Duration::seconds(60),
                 MonotonicClock::default(),
             )),
-            completed_tx,
             Arc::new(AtomicBool::new(false)),
             worker_pool,
         );

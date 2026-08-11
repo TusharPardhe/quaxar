@@ -72,8 +72,10 @@ pub const fn uses_aggressive_by_hash_timeout(timeouts: u32) -> bool {
     timeouts > INBOUND_LEDGER_BECOME_AGGRESSIVE
 }
 const MISSING_NODES_FIND: i32 = 256;
-const REQ_NODES_REPLY: usize = 128;
-const REQ_NODES: usize = 12;
+/// Canonical cap for ordinary inbound-tree node requests.
+pub const INBOUND_LEDGER_NORMAL_NODE_REQUEST_CAP: usize = 12;
+/// Canonical cap for reply-triggered inbound-tree node requests.
+pub const INBOUND_LEDGER_REPLY_NODE_REQUEST_CAP: usize = 128;
 
 /// Stable identity of one tree traversal. A replacement header/root gets a
 /// new ID; ordinary yields, packets, and timer events retain the same ID.
@@ -425,12 +427,34 @@ pub enum InboundLedgerPacketError {
     InvalidData,
 }
 
-/// Result of processing a bounded contiguous range of an inbound packet.
+/// Admission result for one node in a bounded inbound packet step.
+///
+/// This is deliberately derived from the same SHAMap mutation that updates the
+/// ledger.  Consumers must never infer acceptance from wire decodability: a
+/// well-formed node may still fail its root/path/hash proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundLedgerNodeAdmission {
+    /// The node was accepted as useful by the target SHAMap.
+    Accepted { index: usize },
+    /// The node was valid but did not advance the map (already known).
+    Duplicate { index: usize },
+    /// The node was rejected before or during SHAMap validation.
+    Rejected {
+        index: usize,
+        error: InboundLedgerPacketError,
+    },
+}
+
+/// Result of processing a bounded contiguous range of an inbound packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundLedgerPacketStep {
     pub next_node: usize,
     pub complete: bool,
     pub stats: SHAMapAddNode,
+    /// Exact outcomes in original packet-index order. Base packets retain
+    /// their separate header/root semantics and therefore have no node-plan
+    /// admissions here.
+    pub node_admissions: Vec<InboundLedgerNodeAdmission>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1000,25 +1024,17 @@ impl InboundLedgerLocal {
         )
     }
 
+    /// Canonical pre-header request: `getNeededHashes` yields exactly the
+    /// ledger hash as one `otLEDGER` by-hash object. This is intentionally not
+    /// the older GetLedger base request; after the header, state then
+    /// transaction planning takes over.
     pub fn make_header_request(&self) -> ProtocolMessage {
-        let ledger_seq = (self.seq != 0).then_some(self.seq);
-        // querytype=qtINDIRECT when timeouts!=0, for ALL request types
-        // including header requests.
-        let query_type = if self.timeouts > 0 {
-            Some(TM_QUERY_INDIRECT)
-        } else {
-            None
-        };
-        ProtocolMessage::new(ProtocolPayload::GetLedger(TmGetLedger {
-            itype: TM_GET_LEDGER_BASE,
-            ltype: None,
-            ledger_hash: Some(self.hash.as_uint256().data().to_vec()),
-            ledger_seq,
-            node_i_ds: Vec::new(),
-            request_cookie: None,
-            query_type,
-            query_depth: None,
-        }))
+        make_inbound_needed_by_hash_request(
+            self.hash,
+            self.seq,
+            &[(InboundLedgerObjectType::Ledger, *self.hash.as_uint256())],
+        )
+        .expect("one ledger hash always builds a by-hash request")
     }
 
     pub fn make_needed_by_hash_request<CLOCK, S, C, F, MR, NS>(
@@ -1907,8 +1923,9 @@ impl InboundLedgerLocal {
     }
 
     /// Process one bounded range of an inbound packet. Base packets remain
-    /// atomic; node packets retain full-packet structural validation before the
-    /// first range can mutate either SHAMap.
+    /// atomic. Node packets are envelope-checked for non-emptiness, then each
+    /// node is independently validated and applied so a bad sibling cannot
+    /// discard previously useful work from the same peer batch.
     pub fn process_packet_step_with_family_and_config<CLOCK, S, C, F, MR, NS, DB, FP, J>(
         &mut self,
         packet: &InboundLedgerPacket,
@@ -1938,60 +1955,69 @@ impl InboundLedgerLocal {
                 next_node: packet.nodes.len(),
                 complete: true,
                 stats,
+                node_admissions: Vec::new(),
             });
         }
 
         if packet.nodes.is_empty() {
             return Err(InboundLedgerPacketError::EmptyNodes);
         }
-        if next_node == 0 {
-            // A resumable packet must reject any malformed later node before
-            // its first chunk mutates a SHAMap. Subsequent chunks re-use this
-            // admission result and retain the same error semantics as the
-            // former whole-packet path.
-            if packet.nodes.iter().any(|node| node.node_id.is_none()) {
-                journal.warn("Got bad node");
-                return Err(InboundLedgerPacketError::MissingNodeId);
-            }
-            if packet.nodes.iter().any(|node| node.node_data.is_empty()) {
-                journal.warn("Got empty node data");
-                return Err(InboundLedgerPacketError::EmptyNodeData);
-            }
-            if packet.nodes.iter().any(|node| {
-                node.node_id.as_deref().is_none_or(|node_id| {
-                    shamap::node_id::deserialize_shamap_node_id(node_id).is_none()
-                })
-            }) {
-                journal.warn("Got invalid node id");
-                return Err(InboundLedgerPacketError::InvalidNodeId);
-            }
-            if packet
-                .nodes
-                .iter()
-                .any(|node| SHAMapTreeNode::make_from_wire(&node.node_data).is_err())
-            {
-                journal.warn("Got invalid node data");
-                return Err(InboundLedgerPacketError::InvalidNodeData);
-            }
-        }
         if next_node >= packet.nodes.len() {
             return Ok(InboundLedgerPacketStep {
                 next_node: packet.nodes.len(),
                 complete: true,
                 stats: SHAMapAddNode::default(),
+                node_admissions: Vec::new(),
             });
         }
 
+        // `receiveNode` has per-node partial-success semantics. Apply one node
+        // at a time so the actor receives the precise result of the SHAMap
+        // operation rather than reverse-engineering "accepted" nodes from
+        // structurally decodable packet bytes after the fact.
         let end = (next_node + max_nodes.max(1)).min(packet.nodes.len());
-        let chunk =
-            InboundLedgerPacket::new(packet.packet_type, packet.nodes[next_node..end].to_vec());
-        let stats = self.process_packet_with_family_and_config(
-            &chunk, journal, config, store, fetch_pack, family,
-        )?;
+        let mut stats = SHAMapAddNode::default();
+        let mut node_admissions = Vec::with_capacity(end - next_node);
+        for index in next_node..end {
+            let node = &packet.nodes[index];
+            let malformed = match node.node_id.as_deref() {
+                None => Some(InboundLedgerPacketError::MissingNodeId),
+                Some(_) if node.node_data.is_empty() => Some(InboundLedgerPacketError::EmptyNodeData),
+                Some(node_id)
+                    if shamap::node_id::deserialize_shamap_node_id(node_id).is_none() =>
+                {
+                    Some(InboundLedgerPacketError::InvalidNodeId)
+                }
+                Some(_) => None,
+            };
+            if let Some(error) = malformed {
+                stats.inc_invalid();
+                node_admissions.push(InboundLedgerNodeAdmission::Rejected { index, error });
+                continue;
+            }
+
+            let one = InboundLedgerPacket::new(packet.packet_type, vec![node.clone()]);
+            let one_stats = self.process_packet_with_family_and_config(
+                &one, journal, config, store, fetch_pack, family,
+            )?;
+            let admission = if one_stats.is_invalid() {
+                InboundLedgerNodeAdmission::Rejected {
+                    index,
+                    error: InboundLedgerPacketError::InvalidData,
+                }
+            } else if one_stats.is_useful() {
+                InboundLedgerNodeAdmission::Accepted { index }
+            } else {
+                InboundLedgerNodeAdmission::Duplicate { index }
+            };
+            stats += one_stats;
+            node_admissions.push(admission);
+        }
         Ok(InboundLedgerPacketStep {
             next_node: end,
-            complete: end == packet.nodes.len() || stats.is_invalid(),
+            complete: end == packet.nodes.len(),
             stats,
+            node_admissions,
         })
     }
 
@@ -2068,31 +2094,6 @@ impl InboundLedgerLocal {
                 if packet.nodes.is_empty() {
                     return Err(InboundLedgerPacketError::EmptyNodes);
                 }
-                if packet.nodes.iter().any(|node| node.node_id.is_none()) {
-                    journal.warn("Got bad node");
-                    return Err(InboundLedgerPacketError::MissingNodeId);
-                }
-                if packet.nodes.iter().any(|node| node.node_data.is_empty()) {
-                    journal.warn("Got empty node data");
-                    return Err(InboundLedgerPacketError::EmptyNodeData);
-                }
-                if packet.nodes.iter().any(|node| {
-                    node.node_id.as_deref().is_none_or(|node_id| {
-                        shamap::node_id::deserialize_shamap_node_id(node_id).is_none()
-                    })
-                }) {
-                    journal.warn("Got invalid node id");
-                    return Err(InboundLedgerPacketError::InvalidNodeId);
-                }
-                if packet
-                    .nodes
-                    .iter()
-                    .any(|node| SHAMapTreeNode::make_from_wire(&node.node_data).is_err())
-                {
-                    journal.warn("Got invalid node data");
-                    return Err(InboundLedgerPacketError::InvalidNodeData);
-                }
-
                 let mut san = SHAMapAddNode::default();
                 self.receive_node_packet_with_family_and_config(
                     packet, &mut san, config, store, fetch_pack, family, journal,
@@ -2342,18 +2343,19 @@ impl InboundLedgerLocal {
             TransactionStateSF::new(InboundLedgerSyncStore(&mut *store), &mut *fetch_pack);
         for node in &packet.nodes {
             let Some(node_id_bytes) = node.node_id.as_deref() else {
+                journal.warn("Received bad node id");
                 san.inc_invalid();
-                return;
+                continue;
             };
             if node.node_data.is_empty() {
-                journal.warn("Received bad node data");
+                journal.warn("Received empty node data");
                 san.inc_invalid();
-                return;
+                continue;
             }
             let Some(node_id) = shamap::node_id::deserialize_shamap_node_id(node_id_bytes) else {
-                journal.warn("Received bad node data");
+                journal.warn("Received invalid node id");
                 san.inc_invalid();
-                return;
+                continue;
             };
 
             let mut filter_ref: Option<&mut dyn SHAMapSyncFilter> = Some(&mut filter);
@@ -2375,7 +2377,7 @@ impl InboundLedgerLocal {
             *san += added;
             if added.is_invalid() {
                 journal.warn("Received bad node data");
-                return;
+                continue;
             }
         }
 
@@ -2425,18 +2427,19 @@ impl InboundLedgerLocal {
         let loop_start = std::time::Instant::now();
         for node in &packet.nodes {
             let Some(node_id_bytes) = node.node_id.as_deref() else {
+                journal.warn("Received bad node id");
                 san.inc_invalid();
-                return;
+                continue;
             };
             if node.node_data.is_empty() {
-                journal.warn("Received bad node data");
+                journal.warn("Received empty node data");
                 san.inc_invalid();
-                return;
+                continue;
             }
             let Some(node_id) = shamap::node_id::deserialize_shamap_node_id(node_id_bytes) else {
-                journal.warn("Received bad node data");
+                journal.warn("Received invalid node id");
                 san.inc_invalid();
-                return;
+                continue;
             };
 
             let mut filter_ref: Option<&mut dyn SHAMapSyncFilter> = Some(&mut filter);
@@ -2472,7 +2475,7 @@ impl InboundLedgerLocal {
             *san += added;
             if added.is_invalid() {
                 journal.warn("Received bad node data");
-                return;
+                continue;
             }
         }
 
@@ -2601,7 +2604,8 @@ impl InboundLedgerLocal {
         self.signaled = true;
     }
 
-    /// Sends requests to peers based on current acquisition state.
+    #[cfg(test)]
+    /// Legacy synchronous request planner retained only for unit-test reference.
     pub fn trigger_with_family<CLOCK, S, C, F, MR, NS, DB, FP, J>(
         &mut self,
         reason: InboundLedgerRequestTrigger,
@@ -2792,8 +2796,10 @@ impl InboundLedgerLocal {
                 } else {
                     let limit = match reason {
                         InboundLedgerRequestTrigger::Reply
-                        | InboundLedgerRequestTrigger::ReplyHighLatency => REQ_NODES_REPLY,
-                        _ => REQ_NODES,
+                        | InboundLedgerRequestTrigger::ReplyHighLatency => {
+                            INBOUND_LEDGER_REPLY_NODE_REQUEST_CAP
+                        }
+                        _ => INBOUND_LEDGER_NORMAL_NODE_REQUEST_CAP,
                     };
                     let mut fresh: Vec<_> = missing
                         .iter()
@@ -2935,8 +2941,10 @@ impl InboundLedgerLocal {
                     } else {
                         let limit = match reason {
                             InboundLedgerRequestTrigger::Reply
-                            | InboundLedgerRequestTrigger::ReplyHighLatency => REQ_NODES_REPLY,
-                            _ => REQ_NODES,
+                            | InboundLedgerRequestTrigger::ReplyHighLatency => {
+                                INBOUND_LEDGER_REPLY_NODE_REQUEST_CAP
+                            }
+                            _ => INBOUND_LEDGER_NORMAL_NODE_REQUEST_CAP,
                         };
                         let mut fresh: Vec<_> = missing
                             .iter()
@@ -3271,9 +3279,14 @@ pub fn make_inbound_needed_by_hash_request(
     // Rippled parity: rippled explicitly filters the needed hashes by the first
     // type it encounters (p.first == tmBH.type()). It does not mix object types
     // within a single TMGetObjectByHash packet.
-    let mut objects = Vec::new();
+    let max_objects = match first_type {
+        InboundLedgerObjectType::Ledger => 1,
+        InboundLedgerObjectType::StateNode => INBOUND_LEDGER_MAX_NEEDED_STATE_HASHES as usize,
+        InboundLedgerObjectType::TransactionNode => INBOUND_LEDGER_MAX_NEEDED_TX_HASHES as usize,
+    };
+    let mut objects = Vec::with_capacity(max_objects);
     for &(object_type, hash) in needed {
-        if object_type == first_type {
+        if object_type == first_type && objects.len() < max_objects {
             objects.push(overlay::message::wire::TmIndexedObject {
                 hash: Some(hash.data().to_vec()),
                 index: None,

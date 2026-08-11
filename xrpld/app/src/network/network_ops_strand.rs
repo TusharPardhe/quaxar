@@ -81,6 +81,30 @@ enum PreferredLclReconciliation {
     Switched,
 }
 
+/// The NetworkOps strand owns preferred-LCL identity. Every observed target
+/// replacement increments an epoch, so a candidate completed for an older
+/// preference can be retained but cannot be installed after the preference
+/// moved away and back.
+#[derive(Debug, Default)]
+struct PreferredLclTarget {
+    hash: Option<Uint256>,
+    epoch: u64,
+}
+
+impl PreferredLclTarget {
+    fn observe(&mut self, hash: Uint256) -> u64 {
+        if self.hash != Some(hash) {
+            self.hash = Some(hash);
+            self.epoch = self.epoch.wrapping_add(1);
+        }
+        self.epoch
+    }
+
+    fn current_hash(&self) -> Option<Uint256> {
+        self.hash
+    }
+}
+
 /// Result of the strand-owned second phase of inbound completion. A result is
 /// acknowledged only after its intended lifecycle transition is durable or
 /// intentionally cache-only; retry retains the acquisition in the registry.
@@ -270,9 +294,6 @@ pub struct NetworkOpsStrandDeps {
     pub configured_ledger_history: u32,
     /// rippled `SizedItem::LedgerFetch` for the configured node-size profile.
     pub configured_ledger_fetch_size: u32,
-    /// Receiver for completed ledgers from shared_inbound acquisition.
-    pub shared_completed_rx:
-        Option<std::sync::mpsc::Receiver<crate::ledger::inbound_ledgers::CompletedInboundLedger>>,
 }
 
 /// External handle to the running strand. Drop to stop.
@@ -371,7 +392,6 @@ fn strand_loop(
         shared_inbound,
         configured_ledger_history,
         configured_ledger_fetch_size,
-        shared_completed_rx,
     } = deps;
 
     // Take the consensus runner — it now lives exclusively on this thread.
@@ -401,6 +421,10 @@ fn strand_loop(
     // Sample repeating LCL diagnostics while leaving recovery decisions and
     // state-transition logs complete.
     let mut lcl_audit_sampler = LclAuditSampler::new();
+    // This state is intentionally strand-local: peer/validation selection may
+    // change while an inbound candidate is becoming durable, but no other
+    // owner can install an LCL.
+    let mut preferred_lcl_target = PreferredLclTarget::default();
 
     // Detect startup: always start consensus immediately on the closed
     // ledger, matching rippled's Application::run() which calls
@@ -674,14 +698,7 @@ fn strand_loop(
             }
             for (hash, acquisition_id, ledger, reason) in registry_completions {
                 let ledger = Arc::new(ledger);
-                let persisted = persist_completed_inbound_ledger(&root, &lm, &ledger, reason);
-                // Match rippled's completed-ledger handoff: make the ledger
-                // resolver-visible before evaluating validation quorum. The
-                // adaptor-local map is the canonical fast path for
-                // `check_acquired`; registering after checkAccept could turn
-                // a completed ledger into a redundant Generic acquisition.
-                root.validations().register_ledger(&ledger);
-                root.check_accept_completed_inbound_ledger(Arc::clone(&ledger));
+                let persisted = coordinate_completed_inbound_ledger(&root, &lm, &ledger, reason);
                 trace_completed_inbound_handoff(
                     "registry_ready",
                     &lm,
@@ -690,31 +707,20 @@ fn strand_loop(
                     acquisition_id,
                     persisted,
                 );
-                // The queue item is acknowledged only after persistence,
-                // canonical resolver publication, and acceptance dispatch.
-                // A failed persistence remains ready for a fair later retry.
+                // Completion acknowledgement is derived only from the single
+                // coordinator handoff. A failed downstream save retracts this
+                // visible completion and restarts the exact reason path rather
+                // than leaving an unacknowledged terminal entry to poll forever.
                 if persisted.acknowledged {
                     shared_inbound.acknowledge_completed(&hash, acquisition_id);
+                } else if let Some((seq, retry_reason)) =
+                    shared_inbound.retract_completed_for_retry(&hash, acquisition_id)
+                {
+                    shared_inbound.acquire_async(hash, seq, retry_reason);
                 }
             }
         }
 
-        // ─── 6b. completion wakeups ──────────────────────────────────────
-        // Registry polling above is the only persistence/checkAccept/ack owner.
-        // These bounded receivers merely wake this turn; processing them here
-        // would duplicate a completion that is still retained in the registry.
-        if let Some(lm_rt) = root.ledger_master_runtime() {
-            let rx_guard = lm_rt
-                .completed_ledgers_rx
-                .lock()
-                .expect("completed_ledgers_rx");
-            if let Some(rx) = rx_guard.as_ref() {
-                drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |_| {});
-            }
-        }
-        if let Some(ref rx) = shared_completed_rx {
-            drain_bounded(rx, MAX_LEDGER_COMPLETIONS_PER_TURN, |_| {});
-        }
 
         // ─── 6c. pending_consensus_ledger → acquire_async ────────────────
         if let Some(lm_rt) = root.ledger_master_runtime() {
@@ -776,6 +782,7 @@ fn strand_loop(
                 &mut runner,
                 &consensus_rt,
                 &mut last_round_ledger_id,
+                &mut preferred_lcl_target,
                 &mut lcl_audit_sampler,
             )
         } else {
@@ -940,6 +947,7 @@ fn reconcile_preferred_lcl(
     runner: &mut dyn ConsensusRunner,
     consensus_rt: &AppConsensusRuntime,
     last_round_ledger_id: &mut Option<Uint256>,
+    preferred_lcl_target: &mut PreferredLclTarget,
     audit_sampler: &mut LclAuditSampler,
 ) -> PreferredLclReconciliation {
     if !should_reconcile_preferred_lcl(runner.phase()) {
@@ -989,6 +997,7 @@ fn reconcile_preferred_lcl(
         &peer_counts,
     );
     let preferred_hash = preference_diagnostic.selected;
+    let preferred_epoch = preferred_lcl_target.observe(preferred_hash);
     // Preserve the exact resolver result for this Accepted pass. Reusing it
     // below distinguishes a true resolver hit from an inbound-registry hit
     // and avoids a second lookup obscuring a cache/sweep race in diagnostics.
@@ -1003,6 +1012,7 @@ fn reconcile_preferred_lcl(
         local_lcl_hash = %our_hash,
         local_lcl_seq = our_closed.header().seq,
         preferred_lcl_hash = %preferred_hash,
+        preferred_target_epoch = preferred_epoch,
         peer_count = peers.len(),
         selected_trusted_validation_count = root.validations().num_trusted_for_ledger(preferred_hash),
         selected_peer_lcl_support = peer_counts.get(&preferred_hash).copied().unwrap_or_default(),
@@ -1263,18 +1273,39 @@ fn reconcile_preferred_lcl(
     // Rippled demotes only after the candidate survives canBeCurrent and
     // compatibility admission. In particular, an incompatible resolver hit
     // returns false from checkLastClosedLedger without a FULL→CONNECTED flap.
-    demote_for_preferred_lcl_divergence(root);
-
-    switch_last_closed_ledger(
+    let switched = switch_last_closed_ledger(
         root,
         shared_inbound,
         runner,
         consensus_rt,
         last_round_ledger_id,
         preferred_hash,
+        preferred_epoch,
+        preferred_lcl_target,
         candidate,
     );
-    PreferredLclReconciliation::Switched
+    if switched {
+        PreferredLclReconciliation::Switched
+    } else {
+        // The immediate pre-commit recheck observed a newer preference. Keep
+        // the completed old candidate cached and resume canonical recovery for
+        // the current target rather than allowing an old LCL to win.
+        let current = preferred_lcl_target
+            .current_hash()
+            .expect("preferred target observed before switch");
+        if !current.is_zero() && current != parent_hash && current != our_hash {
+            shared_inbound.acquire_closed_ledger_async(current, AcquireReason::Consensus);
+            restart_preferred_lcl_recovery(
+                root,
+                runner,
+                consensus_rt,
+                last_round_ledger_id,
+                current,
+                &our_closed,
+            );
+        }
+        PreferredLclReconciliation::Pending
+    }
 }
 
 /// Demote only once a preferred-LCL divergence has become actionable.
@@ -1289,6 +1320,37 @@ fn demote_for_preferred_lcl_divergence(root: &ApplicationRoot) {
     ) {
         root.set_network_ops_operating_mode(NetworkOpsOperatingMode::Connected);
     }
+}
+
+fn current_preferred_lcl_hash(
+    root: &ApplicationRoot,
+    our_closed: &Arc<ledger::Ledger>,
+) -> Option<Uint256> {
+    let lm = root.ledger_master_runtime()?.ledger_master();
+    use overlay::Overlay;
+    let mut peer_counts = std::collections::BTreeMap::<Uint256, u32>::new();
+    let our_hash = *our_closed.header().hash.as_uint256();
+    peer_counts.entry(our_hash).or_insert(0);
+    if let Some(overlay_rt) = root.overlay_runtime() {
+        for peer in overlay_rt.overlay().active_peers() {
+            let hash = peer.closed_ledger_hash();
+            if !hash.is_zero() {
+                *peer_counts.entry(hash).or_default() += 1;
+            }
+        }
+    }
+    if root.network_ops_operating_mode() >= NetworkOpsOperatingMode::Tracking {
+        *peer_counts.entry(our_hash).or_default() += 1;
+    }
+    Some(
+        root.validations()
+            .preferred_lcl_diagnostic(
+                &RclValidatedLedger::from_ledger(our_closed),
+                lm.valid_ledger_seq(),
+                &peer_counts,
+            )
+            .selected,
+    )
 }
 
 /// Preserve rippled's endConsensus → beginConsensus path when the preferred
@@ -1315,6 +1377,59 @@ fn restart_preferred_lcl_recovery(
     *last_round_ledger_id = Some(target);
 }
 
+/// Re-read every LCL commit precondition immediately before irreversible
+/// TxQ/open-ledger/closed-LCL work. Earlier reconciliation checks are only
+/// candidates: validation preference and map state may have changed while the
+/// completion was persisted or queued on the strand.
+fn final_lcl_commit_admission(
+    root: &ApplicationRoot,
+    target: Uint256,
+    target_epoch: u64,
+    preferred_lcl_target: &mut PreferredLclTarget,
+    ledger: &ledger::Ledger,
+) -> bool {
+    let Some(current_closed) = root.closed_ledger() else {
+        return false;
+    };
+    let selected = current_preferred_lcl_hash(root, &current_closed);
+    let selected_epoch = selected.map(|hash| preferred_lcl_target.observe(hash));
+    let candidate_hash = *ledger.header().hash.as_uint256();
+    let maps_complete = !ledger.state_map().is_synching()
+        && (ledger.header().tx_hash.is_zero() || !ledger.tx_map().is_synching());
+    let (can_be_current, compatible) = root
+        .ledger_master_runtime()
+        .map(|runtime| {
+            let master = runtime.ledger_master();
+            (
+                master.can_be_current(ledger, root.current_close_time_seconds()),
+                master.compatibility_audit(ledger).compatible(),
+            )
+        })
+        .unwrap_or((false, false));
+    let admitted = selected == Some(target)
+        && selected_epoch == Some(target_epoch)
+        && candidate_hash == target
+        && maps_complete
+        && can_be_current
+        && compatible;
+    if !admitted {
+        tracing::info!(
+            target: "lcl_trace",
+            event = "preferred_lcl_switch_commit_rejected",
+            selected_target = ?selected,
+            selected_target_epoch = ?selected_epoch,
+            target = %target,
+            target_epoch,
+            candidate_hash = %candidate_hash,
+            maps_complete,
+            can_be_current,
+            compatible,
+            "LCL trace: final preferred-LCL commit gate rejected cached candidate"
+        );
+    }
+    admitted
+}
+
 /// Commit the resident, currently preferred LCL. Inbound completion only
 /// populates cache/history; this endConsensus pass remains the sole policy
 /// point that installs an admissible LCL.
@@ -1325,11 +1440,44 @@ fn switch_last_closed_ledger(
     consensus_rt: &AppConsensusRuntime,
     last_round_ledger_id: &mut Option<Uint256>,
     target: Uint256,
+    target_epoch: u64,
+    preferred_lcl_target: &mut PreferredLclTarget,
     ledger: Arc<ledger::Ledger>,
-) {
+) -> bool {
+    let Some(current_closed) = root.closed_ledger() else {
+        return false;
+    };
+    let current_preferred = current_preferred_lcl_hash(root, &current_closed);
+    let observed_epoch = current_preferred.map(|hash| preferred_lcl_target.observe(hash));
+    if current_preferred != Some(target) || observed_epoch != Some(target_epoch) {
+        tracing::info!(
+            target: "lcl_trace",
+            event = "preferred_lcl_switch_stale_target",
+            selected_target = ?current_preferred,
+            selected_target_epoch = ?observed_epoch,
+            candidate_target = %target,
+            candidate_target_epoch = target_epoch,
+            "LCL trace: skipped switch for candidate from an obsolete preferred target epoch"
+        );
+        return false;
+    }
+    if !final_lcl_commit_admission(
+        root,
+        target,
+        target_epoch,
+        preferred_lcl_target,
+        ledger.as_ref(),
+    ) {
+        // The completion remains cached by the registry/history handoff. The
+        // caller re-acquires the freshly selected target without demoting or
+        // installing this obsolete/incomplete candidate.
+        return false;
+    }
     let new_hash = *ledger.header().hash.as_uint256();
-    debug_assert_eq!(new_hash, target);
     let new_seq = ledger.header().seq;
+    // Only a candidate that passed the immediate commit audit makes the
+    // preferred-LCL divergence actionable.
+    demote_for_preferred_lcl_divergence(root);
     tracing::info!(
         target: "lcl_audit",
         target_hash = %target,
@@ -1394,6 +1542,7 @@ fn switch_last_closed_ledger(
     );
     tracing::info!(target: "consensus", new_seq, %new_hash,
         "switchLastClosedLedger installed current preferred LCL");
+    true
 }
 
 // ─── checkAccept + tryAdvance + operating mode + history ─────────────────────
@@ -1779,6 +1928,39 @@ fn history_fetch_pack_requested(
 
 fn same_history_fetch_pack_is_suppressed(in_flight: Option<(u32, Instant)>, missing: u32) -> bool {
     in_flight.is_some_and(|(requested, _)| requested == missing)
+}
+
+/// The sole AcqDone consumer. Persistence is always first; Generic and
+/// Consensus then run the exact `checkAccept -> tryAdvance` path, while
+/// History only advances contiguous material already anchored by the validated
+/// chain. Registry acknowledgement is intentionally performed by the caller
+/// after this returns, so no parallel completion route can lose or duplicate a
+/// terminal delivery.
+fn coordinate_completed_inbound_ledger(
+    root: &ApplicationRoot,
+    lm: &ledger::LedgerMaster,
+    ledger: &Arc<ledger::Ledger>,
+    reason: AcquireReason,
+) -> CompletionPersistence {
+    let persisted = persist_completed_inbound_ledger(root, lm, ledger, reason);
+    if !persisted.acknowledged {
+        return persisted;
+    }
+
+    // Completed ledgers are resolver-visible cache material regardless of
+    // reason; only Generic/Consensus may turn that fact into validation
+    // acceptance. This preserves valid stale/history reuse without promoting
+    // an arbitrary historical fork.
+    root.validations().register_ledger(ledger);
+    match reason {
+        AcquireReason::Generic | AcquireReason::Consensus => {
+            root.check_accept_completed_inbound_ledger(Arc::clone(ledger));
+        }
+        AcquireReason::History => {
+            root.try_advance_publication();
+        }
+    }
+    persisted
 }
 
 fn trace_completed_inbound_handoff(

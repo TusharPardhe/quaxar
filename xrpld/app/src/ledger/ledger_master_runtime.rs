@@ -31,13 +31,6 @@ pub type AppLedgerMaster = LedgerMaster<MonotonicClock, HardenedHashBuilder>;
 pub struct AppLedgerMasterRuntime {
     ledger_master: Arc<AppLedgerMaster>,
     pub(crate) pending_consensus_ledger: Arc<Mutex<Option<Uint256>>>,
-    pub(crate) completed_ledgers_rx: Arc<
-        Mutex<
-            Option<
-                std::sync::mpsc::Receiver<crate::ledger::inbound_ledgers::CompletedInboundLedger>,
-            >,
-        >,
-    >,
     pub inbound_ledgers: Arc<Mutex<Option<Arc<crate::ledger::inbound_ledgers::InboundLedgers>>>>,
     /// Sequence of the ledger currently being built by consensus. This lets
     /// acquisition avoid racing the close path for the same next ledger.
@@ -93,7 +86,6 @@ impl AppLedgerMasterRuntime {
         Self {
             ledger_master,
             pending_consensus_ledger: Arc::new(Mutex::new(None)),
-            completed_ledgers_rx: Arc::new(Mutex::new(None)),
             inbound_ledgers: Arc::new(Mutex::new(None)),
             building_ledger_seq: Arc::new(AtomicU32::new(0)),
         }

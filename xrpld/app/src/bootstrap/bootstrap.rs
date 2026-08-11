@@ -1206,9 +1206,6 @@ fn run_start_mode_consensus_loop(
 
     // Consensus event channel for validations and ledger promotions
     let (event_tx, event_rx) = crate::consensus::driver::consensus_event_channel();
-    let (shared_completed_tx, shared_completed_rx) = std::sync::mpsc::sync_channel::<
-        crate::ledger::inbound_ledgers::CompletedInboundLedger,
-    >(1_024);
 
     let lm_rt_for_shared_inbound = runtime.root().ledger_master_runtime();
     let mut worker_handles = Vec::<std::thread::JoinHandle<()>>::new();
@@ -1249,7 +1246,6 @@ fn run_start_mode_consensus_loop(
                     time::Duration::seconds(120),
                     basics::tagged_cache::MonotonicClock::default(),
                 )),
-                shared_completed_tx.clone(),
                 runtime.root().network_ops_state().need_network_ledger_arc(),
             ))
         });
@@ -1842,7 +1838,6 @@ fn run_start_mode_consensus_loop(
         shared_inbound: Arc::clone(&shared_inbound),
         configured_ledger_history,
         configured_ledger_fetch_size: node_size_profile.ledger_fetch_size,
-        shared_completed_rx: Some(shared_completed_rx),
     });
 
     // ===================================================================
@@ -2050,12 +2045,10 @@ fn run_start_mode_consensus_loop(
                             continue;
                         }
 
-                        // Preserve both established cache owners used by the
-                        // shared acquisition lifecycle. Consumers verify the
-                        // content-addressed hash when retrieving each object.
-                        if let Some(ledger_master) = ledger_master.as_ref() {
-                            ledger_master.add_fetch_pack(hash, data.clone());
-                        }
+                        // The registry owns the sole inbound fetch-pack cache.
+                        // Its hydrator content-validates every object before
+                        // applying it; LedgerMaster retains only the
+                        // single-flight notification gate below.
                         router_shared_inbound.store_fetch_pack(hash, data.clone());
                         stored += 1;
                     }
@@ -2067,7 +2060,6 @@ fn run_start_mode_consensus_loop(
                             .as_ref()
                             .is_none_or(|master| master.got_fetch_pack(progress, pack_seq));
                         if dispatch {
-                            let ready_root = router_root.clone();
                             let ready_inbound = Arc::clone(&router_shared_inbound);
                             let ready_master = ledger_master.clone();
                             let rejected_master = ledger_master.clone();
@@ -2075,10 +2067,10 @@ fn run_start_mode_consensus_loop(
                                 crate::job::job_types::JobType::JtLedgerData,
                                 "GotFetchPack",
                                 move || {
-                                    // A reply can contain no useful/complete
-                                    // nodes; it still releases the single-flight
-                                    // completion path, as in gotFetchPack.
-                                    ready_root.signal_fetch_pack_ready();
+                                    // Registry notification is the coalesced
+                                    // wakeup boundary for every active actor.
+                                    // Do not retain a second ApplicationRoot
+                                    // fetch-pack flag with no distinct owner.
                                     ready_inbound.notify_fetch_pack_ready();
                                     if let Some(master) = ready_master {
                                         master.finish_got_fetch_pack();
@@ -2094,6 +2086,12 @@ fn run_start_mode_consensus_loop(
                                 }
                             }
                         }
+                    } else if stored != 0 {
+                        // Header-only and filtered node replies are canonical
+                        // local-hydrator input too. Wake actors once through
+                        // the registry rather than inventing a direct overlay
+                        // mutation or a second cache/notification path.
+                        router_shared_inbound.notify_fetch_pack_ready();
                     }
                 } else if msg.r#type
                     == overlay::message::wire::tm_get_object_by_hash::ObjectType::OtFetchPack as i32

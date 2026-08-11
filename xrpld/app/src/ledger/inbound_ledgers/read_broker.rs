@@ -13,10 +13,12 @@ use std::sync::{Arc, Mutex};
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 
 /// Maximum physical NodeStore reads owned by all inbound acquisitions in the
-/// isolated high-throughput experiment.
+/// These caps bound brokered I/O implementation resources only. They never
+/// change the local-first acquisition state machine or verifier result.
 pub const ACQ_READS_GLOBAL: usize = 128;
 /// Maximum dispatched read subscriptions attributable to one acquisition in
-/// the isolated high-throughput experiment.
+/// They are intentionally separate from protocol planning and peer requests;
+/// a broker admission delay is represented as an actor-owned local-read event.
 pub const ACQ_READS_PER_ACQUISITION: usize = 32;
 /// Maximum acquisitions/plans that may wait on one unique key.
 pub const ACQ_READ_WAITERS_PER_KEY: usize = 32;

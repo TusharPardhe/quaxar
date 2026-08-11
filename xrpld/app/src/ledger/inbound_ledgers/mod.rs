@@ -22,7 +22,7 @@ pub use self::read_broker::{
     ReadAdmission, ReadBrokerConfig, ReadBrokerMetrics, ReadBrokerSnapshot, ReadDispatch, ReadKey,
     ReadOutcome, ReadReady, ReadRejectReason, ReadTicket, ReadTicketId,
 };
-pub use self::registry::{AcquireReason, CompletedInboundLedger, InboundLedgers};
+pub use self::registry::{AcquireReason, InboundLedgers};
 pub use self::worker_pool::WorkerPool;
 
 // ─── Backward-compatible stub ────────────────────────────────────────────────

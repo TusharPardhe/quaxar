@@ -476,7 +476,7 @@ fn inbound_packet_steps_preserve_full_packet_stats_and_timer_progress() {
 }
 
 #[test]
-fn inbound_packet_step_validates_the_original_packet_before_mutating() {
+fn inbound_packet_step_retains_valid_nodes_when_a_sibling_is_malformed() {
     let state_leaf = make_shared_intrusive(SHAMapTreeNode::new_leaf(
         SHAMapNodeType::AccountState,
         SHAMapItem::new(Uint256::from_array([0x54; 32]), vec![1; 12]),
@@ -505,21 +505,23 @@ fn inbound_packet_step_validates_the_original_packet_before_mutating() {
         &mut store,
         &journal,
     ));
-    assert_eq!(
-        inbound.process_packet_step_with_family_and_config(
+    let step = inbound
+        .process_packet_step_with_family_and_config(
             &packet,
             0,
-            INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP,
+            INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP + 1,
             &journal,
             &LedgerConfig::default(),
             &mut store,
             &mut fetch_pack,
             &family,
-        ),
-        Err(InboundLedgerPacketError::MissingNodeId)
-    );
-    assert!(!inbound.planner_state().have_state);
-    assert!(store.stored_nodes.borrow().is_empty());
+        )
+        .expect("a malformed sibling must not reject useful nodes");
+    assert!(step.complete);
+    assert!(step.stats.is_invalid());
+    assert!(step.stats.is_useful());
+    assert!(inbound.planner_state().have_state);
+    assert!(!store.stored_nodes.borrow().is_empty());
 }
 
 #[test]
