@@ -936,34 +936,20 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         let effective_status = self.peer.remember_status(message.new_status);
 
         if message.new_event == Some(lost_sync_event()) {
-            self.peer.clear_closed_ledger_hash();
-            self.peer.clear_previous_ledger_hash();
+            self.peer.clear_status_ledgers();
             return crate::router::RouteAction::Continue;
         }
 
-        if let Some(hash) = message.ledger_hash.as_deref().and_then(Uint256::from_slice) {
-            if let Some(sequence) = message.ledger_seq {
-                self.peer.record_ledger(hash, sequence);
-            } else {
-                self.peer.set_closed_ledger_hash(hash);
-            }
-        } else {
-            self.peer.clear_closed_ledger_hash();
-        }
-
-        if let Some(hash) = message
+        let current = message.ledger_hash.as_deref().and_then(Uint256::from_slice);
+        let previous = message
             .ledger_hash_previous
             .as_deref()
-            .and_then(Uint256::from_slice)
-        {
-            self.peer.set_previous_ledger_hash(hash);
-        } else {
-            self.peer.clear_previous_ledger_hash();
-        }
-
-        if let (Some(first), Some(last)) = (message.first_seq, message.last_seq) {
-            self.peer.set_ledger_range(first, last);
-        }
+            .and_then(Uint256::from_slice);
+        let range = match (message.first_seq, message.last_seq) {
+            (Some(first), Some(last)) => Some((first, last)),
+            _ => None,
+        };
+        self.peer.apply_status_change(current, previous, range);
 
         self.overlay.publish_peer_status(build_peer_status_event(
             effective_status,

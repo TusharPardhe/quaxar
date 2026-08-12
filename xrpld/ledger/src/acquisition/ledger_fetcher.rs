@@ -269,6 +269,21 @@ impl TreePlan {
         self.continuation.network_candidates()
     }
 
+    /// Drain newly announced candidates created by local misses without a
+    /// second traversal pass.
+    pub fn take_network_candidates(&mut self) -> Vec<(shamap::node_id::SHAMapNodeId, Uint256)> {
+        self.continuation.take_unannounced_network()
+    }
+
+    /// Return candidates excluded by an outbound serialization limit to the
+    /// plan's immediate continuation frontier.
+    pub fn restore_network_candidates(
+        &mut self,
+        candidates: Vec<(shamap::node_id::SHAMapNodeId, Uint256)>,
+    ) {
+        self.continuation.restore_unannounced_network(candidates);
+    }
+
     pub fn retry_network_candidate(&mut self, hash: SHAMapHash) -> bool {
         self.continuation.retry_network_candidate(hash)
     }

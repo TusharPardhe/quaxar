@@ -25,8 +25,10 @@ use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 use super::acquisition::{
     AcquisitionBuilder, AcquisitionCompletionRecorder, AcquisitionDurableCompletionRecorder,
     AcquisitionFailureRecorder, AcquisitionLedgerStore, AcquisitionPeerProvider,
-    AcquisitionSnapshot, AcquisitionState, PacketEnqueue, ProvisionalLedgerIdentity,
+    AcquisitionSequencePromoter, AcquisitionSnapshot, AcquisitionState, PacketEnqueue, ProvisionalLedgerIdentity,
 };
+#[cfg(test)]
+use super::acquisition::{SequencePromotionAttempt, SequenceRoutePause};
 use super::read_broker::{NodeReadBroker, ReadBrokerConfig};
 use super::scheduler::{AcquisitionKey, AcquisitionReadyScheduler, ReadyCause};
 use super::worker_pool::WorkerPool;
@@ -45,7 +47,7 @@ const SWEEP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// flood. Operators can use the aggregate fields to see work beyond this set.
 const FETCH_INFO_MAX_ACQUISITIONS: usize = 16;
 
-fn response_sequence_matches_request(expected_seq: u32, response_seq: u32) -> bool {
+pub(crate) fn response_sequence_matches_request(expected_seq: u32, response_seq: u32) -> bool {
     expected_seq == 0 || response_seq == 0 || expected_seq == response_seq
 }
 
@@ -75,6 +77,12 @@ pub(crate) struct AcquisitionLifecycleSnapshot {
     pub initialization_jobs: u64,
     pub request_triggers: u64,
     pub request_messages: u64,
+    pub requests_suppressed_local_probe: u64,
+    pub local_probe_deferred_network_fallbacks: u64,
+    pub header_sequences_promoted: u64,
+    pub reply_headers_received: u64,
+    pub peer_candidates_eligible: u64,
+    pub tree_plans_completed: u64,
     pub peers_added: u64,
     pub data_jobs_submitted: u64,
     pub data_jobs_coalesced: u64,
@@ -108,6 +116,12 @@ pub(crate) struct AcquisitionLifecycleCounters {
     pub initialization_jobs: AtomicU64,
     pub request_triggers: AtomicU64,
     pub request_messages: AtomicU64,
+    pub requests_suppressed_local_probe: AtomicU64,
+    pub local_probe_deferred_network_fallbacks: AtomicU64,
+    pub header_sequences_promoted: AtomicU64,
+    pub reply_headers_received: AtomicU64,
+    pub peer_candidates_eligible: AtomicU64,
+    pub tree_plans_completed: AtomicU64,
     pub peers_added: AtomicU64,
     pub data_jobs_submitted: AtomicU64,
     pub data_jobs_coalesced: AtomicU64,
@@ -147,6 +161,12 @@ impl AcquisitionLifecycleCounters {
             initialization_jobs: load!(initialization_jobs),
             request_triggers: load!(request_triggers),
             request_messages: load!(request_messages),
+            requests_suppressed_local_probe: load!(requests_suppressed_local_probe),
+            local_probe_deferred_network_fallbacks: load!(local_probe_deferred_network_fallbacks),
+            header_sequences_promoted: load!(header_sequences_promoted),
+            reply_headers_received: load!(reply_headers_received),
+            peer_candidates_eligible: load!(peer_candidates_eligible),
+            tree_plans_completed: load!(tree_plans_completed),
             peers_added: load!(peers_added),
             data_jobs_submitted: load!(data_jobs_submitted),
             data_jobs_coalesced: load!(data_jobs_coalesced),
@@ -207,9 +227,10 @@ impl LedgerDataRouteDisposition {
 
 struct Entry {
     id: u64,
-    /// Requested sequence constraint. Zero means the hash is the only
-    /// pre-completion identity; a completed ledger header supplies its
-    /// authoritative sequence to the strand.
+    /// Non-authoritative requested/verified sequence snapshot maintained for
+    /// registry bookkeeping. The state sequence gate invokes its exact
+    /// `(hash, acquisition_id)` callback before a routed packet can pass the
+    /// corresponding validation-and-enqueue boundary.
     seq: u32,
     #[allow(dead_code)]
     reason: AcquireReason,
@@ -883,7 +904,7 @@ impl InboundLedgers {
                         requested_reason = ?reason,
                         acquisition_id = entry_id,
                         entry_reason = ?entry_reason,
-                        entry_seq = entry.seq,
+                        entry_seq = entry.state.seq(),
                         completed = entry.completed_ledger.is_some()
                             || entry.state.completed.load(Ordering::Acquire),
                         failed = true,
@@ -895,21 +916,37 @@ impl InboundLedgers {
                 return None;
             }
             entry.last_touched = Instant::now();
-            let update_seq = (entry.seq == 0 && seq != 0).then_some(seq);
-            if let Some(update_seq) = update_seq {
-                entry.seq = update_seq;
-            }
-            let entry_seq = entry.seq;
+            let state = Arc::clone(&entry.state);
+            let mut entry_seq = state.seq();
+            let requested_seq_update = (entry_seq == 0 && seq != 0).then_some(seq);
             let is_completed = entry.state.completed.load(Ordering::Acquire);
             let completed_ledger = entry.completed_ledger.clone();
-            let state = Arc::clone(&entry.state);
 
             // Do not call into AcquisitionState while holding the registry
             // mutex: worker failure reporting can arrive from acquisition
             // state and then lock this registry.
             drop(inner);
-            if let Some(update_seq) = update_seq {
-                state.update_seq(update_seq);
+            if let Some(requested_seq_update) = requested_seq_update {
+                state.update_seq(requested_seq_update);
+            }
+            // The mutable inbound ledger is authoritative when a duplicate
+            // acquire races a verified header. Publish only its settled value
+            // back to this exact live registry entry; never replace a known
+            // sequence from another acquisition identity.
+            let canonical_seq = state.seq();
+            if canonical_seq != 0 {
+                let mut inner = self.inner.lock().expect("inbound_ledgers sequence update lock");
+                if let Some(entry) = inner.entries.get_mut(&hash)
+                    && entry.id == entry_id
+                    && entry.seq == 0
+                {
+                    entry.seq = canonical_seq;
+                }
+                if let Some(entry) = inner.entries.get(&hash)
+                    && entry.id == entry_id
+                {
+                    entry_seq = state.seq();
+                }
             }
             let result = if is_completed {
                 completed_ledger.or_else(|| state.completed_ledger())
@@ -1110,6 +1147,23 @@ impl InboundLedgers {
                 }
             })
         };
+        let sequence_promoter: AcquisitionSequencePromoter = {
+            let inner = Arc::clone(&self.inner);
+            Arc::new(move |verified_seq| {
+                if verified_seq == 0 {
+                    return;
+                }
+                let mut inner = inner
+                    .lock()
+                    .expect("inbound_ledgers sequence promoter lock");
+                if let Some(entry) = inner.entries.get_mut(&hash)
+                    && entry.id == acquisition_id
+                    && entry.seq == 0
+                {
+                    entry.seq = verified_seq;
+                }
+            })
+        };
         let acq_state = AcquisitionBuilder {
             hash: SHAMapHash::new(hash),
             acquisition_id,
@@ -1121,6 +1175,7 @@ impl InboundLedgers {
             fetch_pack: Arc::clone(&self.fetch_pack),
             store_tx: self.completed_ledgers_tx.clone(),
             failure_recorder,
+            sequence_promoter,
             completion_recorder,
             durable_completion_recorder,
             shared_full_below: Arc::clone(&self.full_below),
@@ -1204,8 +1259,8 @@ impl InboundLedgers {
     /// Route a response while checking the sequence advertised on the wire.
     ///
     /// The ledger hash is the primary acquisition key. When a nonzero
-    /// sequence is available, it is also checked against the acquisition's
-    /// requested sequence so a peer cannot feed a response for another
+    /// sequence is available, it is checked against the acquisition's live
+    /// state-owned sequence so a peer cannot feed a response for another
     /// ledger into an active acquisition.
     pub fn route_response_with_seq(
         &self,
@@ -1234,30 +1289,43 @@ impl InboundLedgers {
                 tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: ignored terminal acquisition");
                 return LedgerDataRouteDisposition::Terminal;
             }
-            if let Some(response_seq) = response_seq
-                && !response_sequence_matches_request(entry.seq, response_seq)
-            {
+            let state = Arc::clone(&entry.state);
+            if entry.id != state.acquisition_id || state.hash.as_uint256() != hash {
+                self.lifecycle.route_misses.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    target: "inbound_ledger",
+                    %hash,
+                    peer_id,
+                    entry_id = entry.id,
+                    state_id = state.acquisition_id,
+                    "route_response: registry/acquisition identity mismatch"
+                );
+                return LedgerDataRouteDisposition::Unmatched;
+            }
+            // Wire receipt does not change rippled InboundLedger::lastAction.
+            // Only construction, duplicate acquire/update, and terminal done
+            // refresh the sweep clock.
+            state
+        };
+
+        match state.enqueue_packet_with_sequence(peer_id, response_seq, packet) {
+            Err(expected_seq) => {
+                let response_seq = response_seq.expect("only a supplied sequence can mismatch");
                 self.lifecycle
                     .route_sequence_mismatch
                     .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     target: "inbound_ledger",
                     %hash,
-                    expected_seq = entry.seq,
+                    expected_seq,
                     response_seq,
                     peer_id,
+                    acquisition_id = state.acquisition_id,
                     "route_response: sequence mismatch"
                 );
-                return LedgerDataRouteDisposition::SequenceMismatch;
+                LedgerDataRouteDisposition::SequenceMismatch
             }
-            // Wire receipt does not change rippled InboundLedger::lastAction.
-            // Only construction, duplicate acquire/update, and terminal done
-            // refresh the sweep clock.
-            Arc::clone(&entry.state)
-        };
-
-        match state.enqueue_packet(peer_id, packet) {
-            PacketEnqueue::Accepted => {
+            Ok(PacketEnqueue::Accepted) => {
                 self.lifecycle
                     .route_accepted
                     .fetch_add(1, Ordering::Relaxed);
@@ -1272,14 +1340,14 @@ impl InboundLedgers {
                 tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: registry hit");
                 LedgerDataRouteDisposition::Accepted
             }
-            PacketEnqueue::Terminal => {
+            Ok(PacketEnqueue::Terminal) => {
                 self.lifecycle
                     .route_terminal
                     .fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: terminal acquisition");
                 LedgerDataRouteDisposition::Terminal
             }
-            PacketEnqueue::Full => {
+            Ok(PacketEnqueue::Full) => {
                 // This packet matched a live acquisition. Do not recategorize
                 // it as stale/fetch-pack material: the caller must apply its
                 // explicit pressure policy instead.
@@ -1320,7 +1388,7 @@ impl InboundLedgers {
                     *hash,
                     entry.id,
                     entry.last_touched,
-                    entry.seq,
+                    entry.state.seq(),
                     entry.reason,
                     idle_for,
                     entry.failed || entry.state.failed.load(Ordering::Acquire),
@@ -1459,7 +1527,7 @@ impl InboundLedgers {
                 .map(|(hash, entry)| {
                     (
                         *hash,
-                        entry.seq,
+                        entry.state.seq(),
                         entry.reason,
                         entry.last_touched.elapsed().as_millis() as u64,
                         entry.completed_ledger.is_some()
@@ -1889,7 +1957,7 @@ impl InboundLedgers {
             // sweep. `acquire(hash, ...)` must still return this ledger,
             // just as rippled finds completed InboundLedger objects.
             entry.completion_acknowledged = true;
-            Some((entry.seq, entry.reason, entry.id))
+            Some((entry.state.seq(), entry.reason, entry.id))
         });
         if let Some((seq, reason, entry_id)) = acknowledged {
             inner.completed_ready.retain(|(ready_hash, ready_id)| {
@@ -1936,8 +2004,8 @@ impl InboundLedgers {
                 .filter(|(_, entry)| {
                     (entry.completed_ledger.is_some() || entry.failed)
                         && !entry.state.has_pending_durability()
-                        && entry.seq > 1
-                        && entry.seq < min_seq
+                        && entry.state.seq() > 1
+                        && entry.state.seq() < min_seq
                 })
                 .map(|(hash, entry)| (*hash, Arc::clone(&entry.state)))
                 .collect::<Vec<_>>()
@@ -1986,8 +2054,9 @@ impl InboundLedgers {
             .entries
             .iter()
             .map(|(hash, entry)| {
-                let key = if entry.seq > 1 {
-                    entry.seq.to_string()
+                let seq = entry.state.seq();
+                let key = if seq > 1 {
+                    seq.to_string()
                 } else {
                     hash.to_string()
                 };
@@ -2024,7 +2093,7 @@ impl InboundLedgers {
                 && !entry.state.failed.load(Ordering::Acquire)
                 && entry.completed_ledger.is_none()
                 && !entry.state.completed.load(Ordering::Acquire)
-                && (*entry_hash == *hash || entry.seq == seq)
+                && (*entry_hash == *hash || entry.state.seq() == seq)
         })
     }
 
@@ -2063,7 +2132,7 @@ impl InboundLedgers {
                     inner
                         .completed_ready
                         .retain(|(ready_hash, ready_id)| *ready_hash != hash || *ready_id != id);
-                    removed.push((hash, entry.seq, entry));
+                    removed.push((hash, entry.state.seq(), entry));
                 }
             }
             removed
@@ -2375,6 +2444,131 @@ mod tests {
         assert_eq!(drained.packet_steps, 2);
         assert_eq!(drained.packet_steps_completed, 2);
         assert_eq!(drained.packet_step_errors, 2);
+        registry.stop();
+    }
+
+    #[test]
+    fn route_uses_promoted_state_sequence_not_stale_entry_snapshot() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let hash = Uint256::from_array([0xC6; 32]);
+        assert!(
+            registry.acquire(hash, 0, AcquireReason::Generic).is_none(),
+            "hash-only acquisition must be active"
+        );
+        let state = {
+            let inner = registry.inner.lock().expect("registry lock");
+            Arc::clone(
+                &inner
+                    .entries
+                    .get(&hash)
+                    .expect("active acquisition entry")
+                    .state,
+            )
+        };
+        state.update_seq(2);
+        assert_eq!(state.seq(), 2, "state CAS publishes the live sequence");
+        {
+            let mut inner = registry.inner.lock().expect("registry lock");
+            inner
+                .entries
+                .get_mut(&hash)
+                .expect("active acquisition entry")
+                .seq = 0;
+        }
+
+        assert_eq!(
+            registry.route_response_with_seq(
+                &hash,
+                77,
+                Some(1),
+                InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new()),
+            ),
+            LedgerDataRouteDisposition::SequenceMismatch,
+            "state-owned sequence rejects a mismatched concurrent wire response"
+        );
+        let lifecycle = registry.lifecycle_snapshot();
+        assert_eq!(lifecycle.route_sequence_mismatch, 1);
+        assert_eq!(lifecycle.route_accepted, 0);
+        registry.stop();
+    }
+
+    #[test]
+    fn route_and_sequence_promotion_are_linearized_before_packet_enqueue() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let registry = Arc::new(registry);
+        let hash = Uint256::from_array([0xC5; 32]);
+        assert!(
+            registry.acquire(hash, 0, AcquireReason::Generic).is_none(),
+            "hash-only acquisition must be active"
+        );
+        let state = {
+            let inner = registry.inner.lock().expect("registry lock");
+            Arc::clone(
+                &inner
+                    .entries
+                    .get(&hash)
+                    .expect("active acquisition entry")
+                    .state,
+            )
+        };
+        let route_pause = Arc::new(SequenceRoutePause::default());
+        let promotion_attempt = Arc::new(SequencePromotionAttempt::default());
+        state.set_sequence_route_pause_for_test(Arc::clone(&route_pause));
+        state.set_sequence_promotion_attempt_for_test(Arc::clone(&promotion_attempt));
+
+        let (route_tx, route_rx) = mpsc::sync_channel(1);
+        let routing_registry = Arc::clone(&registry);
+        let routing_thread = std::thread::spawn(move || {
+            route_tx
+                .send(routing_registry.route_response_with_seq(
+                    &hash,
+                    77,
+                    Some(1),
+                    InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new()),
+                ))
+                .expect("route result receiver");
+        });
+        route_pause.wait_until_entered();
+
+        let (promotion_tx, promotion_rx) = mpsc::sync_channel(1);
+        let promotion_state = Arc::clone(&state);
+        let promotion_thread = std::thread::spawn(move || {
+            promotion_state.update_seq(2);
+            promotion_tx.send(()).expect("promotion completion receiver");
+        });
+        promotion_attempt.wait_until_attempted();
+        assert_eq!(
+            state.seq(),
+            0,
+            "promotion cannot publish while a validated route still owns the enqueue boundary"
+        );
+
+        route_pause.release();
+        assert_eq!(
+            route_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("route completion"),
+            LedgerDataRouteDisposition::Accepted,
+            "an initially unknown sequence accepts the header response before promotion"
+        );
+        promotion_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("promotion completion");
+        routing_thread.join().expect("routing thread");
+        promotion_thread.join().expect("promotion thread");
+        assert_eq!(state.seq(), 2);
+        assert_eq!(
+            registry.route_response_with_seq(
+                &hash,
+                77,
+                Some(1),
+                InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new()),
+            ),
+            LedgerDataRouteDisposition::SequenceMismatch,
+            "a response cannot validate as zero and enqueue after the nonzero promotion"
+        );
         registry.stop();
     }
 

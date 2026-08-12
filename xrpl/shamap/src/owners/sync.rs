@@ -3017,6 +3017,30 @@ impl MissingNodeContinuation {
             .collect()
     }
 
+    /// Transfer candidates created by completed local misses without another
+    /// traversal advance. The actor uses this for deferred-read fallback.
+    pub fn take_unannounced_network(&mut self) -> Vec<(SHAMapNodeId, Uint256)> {
+        std::mem::take(&mut self.unannounced_network)
+    }
+
+    /// Return an outbound-overflow batch to the retained immediate frontier.
+    /// Hash deduplication preserves one continuation per pending node even
+    /// when timeout recovery and bounded serialization meet the same edge.
+    pub fn restore_unannounced_network(
+        &mut self,
+        candidates: impl IntoIterator<Item = (SHAMapNodeId, Uint256)>,
+    ) {
+        for candidate @ (_, hash) in candidates {
+            if !self
+                .unannounced_network
+                .iter()
+                .any(|(_, queued_hash)| *queued_hash == hash)
+            {
+                self.unannounced_network.push(candidate);
+            }
+        }
+    }
+
     pub fn missing_nodes(&self) -> &[(SHAMapNodeId, Uint256)] {
         &self.missing_nodes
     }

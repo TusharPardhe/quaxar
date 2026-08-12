@@ -51,6 +51,37 @@ impl Tracking {
     }
 }
 
+#[derive(Default)]
+struct PeerLedgerStatus {
+    recent_ledgers: VecDeque<Uint256>,
+    closed_ledger_hash: Uint256,
+    previous_ledger_hash: Uint256,
+    min_ledger: u32,
+    max_ledger: u32,
+}
+
+impl PeerLedgerStatus {
+    fn remember(&mut self, hash: Uint256) {
+        // Match rippled PeerImp::addLedger: every valid uint256, including
+        // zero, participates in duplicate detection and the bounded ring.
+        if self.recent_ledgers.iter().any(|known| *known == hash) {
+            return;
+        }
+        if self.recent_ledgers.len() == RECENT_PEER_KNOWLEDGE_CAPACITY {
+            self.recent_ledgers.pop_front();
+        }
+        self.recent_ledgers.push_back(hash);
+    }
+
+    fn normalized_range(min: u32, max: u32) -> (u32, u32) {
+        if min == 0 || max == 0 || max < min {
+            (0, 0)
+        } else {
+            (min, max)
+        }
+    }
+}
+
 pub struct PeerImp {
     id: PeerId,
     remote_address: SocketAddr,
@@ -74,15 +105,11 @@ pub struct PeerImp {
     publisher_list_sequences: Mutex<HashMap<PublicKey, usize>>,
     outbound_state: Mutex<PeerOutboundState>,
     tx_queue: Mutex<HashSet<Uint256>>,
-    known_ledgers: Mutex<VecDeque<(Uint256, u32)>>,
+    ledger_status: Mutex<PeerLedgerStatus>,
     known_tx_sets: Mutex<VecDeque<Uint256>>,
     features: RwLock<HashSet<ProtocolFeature>>,
     protocol_version: RwLock<ProtocolVersion>,
     last_status: Mutex<Option<i32>>,
-    closed_ledger_hash: Mutex<Uint256>,
-    previous_ledger_hash: Mutex<Uint256>,
-    min_ledger: Mutex<u32>,
-    max_ledger: Mutex<u32>,
     tracking: AtomicU8,
     /// When the peer entered its current tracking state. `onTimer` uses this
     /// for the outbound Not Useful deadlines.
@@ -209,15 +236,11 @@ impl PeerImp {
             publisher_list_sequences: Mutex::new(HashMap::new()),
             outbound_state: Mutex::new(PeerOutboundState::default()),
             tx_queue: Mutex::new(HashSet::new()),
-            known_ledgers: Mutex::new(VecDeque::with_capacity(RECENT_PEER_KNOWLEDGE_CAPACITY)),
+            ledger_status: Mutex::new(PeerLedgerStatus::default()),
             known_tx_sets: Mutex::new(VecDeque::with_capacity(RECENT_PEER_KNOWLEDGE_CAPACITY)),
             features: RwLock::new(HashSet::new()),
             protocol_version: RwLock::new(ProtocolVersion::new(2, 2)),
             last_status: Mutex::new(None),
-            closed_ledger_hash: Mutex::new(Uint256::default()),
-            previous_ledger_hash: Mutex::new(Uint256::default()),
-            min_ledger: Mutex::new(0),
-            max_ledger: Mutex::new(0),
             tracking: AtomicU8::new(Tracking::Unknown.as_u8()),
             tracking_since: Mutex::new(Instant::now()),
             lifecycle_timer: Mutex::new(None),
@@ -496,29 +519,47 @@ impl PeerImp {
             .expect("peer protocol version lock") = version;
     }
 
-    pub fn record_ledger(&self, hash: Uint256, sequence: u32) {
-        let mut known_ledgers = self.known_ledgers.lock().expect("peer known ledgers lock");
-        if !known_ledgers
-            .iter()
-            .any(|(known_hash, _)| *known_hash == hash)
-        {
-            if known_ledgers.len() == RECENT_PEER_KNOWLEDGE_CAPACITY {
-                known_ledgers.pop_front();
-            }
-            known_ledgers.push_back((hash, sequence));
-        }
-        *self
-            .closed_ledger_hash
+    pub fn record_ledger(&self, hash: Uint256, _sequence: u32) {
+        // Match rippled `addLedger`: this is recent-hash knowledge only.
+        self.ledger_status
             .lock()
-            .expect("peer closed ledger lock") = hash;
-        let mut min = self.min_ledger.lock().expect("peer min ledger lock");
-        let mut max = self.max_ledger.lock().expect("peer max ledger lock");
-        if *min == 0 || sequence < *min {
-            *min = sequence;
+            .expect("peer ledger status lock")
+            .remember(hash);
+    }
+
+    /// Atomically apply the status fields protected by rippled's
+    /// `recentLock_`: current/prior hashes, recent-hash knowledge, and an
+    /// optionally advertised validated range.
+    pub fn apply_status_change(
+        &self,
+        current: Option<Uint256>,
+        previous: Option<Uint256>,
+        range: Option<(u32, u32)>,
+    ) {
+        let mut status = self.ledger_status.lock().expect("peer ledger status lock");
+        match current {
+            Some(hash) => {
+                status.closed_ledger_hash = hash;
+                status.remember(hash);
+            }
+            None => status.closed_ledger_hash = Uint256::zero(),
         }
-        if sequence > *max {
-            *max = sequence;
+        match previous {
+            Some(hash) => {
+                status.previous_ledger_hash = hash;
+                status.remember(hash);
+            }
+            None => status.previous_ledger_hash = Uint256::zero(),
         }
+        if let Some((min, max)) = range {
+            (status.min_ledger, status.max_ledger) = PeerLedgerStatus::normalized_range(min, max);
+        }
+    }
+
+    pub fn clear_status_ledgers(&self) {
+        let mut status = self.ledger_status.lock().expect("peer ledger status lock");
+        status.closed_ledger_hash = Uint256::zero();
+        status.previous_ledger_hash = Uint256::zero();
     }
 
     pub fn record_tx_set(&self, hash: Uint256) {
@@ -532,10 +573,10 @@ impl PeerImp {
     }
 
     pub fn set_closed_ledger_hash(&self, hash: Uint256) {
-        *self
-            .closed_ledger_hash
+        self.ledger_status
             .lock()
-            .expect("peer closed ledger lock") = hash;
+            .expect("peer ledger status lock")
+            .closed_ledger_hash = hash;
     }
 
     pub fn clear_closed_ledger_hash(&self) {
@@ -543,10 +584,10 @@ impl PeerImp {
     }
 
     pub fn set_previous_ledger_hash(&self, hash: Uint256) {
-        *self
-            .previous_ledger_hash
+        self.ledger_status
             .lock()
-            .expect("peer previous ledger lock") = hash;
+            .expect("peer ledger status lock")
+            .previous_ledger_hash = hash;
     }
 
     pub fn clear_previous_ledger_hash(&self) {
@@ -554,21 +595,16 @@ impl PeerImp {
     }
 
     pub fn previous_ledger_hash(&self) -> Uint256 {
-        *self
-            .previous_ledger_hash
+        self.ledger_status
             .lock()
-            .expect("peer previous ledger lock")
+            .expect("peer ledger status lock")
+            .previous_ledger_hash
     }
 
     pub fn set_ledger_range(&self, min_sequence: u32, max_sequence: u32) {
-        let (min_sequence, max_sequence) =
-            if max_sequence < min_sequence || min_sequence == 0 || max_sequence == 0 {
-                (0, 0)
-            } else {
-                (min_sequence, max_sequence)
-            };
-        *self.min_ledger.lock().expect("peer min ledger lock") = min_sequence;
-        *self.max_ledger.lock().expect("peer max ledger lock") = max_sequence;
+        let mut status = self.ledger_status.lock().expect("peer ledger status lock");
+        (status.min_ledger, status.max_ledger) =
+            PeerLedgerStatus::normalized_range(min_sequence, max_sequence);
     }
 
     pub fn remember_status(&self, incoming_status: Option<i32>) -> Option<i32> {
@@ -686,7 +722,11 @@ impl PeerImp {
     }
 
     pub fn check_tracking(&self, validation_seq: u32) {
-        let server_seq = *self.max_ledger.lock().expect("peer max ledger lock");
+        let server_seq = self
+            .ledger_status
+            .lock()
+            .expect("peer ledger status lock")
+            .max_ledger;
         if server_seq != 0 {
             self.check_tracking_pair(server_seq, validation_seq);
         }
@@ -1052,43 +1092,34 @@ impl Peer for PeerImp {
     }
 
     fn closed_ledger_hash(&self) -> Uint256 {
-        *self
-            .closed_ledger_hash
+        self.ledger_status
             .lock()
-            .expect("peer closed ledger lock")
+            .expect("peer ledger status lock")
+            .closed_ledger_hash
     }
 
     fn previous_ledger_hash(&self) -> Uint256 {
-        *self
-            .previous_ledger_hash
+        self.ledger_status
             .lock()
-            .expect("peer previous ledger lock")
+            .expect("peer ledger status lock")
+            .previous_ledger_hash
     }
 
     fn has_ledger(&self, hash: Uint256, sequence: u32) -> bool {
-        if sequence != 0 {
-            let (min, max) = self.ledger_range();
-            if min != 0
-                && sequence >= min
-                && sequence <= max
-                && self.tracking() == Tracking::Converged
-            {
-                return true;
-            }
+        let status = self.ledger_status.lock().expect("peer ledger status lock");
+        if sequence != 0
+            && sequence >= status.min_ledger
+            && sequence <= status.max_ledger
+            && self.tracking() == Tracking::Converged
+        {
+            return true;
         }
-
-        self.known_ledgers
-            .lock()
-            .expect("peer known ledgers lock")
-            .iter()
-            .any(|(known_hash, _)| *known_hash == hash)
+        status.recent_ledgers.iter().any(|known_hash| *known_hash == hash)
     }
 
     fn ledger_range(&self) -> (u32, u32) {
-        (
-            *self.min_ledger.lock().expect("peer min ledger lock"),
-            *self.max_ledger.lock().expect("peer max ledger lock"),
-        )
+        let status = self.ledger_status.lock().expect("peer ledger status lock");
+        (status.min_ledger, status.max_ledger)
     }
 
     fn has_tx_set(&self, hash: Uint256) -> bool {
@@ -1100,26 +1131,16 @@ impl Peer for PeerImp {
     }
 
     fn cycle_status(&self) {
-        let closed = *self
-            .closed_ledger_hash
-            .lock()
-            .expect("peer closed ledger lock");
-        *self
-            .previous_ledger_hash
-            .lock()
-            .expect("peer previous ledger lock") = closed;
-        *self
-            .closed_ledger_hash
-            .lock()
-            .expect("peer closed ledger lock") = Uint256::zero();
+        let mut status = self.ledger_status.lock().expect("peer ledger status lock");
+        status.previous_ledger_hash = status.closed_ledger_hash;
+        status.closed_ledger_hash = Uint256::zero();
     }
 
     fn has_range(&self, min_sequence: u32, max_sequence: u32) -> bool {
-        let (min, max) = self.ledger_range();
-        min != 0
-            && self.tracking() != Tracking::Diverged
-            && min <= min_sequence
-            && max >= max_sequence
+        let status = self.ledger_status.lock().expect("peer ledger status lock");
+        self.tracking() != Tracking::Diverged
+            && status.min_ledger <= min_sequence
+            && status.max_ledger >= max_sequence
     }
 
     fn compression_enabled(&self) -> bool {
@@ -1350,6 +1371,7 @@ mod tests {
 
         let hash = Uint256::from_u64(55);
         peer.record_ledger(hash, 200);
+        peer.set_ledger_range(200, 200);
         assert!(peer.has_range(200, 200));
 
         peer.check_tracking(400);
@@ -1371,14 +1393,65 @@ mod tests {
             public,
             "recent-cap",
         );
-        for value in 0..129u64 {
+        peer.apply_status_change(Some(Uint256::zero()), None, None);
+        assert!(
+            peer.has_ledger(Uint256::zero(), 0),
+            "an explicit zero status hash is retained in recent ledger knowledge"
+        );
+        for value in 1..=128u64 {
             peer.record_ledger(Uint256::from_u64(value), value as u32 + 1);
             peer.record_tx_set(Uint256::from_u64(value));
         }
-        assert!(!peer.has_ledger(Uint256::from_u64(0), 0));
+        assert!(
+            !peer.has_ledger(Uint256::zero(), 0),
+            "the zero hash is evicted first once the same 128-entry capacity is exceeded"
+        );
         assert!(peer.has_ledger(Uint256::from_u64(128), 0));
         assert!(!peer.has_tx_set(Uint256::from_u64(0)));
         assert!(peer.has_tx_set(Uint256::from_u64(128)));
+    }
+
+    #[test]
+    fn status_change_missing_or_malformed_hashes_clear_without_remembering_zero() {
+        let secret = SecretKey::from_bytes([0x0au8; 32]);
+        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+        let peer = PeerImp::new(
+            10,
+            "127.0.0.1:51236".parse().expect("endpoint"),
+            public,
+            "status-missing-hash",
+        );
+
+        // The status-change decoder maps both absent and non-32-byte hashes to None.
+        peer.apply_status_change(None, None, None);
+
+        assert_eq!(peer.closed_ledger_hash(), Uint256::zero());
+        assert_eq!(peer.previous_ledger_hash(), Uint256::zero());
+        assert!(
+            !peer.has_ledger(Uint256::zero(), 0),
+            "absent or malformed status hashes must not create zero-hash knowledge"
+        );
+    }
+
+    #[test]
+    fn status_change_explicit_zero_hash_is_remembered() {
+        let secret = SecretKey::from_bytes([0x0bu8; 32]);
+        let public = derive_public_key(KeyType::Secp256k1, &secret).expect("public key");
+        let peer = PeerImp::new(
+            11,
+            "127.0.0.1:51237".parse().expect("endpoint"),
+            public,
+            "status-zero-hash",
+        );
+
+        peer.apply_status_change(Some(Uint256::zero()), None, None);
+
+        assert_eq!(peer.closed_ledger_hash(), Uint256::zero());
+        assert_eq!(peer.previous_ledger_hash(), Uint256::zero());
+        assert!(
+            peer.has_ledger(Uint256::zero(), 0),
+            "an explicit zero status hash must create zero-hash knowledge"
+        );
     }
 
     #[test]
@@ -1394,6 +1467,7 @@ mod tests {
 
         let hash = Uint256::from_u64(77);
         peer.record_ledger(hash, 300);
+        peer.set_ledger_range(300, 300);
         peer.check_tracking(300);
 
         assert!(peer.has_ledger(Uint256::zero(), 300));

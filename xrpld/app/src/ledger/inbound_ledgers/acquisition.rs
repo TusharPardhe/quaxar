@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(test)]
 use std::sync::Condvar;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,9 @@ struct LocalProbe {
     /// completion is reduced or terminal teardown explicitly cancels it.
     ticket: ReadTicket,
     kind: LocalProbeKind,
+    /// Deferred broker admission retains the one local-read subscription, but
+    /// the normal peer-recovery path must not treat it as an in-flight probe.
+    suppresses_network: bool,
     reason: InboundLedgerRequestTrigger,
     peer: Option<Arc<dyn Peer>>,
 }
@@ -126,6 +129,79 @@ impl StateScanAfterAdvancePause {
     }
 }
 
+/// Test-only rendezvous inside the sequence gate, after a route has validated
+/// its response and before it can enqueue that packet.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SequenceRoutePause {
+    state: Mutex<SequenceRoutePauseState>,
+    wake: Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SequenceRoutePauseState {
+    entered: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl SequenceRoutePause {
+    pub(crate) fn wait_until_entered(&self) {
+        let state = self.state.lock().expect("sequence route pause lock");
+        let (state, timeout) = self
+            .wake
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !state.entered)
+            .expect("sequence route pause wait");
+        assert!(state.entered, "route did not reach sequence gate pause");
+        assert!(!timeout.timed_out(), "sequence route pause timed out");
+    }
+
+    fn pause_after_validation(&self) {
+        let mut state = self.state.lock().expect("sequence route pause lock");
+        state.entered = true;
+        self.wake.notify_all();
+        while !state.released {
+            state = self.wake.wait(state).expect("sequence route pause wait");
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        let mut state = self.state.lock().expect("sequence route pause lock");
+        state.released = true;
+        self.wake.notify_all();
+    }
+}
+
+/// Test-only proof that a promotion has reached the sequence-gate boundary.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SequencePromotionAttempt {
+    attempted: Mutex<bool>,
+    wake: Condvar,
+}
+
+#[cfg(test)]
+impl SequencePromotionAttempt {
+    pub(crate) fn wait_until_attempted(&self) {
+        let attempted = self.attempted.lock().expect("sequence promotion attempt lock");
+        let (attempted, timeout) = self
+            .wake
+            .wait_timeout_while(attempted, Duration::from_secs(5), |attempted| !*attempted)
+            .expect("sequence promotion attempt wait");
+        assert!(*attempted, "promotion did not reach sequence gate");
+        assert!(!timeout.timed_out(), "sequence promotion attempt timed out");
+    }
+
+    fn mark_attempted(&self) {
+        *self
+            .attempted
+            .lock()
+            .expect("sequence promotion attempt lock") = true;
+        self.wake.notify_all();
+    }
+}
+
 struct WorkerJournal;
 
 impl InboundLedgerJournal for WorkerJournal {
@@ -173,6 +249,10 @@ pub(crate) type AcquisitionPeerProvider =
 /// Mirrors rippled's deferred `InboundLedgers::logFailure` lifecycle while
 /// making the five-minute failure cooldown visible before the next sweep.
 pub(crate) type AcquisitionFailureRecorder = Arc<dyn Fn(Uint256) + Send + Sync + 'static>;
+
+/// Registry-owned callback that promotes the exact live entry from an
+/// initially hash-only request to the verified header sequence.
+pub(crate) type AcquisitionSequencePromoter = Arc<dyn Fn(u32) + Send + Sync + 'static>;
 
 /// Immutable ownership token for an early resolver-visible ledger. It lets
 /// later failure handling revoke only the acquisition that published it.
@@ -757,6 +837,9 @@ struct ActorTreePlan {
     /// Timeout retargeting may use `TMGetObjectByHash` only after the planner's
     /// existing aggressive threshold has been crossed.
     aggressive_by_hash: bool,
+    /// Deferred reads retain their broker ticket while their edges become
+    /// immediately eligible for the normal network request.
+    deferred_network_fallbacks: BTreeSet<SHAMapHash>,
 }
 
 impl ActorTreePlan {
@@ -815,14 +898,6 @@ fn ready_turn_can_requeue(plan: &TreePlan, branch_steps_before: u64) -> bool {
     plan.has_runnable_frontier() && plan.branch_steps() > branch_steps_before
 }
 
-/// A deferred or rejected read admission leaves work waiting on the broker.
-/// Deferred tickets retain a callback-bearing broker subscription; rejected
-/// needs remain in the actor FIFO for a later retry. Neither may manufacture
-/// an immediate successor turn.
-fn needs_reads_turn_can_requeue(plan: &TreePlan, read_admission_blocked: bool) -> bool {
-    !read_admission_blocked && plan.has_runnable_frontier()
-}
-
 const SCAN_OUTCOME_NOT_RUN: u8 = 0;
 const SCAN_OUTCOME_READY: u8 = 1;
 const SCAN_OUTCOME_NEEDS_READS: u8 = 2;
@@ -851,24 +926,47 @@ struct OwnedOutboundRequest {
 
 /// The outbound boundary is deliberately expressed as a sequencing helper:
 /// return the detached TreePlan to its mailbox first, then run the send hook.
-/// Both ordinary and aggressive `NeedsNetwork` branches use this helper.
+/// A terminal restoration reports false, so its caller cannot account or send
+/// a request after cancellation has won. Both ordinary and aggressive
+/// `NeedsNetwork` branches use this helper.
 fn restore_tree_plan_before_peer_send(
     actor_plan: ActorTreePlan,
-    restore_plan: impl FnOnce(ActorTreePlan),
+    restore_plan: impl FnOnce(ActorTreePlan) -> bool,
     send_hook: impl FnOnce(),
-) {
-    restore_plan(actor_plan);
+) -> bool {
+    if !restore_plan(actor_plan) {
+        return false;
+    }
     send_hook();
+    true
 }
 
-fn send_owned_outbound_request(state: &AcquisitionState, outbound: OwnedOutboundRequest) {
-    state
-        .lifecycle
-        .request_messages
-        .fetch_add(1, Ordering::Relaxed);
-    state
-        .peer_set
-        .send_request(&outbound.message, outbound.target.as_ref());
+fn send_owned_outbound_request(state: &AcquisitionState, outbound: OwnedOutboundRequest) -> bool {
+    // Callers hold `outbound_gate` through restored-plan send linearization.
+    state.send_request_while_outbound_gate(&outbound.message, outbound.target.as_ref())
+}
+
+/// Mark only the candidates that will be serialized into this request. The
+/// retained plan owns excess candidates, so put them back on its immediate
+/// frontier rather than making timeout recovery rediscover them.
+fn select_tree_network_candidates(
+    plan: &mut TreePlan,
+    candidates: Vec<(shamap::node_id::SHAMapNodeId, Uint256)>,
+    limit: usize,
+) -> Vec<(shamap::node_id::SHAMapNodeId, Uint256)> {
+    let mut selected = Vec::with_capacity(limit.min(candidates.len()));
+    let mut overflow = Vec::new();
+    for candidate @ (_, hash) in candidates {
+        if selected.len() < limit {
+            if plan.mark_request_candidate(hash) {
+                selected.push(candidate);
+            }
+        } else {
+            overflow.push(candidate);
+        }
+    }
+    plan.restore_network_candidates(overflow);
+    selected
 }
 
 /// The bounded actor mailbox. Its reducer consumes, in order, one timeout,
@@ -932,6 +1030,19 @@ impl AcquisitionMailbox {
             || self.pending_timeouts != 0
             || self.plan.as_ref().is_some_and(|plan| plan.runnable)
             || fetch_pack_ready
+    }
+
+    /// `Some(false)` means this kind already has a deferred broker ticket.
+    /// Keep that one ticket for deduplication, but let later timeout/reply
+    /// triggers take the normal network-recovery path.
+    fn local_probe_network_suppression(&self, kind: LocalProbeKind) -> Option<bool> {
+        if self.completed_local_probes.contains(&kind) {
+            return Some(false);
+        }
+        self.local_probes
+            .values()
+            .find(|probe| probe.kind == kind)
+            .map(|probe| probe.suppresses_network)
     }
 
     /// Wake a retained plan without recursively advancing it. An idle mailbox
@@ -998,12 +1109,22 @@ impl AcquisitionMailbox {
 /// Per-ledger state owned by the registry.
 pub struct AcquisitionState {
     mailbox: Mutex<AcquisitionMailbox>,
+    /// Linearizes response-sequence validation plus packet admission with a
+    /// zero-to-nonzero header sequence promotion. Registry locks are never
+    /// held while taking this gate.
+    sequence_gate: Mutex<()>,
     #[cfg(test)]
     state_scan_after_advance_pause: Mutex<Option<Arc<StateScanAfterAdvancePause>>>,
+    #[cfg(test)]
+    sequence_route_pause: Mutex<Option<Arc<SequenceRoutePause>>>,
+    #[cfg(test)]
+    sequence_promotion_attempt: Mutex<Option<Arc<SequencePromotionAttempt>>>,
     pub mutable: Mutex<AcqMutableState>,
     pub hash: SHAMapHash,
     pub acquisition_id: u64,
-    pub seq: u32,
+    /// Requested sequence, promoted exactly once from zero by a verified
+    /// header. `InboundLedgerLocal` remains the canonical mutable value.
+    seq: AtomicU32,
     pub reason: AcquireReason,
     pub peer_set: overlay::SimplePeerSet,
     peer_provider: AcquisitionPeerProvider,
@@ -1015,6 +1136,10 @@ pub struct AcquisitionState {
     pub node_store: SHAMapStoreNodeStore,
     read_broker: NodeReadBroker,
     persistence: Mutex<PersistenceQueue>,
+    /// Serializes every outbound peer send and its accounting with terminal
+    /// state publication. A request is either sent before terminal wins or is
+    /// suppressed after it; there is no check-then-send gap.
+    outbound_gate: Mutex<()>,
     /// Terminal traversal freezes ingress/request generation while ordered
     /// persistence and its one durability barrier drain.
     draining: AtomicBool,
@@ -1022,6 +1147,7 @@ pub struct AcquisitionState {
     pub shared_tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
     pub store_tx: std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     failure_recorder: AcquisitionFailureRecorder,
+    sequence_promoter: AcquisitionSequencePromoter,
     completion_recorder: AcquisitionCompletionRecorder,
     durable_completion_recorder: AcquisitionDurableCompletionRecorder,
     pub stopped: AtomicBool,
@@ -1112,10 +1238,41 @@ impl AcquisitionState {
         }
     }
 
+    /// Validate a wire sequence and enqueue the packet under the same gate
+    /// used by zero-to-nonzero sequence promotion. A response that validated
+    /// while the sequence was unknown therefore enters before promotion, or
+    /// observes the promoted sequence and is rejected; it cannot validate
+    /// before promotion and enqueue afterward.
+    pub(crate) fn enqueue_packet_with_sequence(
+        self: &Arc<Self>,
+        peer_id: u64,
+        response_seq: Option<u32>,
+        packet: InboundLedgerPacket,
+    ) -> Result<PacketEnqueue, u32> {
+        let _sequence_gate = self.sequence_gate.lock().expect("acquisition sequence gate");
+        let expected_seq = self.seq();
+        if let Some(response_seq) = response_seq
+            && !super::registry::response_sequence_matches_request(expected_seq, response_seq)
+        {
+            return Err(expected_seq);
+        }
+        #[cfg(test)]
+        if let Some(pause) = self
+            .sequence_route_pause
+            .lock()
+            .expect("sequence route pause lock")
+            .clone()
+        {
+            pause.pause_after_validation();
+        }
+        Ok(self.enqueue_packet(peer_id, packet))
+    }
+
     /// Enqueue one immutable packet. Saturation is visible to the caller so
     /// routing can charge/record overload instead of silently losing packet
-    /// ownership.
-    pub(crate) fn enqueue_packet(
+    /// ownership. Callers that receive a wire sequence must use
+    /// `enqueue_packet_with_sequence`.
+    fn enqueue_packet(
         self: &Arc<Self>,
         peer_id: u64,
         packet: InboundLedgerPacket,
@@ -1323,7 +1480,7 @@ impl AcquisitionState {
         let mut mutable = self.lock_mutable("local probe candidate")?;
         let planner = mutable.inbound.planner_state();
         let candidate = if !planner.have_header {
-            Some((LocalProbeKind::Header, *self.hash.as_uint256(), self.seq))
+            Some((LocalProbeKind::Header, *self.hash.as_uint256(), self.seq()))
         } else {
             let ledger = mutable.inbound.ledger_mut()?;
             if !planner.have_state && ledger.state_map_mut().hash().is_zero() {
@@ -1361,16 +1518,8 @@ impl AcquisitionState {
         };
         {
             let mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-            if mailbox.completed_local_probes.contains(&kind)
-                || mailbox
-                    .local_probes
-                    .values()
-                    .any(|probe| probe.kind == kind)
-            {
-                return mailbox
-                    .local_probes
-                    .values()
-                    .any(|probe| probe.kind == kind);
+            if let Some(suppresses_network) = mailbox.local_probe_network_suppression(kind) {
+                return suppresses_network;
             }
         }
         let weak = Arc::downgrade(self);
@@ -1383,9 +1532,7 @@ impl AcquisitionState {
             .read_broker
             .request(key, self.acquisition_id, LOCAL_PROBE_PLAN_ID, sink)
         {
-            ReadAdmission::Accepted(ticket)
-            | ReadAdmission::Deferred(ticket)
-            | ReadAdmission::Attached(ticket) => {
+            ReadAdmission::Accepted(ticket) | ReadAdmission::Attached(ticket) => {
                 self.mailbox
                     .lock()
                     .expect("acquisition mailbox lock")
@@ -1395,13 +1542,41 @@ impl AcquisitionState {
                         LocalProbe {
                             ticket,
                             kind,
+                            suppresses_network: true,
                             reason,
                             peer,
                         },
                     );
                 self.read_broker
                     .submit_ready_to_node_store(&self.node_store);
+                self.lifecycle
+                    .requests_suppressed_local_probe
+                    .fetch_add(1, Ordering::Relaxed);
                 true
+            }
+            ReadAdmission::Deferred(ticket) => {
+                // Preserve the broker subscription, but do not let a capacity
+                // wait suppress the normal request path.
+                self.mailbox
+                    .lock()
+                    .expect("acquisition mailbox lock")
+                    .local_probes
+                    .insert(
+                        ticket.id().get(),
+                        LocalProbe {
+                            ticket,
+                            kind,
+                            suppresses_network: false,
+                            reason,
+                            peer,
+                        },
+                    );
+                self.read_broker
+                    .submit_ready_to_node_store(&self.node_store);
+                self.lifecycle
+                    .local_probe_deferred_network_fallbacks
+                    .fetch_add(1, Ordering::Relaxed);
+                false
             }
             ReadAdmission::Rejected(ReadRejectReason::Stopped) => false,
         }
@@ -1575,7 +1750,7 @@ impl AcquisitionState {
         if self.stats.should_emit_sampled_diagnostic() {
             tracing::debug!(
                 target: "inbound_ledger",
-                seq = self.seq,
+                seq = self.seq(),
                 hash = %self.hash,
                 pending_timeouts,
                 scan_pending,
@@ -1614,30 +1789,75 @@ impl AcquisitionState {
             .take()
     }
 
-    fn restore_tree_plan(&self, plan: ActorTreePlan) {
+    fn try_restore_tree_plan(&self, plan: ActorTreePlan) -> bool {
         let mut pending = Some(plan);
-        let rejected_tickets = {
+        let (restored, rejected_tickets) = {
             let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
             if !self.is_done() && mailbox.plan.is_none() {
                 mailbox.plan = pending.take();
                 self.stats.state_scan_yields.fetch_add(1, Ordering::Relaxed);
-                Vec::new()
+                (true, Vec::new())
             } else {
                 // A terminal transition can race while the actor temporarily
                 // owns its plan. Never drop newly admitted/deferred broker
                 // tickets in that gap; settle them after releasing the
                 // mailbox lock just like ordinary terminal teardown.
-                pending
-                    .take()
-                    .expect("detached tree plan must remain owned until restoration")
-                    .tickets
-                    .into_values()
-                    .collect::<Vec<_>>()
+                (
+                    false,
+                    pending
+                        .take()
+                        .expect("detached tree plan must remain owned until restoration")
+                        .tickets
+                        .into_values()
+                        .collect::<Vec<_>>(),
+                )
             }
         };
         for ticket in rejected_tickets {
             self.read_broker.cancel(ticket);
         }
+        restored
+    }
+
+    fn restore_tree_plan(&self, plan: ActorTreePlan) {
+        let _ = self.try_restore_tree_plan(plan);
+    }
+
+    fn restore_tree_plan_before_peer_send(
+        &self,
+        actor_plan: ActorTreePlan,
+        send_hook: impl FnOnce(),
+    ) -> bool {
+        let _outbound = self.outbound_gate.lock().expect("acquisition outbound gate lock");
+        restore_tree_plan_before_peer_send(
+            actor_plan,
+            |actor_plan| self.try_restore_tree_plan(actor_plan),
+            send_hook,
+        )
+    }
+
+    fn send_request_while_outbound_gate(
+        &self,
+        message: &overlay::ProtocolMessage,
+        target: Option<&Arc<dyn Peer>>,
+    ) -> bool {
+        if self.is_done() || self.draining.load(Ordering::Acquire) {
+            return false;
+        }
+        self.lifecycle
+            .request_messages
+            .fetch_add(1, Ordering::Relaxed);
+        self.peer_set.send_request(message, target);
+        true
+    }
+
+    fn send_request_if_live(
+        &self,
+        message: &overlay::ProtocolMessage,
+        target: Option<&Arc<dyn Peer>>,
+    ) -> bool {
+        let _outbound = self.outbound_gate.lock().expect("acquisition outbound gate lock");
+        self.send_request_while_outbound_gate(message, target)
     }
 
     fn wake_tree_plan(self: &Arc<Self>) {
@@ -1743,7 +1963,7 @@ impl AcquisitionState {
                     mutable.inbound.timeout_count(),
                 )
             })
-            .unwrap_or((self.seq, Default::default(), 0));
+            .unwrap_or((self.seq(), Default::default(), 0));
         let (
             buffered_packets,
             buffered_packets_high_water,
@@ -1909,19 +2129,21 @@ impl AcquisitionState {
             self.mark_failed();
             return;
         }
-        if self.stopped.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.scheduler.cancel(self.scheduler_key);
-        self.persistence
-            .lock()
-            .expect("persistence queue lock")
-            .cancel();
-        let tickets = self
-            .mailbox
-            .lock()
-            .expect("acquisition mailbox lock")
-            .clear_terminal_work();
+        let tickets = {
+            let _outbound = self.outbound_gate.lock().expect("acquisition outbound gate lock");
+            if self.stopped.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            self.scheduler.cancel(self.scheduler_key);
+            self.persistence
+                .lock()
+                .expect("persistence queue lock")
+                .cancel();
+            self.mailbox
+                .lock()
+                .expect("acquisition mailbox lock")
+                .clear_terminal_work()
+        };
         for ticket in tickets {
             self.read_broker.cancel(ticket);
         }
@@ -1954,7 +2176,7 @@ impl AcquisitionState {
                 tracing::error!(
                     target: "inbound_ledger",
                     operation,
-                    seq = self.seq,
+                    seq = self.seq(),
                     hash = %self.hash,
                     "acquisition mutable state was poisoned; failing acquisition"
                 );
@@ -1965,33 +2187,35 @@ impl AcquisitionState {
     }
 
     fn mark_failed(&self) {
-        if self
-            .failure_claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        // InboundLedger::done touches before dispatching AcqDone. Keep the
-        // matching registry entry alive and record its cooldown before any
-        // strand poll or sweep can observe the terminal failure flags.
-        (self.failure_recorder)(*self.hash.as_uint256());
-        self.scheduler.cancel(self.scheduler_key);
-        self.persistence
-            .lock()
-            .expect("persistence queue lock")
-            .cancel();
-        self.failed.store(true, Ordering::Release);
-        self.stopped.store(true, Ordering::Release);
-        // Failure can be raised outside a normal actor turn (for example from
-        // a persistence acknowledgement or a poisoned mutable guard). Settle
-        // all retained tree and local-probe subscriptions here rather than
-        // relying on a later sweep or callback to reclaim broker capacity.
-        let tickets = self
-            .mailbox
-            .lock()
-            .expect("acquisition mailbox lock")
-            .clear_terminal_work();
+        let tickets = {
+            let _outbound = self.outbound_gate.lock().expect("acquisition outbound gate lock");
+            if self
+                .failure_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return;
+            }
+            // InboundLedger::done touches before dispatching AcqDone. Keep the
+            // matching registry entry alive and record its cooldown before any
+            // strand poll or sweep can observe the terminal failure flags.
+            (self.failure_recorder)(*self.hash.as_uint256());
+            self.scheduler.cancel(self.scheduler_key);
+            self.persistence
+                .lock()
+                .expect("persistence queue lock")
+                .cancel();
+            self.failed.store(true, Ordering::Release);
+            self.stopped.store(true, Ordering::Release);
+            // Failure can be raised outside a normal actor turn (for example from
+            // a persistence acknowledgement or a poisoned mutable guard). Settle
+            // all retained tree and local-probe subscriptions here rather than
+            // relying on a later sweep or callback to reclaim broker capacity.
+            self.mailbox
+                .lock()
+                .expect("acquisition mailbox lock")
+                .clear_terminal_work()
+        };
         for ticket in tickets {
             self.read_broker.cancel(ticket);
         }
@@ -2015,11 +2239,85 @@ impl AcquisitionState {
         !mailbox.packets.is_empty()
     }
 
+    pub(crate) fn seq(&self) -> u32 {
+        self.seq.load(Ordering::Acquire)
+    }
+
+    /// Propagate the verified canonical sequence only while this acquisition
+    /// remains hash-only. Header mismatch rejection belongs to
+    /// `InboundLedgerLocal`; this mirror only publishes its settled result.
+    /// The gate also covers registry promotion so routing cannot validate a
+    /// zero sequence and enqueue after this promotion has completed.
+    fn promote_seq(&self, sequence: u32) -> bool {
+        if sequence == 0 {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(attempt) = self
+            .sequence_promotion_attempt
+            .lock()
+            .expect("sequence promotion attempt lock")
+            .clone()
+        {
+            attempt.mark_attempted();
+        }
+        let _sequence_gate = self.sequence_gate.lock().expect("acquisition sequence gate");
+        if self
+            .seq
+            .compare_exchange(0, sequence, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            (self.sequence_promoter)(sequence);
+            return true;
+        }
+        false
+    }
+
+    fn sync_header_sequence(&self, sequence: u32) {
+        if self.promote_seq(sequence) {
+            self.lifecycle
+                .header_sequences_promoted
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                target: "inbound_ledger",
+                hash = %self.hash,
+                acquisition_id = self.acquisition_id,
+                seq = sequence,
+                "promoted verified inbound ledger sequence"
+            );
+        }
+    }
+
     pub(crate) fn update_seq(&self, seq: u32) {
-        let Some(mut mutable) = self.lock_mutable("update sequence") else {
-            return;
+        let canonical_seq = {
+            let Some(mut mutable) = self.lock_mutable("update sequence") else {
+                return;
+            };
+            // Match rippled `InboundLedger::update`: do not replace a known
+            // value, including one learned by a racing header parse.
+            mutable.inbound.update(seq, time::Duration::ZERO);
+            mutable.inbound.seq()
         };
-        mutable.inbound.update(seq, time::Duration::ZERO);
+        self.promote_seq(canonical_seq);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sequence_route_pause_for_test(&self, pause: Arc<SequenceRoutePause>) {
+        *self
+            .sequence_route_pause
+            .lock()
+            .expect("sequence route pause lock") = Some(pause);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sequence_promotion_attempt_for_test(
+        &self,
+        attempt: Arc<SequencePromotionAttempt>,
+    ) {
+        *self
+            .sequence_promotion_attempt
+            .lock()
+            .expect("sequence promotion attempt lock") = Some(attempt);
     }
 
     pub(crate) fn completed_ledger(&self) -> Option<Arc<Ledger>> {
@@ -2050,6 +2348,7 @@ pub struct AcquisitionBuilder {
     pub fetch_pack: Arc<FetchPackCache>,
     pub store_tx: std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     pub failure_recorder: AcquisitionFailureRecorder,
+    pub sequence_promoter: AcquisitionSequencePromoter,
     pub completion_recorder: AcquisitionCompletionRecorder,
     pub durable_completion_recorder: AcquisitionDurableCompletionRecorder,
     pub shared_full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
@@ -2070,8 +2369,13 @@ impl AcquisitionBuilder {
         let stats = Arc::new(AcquisitionStats::new());
         Arc::new(AcquisitionState {
             mailbox: Mutex::new(AcquisitionMailbox::default()),
+            sequence_gate: Mutex::new(()),
             #[cfg(test)]
             state_scan_after_advance_pause: Mutex::new(None),
+            #[cfg(test)]
+            sequence_route_pause: Mutex::new(None),
+            #[cfg(test)]
+            sequence_promotion_attempt: Mutex::new(None),
             mutable: Mutex::new(AcqMutableState {
                 inbound: InboundLedgerLocal::new_with_reason(self.hash, self.seq, reason),
                 store: WorkerStore {
@@ -2084,7 +2388,7 @@ impl AcquisitionBuilder {
             }),
             hash: self.hash,
             acquisition_id: self.acquisition_id,
-            seq: self.seq,
+            seq: AtomicU32::new(self.seq),
             reason: self.reason,
             peer_set: overlay::SimplePeerSet::new(self.initial_peers),
             peer_provider: self.peer_provider,
@@ -2093,11 +2397,13 @@ impl AcquisitionBuilder {
             node_store: self.node_store,
             read_broker: self.read_broker,
             persistence: Mutex::new(PersistenceQueue::default()),
+            outbound_gate: Mutex::new(()),
             draining: AtomicBool::new(false),
             next_plan_id: AtomicU64::new(1),
             shared_tree_cache: self.tree_cache,
             store_tx: self.store_tx,
             failure_recorder: self.failure_recorder,
+            sequence_promoter: self.sequence_promoter,
             completion_recorder: self.completion_recorder,
             durable_completion_recorder: self.durable_completion_recorder,
             stopped: AtomicBool::new(false),
@@ -2136,7 +2442,7 @@ fn run_acquisition_job(state: &Arc<AcquisitionState>, operation: &'static str, j
         tracing::error!(
             target: "inbound_ledger",
             operation,
-            seq = state.seq,
+            seq = state.seq(),
             hash = %state.hash,
             %message,
             "acquisition job panicked; failing acquisition"
@@ -2206,7 +2512,7 @@ fn trigger(
 
     // Planner mutation is isolated from command emission. In particular, peer
     // sends happen only after this guard is dropped.
-    let (messages, plan, terminal) = {
+    let (messages, plan, terminal, canonical_seq) = {
         let Some(mut mutable) = state.lock_mutable("trigger") else {
             return;
         };
@@ -2242,23 +2548,21 @@ fn trigger(
                 read_admission_backlog: VecDeque::new(),
                 runnable: true,
                 aggressive_by_hash: false,
+                deferred_network_fallbacks: BTreeSet::new(),
             });
         (
             setup.messages_to_send,
             plan,
             inbound.is_failed() || inbound.is_complete(),
+            inbound.seq(),
         )
     };
+    state.sync_header_sequence(canonical_seq);
 
     for message in messages {
-        if state.is_done() {
+        if !state.send_request_if_live(&message, peer.as_ref()) {
             return;
         }
-        state
-            .lifecycle
-            .request_messages
-            .fetch_add(1, Ordering::Relaxed);
-        state.peer_set.send_request(&message, peer.as_ref());
     }
     if let Some(plan) = plan
         && state.install_tree_plan(plan)
@@ -2287,12 +2591,23 @@ fn add_peers(state: &AcquisitionState) -> Vec<Arc<dyn Peer>> {
         PEER_COUNT_ADD
     };
     let hash = *state.hash.as_uint256();
+    let mut eligible = 0u64;
     let mut added = Vec::new();
     state.peer_set.add_peers(
         limit,
-        &mut |peer| peer_has_acquisition_target(peer, hash, state.seq),
+        &mut |peer| {
+            let has_target = peer_has_acquisition_target(peer, hash, state.seq());
+            if has_target {
+                eligible += 1;
+            }
+            has_target
+        },
         &mut |peer| added.push(Arc::clone(peer)),
     );
+    state
+        .lifecycle
+        .peer_candidates_eligible
+        .fetch_add(eligible, Ordering::Relaxed);
     state
         .lifecycle
         .peers_added
@@ -2316,16 +2631,17 @@ fn process_init(state: &Arc<AcquisitionState>) {
     if state.is_done() {
         return;
     }
-    let (added, persistence_writes, terminal) = {
+    let (persistence_writes, terminal, canonical_seq) = {
         let Some(mut mutable) = state.lock_mutable("initialization") else {
             return;
         };
         check_local(state, &mut mutable);
         let persistence_writes = mutable.store.take_pending_writes();
         let terminal = mutable.inbound.is_failed() || mutable.inbound.is_complete();
-        let added = (!terminal).then(|| add_peers(state)).unwrap_or_default();
-        (added, persistence_writes, terminal)
+        (persistence_writes, terminal, mutable.inbound.seq())
     };
+    state.sync_header_sequence(canonical_seq);
+    let added = (!terminal).then(|| add_peers(state)).unwrap_or_default();
     state.submit_persistence_writes(persistence_writes);
     if terminal {
         finalize_terminal(state);
@@ -2442,13 +2758,36 @@ fn process_data_job(state: &Arc<AcquisitionState>, budget: &TurnBudget) {
     }
 }
 
+/// Record a first accepted wire header even when that packet also reaches a
+/// terminal inbound state. The pre-packet header observation keeps both the
+/// timestamp and lifecycle counter exactly once per acquisition.
+fn record_first_packet_header_received(
+    stats: &AcquisitionStats,
+    lifecycle: &AcquisitionLifecycleCounters,
+    had_header: bool,
+    have_header_after_processing: bool,
+    terminal_after_processing: bool,
+) {
+    if matches!(
+        (
+            had_header,
+            have_header_after_processing,
+            terminal_after_processing,
+        ),
+        (false, true, _)
+    ) {
+        stats.mark_header_received();
+        lifecycle.reply_headers_received.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn process_one_data_job(state: &Arc<AcquisitionState>) {
     if state.is_done() {
         return;
     }
 
     let Some(work) = state.take_packet_for_turn() else {
-        let (terminal, persistence_writes) = {
+        let (terminal, persistence_writes, canonical_seq) = {
             let Some(mut mutable) = state.lock_mutable("data processing") else {
                 return;
             };
@@ -2463,8 +2802,9 @@ fn process_one_data_job(state: &Arc<AcquisitionState>) {
             state
                 .stats
                 .record_data_drain(data_drain_started.elapsed().as_micros() as u64, 0);
-            (terminal, persistence_writes)
+            (terminal, persistence_writes, mutable.inbound.seq())
         };
+        state.sync_header_sequence(canonical_seq);
         state.submit_persistence_writes(persistence_writes);
         if terminal {
             finalize_terminal(state);
@@ -2484,6 +2824,7 @@ fn process_one_data_job(state: &Arc<AcquisitionState>) {
     let mut had_header = false;
     let terminal;
     let persistence_writes;
+    let canonical_seq;
     {
         let Some(mut mutable) = state.lock_mutable("data processing") else {
             return;
@@ -2536,11 +2877,13 @@ fn process_one_data_job(state: &Arc<AcquisitionState>) {
             }
         }
         terminal = inbound.is_failed() || inbound.is_complete();
+        canonical_seq = inbound.seq();
         persistence_writes = store.take_pending_writes();
     }
 
     // The packet reducer has released `mutable`; physical NodeStore I/O now
     // enters the actor-external FIFO command queue.
+    state.sync_header_sequence(canonical_seq);
     state.submit_persistence_writes(persistence_writes);
 
     let data_drain_us = data_drain_started.elapsed().as_micros() as u64;
@@ -2548,7 +2891,7 @@ fn process_one_data_job(state: &Arc<AcquisitionState>) {
     if state.stats.should_emit_sampled_diagnostic() {
         tracing::debug!(
             target: "inbound_ledger",
-            seq = state.seq,
+            seq = state.seq(),
             hash = %state.hash,
             drain_us = data_drain_us,
             nodes = work.packet.nodes.len(),
@@ -2559,14 +2902,17 @@ fn process_one_data_job(state: &Arc<AcquisitionState>) {
     if !accepted_nodes.is_empty() && !invalid && malformed.is_none() {
         apply_packet_nodes_to_plan(state, packet_type, accepted_nodes);
     }
-    if !had_header && !terminal {
-        let has_header = state
-            .lock_mutable("data header diagnostics")
-            .is_some_and(|mutable| mutable.inbound.planner_state().have_header);
-        if has_header {
-            state.stats.mark_header_received();
-        }
-    }
+    let have_header_after_processing = state
+        .lock_mutable("data header diagnostics")
+        .map(|mutable| mutable.inbound.planner_state().have_header)
+        .unwrap_or(false);
+    record_first_packet_header_received(
+        &state.stats,
+        &state.lifecycle,
+        had_header,
+        have_header_after_processing,
+        terminal,
+    );
     state.lifecycle.packet_steps.fetch_add(1, Ordering::Relaxed);
     if packet_complete {
         state
@@ -2685,7 +3031,7 @@ fn process_persistence_event(state: &Arc<AcquisitionState>) {
         return;
     }
     if let Some(error) = failed {
-        tracing::error!(target: "inbound_ledger", seq = state.seq, hash = %state.hash, %error,
+        tracing::error!(target: "inbound_ledger", seq = state.seq(), hash = %state.hash, %error,
             "acquisition persistence command failed");
         state.mark_failed();
         return;
@@ -2776,6 +3122,14 @@ fn process_local_probe(state: &Arc<AcquisitionState>, probe: LocalProbe, ready: 
         }
     };
     state.submit_persistence_writes(writes);
+    if probe.kind == LocalProbeKind::Header && verified {
+        let canonical_seq = state
+            .lock_mutable("brokered header sequence")
+            .map(|mutable| mutable.inbound.seq())
+            .unwrap_or_default();
+        state.sync_header_sequence(canonical_seq);
+        state.stats.mark_header_received();
+    }
     if invalid_local_root {
         state.mark_failed();
         return;
@@ -2830,39 +3184,59 @@ fn process_one_read_event(state: &Arc<AcquisitionState>) -> bool {
     }
     let hash = SHAMapHash::new(ready.ticket.key().hash);
     actor_plan.tickets.remove(&hash);
-    let outcome = match ready.outcome {
+    let deferred_network_fallback = actor_plan.deferred_network_fallbacks.remove(&hash);
+    let apply = match ready.outcome {
         ReadOutcome::Found(object) => {
-            match shamap::tree_node::SHAMapTreeNode::make_from_prefix(object.data(), hash) {
-                Ok(node) => MissingNodeReadOutcome::Found(node),
+            let node = match shamap::tree_node::SHAMapTreeNode::make_from_prefix(object.data(), hash) {
+                Ok(node) => node,
                 Err(_) => {
                     fail_actor_plan(state, actor_plan);
                     return true;
                 }
+            };
+            if deferred_network_fallback {
+                actor_plan
+                    .plan
+                    .apply_network_node(TreePlanId::new(ready.ticket.plan_id()), hash, node)
+            } else {
+                actor_plan.plan.apply_read_result(
+                    TreePlanId::new(ready.ticket.plan_id()),
+                    hash,
+                    MissingNodeReadOutcome::Found(node),
+                )
             }
         }
-        ReadOutcome::Miss => MissingNodeReadOutcome::Miss,
-        ReadOutcome::Cancelled => MissingNodeReadOutcome::Cancelled,
+        ReadOutcome::Miss if deferred_network_fallback => MissingNodeReadApply::Applied {
+            attached_edges: 0,
+            missing_edges: 0,
+        },
+        ReadOutcome::Miss => actor_plan.plan.apply_read_result(
+            TreePlanId::new(ready.ticket.plan_id()),
+            hash,
+            MissingNodeReadOutcome::Miss,
+        ),
+        ReadOutcome::Cancelled if deferred_network_fallback => MissingNodeReadApply::Applied {
+            attached_edges: 0,
+            missing_edges: 0,
+        },
+        ReadOutcome::Cancelled => actor_plan.plan.apply_read_result(
+            TreePlanId::new(ready.ticket.plan_id()),
+            hash,
+            MissingNodeReadOutcome::Cancelled,
+        ),
         ReadOutcome::Fault(_) => {
             fail_actor_plan(state, actor_plan);
             return true;
         }
     };
-    match actor_plan
-        .plan
-        .apply_read_result(TreePlanId::new(ready.ticket.plan_id()), hash, outcome)
-    {
+    match apply {
         MissingNodeReadApply::HashMismatch => fail_actor_plan(state, actor_plan),
         MissingNodeReadApply::Applied { attached_edges, .. } => {
-            // Only a matching, verified attachment resets the timeout progress
-            // clock. Misses, duplicate admissions, and stale results do not.
             if attached_edges != 0 {
                 if let Some(mut mutable) = state.lock_mutable("verified broker read progress") {
                     mutable.inbound.record_verified_progress();
                 }
             }
-            // A settled ticket can make the retained traversal runnable. Its
-            // unannounced needs remain owned by the continuation rather than
-            // being reconstructed by a fresh actor turn.
             actor_plan.runnable = !actor_plan.read_admission_backlog.is_empty()
                 || actor_plan.plan.has_runnable_frontier();
             state.restore_tree_plan(actor_plan);
@@ -2871,15 +3245,80 @@ fn process_one_read_event(state: &Arc<AcquisitionState>) -> bool {
             actor_plan.runnable = !actor_plan.read_admission_backlog.is_empty();
             state.restore_tree_plan(actor_plan);
         }
-        MissingNodeReadApply::Cancelled => {
-            fail_actor_plan(state, actor_plan);
-        }
+        MissingNodeReadApply::Cancelled => fail_actor_plan(state, actor_plan),
         MissingNodeReadApply::StalePlan | MissingNodeReadApply::UnknownRead => {
+            // A deferred local hit may arrive after the peer already supplied
+            // the same candidate. The retained plan is authoritative; this is
+            // harmless late local data rather than an acquisition failure.
             state.record_stale_event();
             state.restore_tree_plan(actor_plan);
         }
     }
     true
+}
+
+/// Build one bounded normal or aggressive request from a retained verified
+/// network frontier. The caller restores the detached plan before sending.
+fn take_tree_network_request(
+    state: &AcquisitionState,
+    actor_plan: &mut ActorTreePlan,
+    candidates: Vec<(shamap::node_id::SHAMapNodeId, Uint256)>,
+) -> (Option<OwnedOutboundRequest>, bool) {
+    let limit = match actor_plan.reason {
+        InboundLedgerRequestTrigger::Reply | InboundLedgerRequestTrigger::ReplyHighLatency => 128,
+        _ => 12,
+    };
+    let candidates = select_tree_network_candidates(&mut actor_plan.plan, candidates, limit);
+    if candidates.is_empty() {
+        return (None, false);
+    }
+    if actor_plan.reason == InboundLedgerRequestTrigger::Timeout && actor_plan.aggressive_by_hash {
+        let object_type = match actor_plan.plan.kind() {
+            TreeKind::State => InboundLedgerObjectType::StateNode,
+            TreeKind::Transaction => InboundLedgerObjectType::TransactionNode,
+        };
+        let needed = candidates
+            .iter()
+            .map(|(_, hash)| (object_type, *hash))
+            .collect::<Vec<_>>();
+        let outbound = make_inbound_needed_by_hash_request(state.hash, state.seq(), &needed).map(
+            |message| {
+                actor_plan.aggressive_by_hash = false;
+                OwnedOutboundRequest {
+                    message,
+                    target: None,
+                }
+            },
+        );
+        let consumed = outbound.is_some();
+        return (outbound, consumed);
+    }
+
+    let ids = candidates
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let depth = match actor_plan.reason {
+        InboundLedgerRequestTrigger::Reply => 1,
+        InboundLedgerRequestTrigger::ReplyHighLatency => 2,
+        _ => 0,
+    };
+    let itype = match actor_plan.plan.kind() {
+        TreeKind::State => 2,
+        TreeKind::Transaction => 1,
+    };
+    let message = make_get_ledger_with_node_ids(
+        state.hash,
+        state.seq(),
+        itype,
+        &ids,
+        depth,
+        (actor_plan.reason == InboundLedgerRequestTrigger::Timeout).then_some(0),
+    );
+    let target = (actor_plan.reason != InboundLedgerRequestTrigger::Timeout)
+        .then(|| actor_plan.peer.clone())
+        .flatten();
+    (Some(OwnedOutboundRequest { message, target }), false)
 }
 
 /// Admit retained TreePlan reads while there is mailbox completion capacity.
@@ -2890,7 +3329,7 @@ fn process_one_read_event(state: &Arc<AcquisitionState>) -> bool {
 /// FIFO directly and cannot create a zero-branch TreePlan turn.
 fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: ActorTreePlan) {
     let plan_id = actor_plan.plan.id();
-    let mut deferred = false;
+    let mut deferred_fallback_hashes = BTreeSet::new();
     while let Some(need) = actor_plan.read_admission_backlog.pop_front() {
         let key = ReadKey::new(*need.hash().as_uint256(), need.ledger_seq(), 0);
         let weak = Arc::downgrade(state);
@@ -2911,9 +3350,24 @@ fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: 
                 actor_plan.tickets.insert(need.hash(), ticket);
             }
             ReadAdmission::Deferred(ticket) => {
-                // A callback-bearing ticket remains queued until the broker's
-                // sole global physical-read boundary frees capacity.
-                deferred = true;
+                // Keep the callback-bearing ticket, but immediately expose
+                // the same verified network candidate that a local miss would
+                // create. A later local hit attaches through that candidate.
+                match actor_plan.plan.apply_read_result(
+                    plan_id,
+                    need.hash(),
+                    MissingNodeReadOutcome::Miss,
+                ) {
+                    MissingNodeReadApply::Applied { .. } => {}
+                    _ => {
+                        fail_actor_plan(state, actor_plan);
+                        return;
+                    }
+                }
+                deferred_fallback_hashes.insert(need.hash());
+                actor_plan
+                    .deferred_network_fallbacks
+                    .insert(need.hash());
                 state
                     .stats
                     .state_scan_read_admission_deferred
@@ -2933,12 +3387,39 @@ fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: 
             }
         }
     }
-    actor_plan.runnable = actor_plan.read_admission_backlog.is_empty()
-        && needs_reads_turn_can_requeue(&actor_plan.plan, deferred);
-    state.restore_tree_plan(actor_plan);
+    let fallback_candidates = actor_plan
+        .plan
+        .take_network_candidates()
+        .into_iter()
+        .filter(|(_, hash)| deferred_fallback_hashes.contains(&SHAMapHash::new(*hash)))
+        .collect::<Vec<_>>();
+    if fallback_candidates.is_empty() {
+        actor_plan.runnable = actor_plan.read_admission_backlog.is_empty()
+            && actor_plan.plan.has_runnable_frontier();
+        state.restore_tree_plan(actor_plan);
+        state
+            .read_broker
+            .submit_ready_to_node_store(&state.node_store);
+        return;
+    }
+
+    let (outbound, consume_aggressive_by_hash) =
+        take_tree_network_request(state, &mut actor_plan, fallback_candidates);
+    actor_plan.runnable = false;
     state
         .read_broker
         .submit_ready_to_node_store(&state.node_store);
+    if consume_aggressive_by_hash {
+        if let Some(mut mutable) = state.lock_mutable("consume aggressive by-hash request") {
+            mutable.inbound.set_by_hash(false);
+        }
+    }
+    actor_plan.runnable = actor_plan.plan.has_runnable_frontier();
+    state.restore_tree_plan_before_peer_send(actor_plan, || {
+        if let Some(outbound) = outbound {
+            let _ = send_owned_outbound_request(state, outbound);
+        }
+    });
 }
 
 fn process_tree_plan_turn(state: &Arc<AcquisitionState>, budget: &TurnBudget) {
@@ -3118,6 +3599,10 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>, budget: &TurnBudget) {
     match advance {
         TreeAdvance::Invalid => fail_actor_plan(state, actor_plan),
         TreeAdvance::Complete => {
+            state
+                .lifecycle
+                .tree_plans_completed
+                .fetch_add(1, Ordering::Relaxed);
             let kind = actor_plan.plan.kind();
             let terminal = state
                 .lock_mutable("complete tree plan")
@@ -3136,91 +3621,19 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>, budget: &TurnBudget) {
             submit_read_admission_backlog(state, actor_plan);
         }
         TreeAdvance::NeedsNetwork(candidates) => {
-            let limit = match actor_plan.reason {
-                InboundLedgerRequestTrigger::Reply
-                | InboundLedgerRequestTrigger::ReplyHighLatency => 128,
-                _ => 12,
-            };
-            let candidates = candidates
-                .into_iter()
-                .filter(|(_, hash)| actor_plan.plan.mark_request_candidate(*hash))
-                .take(limit)
-                .collect::<Vec<_>>();
-            let mut consume_aggressive_by_hash = false;
-            let outbound = if candidates.is_empty() {
-                None
-            } else if actor_plan.reason == InboundLedgerRequestTrigger::Timeout
-                && actor_plan.aggressive_by_hash
-            {
-                let object_type = match actor_plan.plan.kind() {
-                    TreeKind::State => InboundLedgerObjectType::StateNode,
-                    TreeKind::Transaction => InboundLedgerObjectType::TransactionNode,
-                };
-                let needed = candidates
-                    .iter()
-                    .map(|(_, hash)| (object_type, *hash))
-                    .collect::<Vec<_>>();
-                make_inbound_needed_by_hash_request(state.hash, state.seq, &needed).map(|message| {
-                    // Commit this retained-plan transition before the peer can
-                    // synchronously re-enter any acquisition-facing path.
-                    actor_plan.aggressive_by_hash = false;
-                    consume_aggressive_by_hash = true;
-                    OwnedOutboundRequest {
-                        message,
-                        target: None,
-                    }
-                })
-            } else {
-                let ids = candidates
-                    .iter()
-                    .map(|(id, _)| id.clone())
-                    .collect::<Vec<_>>();
-                let depth = match actor_plan.reason {
-                    InboundLedgerRequestTrigger::Reply => 1,
-                    InboundLedgerRequestTrigger::ReplyHighLatency => 2,
-                    _ => 0,
-                };
-                let itype = match actor_plan.plan.kind() {
-                    TreeKind::State => 2,
-                    TreeKind::Transaction => 1,
-                };
-                let message = make_get_ledger_with_node_ids(
-                    state.hash,
-                    state.seq,
-                    itype,
-                    &ids,
-                    depth,
-                    (actor_plan.reason == InboundLedgerRequestTrigger::Timeout).then_some(0),
-                );
-                // Clone the reply target into the owned command before the
-                // detached plan is returned to the actor mailbox.
-                let target = (actor_plan.reason != InboundLedgerRequestTrigger::Timeout)
-                    .then(|| actor_plan.peer.clone())
-                    .flatten();
-                Some(OwnedOutboundRequest { message, target })
-            };
-
-            actor_plan.runnable = false;
-            restore_tree_plan_before_peer_send(
-                actor_plan,
-                |actor_plan| state.restore_tree_plan(actor_plan),
-                || {
-                    if consume_aggressive_by_hash {
-                        // The mutable planner transition also completes before
-                        // peer send; this scope cannot cross the boundary.
-                        {
-                            if let Some(mut mutable) =
-                                state.lock_mutable("consume aggressive by-hash request")
-                            {
-                                mutable.inbound.set_by_hash(false);
-                            }
-                        }
-                    }
-                    if let Some(outbound) = outbound {
-                        send_owned_outbound_request(state, outbound);
-                    }
-                },
-            );
+            let (outbound, consume_aggressive_by_hash) =
+                take_tree_network_request(state, &mut actor_plan, candidates);
+            if consume_aggressive_by_hash {
+                if let Some(mut mutable) = state.lock_mutable("consume aggressive by-hash request") {
+                    mutable.inbound.set_by_hash(false);
+                }
+            }
+            actor_plan.runnable = actor_plan.plan.has_runnable_frontier();
+            state.restore_tree_plan_before_peer_send(actor_plan, || {
+                if let Some(outbound) = outbound {
+                    let _ = send_owned_outbound_request(state, outbound);
+                }
+            });
         }
         TreeAdvance::Ready => {
             actor_plan.runnable = ready_turn_can_requeue(&actor_plan.plan, branch_steps_before);
@@ -3287,7 +3700,7 @@ fn process_timeout_job(state: &Arc<AcquisitionState>) {
     if state.stats.should_emit_sampled_diagnostic() {
         tracing::debug!(
             target: "inbound_ledger",
-            seq = state.seq,
+            seq = state.seq(),
             hash = %state.hash,
             timeout_dispatches = state.stats.timeout_dispatches.load(Ordering::Relaxed),
             "sampled admitted timeout dispatched from acquisition mailbox"
@@ -3299,6 +3712,7 @@ fn process_timeout_job(state: &Arc<AcquisitionState>) {
     let mut finalize = false;
     let mut failed = false;
     let persistence_writes;
+    let canonical_seq;
     {
         let Some(mut mutable) = state.lock_mutable("timeout") else {
             return;
@@ -3328,8 +3742,10 @@ fn process_timeout_job(state: &Arc<AcquisitionState>) {
             }
         }
         persistence_writes = mutable.store.take_pending_writes();
+        canonical_seq = mutable.inbound.seq();
     }
 
+    state.sync_header_sequence(canonical_seq);
     state.submit_persistence_writes(persistence_writes);
     if failed || finalize {
         finalize_terminal(state);
@@ -3474,12 +3890,18 @@ fn build_resolver_visible_ledger(state: &AcquisitionState) -> Option<Arc<Ledger>
 }
 
 fn finalize_acquisition(state: &Arc<AcquisitionState>) {
-    if state.is_done()
-        || state
-            .draining
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
+    let began_terminal_drain = {
+        let _outbound = state
+            .outbound_gate
+            .lock()
+            .expect("acquisition outbound gate lock");
+        !state.is_done()
+            && state
+                .draining
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    };
+    if !began_terminal_drain {
         return;
     }
     let terminal = state
@@ -3566,7 +3988,16 @@ fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
         return;
     };
 
-    state.completed.store(true, Ordering::Release);
+    {
+        let _outbound = state
+            .outbound_gate
+            .lock()
+            .expect("acquisition outbound gate lock");
+        if state.is_done() {
+            return;
+        }
+        state.completed.store(true, Ordering::Release);
+    }
     (state.durable_completion_recorder)(*state.hash.as_uint256());
     state
         .lifecycle
@@ -3800,10 +4231,6 @@ mod actor_mailbox_tests {
             "a Deferred ticket has not delivered ReadReady"
         );
         assert_eq!(broker.take_ready_dispatches().len(), 1);
-        assert!(
-            !needs_reads_turn_can_requeue(&plan, true),
-            "a Deferred ticket must park retained frontier until ReadReady"
-        );
     }
 
     #[test]
@@ -3874,10 +4301,6 @@ mod actor_mailbox_tests {
             TreeAdvance::Ready
         ));
         assert_eq!(plan.branch_steps(), branch_steps_before);
-        assert!(
-            !needs_reads_turn_can_requeue(&plan, false),
-            "the plan itself remains idle while its actor-owned FIFO waits"
-        );
 
         let mut actor_plan = ActorTreePlan {
             plan,
@@ -3887,6 +4310,7 @@ mod actor_mailbox_tests {
             read_admission_backlog,
             runnable: false,
             aggressive_by_hash: false,
+            deferred_network_fallbacks: BTreeSet::new(),
         };
         actor_plan.retarget(InboundLedgerRequestTrigger::Timeout, None, false);
         assert!(
@@ -4061,6 +4485,7 @@ mod actor_mailbox_tests {
             read_admission_backlog: VecDeque::new(),
             runnable: false,
             aggressive_by_hash: false,
+            deferred_network_fallbacks: BTreeSet::new(),
         };
         assert!(
             apply_verified_peer_nodes_to_plan(&mut actor_plan, [child]),
@@ -4106,6 +4531,7 @@ mod actor_mailbox_tests {
             LocalProbe {
                 ticket,
                 kind: LocalProbeKind::Header,
+                suppresses_network: true,
                 reason: InboundLedgerRequestTrigger::Blind,
                 peer: None,
             },
@@ -4137,6 +4563,61 @@ mod actor_mailbox_tests {
     }
 
     #[test]
+    fn deferred_local_probe_keeps_one_ticket_without_suppressing_later_recovery() {
+        use super::super::read_broker::ReadBrokerConfig;
+
+        let broker = NodeReadBroker::new(ReadBrokerConfig {
+            global_in_flight: 1,
+        })
+        .expect("valid broker config");
+        let sink: ReadReadySink = Arc::new(|_| {});
+        let admitted = match broker.request(
+            ReadKey::new(Uint256::from_array([0xD1; 32]), 77, 0),
+            41,
+            LOCAL_PROBE_PLAN_ID,
+            Arc::clone(&sink),
+        ) {
+            ReadAdmission::Accepted(ticket) => ticket,
+            other => panic!("expected admitted probe ticket, got {other:?}"),
+        };
+        let deferred = match broker.request(
+            ReadKey::new(Uint256::from_array([0xD2; 32]), 77, 0),
+            41,
+            LOCAL_PROBE_PLAN_ID,
+            sink,
+        ) {
+            ReadAdmission::Deferred(ticket) => ticket,
+            other => panic!("expected deferred probe ticket, got {other:?}"),
+        };
+
+        let mut mailbox = AcquisitionMailbox::default();
+        mailbox.local_probes.insert(
+            deferred.id().get(),
+            LocalProbe {
+                ticket: deferred,
+                kind: LocalProbeKind::Header,
+                suppresses_network: false,
+                reason: InboundLedgerRequestTrigger::Timeout,
+                peer: None,
+            },
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                mailbox.local_probe_network_suppression(LocalProbeKind::Header),
+                Some(false),
+                "a repeated trigger must recover through the network while retaining the deferred ticket"
+            );
+        }
+        assert_eq!(
+            mailbox.local_probes.len(),
+            1,
+            "later triggers reuse the existing deferred subscription instead of issuing another local read"
+        );
+        assert!(broker.cancel(deferred));
+        assert!(broker.cancel(admitted));
+    }
+
+    #[test]
     fn complete_wire_packets_remain_fifo_units() {
         let mut mailbox = AcquisitionMailbox::default();
         mailbox.packets.push_back(packet_work(11, 128));
@@ -4148,6 +4629,29 @@ mod actor_mailbox_tests {
         assert_eq!(active.peer_id, 11);
         assert_eq!(mailbox.packets.front().expect("later packet").peer_id, 22);
         assert_eq!(mailbox.packet_bytes, 1);
+    }
+
+    #[test]
+    fn terminal_packet_first_header_receipt_is_recorded_exactly_once() {
+        let stats = AcquisitionStats::new();
+        let lifecycle = AcquisitionLifecycleCounters::default();
+
+        record_first_packet_header_received(&stats, &lifecycle, false, true, true);
+        record_first_packet_header_received(&stats, &lifecycle, true, true, true);
+
+        assert!(
+            stats
+                .first_header_at
+                .lock()
+                .expect("acquisition first_header_at lock")
+                .is_some(),
+            "the terminal packet's first header must set its receipt timestamp"
+        );
+        assert_eq!(
+            lifecycle.reply_headers_received.load(Ordering::Relaxed),
+            1,
+            "a later packet observing the same header must not increment again"
+        );
     }
 
     fn network_waiting_actor_plan(
@@ -4216,6 +4720,7 @@ mod actor_mailbox_tests {
             read_admission_backlog: VecDeque::new(),
             runnable: false,
             aggressive_by_hash,
+            deferred_network_fallbacks: BTreeSet::new(),
         }
     }
 
@@ -4241,6 +4746,7 @@ mod actor_mailbox_tests {
                 actor_plan,
                 move |actor_plan| {
                     restored_mailbox.lock().expect("restore mailbox lock").plan = Some(actor_plan);
+                    true
                 },
                 move || {
                     // This deterministic send hook models a synchronous peer
@@ -4260,6 +4766,140 @@ mod actor_mailbox_tests {
             assert!(
                 send_hook_observed_restored_plan.load(Ordering::Acquire),
                 "{reason:?} send hook must run after plan restoration"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_restore_suppresses_deferred_fallback_send_and_settles_ticket() {
+        use super::super::read_broker::ReadBrokerConfig;
+
+        let broker = NodeReadBroker::new(ReadBrokerConfig::default()).expect("valid broker config");
+        let events = Arc::new(Mutex::new(Vec::<ReadReady>::new()));
+        let sink: ReadReadySink = {
+            let events = Arc::clone(&events);
+            Arc::new(move |ready| events.lock().expect("read events lock").push(ready))
+        };
+        let ticket = match broker.request(
+            ReadKey::new(Uint256::from_array([0xD1; 32]), 77, 0),
+            41,
+            93,
+            sink,
+        ) {
+            ReadAdmission::Accepted(ticket) => ticket,
+            other => panic!("expected accepted ticket, got {other:?}"),
+        };
+        let dispatch = broker
+            .take_ready_dispatches()
+            .into_iter()
+            .next()
+            .expect("admitted read dispatch");
+        let mut actor_plan =
+            network_waiting_actor_plan(93, InboundLedgerRequestTrigger::Reply, false);
+        actor_plan
+            .tickets
+            .insert(SHAMapHash::new(ticket.key().hash), ticket);
+        let sent = Arc::new(AtomicBool::new(false));
+        let sent_hook = Arc::clone(&sent);
+        let cancel_broker = broker.clone();
+
+        assert!(
+            !restore_tree_plan_before_peer_send(
+                actor_plan,
+                move |actor_plan| {
+                    for ticket in actor_plan.tickets.into_values() {
+                        assert!(cancel_broker.cancel(ticket));
+                    }
+                    false
+                },
+                move || sent_hook.store(true, Ordering::Release),
+            ),
+            "terminal restore must report non-live"
+        );
+        assert!(
+            !sent.load(Ordering::Acquire),
+            "a deferred fallback cannot send after cancellation wins"
+        );
+        assert_eq!(events.lock().expect("read events lock").len(), 1);
+        assert_eq!(
+            events.lock().expect("read events lock")[0].outcome,
+            ReadOutcome::Cancelled
+        );
+        assert!(
+            !broker.cancel(ticket),
+            "terminal restoration leaves no retained broker subscription"
+        );
+        dispatch.complete(ReadOutcome::Miss);
+    }
+
+    #[test]
+    fn network_request_overflow_is_requeued_without_marking_or_timeout() {
+        use basics::intrusive_pointer::make_shared_intrusive;
+        use shamap::sync::{SHAMapType, SyncState, SyncTree};
+        use shamap::tree_node::SHAMapTreeNode;
+
+        struct NoResident;
+        impl MissingNodeResidentLookup for NoResident {
+            fn load_resident(
+                &mut self,
+                _hash: SHAMapHash,
+                _ledger_seq: u32,
+            ) -> Option<basics::intrusive_pointer::SharedIntrusive<SHAMapTreeNode>> {
+                None
+            }
+        }
+
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        for branch in 0..16 {
+            root.set_child_hash(
+                branch,
+                SHAMapHash::new(Uint256::from_array([(branch + 1) as u8; 32])),
+            );
+        }
+        root.update_hash();
+        let tree = SyncTree::from_root_with_type(
+            root.clone(),
+            SHAMapType::State,
+            true,
+            77,
+            SyncState::Synching,
+        );
+        let mut first_child = || 0;
+        let mut plan = TreePlan::new(
+            TreePlanId::new(95),
+            TreeKind::State,
+            &tree,
+            root.get_hash(),
+            16,
+            0,
+            &mut first_child,
+        );
+        let mut resident = NoResident;
+        let TreeAdvance::NeedsReads(reads) = plan.advance(256, 16, &mut resident, &mut first_child)
+        else {
+            panic!("expected sixteen brokered reads");
+        };
+        for read in reads {
+            assert!(matches!(
+                plan.apply_read_result(plan.id(), read.hash(), MissingNodeReadOutcome::Miss),
+                MissingNodeReadApply::Applied { .. }
+            ));
+        }
+        let TreeAdvance::NeedsNetwork(candidates) =
+            plan.advance(256, 16, &mut resident, &mut first_child)
+        else {
+            panic!("expected sixteen network candidates");
+        };
+        assert_eq!(candidates.len(), 16);
+
+        let selected = select_tree_network_candidates(&mut plan, candidates, 12);
+        assert_eq!(selected.len(), 12, "outbound serialization remains bounded");
+        let overflow = plan.take_network_candidates();
+        assert_eq!(overflow.len(), 4, "overflow stays on the immediate frontier");
+        for (_, hash) in overflow {
+            assert!(
+                plan.mark_request_candidate(hash),
+                "an overflow candidate was not marked before its later request"
             );
         }
     }
@@ -4328,6 +4968,7 @@ mod actor_mailbox_tests {
             read_admission_backlog: VecDeque::new(),
             runnable: false,
             aggressive_by_hash: false,
+            deferred_network_fallbacks: BTreeSet::new(),
         };
         assert!(!uses_aggressive_by_hash_timeout(4));
         assert!(uses_aggressive_by_hash_timeout(5));

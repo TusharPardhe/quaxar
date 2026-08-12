@@ -1555,6 +1555,9 @@ async fn inbound_status_change_preserves_status_publishes_and_skips_lost_sync() 
     .await
     .expect("wait for published status events");
 
+    assert!(peer.has_ledger(Uint256::from_u64(301), 0));
+    assert!(peer.has_ledger(Uint256::from_u64(300), 0));
+
     let published_events = published.lock().expect("published peer status lock");
     let JsonValue::Object(first) = &published_events[0] else {
         panic!("first peer status event should be an object");
