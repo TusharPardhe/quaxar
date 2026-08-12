@@ -867,7 +867,7 @@ impl InboundLedgerLocal {
     /// independent of ordinary packet receipt, so an old plan cannot make a
     /// newer root look complete.
     pub fn complete_tree_plan(&mut self, kind: TreeKind) -> bool {
-        let Some(ledger) = self.ledger.as_ref() else {
+        let Some(ledger) = self.ledger.as_mut() else {
             self.failed = true;
             return false;
         };
@@ -881,8 +881,14 @@ impl InboundLedgerLocal {
             return false;
         }
         match kind {
-            TreeKind::State => self.planner_state.have_state = true,
-            TreeKind::Transaction => self.planner_state.have_transactions = true,
+            TreeKind::State => {
+                ledger.state_map_mut().clear_synching();
+                self.planner_state.have_state = true;
+            }
+            TreeKind::Transaction => {
+                ledger.tx_map_mut().clear_synching();
+                self.planner_state.have_transactions = true;
+            }
         }
         if self.planner_state.have_header
             && self.planner_state.have_state

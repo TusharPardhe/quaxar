@@ -31,7 +31,7 @@ pub const ACQ_READS_GLOBAL: usize = 512;
 /// its subscriber, but remains within the existing physical in-flight limit.
 /// A request at the retained-subscription bound is returned as non-terminal
 /// `Deferred` with no broker record or sink event, leaving the actor's
-/// retained missing edge available for peer fallback.
+/// retained missing edge available for bounded local-read retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadBrokerLimits {
     pub max_retained_logical_subscriptions: usize,
@@ -141,7 +141,7 @@ pub enum ReadRejectReason {
 /// Result of a submission attempt. `Deferred` can retain a broker ticket
 /// while physical dispatch is occupied. At the retained-subscription bound it
 /// has no broker record and produces no terminal sink event: that admission
-/// signal leaves the caller's missing edge available for peer fallback.
+/// signal leaves the caller's missing edge available for bounded local-read retry.
 /// Cancelling an unretained ticket is harmless and returns `false`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadAdmission {
@@ -924,8 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn request_at_real_512_513_514_boundary_preserves_peer_fallback_without_cancelled_actor_event()
-    {
+    fn request_at_real_512_513_514_boundary_defers_without_actor_completion() {
         let broker = broker(ReadBrokerConfig::default());
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut tickets = Vec::with_capacity(ACQ_READS_GLOBAL);

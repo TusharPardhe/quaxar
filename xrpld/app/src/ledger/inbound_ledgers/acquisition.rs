@@ -993,12 +993,15 @@ struct ActorTreePlan {
     /// Timeout retargeting may use `TMGetObjectByHash` only after the planner's
     /// existing aggressive threshold has been crossed.
     aggressive_by_hash: bool,
-    /// Deferred reads retain their broker ticket while their edges become
-    /// immediately eligible for the normal network request.
-    deferred_network_fallbacks: BTreeSet<SHAMapHash>,
 }
 
 impl ActorTreePlan {
+    /// A local deferred batch is an atomic `getMissingNodes()` boundary: peer
+    /// candidates are considered only after every admitted read settles.
+    fn awaiting_local_read_batch(&self) -> bool {
+        !self.read_admission_backlog.is_empty() || !self.tickets.is_empty()
+    }
+
     fn retarget(
         &mut self,
         reason: InboundLedgerRequestTrigger,
@@ -2843,7 +2846,6 @@ fn trigger(
                 read_admission_backlog: VecDeque::new(),
                 runnable: true,
                 aggressive_by_hash: false,
-                deferred_network_fallbacks: BTreeSet::new(),
             });
         (
             setup.messages_to_send,
@@ -3500,7 +3502,6 @@ fn process_one_read_event(state: &Arc<AcquisitionState>) -> bool {
     }
     let hash = SHAMapHash::new(ready.ticket.key().hash);
     actor_plan.tickets.remove(&hash);
-    let deferred_network_fallback = actor_plan.deferred_network_fallbacks.remove(&hash);
     let apply = match ready.outcome {
         ReadOutcome::Found(object) => {
             let node =
@@ -3511,33 +3512,17 @@ fn process_one_read_event(state: &Arc<AcquisitionState>) -> bool {
                         return true;
                     }
                 };
-            if deferred_network_fallback {
-                actor_plan.plan.apply_network_node(
-                    TreePlanId::new(ready.ticket.plan_id()),
-                    hash,
-                    node,
-                )
-            } else {
-                actor_plan.plan.apply_read_result(
-                    TreePlanId::new(ready.ticket.plan_id()),
-                    hash,
-                    MissingNodeReadOutcome::Found(node),
-                )
-            }
+            actor_plan.plan.apply_read_result(
+                TreePlanId::new(ready.ticket.plan_id()),
+                hash,
+                MissingNodeReadOutcome::Found(node),
+            )
         }
-        ReadOutcome::Miss if deferred_network_fallback => MissingNodeReadApply::Applied {
-            attached_edges: 0,
-            missing_edges: 0,
-        },
         ReadOutcome::Miss => actor_plan.plan.apply_read_result(
             TreePlanId::new(ready.ticket.plan_id()),
             hash,
             MissingNodeReadOutcome::Miss,
         ),
-        ReadOutcome::Cancelled if deferred_network_fallback => MissingNodeReadApply::Applied {
-            attached_edges: 0,
-            missing_edges: 0,
-        },
         ReadOutcome::Cancelled => actor_plan.plan.apply_read_result(
             TreePlanId::new(ready.ticket.plan_id()),
             hash,
@@ -3647,7 +3632,6 @@ fn take_tree_network_request(
 /// FIFO directly and cannot create a zero-branch TreePlan turn.
 fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: ActorTreePlan) {
     let plan_id = actor_plan.plan.id();
-    let mut deferred_fallback_hashes = BTreeSet::new();
     while let Some(need) = actor_plan.read_admission_backlog.pop_front() {
         let store_generation = state.node_store.store_generation();
         let key = ReadKey::new(
@@ -3672,28 +3656,17 @@ fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: 
                     .fetch_add(1, Ordering::Relaxed);
                 actor_plan.tickets.insert(need.hash(), ticket);
             }
-            ReadAdmission::Deferred(ticket) => {
-                // Keep the callback-bearing ticket, but immediately expose
-                // the same verified network candidate that a local miss would
-                // create. A later local hit attaches through that candidate.
-                match actor_plan.plan.apply_read_result(
-                    plan_id,
-                    need.hash(),
-                    MissingNodeReadOutcome::Miss,
-                ) {
-                    MissingNodeReadApply::Applied { .. } => {}
-                    _ => {
-                        fail_actor_plan(state, actor_plan);
-                        return;
-                    }
-                }
-                deferred_fallback_hashes.insert(need.hash());
-                actor_plan.deferred_network_fallbacks.insert(need.hash());
+            ReadAdmission::Deferred(_) => {
+                // Broker pressure is not a NodeStore miss. Rippled waits for
+                // all locally deferred reads before exposing missing nodes, so
+                // retain this edge for timeout-driven retry without creating a
+                // synthetic peer request.
+                actor_plan.read_admission_backlog.push_front(need);
                 state
                     .stats
                     .state_scan_read_admission_deferred
                     .fetch_add(1, Ordering::Relaxed);
-                actor_plan.tickets.insert(need.hash(), ticket);
+                break;
             }
             ReadAdmission::Attached(ticket) => {
                 state
@@ -3708,39 +3681,12 @@ fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: 
             }
         }
     }
-    let fallback_candidates = actor_plan
-        .plan
-        .take_network_candidates()
-        .into_iter()
-        .filter(|(_, hash)| deferred_fallback_hashes.contains(&SHAMapHash::new(*hash)))
-        .collect::<Vec<_>>();
-    if fallback_candidates.is_empty() {
-        actor_plan.runnable =
-            actor_plan.read_admission_backlog.is_empty() && actor_plan.plan.has_runnable_frontier();
-        state.restore_tree_plan(actor_plan);
-        state
-            .read_broker
-            .submit_ready_to_node_store(&state.node_store);
-        return;
-    }
-
-    let (outbound, consume_aggressive_by_hash) =
-        take_tree_network_request(state, &mut actor_plan, fallback_candidates);
-    actor_plan.runnable = false;
+    actor_plan.runnable =
+        !actor_plan.awaiting_local_read_batch() && actor_plan.plan.has_runnable_frontier();
+    state.restore_tree_plan(actor_plan);
     state
         .read_broker
         .submit_ready_to_node_store(&state.node_store);
-    if consume_aggressive_by_hash {
-        if let Some(mut mutable) = state.lock_mutable("consume aggressive by-hash request") {
-            mutable.inbound.set_by_hash(false);
-        }
-    }
-    actor_plan.runnable = actor_plan.plan.has_runnable_frontier();
-    state.restore_tree_plan_before_peer_send(actor_plan, || {
-        if let Some(outbound) = outbound {
-            let _ = send_owned_outbound_request(state, outbound);
-        }
-    });
 }
 
 fn process_tree_plan_turn(state: &Arc<AcquisitionState>, budget: &TurnBudget) {
@@ -3749,6 +3695,11 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>, budget: &TurnBudget) {
     };
     if !actor_plan.read_admission_backlog.is_empty() {
         submit_read_admission_backlog(state, actor_plan);
+        return;
+    }
+    if actor_plan.awaiting_local_read_batch() {
+        actor_plan.runnable = false;
+        state.restore_tree_plan(actor_plan);
         return;
     }
     let retained_reads = actor_plan
@@ -4632,7 +4583,6 @@ mod actor_mailbox_tests {
             read_admission_backlog,
             runnable: false,
             aggressive_by_hash: false,
-            deferred_network_fallbacks: BTreeSet::new(),
         };
         actor_plan.retarget(InboundLedgerRequestTrigger::Timeout, None, false);
         assert!(
@@ -4807,7 +4757,6 @@ mod actor_mailbox_tests {
             read_admission_backlog: VecDeque::new(),
             runnable: false,
             aggressive_by_hash: false,
-            deferred_network_fallbacks: BTreeSet::new(),
         };
         assert!(
             apply_verified_peer_nodes_to_plan(&mut actor_plan, [child]),
@@ -5042,7 +4991,6 @@ mod actor_mailbox_tests {
             read_admission_backlog: VecDeque::new(),
             runnable: false,
             aggressive_by_hash,
-            deferred_network_fallbacks: BTreeSet::new(),
         }
     }
 
@@ -5093,7 +5041,59 @@ mod actor_mailbox_tests {
     }
 
     #[test]
-    fn cancelled_restore_suppresses_deferred_fallback_send_and_settles_ticket() {
+    fn local_read_batch_fence_requires_all_admitted_reads_to_settle() {
+        use super::super::read_broker::ReadBrokerConfig;
+
+        let broker = NodeReadBroker::new(ReadBrokerConfig::default()).expect("valid broker config");
+        let events = Arc::new(Mutex::new(Vec::<ReadReady>::new()));
+        let sink: ReadReadySink = {
+            let events = Arc::clone(&events);
+            Arc::new(move |ready| events.lock().expect("read events lock").push(ready))
+        };
+        let first = match broker.request(
+            ReadKey::new(Uint256::from_array([0xA1; 32]), 77, 0),
+            41,
+            93,
+            Arc::clone(&sink),
+        ) {
+            ReadAdmission::Accepted(ticket) => ticket,
+            other => panic!("expected first accepted ticket, got {other:?}"),
+        };
+        let second = match broker.request(
+            ReadKey::new(Uint256::from_array([0xA2; 32]), 77, 0),
+            41,
+            93,
+            sink,
+        ) {
+            ReadAdmission::Accepted(ticket) => ticket,
+            other => panic!("expected second accepted ticket, got {other:?}"),
+        };
+
+        let mut actor_plan =
+            network_waiting_actor_plan(93, InboundLedgerRequestTrigger::Reply, false);
+        actor_plan
+            .tickets
+            .insert(SHAMapHash::new(first.key().hash), first);
+        actor_plan
+            .tickets
+            .insert(SHAMapHash::new(second.key().hash), second);
+        assert!(actor_plan.awaiting_local_read_batch());
+
+        actor_plan
+            .tickets
+            .remove(&SHAMapHash::new(first.key().hash));
+        assert!(
+            actor_plan.awaiting_local_read_batch(),
+            "one local miss cannot expose peer candidates before its batch completes"
+        );
+        actor_plan
+            .tickets
+            .remove(&SHAMapHash::new(second.key().hash));
+        assert!(!actor_plan.awaiting_local_read_batch());
+    }
+
+    #[test]
+    fn cancelled_restore_suppresses_peer_send_and_settles_ticket() {
         use super::super::read_broker::ReadBrokerConfig;
 
         let broker = NodeReadBroker::new(ReadBrokerConfig::default()).expect("valid broker config");
@@ -5140,7 +5140,7 @@ mod actor_mailbox_tests {
         );
         assert!(
             !sent.load(Ordering::Acquire),
-            "a deferred fallback cannot send after cancellation wins"
+            "a peer request cannot send after cancellation wins"
         );
         assert_eq!(events.lock().expect("read events lock").len(), 1);
         assert_eq!(
@@ -5294,7 +5294,6 @@ mod actor_mailbox_tests {
             read_admission_backlog: VecDeque::new(),
             runnable: false,
             aggressive_by_hash: false,
-            deferred_network_fallbacks: BTreeSet::new(),
         };
         assert!(!uses_aggressive_by_hash_timeout(4));
         assert!(uses_aggressive_by_hash_timeout(5));
