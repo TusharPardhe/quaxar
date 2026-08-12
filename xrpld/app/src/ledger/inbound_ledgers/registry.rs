@@ -1136,6 +1136,7 @@ impl InboundLedgers {
             // Rippled stores before dispatching AcqDone; retaining this entry
             // prevents a delayed strand turn from silently losing that ledger.
             if idle_for > SWEEP_IDLE_TIMEOUT
+                && !entry.state.has_pending_durability()
                 && (!entry.state.completed.load(Ordering::Acquire)
                     && entry.completed_ledger.is_none()
                     || entry.completion_acknowledged)
@@ -1655,6 +1656,7 @@ impl InboundLedgers {
                 .iter()
                 .filter(|(_, entry)| {
                     (entry.completed_ledger.is_some() || entry.failed)
+                        && !entry.state.has_pending_durability()
                         && entry.seq > 1
                         && entry.seq < min_seq
                 })
@@ -1736,6 +1738,7 @@ impl InboundLedgers {
         inner.entries.iter().any(|(entry_hash, entry)| {
             !entry.failed
                 && !entry.state.failed.load(Ordering::Acquire)
+                && entry.completed_ledger.is_none()
                 && !entry.state.completed.load(Ordering::Acquire)
                 && (*entry_hash == *hash || entry.seq == seq)
         })

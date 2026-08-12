@@ -1016,8 +1016,15 @@ pub struct AcquisitionState {
     // must be claimed before its registry touch/cooldown callback, but not
     // published to poll/sweep consumers until that callback has completed.
     failure_claimed: AtomicBool,
-    // Mirrors rippled InboundLedger::done's signaled_ guard: exactly one
-    // caller owns expensive successful-terminal finalization.
+    // Exactly one caller publishes the complete immutable ledger to the
+    // resolver path. This is intentionally distinct from durable completion:
+    // rippled exposes the completed ledger before its downstream AcqDone work.
+    resolver_publication_claimed: AtomicBool,
+    // Set only after the cache-only immutable ledger is visible to the
+    // registry, LedgerHistory, and validation resolver.
+    resolver_published: AtomicBool,
+    // Exactly one caller records terminal durability after the FIFO NodeStore
+    // barrier acknowledges every accepted write.
     finalization_claimed: AtomicBool,
     pub fetch_pack_ready: AtomicBool,
     timer_armed: AtomicBool,
@@ -1915,6 +1922,16 @@ impl AcquisitionState {
             || self.failed.load(Ordering::Acquire)
     }
 
+    /// A resolver-visible ledger may remain in ordered persistence after the
+    /// app has acknowledged its cache handoff. Registry sweep must retain this
+    /// state until the FIFO durability barrier has settled.
+    pub(crate) fn has_pending_durability(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+            && !self.completed.load(Ordering::Acquire)
+            && !self.failed.load(Ordering::Acquire)
+            && !self.stopped.load(Ordering::Acquire)
+    }
+
     /// Refuse to continue an acquisition after an unwind poisoned its mutable
     /// planner state. Dropping the recovered guard first prevents the failure
     /// recorder from re-entering while this mutex remains locked.
@@ -2078,6 +2095,8 @@ impl AcquisitionBuilder {
             completed_ledger: Mutex::new(None),
             failed: AtomicBool::new(false),
             failure_claimed: AtomicBool::new(false),
+            resolver_publication_claimed: AtomicBool::new(false),
+            resolver_published: AtomicBool::new(false),
             finalization_claimed: AtomicBool::new(false),
             fetch_pack_ready: AtomicBool::new(false),
             timer_armed: AtomicBool::new(false),
@@ -3382,29 +3401,29 @@ fn finalize_terminal(state: &Arc<AcquisitionState>) {
     }
 }
 
-fn record_completed_ledger(
+fn record_resolver_visible_ledger(
     acquisition_id: u64,
-    completed: &AtomicBool,
+    resolver_published: &AtomicBool,
     completed_ledger: &Mutex<Option<Arc<Ledger>>>,
     store_tx: &std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     reason: AcquireReason,
     ledger: Arc<Ledger>,
 ) -> bool {
-    // Record first: the registry's polling path is the authoritative
-    // recovery path when the notification receiver is disconnected or late.
-    // Holding this small cache lock closes the completed=true/cache-empty
-    // window for concurrent acquire/poll callers.
+    // Record first: the registry polling path is the authoritative recovery
+    // path when its notification receiver is disconnected or late. Holding
+    // this lock closes the publication=true/cache-empty window for concurrent
+    // acquire/poll callers.
     let mut cached = completed_ledger
         .lock()
         .expect("acquisition completed ledger lock");
-    if completed.swap(true, Ordering::AcqRel) {
+    if resolver_published.swap(true, Ordering::AcqRel) {
         return false;
     }
     *cached = Some(Arc::clone(&ledger));
     drop(cached);
 
-    // This channel only wakes a consumer; failure must not revoke a completed
-    // acquisition or make the ledger unrecoverable through the registry.
+    // This channel only wakes a consumer; registry publication retains the
+    // completed result independently of durable NodeStore acknowledgement.
     let _ = store_tx.try_send(CompletedInboundLedger {
         ledger,
         reason,
@@ -3413,28 +3432,51 @@ fn record_completed_ledger(
     true
 }
 
-fn publish_completed_ledger(
+fn publish_resolver_visible_ledger(
     hash: Uint256,
     acquisition_id: u64,
     completion_recorder: &AcquisitionCompletionRecorder,
-    completed: &AtomicBool,
+    resolver_published: &AtomicBool,
     completed_ledger: &Mutex<Option<Arc<Ledger>>>,
     store_tx: &std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     reason: AcquireReason,
     ledger: Arc<Ledger>,
 ) -> bool {
-    // Match InboundLedger::done(): terminal touch precedes both storing the
-    // completed result and dispatching AcqDone. A concurrent sweep/consumer
-    // must never observe a completed acquisition with its old idle timestamp.
+    // Match InboundLedger::done(): terminal touch, resolver publication, and
+    // AcqDone dispatch occur as soon as the full immutable ledger exists.
+    // NodeStore durability remains a separate, ordered background concern.
     completion_recorder(hash, Arc::clone(&ledger));
-    record_completed_ledger(
+    record_resolver_visible_ledger(
         acquisition_id,
-        completed,
+        resolver_published,
         completed_ledger,
         store_tx,
         reason,
         ledger,
     )
+}
+
+/// Snapshot the completed ledger while the acquisition is frozen, then release
+/// actor ownership before immutable-ledger setup can invoke its node fetcher.
+fn snapshot_completed_ledger(state: &AcquisitionState) -> Option<Ledger> {
+    let mutable = state.lock_mutable("snapshot completed ledger")?;
+    if mutable.inbound.is_failed() || !mutable.inbound.is_complete() {
+        return None;
+    }
+    mutable.inbound.ledger().cloned()
+}
+
+/// Build the cache-only immutable ledger that can safely satisfy validation
+/// resolver lookups before the FIFO persistence barrier reaches `sync_result`.
+fn build_resolver_visible_ledger(state: &AcquisitionState) -> Option<Arc<Ledger>> {
+    let mut ledger = snapshot_completed_ledger(state)?;
+    if !ledger.is_immutable() {
+        ledger.set_immutable(true);
+    }
+    ledger.set_full();
+    let tree_cache = Arc::clone(&state.shared_tree_cache);
+    ledger.set_node_fetcher(Arc::new(move |hash| tree_cache.fetch(hash.as_uint256())));
+    Some(Arc::new(ledger))
 }
 
 fn finalize_acquisition(state: &Arc<AcquisitionState>) {
@@ -3454,22 +3496,56 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
         state.mark_failed();
         return;
     }
-    // All accepted writes were enqueued as commands after their packet guard
-    // released. Appending exactly one barrier makes publication wait for their
-    // acknowledgements in FIFO order.
-    state.request_durability_barrier();
-}
 
-/// Snapshot the completed ledger while the acquisition remains frozen, then
-/// release actor ownership before any immutable-ledger setup can invoke its
-/// node fetcher. Durable completion has already been acknowledged when this
-/// helper is called.
-fn snapshot_durable_completed_ledger(state: &AcquisitionState) -> Option<Ledger> {
-    let mutable = state.lock_mutable("snapshot durable completed ledger")?;
-    if mutable.inbound.is_failed() || !mutable.inbound.is_complete() {
-        return None;
+    if state
+        .resolver_publication_claimed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        state.mark_failed();
+        return;
     }
-    mutable.inbound.ledger().cloned()
+    let Some(ledger) = build_resolver_visible_ledger(state) else {
+        state.mark_failed();
+        return;
+    };
+    let ledger_seq = ledger.header().seq;
+    let ledger_hash = *ledger.header().hash.as_uint256();
+    let target_hash = *state.hash.as_uint256();
+    let state_synching = ledger.state_map().is_synching();
+    let tx_synching = ledger.tx_map().is_synching();
+    if !publish_resolver_visible_ledger(
+        target_hash,
+        state.acquisition_id,
+        &state.completion_recorder,
+        &state.resolver_published,
+        &state.completed_ledger,
+        &state.store_tx,
+        state.reason,
+        ledger,
+    ) {
+        state.mark_failed();
+        return;
+    }
+    tracing::info!(
+        target: "lcl_trace",
+        event = "inbound_resolver_visible",
+        target_hash = %target_hash,
+        ledger_hash = %ledger_hash,
+        target_matches_header = target_hash == ledger_hash,
+        ledger_seq,
+        acquisition_id = state.acquisition_id,
+        reason = ?state.reason,
+        state_synching,
+        tx_synching,
+        "LCL trace: completed inbound ledger published before durable NodeStore sync"
+    );
+
+    // All accepted writes were already enqueued after their packet guards
+    // released. Keep the original FIFO barrier so durability is still tracked
+    // and persistence failures remain terminal; it simply no longer delays
+    // validation-trie and LedgerHistory resolver visibility.
+    state.request_durability_barrier();
 }
 
 fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
@@ -3481,40 +3557,21 @@ fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
     {
         return;
     }
-    let Some(mut ledger) = snapshot_durable_completed_ledger(state) else {
+    if !state.resolver_published.load(Ordering::Acquire) {
+        state.mark_failed();
+        return;
+    }
+    let Some(ledger) = state
+        .completed_ledger
+        .lock()
+        .expect("acquisition completed ledger lock")
+        .clone()
+    else {
         state.mark_failed();
         return;
     };
 
-    // Final immutable-ledger setup is intentionally after the mutable snapshot
-    // has been released. The completed acquisition supplies a cache-only
-    // fetcher: source-reachable NodeStore I/O stays exclusively in the broker
-    // and persistence workers, never in actor-owned finalization.
-    if !ledger.is_immutable() {
-        ledger.set_immutable(true);
-    }
-    ledger.set_full();
-    let tree_cache = Arc::clone(&state.shared_tree_cache);
-    ledger.set_node_fetcher(Arc::new(move |hash| tree_cache.fetch(hash.as_uint256())));
-
-    let ledger = Arc::new(ledger);
-    let ledger_seq = ledger.header().seq;
-    let ledger_hash = *ledger.header().hash.as_uint256();
-    let target_hash = *state.hash.as_uint256();
-    let state_synching = ledger.state_map().is_synching();
-    let tx_synching = ledger.tx_map().is_synching();
-    if !publish_completed_ledger(
-        *state.hash.as_uint256(),
-        state.acquisition_id,
-        &state.completion_recorder,
-        &state.completed,
-        &state.completed_ledger,
-        &state.store_tx,
-        state.reason,
-        ledger,
-    ) {
-        return;
-    }
+    state.completed.store(true, Ordering::Release);
     state
         .lifecycle
         .terminal_completed
@@ -3522,20 +3579,18 @@ fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
     tracing::info!(
         target: "lcl_trace",
         event = "inbound_durable_complete",
-        target_hash = %target_hash,
-        ledger_hash = %ledger_hash,
-        target_matches_header = target_hash == ledger_hash,
-        ledger_seq,
+        target_hash = %state.hash,
+        ledger_hash = %ledger.header().hash,
+        target_matches_header = state.hash == ledger.header().hash,
+        ledger_seq = ledger.header().seq,
         acquisition_id = state.acquisition_id,
         reason = ?state.reason,
-        state_synching,
-        tx_synching,
-        "LCL trace: inbound acquisition completed durable tree finalization"
+        "LCL trace: inbound acquisition durability barrier acknowledged"
     );
     tracing::info!(
         target: "inbound_ledger",
-        seq = ledger_seq,
-        hash = %ledger_hash,
+        seq = ledger.header().seq,
+        hash = %ledger.header().hash,
         acquisition_id = state.acquisition_id,
         reason = ?state.reason,
         "LEDGER ACQUIRED"

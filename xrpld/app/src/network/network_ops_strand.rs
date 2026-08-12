@@ -1817,7 +1817,17 @@ fn persist_completed_inbound_ledger(
     ledger: &Arc<ledger::Ledger>,
     reason: AcquireReason,
 ) -> CompletionPersistence {
-    let normalized = root.ledger_with_node_fetcher(Arc::clone(ledger));
+    // A structurally complete inbound consensus/generic ledger arrives with
+    // its cache-only fetcher already attached. Keep that in-memory resolver
+    // path intact until the independent NodeStore durability barrier finishes;
+    // replacing it here with a NodeStore fetcher would reintroduce the exact
+    // persistence gate this handoff intentionally removes.
+    let normalized = match reason {
+        AcquireReason::Consensus | AcquireReason::Generic if ledger.has_node_fetcher() => {
+            Arc::clone(ledger)
+        }
+        _ => root.ledger_with_node_fetcher(Arc::clone(ledger)),
+    };
     match reason {
         // `InboundLedger::done` calls `storeLedger` for generic and consensus
         // acquisitions. It preserves the header's existing validated state

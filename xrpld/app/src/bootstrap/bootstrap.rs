@@ -2350,6 +2350,13 @@ fn run_start_mode_consensus_loop(
                         // Keep the shared acquisition cache on the same cadence.
                         hk_full_below_cache.sweep();
 
+                        // LedgerMaster sweep — matching rippled's doSweep. This
+                        // expires completed inbound-ledger history and fetch-pack
+                        // cache entries once their normal cache policy permits it.
+                        if let Some(ledger_master_runtime) = root.ledger_master_runtime() {
+                            ledger_master_runtime.ledger_master().sweep();
+                        }
+
                         // TransactionMaster sweep — matching rippled's doSweep which
                         // sweeps the MasterTransaction TaggedCache (65,536 entries, 30min TTL).
                         // Without this, completed transactions accumulate indefinitely.
