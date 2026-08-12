@@ -330,6 +330,37 @@ where
         Ok((ledger.header().seq == ledger_index).then_some(ledger))
     }
 
+    /// Remove one exact ledger identity from both hash and validated-sequence
+    /// indexes. A same-sequence successor must remain cached and complete.
+    pub fn remove_exact(&self, ledger_hash: SHAMapHash, ledger_seq: u32) -> bool {
+        if self
+            .ledgers_by_hash
+            .fetch(&ledger_hash)
+            .is_none_or(|ledger| ledger.header().seq != ledger_seq)
+        {
+            return false;
+        }
+        self.ledgers_by_hash.del(&ledger_hash, false);
+        self.ledgers_by_index
+            .lock()
+            .expect("ledger-history index mutex must not be poisoned")
+            .retain(|index, hash| *index != ledger_seq || *hash != ledger_hash);
+        true
+    }
+
+    /// Remove one exact ledger from both hash and validated-sequence indexes.
+    /// This is intentionally narrower than cache sweeping: it compensates a
+    /// provisional inbound publication that failed its final NodeStore fence.
+    pub fn remove(&self, ledger_hash: SHAMapHash) -> bool {
+        let removed = self.ledgers_by_hash.fetch(&ledger_hash).is_some();
+        self.ledgers_by_hash.del(&ledger_hash, false);
+        self.ledgers_by_index
+            .lock()
+            .expect("ledger-history index mutex must not be poisoned")
+            .retain(|_, hash| *hash != ledger_hash);
+        removed
+    }
+
     pub fn sweep(&self) {
         self.ledgers_by_hash.sweep();
     }

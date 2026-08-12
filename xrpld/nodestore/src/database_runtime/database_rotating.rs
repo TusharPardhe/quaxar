@@ -4,7 +4,7 @@ use crate::database::{
 };
 use crate::{
     AsyncFetchCallback, Backend, FetchReport, FetchType, JournalLevel, NodeObject, NodeObjectType,
-    NodeStoreJournal, Scheduler, Status,
+    NodeStoreJournal, ScheduledWrite, Scheduler, Status,
 };
 use basics::base_uint::Uint256;
 use basics::basic_config::Section;
@@ -540,6 +540,10 @@ impl DatabaseTrait for DatabaseRotatingImp {
 
     fn sync_result(&self) -> Result<(), String> {
         DatabaseRotatingImp::sync_result(self)
+    }
+
+    fn schedule_write(&self, write: ScheduledWrite) {
+        self.database.schedule_write(write);
     }
 
     fn fetch_node_object(

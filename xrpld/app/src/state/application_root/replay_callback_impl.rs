@@ -331,6 +331,9 @@ impl ApplicationRoot {
             let ledger = self.store_consensus_ledger(ledger);
             self.check_accept_hash_seq(*ledger.header().hash.as_uint256(), ledger.header().seq);
         }
+        // A verified replay response can advance its owned task before a
+        // validated/published head changes; request one serialized replan.
+        self.request_publication_advance();
         self.try_advance_publication();
         true
     }

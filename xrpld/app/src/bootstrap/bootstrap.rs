@@ -29,7 +29,7 @@ use protocol::{
 };
 use rusqlite::{OptionalExtension, params};
 use shamap::family::{
-    FullBelowCache, NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
+    NullFullBelowCache, NullMissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher,
 };
 use shamap::item::SHAMapItem;
 use shamap::mutation::MutableTree;
@@ -648,6 +648,21 @@ pub fn build_bootstrap_root(
     }
     .max(1);
     let ledger_history = config_legacy_u32(config, "ledger_history").unwrap_or(0);
+    // Match rippled Config: [network_quorum] is an exact single unsigned
+    // value and is checked against raw legacy [peers_max] (zero/absent = 21),
+    // not the derived directional overlay limits.
+    let network_quorum = config_single_unsigned(config, "network_quorum")?.unwrap_or(1);
+    let raw_peers_max = config_single_unsigned(config, "peers_max")?.unwrap_or(0);
+    let effective_peers_max = if raw_peers_max == 0 {
+        21
+    } else {
+        raw_peers_max
+    };
+    if network_quorum > effective_peers_max {
+        return Err(format!(
+            "[network_quorum] {network_quorum} exceeds configured [peers_max] {effective_peers_max}"
+        ));
+    }
     let path_search_old = config_legacy_u32(config, "path_search_old").unwrap_or(2);
     let path_search = config_legacy_u32(config, "path_search").unwrap_or(2);
     let path_search_fast = config_legacy_u32(config, "path_search_fast").unwrap_or(2);
@@ -663,6 +678,7 @@ pub fn build_bootstrap_root(
         start_ledger: options.start_ledger.clone(),
         import: options.import,
         quorum: options.quorum,
+        network_quorum,
         ..ApplicationRootOptions::default()
     })
     .map_err(|error| error.to_string())?;
@@ -1212,57 +1228,44 @@ fn run_start_mode_consensus_loop(
 
     let lm_rt_for_shared_inbound = runtime.root().ledger_master_runtime();
     let mut worker_handles = Vec::<std::thread::JoinHandle<()>>::new();
-    // Use the app's shared TreeNodeCache (properly sized per node_size profile,
-    // matching rippled's NodeFamily::tnCache_ which uses getValueFor(TreeCacheSize)).
-    // This is the key to bounded memory during acquisition — the cache evicts
-    // old entries via TTL sweep, and acquisitions re-read from NuDB on miss.
-    let node_size_profile = crate::NodeSizeResourceProfile::for_node_size(
-        runtime.root().status_rpc_node_size().as_deref(),
-    );
-    let app_tree_cache: Arc<shamap::tree_node_cache::TreeNodeCache> = runtime
-        .root()
-        .shared_tree_cache_arc()
-        .map(|arc| Arc::clone(arc))
-        .unwrap_or_else(|| {
-            Arc::new(shamap::tree_node_cache::TreeNodeCache::new(
-                "acq-tc",
-                node_size_profile.tree_cache_size,
-                time::Duration::seconds(node_size_profile.tree_cache_age_seconds),
-                basics::tagged_cache::MonotonicClock::default(),
-            ))
-        });
+    // Bootstrap installs the one NodeFamily before this loop. Inbound SHAMap
+    // acquisition must use its exact tree and full-below caches; creating a
+    // fallback cache would split traversal generation/lifecycle ownership.
+    let Some(app_tree_cache) = runtime.root().shared_tree_cache_arc().map(Arc::clone) else {
+        tracing::error!(target: "consensus", "NodeFamily tree cache missing before consensus loop");
+        return;
+    };
+    let Some(node_family_full_below_cache) = runtime.root().node_family_full_below_cache() else {
+        tracing::error!(target: "consensus", "NodeFamily FullBelow cache missing before consensus loop");
+        return;
+    };
 
-    let shared_inbound = lm_rt_for_shared_inbound
+    let shared_inbound = match lm_rt_for_shared_inbound
         .as_ref()
         .and_then(|lm_rt| lm_rt.inbound_ledgers.lock().ok()?.clone())
-        .unwrap_or_else(|| {
-            Arc::new(crate::ledger::inbound_ledgers::InboundLedgers::new(
-                Arc::clone(&app_tree_cache),
-                Arc::new(shamap::family::FullBelowCacheImpl::new(
-                    1,
-                    basics::tagged_cache::MonotonicClock::default(),
-                    basics::hardened_hash::HardenedHashBuilder::default(),
-                    node_size_profile.full_below_target_size,
-                )),
-                Arc::new(ledger::FetchPackCache::new(
-                    256,
-                    time::Duration::seconds(120),
-                    basics::tagged_cache::MonotonicClock::default(),
-                )),
-                shared_completed_tx.clone(),
-                runtime.root().network_ops_state().need_network_ledger_arc(),
-            ))
-        });
+    {
+        Some(inbound) => {
+            if !Arc::ptr_eq(inbound.full_below_cache(), &node_family_full_below_cache) {
+                tracing::error!(target: "consensus", "existing InboundLedgers does not use the NodeFamily FullBelow cache");
+                return;
+            }
+            inbound
+        }
+        None => Arc::new(crate::ledger::inbound_ledgers::InboundLedgers::new(
+            Arc::clone(&app_tree_cache),
+            Arc::clone(&node_family_full_below_cache),
+            Arc::new(ledger::FetchPackCache::new(
+                256,
+                time::Duration::seconds(120),
+                basics::tagged_cache::MonotonicClock::default(),
+            )),
+            shared_completed_tx.clone(),
+            runtime.root().network_ops_state().need_network_ledger_arc(),
+        )),
+    };
 
-    // Attach the shared tree cache and full-below cache on ApplicationRoot
-    // so get_counts can report live treenode_cache_size, treenode_track_size,
-    // and fullbelow_size values.
-    runtime
-        .root()
-        .attach_shared_tree_cache(Arc::clone(&app_tree_cache));
-    runtime
-        .root()
-        .attach_shared_full_below_cache(Arc::clone(shared_inbound.full_below_cache()));
+    // Tree and FullBelow cache ownership was established by NodeFamily before
+    // this loop. Do not attach registry-owned aliases on ApplicationRoot.
 
     if let Some(lm_rt) = lm_rt_for_shared_inbound.as_ref()
         && let Ok(mut guard) = lm_rt.inbound_ledgers.lock()
@@ -1279,6 +1282,14 @@ fn run_start_mode_consensus_loop(
         let ledger_master = lm_rt.ledger_master();
         shared_inbound.set_completed_ledger_store(Arc::new(move |ledger| {
             ledger_master.ledger_history().insert(ledger, false);
+        }));
+        let root = runtime.root().clone();
+        shared_inbound.set_completed_ledger_revoker(Arc::new(move |identity| {
+            root.revoke_provisional_inbound_ledger(identity);
+        }));
+        let root = runtime.root().clone();
+        shared_inbound.set_publication_advance_notifier(Arc::new(move || {
+            root.request_publication_advance();
         }));
     }
 
@@ -1697,7 +1708,12 @@ fn run_start_mode_consensus_loop(
                             Some(message.ledger_seq),
                             packet,
                         );
-                        if !routed {
+                        if routed
+                            == crate::ledger::inbound_ledgers::LedgerDataRouteDisposition::Accepted
+                        {
+                            return;
+                        }
+                        if routed.may_stash_as_stale() {
                             if let Some(packet) = stale_packet {
                                 // Rippled routes valid untracked liAS_NODE
                                 // data through InboundLedgers::gotStaleData
@@ -1707,14 +1723,29 @@ fn run_start_mode_consensus_loop(
                                 router_shared_inbound.note_stale_packet_result(stored);
                                 return;
                             }
-                            // Base and transaction-node responses with no
-                            // active acquisition remain unsolicited.
+                        }
+                        if routed
+                            == crate::ledger::inbound_ledgers::LedgerDataRouteDisposition::MailboxFull
+                        {
+                            // The data matched an active acquisition but its
+                            // bounded ingress is full. Apply explicit peer
+                            // backpressure; never change it into stale cache
+                            // content for a different acquisition.
                             if let Some(peer) = router_overlay.find_peer_by_short_id(peer_id) {
                                 peer.charge(
-                                    (*resource::FEE_USELESS_DATA).clone(),
-                                    "Unsolicited TmLedgerData response".to_owned(),
+                                    (*resource::FEE_HEAVY_BURDEN_PEER).clone(),
+                                    "Inbound ledger acquisition mailbox full".to_owned(),
                                 );
                             }
+                            return;
+                        }
+                        // Base and transaction-node responses with no active
+                        // acquisition remain unsolicited.
+                        if let Some(peer) = router_overlay.find_peer_by_short_id(peer_id) {
+                            peer.charge(
+                                (*resource::FEE_USELESS_DATA).clone(),
+                                "Unsolicited TmLedgerData response".to_owned(),
+                            );
                         }
                     }
                     _ => {}
@@ -1852,7 +1883,15 @@ fn run_start_mode_consensus_loop(
         consensus_rt: Arc::clone(&consensus_rt),
         shared_inbound: Arc::clone(&shared_inbound),
         configured_ledger_history,
-        configured_ledger_fetch_size: node_size_profile.ledger_fetch_size,
+        configured_ledger_fetch_size: crate::NodeSizeResourceProfile::for_node_size(
+            runtime.root().status_rpc_node_size().as_deref(),
+        )
+        .ledger_fetch_size,
+        min_peer_count: if runtime.root().config().start_valid {
+            0
+        } else {
+            runtime.root().config().network_quorum
+        },
         shared_completed_rx: Some(shared_completed_rx),
     });
 
@@ -2090,7 +2129,7 @@ fn run_start_mode_consensus_loop(
                                     // nodes; it still releases the single-flight
                                     // completion path, as in gotFetchPack.
                                     ready_root.signal_fetch_pack_ready();
-                                    ready_inbound.notify_fetch_pack_ready();
+                                    ready_inbound.finish_fetch_pack_pass();
                                     if let Some(master) = ready_master {
                                         master.finish_got_fetch_pack();
                                     }
@@ -2324,8 +2363,6 @@ fn run_start_mode_consensus_loop(
         let hk_stop = Arc::clone(&stop);
         let hk_runtime = Arc::clone(&runtime);
         let hk_shared_inbound = Arc::clone(&shared_inbound);
-        let hk_full_below_cache = Arc::clone(shared_inbound.full_below_cache());
-        let hk_tree_cache = Arc::clone(&app_tree_cache);
         let hk_sweep_interval = configured_sweep_interval_seconds;
         worker_handles.push(
             std::thread::Builder::new()
@@ -2346,9 +2383,20 @@ fn run_start_mode_consensus_loop(
                     // rippled does not sweep inbound ledgers on every overlay tick.
                     if last_cache_sweep.elapsed() >= Duration::from_secs(hk_sweep_interval) {
                         hk_shared_inbound.sweep();
-                        let before_size = hk_tree_cache.size();
-                        hk_tree_cache.sweep();
-                        let after_size = hk_tree_cache.size();
+                        let before_size = root
+                            .shared_tree_cache()
+                            .map(|cache| cache.size())
+                            .unwrap_or(0);
+                        if let Some(node_family) = root.node_family() {
+                            // NodeFamily owns both caches, so its sweep is the
+                            // only lifecycle path for the shared FullBelow
+                            // generation and tree-node entries.
+                            node_family.sweep();
+                        }
+                        let after_size = root
+                            .shared_tree_cache()
+                            .map(|cache| cache.size())
+                            .unwrap_or(0);
                         if before_size != after_size {
                             tracing::info!(target: "app",
                                 before_size, after_size,
@@ -2357,9 +2405,8 @@ fn run_start_mode_consensus_loop(
                             );
                         }
 
-                        // `nodeFamily_.sweep()` also expires FullBelow entries.
-                        // Keep the shared acquisition cache on the same cadence.
-                        hk_full_below_cache.sweep();
+                        // NodeFamily::sweep() above expires the shared
+                        // FullBelow cache used by every inbound acquisition.
 
                         // LedgerMaster sweep — matching rippled's doSweep. This
                         // expires completed inbound-ledger history and fetch-pack
@@ -4045,12 +4092,14 @@ fn attach_bootstrap_node_family(root: &mut ApplicationRoot, node_size: Option<&s
             MonotonicClock::default(),
         ));
         let _ = root.attach_shared_tree_cache(Arc::clone(&tree_cache));
-        let family = crate::NodeFamily::new(SHAMapFamily::new(
+        let family = crate::NodeFamily::new_with_owned_full_below_cache(
             tree_cache,
-            NullFullBelowCache::new(0),
+            1,
+            profile.full_below_target_size,
+            time::Duration::seconds(profile.full_below_expiration_seconds),
             BootstrapNodeStoreFetcher::new(node_store),
             NullMissingNodeReporter,
-        ));
+        );
         let _ = root.attach_node_family(Arc::new(family));
         let _ = root.wire_node_family_reset();
         return;
@@ -4455,10 +4504,12 @@ fn hydrate_loaded_ledger(
     let next_index = ledger.header().seq.saturating_add(1);
     let base_fee = ledger.fees().base.max(10);
     let _ = root.open_ledger().modify(|view| {
-        *view = crate::AppOpenLedgerView::with_parent_hash(
+        *view = crate::AppOpenLedgerView::with_parent_timing(
             next_index,
             base_fee,
             *ledger.header().hash.as_uint256(),
+            ledger.header().close_time,
+            ledger.header().close_time_resolution,
         );
         true
     });
@@ -4855,10 +4906,12 @@ fn seed_startup_ledger_state(
 
     let next_open_index = next.header().seq.saturating_add(1);
     let _ = root.open_ledger().modify(|view| {
-        *view = crate::AppOpenLedgerView::with_parent_hash(
+        *view = crate::AppOpenLedgerView::with_parent_timing(
             next_open_index,
             next.fees().base.max(10),
             *next.header().hash.as_uint256(),
+            next.header().close_time,
+            next.header().close_time_resolution,
         );
         true
     });
@@ -4939,6 +4992,21 @@ fn config_legacy_u32(config: &BasicConfig, section: &str) -> Option<u32> {
 
 fn config_legacy_usize(config: &BasicConfig, section: &str) -> Option<usize> {
     config.legacy(section).ok()?.trim().parse::<usize>().ok()
+}
+
+/// Strict legacy-section parser for Config values where malformed, signed, or
+/// multiple entries must fail bootstrap rather than silently choosing a default.
+fn config_single_unsigned(config: &BasicConfig, section: &str) -> Result<Option<usize>, String> {
+    let values = config.section(section).values();
+    match values {
+        [] => Ok(None),
+        [value] => value.trim().parse::<usize>().map(Some).map_err(|_| {
+            format!("invalid [{section}] configuration: expected one unsigned integer")
+        }),
+        _ => Err(format!(
+            "invalid [{section}] configuration: expected one value"
+        )),
+    }
 }
 
 /// Match rippled Config's `[sweep_interval]`: administrators may override the

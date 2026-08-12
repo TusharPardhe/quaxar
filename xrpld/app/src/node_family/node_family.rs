@@ -11,14 +11,19 @@ use basics::sha_map_hash::SHAMapHash;
 use basics::tagged_cache::{CacheClock, MonotonicClock};
 use ledger::Ledger;
 use shamap::family::{
-    FullBelowCache, MissingNodeReporter, NullFullBelowCache, NullMissingNodeReporter,
-    NullNodeFetcher, SHAMapFamily, SHAMapNodeFetcher,
+    FullBelowCache, FullBelowCacheImpl, MissingNodeReporter, NullFullBelowCache,
+    NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily, SHAMapNodeFetcher,
 };
 use shamap::traversal::TraversalError;
 use shamap::tree_node::SHAMapTreeNode;
 use shamap::tree_node_cache::TreeNodeCache;
 use std::hash::BuildHasher;
 use std::sync::Arc;
+
+/// The concrete full-below cache used by the production `NodeFamily` and all
+/// inbound SHAMap acquisitions. The NodeFamily retains the owner handle; other
+/// runtime users receive only clones of this same `Arc`.
+pub type NodeFamilyFullBelowCache = Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>;
 
 ///
 /// This keeps Rust's shared SHAMap tree cache sizing tied to the same
@@ -95,6 +100,13 @@ impl NodeSizeResourceProfile {
 pub trait NodeFamilyRuntime: Send + Sync {
     fn sweep(&self);
     fn reset(&self);
+
+    /// Returns the production cache owned by this NodeFamily. Test-only and
+    /// legacy family implementations that do not own the concrete cache keep
+    /// the default `None`; bootstrap refuses to create an independent cache.
+    fn owned_full_below_cache(&self) -> Option<NodeFamilyFullBelowCache> {
+        None
+    }
     fn fetch_cached_node(
         &self,
         hash: SHAMapHash,
@@ -119,17 +131,24 @@ pub struct NodeFamily<
     NS = (),
 > {
     family: Arc<SHAMapFamily<C, S, FB, F, MR, NS>>,
+    /// Present only for the production family whose SHAMapFamily receives this
+    /// exact Arc as its full-below cache.
+    owned_full_below_cache: Option<NodeFamilyFullBelowCache>,
 }
 
 impl<C, S, FB, F, MR, NS> NodeFamily<C, S, FB, F, MR, NS> {
     pub fn new(family: SHAMapFamily<C, S, FB, F, MR, NS>) -> Self {
         Self {
             family: Arc::new(family),
+            owned_full_below_cache: None,
         }
     }
 
     pub fn from_arc(family: Arc<SHAMapFamily<C, S, FB, F, MR, NS>>) -> Self {
-        Self { family }
+        Self {
+            family,
+            owned_full_below_cache: None,
+        }
     }
 
     pub fn shared_family(&self) -> Arc<SHAMapFamily<C, S, FB, F, MR, NS>> {
@@ -206,6 +225,37 @@ impl<C, S, FB, F, MR, NS> NodeFamily<C, S, FB, F, MR, NS> {
     }
 }
 
+impl<F, MR> NodeFamily<MonotonicClock, HardenedHashBuilder, NodeFamilyFullBelowCache, F, MR> {
+    /// Construct the production family around its one real FullBelow cache.
+    /// The same Arc is installed in `SHAMapFamily`, retained by `NodeFamily`,
+    /// and later handed to `InboundLedgers` for every acquisition.
+    pub fn new_with_owned_full_below_cache(
+        tree_node_cache: Arc<TreeNodeCache<MonotonicClock, HardenedHashBuilder>>,
+        generation: u32,
+        target_size: usize,
+        expiration: time::Duration,
+        fetcher: F,
+        missing_node_reporter: MR,
+    ) -> Self {
+        let full_below_cache = Arc::new(FullBelowCacheImpl::new_with_expiration(
+            generation,
+            MonotonicClock::default(),
+            HardenedHashBuilder::default(),
+            target_size,
+            expiration,
+        ));
+        Self {
+            family: Arc::new(SHAMapFamily::new(
+                tree_node_cache,
+                Arc::clone(&full_below_cache),
+                fetcher,
+                missing_node_reporter,
+            )),
+            owned_full_below_cache: Some(full_below_cache),
+        }
+    }
+}
+
 impl<C, S, FB, F, MR, NS> NodeFamilyRuntime for NodeFamily<C, S, FB, F, MR, NS>
 where
     C: CacheClock + Send + Sync + 'static,
@@ -221,6 +271,10 @@ where
 
     fn reset(&self) {
         NodeFamily::reset(self);
+    }
+
+    fn owned_full_below_cache(&self) -> Option<NodeFamilyFullBelowCache> {
+        self.owned_full_below_cache.as_ref().map(Arc::clone)
     }
 
     fn fetch_cached_node(

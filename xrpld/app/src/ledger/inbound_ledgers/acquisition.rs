@@ -21,8 +21,8 @@ use ledger::{
 use overlay::{Peer, PeerSet as _};
 use shamap::family::{FullBelowCache, FullBelowCacheImpl, NullMissingNodeReporter, SHAMapFamily};
 use shamap::sync::{
-    MissingNodeReadApply, MissingNodeReadOutcome, MissingNodeResidentLookup, ReadNeed,
-    SHAMapAddNode,
+    DEFAULT_MAX_DEFERRED_MISSING_NODE_READS, MissingNodeReadApply, MissingNodeReadOutcome,
+    MissingNodeResidentLookup, ReadNeed, SHAMapAddNode,
 };
 use shamap::tree_node_cache::TreeNodeCache;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -40,6 +40,7 @@ use super::read_broker::{
     ReadRejectReason, ReadTicket,
 };
 use super::registry::{AcquireReason, AcquisitionLifecycleCounters, CompletedInboundLedger};
+use super::scheduler::{AcquisitionKey, AcquisitionReadyScheduler, ReadyCause};
 use super::worker_pool::WorkerPool;
 
 const PEER_COUNT_START: usize = 5;
@@ -67,15 +68,10 @@ struct LocalProbe {
     peer: Option<Arc<dyn Peer>>,
 }
 
-/// Bounded actor CPU admission. These are intentionally separate from the
-/// broker limits: a plan yields after this many branches even when no I/O is
-/// pending, so a packet flood cannot monopolize a ledger-data worker.
-pub const ACQ_TURN_MAX_BRANCH_STEPS: usize = 256;
-pub const ACQ_TURN_MAX_NEW_READS: usize = 16;
-/// Maximum settled broker completions reduced in one actor turn. This remains
-/// below the per-acquisition logical-read limit so a full mailbox yields after
-/// at most two turns instead of monopolizing a ledger-data worker.
-pub const ACQ_TURN_MAX_READ_EVENTS: usize = 8;
+/// Match rippled `SHAMap::getMissingNodes()`' retained deferred-read pass.
+/// The broker owns the single global physical-read boundary; this is not an
+/// actor-local per-turn or per-acquisition cap.
+const ACQ_DEFERRED_READS_PER_PASS: usize = DEFAULT_MAX_DEFERRED_MISSING_NODE_READS;
 pub const ACQ_MAILBOX_PACKET_CAPACITY: usize = 128;
 pub const ACQ_MAILBOX_BYTE_CAPACITY: usize = 4 * 1024 * 1024;
 
@@ -178,12 +174,26 @@ pub(crate) type AcquisitionPeerProvider =
 /// making the five-minute failure cooldown visible before the next sweep.
 pub(crate) type AcquisitionFailureRecorder = Arc<dyn Fn(Uint256) + Send + Sync + 'static>;
 
+/// Immutable ownership token for an early resolver-visible ledger. It lets
+/// later failure handling revoke only the acquisition that published it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProvisionalLedgerIdentity {
+    pub acquisition_id: u64,
+    pub target_hash: Uint256,
+    pub ledger_hash: Uint256,
+    pub ledger_seq: u32,
+}
+
 /// Registry-owned callback invoked exactly once after a successful terminal
 /// acquisition has made its completed ledger visible. This mirrors
 /// `InboundLedger::done()` calling `touch()` before it dispatches `AcqDone`,
 /// preserving the completed entry for its normal sweep lifetime.
 pub(crate) type AcquisitionCompletionRecorder =
-    Arc<dyn Fn(Uint256, Arc<Ledger>) + Send + Sync + 'static>;
+    Arc<dyn Fn(ProvisionalLedgerIdentity, Arc<Ledger>) -> bool + Send + Sync + 'static>;
+
+/// Registry-owned callback that makes an already resolver-visible entry ready
+/// for the single AcqDone-equivalent consumer only after its NodeStore fence.
+pub(crate) type AcquisitionDurableCompletionRecorder = Arc<dyn Fn(Uint256) + Send + Sync + 'static>;
 
 /// Application-owned `LedgerMaster::storeLedger` equivalent for completed
 /// non-history acquisitions. It must run before the registry-ready handoff,
@@ -318,11 +328,6 @@ impl AcquisitionStats {
         }
     }
 
-    fn record_state_scan_buffered_packets(&self, packets: usize) {
-        self.state_scan_max_buffered_packets
-            .fetch_max(packets as u64, Ordering::Relaxed);
-    }
-
     fn record_data_drain(&self, elapsed_us: u64, packets: usize) {
         self.data_drain_runs.fetch_add(1, Ordering::Relaxed);
         self.data_drain_us.fetch_add(elapsed_us, Ordering::Relaxed);
@@ -347,15 +352,6 @@ impl AcquisitionStats {
             return true;
         }
         false
-    }
-
-    fn record_node_store_fetch(&self, hit: bool) {
-        let counter = if hit {
-            &self.node_store_fetch_hits
-        } else {
-            &self.node_store_fetch_misses
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -425,21 +421,9 @@ pub(crate) struct AcquisitionSnapshot {
     pub tracked_peers: usize,
     pub buffered_packets: usize,
     pub buffered_packets_high_water: usize,
-    pub mailbox_bytes: usize,
-    pub mailbox_bytes_high_water: usize,
-    pub mailbox_events: usize,
-    pub stale_events: u64,
-    pub overload_rejections: u64,
-    pub active_plan_id: Option<u64>,
-    pub active_plan_kind: Option<&'static str>,
-    pub plan_pending_hashes: usize,
-    pub plan_pending_edges: usize,
-    pub broker_queued_keys: usize,
-    pub broker_in_flight_keys: usize,
     pub mailbox_token: &'static str,
     pub scan_continuation_pending: bool,
     pub pending_admitted_timeouts: u32,
-    pub has_active_packet: bool,
 }
 
 /// One idempotent accepted-node persistence command. Commands are collected
@@ -462,14 +446,21 @@ struct PersistenceWrite {
 
 #[derive(Clone)]
 enum PersistenceCommand {
-    Write { id: u64, write: PersistenceWrite },
-    DurabilityBarrier { id: u64 },
+    /// One bounded packet/scan batch owned by the NodeStore write scheduler.
+    /// A single completion settles every accepted key in this batch.
+    WriteBatch {
+        id: u64,
+        writes: Vec<PersistenceWrite>,
+    },
+    DurabilityBarrier {
+        id: u64,
+    },
 }
 
 impl PersistenceCommand {
     fn id(&self) -> u64 {
         match self {
-            Self::Write { id, .. } | Self::DurabilityBarrier { id } => *id,
+            Self::WriteBatch { id, .. } | Self::DurabilityBarrier { id } => *id,
         }
     }
 
@@ -485,16 +476,41 @@ struct PersistenceReady {
     durability_barrier: bool,
 }
 
-/// Every accepted persistence command has one durable terminal disposition.
-/// Duplicate writes are a visible logical settlement, while terminal teardown
-/// settles both queued and executing commands as cancelled before callbacks
-/// are allowed to disappear.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PersistenceSettlement {
-    Written,
-    Duplicate,
-    Failed(Arc<str>),
-    Cancelled,
+/// A scheduled NodeStore callback owns exactly one persistence ticket. If an
+/// executor rejects, drops, or unwinds that callback, `Drop` delivers the
+/// terminal failure that lets the acquisition release its final barrier.
+struct PersistenceCompletionGuard {
+    state: Arc<AcquisitionState>,
+    ready: Option<PersistenceReady>,
+}
+
+impl PersistenceCompletionGuard {
+    fn new(state: Arc<AcquisitionState>, id: u64, durability_barrier: bool) -> Self {
+        Self {
+            state,
+            ready: Some(PersistenceReady {
+                id,
+                result: Err(Arc::from("NodeStore persistence callback dropped")),
+                durability_barrier,
+            }),
+        }
+    }
+
+    fn settle(&mut self, result: Result<(), Arc<str>>) {
+        let Some(mut ready) = self.ready.take() else {
+            return;
+        };
+        ready.result = result;
+        self.state.enqueue_persistence_ready(ready);
+    }
+}
+
+impl Drop for PersistenceCompletionGuard {
+    fn drop(&mut self) {
+        if let Some(ready) = self.ready.take() {
+            self.state.enqueue_persistence_ready(ready);
+        }
+    }
 }
 
 /// Actor-external, per-acquisition FIFO persistence owner. Exactly one command
@@ -506,7 +522,6 @@ struct PersistenceQueue {
     queued: VecDeque<PersistenceCommand>,
     in_flight: Option<PersistenceCommand>,
     accepted: BTreeSet<PersistenceKey>,
-    settled: BTreeMap<u64, PersistenceSettlement>,
     barrier_enqueued: bool,
     barrier_acknowledged: bool,
     failed: Option<Arc<str>>,
@@ -519,7 +534,6 @@ impl Default for PersistenceQueue {
             queued: VecDeque::new(),
             in_flight: None,
             accepted: BTreeSet::new(),
-            settled: BTreeMap::new(),
             barrier_enqueued: false,
             barrier_acknowledged: false,
             failed: None,
@@ -529,19 +543,24 @@ impl Default for PersistenceQueue {
 
 impl PersistenceQueue {
     fn enqueue_writes(&mut self, writes: Vec<PersistenceWrite>) {
+        let mut accepted = Vec::with_capacity(writes.len());
         for write in writes {
-            let id = self.next_id;
-            self.next_id = self
-                .next_id
-                .checked_add(1)
-                .expect("persistence command id overflow");
-            if !self.accepted.insert(write.key) {
-                self.settled.insert(id, PersistenceSettlement::Duplicate);
-                continue;
+            if self.accepted.insert(write.key) {
+                accepted.push(write);
             }
-            self.queued
-                .push_back(PersistenceCommand::Write { id, write });
         }
+        if accepted.is_empty() {
+            return;
+        }
+        let id = self.next_id;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("persistence command id overflow");
+        self.queued.push_back(PersistenceCommand::WriteBatch {
+            id,
+            writes: accepted,
+        });
     }
 
     fn enqueue_barrier(&mut self) {
@@ -579,39 +598,20 @@ impl PersistenceQueue {
         }
         match &ready.result {
             Ok(()) => {
-                self.settled
-                    .insert(command.id(), PersistenceSettlement::Written);
                 if ready.durability_barrier {
                     self.barrier_acknowledged = true;
                 }
             }
-            Err(error) => {
-                self.failed = Some(Arc::clone(error));
-                self.settled.insert(
-                    command.id(),
-                    PersistenceSettlement::Failed(Arc::clone(error)),
-                );
-            }
+            Err(error) => self.failed = Some(Arc::clone(error)),
         }
         true
     }
 
-    /// Settle all still-owned commands during a terminal transition. A late
-    /// worker completion is stale by construction because its in-flight slot
-    /// has already been visibly settled as cancelled.
+    /// Drop all still-owned commands during a terminal transition. A late
+    /// worker completion is stale because its in-flight slot no longer exists.
     fn cancel(&mut self) {
-        if let Some(command) = self.in_flight.take() {
-            self.settled
-                .insert(command.id(), PersistenceSettlement::Cancelled);
-        }
-        for command in self.queued.drain(..) {
-            self.settled
-                .insert(command.id(), PersistenceSettlement::Cancelled);
-        }
-    }
-
-    fn settlement(&self, id: u64) -> Option<&PersistenceSettlement> {
-        self.settled.get(&id)
+        self.in_flight.take();
+        self.queued.clear();
     }
 }
 
@@ -725,13 +725,19 @@ impl AcquisitionWorkToken {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PacketEnqueue {
+    Accepted,
+    Terminal,
+    Full,
+}
+
 /// One packet remains exclusively owned by this acquisition until all of its
 /// 128-node application steps have settled. It is never silently dropped on a
 /// full mailbox; ingress receives an explicit rejection instead.
 struct PacketWork {
     peer_id: u64,
     packet: InboundLedgerPacket,
-    next_node: usize,
     bytes: usize,
 }
 
@@ -872,15 +878,17 @@ fn send_owned_outbound_request(state: &AcquisitionState, outbound: OwnedOutbound
 struct AcquisitionMailbox {
     packets: VecDeque<PacketWork>,
     packet_bytes: usize,
-    /// ReadReady is separately capacity-reserved before broker admission.
-    /// This queue therefore cannot drop an accepted completion.
+    /// Broker completions retain ticket ownership until this actor reduces
+    /// them. The broker's global physical-read boundary bounds I/O; mailbox
+    /// delivery is never rejected after admission.
     events: VecDeque<ReadReady>,
-    read_event_reservations: usize,
     persistence_events: VecDeque<PersistenceReady>,
     local_probes: BTreeMap<u64, LocalProbe>,
     completed_local_probes: BTreeSet<LocalProbeKind>,
     token: AcquisitionWorkToken,
     pending_timeouts: u32,
+    pending_fetch_pack_generation: u64,
+    handled_fetch_pack_generation: u64,
     plan: Option<ActorTreePlan>,
     batch_useful_peer_counts: BTreeMap<u64, i32>,
     buffered_packets_high_water: usize,
@@ -895,12 +903,13 @@ impl Default for AcquisitionMailbox {
             packets: VecDeque::new(),
             packet_bytes: 0,
             events: VecDeque::new(),
-            read_event_reservations: 0,
             persistence_events: VecDeque::new(),
             local_probes: BTreeMap::new(),
             completed_local_probes: BTreeSet::new(),
             token: AcquisitionWorkToken::Idle,
             pending_timeouts: 0,
+            pending_fetch_pack_generation: 0,
+            handled_fetch_pack_generation: 0,
             plan: None,
             batch_useful_peer_counts: BTreeMap::new(),
             buffered_packets_high_water: 0,
@@ -957,11 +966,10 @@ impl AcquisitionMailbox {
         }
     }
 
-    /// Pop one settled completion and release exactly its pre-reserved slot.
+    /// Pop one settled completion. The broker owns admission; this actor only
+    /// preserves FIFO reduction and ticket/plan identity checks.
     fn take_read_event(&mut self) -> Option<ReadReady> {
-        let event = self.events.pop_front()?;
-        self.read_event_reservations = self.read_event_reservations.saturating_sub(1);
-        Some(event)
+        self.events.pop_front()
     }
 
     fn clear_terminal_work(&mut self) -> Vec<ReadTicket> {
@@ -977,7 +985,6 @@ impl AcquisitionMailbox {
         self.packets.clear();
         self.packet_bytes = 0;
         self.events.clear();
-        self.read_event_reservations = 0;
         self.persistence_events.clear();
         self.local_probes.clear();
         self.completed_local_probes.clear();
@@ -1001,7 +1008,10 @@ pub struct AcquisitionState {
     pub peer_set: overlay::SimplePeerSet,
     peer_provider: AcquisitionPeerProvider,
     stats: Arc<AcquisitionStats>,
-    pub worker_full_below: FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>,
+    /// The NodeFamily-owned cache shared by every inbound traversal. This is
+    /// the same cache swept by the application and lets a complete backed
+    /// subtree discovered by one acquisition suppress work in another.
+    pub shared_full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
     pub node_store: SHAMapStoreNodeStore,
     read_broker: NodeReadBroker,
     persistence: Mutex<PersistenceQueue>,
@@ -1013,7 +1023,7 @@ pub struct AcquisitionState {
     pub store_tx: std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     failure_recorder: AcquisitionFailureRecorder,
     completion_recorder: AcquisitionCompletionRecorder,
-    completed_ledger_store: Option<AcquisitionLedgerStore>,
+    durable_completion_recorder: AcquisitionDurableCompletionRecorder,
     pub stopped: AtomicBool,
     pub completed: AtomicBool,
     completed_ledger: Mutex<Option<Arc<Ledger>>>,
@@ -1026,6 +1036,9 @@ pub struct AcquisitionState {
     // resolver path. This is intentionally distinct from durable completion:
     // rippled exposes the completed ledger before its downstream AcqDone work.
     resolver_publication_claimed: AtomicBool,
+    // Set before registry completion registration so cancellation can prevent
+    // or revoke every stage of provisional resolver publication.
+    provisional_registered: AtomicBool,
     // Set only after the cache-only immutable ledger is visible to the
     // registry, LedgerHistory, and validation resolver.
     resolver_published: AtomicBool,
@@ -1035,7 +1048,37 @@ pub struct AcquisitionState {
     pub fetch_pack_ready: AtomicBool,
     timer_armed: AtomicBool,
     worker_pool: Arc<WorkerPool>,
+    scheduler: Arc<AcquisitionReadyScheduler>,
+    scheduler_key: AcquisitionKey,
     lifecycle: Arc<AcquisitionLifecycleCounters>,
+}
+
+/// A fair turn yields only after an atomic unit when another acquisition is
+/// ready. It intentionally replaces packet/node-count continuation churn.
+pub(crate) struct TurnBudget {
+    started: Instant,
+    competing_ready: usize,
+}
+
+impl TurnBudget {
+    const FAIR_TURN_ELAPSED_TARGET: Duration = Duration::from_millis(2);
+
+    pub(crate) fn new(competing_ready: usize) -> Self {
+        Self {
+            started: Instant::now(),
+            competing_ready,
+        }
+    }
+
+    pub(crate) fn must_yield_after_atomic_unit(&self) -> bool {
+        self.competing_ready != 0 && self.started.elapsed() >= Self::FAIR_TURN_ELAPSED_TARGET
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AcquisitionTurnOutcome {
+    pub terminal: bool,
+    pub needs_turn: bool,
 }
 
 impl AcquisitionState {
@@ -1072,9 +1115,13 @@ impl AcquisitionState {
     /// Enqueue one immutable packet. Saturation is visible to the caller so
     /// routing can charge/record overload instead of silently losing packet
     /// ownership.
-    pub fn enqueue_packet(self: &Arc<Self>, peer_id: u64, packet: InboundLedgerPacket) -> bool {
+    pub(crate) fn enqueue_packet(
+        self: &Arc<Self>,
+        peer_id: u64,
+        packet: InboundLedgerPacket,
+    ) -> PacketEnqueue {
         if self.is_done() || self.draining.load(Ordering::Acquire) {
-            return false;
+            return PacketEnqueue::Terminal;
         }
         let bytes = packet
             .nodes
@@ -1087,13 +1134,12 @@ impl AcquisitionState {
                 || mailbox.packet_bytes.saturating_add(bytes) > ACQ_MAILBOX_BYTE_CAPACITY
             {
                 mailbox.overload_rejections += 1;
-                return false;
+                return PacketEnqueue::Full;
             }
             mailbox.packet_bytes += bytes;
             mailbox.packets.push_back(PacketWork {
                 peer_id,
                 packet,
-                next_node: 0,
                 bytes,
             });
             mailbox.buffered_packets_high_water = mailbox
@@ -1114,7 +1160,7 @@ impl AcquisitionState {
         if should_enqueue {
             self.enqueue_acquisition_turn();
         }
-        true
+        PacketEnqueue::Accepted
     }
 
     fn enqueue_read_ready(self: &Arc<Self>, ready: ReadReady) {
@@ -1130,15 +1176,6 @@ impl AcquisitionState {
         }
         let should_enqueue = {
             let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-            // A reservation is created before every accepted broker ticket.
-            // Reaching it is a source invariant breach, so fail visibly rather
-            // than discarding a settled completion and stranding its edges.
-            if mailbox.events.len() >= mailbox.read_event_reservations {
-                mailbox.stale_events += 1;
-                drop(mailbox);
-                self.mark_failed();
-                return;
-            }
             mailbox.events.push_back(ready);
             if mailbox.token == AcquisitionWorkToken::Idle {
                 mailbox.token = AcquisitionWorkToken::Queued;
@@ -1148,7 +1185,7 @@ impl AcquisitionState {
             }
         };
         if should_enqueue {
-            self.enqueue_acquisition_turn();
+            self.enqueue_acquisition_turn_with_cause(ReadyCause::READ_READY);
         }
     }
 
@@ -1169,23 +1206,37 @@ impl AcquisitionState {
     }
 
     fn enqueue_acquisition_turn(self: &Arc<Self>) {
+        self.enqueue_acquisition_turn_with_cause(ReadyCause::WIRE);
+    }
+
+    fn enqueue_acquisition_turn_with_cause(self: &Arc<Self>, cause: ReadyCause) {
         self.lifecycle
             .data_jobs_submitted
             .fetch_add(1, Ordering::Relaxed);
-        let state = Arc::clone(self);
+        self.scheduler.wake(self.scheduler_key, self, cause);
+    }
+
+    /// Scheduler-owned execution boundary. Mailbox state still protects actor
+    /// payload, while admission/cancellation is exclusively keyed by the
+    /// registry-owned ready set.
+    pub(crate) fn run_ready_turn(self: &Arc<Self>, budget: &TurnBudget) -> AcquisitionTurnOutcome {
         let queued_at = Instant::now();
-        self.worker_pool.submit_ledger_data(Box::new(move || {
-            state
-                .lifecycle
-                .data_jobs_started
-                .fetch_add(1, Ordering::Relaxed);
-            state.stats.worker_jobs.fetch_add(1, Ordering::Relaxed);
-            state
-                .stats
-                .worker_queue_wait_us
-                .fetch_add(queued_at.elapsed().as_micros() as u64, Ordering::Relaxed);
-            run_acquisition_job(&state, "mailbox", || process_acquisition_turn(&state));
-        }));
+        self.lifecycle
+            .data_jobs_started
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats.worker_jobs.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .worker_queue_wait_us
+            .fetch_add(queued_at.elapsed().as_micros() as u64, Ordering::Relaxed);
+        run_acquisition_job(self, "mailbox", || process_acquisition_turn(self, budget));
+        let mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        let needs_turn = !self.is_done()
+            && (mailbox.token == AcquisitionWorkToken::Queued
+                || (!mailbox.packets.is_empty() && !budget.must_yield_after_atomic_unit()));
+        AcquisitionTurnOutcome {
+            terminal: self.is_done(),
+            needs_turn,
+        }
     }
 
     fn begin_acquisition_turn(&self) -> bool {
@@ -1227,12 +1278,6 @@ impl AcquisitionState {
         Some(packet)
     }
 
-    fn restore_packet(&self, packet: PacketWork) {
-        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-        mailbox.packet_bytes += packet.bytes;
-        mailbox.packets.push_front(packet);
-    }
-
     fn record_stale_event(&self) {
         self.mailbox
             .lock()
@@ -1245,21 +1290,6 @@ impl AcquisitionState {
             .lock()
             .expect("acquisition mailbox lock")
             .take_read_event()
-    }
-
-    fn reserve_read_event_slot(&self) -> bool {
-        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-        if mailbox.read_event_reservations >= super::read_broker::ACQ_READS_PER_ACQUISITION {
-            mailbox.overload_rejections += 1;
-            return false;
-        }
-        mailbox.read_event_reservations += 1;
-        true
-    }
-
-    fn release_read_event_slot(&self) {
-        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-        mailbox.read_event_reservations = mailbox.read_event_reservations.saturating_sub(1);
     }
 
     fn enqueue_persistence_ready(self: &Arc<Self>, ready: PersistenceReady) {
@@ -1343,9 +1373,6 @@ impl AcquisitionState {
                     .any(|probe| probe.kind == kind);
             }
         }
-        if !self.reserve_read_event_slot() {
-            return false;
-        }
         let weak = Arc::downgrade(self);
         let sink: ReadReadySink = Arc::new(move |ready| {
             if let Some(state) = weak.upgrade() {
@@ -1376,10 +1403,7 @@ impl AcquisitionState {
                     .submit_ready_to_node_store(&self.node_store);
                 true
             }
-            ReadAdmission::Rejected(_) => {
-                self.release_read_event_slot();
-                false
-            }
+            ReadAdmission::Rejected(ReadRejectReason::Stopped) => false,
         }
     }
 
@@ -1399,9 +1423,9 @@ impl AcquisitionState {
         Some(probe)
     }
 
-    /// Submit collected write commands only after an actor mutation guard has
-    /// been released. One command remains in flight until its mailbox ack is
-    /// reduced, preserving write order and the terminal barrier ordering.
+    /// Submit packet/scan batches after actor ownership is released. The
+    /// NodeStore owns execution through `schedule_write`; the acquisition only
+    /// receives one ticket completion per bounded batch and the final fence.
     fn submit_persistence_writes(self: &Arc<Self>, writes: Vec<PersistenceWrite>) {
         if writes.is_empty() || self.is_done() {
             return;
@@ -1435,10 +1459,18 @@ impl AcquisitionState {
         };
         let state = Arc::clone(self);
         let node_store = state.node_store.clone();
-        self.worker_pool.submit_ledger_data(Box::new(move || {
-            let (id, durability_barrier, result) = match command {
-                PersistenceCommand::Write { id, write } => {
-                    let result = match &node_store {
+        let execution_node_store = node_store.clone();
+        let completion = PersistenceCompletionGuard::new(
+            Arc::clone(&state),
+            command.id(),
+            command.is_durability_barrier(),
+        );
+        node_store.schedule_write(Box::new(move || {
+            let mut completion = completion;
+            let result = match command {
+                PersistenceCommand::WriteBatch { writes, .. } => writes
+                    .into_iter()
+                    .try_for_each(|write| match &execution_node_store {
                         SHAMapStoreNodeStore::Single(database) => database.store(
                             write.object_type,
                             write.data,
@@ -1451,22 +1483,17 @@ impl AcquisitionState {
                             write.key.hash,
                             write.key.ledger_seq,
                         ),
-                    };
-                    (id, false, result.map_err(|error| Arc::from(error.as_str())))
-                }
-                PersistenceCommand::DurabilityBarrier { id } => {
-                    let result = match &node_store {
+                    })
+                    .map_err(|error| Arc::from(error.as_str())),
+                PersistenceCommand::DurabilityBarrier { .. } => {
+                    let result = match &execution_node_store {
                         SHAMapStoreNodeStore::Single(database) => database.sync_result(),
                         SHAMapStoreNodeStore::Rotating(database) => database.sync_result(),
                     };
-                    (id, true, result.map_err(|error| Arc::from(error.as_str())))
+                    result.map_err(|error| Arc::from(error.as_str()))
                 }
             };
-            state.enqueue_persistence_ready(PersistenceReady {
-                id,
-                result,
-                durability_barrier,
-            });
+            completion.settle(result);
         }));
     }
 
@@ -1517,6 +1544,14 @@ impl AcquisitionState {
         true
     }
 
+    pub(crate) fn has_pending_timeout(&self) -> bool {
+        self.mailbox
+            .lock()
+            .expect("acquisition mailbox lock")
+            .pending_timeouts
+            != 0
+    }
+
     fn record_admitted_timeout(self: &Arc<Self>) {
         if self.is_done() {
             return;
@@ -1549,8 +1584,14 @@ impl AcquisitionState {
             );
         }
         if should_enqueue {
-            self.enqueue_acquisition_turn();
+            self.lifecycle
+                .data_jobs_submitted
+                .fetch_add(1, Ordering::Relaxed);
         }
+        // Timeouts are the recovery class of the same acquisition identity;
+        // never submit a separate WorkerPool closure outside the ready set.
+        self.scheduler
+            .wake(self.scheduler_key, self, ReadyCause::TIMEOUT);
     }
 
     fn install_tree_plan(&self, plan: ActorTreePlan) -> bool {
@@ -1643,31 +1684,11 @@ impl AcquisitionState {
         if self.is_done() {
             return;
         }
-        let state = Arc::clone(self);
-        if !self.worker_pool.try_submit_timeout(Box::new(move || {
-            // Admission was decided by WorkerPool's unchanged aggregate < 5
-            // gate. Delivery is mailbox work so a scan can never discard it.
-            state.record_admitted_timeout();
-        })) {
-            self.lifecycle
-                .timeout_queue_rejected
-                .fetch_add(1, Ordering::Relaxed);
-            if self.stats.should_emit_sampled_diagnostic() {
-                let worker = self.worker_pool.snapshot();
-                tracing::debug!(
-                    target: "inbound_ledger",
-                    seq = self.seq,
-                    hash = %self.hash,
-                    queued_jobs = worker.queued_jobs,
-                    outstanding_jobs = worker.outstanding_ledger_data_jobs,
-                    job_limit = worker.ledger_data_job_limit,
-                    timeout_attempts = worker.timeout_submission_attempts,
-                    timeout_rejections = worker.timeout_submission_rejected,
-                    "sampled timeout admission rejected"
-                );
-            }
-            self.arm_timer();
-        }
+        // `AcquisitionReadyScheduler` owns the shared five-slot admission
+        // boundary and recovery/normal fairness. Record the timeout in this
+        // actor's mailbox, then wake that one identity through the scheduler;
+        // do not bypass it with a WorkerPool-only timeout closure.
+        self.record_admitted_timeout();
     }
 
     fn arm_timer(self: &Arc<Self>) {
@@ -1693,6 +1714,25 @@ impl AcquisitionState {
         self.peer_set.refresh_peers((self.peer_provider)());
     }
 
+    /// Record a fetch-pack generation for this acquisition. rippled's
+    /// `gotFetchPack()` calls `checkLocal()` for every active acquisition
+    /// because any retained descendant may now be resident.
+    pub(crate) fn note_fetch_pack_generation(&self, generation: u64) -> bool {
+        if self.is_done() {
+            return false;
+        }
+        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        if generation <= mailbox.pending_fetch_pack_generation {
+            return false;
+        }
+        mailbox.pending_fetch_pack_generation = generation;
+        self.fetch_pack_ready.store(true, Ordering::Release);
+        if mailbox.token == AcquisitionWorkToken::Idle {
+            mailbox.token = AcquisitionWorkToken::Queued;
+        }
+        true
+    }
+
     pub(crate) fn diagnostics(&self) -> AcquisitionSnapshot {
         let (seq, planner, timeouts) = self
             .lock_mutable("diagnostics")
@@ -1705,51 +1745,21 @@ impl AcquisitionState {
             })
             .unwrap_or((self.seq, Default::default(), 0));
         let (
-            has_active_packet,
             buffered_packets,
             buffered_packets_high_water,
-            mailbox_events,
-            mailbox_bytes,
-            mailbox_bytes_high_water,
-            stale_events,
-            overload_rejections,
-            active_plan_id,
-            active_plan_kind,
-            plan_pending_hashes,
-            plan_pending_edges,
             mailbox_token,
             scan_continuation_pending,
             pending_admitted_timeouts,
         ) = {
             let mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
             (
-                false,
                 mailbox.buffered_packet_count(),
                 mailbox.buffered_packets_high_water,
-                mailbox.events.len(),
-                mailbox.packet_bytes,
-                mailbox.buffered_bytes_high_water,
-                mailbox.stale_events,
-                mailbox.overload_rejections,
-                mailbox.plan.as_ref().map(|plan| plan.plan.id().get()),
-                mailbox.plan.as_ref().map(|plan| match plan.plan.kind() {
-                    TreeKind::State => "state",
-                    TreeKind::Transaction => "transaction",
-                }),
-                mailbox
-                    .plan
-                    .as_ref()
-                    .map_or(0, |plan| plan.plan.pending_hashes()),
-                mailbox
-                    .plan
-                    .as_ref()
-                    .map_or(0, |plan| plan.plan.pending_edges()),
                 mailbox.token.name(),
                 mailbox.plan.is_some(),
                 mailbox.pending_timeouts,
             )
         };
-        let broker = self.read_broker.snapshot();
         let header_after_ms = self
             .stats
             .first_header_at
@@ -1883,31 +1893,26 @@ impl AcquisitionState {
             tracked_peers: self.peer_set.peer_count(),
             buffered_packets,
             buffered_packets_high_water,
-            mailbox_bytes,
-            mailbox_bytes_high_water,
-            mailbox_events,
-            stale_events,
-            overload_rejections,
-            active_plan_id,
-            active_plan_kind,
-            plan_pending_hashes,
-            plan_pending_edges,
-            broker_queued_keys: broker.queued_keys,
-            broker_in_flight_keys: broker.in_flight_keys,
             mailbox_token,
             scan_continuation_pending,
             pending_admitted_timeouts,
-            has_active_packet,
         }
     }
 
-    /// Explicit terminal cancellation runs before a registry sweep destroys
-    /// the handle. It settles broker subscriptions and packet ownership rather
-    /// than relying on a later callback to notice a stopped flag.
+    /// Explicit terminal cancellation revokes a resolver-visible provisional
+    /// identity through the failure recorder while its registry entry is still
+    /// available. Other cancellations only settle local work and reservations.
     pub(crate) fn cancel(&self) {
+        if self.provisional_registered.load(Ordering::Acquire)
+            && !self.completed.load(Ordering::Acquire)
+        {
+            self.mark_failed();
+            return;
+        }
         if self.stopped.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.scheduler.cancel(self.scheduler_key);
         self.persistence
             .lock()
             .expect("persistence queue lock")
@@ -1971,6 +1976,7 @@ impl AcquisitionState {
         // matching registry entry alive and record its cooldown before any
         // strand poll or sweep can observe the terminal failure flags.
         (self.failure_recorder)(*self.hash.as_uint256());
+        self.scheduler.cancel(self.scheduler_key);
         self.persistence
             .lock()
             .expect("persistence queue lock")
@@ -2045,9 +2051,10 @@ pub struct AcquisitionBuilder {
     pub store_tx: std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     pub failure_recorder: AcquisitionFailureRecorder,
     pub completion_recorder: AcquisitionCompletionRecorder,
-    pub completed_ledger_store: Option<AcquisitionLedgerStore>,
-    pub full_below_generation: u32,
+    pub durable_completion_recorder: AcquisitionDurableCompletionRecorder,
+    pub shared_full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
     pub worker_pool: Arc<WorkerPool>,
+    pub scheduler: Arc<AcquisitionReadyScheduler>,
     pub initial_peers: Vec<Arc<dyn Peer>>,
     pub peer_provider: AcquisitionPeerProvider,
     pub lifecycle: Arc<AcquisitionLifecycleCounters>,
@@ -2082,12 +2089,7 @@ impl AcquisitionBuilder {
             peer_set: overlay::SimplePeerSet::new(self.initial_peers),
             peer_provider: self.peer_provider,
             stats,
-            worker_full_below: FullBelowCacheImpl::new(
-                self.full_below_generation,
-                MonotonicClock::default(),
-                HardenedHashBuilder::default(),
-                524_288,
-            ),
+            shared_full_below: self.shared_full_below,
             node_store: self.node_store,
             read_broker: self.read_broker,
             persistence: Mutex::new(PersistenceQueue::default()),
@@ -2097,18 +2099,24 @@ impl AcquisitionBuilder {
             store_tx: self.store_tx,
             failure_recorder: self.failure_recorder,
             completion_recorder: self.completion_recorder,
-            completed_ledger_store: self.completed_ledger_store,
+            durable_completion_recorder: self.durable_completion_recorder,
             stopped: AtomicBool::new(false),
             completed: AtomicBool::new(false),
             completed_ledger: Mutex::new(None),
             failed: AtomicBool::new(false),
             failure_claimed: AtomicBool::new(false),
             resolver_publication_claimed: AtomicBool::new(false),
+            provisional_registered: AtomicBool::new(false),
             resolver_published: AtomicBool::new(false),
             finalization_claimed: AtomicBool::new(false),
             fetch_pack_ready: AtomicBool::new(false),
             timer_armed: AtomicBool::new(false),
             worker_pool: self.worker_pool,
+            scheduler_key: AcquisitionKey {
+                hash: *self.hash.as_uint256(),
+                id: self.acquisition_id,
+            },
+            scheduler: self.scheduler,
             lifecycle: self.lifecycle,
         })
     }
@@ -2153,19 +2161,19 @@ impl shamap::family::SHAMapNodeFetcher for ActorNodeFetcher {
     }
 }
 
-fn family<'a>(
-    state: &'a AcquisitionState,
+fn family(
+    state: &AcquisitionState,
 ) -> SHAMapFamily<
     MonotonicClock,
     HardenedHashBuilder,
-    &'a FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>,
+    Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
     ActorNodeFetcher,
     NullMissingNodeReporter,
     (),
 > {
     SHAMapFamily::new(
         Arc::clone(&state.shared_tree_cache),
-        &state.worker_full_below,
+        Arc::clone(&state.shared_full_below),
         ActorNodeFetcher,
         NullMissingNodeReporter,
     )
@@ -2223,7 +2231,7 @@ fn trigger(
                 inbound.start_tree_plan(
                     kind,
                     TreePlanId::new(state.next_plan_id.fetch_add(1, Ordering::Relaxed)),
-                    state.worker_full_below.generation(),
+                    state.shared_full_below.generation(),
                 )
             })
             .map(|plan| ActorTreePlan {
@@ -2263,18 +2271,9 @@ fn trigger(
 }
 
 fn peer_has_acquisition_target(peer: &Arc<dyn Peer>, hash: Uint256, seq: u32) -> bool {
-    if peer.has_ledger(hash, seq) {
-        return true;
-    }
-
-    // A hash-only closed-ledger request deliberately has no sequence claim.
-    // Prefer peers that explicitly advertise the hash, but do not make that
-    // advertisement a routing precondition: trusted validation can name a
-    // preferred LCL before a peer's StatusChange reaches us. The wire request
-    // still carries the exact hash and response routing keeps its hash and
-    // known-sequence checks, so this broadens discovery without weakening
-    // target identity.
-    seq == 0 || peer.closed_ledger_hash() == hash
+    // Match PeerImp::hasLedger exactly: a zero sequence has no range claim,
+    // so it is eligible only when the peer advertised this exact recent hash.
+    peer.has_ledger(hash, seq)
 }
 
 fn add_peers(state: &AcquisitionState) -> Vec<Arc<dyn Peer>> {
@@ -2340,7 +2339,7 @@ fn process_init(state: &Arc<AcquisitionState>) {
     state.queue_timeout_job();
 }
 
-fn process_acquisition_turn(state: &Arc<AcquisitionState>) {
+fn process_acquisition_turn(state: &Arc<AcquisitionState>, budget: &TurnBudget) {
     if !state.begin_acquisition_turn() {
         return;
     }
@@ -2349,24 +2348,25 @@ fn process_acquisition_turn(state: &Arc<AcquisitionState>) {
         return;
     }
 
-    // Event-first fairness: recovery is never disabled by pending reads; one
-    // packet step and one plan advance then yield to the shared worker queue.
+    // Event-first fairness: recovery is never disabled by pending reads; a
+    // fair packet batch and one plan advance then yield to the shared worker
+    // queue.
     if state.take_admitted_timeout() {
         process_timeout_job(state);
     }
     if !state.is_done() && state.has_pending_packets() {
-        process_data_job(state);
+        process_data_job(state, budget);
     } else if !state.is_done() && state.fetch_pack_ready.load(Ordering::Acquire) {
-        process_data_job(state);
+        process_data_job(state, budget);
     }
     if !state.is_done() {
         process_persistence_event(state);
     }
     if !state.is_done() {
-        process_read_events(state);
+        process_read_events(state, budget);
     }
     if !state.is_done() && state.has_tree_plan() {
-        process_tree_plan_turn(state);
+        process_tree_plan_turn(state, budget);
     }
     state.finish_acquisition_turn();
 }
@@ -2425,14 +2425,29 @@ fn apply_packet_nodes_to_plan(
     }
 }
 
-fn process_data_job(state: &Arc<AcquisitionState>) {
+/// Drain the packet batch ready for this acquisition, yielding only after an
+/// atomic packet reduction when another ready identity has consumed its fair
+/// elapsed-work share. This mirrors `InboundLedger::runData()`'s swap-and-drain
+/// loop while retaining the Rust scheduler's cross-acquisition fairness bound.
+fn process_data_job(state: &Arc<AcquisitionState>, budget: &TurnBudget) {
+    loop {
+        let processed_packet = state.has_pending_packets();
+        process_one_data_job(state);
+        if state.is_done()
+            || !state.has_pending_packets()
+            || (processed_packet && budget.must_yield_after_atomic_unit())
+        {
+            return;
+        }
+    }
+}
+
+fn process_one_data_job(state: &Arc<AcquisitionState>) {
     if state.is_done() {
         return;
     }
 
-    // Exactly one prevalidated packet chunk per actor turn. The remaining
-    // packet keeps FIFO ownership and is restored before later packets.
-    let Some(mut work) = state.take_packet_for_turn() else {
+    let Some(work) = state.take_packet_for_turn() else {
         let (terminal, persistence_writes) = {
             let Some(mut mutable) = state.lock_mutable("data processing") else {
                 return;
@@ -2440,6 +2455,8 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
             let data_drain_started = Instant::now();
             if state.fetch_pack_ready.swap(false, Ordering::AcqRel) {
                 check_local(state, &mut mutable);
+                let mut mailbox = state.mailbox.lock().expect("acquisition mailbox lock");
+                mailbox.handled_fetch_pack_generation = mailbox.pending_fetch_pack_generation;
             }
             let terminal = mutable.inbound.is_failed() || mutable.inbound.is_complete();
             let persistence_writes = mutable.store.take_pending_writes();
@@ -2455,7 +2472,7 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
         return;
     };
 
-    let step_start = work.next_node;
+    let step_start = 0;
     let mut accepted_nodes = Vec::new();
     let data_drain_started = Instant::now();
     let packet_type = work.packet.packet_type;
@@ -2484,32 +2501,25 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
             let journal = WorkerJournal;
             let config = ledger::LedgerConfig::default();
             let family = family(state);
-            match inbound.process_packet_step_with_family_and_config(
+            match inbound.process_packet_with_family_and_config(
                 &work.packet,
-                work.next_node,
-                ledger::INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP,
                 &journal,
                 &config,
                 store,
                 fetch_pack,
                 &family,
             ) {
-                Ok(step) => {
-                    packet_stats = step.stats;
-                    work.next_node = step.next_node;
-                    packet_complete = step.complete;
-                    if !step.stats.is_invalid() {
-                        accepted_nodes.extend(
-                            work.packet.nodes[step_start..work.next_node]
-                                .iter()
-                                .filter_map(|node| {
-                                    shamap::tree_node::SHAMapTreeNode::make_from_wire(
-                                        &node.node_data,
-                                    )
+                Ok(stats) => {
+                    packet_stats = stats;
+                    packet_complete = true;
+                    if !stats.is_invalid() {
+                        accepted_nodes.extend(work.packet.nodes[step_start..].iter().filter_map(
+                            |node| {
+                                shamap::tree_node::SHAMapTreeNode::make_from_wire(&node.node_data)
                                     .ok()
                                     .flatten()
-                                }),
-                        );
+                            },
+                        ));
                     }
                     inbound.record_packet_stats_with_family_and_config(
                         packet_stats,
@@ -2542,7 +2552,6 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
             hash = %state.hash,
             drain_us = data_drain_us,
             nodes = work.packet.nodes.len(),
-            next_node = work.next_node,
             "sampled full inbound data packet"
         );
     }
@@ -2564,8 +2573,6 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
             .lifecycle
             .packet_steps_completed
             .fetch_add(1, Ordering::Relaxed);
-    } else {
-        state.restore_packet(work);
     }
     state.stats.packets.fetch_add(1, Ordering::Relaxed);
     let useful_nodes = packet_stats.get_good().max(0) as u64;
@@ -2636,6 +2643,7 @@ fn process_data_job(state: &Arc<AcquisitionState>) {
 }
 struct ActorResident<'a> {
     cache: &'a TreeNodeCache<MonotonicClock>,
+    full_below: &'a FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>,
 }
 
 impl MissingNodeResidentLookup for ActorResident<'_> {
@@ -2645,6 +2653,14 @@ impl MissingNodeResidentLookup for ActorResident<'_> {
         _ledger_seq: u32,
     ) -> Option<basics::intrusive_pointer::SharedIntrusive<shamap::tree_node::SHAMapTreeNode>> {
         self.cache.fetch(hash.as_uint256())
+    }
+
+    fn is_full_below(&mut self, hash: SHAMapHash) -> bool {
+        self.full_below.touch_if_exists(*hash.as_uint256())
+    }
+
+    fn mark_full_below(&mut self, hash: SHAMapHash) {
+        self.full_below.insert(*hash.as_uint256());
     }
 }
 
@@ -2776,22 +2792,11 @@ fn process_local_probe(state: &Arc<AcquisitionState>, probe: LocalProbe, ready: 
     }
 }
 
-/// Drain a fixed number of settled read completions without holding the
-/// mailbox lock while their actor-owned plan, persistence, or peer state is
-/// reduced. A false result means the mailbox has no more safely runnable work.
-fn drain_bounded_read_events(mut reduce_one: impl FnMut() -> bool) -> usize {
-    let mut reduced = 0;
-    for _ in 0..ACQ_TURN_MAX_READ_EVENTS {
-        if !reduce_one() {
-            break;
-        }
-        reduced += 1;
-    }
-    reduced
-}
-
-fn process_read_events(state: &Arc<AcquisitionState>) {
-    let _ = drain_bounded_read_events(|| process_one_read_event(state));
+/// Reduce settled broker completions into the same retained traversal pass.
+/// A contested scheduler yields only between completed atomic reductions; an
+/// idle scheduler drains all currently-ready work without an eight-event cap.
+fn process_read_events(state: &Arc<AcquisitionState>, budget: &TurnBudget) {
+    while !budget.must_yield_after_atomic_unit() && process_one_read_event(state) {}
 }
 
 /// Reduce one settled completion. Returning false leaves the mailbox untouched;
@@ -2855,9 +2860,9 @@ fn process_one_read_event(state: &Arc<AcquisitionState>) -> bool {
                     mutable.inbound.record_verified_progress();
                 }
             }
-            // `take_read_event` released one reserved completion slot. If the
-            // actor owns unadmitted needs, consume that freed capacity directly
-            // instead of asking TreePlan to reannounce the same batch.
+            // A settled ticket can make the retained traversal runnable. Its
+            // unannounced needs remain owned by the continuation rather than
+            // being reconstructed by a fresh actor turn.
             actor_plan.runnable = !actor_plan.read_admission_backlog.is_empty()
                 || actor_plan.plan.has_runnable_frontier();
             state.restore_tree_plan(actor_plan);
@@ -2885,20 +2890,8 @@ fn process_one_read_event(state: &Arc<AcquisitionState>) -> bool {
 /// FIFO directly and cannot create a zero-branch TreePlan turn.
 fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: ActorTreePlan) {
     let plan_id = actor_plan.plan.id();
-    let mut read_admission_blocked = false;
+    let mut deferred = false;
     while let Some(need) = actor_plan.read_admission_backlog.pop_front() {
-        // Reserve delivery capacity before accepting a broker ticket. Keep the
-        // need in the actor FIFO when full; a later real completion releases a
-        // reservation and wakes exactly one bounded admission attempt.
-        if !state.reserve_read_event_slot() {
-            read_admission_blocked = true;
-            state
-                .stats
-                .state_scan_read_slot_full
-                .fetch_add(1, Ordering::Relaxed);
-            actor_plan.read_admission_backlog.push_front(need);
-            break;
-        }
         let key = ReadKey::new(*need.hash().as_uint256(), need.ledger_seq(), 0);
         let weak = Arc::downgrade(state);
         let sink: ReadReadySink = Arc::new(move |ready| {
@@ -2918,10 +2911,9 @@ fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: 
                 actor_plan.tickets.insert(need.hash(), ticket);
             }
             ReadAdmission::Deferred(ticket) => {
-                // A Deferred ticket is callback-bearing waiting work in the
-                // broker FIFO. Do not self-requeue retained TreePlan frontier
-                // before its matching ReadReady can make progress.
-                read_admission_blocked = true;
+                // A callback-bearing ticket remains queued until the broker's
+                // sole global physical-read boundary frees capacity.
+                deferred = true;
                 state
                     .stats
                     .state_scan_read_admission_deferred
@@ -2936,39 +2928,20 @@ fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: 
                 actor_plan.tickets.insert(need.hash(), ticket);
             }
             ReadAdmission::Rejected(ReadRejectReason::Stopped) => {
-                // A stopped broker cannot deliver a callback to drain this
-                // FIFO. Settle all actor-owned tickets through terminal
-                // failure rather than retaining unreachable local reads.
-                state.release_read_event_slot();
                 fail_actor_plan(state, actor_plan);
                 return;
             }
-            ReadAdmission::Rejected(_) => {
-                read_admission_blocked = true;
-                state
-                    .stats
-                    .state_scan_read_broker_rejected
-                    .fetch_add(1, Ordering::Relaxed);
-                state.release_read_event_slot();
-                actor_plan.read_admission_backlog.push_front(need);
-                break;
-            }
         }
     }
-    // A nonempty FIFO, a Deferred ticket, or a rejection is waiting work,
-    // not a runnable TreePlan frontier. It is woken by ReadReady or an
-    // existing external trigger such as timeout recovery.
     actor_plan.runnable = actor_plan.read_admission_backlog.is_empty()
-        && needs_reads_turn_can_requeue(&actor_plan.plan, read_admission_blocked);
+        && needs_reads_turn_can_requeue(&actor_plan.plan, deferred);
     state.restore_tree_plan(actor_plan);
-    // The broker owns physical I/O and runs submission after the actor plan
-    // has been returned to the mailbox.
     state
         .read_broker
         .submit_ready_to_node_store(&state.node_store);
 }
 
-fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
+fn process_tree_plan_turn(state: &Arc<AcquisitionState>, budget: &TurnBudget) {
     let Some(mut actor_plan) = state.take_tree_plan() else {
         return;
     };
@@ -2978,7 +2951,7 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
     }
     let retained_reads = actor_plan
         .plan
-        .take_read_admission_batch(ACQ_TURN_MAX_NEW_READS);
+        .take_read_admission_batch(ACQ_DEFERRED_READS_PER_PASS);
     if !retained_reads.is_empty() {
         actor_plan.read_admission_backlog.extend(retained_reads);
         submit_read_admission_backlog(state, actor_plan);
@@ -2989,12 +2962,13 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
     let branch_steps_before = scan_before.branch_steps;
     let mut resident = ActorResident {
         cache: &state.shared_tree_cache,
+        full_below: state.shared_full_below.as_ref(),
     };
-    let advance = actor_plan.plan.advance(
-        ACQ_TURN_MAX_BRANCH_STEPS,
-        ACQ_TURN_MAX_NEW_READS,
+    let advance = actor_plan.plan.advance_with_yield(
+        ACQ_DEFERRED_READS_PER_PASS,
         &mut resident,
         &mut || basics::random::rand_int_to(255u8),
+        &mut || budget.must_yield_after_atomic_unit(),
     );
     let scan_after = actor_plan.plan.scan_stats();
     let branch_steps_after = scan_after.branch_steps;
@@ -3117,13 +3091,14 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>) {
         }
         TreeAdvance::Invalid => {}
     }
-    if outcome == SCAN_OUTCOME_READY && branch_steps_delta == ACQ_TURN_MAX_BRANCH_STEPS as u64 {
+    if outcome == SCAN_OUTCOME_READY && budget.must_yield_after_atomic_unit() {
         state
             .stats
             .state_scan_branch_budget_yields
             .fetch_add(1, Ordering::Relaxed);
     }
-    if outcome == SCAN_OUTCOME_NEEDS_READS && deferred_reads_delta == ACQ_TURN_MAX_NEW_READS as u64
+    if outcome == SCAN_OUTCOME_NEEDS_READS
+        && deferred_reads_delta == ACQ_DEFERRED_READS_PER_PASS as u64
     {
         state
             .stats
@@ -3444,24 +3419,27 @@ fn publish_resolver_visible_ledger(
     hash: Uint256,
     acquisition_id: u64,
     completion_recorder: &AcquisitionCompletionRecorder,
-    completed_ledger_store: &Option<AcquisitionLedgerStore>,
     resolver_published: &AtomicBool,
     completed_ledger: &Mutex<Option<Arc<Ledger>>>,
     store_tx: &std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     reason: AcquireReason,
     ledger: Arc<Ledger>,
 ) -> bool {
-    // Match InboundLedger::done(): make non-history work LedgerMaster-visible
-    // before terminal touch/AcqDone dispatch. The queued strand work still
+    // Establish the registry's provisional identity before making the ledger
+    // visible to any cache-backed resolver. The queued strand work still
     // performs validation registration and acceptance, just as rippled's
     // separately dispatched AcqDone job does.
-    if reason != AcquireReason::History
-        && let Some(store) = completed_ledger_store
-    {
-        store(Arc::clone(&ledger));
+    if !completion_recorder(
+        ProvisionalLedgerIdentity {
+            acquisition_id,
+            target_hash: hash,
+            ledger_hash: *ledger.header().hash.as_uint256(),
+            ledger_seq: ledger.header().seq,
+        },
+        Arc::clone(&ledger),
+    ) {
+        return false;
     }
-    // NodeStore durability remains a separate, ordered background concern.
-    completion_recorder(hash, Arc::clone(&ledger));
     record_resolver_visible_ledger(
         acquisition_id,
         resolver_published,
@@ -3530,11 +3508,11 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
     let target_hash = *state.hash.as_uint256();
     let state_synching = ledger.state_map().is_synching();
     let tx_synching = ledger.tx_map().is_synching();
+    state.provisional_registered.store(true, Ordering::Release);
     if !publish_resolver_visible_ledger(
         target_hash,
         state.acquisition_id,
         &state.completion_recorder,
-        &state.completed_ledger_store,
         &state.resolver_published,
         &state.completed_ledger,
         &state.store_tx,
@@ -3589,6 +3567,7 @@ fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
     };
 
     state.completed.store(true, Ordering::Release);
+    (state.durable_completion_recorder)(*state.hash.as_uint256());
     state
         .lifecycle
         .terminal_completed
@@ -3650,7 +3629,6 @@ mod actor_mailbox_tests {
                     vec![0; bytes],
                 )],
             ),
-            next_node: 0,
             bytes,
         }
     }
@@ -3708,18 +3686,15 @@ mod actor_mailbox_tests {
             &mut first_child,
         );
         let mut resident = NoResident;
-        let TreeAdvance::NeedsReads(initial_reads) = plan.advance(
-            ACQ_TURN_MAX_BRANCH_STEPS,
-            ACQ_TURN_MAX_NEW_READS,
-            &mut resident,
-            &mut first_child,
-        ) else {
+        let TreeAdvance::NeedsReads(initial_reads) =
+            plan.advance(256, 16, &mut resident, &mut first_child)
+        else {
             panic!("expected the first bounded local-read batch");
         };
-        assert_eq!(initial_reads.len(), ACQ_TURN_MAX_NEW_READS);
+        assert_eq!(initial_reads.len(), 16);
         let branch_steps_before = plan.branch_steps();
-        let retained_reads = plan.take_read_admission_batch(ACQ_TURN_MAX_NEW_READS);
-        assert_eq!(retained_reads.len(), ACQ_TURN_MAX_NEW_READS);
+        let retained_reads = plan.take_read_admission_batch(16);
+        assert_eq!(retained_reads.len(), 16);
         assert_eq!(
             plan.branch_steps(),
             branch_steps_before,
@@ -3781,15 +3756,11 @@ mod actor_mailbox_tests {
             &mut first_child,
         );
         let mut resident = NoResident;
-        let TreeAdvance::NeedsReads(reads) = plan.advance(
-            ACQ_TURN_MAX_BRANCH_STEPS,
-            ACQ_TURN_MAX_NEW_READS,
-            &mut resident,
-            &mut first_child,
-        ) else {
+        let TreeAdvance::NeedsReads(reads) = plan.advance(256, 16, &mut resident, &mut first_child)
+        else {
             panic!("expected bounded local-read needs");
         };
-        assert_eq!(reads.len(), ACQ_TURN_MAX_NEW_READS);
+        assert_eq!(reads.len(), 16);
         assert!(
             plan.has_runnable_frontier(),
             "remaining branches keep the TreePlan frontier runnable"
@@ -3797,8 +3768,6 @@ mod actor_mailbox_tests {
 
         let broker = NodeReadBroker::new(ReadBrokerConfig {
             global_in_flight: 1,
-            per_acquisition_in_flight: ACQ_TURN_MAX_NEW_READS,
-            waiters_per_key: 4,
         })
         .expect("valid broker config");
         let delivered = Arc::new(Mutex::new(Vec::<ReadReady>::new()));
@@ -3884,12 +3853,9 @@ mod actor_mailbox_tests {
             &mut first_child,
         );
         let mut resident = NoResident;
-        let TreeAdvance::NeedsReads(initial_reads) = plan.advance(
-            ACQ_TURN_MAX_BRANCH_STEPS,
-            ACQ_TURN_MAX_NEW_READS,
-            &mut resident,
-            &mut first_child,
-        ) else {
+        let TreeAdvance::NeedsReads(initial_reads) =
+            plan.advance(256, 16, &mut resident, &mut first_child)
+        else {
             panic!("expected the initial 16 local-read needs");
         };
         // TreePlan has removed these needs from its unannounced set. A full
@@ -3904,12 +3870,7 @@ mod actor_mailbox_tests {
 
         let branch_steps_before = plan.branch_steps();
         assert!(matches!(
-            plan.advance(
-                ACQ_TURN_MAX_BRANCH_STEPS,
-                ACQ_TURN_MAX_NEW_READS,
-                &mut resident,
-                &mut first_child,
-            ),
+            plan.advance(256, 16, &mut resident, &mut first_child,),
             TreeAdvance::Ready
         ));
         assert_eq!(plan.branch_steps(), branch_steps_before);
@@ -3962,12 +3923,7 @@ mod actor_mailbox_tests {
             }
         ));
         assert!(matches!(
-            plan.advance(
-                ACQ_TURN_MAX_BRANCH_STEPS,
-                ACQ_TURN_MAX_NEW_READS,
-                &mut resident,
-                &mut first_child,
-            ),
+            plan.advance(256, 16, &mut resident, &mut first_child,),
             TreeAdvance::NeedsNetwork(_)
         ));
     }
@@ -4021,7 +3977,7 @@ mod actor_mailbox_tests {
         let branch_steps_before = plan.branch_steps();
 
         assert!(matches!(
-            plan.advance(0, ACQ_TURN_MAX_NEW_READS, &mut resident, &mut first_child),
+            plan.advance(0, 16, &mut resident, &mut first_child),
             TreeAdvance::Ready
         ));
         assert!(
@@ -4154,12 +4110,9 @@ mod actor_mailbox_tests {
                 peer: None,
             },
         );
-        mailbox.read_event_reservations = 1;
-
         let terminal_tickets = mailbox.clear_terminal_work();
         assert_eq!(terminal_tickets, vec![ticket]);
         assert!(mailbox.local_probes.is_empty());
-        assert_eq!(mailbox.read_event_reservations, 0);
         assert!(
             mailbox.clear_terminal_work().is_empty(),
             "terminal cleanup cannot return a ticket twice"
@@ -4184,113 +4137,17 @@ mod actor_mailbox_tests {
     }
 
     #[test]
-    fn packet_continuation_is_restored_to_the_fifo_front_after_a_128_node_step() {
+    fn complete_wire_packets_remain_fifo_units() {
         let mut mailbox = AcquisitionMailbox::default();
         mailbox.packets.push_back(packet_work(11, 128));
         mailbox.packets.push_back(packet_work(22, 1));
         mailbox.packet_bytes = 129;
 
-        let mut active = mailbox.packets.pop_front().expect("first FIFO packet");
+        let active = mailbox.packets.pop_front().expect("first FIFO packet");
         mailbox.packet_bytes = mailbox.packet_bytes.saturating_sub(active.bytes);
-        active.next_node = ledger::INBOUND_LEDGER_MAX_PACKET_NODES_PER_STEP;
-        mailbox.packet_bytes += active.bytes;
-        mailbox.packets.push_front(active);
-
-        assert_eq!(
-            mailbox
-                .packets
-                .front()
-                .expect("active continuation")
-                .peer_id,
-            11
-        );
-        assert_eq!(
-            mailbox
-                .packets
-                .front()
-                .expect("active continuation")
-                .next_node,
-            128
-        );
-        assert_eq!(mailbox.packets.get(1).expect("later packet").peer_id, 22);
-        assert_eq!(mailbox.packet_bytes, 129);
-    }
-
-    #[test]
-    fn reserved_read_completion_capacity_never_uses_packet_capacity_or_drops_work() {
-        let mut mailbox = AcquisitionMailbox::default();
-        mailbox.read_event_reservations = super::super::read_broker::ACQ_READS_PER_ACQUISITION;
-        assert_eq!(mailbox.events.len(), 0);
-        assert_eq!(
-            mailbox.read_event_reservations,
-            super::super::read_broker::ACQ_READS_PER_ACQUISITION,
-            "each accepted broker ticket owns one reserved completion slot"
-        );
-        assert!(
-            !mailbox.has_work(false),
-            "reservations alone are waiting work, not a spin token"
-        );
-    }
-
-    #[test]
-    fn ready_read_events_drain_in_bounded_turns() {
-        use super::super::read_broker::ReadBrokerConfig;
-
-        let broker = NodeReadBroker::new(ReadBrokerConfig::default()).expect("valid broker config");
-        let delivered = Arc::new(Mutex::new(Vec::<ReadReady>::new()));
-        let sink: ReadReadySink = {
-            let delivered = Arc::clone(&delivered);
-            Arc::new(move |ready| {
-                delivered
-                    .lock()
-                    .expect("read event fixture lock")
-                    .push(ready);
-            })
-        };
-        let event_count = ACQ_TURN_MAX_READ_EVENTS * 2;
-        for index in 0..event_count {
-            let key = ReadKey::new(Uint256::from_array([index as u8; 32]), 77, 0);
-            assert!(matches!(
-                broker.request(key, 41, 7, Arc::clone(&sink)),
-                ReadAdmission::Accepted(_)
-            ));
-            assert!(broker.complete(key, ReadOutcome::Miss));
-        }
-        let delivered = std::mem::take(&mut *delivered.lock().expect("read event fixture lock"));
-        assert_eq!(delivered.len(), event_count);
-        let retained_ticket = delivered[ACQ_TURN_MAX_READ_EVENTS].ticket;
-
-        let mut mailbox = AcquisitionMailbox {
-            events: VecDeque::from(delivered),
-            read_event_reservations: event_count,
-            token: AcquisitionWorkToken::Running,
-            ..AcquisitionMailbox::default()
-        };
-        let first_turn = drain_bounded_read_events(|| mailbox.take_read_event().is_some());
-        assert_eq!(first_turn, ACQ_TURN_MAX_READ_EVENTS);
-        assert_eq!(mailbox.events.len(), ACQ_TURN_MAX_READ_EVENTS);
-        assert_eq!(mailbox.read_event_reservations, ACQ_TURN_MAX_READ_EVENTS);
-        assert_eq!(
-            mailbox.events.front().expect("retained event").ticket,
-            retained_ticket,
-            "the next settled completion remains FIFO-owned for the successor"
-        );
-        assert!(
-            mailbox.finish_turn(false),
-            "remaining settled completions schedule one successor turn"
-        );
-        assert_eq!(mailbox.token, AcquisitionWorkToken::Queued);
-
-        mailbox.token = AcquisitionWorkToken::Running;
-        let second_turn = drain_bounded_read_events(|| mailbox.take_read_event().is_some());
-        assert_eq!(second_turn, ACQ_TURN_MAX_READ_EVENTS);
-        assert!(mailbox.events.is_empty());
-        assert_eq!(mailbox.read_event_reservations, 0);
-        assert!(
-            !mailbox.finish_turn(false),
-            "an empty mailbox must not submit an extra successor"
-        );
-        assert_eq!(mailbox.token, AcquisitionWorkToken::Idle);
+        assert_eq!(active.peer_id, 11);
+        assert_eq!(mailbox.packets.front().expect("later packet").peer_id, 22);
+        assert_eq!(mailbox.packet_bytes, 1);
     }
 
     fn network_waiting_actor_plan(
@@ -4497,7 +4354,7 @@ mod actor_mailbox_tests {
     }
 
     #[test]
-    fn persistence_queue_dispatches_once_and_settles_duplicates() {
+    fn persistence_queue_dispatches_once_and_deduplicates() {
         let mut queue = PersistenceQueue::default();
         let write = PersistenceWrite {
             key: PersistenceKey {
@@ -4520,16 +4377,11 @@ mod actor_mailbox_tests {
             queue.in_flight.as_ref().map(PersistenceCommand::id),
             Some(first.id())
         );
-        assert_eq!(queue.settlement(2), Some(&PersistenceSettlement::Duplicate));
         assert!(queue.acknowledge(&PersistenceReady {
             id: first.id(),
             result: Ok(()),
             durability_barrier: false,
         }));
-        assert_eq!(
-            queue.settlement(first.id()),
-            Some(&PersistenceSettlement::Written)
-        );
         assert!(matches!(
             queue.take_next(),
             Some(PersistenceCommand::DurabilityBarrier { .. })
@@ -4537,7 +4389,7 @@ mod actor_mailbox_tests {
     }
 
     #[test]
-    fn terminal_cancellation_visibly_settles_in_flight_and_queued_persistence() {
+    fn terminal_cancellation_discards_in_flight_and_queued_persistence() {
         let mut queue = PersistenceQueue::default();
         queue.enqueue_writes(vec![PersistenceWrite {
             key: PersistenceKey {
@@ -4550,18 +4402,9 @@ mod actor_mailbox_tests {
         }]);
         queue.enqueue_barrier();
         let in_flight = queue.take_next().expect("write dispatch");
-        let queued = queue.queued.front().expect("queued barrier").id();
         queue.cancel();
         assert!(queue.in_flight.is_none());
         assert!(queue.queued.is_empty());
-        assert_eq!(
-            queue.settlement(in_flight.id()),
-            Some(&PersistenceSettlement::Cancelled)
-        );
-        assert_eq!(
-            queue.settlement(queued),
-            Some(&PersistenceSettlement::Cancelled)
-        );
         assert!(
             !queue.acknowledge(&PersistenceReady {
                 id: in_flight.id(),
@@ -4604,7 +4447,7 @@ mod actor_mailbox_tests {
         queue.enqueue_writes(vec![write]);
         queue.enqueue_barrier();
         let first = queue.take_next().expect("write command");
-        assert!(matches!(first, PersistenceCommand::Write { .. }));
+        assert!(matches!(first, PersistenceCommand::WriteBatch { .. }));
         assert!(queue.acknowledge(&PersistenceReady {
             id: first.id(),
             result: Ok(()),
@@ -4637,7 +4480,7 @@ mod actor_mailbox_tests {
         }]);
         queue.enqueue_barrier();
         let write = queue.take_next().expect("write command");
-        assert!(matches!(write, PersistenceCommand::Write { .. }));
+        assert!(matches!(write, PersistenceCommand::WriteBatch { .. }));
         assert!(queue.acknowledge(&PersistenceReady {
             id: write.id(),
             result: Err(Arc::from("store fault")),

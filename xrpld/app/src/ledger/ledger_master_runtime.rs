@@ -349,20 +349,15 @@ impl AppLedgerMasterRuntime {
         if finish.header().seq <= start.header().seq {
             return None;
         }
-        let missing = report.missing?;
-
         while start.header().seq.checked_add(1)? < finish.header().seq {
             let parent_hash = finish.header().parent_hash;
             let parent_seq = finish.header().seq.checked_sub(1)?;
             let Some(parent) = self.ledger_master.get_ledger_by_hash(parent_hash) else {
-                // Never turn an arbitrary report marker into acquisition work.
-                // The marker must be exactly the parent absent from the
-                // validated chain at this point, as in LedgerMaster.cpp's
-                // backward walk before it calls LedgerReplayer::replay.
-                if parent_hash.is_zero()
-                    || missing.seq != parent_seq
-                    || missing.hash != *parent_hash.as_uint256()
-                {
+                // Match LedgerMaster::findNewLedgersToPublish: the backward
+                // validated-tip walk chooses its first unavailable parent.
+                // The forward publication-hole marker is useful for Generic
+                // acquisition, but is not a replay admission predicate.
+                if parent_hash.is_zero() {
                     return None;
                 }
 

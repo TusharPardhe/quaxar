@@ -11,9 +11,9 @@ use basics::tagged_cache::MonotonicClock;
 use ledger::{FetchPackCache, InboundLedgerPacket, Ledger};
 use overlay::Peer;
 use protocol::JsonValue;
-use shamap::family::{FullBelowCache, FullBelowCacheImpl};
+use shamap::family::FullBelowCacheImpl;
 use shamap::tree_node_cache::TreeNodeCache;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, RwLock};
@@ -23,10 +23,12 @@ use crate::runtime::overlay_runtime::AppOverlayRuntime;
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 
 use super::acquisition::{
-    AcquisitionBuilder, AcquisitionCompletionRecorder, AcquisitionFailureRecorder,
-    AcquisitionLedgerStore, AcquisitionPeerProvider, AcquisitionSnapshot, AcquisitionState,
+    AcquisitionBuilder, AcquisitionCompletionRecorder, AcquisitionDurableCompletionRecorder,
+    AcquisitionFailureRecorder, AcquisitionLedgerStore, AcquisitionPeerProvider,
+    AcquisitionSnapshot, AcquisitionState, PacketEnqueue, ProvisionalLedgerIdentity,
 };
 use super::read_broker::{NodeReadBroker, ReadBrokerConfig};
+use super::scheduler::{AcquisitionKey, AcquisitionReadyScheduler, ReadyCause};
 use super::worker_pool::WorkerPool;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -185,7 +187,23 @@ pub struct CompletedInboundLedger {
     pub acquisition_id: u64,
 }
 
-// ─── Entry ───────────────────────────────────────────────────────────────────
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerDataRouteDisposition {
+    Accepted,
+    Unmatched,
+    Terminal,
+    SequenceMismatch,
+    MailboxFull,
+}
+
+impl LedgerDataRouteDisposition {
+    pub const fn may_stash_as_stale(self) -> bool {
+        matches!(
+            self,
+            Self::Unmatched | Self::Terminal | Self::SequenceMismatch
+        )
+    }
+}
 
 struct Entry {
     id: u64,
@@ -200,6 +218,9 @@ struct Entry {
     #[allow(dead_code)]
     started_at: Instant,
     completed_ledger: Option<Arc<Ledger>>,
+    /// Exact identity of the resolver-visible provisional ledger. This stays
+    /// with the registry entry until durable completion or failure revokes it.
+    provisional_identity: Option<ProvisionalLedgerIdentity>,
     /// Completion has been durably consumed by the app layer. Keep the
     /// completed object in the registry until the normal sweep, matching
     /// rippled's InboundLedgers map, while suppressing duplicate handoffs.
@@ -250,22 +271,6 @@ fn record_recent_failure_at(
 
 fn record_recent_failure(inner: &mut RegistryInner, hash: Uint256, acquisition_id: Option<u64>) {
     record_recent_failure_at(inner, hash, acquisition_id, Instant::now());
-}
-
-/// Match `InboundLedger::done()`'s terminal `touch()`. The callback carries an
-/// acquisition identity so a delayed terminal event from a swept predecessor
-/// cannot extend the lifetime of a replacement entry for the same hash.
-fn touch_terminal_entry_at(
-    inner: &mut RegistryInner,
-    hash: Uint256,
-    acquisition_id: u64,
-    now: Instant,
-) {
-    if let Some(entry) = inner.entries.get_mut(&hash)
-        && entry.id == acquisition_id
-    {
-        entry.last_touched = now;
-    }
 }
 
 #[derive(Clone)]
@@ -565,10 +570,6 @@ fn acquisition_snapshot_json(
             "pending_admitted_timeouts".to_owned(),
             JsonValue::Unsigned(snapshot.pending_admitted_timeouts as u64),
         ),
-        (
-            "has_active_packet".to_owned(),
-            JsonValue::Bool(snapshot.has_active_packet),
-        ),
     ]);
     values.insert(
         "header_after_ms".to_owned(),
@@ -629,18 +630,33 @@ fn recovery_lcl_decision_json(decision: Option<RecoveryLclDecision>) -> JsonValu
 ///
 /// Matches rippled's InboundLedgers: one entry per hash, touch-on-access,
 /// sweep idle entries, route peer responses, fixed worker pool.
+struct FetchPackWakeState {
+    next_generation: u64,
+    pending_hashes: BTreeSet<Uint256>,
+}
+
+type AcquisitionLedgerRevoker = Arc<dyn Fn(ProvisionalLedgerIdentity) + Send + Sync + 'static>;
+type AcquisitionAdvanceNotifier = Arc<dyn Fn() + Send + Sync + 'static>;
+
 pub struct InboundLedgers {
     inner: Arc<Mutex<RegistryInner>>,
     worker_pool: Arc<WorkerPool>,
+    scheduler: Arc<AcquisitionReadyScheduler>,
     read_broker: NodeReadBroker,
     // Shared resources for creating acquisitions
     node_store: Arc<RwLock<Option<SHAMapStoreNodeStore>>>,
     tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
     full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
     fetch_pack: Arc<FetchPackCache>,
+    fetch_pack_wakes: Mutex<FetchPackWakeState>,
     overlay_rt: Arc<RwLock<Option<Arc<AppOverlayRuntime>>>>,
     completed_ledgers_tx: SyncSender<CompletedInboundLedger>,
     completed_ledger_store: Arc<RwLock<Option<AcquisitionLedgerStore>>>,
+    completed_ledger_revoker: Arc<RwLock<Option<AcquisitionLedgerRevoker>>>,
+    /// App-owned publication planner wakeup. It records no ledger policy in
+    /// this registry; terminal lifecycle transitions only request one
+    /// serialized owner pass.
+    publication_advance_notifier: Arc<RwLock<Option<AcquisitionAdvanceNotifier>>>,
     stopping: AtomicBool,
     need_network_ledger: Arc<AtomicBool>,
     pending_acquires: Arc<Mutex<HashSet<Uint256>>>,
@@ -683,6 +699,7 @@ impl InboundLedgers {
         need_network_ledger: Arc<AtomicBool>,
         worker_pool: Arc<WorkerPool>,
     ) -> Self {
+        let scheduler = AcquisitionReadyScheduler::new(Arc::clone(&worker_pool));
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
                 entries: BTreeMap::new(),
@@ -690,15 +707,22 @@ impl InboundLedgers {
                 completed_ready: VecDeque::new(),
             })),
             worker_pool,
+            scheduler,
             read_broker: NodeReadBroker::new(ReadBrokerConfig::default())
                 .expect("default inbound read broker bounds are valid"),
             node_store: Arc::new(RwLock::new(None)),
             tree_cache,
             full_below,
             fetch_pack,
+            fetch_pack_wakes: Mutex::new(FetchPackWakeState {
+                next_generation: 0,
+                pending_hashes: BTreeSet::new(),
+            }),
             overlay_rt: Arc::new(RwLock::new(None)),
             completed_ledgers_tx,
             completed_ledger_store: Arc::new(RwLock::new(None)),
+            completed_ledger_revoker: Arc::new(RwLock::new(None)),
+            publication_advance_notifier: Arc::new(RwLock::new(None)),
             stopping: AtomicBool::new(false),
             need_network_ledger,
             pending_acquires: Arc::new(Mutex::new(HashSet::new())),
@@ -735,6 +759,37 @@ impl InboundLedgers {
             .completed_ledger_store
             .write()
             .expect("completed_ledger_store write") = Some(store);
+    }
+
+    /// Install the single application owner that compensates early resolver
+    /// visibility if a later NodeStore durability fence fails.
+    pub(crate) fn set_completed_ledger_revoker(&self, revoker: AcquisitionLedgerRevoker) {
+        *self
+            .completed_ledger_revoker
+            .write()
+            .expect("completed_ledger_revoker write") = Some(revoker);
+    }
+
+    /// Install the sole owner-level advance event sink. Inbound acquisition
+    /// owns no publication policy; it reports only a real terminal/sweep
+    /// lifecycle change so ApplicationRoot can coalesce planning on its
+    /// validation/NetworkOps serialization boundary.
+    pub(crate) fn set_publication_advance_notifier(&self, notifier: AcquisitionAdvanceNotifier) {
+        *self
+            .publication_advance_notifier
+            .write()
+            .expect("publication_advance_notifier write") = Some(notifier);
+    }
+
+    fn notify_publication_advance(&self) {
+        if let Some(notify) = self
+            .publication_advance_notifier
+            .read()
+            .expect("publication_advance_notifier read")
+            .clone()
+        {
+            notify();
+        }
     }
 
     /// Return a read-only, cumulative trace of inbound ledger work across all
@@ -924,9 +979,48 @@ impl InboundLedgers {
         let acquisition_id = self.next_acquisition_id.fetch_add(1, Ordering::Relaxed);
         let failure_recorder: AcquisitionFailureRecorder = {
             let inner = Arc::clone(&self.inner);
+            let revoker = Arc::clone(&self.completed_ledger_revoker);
+            let publication_advance_notifier = Arc::clone(&self.publication_advance_notifier);
             Arc::new(move |failed_hash| {
-                let mut inner = inner.lock().expect("inbound_ledgers failure recorder lock");
-                record_recent_failure(&mut inner, failed_hash, Some(acquisition_id));
+                let (revoke, transitioned) = {
+                    let mut inner = inner.lock().expect("inbound_ledgers failure recorder lock");
+                    let (revoke, transitioned) =
+                        inner
+                            .entries
+                            .get_mut(&failed_hash)
+                            .map_or((None, false), |entry| {
+                                if entry.id != acquisition_id || entry.failed {
+                                    return (None, false);
+                                }
+                                entry.failed = true;
+                                let revoke = entry.provisional_identity.take();
+                                entry.completed_ledger.take();
+                                (revoke, true)
+                            });
+                    if revoke.is_some() {
+                        inner
+                            .completed_ready
+                            .retain(|(hash, id)| *hash != failed_hash || *id != acquisition_id);
+                    }
+                    record_recent_failure(&mut inner, failed_hash, Some(acquisition_id));
+                    (revoke, transitioned)
+                };
+                if let Some(identity) = revoke
+                    && let Some(revoker) = revoker
+                        .read()
+                        .expect("completed_ledger_revoker read")
+                        .clone()
+                {
+                    revoker(identity);
+                }
+                if transitioned
+                    && let Some(notify) = publication_advance_notifier
+                        .read()
+                        .expect("publication_advance_notifier read")
+                        .clone()
+                {
+                    notify();
+                }
             })
         };
         let completed_ledger_store = self
@@ -936,30 +1030,39 @@ impl InboundLedgers {
             .clone();
         let completion_recorder: AcquisitionCompletionRecorder = {
             let inner = Arc::clone(&self.inner);
-            Arc::new(move |completed_hash, ledger| {
+            Arc::new(move |identity, ledger| {
                 let mut inner = inner
                     .lock()
                     .expect("inbound_ledgers completion recorder lock");
                 // Match InboundLedger::done(): terminal completion owns the
                 // last-action update, so queue latency cannot make a newly
                 // completed ledger eligible for an immediate sweep.
-                let registered = if let Some(entry) = inner.entries.get_mut(&completed_hash)
-                    && entry.id == acquisition_id
+                let registered = if let Some(entry) = inner.entries.get_mut(&identity.target_hash)
+                    && entry.id == identity.acquisition_id
+                    && !entry.failed
+                    && identity.ledger_hash == identity.target_hash
+                    && ledger.header().seq == identity.ledger_seq
                 {
-                    entry.completed_ledger = Some(ledger);
+                    entry.provisional_identity = Some(identity);
+                    entry.completed_ledger = Some(Arc::clone(&ledger));
                     entry.last_touched = Instant::now();
                     true
                 } else {
                     false
                 };
+                if registered && reason != AcquireReason::History {
+                    if let Some(store) = &completed_ledger_store {
+                        // Hold the registry identity through history visibility:
+                        // cancellation cannot revoke before this exact cache
+                        // publication is either complete or refused.
+                        store(ledger);
+                    }
+                }
                 if registered {
-                    // `InboundLedger::done()` reaches `AcqDone` only after
-                    // the completed ledger has been stored. Publish the exact
-                    // acquisition identity here, rather than asking the
-                    // strand to eventually discover it by scanning entries.
-                    inner
-                        .completed_ready
-                        .push_back((completed_hash, acquisition_id));
+                    // Resolver visibility intentionally precedes the final
+                    // fence, but AcqDone/NetworkOps adoption does not. The
+                    // durable callback below owns both ready-queue publication
+                    // and the coalesced advance event.
                 } else {
                     // Match rippled's InboundLedgers::sweep ownership: once
                     // an entry is no longer resident, a late completion must
@@ -967,15 +1070,46 @@ impl InboundLedgers {
                     // A later validation/history request can acquire it again.
                     tracing::debug!(
                         target: "inbound_ledger",
-                        hash = %completed_hash,
-                        acquisition_id,
+                        hash = %identity.target_hash,
+                        acquisition_id = identity.acquisition_id,
                         "dropping completion for swept inbound ledger"
                     );
                 }
+                registered
             })
         };
-        let full_below_gen = self.full_below.generation().wrapping_add(1);
-
+        let durable_completion_recorder: AcquisitionDurableCompletionRecorder = {
+            let inner = Arc::clone(&self.inner);
+            let publication_advance_notifier = Arc::clone(&self.publication_advance_notifier);
+            Arc::new(move |completed_hash| {
+                let ready = {
+                    let mut inner = inner
+                        .lock()
+                        .expect("inbound_ledgers durable completion recorder lock");
+                    if let Some(entry) = inner.entries.get_mut(&completed_hash)
+                        && entry.id == acquisition_id
+                        && !entry.failed
+                        && entry.completed_ledger.is_some()
+                    {
+                        entry.provisional_identity = None;
+                        inner
+                            .completed_ready
+                            .push_back((completed_hash, acquisition_id));
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if ready
+                    && let Some(notify) = publication_advance_notifier
+                        .read()
+                        .expect("publication_advance_notifier read")
+                        .clone()
+                {
+                    notify();
+                }
+            })
+        };
         let acq_state = AcquisitionBuilder {
             hash: SHAMapHash::new(hash),
             acquisition_id,
@@ -988,9 +1122,10 @@ impl InboundLedgers {
             store_tx: self.completed_ledgers_tx.clone(),
             failure_recorder,
             completion_recorder,
-            completed_ledger_store,
-            full_below_generation: full_below_gen,
+            durable_completion_recorder,
+            shared_full_below: Arc::clone(&self.full_below),
             worker_pool: Arc::clone(&self.worker_pool),
+            scheduler: Arc::clone(&self.scheduler),
             initial_peers,
             peer_provider,
             lifecycle: Arc::clone(&self.lifecycle),
@@ -1008,6 +1143,7 @@ impl InboundLedgers {
                 last_touched: now,
                 started_at: now,
                 completed_ledger: None,
+                provisional_identity: None,
                 completion_acknowledged: false,
                 failed: false,
             },
@@ -1077,7 +1213,7 @@ impl InboundLedgers {
         peer_id: u64,
         response_seq: Option<u32>,
         packet: InboundLedgerPacket,
-    ) -> bool {
+    ) -> LedgerDataRouteDisposition {
         self.lifecycle
             .route_attempts
             .fetch_add(1, Ordering::Relaxed);
@@ -1086,7 +1222,7 @@ impl InboundLedgers {
             let Some(entry) = inner.entries.get_mut(hash) else {
                 self.lifecycle.route_misses.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: registry miss");
-                return false;
+                return LedgerDataRouteDisposition::Unmatched;
             };
             if entry.failed
                 || entry.state.failed.load(Ordering::Acquire)
@@ -1096,7 +1232,7 @@ impl InboundLedgers {
                     .route_terminal
                     .fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: ignored terminal acquisition");
-                return false;
+                return LedgerDataRouteDisposition::Terminal;
             }
             if let Some(response_seq) = response_seq
                 && !response_sequence_matches_request(entry.seq, response_seq)
@@ -1112,7 +1248,7 @@ impl InboundLedgers {
                     peer_id,
                     "route_response: sequence mismatch"
                 );
-                return false;
+                return LedgerDataRouteDisposition::SequenceMismatch;
             }
             // Wire receipt does not change rippled InboundLedger::lastAction.
             // Only construction, duplicate acquire/update, and terminal done
@@ -1120,18 +1256,39 @@ impl InboundLedgers {
             Arc::clone(&entry.state)
         };
 
-        if state.enqueue_packet(peer_id, packet) {
-            self.lifecycle
-                .route_accepted
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: registry hit");
-            true
-        } else {
-            self.lifecycle
-                .route_terminal
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(target: "inbound_ledger", %hash, peer_id, "route_response: acquisition mailbox overloaded or terminal");
-            false
+        match state.enqueue_packet(peer_id, packet) {
+            PacketEnqueue::Accepted => {
+                self.lifecycle
+                    .route_accepted
+                    .fetch_add(1, Ordering::Relaxed);
+                self.scheduler.wake(
+                    AcquisitionKey {
+                        hash: *hash,
+                        id: state.acquisition_id,
+                    },
+                    &state,
+                    ReadyCause::WIRE,
+                );
+                tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: registry hit");
+                LedgerDataRouteDisposition::Accepted
+            }
+            PacketEnqueue::Terminal => {
+                self.lifecycle
+                    .route_terminal
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: terminal acquisition");
+                LedgerDataRouteDisposition::Terminal
+            }
+            PacketEnqueue::Full => {
+                // This packet matched a live acquisition. Do not recategorize
+                // it as stale/fetch-pack material: the caller must apply its
+                // explicit pressure policy instead.
+                self.lifecycle
+                    .route_terminal
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(target: "inbound_ledger", %hash, peer_id, "route_response: acquisition mailbox full");
+                LedgerDataRouteDisposition::MailboxFull
+            }
         }
     }
 
@@ -1161,6 +1318,8 @@ impl InboundLedgers {
             {
                 to_remove.push((
                     *hash,
+                    entry.id,
+                    entry.last_touched,
                     entry.seq,
                     entry.reason,
                     idle_for,
@@ -1171,28 +1330,29 @@ impl InboundLedgers {
             }
         }
 
-        let mut swept_states = Vec::new();
-        for (hash, seq, reason, idle_for, failed, completed) in to_remove {
-            if let Some(entry) = inner.entries.remove(&hash) {
-                tracing::info!(
-                    target: "lcl_trace",
-                    event = "inbound_swept",
-                    %hash,
-                    seq,
-                    reason = ?reason,
-                    idle_ms = idle_for.as_millis() as u64,
-                    failed,
-                    completed,
-                    "LCL trace: inbound acquisition removed by sweep"
-                );
-                // Match rippled's sweep: removing an idle InboundLedger
-                // releases its completed ledger. Remove its direct completion
-                // handoff as well; future validation/history work will
-                // reacquire the exact hash.
+        // Revalidate and detach under the registry owner lock. A stale
+        // snapshot must never cancel a same-hash acquisition that was touched
+        // or replaced after the initial scan.
+        let mut removed = Vec::new();
+        for (hash, id, observed_touch, seq, reason, idle_for, failed, completed) in to_remove {
+            let removable = inner.entries.get(&hash).is_some_and(|entry| {
+                entry.id == id
+                    && entry.last_touched == observed_touch
+                    && now.duration_since(entry.last_touched) > SWEEP_IDLE_TIMEOUT
+                    && !entry.state.has_pending_durability()
+                    && (!entry.state.completed.load(Ordering::Acquire)
+                        && entry.completed_ledger.is_none()
+                        || entry.completion_acknowledged)
+            });
+            if removable {
+                let entry = inner
+                    .entries
+                    .remove(&hash)
+                    .expect("revalidated inbound entry");
                 inner
                     .completed_ready
-                    .retain(|(ready_hash, _)| *ready_hash != hash);
-                swept_states.push(entry.state);
+                    .retain(|(ready_hash, ready_id)| *ready_hash != hash || *ready_id != id);
+                removed.push((hash, seq, reason, idle_for, failed, completed, entry));
             }
         }
         inner
@@ -1200,17 +1360,47 @@ impl InboundLedgers {
             .retain(|_, when| when.elapsed() < FAILURE_COOLDOWN);
         drop(inner);
 
+        let revoker = self
+            .completed_ledger_revoker
+            .read()
+            .expect("completed_ledger_revoker read")
+            .clone();
+        let swept = !removed.is_empty();
+        let mut stale_packets = Vec::new();
+        for (hash, seq, reason, idle_for, failed, completed, entry) in removed {
+            if let Some(identity) = entry.provisional_identity
+                && let Some(revoke) = &revoker
+            {
+                revoke(identity);
+            }
+            let buffered = entry.state.take_buffered_packets();
+            entry.state.cancel();
+            stale_packets.push((hash, buffered));
+            tracing::info!(
+                target: "lcl_trace",
+                event = "inbound_swept",
+                %hash,
+                seq,
+                reason = ?reason,
+                idle_ms = idle_for.as_millis() as u64,
+                failed,
+                completed,
+                "LCL trace: inbound acquisition removed by sweep"
+            );
+        }
+
         // Mirrors InboundLedger destruction: useful state-node packets that
         // were received but not yet processed can seed a later acquisition.
-        for state in swept_states {
-            let buffered = state.take_buffered_packets();
-            state.cancel();
+        for (_, buffered) in stale_packets {
             for received in buffered {
                 if received.packet.packet_type == ledger::InboundLedgerDataType::StateNode {
                     let stored = self.stash_stale_packet(&received.packet);
                     self.note_stale_packet_result(stored);
                 }
             }
+        }
+        if swept {
+            self.notify_publication_advance();
         }
     }
 
@@ -1334,18 +1524,6 @@ impl InboundLedgers {
                         "worker_count".to_owned(),
                         JsonValue::Unsigned(worker.worker_count as u64),
                     ),
-                    (
-                        "ledger_data_job_limit".to_owned(),
-                        JsonValue::Unsigned(worker.ledger_data_job_limit as u64),
-                    ),
-                    (
-                        "timeout_submission_attempts".to_owned(),
-                        JsonValue::Unsigned(worker.timeout_submission_attempts),
-                    ),
-                    (
-                        "timeout_submission_rejected".to_owned(),
-                        JsonValue::Unsigned(worker.timeout_submission_rejected),
-                    ),
                 ])),
             ),
         ]);
@@ -1378,20 +1556,26 @@ impl InboundLedgers {
 
     /// Notify that a ledger was completed (called externally or by sweep).
     pub fn on_complete(&self, hash: Uint256, ledger: Arc<Ledger>) {
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        let completion_id = if let Some(entry) = inner.entries.get_mut(&hash) {
-            if entry.completed_ledger.is_none() {
-                entry.completed_ledger = Some(ledger);
-                entry.last_touched = Instant::now();
-                Some(entry.id)
+        let completion_id = {
+            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let completion_id = if let Some(entry) = inner.entries.get_mut(&hash) {
+                if entry.completed_ledger.is_none() {
+                    entry.completed_ledger = Some(ledger);
+                    entry.last_touched = Instant::now();
+                    Some(entry.id)
+                } else {
+                    None
+                }
             } else {
                 None
+            };
+            if let Some(acquisition_id) = completion_id {
+                inner.completed_ready.push_back((hash, acquisition_id));
             }
-        } else {
-            None
+            completion_id
         };
-        if let Some(acquisition_id) = completion_id {
-            inner.completed_ready.push_back((hash, acquisition_id));
+        if completion_id.is_some() {
+            self.notify_publication_advance();
         }
     }
 
@@ -1407,13 +1591,29 @@ impl InboundLedgers {
         };
         if let Some(state) = state {
             state.cancel();
+            self.notify_publication_advance();
         }
     }
 
     /// Log a failure for the given hash/seq (matches rippled's `logFailure`).
     pub fn log_failure(&self, hash: Uint256, _seq: u32) {
-        let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-        record_recent_failure(&mut inner, hash, None);
+        {
+            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            record_recent_failure(&mut inner, hash, None);
+        }
+        self.notify_publication_advance();
+    }
+
+    /// True only while a completed ledger is resolver-visible but its final
+    /// NodeStore durability fence has not succeeded. Resolver access remains
+    /// available; validation, LCL, and publication owners must not adopt it.
+    pub(crate) fn is_provisional(&self, hash: &Uint256) -> bool {
+        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        inner.entries.get(hash).is_some_and(|entry| {
+            !entry.failed
+                && entry.completed_ledger.is_some()
+                && !entry.state.completed.load(Ordering::Acquire)
+        })
     }
 
     /// Check whether a hash is recorded as a recent failure (matches rippled's
@@ -1432,14 +1632,31 @@ impl InboundLedgers {
     /// Clear both `recent_failures` and `ledgers_` (matches rippled's
     /// `clearFailures`).
     pub fn clear_failures(&self) {
-        let entries = {
+        let states = {
+            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            inner
+                .entries
+                .values()
+                .map(|entry| Arc::clone(&entry.state))
+                .collect::<Vec<_>>()
+        };
+        // Keep each entry resident through cancellation so the failure
+        // recorder can retract any resolver-visible provisional ledger.
+        for state in &states {
+            state.cancel();
+        }
+        let changed = {
             let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let changed = !inner.entries.is_empty()
+                || !inner.recent_failures.is_empty()
+                || !inner.completed_ready.is_empty();
             inner.recent_failures.clear();
             inner.completed_ready.clear();
-            std::mem::take(&mut inner.entries)
+            inner.entries.clear();
+            changed
         };
-        for entry in entries.into_values() {
-            entry.state.cancel();
+        if changed {
+            self.notify_publication_advance();
         }
     }
 
@@ -1466,6 +1683,11 @@ impl InboundLedgers {
     /// all acquisition workers.
     pub fn store_fetch_pack(&self, hash: Uint256, data: Vec<u8>) {
         self.fetch_pack.add_fetch_pack(hash, data);
+        self.fetch_pack_wakes
+            .lock()
+            .expect("fetch-pack wake lock")
+            .pending_hashes
+            .insert(hash);
     }
 
     /// Stash state-node data from an untracked ledger response, matching
@@ -1492,40 +1714,71 @@ impl InboundLedgers {
         true
     }
 
-    /// Send fetch-pack-ready signal to all in-progress acquisitions.
-    pub fn notify_fetch_pack_ready(&self) {
+    /// Complete the one LedgerMaster single-flight fetch-pack pass. It snapshots
+    /// active acquisitions and schedules their local checks through the ready
+    /// set, matching rippled `InboundLedgers::gotFetchPack()` without N direct
+    /// worker submissions.
+    pub fn finish_fetch_pack_pass(&self) {
+        let generation = {
+            let mut wakes = self.fetch_pack_wakes.lock().expect("fetch-pack wake lock");
+            if wakes.pending_hashes.is_empty() {
+                return;
+            }
+            wakes.next_generation = wakes.next_generation.wrapping_add(1).max(1);
+            wakes.pending_hashes.clear();
+            wakes.next_generation
+        };
         let states: Vec<Arc<AcquisitionState>> = {
             let inner = self.inner.lock().expect("inbound_ledgers lock");
             inner
                 .entries
                 .values()
-                .filter(|e| !e.failed && e.completed_ledger.is_none())
-                .map(|e| Arc::clone(&e.state))
+                .filter_map(|entry| {
+                    (!entry.failed && entry.completed_ledger.is_none())
+                        .then(|| Arc::clone(&entry.state))
+                })
                 .collect()
         };
         for state in states {
-            if state.stopped.load(Ordering::Acquire) || state.completed.load(Ordering::Acquire) {
-                continue;
+            if state.note_fetch_pack_generation(generation) {
+                self.scheduler.wake(
+                    AcquisitionKey {
+                        hash: *state.hash.as_uint256(),
+                        id: state.acquisition_id,
+                    },
+                    &state,
+                    ReadyCause::FETCH_PACK,
+                );
             }
-            state.fetch_pack_ready.store(true, Ordering::Release);
-            state.submit_data_job();
         }
     }
 
     /// Remove a specific entry.
     pub fn remove(&self, hash: &Uint256) {
         let state = {
-            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-            let state = inner.entries.remove(hash).map(|entry| entry.state);
-            if state.is_some() {
-                inner
-                    .completed_ready
-                    .retain(|(ready_hash, _)| ready_hash != hash);
-            }
-            state
+            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            inner
+                .entries
+                .get(hash)
+                .map(|entry| Arc::clone(&entry.state))
         };
+        // Cancellation must happen while the exact registry entry is still
+        // present so its recorder can revoke a provisional resolver result.
         if let Some(state) = state {
             state.cancel();
+            let removed = {
+                let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+                let removed = inner.entries.remove(hash).is_some();
+                if removed {
+                    inner
+                        .completed_ready
+                        .retain(|(ready_hash, _)| ready_hash != hash);
+                }
+                removed
+            };
+            if removed {
+                self.notify_publication_advance();
+            }
         }
     }
 
@@ -1533,16 +1786,24 @@ impl InboundLedgers {
     pub fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
 
-        let entries = {
+        let states = {
+            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            inner
+                .entries
+                .values()
+                .map(|entry| Arc::clone(&entry.state))
+                .collect::<Vec<_>>()
+        };
+        for state in &states {
+            state.cancel();
+        }
+        {
             let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-            let entries = std::mem::take(&mut inner.entries);
+            inner.entries.clear();
             inner.recent_failures.clear();
             inner.completed_ready.clear();
-            entries
-        };
-        for (_, entry) in entries {
-            entry.state.cancel();
         }
+        self.scheduler.stop();
         self.read_broker.stop();
         self.worker_pool.stop();
     }
@@ -1667,9 +1928,9 @@ impl InboundLedgers {
         if min_seq <= 1 {
             return 0;
         }
-        let (count, states) = {
-            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-            let stale: Vec<Uint256> = inner
+        let candidates = {
+            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            inner
                 .entries
                 .iter()
                 .filter(|(_, entry)| {
@@ -1678,22 +1939,27 @@ impl InboundLedgers {
                         && entry.seq > 1
                         && entry.seq < min_seq
                 })
-                .map(|(hash, _)| *hash)
-                .collect();
-            let count = stale.len();
-            let mut states = Vec::with_capacity(count);
-            for hash in stale {
-                if let Some(entry) = inner.entries.remove(&hash) {
+                .map(|(hash, entry)| (*hash, Arc::clone(&entry.state)))
+                .collect::<Vec<_>>()
+        };
+        for (_, state) in &candidates {
+            state.cancel();
+        }
+        let count = {
+            let mut inner = self.inner.lock().expect("inbound_ledgers lock");
+            let mut count = 0;
+            for (hash, _) in &candidates {
+                if inner.entries.remove(hash).is_some() {
                     inner
                         .completed_ready
-                        .retain(|(ready_hash, _)| *ready_hash != hash);
-                    states.push(entry.state);
+                        .retain(|(ready_hash, _)| ready_hash != hash);
+                    count += 1;
                 }
             }
-            (count, states)
+            count
         };
-        for state in states {
-            state.cancel();
+        if count != 0 {
+            self.notify_publication_advance();
         }
         count
     }
@@ -1767,32 +2033,57 @@ impl InboundLedgers {
     /// Returns the number of entries removed.
     pub fn remove_stale_no_progress(&self, idle_timeout: Duration) -> Vec<(Uint256, u32)> {
         let now = Instant::now();
-        let (stale, states) = {
+        let removed = {
             let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-            let stale: Vec<(Uint256, u32)> = inner
+            let stale = inner
                 .entries
                 .iter()
-                .filter(|(_, e)| {
-                    !e.failed
-                        && e.completed_ledger.is_none()
-                        && !e.state.completed.load(Ordering::Acquire)
-                        && now.duration_since(e.last_touched) > idle_timeout
+                .filter(|(_, entry)| {
+                    !entry.failed
+                        && entry.completed_ledger.is_none()
+                        && !entry.state.completed.load(Ordering::Acquire)
+                        && now.duration_since(entry.last_touched) > idle_timeout
                 })
-                .map(|(hash, e)| (*hash, e.seq))
-                .collect();
-            let mut states = Vec::with_capacity(stale.len());
-            for (hash, _) in &stale {
-                if let Some(entry) = inner.entries.remove(hash) {
+                .map(|(hash, entry)| (*hash, entry.id))
+                .collect::<Vec<_>>();
+            let mut removed = Vec::with_capacity(stale.len());
+            for (hash, id) in stale {
+                let removable = inner.entries.get(&hash).is_some_and(|entry| {
+                    entry.id == id
+                        && !entry.failed
+                        && entry.completed_ledger.is_none()
+                        && !entry.state.completed.load(Ordering::Acquire)
+                        && now.duration_since(entry.last_touched) > idle_timeout
+                });
+                if removable {
+                    let entry = inner
+                        .entries
+                        .remove(&hash)
+                        .expect("revalidated stale entry");
                     inner
                         .completed_ready
-                        .retain(|(ready_hash, _)| ready_hash != hash);
-                    states.push(entry.state);
+                        .retain(|(ready_hash, ready_id)| *ready_hash != hash || *ready_id != id);
+                    removed.push((hash, entry.seq, entry));
                 }
             }
-            (stale, states)
+            removed
         };
-        for state in states {
-            state.cancel();
+        let revoker = self
+            .completed_ledger_revoker
+            .read()
+            .expect("completed_ledger_revoker read")
+            .clone();
+        let stale = removed
+            .iter()
+            .map(|(hash, seq, _)| (*hash, *seq))
+            .collect::<Vec<_>>();
+        for (_, _, entry) in removed {
+            if let Some(identity) = entry.provisional_identity
+                && let Some(revoke) = &revoker
+            {
+                revoke(identity);
+            }
+            entry.state.cancel();
         }
         stale
     }
@@ -1926,7 +2217,7 @@ mod tests {
         AcquireReason, AcquisitionLifecycleCounters, AcquisitionLifecycleSnapshot, InboundLedgers,
         RecoveryLclDecision, RegistryInner, SWEEP_IDLE_TIMEOUT, acquisition_snapshot_json,
         failure_matches_entry, record_recent_failure, record_recent_failure_at,
-        recovery_lcl_decision_json, response_sequence_matches_request, touch_terminal_entry_at,
+        recovery_lcl_decision_json, response_sequence_matches_request,
     };
     use basics::base_uint::Uint256;
     use basics::basic_config::BasicConfig;
@@ -2036,8 +2327,14 @@ mod tests {
         );
 
         let malformed = || InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new());
-        assert!(registry.route_response_with_seq(&hash, 77, Some(1), malformed()));
-        assert!(registry.route_response_with_seq(&hash, 77, Some(1), malformed()));
+        assert_eq!(
+            registry.route_response_with_seq(&hash, 77, Some(1), malformed()),
+            LedgerDataRouteDisposition::Accepted
+        );
+        assert_eq!(
+            registry.route_response_with_seq(&hash, 77, Some(1), malformed()),
+            LedgerDataRouteDisposition::Accepted
+        );
         assert_eq!(
             worker_pool.snapshot().queued_jobs,
             queued_before_ingress + 1,
@@ -2248,59 +2545,6 @@ mod tests {
         assert!(failure_matches_entry(None, 2));
         assert!(failure_matches_entry(Some(2), 2));
         assert!(!failure_matches_entry(Some(1), 2));
-    }
-
-    #[test]
-    fn terminal_touch_refreshes_only_the_matching_acquisition() {
-        let worker_pool = Arc::new(WorkerPool::new(0));
-        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
-        let hash = Uint256::from_array([0xF6; 32]);
-        assert!(
-            registry
-                .acquire(hash, 0, AcquireReason::Consensus)
-                .is_none()
-        );
-
-        let first_id = {
-            let inner = registry.inner.lock().expect("registry lock");
-            inner.entries.get(&hash).expect("first entry").id
-        };
-        registry.remove(&hash);
-        assert!(
-            registry
-                .acquire(hash, 0, AcquireReason::Consensus)
-                .is_none()
-        );
-
-        let before = Instant::now() - Duration::from_secs(30);
-        let refreshed = Instant::now();
-        {
-            let mut inner = registry.inner.lock().expect("registry lock");
-            let replacement = inner.entries.get_mut(&hash).expect("replacement entry");
-            replacement.last_touched = before;
-            let replacement_id = replacement.id;
-            touch_terminal_entry_at(&mut inner, hash, first_id, refreshed);
-            assert_eq!(
-                inner
-                    .entries
-                    .get(&hash)
-                    .expect("replacement entry")
-                    .last_touched,
-                before,
-                "a delayed predecessor terminal callback must not refresh a replacement"
-            );
-            touch_terminal_entry_at(&mut inner, hash, replacement_id, refreshed);
-            assert_eq!(
-                inner
-                    .entries
-                    .get(&hash)
-                    .expect("replacement entry")
-                    .last_touched,
-                refreshed,
-                "the matching terminal callback must own the sweep timestamp"
-            );
-        }
-        registry.stop();
     }
 
     #[test]
@@ -2555,21 +2799,9 @@ mod tests {
             tracked_peers: 0,
             buffered_packets: 0,
             buffered_packets_high_water: 0,
-            mailbox_bytes: 0,
-            mailbox_bytes_high_water: 0,
-            mailbox_events: 0,
-            stale_events: 0,
-            overload_rejections: 0,
-            active_plan_id: None,
-            active_plan_kind: None,
-            plan_pending_hashes: 0,
-            plan_pending_edges: 0,
-            broker_queued_keys: 0,
-            broker_in_flight_keys: 0,
             mailbox_token: "idle",
             scan_continuation_pending: false,
             pending_admitted_timeouts: 0,
-            has_active_packet: false,
         };
 
         let JsonValue::Object(values) = acquisition_snapshot_json(

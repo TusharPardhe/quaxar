@@ -264,7 +264,17 @@ pub struct AppOpenLedgerView {
     pub ledger_current_index: u32,
     pub base_fee_drops: u64,
     pub parent_hash: Uint256,
+    /// Header timing copied from the current open ledger's parent.  This is
+    /// deliberately not reconstructed from a later closed ledger.
+    pub parent_close_time: u32,
+    pub close_time_resolution: u8,
     txs: Vec<AppOpenLedgerTxRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppOpenLedgerTiming {
+    pub parent_close_time: u32,
+    pub close_time_resolution: u8,
 }
 
 impl Default for AppOpenLedgerView {
@@ -283,10 +293,22 @@ impl AppOpenLedgerView {
         base_fee_drops: u64,
         parent_hash: Uint256,
     ) -> Self {
+        Self::with_parent_timing(ledger_current_index, base_fee_drops, parent_hash, 0, 0)
+    }
+
+    pub fn with_parent_timing(
+        ledger_current_index: u32,
+        base_fee_drops: u64,
+        parent_hash: Uint256,
+        parent_close_time: u32,
+        close_time_resolution: u8,
+    ) -> Self {
         Self {
             ledger_current_index,
             base_fee_drops,
             parent_hash,
+            parent_close_time,
+            close_time_resolution,
             txs: Vec::new(),
         }
     }
@@ -301,6 +323,8 @@ impl AppOpenLedgerView {
             ledger_current_index,
             base_fee_drops,
             parent_hash,
+            parent_close_time: 0,
+            close_time_resolution: 0,
             txs,
         }
     }
@@ -561,6 +585,17 @@ impl SharedAppOpenLedger {
         let current_index = self.current().ledger_current_index;
         (current_index != 0).then_some(current_index)
     }
+
+    /// Snapshot only the current-open header fields used by NetworkOPs mode
+    /// promotion. A zero resolution is the synthetic/uninitialized state and
+    /// intentionally cannot satisfy the Full freshness predicate.
+    pub fn current_header_timing(&self) -> Option<AppOpenLedgerTiming> {
+        let current = self.current();
+        (current.close_time_resolution != 0).then_some(AppOpenLedgerTiming {
+            parent_close_time: current.parent_close_time,
+            close_time_resolution: current.close_time_resolution,
+        })
+    }
 }
 
 impl crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource for SharedAppOpenLedger {
@@ -581,6 +616,8 @@ impl crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource for SharedApp
         next_seq: u32,
         base_fee: u64,
         parent_hash: &basics::base_uint::Uint256,
+        parent_close_time: u32,
+        close_time_resolution: u8,
         completed_transaction_ids: &std::collections::HashSet<basics::base_uint::Uint256>,
         retry_transactions: &[std::sync::Arc<protocol::STTx>],
         retries_first: bool,
@@ -636,7 +673,13 @@ impl crate::consensus::rcl_consensus::RclConsensusOpenLedgerSource for SharedApp
                 }
             }
 
-            *view = AppOpenLedgerView::with_parent_hash(next_seq, base_fee, *parent_hash);
+            *view = AppOpenLedgerView::with_parent_timing(
+                next_seq,
+                base_fee,
+                *parent_hash,
+                parent_close_time,
+                close_time_resolution,
+            );
             for tx in next_transactions {
                 view.push_transaction(tx);
             }
@@ -676,6 +719,8 @@ mod open_ledger_tests {
             11,
             12,
             &Uint256::from_u64(10),
+            100,
+            10,
             &completed_ids,
             &[
                 Arc::clone(&local_retry),
@@ -699,6 +744,8 @@ mod open_ledger_tests {
             ])
         );
         assert_eq!(open_ledger.current().ledger_current_index, 11);
+        assert_eq!(open_ledger.current().parent_close_time, 100);
+        assert_eq!(open_ledger.current().close_time_resolution, 10);
         assert_eq!(
             retained
                 .iter()
@@ -1006,10 +1053,14 @@ pub struct AppConfig {
     pub relay_untrusted_validations: RelayUntrustedPolicy,
     pub relay_untrusted_proposals: RelayUntrustedPolicy,
     pub standalone: bool,
+    pub start_valid: bool,
     pub start_up: xrpl_core::StartUpType,
     pub start_ledger: Option<String>,
     pub do_import: bool,
     pub validation_quorum: usize,
+    /// rippled Config::networkQuorum; network presence threshold, unrelated
+    /// to validator quorum.
+    pub network_quorum: usize,
     pub validation_seed: Option<String>,
     pub validator_token: Option<Vec<String>>,
 }
@@ -1025,10 +1076,12 @@ impl Default for AppConfig {
             relay_untrusted_validations: RelayUntrustedPolicy::All,
             relay_untrusted_proposals: RelayUntrustedPolicy::Trusted,
             standalone: false,
+            start_valid: false,
             start_up: xrpl_core::StartUpType::Fresh,
             start_ledger: None,
             do_import: false,
             validation_quorum: 1,
+            network_quorum: 1,
             validation_seed: None,
             validator_token: None,
         }
@@ -1384,10 +1437,12 @@ impl ApplicationRegistryOwners {
                 relay_untrusted_validations: RelayUntrustedPolicy::All,
                 relay_untrusted_proposals: RelayUntrustedPolicy::Trusted,
                 standalone: false,
+                start_valid: false,
                 start_up: xrpl_core::StartUpType::Fresh,
                 start_ledger: None,
                 do_import: false,
                 validation_quorum: 1,
+                network_quorum: 1,
                 validation_seed: None,
                 validator_token: None,
             },

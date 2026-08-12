@@ -381,6 +381,11 @@ impl MainRuntime {
             return;
         }
 
+        // Keep direct shutdown on the same one-shot lifecycle as the normal
+        // signal-and-wait path. This runs stop-tree callbacks, including the
+        // NodeFamily reset, before any owned worker or component is torn down.
+        let _ = self.signal_stop("runtime shutdown");
+
         // RPC snapshot exports borrow a NodeStore backend on a dedicated
         // worker. Quiesce and join that owned worker before any managed
         // storage service is stopped.

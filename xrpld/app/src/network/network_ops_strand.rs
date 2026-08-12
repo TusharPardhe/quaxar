@@ -90,6 +90,51 @@ struct CompletionPersistence {
     acknowledged: bool,
 }
 
+/// Live adapters for the deterministic `ledger::run_try_fill_backwalk` core.
+/// They keep relational and NodeStore ownership in `AppLoadedLedgerRuntime`;
+/// this strand only applies the already verified contiguous result.
+struct LiveHistoryPresence<'a> {
+    ledger_master: &'a ledger::LedgerMaster,
+}
+
+impl ledger::LedgerPresence for LiveHistoryPresence<'_> {
+    fn have_ledger(&self, ledger_index: u32) -> bool {
+        self.ledger_master.have_ledger(ledger_index)
+    }
+}
+
+struct LiveHistoryHashPairs<'a> {
+    loaded: &'a crate::ledger::loaded_ledger_runtime::AppLoadedLedgerRuntime,
+}
+
+impl ledger::LedgerHashPairProvider for LiveHistoryHashPairs<'_> {
+    fn get_hashes_by_index(
+        &self,
+        min_seq: u32,
+        max_seq: u32,
+    ) -> Vec<(u32, ledger::LedgerHashPair)> {
+        self.loaded.get_hash_pairs_by_index(min_seq, max_seq)
+    }
+}
+
+struct LiveHistoryObjectPresence<'a> {
+    loaded: &'a crate::ledger::loaded_ledger_runtime::AppLoadedLedgerRuntime,
+}
+
+impl ledger::LedgerObjectPresence for LiveHistoryObjectPresence<'_> {
+    fn has_ledger_object(&self, ledger_hash: ledger::SHAMapHash, ledger_seq: u32) -> bool {
+        self.loaded.has_ledger_object(ledger_hash, ledger_seq)
+    }
+}
+
+struct StrandHistoryFillStopper<'a>(&'a ApplicationRoot);
+
+impl ledger::Stopper for StrandHistoryFillStopper<'_> {
+    fn is_stopping(&self) -> bool {
+        self.0.is_stopping()
+    }
+}
+
 /// Typed JobQueue handoff for work that must ultimately mutate consensus.
 ///
 /// Rippled schedules heartbeats as `JtNetopTimer` and accepted-ledger work as
@@ -270,6 +315,9 @@ pub struct NetworkOpsStrandDeps {
     pub configured_ledger_history: u32,
     /// rippled `SizedItem::LedgerFetch` for the configured node-size profile.
     pub configured_ledger_fetch_size: u32,
+    /// rippled NetworkOPsImp::minPeerCount_, fixed at construction (zero for
+    /// start_valid) rather than reinterpreted in the heartbeat.
+    pub min_peer_count: usize,
     /// Receiver for completed ledgers from shared_inbound acquisition.
     pub shared_completed_rx:
         Option<std::sync::mpsc::Receiver<crate::ledger::inbound_ledgers::CompletedInboundLedger>>,
@@ -371,6 +419,7 @@ fn strand_loop(
         shared_inbound,
         configured_ledger_history,
         configured_ledger_fetch_size,
+        min_peer_count,
         shared_completed_rx,
     } = deps;
 
@@ -523,7 +572,7 @@ fn strand_loop(
         if let Some(overlay_rt) = root.overlay_runtime() {
             use overlay::Overlay;
             let num_peers = overlay_rt.overlay().size();
-            let min_peers: usize = 1; // rippled default minPeerCount_
+            let min_peers = min_peer_count;
             let current_mode = root.network_ops_state().operating_mode();
             if num_peers < min_peers {
                 if current_mode != NetworkOpsOperatingMode::Disconnected {
@@ -989,14 +1038,10 @@ fn reconcile_preferred_lcl(
         &peer_counts,
     );
     let preferred_hash = preference_diagnostic.selected;
-    // Preserve the exact resolver result for this Accepted pass. Reusing it
-    // below distinguishes a true resolver hit from an inbound-registry hit
-    // and avoids a second lookup obscuring a cache/sweep race in diagnostics.
-    let preferred_resident =
-        root.resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash));
-    let selected_preferred_resident = preferred_resident
-        .as_ref()
-        .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
+    // Do not resolve before rippled's no-switch predicates below. Keep this
+    // pre-check diagnostic provider-free so an already-local/parent preference
+    // cannot create serialized-strand lookup work.
+    let selected_preferred_resident: Option<(Uint256, u32)> = None;
     tracing::info!(
         target: "lcl_trace",
         event = "preferred_lcl_selected",
@@ -1084,6 +1129,11 @@ fn reconcile_preferred_lcl(
         );
         return PreferredLclReconciliation::NoChange;
     }
+
+    // Rippled resolves a preferred ledger only after proving this is an
+    // actionable switch candidate.
+    let preferred_resident =
+        root.resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(preferred_hash));
 
     // `checkLastClosedLedger` immediately asks InboundLedgers for a resolver
     // miss. Preserve the source of a successful candidate so a live trace can
@@ -1470,30 +1520,29 @@ fn check_accept_and_advance(
             next_mode = NetworkOpsOperatingMode::Tracking;
         }
 
-        let local_lcl = root.closed_ledger();
         let now_close_time = root.current_close_time_seconds();
-        let full_freshness = local_lcl.as_ref().map(|lcl| {
-            let resolution = u32::from(lcl.header().close_time_resolution);
-            let freshness_deadline = lcl
-                .header()
-                .close_time
+        // rippled endConsensus reads LedgerMaster::getCurrentLedger(), whose
+        // parentCloseTime/resolution are current-open header provenance, not
+        // the closed/published fallback used by the old port.
+        let full_freshness = root.open_ledger().current_header_timing().map(|timing| {
+            let resolution = u32::from(timing.close_time_resolution);
+            let freshness_deadline = timing
+                .parent_close_time
                 .saturating_add(resolution.saturating_mul(2));
             (
-                *lcl.header().hash.as_uint256(),
-                lcl.header().seq,
-                lcl.header().close_time,
+                timing.parent_close_time,
                 resolution,
                 freshness_deadline,
                 now_close_time < freshness_deadline,
             )
         });
 
-        // Connected/Tracking → Full when the local LCL close time is fresh.
-        // rippled (NetworkOPs.cpp:2219-2230) does NOT gate this on needNetworkLedger.
+        // Connected/Tracking → Full when the current open ledger's parent
+        // close time is fresh. rippled does NOT gate this on needNetworkLedger.
         if matches!(
             next_mode,
             NetworkOpsOperatingMode::Connected | NetworkOpsOperatingMode::Tracking
-        ) && full_freshness.is_some_and(|(_, _, _, _, _, fresh)| fresh)
+        ) && full_freshness.is_some_and(|(_, _, _, fresh)| fresh)
         {
             next_mode = NetworkOpsOperatingMode::Full;
         }
@@ -1517,7 +1566,7 @@ fn check_accept_and_advance(
                     ledger.header().seq
                 )),
                 live_current_ledger_index = ?root.live_current_ledger_index(),
-                local_lcl_freshness = ?full_freshness,
+                current_open_ledger_freshness = ?full_freshness,
                 "LCL trace: operating-mode promotion decision"
             );
             tracing::info!(target: "app", ?current_mode, ?next_mode, "strand: operating mode promoted");
@@ -1783,6 +1832,38 @@ fn trace_completed_inbound_handoff(
     );
 }
 
+fn fill_verified_history_range(
+    root: &ApplicationRoot,
+    lm: &ledger::LedgerMaster,
+    completed_ledger: &ledger::Ledger,
+) {
+    let Some(loaded) =
+        crate::ledger::loaded_ledger_runtime::AppLoadedLedgerRuntime::from_root(root)
+    else {
+        return;
+    };
+    let plan = ledger::run_try_fill_backwalk(
+        &completed_ledger.header(),
+        &LiveHistoryPresence { ledger_master: lm },
+        &LiveHistoryHashPairs { loaded: &loaded },
+        &LiveHistoryObjectPresence { loaded: &loaded },
+        &StrandHistoryFillStopper(root),
+    );
+    for range in &plan.inserted_ranges {
+        if root.is_stopping() {
+            break;
+        }
+        lm.mark_ledger_complete_range(range.min, range.max);
+    }
+    tracing::debug!(
+        target: "history",
+        seq = completed_ledger.header().seq,
+        inserted_ranges = ?plan.inserted_ranges,
+        stop_reason = ?plan.stop_reason,
+        "materialized verified contiguous history range"
+    );
+}
+
 fn persist_completed_inbound_ledger(
     root: &ApplicationRoot,
     lm: &ledger::LedgerMaster,
@@ -1845,7 +1926,12 @@ fn persist_completed_inbound_ledger(
                     // this trusted historical ledger cacheable by exact hash
                     // for subsequent contiguous materialization/publication,
                     // but do not mark it as a new validated head.
-                    lm.ledger_history().insert(normalized, false);
+                    lm.ledger_history().insert(Arc::clone(&normalized), false);
+                    // `tryFill` can now extend the trusted contiguous range
+                    // through relational headers only while their earliest
+                    // SQL entry is backed by NodeStore. The pure helper keeps
+                    // rippled's 500-row windows and parent-hash proof.
+                    fill_verified_history_range(root, lm, normalized.as_ref());
                     CompletionPersistence {
                         inserted: !was_complete,
                         acknowledged: true,

@@ -250,6 +250,16 @@ impl<Clock: crate::state::time_keeper::TimeKeeperClock + 'static> SharedAppValid
             .register_ledger(ledger);
     }
 
+    /// Retract a provisional resolver ledger after its NodeStore durability
+    /// fence failed, so validation ancestry lookup cannot retain it.
+    pub fn unregister_ledger(&self, hash: basics::base_uint::Uint256) -> bool {
+        self.inner
+            .lock()
+            .expect("shared app validations mutex must not be poisoned")
+            .adaptor()
+            .unregister_ledger(hash)
+    }
+
     /// Return the preferred-LCL decision together with sampled diagnostic
     /// state identifying whether it came from the validation trie, pending
     /// acquisition fallback, or peer fallback. This preserves the selection

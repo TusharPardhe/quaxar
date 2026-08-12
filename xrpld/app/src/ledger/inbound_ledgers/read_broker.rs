@@ -12,12 +12,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 
-/// Maximum physical NodeStore reads owned by all inbound acquisitions.
-pub const ACQ_READS_GLOBAL: usize = 64;
-/// Maximum dispatched read subscriptions attributable to one acquisition.
-pub const ACQ_READS_PER_ACQUISITION: usize = 16;
-/// Maximum acquisitions/plans that may wait on one unique key.
-pub const ACQ_READ_WAITERS_PER_KEY: usize = 32;
+/// The sole explicit NodeStore resource boundary for inbound traversal.
+///
+/// Rippled retains up to 512 deferred reads in one `getMissingNodes()` pass.
+/// Quaxar preserves that progression while making the physical-read limit
+/// global, so coalesced acquisitions never multiply database I/O.
+pub const ACQ_READS_GLOBAL: usize = 512;
 
 /// One database identity. The generation makes a rotation boundary explicit:
 /// equal hashes from different backing generations never share a read.
@@ -110,8 +110,6 @@ pub type ReadReadySink = Arc<dyn Fn(ReadReady) + Send + Sync + 'static>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadRejectReason {
     Stopped,
-    WaitersPerKeyLimit,
-    PerAcquisitionLimit,
 }
 
 /// Result of a submission attempt. Deferred requests retain their ticket and
@@ -129,16 +127,12 @@ pub enum ReadAdmission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadBrokerConfig {
     pub global_in_flight: usize,
-    pub per_acquisition_in_flight: usize,
-    pub waiters_per_key: usize,
 }
 
 impl Default for ReadBrokerConfig {
     fn default() -> Self {
         Self {
             global_in_flight: ACQ_READS_GLOBAL,
-            per_acquisition_in_flight: ACQ_READS_PER_ACQUISITION,
-            waiters_per_key: ACQ_READ_WAITERS_PER_KEY,
         }
     }
 }
@@ -147,12 +141,6 @@ impl ReadBrokerConfig {
     pub fn validate(self) -> Result<Self, &'static str> {
         if self.global_in_flight == 0 {
             return Err("global inbound read capacity must be nonzero");
-        }
-        if self.per_acquisition_in_flight == 0 {
-            return Err("per-acquisition inbound read capacity must be nonzero");
-        }
-        if self.waiters_per_key == 0 {
-            return Err("per-key inbound read waiter capacity must be nonzero");
         }
         Ok(self)
     }
@@ -180,7 +168,6 @@ pub struct ReadBrokerSnapshot {
     pub stopped: bool,
     pub queued_keys: usize,
     pub in_flight_keys: usize,
-    pub active_by_acquisition: BTreeMap<u64, usize>,
     pub metrics: ReadBrokerMetrics,
 }
 
@@ -218,7 +205,6 @@ struct BrokerState {
     fifo: VecDeque<ReadKey>,
     ready_dispatches: VecDeque<ReadDispatch>,
     tickets: BTreeMap<ReadTicketId, TicketRecord>,
-    active_by_acquisition: BTreeMap<u64, usize>,
     metrics: ReadBrokerMetrics,
 }
 
@@ -231,7 +217,6 @@ impl Default for BrokerState {
             fifo: VecDeque::new(),
             ready_dispatches: VecDeque::new(),
             tickets: BTreeMap::new(),
-            active_by_acquisition: BTreeMap::new(),
             metrics: ReadBrokerMetrics::default(),
         }
     }
@@ -295,25 +280,6 @@ impl NodeReadBroker {
             .flights
             .get(&key)
             .is_some_and(|flight| flight.state == Some(FlightState::Dispatched));
-        if dispatched
-            && state
-                .active_by_acquisition
-                .get(&acquisition_id)
-                .copied()
-                .unwrap_or_default()
-                >= self.inner.config.per_acquisition_in_flight
-        {
-            state.metrics.rejected += 1;
-            return ReadAdmission::Rejected(ReadRejectReason::PerAcquisitionLimit);
-        }
-        if state
-            .flights
-            .get(&key)
-            .is_some_and(|flight| flight.subscribers.len() >= self.inner.config.waiters_per_key)
-        {
-            state.metrics.rejected += 1;
-            return ReadAdmission::Rejected(ReadRejectReason::WaitersPerKeyLimit);
-        }
 
         let ticket_id = ReadTicketId(state.next_ticket);
         state.next_ticket = state
@@ -358,11 +324,6 @@ impl NodeReadBroker {
             state.fifo.push_back(key);
             let queued_keys = state.fifo.len();
             state.metrics.queue_high_water = state.metrics.queue_high_water.max(queued_keys);
-        } else if dispatched {
-            *state
-                .active_by_acquisition
-                .entry(acquisition_id)
-                .or_default() += 1;
         }
 
         Self::admit_queued_locked(&self.inner, &mut state);
@@ -408,9 +369,6 @@ impl NodeReadBroker {
                     .remove(&(subscriber.acquisition_id, subscriber.plan_id));
                 (subscriber, flight.state, flight.subscribers.is_empty())
             };
-            if record.dispatched {
-                Self::release_acquisition_slot(&mut state, subscriber.acquisition_id);
-            }
             if empty && flight_state == Some(FlightState::Queued) {
                 state.flights.remove(&record.key);
                 state.fifo.retain(|queued| *queued != record.key);
@@ -462,9 +420,6 @@ impl NodeReadBroker {
                 let Some(record) = state.tickets.remove(&ticket_id) else {
                     continue;
                 };
-                if record.dispatched {
-                    Self::release_acquisition_slot(&mut state, subscriber.acquisition_id);
-                }
                 notifications.push((
                     subscriber.sink,
                     ReadReady {
@@ -511,7 +466,6 @@ impl NodeReadBroker {
                 // fallback because it would otherwise re-enter this mutex.
                 dispatch.settled = true;
             }
-            state.active_by_acquisition.clear();
             let mut notifications = Vec::new();
             for (key, flight) in flights {
                 for (ticket_id, subscriber) in flight.subscribers {
@@ -577,18 +531,15 @@ impl NodeReadBroker {
                 .values()
                 .filter(|flight| flight.state == Some(FlightState::Dispatched))
                 .count(),
-            active_by_acquisition: state.active_by_acquisition.clone(),
             metrics: state.metrics,
         }
     }
 
     fn admit_queued_locked(inner: &Arc<NodeReadBrokerInner>, state: &mut BrokerState) {
-        let mut skipped = 0usize;
-        while Self::in_flight_count(state) < inner.config.global_in_flight
-            && !state.fifo.is_empty()
-            && skipped < state.fifo.len()
-        {
-            let key = state.fifo.pop_front().expect("nonempty broker FIFO");
+        while Self::in_flight_count(state) < inner.config.global_in_flight {
+            let Some(key) = state.fifo.pop_front() else {
+                break;
+            };
             let Some(flight) = state.flights.get(&key) else {
                 continue;
             };
@@ -596,40 +547,17 @@ impl NodeReadBroker {
                 continue;
             }
             let subscriber_ids = flight.subscribers.keys().copied().collect::<Vec<_>>();
-            let eligible = subscriber_ids.iter().all(|ticket_id| {
-                let acquisition_id = state
-                    .tickets
-                    .get(ticket_id)
-                    .expect("broker flight subscriber must have a ticket")
-                    .acquisition_id;
-                state
-                    .active_by_acquisition
-                    .get(&acquisition_id)
-                    .copied()
-                    .unwrap_or_default()
-                    < inner.config.per_acquisition_in_flight
-            });
-            if !eligible {
-                state.fifo.push_back(key);
-                skipped += 1;
-                continue;
-            }
-            skipped = 0;
             state
                 .flights
                 .get_mut(&key)
                 .expect("queued broker flight must exist")
                 .state = Some(FlightState::Dispatched);
             for ticket_id in subscriber_ids {
-                let record = state
+                state
                     .tickets
                     .get_mut(&ticket_id)
-                    .expect("broker ticket must exist for dispatched flight");
-                record.dispatched = true;
-                *state
-                    .active_by_acquisition
-                    .entry(record.acquisition_id)
-                    .or_default() += 1;
+                    .expect("broker ticket must exist for dispatched flight")
+                    .dispatched = true;
             }
             state.ready_dispatches.push_back(ReadDispatch {
                 broker: NodeReadBroker {
@@ -650,19 +578,6 @@ impl NodeReadBroker {
             .values()
             .filter(|flight| flight.state == Some(FlightState::Dispatched))
             .count()
-    }
-
-    fn release_acquisition_slot(state: &mut BrokerState, acquisition_id: u64) {
-        let remove = {
-            let Some(active) = state.active_by_acquisition.get_mut(&acquisition_id) else {
-                return;
-            };
-            *active = active.saturating_sub(1);
-            *active == 0
-        };
-        if remove {
-            state.active_by_acquisition.remove(&acquisition_id);
-        }
     }
 }
 
@@ -814,8 +729,6 @@ mod tests {
     fn deferred_fifo_admission_recovers_after_incremental_completion() {
         let broker = broker(ReadBrokerConfig {
             global_in_flight: 1,
-            per_acquisition_in_flight: 1,
-            waiters_per_key: 4,
         });
         let events = Arc::new(Mutex::new(Vec::new()));
         let first = broker.request(key(4, 10), 1, 1, sink(Arc::clone(&events)));
@@ -865,8 +778,6 @@ mod tests {
     fn stop_cancels_queued_and_dispatched_subscribers() {
         let broker = broker(ReadBrokerConfig {
             global_in_flight: 1,
-            per_acquisition_in_flight: 1,
-            waiters_per_key: 4,
         });
         let events = Arc::new(Mutex::new(Vec::new()));
         assert!(matches!(
@@ -892,29 +803,27 @@ mod tests {
     }
 
     #[test]
-    fn waiter_limit_rejects_overload_without_hiding_the_existing_flight() {
+    fn shared_key_attaches_without_an_artificial_waiter_limit() {
         let broker = broker(ReadBrokerConfig {
             global_in_flight: 1,
-            per_acquisition_in_flight: 4,
-            waiters_per_key: 1,
         });
         let events = Arc::new(Mutex::new(Vec::new()));
         assert!(matches!(
             broker.request(key(10, 10), 1, 1, sink(Arc::clone(&events))),
             ReadAdmission::Accepted(_)
         ));
-        assert_eq!(
+        assert!(matches!(
             broker.request(key(10, 10), 2, 1, sink(Arc::clone(&events))),
-            ReadAdmission::Rejected(ReadRejectReason::WaitersPerKeyLimit)
-        );
+            ReadAdmission::Accepted(_)
+        ));
         let dispatch = broker
             .take_ready_dispatches()
             .into_iter()
             .next()
             .expect("dispatch");
         dispatch.complete(ReadOutcome::Miss);
-        assert_eq!(events.lock().expect("event sink").len(), 1);
-        assert_eq!(broker.snapshot().metrics.rejected, 1);
+        assert_eq!(events.lock().expect("event sink").len(), 2);
+        assert_eq!(broker.snapshot().metrics.rejected, 0);
     }
 
     #[test]

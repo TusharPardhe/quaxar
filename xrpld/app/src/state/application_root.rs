@@ -83,7 +83,7 @@ use protocol::{
     calc_node_id, feature_xrp_fees, get_field_by_symbol, is_tec_claim, is_tef_failure,
     is_tem_malformed, is_tes_success, lsfDisableMaster, tfInnerBatchTxn,
 };
-use shamap::family::{NullFullBelowCache, NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
+use shamap::family::{NullMissingNodeReporter, NullNodeFetcher, SHAMapFamily};
 use shamap::tree_node_cache::TreeNodeCache;
 use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
@@ -234,6 +234,8 @@ pub struct ApplicationRootOptions {
     pub start_ledger: Option<String>,
     pub import: bool,
     pub quorum: Option<usize>,
+    /// rippled Config::networkQuorum, passed to NetworkOPs at construction.
+    pub network_quorum: usize,
     /// Target fee schedule advertised by this validator on voting ledgers.
     /// The reference reads this from the configured `[voting]` section.
     pub fee_setup: FeeSetup,
@@ -253,6 +255,7 @@ impl Default for ApplicationRootOptions {
             start_ledger: None,
             import: false,
             quorum: None,
+            network_quorum: 1,
             fee_setup: FeeSetup::default(),
             collector_params: CollectorParams::default(),
             load_manager_timing: LoadManagerTiming::default(),
@@ -421,6 +424,66 @@ pub struct PendingReplayStartup {
     pub trap_tx_hash: Option<Uint256>,
 }
 
+/// The minimal owner-visible state that defines a publication plan. The epoch
+/// records lifecycle changes that a hash/sequence snapshot cannot express
+/// (for example, a failed or swept Generic acquisition).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PublicationPlanIdentity {
+    validated: Option<(Uint256, u32)>,
+    published: Option<(Uint256, u32)>,
+    missing: Option<(Uint256, u32)>,
+}
+
+impl PublicationPlanIdentity {
+    fn heads(lm: &crate::AppLedgerMaster) -> (Option<(Uint256, u32)>, Option<(Uint256, u32)>) {
+        let validated = lm
+            .validated_ledger()
+            .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
+        let published = lm
+            .published_ledger()
+            .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
+        (validated, published)
+    }
+
+    fn from_report(
+        lm: &crate::AppLedgerMaster,
+        report: &crate::ledger::ledger_master_runtime::AppLedgerMasterAdvanceReport,
+    ) -> Self {
+        let (validated, published) = Self::heads(lm);
+        Self {
+            validated,
+            published,
+            missing: report.missing.map(|missing| (missing.hash, missing.seq)),
+        }
+    }
+
+    fn matches_heads(&self, heads: (Option<(Uint256, u32)>, Option<(Uint256, u32)>)) -> bool {
+        self.validated == heads.0 && self.published == heads.1
+    }
+}
+
+/// Rust's equivalent of LedgerMaster's `advanceWork_`/`advanceThread_` gate.
+/// The NetworkOps strand remains the only execution owner; outside lifecycle
+/// callbacks only advance this coalesced event epoch and wake that strand.
+#[derive(Debug)]
+struct PublicationAdvanceState {
+    requested_epoch: u64,
+    planned_epoch: u64,
+    last_plan: Option<PublicationPlanIdentity>,
+}
+
+impl Default for PublicationAdvanceState {
+    fn default() -> Self {
+        // The initial validated/published state requires one planning pass
+        // after the LedgerMaster runtime is attached.
+        Self {
+            requested_epoch: 1,
+            planned_epoch: 0,
+            last_plan: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ApplicationRoot {
     registry: ApplicationRegistryOwners,
@@ -522,6 +585,10 @@ pub struct ApplicationRoot {
     /// tryAdvance path; keep it separate from the re-entrant LCL transition
     /// gate because it never recursively switches the closed ledger.
     validation_advance_gate: Arc<parking_lot::Mutex<()>>,
+    /// Coalesced owner event and last plan identity for validated-to-published
+    /// advancement. Lifecycle callbacks may request work, but only the
+    /// validation/NetworkOps serialized paths execute it.
+    publication_advance: Arc<Mutex<PublicationAdvanceState>>,
     /// Condvar to wake the consensus strand loop immediately when proposals
     /// arrive from the overlay, removing the 50ms poll latency. Matches
     /// rippled's strand-based immediate dispatch of proposals.
@@ -533,16 +600,6 @@ pub struct ApplicationRoot {
     /// which calls `canonicalize` + `db().store()`).
     shared_tree_cache: std::sync::OnceLock<
         Arc<TreeNodeCache<MonotonicClock, basics::hardened_hash::HardenedHashBuilder>>,
-    >,
-    /// Shared full-below cache — tracks SHAMap subtrees that are fully
-    /// downloaded.  Attached during bootstrap alongside the tree cache.
-    shared_full_below_cache: std::sync::OnceLock<
-        Arc<
-            shamap::family::FullBelowCacheImpl<
-                MonotonicClock,
-                basics::hardened_hash::HardenedHashBuilder,
-            >,
-        >,
     >,
     /// Maximum disallowed ledger sequence — set from the relational database's
     /// highest stored ledger for validator nodes. Matches rippled's
@@ -3950,6 +4007,7 @@ impl ApplicationRoot {
             start_ledger,
             import,
             quorum,
+            network_quorum,
             fee_setup,
             collector_params,
             load_manager_timing,
@@ -3957,12 +4015,14 @@ impl ApplicationRoot {
 
         let mut registry = ApplicationRegistryOwners::new().map_err(std::io::Error::other)?;
         registry.config.standalone = standalone;
+        registry.config.start_valid = start_valid;
         registry.config.start_up = start_type;
         registry.config.start_ledger = start_ledger;
         registry.config.do_import = import;
         if let Some(q) = quorum {
             registry.config.validation_quorum = q;
         }
+        registry.config.network_quorum = network_quorum;
         let perf_log = Arc::clone(
             registry
                 .perf_log
@@ -4093,9 +4153,9 @@ impl ApplicationRoot {
             close_gate: Arc::new(std::sync::Mutex::new(())),
             lcl_transition_gate: Arc::new(parking_lot::ReentrantMutex::new(())),
             validation_advance_gate: Arc::new(parking_lot::Mutex::new(())),
+            publication_advance: Arc::new(Mutex::new(PublicationAdvanceState::default())),
             consensus_notify: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
             shared_tree_cache: std::sync::OnceLock::new(),
-            shared_full_below_cache: std::sync::OnceLock::new(),
             max_disallowed_ledger: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         });
 
@@ -4540,7 +4600,15 @@ impl ApplicationRoot {
         let applied_ids = std::cell::RefCell::new(std::collections::HashSet::new());
 
         self.open_ledger().accept(
-            || AppOpenLedgerView::with_parent_hash(next_open_index, base_fee_drops, parent_hash),
+            || {
+                AppOpenLedgerView::with_parent_timing(
+                    next_open_index,
+                    base_fee_drops,
+                    parent_hash,
+                    parent.header().close_time,
+                    parent.header().close_time_resolution,
+                )
+            },
             &|tx_id: &Uint256| parent.tx_exists(*tx_id),
             local_txs,
             false,
@@ -4795,7 +4863,15 @@ impl ApplicationRoot {
         ));
         let applied_ids = std::cell::RefCell::new(std::collections::HashSet::new());
         self.open_ledger().accept(
-            || AppOpenLedgerView::with_parent_hash(next_open_index, base_fee_drops, parent_hash),
+            || {
+                AppOpenLedgerView::with_parent_timing(
+                    next_open_index,
+                    base_fee_drops,
+                    parent_hash,
+                    parent.header().close_time,
+                    parent.header().close_time_resolution,
+                )
+            },
             &|tx_id: &Uint256| parent.tx_exists(*tx_id),
             local_txs,
             retries_first,
@@ -5588,24 +5664,19 @@ impl ApplicationRoot {
         self.shared_tree_cache.get()
     }
 
-    /// Attach the shared full-below cache so `get_counts` can report its size.
-    pub fn attach_shared_full_below_cache(
-        &self,
-        cache: Arc<
-            shamap::family::FullBelowCacheImpl<
-                MonotonicClock,
-                basics::hardened_hash::HardenedHashBuilder,
-            >,
-        >,
-    ) {
-        let _ = self.shared_full_below_cache.set(cache);
+    /// Returns the concrete FullBelow cache retained by the NodeFamily. The
+    /// bootstrap path requires this value and never constructs a second cache
+    /// for inbound acquisition.
+    pub fn node_family_full_below_cache(&self) -> Option<crate::NodeFamilyFullBelowCache> {
+        self.node_family()
+            .and_then(|node_family| node_family.owned_full_below_cache())
     }
 
-    /// Returns the current entry count of the shared full-below cache.
+    /// Returns the current entry count of the NodeFamily-owned full-below
+    /// cache. It is intentionally not cached on ApplicationRoot.
     pub fn full_below_cache_size(&self) -> usize {
-        self.shared_full_below_cache
-            .get()
-            .map(|c| c.size())
+        self.node_family_full_below_cache()
+            .map(|cache| cache.size())
             .unwrap_or(0)
     }
 
@@ -5727,17 +5798,22 @@ impl ApplicationRoot {
 
         let profile =
             crate::NodeSizeResourceProfile::for_node_size(self.status_rpc_node_size().as_deref());
-        let family: Arc<dyn NodeFamilyRuntime> = Arc::new(NodeFamily::new(SHAMapFamily::new(
-            Arc::new(TreeNodeCache::new(
-                "app-bootstrap-node-family",
-                profile.tree_cache_size,
-                Duration::seconds(profile.tree_cache_age_seconds),
-                MonotonicClock::default(),
-            )),
-            NullFullBelowCache::new(0),
-            NullNodeFetcher,
-            NullMissingNodeReporter,
-        )));
+        let tree_node_cache = Arc::new(TreeNodeCache::new(
+            "app-bootstrap-node-family",
+            profile.tree_cache_size,
+            Duration::seconds(profile.tree_cache_age_seconds),
+            MonotonicClock::default(),
+        ));
+        let _ = self.attach_shared_tree_cache(Arc::clone(&tree_node_cache));
+        let family: Arc<dyn NodeFamilyRuntime> =
+            Arc::new(NodeFamily::new_with_owned_full_below_cache(
+                tree_node_cache,
+                1,
+                profile.full_below_target_size,
+                Duration::seconds(profile.full_below_expiration_seconds),
+                NullNodeFetcher,
+                NullMissingNodeReporter,
+            ));
         let _ = self.attach_node_family(Arc::clone(&family));
         let _ = self.wire_node_family_reset();
         family
@@ -7319,6 +7395,11 @@ impl ApplicationRoot {
         ledger: Arc<Ledger>,
         history_action: ClosedLedgerHistoryAction,
     ) -> Result<(), String> {
+        if self.inbound_ledger_is_provisional(*ledger.header().hash.as_uint256()) {
+            tracing::debug!(target: "inbound_ledger", hash = %ledger.header().hash,
+                "deferring LCL installation for resolver-visible provisional inbound ledger");
+            return Ok(());
+        }
         let _lcl_transition_guard = self.lcl_transition_gate.lock();
         // Diagnostic: check incoming tree state before clone
         {
@@ -7649,6 +7730,12 @@ impl ApplicationRoot {
         lm: &crate::AppLedgerMaster,
         ledger: Arc<Ledger>,
     ) -> Result<Arc<Ledger>, String> {
+        let hash = *ledger.header().hash.as_uint256();
+        if self.inbound_ledger_is_provisional(hash) {
+            return Err(format!(
+                "publication deferred for provisional inbound ledger {hash}"
+            ));
+        }
         let persistence = ledger::LedgerPersistence::new(self.build_ledger_persistence_runtime());
         let mut full = ledger;
         {
@@ -7659,6 +7746,9 @@ impl ApplicationRoot {
         lm.set_full_ledger(&persistence, Arc::clone(&full), true, true, None, None)
             .map_err(|error| format!("publication setFullLedger failed: {error:?}"))?;
         lm.set_pub_ledger(Arc::clone(&full));
+        // Publishing changes the owner-visible plan even when no validation
+        // or inbound callback follows immediately.
+        self.request_publication_advance();
         self.on_published_ledger(Arc::clone(&full));
         let _ = self.order_book_db().setup(
             Arc::clone(&full),
@@ -7683,10 +7773,44 @@ impl ApplicationRoot {
         self.try_advance_publication_serialized();
     }
 
+    /// Request one coalesced publication planning pass. This function is safe
+    /// for acquisition and replay callbacks: it does not inspect ledgers or
+    /// acquire anything itself, and merely wakes the serialized strand owner.
+    pub(crate) fn request_publication_advance(&self) {
+        {
+            let mut advance = self
+                .publication_advance
+                .lock()
+                .expect("publication advance state lock");
+            advance.requested_epoch = advance.requested_epoch.wrapping_add(1).max(1);
+        }
+        self.notify_consensus_event();
+    }
+
     fn try_advance_publication_serialized(&self) {
         let Some(lm_rt) = self.ledger_master_runtime() else {
             return;
         };
+        let lm = lm_rt.ledger_master();
+        let epoch = {
+            let advance = self
+                .publication_advance
+                .lock()
+                .expect("publication advance state lock");
+            let heads = PublicationPlanIdentity::heads(lm.as_ref());
+            if advance.planned_epoch == advance.requested_epoch
+                && advance
+                    .last_plan
+                    .is_some_and(|last_plan| last_plan.matches_heads(heads))
+            {
+                // An ordinary NetworkOps heartbeat has no new owner event and
+                // the validated/published heads are unchanged. In particular,
+                // do not re-touch the same Generic candidates.
+                return;
+            }
+            advance.requested_epoch
+        };
+
         let mut report = lm_rt.plan_advance_publication();
         if let Some(missing) = report.missing
             && self
@@ -7702,6 +7826,7 @@ impl ApplicationRoot {
         // publication plan, not directly from an arbitrary missing hash. Keep
         // that proof before publication mutates the owner's current pointer.
         let replay_range = lm_rt.plan_publication_replay(&report);
+        let plan_identity = PublicationPlanIdentity::from_report(lm.as_ref(), &report);
 
         use crate::ledger::ledger_master_runtime::AppLedgerMasterPublishAdvance;
         match report.decision {
@@ -7819,6 +7944,17 @@ impl ApplicationRoot {
                 }
             }
         }
+
+        // Preserve a later event that raced this serialized pass: only the
+        // epoch observed above is consumed. The next strand turn will plan
+        // again when a completion, failure, sweep, replay event, or publish
+        // arrived during this work.
+        let mut advance = self
+            .publication_advance
+            .lock()
+            .expect("publication advance state lock");
+        advance.planned_epoch = epoch;
+        advance.last_plan = Some(plan_identity);
     }
 
     /// Cheap scheduler predicate: while no replay owner is active, the
@@ -7884,6 +8020,9 @@ impl ApplicationRoot {
             let ledger = self.store_consensus_ledger(ledger);
             self.check_accept_hash_seq(*ledger.header().hash.as_uint256(), ledger.header().seq);
         }
+        // A replay timer can advance its owned task even when it produced no
+        // complete ledger yet; make that progress a coalesced planning event.
+        self.request_publication_advance();
         self.try_advance_publication();
     }
 
@@ -8089,6 +8228,47 @@ impl ApplicationRoot {
             .map(|service| service.operating_mode())
     }
 
+    fn inbound_ledger_is_provisional(&self, hash: basics::base_uint::Uint256) -> bool {
+        self.ledger_master_runtime().is_some_and(|runtime| {
+            runtime
+                .inbound_ledgers
+                .lock()
+                .expect("inbound_ledgers mutex")
+                .as_ref()
+                .is_some_and(|inbound| inbound.is_provisional(&hash))
+        })
+    }
+
+    /// Compensate an early resolver publication whose final NodeStore
+    /// durability fence failed on the validation/publication owner. Every
+    /// target is conditional on the exact acquisition, hash, and sequence.
+    pub(crate) fn revoke_provisional_inbound_ledger(
+        &self,
+        identity: crate::ledger::inbound_ledgers::ProvisionalLedgerIdentity,
+    ) {
+        let _lcl_transition_guard = self.lcl_transition_gate.lock();
+        let _advance_guard = self.validation_advance_gate.lock();
+        let hash = basics::sha_map_hash::SHAMapHash::new(identity.ledger_hash);
+        if identity.target_hash != identity.ledger_hash {
+            return;
+        }
+        if let Some(runtime) = self.ledger_master_runtime() {
+            runtime
+                .ledger_master()
+                .revoke_provisional_ledger(hash, identity.ledger_seq);
+        }
+        self.validations().unregister_ledger(identity.ledger_hash);
+        self.ledger_master_state
+            .revoke_ledger(hash, identity.ledger_seq);
+        tracing::warn!(
+            target: "inbound_ledger",
+            hash = %identity.ledger_hash,
+            seq = identity.ledger_seq,
+            acquisition_id = identity.acquisition_id,
+            "revoked provisional inbound ledger after NodeStore durability failure"
+        );
+    }
+
     /// Resolve an immutable ledger by its exact hash through the same
     /// cache-then-provider path used by ledger serving. A provider result is
     /// canonicalized as a nonvalidated history cache entry; callers must still
@@ -8134,6 +8314,11 @@ impl ApplicationRoot {
     }
 
     pub fn on_validated_ledger(&self, ledger: Arc<Ledger>) -> bool {
+        if self.inbound_ledger_is_provisional(*ledger.header().hash.as_uint256()) {
+            tracing::debug!(target: "inbound_ledger", hash = %ledger.header().hash,
+                "deferring direct validated-ledger adoption until NodeStore fence succeeds");
+            return false;
+        }
         let ledger = self.ledger_with_node_fetcher(ledger);
         self.ledger_master_state
             .note_validated_ledger(Arc::clone(&ledger));
@@ -8443,6 +8628,11 @@ impl ApplicationRoot {
     /// (LedgerMaster.cpp:946-1000): promotes `ledger` to validated if it
     /// has reached quorum among trusted validators.
     fn check_accept_ledger(&self, ledger: Arc<Ledger>) {
+        if self.inbound_ledger_is_provisional(*ledger.header().hash.as_uint256()) {
+            tracing::debug!(target: "inbound_ledger", hash = %ledger.header().hash,
+                "deferring validation and publication adoption until NodeStore fence succeeds");
+            return;
+        }
         let Some(lm_rt) = self.ledger_master_runtime() else {
             return;
         };
@@ -8550,6 +8740,8 @@ impl ApplicationRoot {
         let validated = Arc::new(l);
 
         lm.set_valid_ledger_no_sweep(Arc::clone(&validated), None, Some(validated_sign_time));
+        // Validated-head movement is the primary `advanceWork_` source.
+        self.request_publication_advance();
         tracing::info!(
             target: "lcl_trace",
             event = "validation_adoption_committed",

@@ -111,6 +111,18 @@ s2.ripple.com 51235
 Optional network selector. Common values are `main`, `testnet`, `devnet`, or a
 numeric network ID.
 
+### `[network_quorum]`
+
+The minimum number of peers required before NetworkOps treats the network as
+present. The default is `1`. It must be one unsigned value and may not exceed
+legacy `[peers_max]`; when `[peers_max]` is omitted or zero, the reference
+default maximum of `21` is used.
+
+```ini
+[network_quorum]
+1
+```
+
 ### `[overlay]`
 
 Peer overlay settings.

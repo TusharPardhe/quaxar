@@ -244,6 +244,10 @@ impl RclValidationsAdaptor {
         self.ledgers.lock().insert(wrapped.id(), wrapped);
     }
 
+    pub fn unregister_ledger(&self, hash: Uint256) -> bool {
+        self.ledgers.lock().remove(&hash).is_some()
+    }
+
     /// Attach (or detach) the ledger master runtime this adaptor consults
     /// on a cache miss in `acquire`, matching the reference's
     /// `RCLValidationsAdaptor` holding a reference to the owning

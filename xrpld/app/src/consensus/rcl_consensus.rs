@@ -157,6 +157,8 @@ pub trait RclConsensusOpenLedgerSource {
         next_seq: u32,
         base_fee: u64,
         parent_hash: &Uint256,
+        parent_close_time: u32,
+        close_time_resolution: u8,
         completed_transaction_ids: &std::collections::HashSet<Uint256>,
         retry_transactions: &[Arc<protocol::STTx>],
         retries_first: bool,

@@ -210,6 +210,35 @@ impl TreePlan {
         }
     }
 
+    /// Advance until a natural local-read/network boundary or a contested
+    /// scheduler yield. This retains traversal state across async NodeStore
+    /// completion without reintroducing an actor-local branch budget.
+    pub fn advance_with_yield<L, R, Y>(
+        &mut self,
+        max_new_reads: usize,
+        resident: &mut L,
+        next_first_child: &mut R,
+        should_yield: &mut Y,
+    ) -> TreeAdvance
+    where
+        L: MissingNodeResidentLookup,
+        R: FnMut() -> u8,
+        Y: FnMut() -> bool,
+    {
+        match self.continuation.advance_with_yield(
+            max_new_reads,
+            resident,
+            next_first_child,
+            should_yield,
+        ) {
+            MissingNodeAdvance::Ready => TreeAdvance::Ready,
+            MissingNodeAdvance::NeedsReads(reads) => TreeAdvance::NeedsReads(reads),
+            MissingNodeAdvance::NeedsNetwork(nodes) => TreeAdvance::NeedsNetwork(nodes),
+            MissingNodeAdvance::Complete => TreeAdvance::Complete,
+            MissingNodeAdvance::Invalid => TreeAdvance::Invalid,
+        }
+    }
+
     /// Take a bounded batch of read needs previously discovered by an earlier
     /// scan without consuming another branch-selection turn.
     pub fn take_read_admission_batch(&mut self, max_new_reads: usize) -> Vec<ReadNeed> {

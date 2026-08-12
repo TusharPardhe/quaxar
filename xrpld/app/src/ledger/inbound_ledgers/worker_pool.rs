@@ -5,14 +5,10 @@
 //! logic on the timer thread.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-
-// `TimeoutCounter` admits recovery work only while fewer than this many
-// JtLedgerData-equivalent jobs are live (queued or executing).
-const LEDGER_DATA_JOB_LIMIT: usize = 5;
 
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -52,15 +48,12 @@ fn reserve_ledger_data_job(job: Job, count: Arc<AtomicUsize>) -> Job {
     })
 }
 
-/// Bounded, read-only worker-pool state for acquisition diagnostics.
+/// Worker-pool state for acquisition diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerPoolSnapshot {
     pub queued_jobs: usize,
     pub outstanding_ledger_data_jobs: usize,
     pub worker_count: usize,
-    pub ledger_data_job_limit: usize,
-    pub timeout_submission_attempts: u64,
-    pub timeout_submission_rejected: u64,
 }
 
 struct TimerTask {
@@ -197,8 +190,6 @@ pub struct WorkerPool {
     stop: Arc<AtomicBool>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     ledger_data_jobs: Arc<AtomicUsize>,
-    timeout_submission_attempts: AtomicU64,
-    timeout_submission_rejected: AtomicU64,
     timers: TimerService,
 }
 
@@ -262,8 +253,6 @@ impl WorkerPool {
             stop,
             workers: Mutex::new(workers),
             ledger_data_jobs: Arc::new(AtomicUsize::new(0)),
-            timeout_submission_attempts: AtomicU64::new(0),
-            timeout_submission_rejected: AtomicU64::new(0),
             timers: TimerService::new(),
         }
     }
@@ -283,45 +272,19 @@ impl WorkerPool {
         wake.notify_all();
     }
 
-    /// Queue a response-processing job. rippled queues this whenever
-    /// `InboundLedger::gotData` transitions its dispatch flag to true. This
-    /// must not wait for queue capacity: the coalesced dispatch remains live
-    /// until its queued job runs.
-    pub fn submit_ledger_data(&self, job: Job) {
+    /// Submit an actor turn for which `AcquisitionReadyScheduler` already
+    /// reserved one of the five JtLedgerData-equivalent slots.  WorkerPool is
+    /// deliberately only an executor; it no longer admits acquisition
+    /// identities or owns an unbounded normal acquisition FIFO.
+    pub(crate) fn submit_reserved_turn(&self, job: Job) {
         if !self.stop.load(Ordering::Acquire) {
             self.enqueue_ledger_data(job);
         }
     }
 
-    /// Queue TimeoutCounter recovery work only while the aggregate live
-    /// JtLedgerData-equivalent count is below rippled's admission limit. A
-    /// false result lets the timer re-arm rather than dropping recovery work.
-    pub fn try_submit_timeout(&self, job: Job) -> bool {
-        self.timeout_submission_attempts
-            .fetch_add(1, Ordering::Relaxed);
-        if self.stop.load(Ordering::Acquire) {
-            self.timeout_submission_rejected
-                .fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-
-        let (lock, wake) = &*self.queue;
-        let mut jobs = lock.lock().expect("acquisition queue lock");
-        if self.stop.load(Ordering::Acquire)
-            || self.ledger_data_jobs.load(Ordering::Acquire) >= LEDGER_DATA_JOB_LIMIT
-        {
-            self.timeout_submission_rejected
-                .fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-
-        self.ledger_data_jobs.fetch_add(1, Ordering::AcqRel);
-        jobs.ledger_data.push_back(reserve_ledger_data_job(
-            job,
-            Arc::clone(&self.ledger_data_jobs),
-        ));
-        wake.notify_all();
-        true
+    #[cfg(test)]
+    pub fn submit_ledger_data(&self, job: Job) {
+        self.submit_reserved_turn(job);
     }
 
     /// Schedule one delayed timer callback. The callback must decide whether
@@ -341,9 +304,6 @@ impl WorkerPool {
             queued_jobs,
             outstanding_ledger_data_jobs: self.ledger_data_jobs.load(Ordering::Acquire),
             worker_count,
-            ledger_data_job_limit: LEDGER_DATA_JOB_LIMIT,
-            timeout_submission_attempts: self.timeout_submission_attempts.load(Ordering::Relaxed),
-            timeout_submission_rejected: self.timeout_submission_rejected.load(Ordering::Relaxed),
         }
     }
 
@@ -461,17 +421,6 @@ mod tests {
             vec!["timer_callback", "worker_job"]
         );
         assert!(!pool.run_next_job_for_test());
-    }
-
-    #[test]
-    fn timeout_admission_snapshot_counts_rejected_submission() {
-        let pool = WorkerPool::new(1);
-        pool.stop();
-
-        assert!(!pool.try_submit_timeout(Box::new(|| {})));
-        let snapshot = pool.snapshot();
-        assert_eq!(snapshot.timeout_submission_attempts, 1);
-        assert_eq!(snapshot.timeout_submission_rejected, 1);
     }
 }
 

@@ -674,11 +674,57 @@ where
         Ok(saved)
     }
 
+    /// Retract only the exact provisional identity. A newer ledger at the
+    /// same sequence must keep its history, slots, and complete-range claim.
+    pub fn revoke_provisional_ledger(&self, hash: SHAMapHash, seq: u32) {
+        let matches =
+            |ledger: Arc<Ledger>| ledger.header().hash == hash && ledger.header().seq == seq;
+        let cleared_valid =
+            self.valid_ledger.get().is_some_and(matches) && self.valid_ledger.clear_if_hash(hash);
+        let cleared_published = self.published_ledger.get().is_some_and(matches)
+            && self.published_ledger.clear_if_hash(hash);
+        let cleared_closed =
+            self.closed_ledger.get().is_some_and(matches) && self.closed_ledger.clear_if_hash(hash);
+        let removed_history = self.ledger_history.remove_exact(hash, seq);
+        // Early resolver visibility is only used for Consensus/Generic
+        // acquisitions, neither of which may claim a complete-history range.
+        // Do not erase a sequence interval without a matching range owner.
+        if !(cleared_valid || cleared_published || cleared_closed || removed_history) {
+            return;
+        }
+        if cleared_valid {
+            self.valid_ledger_sign.store(0, Ordering::SeqCst);
+            self.valid_ledger_seq.store(0, Ordering::SeqCst);
+        }
+        if cleared_published {
+            self.pub_ledger_close.store(0, Ordering::SeqCst);
+        }
+        let mut last_valid = self
+            .last_valid_ledger
+            .lock()
+            .expect("last-valid-ledger mutex must not be poisoned");
+        if last_valid.is_some_and(|(last_hash, _)| last_hash == *hash.as_uint256()) {
+            *last_valid = None;
+        }
+    }
+
     pub fn mark_ledger_complete(&self, seq: u32) {
         self.complete_ledgers
             .lock()
             .expect("complete-ledgers mutex must not be poisoned")
             .insert(seq);
+    }
+
+    /// Apply one verified contiguous history interval, matching
+    /// `LedgerMaster::tryFill`'s `completeLedgers_.insert(range(...))`.
+    pub fn mark_ledger_complete_range(&self, min: u32, max: u32) {
+        if min > max {
+            return;
+        }
+        self.complete_ledgers
+            .lock()
+            .expect("complete-ledgers mutex must not be poisoned")
+            .insert_interval(range(min, max));
     }
 
     pub fn have_ledger(&self, seq: u32) -> bool {

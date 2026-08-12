@@ -14,15 +14,19 @@
 mod acquisition;
 mod read_broker;
 mod registry;
+mod scheduler;
 mod worker_pool;
 
+pub(crate) use self::acquisition::ProvisionalLedgerIdentity;
 pub use self::acquisition::{AcquisitionState, stash_stale_packet};
 pub use self::read_broker::{
-    ACQ_READ_WAITERS_PER_KEY, ACQ_READS_GLOBAL, ACQ_READS_PER_ACQUISITION, NodeReadBroker,
-    ReadAdmission, ReadBrokerConfig, ReadBrokerMetrics, ReadBrokerSnapshot, ReadDispatch, ReadKey,
-    ReadOutcome, ReadReady, ReadRejectReason, ReadTicket, ReadTicketId,
+    ACQ_READS_GLOBAL, NodeReadBroker, ReadAdmission, ReadBrokerConfig, ReadBrokerMetrics,
+    ReadBrokerSnapshot, ReadDispatch, ReadKey, ReadOutcome, ReadReady, ReadRejectReason,
+    ReadTicket, ReadTicketId,
 };
-pub use self::registry::{AcquireReason, CompletedInboundLedger, InboundLedgers};
+pub use self::registry::{
+    AcquireReason, CompletedInboundLedger, InboundLedgers, LedgerDataRouteDisposition,
+};
 pub use self::worker_pool::WorkerPool;
 
 // ─── Backward-compatible stub ────────────────────────────────────────────────

@@ -32,7 +32,7 @@ pub use codec::{
 };
 pub use database::{
     AsyncFetchCallback, Database, DatabaseDelegate, DatabaseImporter, DatabaseRotating,
-    DatabaseRuntime, DatabaseSource, DatabaseSurface,
+    DatabaseRuntime, DatabaseSource, DatabaseSurface, ScheduledWrite,
 };
 pub use database_node_imp::DatabaseNodeImp;
 pub use database_rotating::DatabaseRotatingImp;

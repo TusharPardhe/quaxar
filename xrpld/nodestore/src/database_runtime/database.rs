@@ -1,7 +1,7 @@
 use crate::database_runtime::node_object_cache::NodeObjectCache;
 use crate::{
     Backend, FetchReport, FetchType, JournalLevel, NodeObject, NodeObjectType, NodeStoreJournal,
-    Scheduler, batch_write_preallocation_size,
+    Scheduler, Task, batch_write_preallocation_size,
 };
 use basics::base_uint::Uint256;
 use basics::basic_config::{Section, get};
@@ -18,6 +18,22 @@ use std::time::{Duration, Instant};
 const XRP_LEDGER_EARLIEST_SEQ: u32 = 32_570;
 
 pub type AsyncFetchCallback = Box<dyn FnOnce(Option<Arc<NodeObject>>) + Send + 'static>;
+pub type ScheduledWrite = Box<dyn FnOnce() + Send + 'static>;
+
+struct ScheduledWriteTask(Mutex<Option<ScheduledWrite>>);
+
+impl Task for ScheduledWriteTask {
+    fn perform_scheduled_task(&self) {
+        if let Some(write) = self
+            .0
+            .lock()
+            .expect("scheduled NodeStore write task mutex must not be poisoned")
+            .take()
+        {
+            write();
+        }
+    }
+}
 
 pub trait DatabaseSource: Send + Sync + 'static {
     fn for_each(&self, callback: &mut dyn FnMut(Arc<NodeObject>));
@@ -50,6 +66,13 @@ pub trait Database: DatabaseSource + DatabaseImporter + Send + Sync + 'static {
     fn sync_result(&self) -> Result<(), String> {
         self.sync();
         Ok(())
+    }
+
+    /// Queue one write-owner task on the NodeStore scheduler. Callers use this
+    /// for bounded write batches; it deliberately does not expose an
+    /// acquisition-worker execution path.
+    fn schedule_write(&self, write: ScheduledWrite) {
+        write();
     }
 
     fn fetch_node_object(
@@ -357,6 +380,18 @@ impl DatabaseRuntime {
     ) -> Option<Arc<NodeObject>> {
         self.inner
             .fetch_node_object(hash, ledger_seq, fetch_type, duplicate)
+    }
+
+    pub fn schedule_write(&self, write: ScheduledWrite) {
+        // Reject after stop instead of leaving an accepted persistence ticket
+        // in an executor that can no longer run it. Dropping `write` invokes
+        // the caller's completion guard exactly once.
+        if self.inner.is_stopping() {
+            return;
+        }
+        self.inner
+            .scheduler
+            .schedule_task(Arc::new(ScheduledWriteTask(Mutex::new(Some(write)))));
     }
 
     pub fn async_fetch(&self, hash: Uint256, ledger_seq: u32, callback: AsyncFetchCallback) {

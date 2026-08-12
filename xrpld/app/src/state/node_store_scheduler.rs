@@ -46,7 +46,6 @@ pub struct NodeStoreBatchWriteReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduleTaskResult {
     Queued,
-    RanSynchronously,
     DroppedStopped,
 }
 
@@ -90,14 +89,10 @@ impl NodeStoreScheduler {
         if scheduled {
             ScheduleTaskResult::Queued
         } else {
-            if let Some(perform) = perform
-                .lock()
-                .expect("scheduled task mutex must not be poisoned")
-                .take()
-            {
-                perform();
-            }
-            ScheduleTaskResult::RanSynchronously
+            // The queue can enter stopping between the precheck and add_job.
+            // Do not run a NodeStore write against a stopping owner: dropping
+            // the task returns its acquisition ticket as a terminal failure.
+            ScheduleTaskResult::DroppedStopped
         }
     }
 

@@ -28,6 +28,13 @@ impl SHAMapStoreNodeStore {
         }
     }
 
+    pub fn schedule_write(&self, write: nodestore::ScheduledWrite) {
+        match self {
+            Self::Single(database) => database.schedule_write(write),
+            Self::Rotating(database) => database.schedule_write(write),
+        }
+    }
+
     pub fn export_backend(&self) -> Option<Arc<dyn Backend>> {
         match self {
             Self::Single(database) => database.export_backend(),

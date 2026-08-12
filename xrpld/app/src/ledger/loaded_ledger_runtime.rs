@@ -247,7 +247,10 @@ impl AppLoadedLedgerRuntime {
 
     fn current_closed_ledger(&self) -> Option<Arc<Ledger>> {
         if let Some(state) = self.ledger_master_state.as_ref() {
-            state.closed_ledger()
+            // Rippled falls back to its current closed ledger. Quaxar keeps a
+            // separately owned validated slot during bootstrap/recovery, so
+            // use it only after the exact closed-ledger fast path misses.
+            state.closed_ledger().or_else(|| state.validated_ledger())
         } else {
             self.ledger_master.closed_ledger()
         }

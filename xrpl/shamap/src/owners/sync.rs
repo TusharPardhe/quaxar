@@ -3044,6 +3044,54 @@ impl MissingNodeContinuation {
         L: MissingNodeResidentLookup,
         R: FnMut() -> u8,
     {
+        self.advance_with_budget(
+            max_branch_steps,
+            max_new_reads,
+            resident,
+            next_first_child,
+            &mut || false,
+        )
+    }
+
+    /// Advance until traversal reaches its natural read/result boundary or the
+    /// scheduler asks a contested acquisition to yield. This is the async
+    /// counterpart to rippled's retained `getMissingNodes()` pass: it does not
+    /// impose an actor-local branch quota, and may announce up to 512 unique
+    /// deferred reads before returning control to the broker.
+    pub fn advance_with_yield<L, R, Y>(
+        &mut self,
+        max_new_reads: usize,
+        resident: &mut L,
+        next_first_child: &mut R,
+        should_yield: &mut Y,
+    ) -> MissingNodeAdvance
+    where
+        L: MissingNodeResidentLookup,
+        R: FnMut() -> u8,
+        Y: FnMut() -> bool,
+    {
+        self.advance_with_budget(
+            usize::MAX,
+            max_new_reads,
+            resident,
+            next_first_child,
+            should_yield,
+        )
+    }
+
+    fn advance_with_budget<L, R, Y>(
+        &mut self,
+        max_branch_steps: usize,
+        max_new_reads: usize,
+        resident: &mut L,
+        next_first_child: &mut R,
+        should_yield: &mut Y,
+    ) -> MissingNodeAdvance
+    where
+        L: MissingNodeResidentLookup,
+        R: FnMut() -> u8,
+        Y: FnMut() -> bool,
+    {
         if self.invalid {
             return MissingNodeAdvance::Invalid;
         }
@@ -3058,7 +3106,7 @@ impl MissingNodeContinuation {
 
         let mut branch_steps = 0usize;
         while let Some(state) = self.stack.last_mut() {
-            if branch_steps >= max_branch_steps || self.remaining <= 0 {
+            if branch_steps >= max_branch_steps || self.remaining <= 0 || should_yield() {
                 break;
             }
 

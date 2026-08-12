@@ -1491,7 +1491,13 @@ fn promote_current_ledger(
     }
     let parent_hash = *ledger.header().hash.as_uint256();
     let _ = app.open_ledger().modify(|view| {
-        *view = app::AppOpenLedgerView::with_parent_hash(next_seq, base_fee, parent_hash);
+        *view = app::AppOpenLedgerView::with_parent_timing(
+            next_seq,
+            base_fee,
+            parent_hash,
+            ledger.header().close_time,
+            ledger.header().close_time_resolution,
+        );
         true
     });
 

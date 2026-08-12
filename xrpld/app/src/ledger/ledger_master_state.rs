@@ -94,6 +94,37 @@ impl SharedLedgerMasterState {
         self.validated_close_time.store(0, Ordering::Release);
     }
 
+    /// Retract a failed provisional ledger only from slots that still point to
+    /// the exact hash and sequence. Later durable progress always wins.
+    pub fn revoke_ledger(&self, hash: basics::sha_map_hash::SHAMapHash, seq: u32) {
+        for slot in [
+            &self.closed_ledger,
+            &self.validated_ledger,
+            &self.published_ledger,
+        ] {
+            if let Some(current) = slot.load_full()
+                && current.header().hash == hash
+                && current.header().seq == seq
+            {
+                slot.compare_and_swap(&current, None);
+            }
+        }
+        if self
+            .validated_ledger
+            .load_full()
+            .is_none_or(|ledger| ledger.header().hash == hash && ledger.header().seq == seq)
+        {
+            self.validated_close_time.store(0, Ordering::Release);
+        }
+        if self
+            .published_ledger
+            .load_full()
+            .is_none_or(|ledger| ledger.header().hash == hash && ledger.header().seq == seq)
+        {
+            self.published_close_time.store(0, Ordering::Release);
+        }
+    }
+
     pub fn closed_ledger(&self) -> Option<Arc<Ledger>> {
         self.closed_ledger.load_full()
     }

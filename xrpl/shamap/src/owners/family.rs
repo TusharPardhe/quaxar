@@ -90,6 +90,23 @@ where
     cache: TaggedCache<Uint256, (), C, S, SharedWeakCachePointer<()>, Arc<()>>,
 }
 
+impl<C, S> std::fmt::Debug for FullBelowCacheImpl<C, S>
+where
+    C: CacheClock,
+    S: BuildHasher + Clone,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FullBelowCacheImpl")
+            .field(
+                "generation",
+                &self.generation.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .field("entries", &self.size())
+            .finish()
+    }
+}
+
 impl<C, S> FullBelowCacheImpl<C, S>
 where
     C: CacheClock,
