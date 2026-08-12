@@ -185,6 +185,11 @@ pub(crate) type AcquisitionFailureRecorder = Arc<dyn Fn(Uint256) + Send + Sync +
 pub(crate) type AcquisitionCompletionRecorder =
     Arc<dyn Fn(Uint256, Arc<Ledger>) + Send + Sync + 'static>;
 
+/// Application-owned `LedgerMaster::storeLedger` equivalent for completed
+/// non-history acquisitions. It must run before the registry-ready handoff,
+/// matching rippled `InboundLedger::done()`.
+pub(crate) type AcquisitionLedgerStore = Arc<dyn Fn(Arc<Ledger>) + Send + Sync + 'static>;
+
 #[derive(Debug)]
 struct AcquisitionStats {
     started_at: Instant,
@@ -1008,6 +1013,7 @@ pub struct AcquisitionState {
     pub store_tx: std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     failure_recorder: AcquisitionFailureRecorder,
     completion_recorder: AcquisitionCompletionRecorder,
+    completed_ledger_store: Option<AcquisitionLedgerStore>,
     pub stopped: AtomicBool,
     pub completed: AtomicBool,
     completed_ledger: Mutex<Option<Arc<Ledger>>>,
@@ -2039,6 +2045,7 @@ pub struct AcquisitionBuilder {
     pub store_tx: std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     pub failure_recorder: AcquisitionFailureRecorder,
     pub completion_recorder: AcquisitionCompletionRecorder,
+    pub completed_ledger_store: Option<AcquisitionLedgerStore>,
     pub full_below_generation: u32,
     pub worker_pool: Arc<WorkerPool>,
     pub initial_peers: Vec<Arc<dyn Peer>>,
@@ -2090,6 +2097,7 @@ impl AcquisitionBuilder {
             store_tx: self.store_tx,
             failure_recorder: self.failure_recorder,
             completion_recorder: self.completion_recorder,
+            completed_ledger_store: self.completed_ledger_store,
             stopped: AtomicBool::new(false),
             completed: AtomicBool::new(false),
             completed_ledger: Mutex::new(None),
@@ -3436,14 +3444,22 @@ fn publish_resolver_visible_ledger(
     hash: Uint256,
     acquisition_id: u64,
     completion_recorder: &AcquisitionCompletionRecorder,
+    completed_ledger_store: &Option<AcquisitionLedgerStore>,
     resolver_published: &AtomicBool,
     completed_ledger: &Mutex<Option<Arc<Ledger>>>,
     store_tx: &std::sync::mpsc::SyncSender<CompletedInboundLedger>,
     reason: AcquireReason,
     ledger: Arc<Ledger>,
 ) -> bool {
-    // Match InboundLedger::done(): terminal touch, resolver publication, and
-    // AcqDone dispatch occur as soon as the full immutable ledger exists.
+    // Match InboundLedger::done(): make non-history work LedgerMaster-visible
+    // before terminal touch/AcqDone dispatch. The queued strand work still
+    // performs validation registration and acceptance, just as rippled's
+    // separately dispatched AcqDone job does.
+    if reason != AcquireReason::History
+        && let Some(store) = completed_ledger_store
+    {
+        store(Arc::clone(&ledger));
+    }
     // NodeStore durability remains a separate, ordered background concern.
     completion_recorder(hash, Arc::clone(&ledger));
     record_resolver_visible_ledger(
@@ -3518,6 +3534,7 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
         target_hash,
         state.acquisition_id,
         &state.completion_recorder,
+        &state.completed_ledger_store,
         &state.resolver_published,
         &state.completed_ledger,
         &state.store_tx,

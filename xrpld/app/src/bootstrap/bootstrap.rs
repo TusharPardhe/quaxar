@@ -1271,6 +1271,17 @@ fn run_start_mode_consensus_loop(
         *guard = Some(Arc::clone(&shared_inbound));
     }
 
+    // Match rippled InboundLedger::done: a structurally complete Consensus or
+    // Generic ledger enters LedgerHistory before its queued AcqDone-equivalent
+    // work. The callback is intentionally installed before acquisitions begin;
+    // History material follows its separately validated persistence path.
+    if let Some(lm_rt) = lm_rt_for_shared_inbound.as_ref() {
+        let ledger_master = lm_rt.ledger_master();
+        shared_inbound.set_completed_ledger_store(Arc::new(move |ledger| {
+            ledger_master.ledger_history().insert(ledger, false);
+        }));
+    }
+
     // Attach the synchronous SHAMap node store before acquisitions begin.
     if let Some(ns) = runtime.root().node_store().as_ref() {
         shared_inbound.set_node_store(ns.clone());

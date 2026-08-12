@@ -72,7 +72,11 @@ pub struct AppLedgerMasterReplayRange {
 pub struct AppLedgerMasterAdvanceReport {
     pub decision: AppLedgerMasterPublishAdvance,
     pub published: Vec<Arc<Ledger>>,
+    /// First missing validated-chain ledger. It remains the sole replay proof.
     pub missing: Option<AppLedgerMasterMissingLedger>,
+    /// Missing validated-chain ledgers in ascending order. The caller applies
+    /// rippled's bounded `ledgerFetchSize_` Generic-acquisition quota.
+    pub generic_acquire_candidates: Vec<AppLedgerMasterMissingLedger>,
 }
 
 impl Default for AppLedgerMasterRuntime {
@@ -207,6 +211,7 @@ impl AppLedgerMasterRuntime {
                 decision: AppLedgerMasterPublishAdvance::NothingToPublish,
                 published: Vec::new(),
                 missing: None,
+                generic_acquire_candidates: Vec::new(),
             };
         };
 
@@ -230,22 +235,29 @@ impl AppLedgerMasterRuntime {
                 decision,
                 published: Vec::new(),
                 missing: None,
+                generic_acquire_candidates: Vec::new(),
             },
             AppLedgerMasterPublishAdvance::FirstPublished
             | AppLedgerMasterPublishAdvance::GapTooLarge => AppLedgerMasterAdvanceReport {
                 decision,
                 published: vec![validated],
                 missing: None,
+                generic_acquire_candidates: Vec::new(),
             },
             AppLedgerMasterPublishAdvance::Sequential => {
                 let mut to_publish = Vec::new();
                 let mut missing = None;
+                let mut generic_acquire_candidates = Vec::new();
+                let mut publication_contiguous = true;
                 let mut next_seq = published
                     .as_ref()
                     .map(|ledger| ledger.header().seq)
                     .unwrap_or(0)
                     .saturating_add(1);
 
+                // Match rippled findNewLedgersToPublish: continue scanning the
+                // validated chain after the first publication hole so a bounded
+                // ascending set of Generic acquisitions can begin in parallel.
                 while next_seq <= valid_seq {
                     let next_ledger = if next_seq == valid_seq {
                         Some(Arc::clone(&validated))
@@ -256,33 +268,42 @@ impl AppLedgerMasterRuntime {
                         if hash.is_zero() {
                             break;
                         }
-                        self.ledger_master.get_ledger_by_hash(hash).or_else(|| {
-                            missing = Some(AppLedgerMasterMissingLedger {
-                                hash: *hash.as_uint256(),
-                                seq: next_seq,
-                            });
-                            None
-                        })
+                        match self.ledger_master.get_ledger_by_hash(hash) {
+                            Some(ledger) => Some(ledger),
+                            None => {
+                                let candidate = AppLedgerMasterMissingLedger {
+                                    hash: *hash.as_uint256(),
+                                    seq: next_seq,
+                                };
+                                missing.get_or_insert(candidate);
+                                generic_acquire_candidates.push(candidate);
+                                publication_contiguous = false;
+                                next_seq = next_seq.saturating_add(1);
+                                continue;
+                            }
+                        }
                     };
 
                     let Some(next_ledger) = next_ledger else {
                         break;
                     };
-
                     if next_ledger.header().seq != next_seq {
                         break;
                     }
 
-                    if let Some(previous) = to_publish
-                        .last()
-                        .cloned()
-                        .or_else(|| self.ledger_master.published_ledger())
-                        && previous.header().hash != next_ledger.header().parent_hash
-                    {
-                        break;
+                    if publication_contiguous {
+                        if let Some(previous) = to_publish
+                            .last()
+                            .cloned()
+                            .or_else(|| self.ledger_master.published_ledger())
+                            && previous.header().hash != next_ledger.header().parent_hash
+                        {
+                            publication_contiguous = false;
+                            next_seq = next_seq.saturating_add(1);
+                            continue;
+                        }
+                        to_publish.push(next_ledger);
                     }
-
-                    to_publish.push(next_ledger);
                     next_seq = next_seq.saturating_add(1);
                 }
 
@@ -290,6 +311,7 @@ impl AppLedgerMasterRuntime {
                     decision,
                     published: to_publish,
                     missing,
+                    generic_acquire_candidates,
                 }
             }
         }

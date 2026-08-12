@@ -7752,15 +7752,29 @@ impl ApplicationRoot {
                     }
                 }
                 if !report.published.is_empty() {}
-                // If there's a missing ledger, trigger acquisition.
-                if let Some(missing) = report.missing {
+                // Match rippled findNewLedgersToPublish: start missing
+                // validated-chain ledgers in ascending order with its strict
+                // `++acqCount < ledgerFetchSize_` bound. The planner retains
+                // the first missing item separately for replay proof.
+                let generic_fetch_limit = crate::NodeSizeResourceProfile::for_node_size(
+                    self.status_rpc_node_size().as_deref(),
+                )
+                .ledger_fetch_size
+                .saturating_sub(1);
+                if generic_fetch_limit != 0 {
                     if let Ok(guard) = lm_rt.inbound_ledgers.lock() {
                         if let Some(shared) = guard.as_ref() {
-                            shared.acquire_async(
-                                missing.hash,
-                                missing.seq,
-                                crate::ledger::inbound_ledgers::AcquireReason::Generic,
-                            );
+                            for missing in report
+                                .generic_acquire_candidates
+                                .iter()
+                                .take(generic_fetch_limit as usize)
+                            {
+                                shared.acquire_async(
+                                    missing.hash,
+                                    missing.seq,
+                                    crate::ledger::inbound_ledgers::AcquireReason::Generic,
+                                );
+                            }
                         }
                     }
                 }

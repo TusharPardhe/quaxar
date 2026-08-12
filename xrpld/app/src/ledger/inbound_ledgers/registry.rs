@@ -24,7 +24,7 @@ use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 
 use super::acquisition::{
     AcquisitionBuilder, AcquisitionCompletionRecorder, AcquisitionFailureRecorder,
-    AcquisitionPeerProvider, AcquisitionSnapshot, AcquisitionState,
+    AcquisitionLedgerStore, AcquisitionPeerProvider, AcquisitionSnapshot, AcquisitionState,
 };
 use super::read_broker::{NodeReadBroker, ReadBrokerConfig};
 use super::worker_pool::WorkerPool;
@@ -640,6 +640,7 @@ pub struct InboundLedgers {
     fetch_pack: Arc<FetchPackCache>,
     overlay_rt: Arc<RwLock<Option<Arc<AppOverlayRuntime>>>>,
     completed_ledgers_tx: SyncSender<CompletedInboundLedger>,
+    completed_ledger_store: Arc<RwLock<Option<AcquisitionLedgerStore>>>,
     stopping: AtomicBool,
     need_network_ledger: Arc<AtomicBool>,
     pending_acquires: Arc<Mutex<HashSet<Uint256>>>,
@@ -697,6 +698,7 @@ impl InboundLedgers {
             fetch_pack,
             overlay_rt: Arc::new(RwLock::new(None)),
             completed_ledgers_tx,
+            completed_ledger_store: Arc::new(RwLock::new(None)),
             stopping: AtomicBool::new(false),
             need_network_ledger,
             pending_acquires: Arc::new(Mutex::new(HashSet::new())),
@@ -723,6 +725,16 @@ impl InboundLedgers {
     pub fn set_node_store(&self, ns: SHAMapStoreNodeStore) {
         let mut guard = self.node_store.write().expect("node_store write");
         *guard = Some(ns);
+    }
+
+    /// Install the app-owned `LedgerMaster::storeLedger` equivalent used by
+    /// completed Consensus/Generic acquisitions before their AcqDone-equivalent
+    /// queue handoff. History completion deliberately uses its separate path.
+    pub(crate) fn set_completed_ledger_store(&self, store: AcquisitionLedgerStore) {
+        *self
+            .completed_ledger_store
+            .write()
+            .expect("completed_ledger_store write") = Some(store);
     }
 
     /// Return a read-only, cumulative trace of inbound ledger work across all
@@ -917,6 +929,11 @@ impl InboundLedgers {
                 record_recent_failure(&mut inner, failed_hash, Some(acquisition_id));
             })
         };
+        let completed_ledger_store = self
+            .completed_ledger_store
+            .read()
+            .expect("completed_ledger_store read")
+            .clone();
         let completion_recorder: AcquisitionCompletionRecorder = {
             let inner = Arc::clone(&self.inner);
             Arc::new(move |completed_hash, ledger| {
@@ -971,6 +988,7 @@ impl InboundLedgers {
             store_tx: self.completed_ledgers_tx.clone(),
             failure_recorder,
             completion_recorder,
+            completed_ledger_store,
             full_below_generation: full_below_gen,
             worker_pool: Arc::clone(&self.worker_pool),
             initial_peers,
