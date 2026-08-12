@@ -25,7 +25,8 @@ use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 use super::acquisition::{
     AcquisitionBuilder, AcquisitionCompletionRecorder, AcquisitionDurableCompletionRecorder,
     AcquisitionFailureRecorder, AcquisitionLedgerStore, AcquisitionPeerProvider,
-    AcquisitionSequencePromoter, AcquisitionSnapshot, AcquisitionState, PacketEnqueue, ProvisionalLedgerIdentity,
+    AcquisitionSequencePromoter, AcquisitionSnapshot, AcquisitionState, PacketEnqueue,
+    ProvisionalLedgerIdentity,
 };
 #[cfg(test)]
 use super::acquisition::{SequencePromotionAttempt, SequenceRoutePause};
@@ -935,7 +936,10 @@ impl InboundLedgers {
             // sequence from another acquisition identity.
             let canonical_seq = state.seq();
             if canonical_seq != 0 {
-                let mut inner = self.inner.lock().expect("inbound_ledgers sequence update lock");
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .expect("inbound_ledgers sequence update lock");
                 if let Some(entry) = inner.entries.get_mut(&hash)
                     && entry.id == entry_id
                     && entry.seq == 0
@@ -2536,7 +2540,9 @@ mod tests {
         let promotion_state = Arc::clone(&state);
         let promotion_thread = std::thread::spawn(move || {
             promotion_state.update_seq(2);
-            promotion_tx.send(()).expect("promotion completion receiver");
+            promotion_tx
+                .send(())
+                .expect("promotion completion receiver");
         });
         promotion_attempt.wait_until_attempted();
         assert_eq!(

@@ -1114,7 +1114,10 @@ impl Peer for PeerImp {
         {
             return true;
         }
-        status.recent_ledgers.iter().any(|known_hash| *known_hash == hash)
+        status
+            .recent_ledgers
+            .iter()
+            .any(|known_hash| *known_hash == hash)
     }
 
     fn ledger_range(&self) -> (u32, u32) {

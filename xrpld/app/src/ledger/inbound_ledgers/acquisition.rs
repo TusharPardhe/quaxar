@@ -184,7 +184,10 @@ pub(crate) struct SequencePromotionAttempt {
 #[cfg(test)]
 impl SequencePromotionAttempt {
     pub(crate) fn wait_until_attempted(&self) {
-        let attempted = self.attempted.lock().expect("sequence promotion attempt lock");
+        let attempted = self
+            .attempted
+            .lock()
+            .expect("sequence promotion attempt lock");
         let (attempted, timeout) = self
             .wake
             .wait_timeout_while(attempted, Duration::from_secs(5), |attempted| !*attempted)
@@ -1249,7 +1252,10 @@ impl AcquisitionState {
         response_seq: Option<u32>,
         packet: InboundLedgerPacket,
     ) -> Result<PacketEnqueue, u32> {
-        let _sequence_gate = self.sequence_gate.lock().expect("acquisition sequence gate");
+        let _sequence_gate = self
+            .sequence_gate
+            .lock()
+            .expect("acquisition sequence gate");
         let expected_seq = self.seq();
         if let Some(response_seq) = response_seq
             && !super::registry::response_sequence_matches_request(expected_seq, response_seq)
@@ -1828,7 +1834,10 @@ impl AcquisitionState {
         actor_plan: ActorTreePlan,
         send_hook: impl FnOnce(),
     ) -> bool {
-        let _outbound = self.outbound_gate.lock().expect("acquisition outbound gate lock");
+        let _outbound = self
+            .outbound_gate
+            .lock()
+            .expect("acquisition outbound gate lock");
         restore_tree_plan_before_peer_send(
             actor_plan,
             |actor_plan| self.try_restore_tree_plan(actor_plan),
@@ -1856,7 +1865,10 @@ impl AcquisitionState {
         message: &overlay::ProtocolMessage,
         target: Option<&Arc<dyn Peer>>,
     ) -> bool {
-        let _outbound = self.outbound_gate.lock().expect("acquisition outbound gate lock");
+        let _outbound = self
+            .outbound_gate
+            .lock()
+            .expect("acquisition outbound gate lock");
         self.send_request_while_outbound_gate(message, target)
     }
 
@@ -2130,7 +2142,10 @@ impl AcquisitionState {
             return;
         }
         let tickets = {
-            let _outbound = self.outbound_gate.lock().expect("acquisition outbound gate lock");
+            let _outbound = self
+                .outbound_gate
+                .lock()
+                .expect("acquisition outbound gate lock");
             if self.stopped.swap(true, Ordering::AcqRel) {
                 return;
             }
@@ -2188,7 +2203,10 @@ impl AcquisitionState {
 
     fn mark_failed(&self) {
         let tickets = {
-            let _outbound = self.outbound_gate.lock().expect("acquisition outbound gate lock");
+            let _outbound = self
+                .outbound_gate
+                .lock()
+                .expect("acquisition outbound gate lock");
             if self
                 .failure_claimed
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -2261,7 +2279,10 @@ impl AcquisitionState {
         {
             attempt.mark_attempted();
         }
-        let _sequence_gate = self.sequence_gate.lock().expect("acquisition sequence gate");
+        let _sequence_gate = self
+            .sequence_gate
+            .lock()
+            .expect("acquisition sequence gate");
         if self
             .seq
             .compare_exchange(0, sequence, Ordering::AcqRel, Ordering::Acquire)
@@ -2777,7 +2798,9 @@ fn record_first_packet_header_received(
         (false, true, _)
     ) {
         stats.mark_header_received();
-        lifecycle.reply_headers_received.fetch_add(1, Ordering::Relaxed);
+        lifecycle
+            .reply_headers_received
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -3187,17 +3210,20 @@ fn process_one_read_event(state: &Arc<AcquisitionState>) -> bool {
     let deferred_network_fallback = actor_plan.deferred_network_fallbacks.remove(&hash);
     let apply = match ready.outcome {
         ReadOutcome::Found(object) => {
-            let node = match shamap::tree_node::SHAMapTreeNode::make_from_prefix(object.data(), hash) {
-                Ok(node) => node,
-                Err(_) => {
-                    fail_actor_plan(state, actor_plan);
-                    return true;
-                }
-            };
+            let node =
+                match shamap::tree_node::SHAMapTreeNode::make_from_prefix(object.data(), hash) {
+                    Ok(node) => node,
+                    Err(_) => {
+                        fail_actor_plan(state, actor_plan);
+                        return true;
+                    }
+                };
             if deferred_network_fallback {
-                actor_plan
-                    .plan
-                    .apply_network_node(TreePlanId::new(ready.ticket.plan_id()), hash, node)
+                actor_plan.plan.apply_network_node(
+                    TreePlanId::new(ready.ticket.plan_id()),
+                    hash,
+                    node,
+                )
             } else {
                 actor_plan.plan.apply_read_result(
                     TreePlanId::new(ready.ticket.plan_id()),
@@ -3281,15 +3307,14 @@ fn take_tree_network_request(
             .iter()
             .map(|(_, hash)| (object_type, *hash))
             .collect::<Vec<_>>();
-        let outbound = make_inbound_needed_by_hash_request(state.hash, state.seq(), &needed).map(
-            |message| {
+        let outbound =
+            make_inbound_needed_by_hash_request(state.hash, state.seq(), &needed).map(|message| {
                 actor_plan.aggressive_by_hash = false;
                 OwnedOutboundRequest {
                     message,
                     target: None,
                 }
-            },
-        );
+            });
         let consumed = outbound.is_some();
         return (outbound, consumed);
     }
@@ -3365,9 +3390,7 @@ fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: 
                     }
                 }
                 deferred_fallback_hashes.insert(need.hash());
-                actor_plan
-                    .deferred_network_fallbacks
-                    .insert(need.hash());
+                actor_plan.deferred_network_fallbacks.insert(need.hash());
                 state
                     .stats
                     .state_scan_read_admission_deferred
@@ -3394,8 +3417,8 @@ fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: 
         .filter(|(_, hash)| deferred_fallback_hashes.contains(&SHAMapHash::new(*hash)))
         .collect::<Vec<_>>();
     if fallback_candidates.is_empty() {
-        actor_plan.runnable = actor_plan.read_admission_backlog.is_empty()
-            && actor_plan.plan.has_runnable_frontier();
+        actor_plan.runnable =
+            actor_plan.read_admission_backlog.is_empty() && actor_plan.plan.has_runnable_frontier();
         state.restore_tree_plan(actor_plan);
         state
             .read_broker
@@ -3624,7 +3647,8 @@ fn process_tree_plan_turn(state: &Arc<AcquisitionState>, budget: &TurnBudget) {
             let (outbound, consume_aggressive_by_hash) =
                 take_tree_network_request(state, &mut actor_plan, candidates);
             if consume_aggressive_by_hash {
-                if let Some(mut mutable) = state.lock_mutable("consume aggressive by-hash request") {
+                if let Some(mut mutable) = state.lock_mutable("consume aggressive by-hash request")
+                {
                     mutable.inbound.set_by_hash(false);
                 }
             }
@@ -4895,7 +4919,11 @@ mod actor_mailbox_tests {
         let selected = select_tree_network_candidates(&mut plan, candidates, 12);
         assert_eq!(selected.len(), 12, "outbound serialization remains bounded");
         let overflow = plan.take_network_candidates();
-        assert_eq!(overflow.len(), 4, "overflow stays on the immediate frontier");
+        assert_eq!(
+            overflow.len(),
+            4,
+            "overflow stays on the immediate frontier"
+        );
         for (_, hash) in overflow {
             assert!(
                 plan.mark_request_candidate(hash),
