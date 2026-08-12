@@ -2,7 +2,7 @@ use crate::database::{
     Database as DatabaseTrait, DatabaseDelegate, DatabaseImporter, DatabaseRuntime, DatabaseSource,
 };
 use crate::{
-    AsyncFetchCallback, Backend, FetchReport, FetchType, JournalLevel, NodeObject, NodeObjectType,
+    AsyncReadWork, Backend, FetchReport, FetchType, JournalLevel, NodeObject, NodeObjectType,
     NodeStoreJournal, ScheduledWrite, Scheduler, Status,
 };
 use basics::base_uint::Uint256;
@@ -162,8 +162,8 @@ impl DatabaseNodeImp {
             .fetch_node_object(hash, ledger_seq, fetch_type, duplicate)
     }
 
-    pub fn async_fetch(&self, hash: Uint256, ledger_seq: u32, callback: AsyncFetchCallback) {
-        self.database.async_fetch(hash, ledger_seq, callback);
+    pub fn async_fetch(&self, hash: Uint256, ledger_seq: u32, work: Box<dyn AsyncReadWork>) {
+        self.database.async_fetch(hash, ledger_seq, work);
     }
 
     /// Compatibility batch helper. The public Database trait has no batch
@@ -236,6 +236,10 @@ impl DatabaseNodeImp {
     pub fn fd_required(&self) -> i32 {
         self.backend.fd_required()
     }
+
+    pub fn store_generation(&self) -> u64 {
+        self.database.store_generation()
+    }
 }
 
 impl DatabaseSource for DatabaseNodeImp {
@@ -286,6 +290,10 @@ impl DatabaseTrait for DatabaseNodeImp {
         self.database.schedule_write(write);
     }
 
+    fn store_generation(&self) -> u64 {
+        DatabaseNodeImp::store_generation(self)
+    }
+
     fn fetch_node_object(
         &self,
         hash: &Uint256,
@@ -296,8 +304,8 @@ impl DatabaseTrait for DatabaseNodeImp {
         DatabaseNodeImp::fetch_node_object(self, hash, ledger_seq, fetch_type, duplicate)
     }
 
-    fn async_fetch(&self, hash: Uint256, ledger_seq: u32, callback: AsyncFetchCallback) {
-        DatabaseNodeImp::async_fetch(self, hash, ledger_seq, callback);
+    fn async_fetch(&self, hash: Uint256, ledger_seq: u32, work: Box<dyn AsyncReadWork>) {
+        DatabaseNodeImp::async_fetch(self, hash, ledger_seq, work);
     }
 
     fn stop(&self) {
@@ -356,5 +364,150 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
         message.clone()
     } else {
         "unknown panic payload".to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DatabaseNodeImp;
+    use crate::{
+        Backend, BatchWriteReport, Database as DatabaseTrait, FetchReport, NodeObject, NullJournal,
+        PersistenceWork, Scheduler, Status, Task,
+    };
+    use basics::base_uint::Uint256;
+    use basics::basic_config::Section;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RejectingScheduler {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl Scheduler for RejectingScheduler {
+        fn schedule_task(&self, _task: Arc<dyn Task>) {}
+
+        fn try_schedule_task(&self, _task: Arc<dyn Task>) -> bool {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            false
+        }
+
+        fn on_fetch(&self, _report: FetchReport) {}
+
+        fn on_batch_write(&self, _report: BatchWriteReport) {}
+    }
+
+    struct EmptyBackend;
+
+    impl Backend for EmptyBackend {
+        fn get_name(&self) -> String {
+            "empty".to_owned()
+        }
+
+        fn open(&self, _create_if_missing: bool) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn is_open(&self) -> bool {
+            true
+        }
+
+        fn close(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn fetch(&self, _hash: &Uint256) -> (Option<Arc<NodeObject>>, Status) {
+            (None, Status::NotFound)
+        }
+
+        fn fetch_batch(&self, hashes: &[Uint256]) -> (Vec<Option<Arc<NodeObject>>>, Status) {
+            (vec![None; hashes.len()], Status::NotFound)
+        }
+
+        fn store(&self, _object: Arc<NodeObject>) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn store_batch(&self, _batch: &crate::Batch) {}
+
+        fn sync(&self) {}
+
+        fn for_each(&self, _callback: &mut dyn FnMut(Arc<NodeObject>)) {}
+
+        fn get_write_load(&self) -> i32 {
+            0
+        }
+
+        fn set_delete_path(&self) {}
+
+        fn fd_required(&self) -> i32 {
+            0
+        }
+    }
+
+    struct TerminalTicket(Arc<AtomicUsize>);
+
+    impl Drop for TerminalTicket {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct TerminalWriteWork {
+        ticket: TerminalTicket,
+        payload: Vec<u8>,
+    }
+
+    impl PersistenceWork for TerminalWriteWork {
+        fn retained_payload_bytes(&self) -> usize {
+            self.payload.capacity()
+        }
+
+        fn run(self: Box<Self>) {
+            drop(self);
+        }
+    }
+
+    #[test]
+    fn database_trait_forwards_store_generation_and_rejected_write_once() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let database: Arc<dyn DatabaseTrait> = DatabaseNodeImp::new(
+            Arc::new(RejectingScheduler {
+                attempts: Arc::clone(&attempts),
+            }),
+            1,
+            Arc::new(EmptyBackend),
+            &Section::new("node_db"),
+            Arc::new(NullJournal),
+        )
+        .expect("database node adapter");
+        let terminal = Arc::new(AtomicUsize::new(0));
+        let ticket = TerminalTicket(Arc::clone(&terminal));
+
+        assert_eq!(
+            database.store_generation(),
+            1,
+            "the Database trait must forward the runtime's initial nonzero store generation"
+        );
+        database.schedule_write(Box::new(TerminalWriteWork {
+            ticket,
+            payload: Vec::with_capacity(1),
+        }));
+
+        assert_eq!(
+            attempts.load(Ordering::Acquire),
+            1,
+            "the adapter must forward the write to the real runtime scheduler"
+        );
+        assert_eq!(
+            terminal.load(Ordering::Acquire),
+            1,
+            "a rejected scheduler task must terminally release its write owner exactly once"
+        );
+        database.stop();
+        assert_eq!(
+            terminal.load(Ordering::Acquire),
+            1,
+            "stop must not redeliver an already rejected write owner"
+        );
     }
 }

@@ -23,8 +23,15 @@ use crate::tuning::{
 };
 
 const RECENT_PEER_KNOWLEDGE_CAPACITY: usize = 128;
-/// Matches rippled's `Tuning::kDropSendQueue`.
+/// Matches rippled's `Tuning::kDropSendQueue` item admission boundary.
 pub(crate) const SEND_QUEUE_CAPACITY: usize = 192;
+/// Byte accounting is bounded by a Rust transport adaptation, not a rippled
+/// byte-parity claim: the source-backed item budget above multiplied by the
+/// decoder-owned maximum wire frame (payload/decompressed limit plus the
+/// 10-byte header retained by `SESSION_RAW_BUFFER_CAPACITY`).
+const MAXIMUM_OUTBOUND_WIRE_FRAME_SIZE: usize = crate::MAXIMUM_MESSAGE_SIZE + 10;
+pub(crate) const SEND_QUEUE_BYTE_CAPACITY: usize =
+    SEND_QUEUE_CAPACITY * MAXIMUM_OUTBOUND_WIRE_FRAME_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tracking {
@@ -176,11 +183,13 @@ struct ListenerCheckState {
 #[derive(Default)]
 struct PeerOutboundState {
     queued_messages: Vec<Message>,
-    session_tx: Option<mpsc::UnboundedSender<Message>>,
+    queued_bytes: usize,
+    session_tx: Option<mpsc::Sender<Message>>,
     /// Shared with the session writer, which decrements it only after each
     /// async socket write completes. This restores the active-session depth
     /// used by PeerImp's lifecycle admission timer.
     session_queue_depth: Option<Arc<AtomicUsize>>,
+    session_queue_bytes: Option<Arc<AtomicUsize>>,
     session_stop: Option<watch::Sender<bool>>,
 }
 
@@ -189,6 +198,7 @@ impl std::fmt::Debug for PeerOutboundState {
         formatter
             .debug_struct("PeerOutboundState")
             .field("queued_messages", &self.queued_messages.len())
+            .field("queued_bytes", &self.queued_bytes)
             .field("session_attached", &self.session_tx.is_some())
             .field(
                 "session_queue_depth",
@@ -196,6 +206,13 @@ impl std::fmt::Debug for PeerOutboundState {
                     .session_queue_depth
                     .as_ref()
                     .map(|depth| depth.load(Ordering::Relaxed)),
+            )
+            .field(
+                "session_queue_bytes",
+                &self
+                    .session_queue_bytes
+                    .as_ref()
+                    .map(|bytes| bytes.load(Ordering::Relaxed)),
             )
             .finish()
     }
@@ -379,7 +396,11 @@ impl PeerImp {
         // onTimer. Here we only increment/check.
         if self.send_queue_size() >= TARGET_SEND_QUEUE {
             if self.large_sendq.fetch_add(1, Ordering::AcqRel) >= SENDQ_INTERVALS {
-                tracing::warn!(target: "overlay", peer_id = %self.id, "send queue remained large; disconnecting peer");
+                tracing::warn!(
+                    target: "overlay",
+                    peer_id = %self.id,
+                    "send queue remained large; disconnecting peer"
+                );
                 self.request_disconnect();
                 return;
             }
@@ -396,7 +417,12 @@ impl PeerImp {
             let expired = matches!(state, Tracking::Diverged) && state_age > MAX_DIVERGED_TIME
                 || matches!(state, Tracking::Unknown) && state_age > MAX_UNKNOWN_TIME;
             if expired {
-                tracing::warn!(target: "overlay", peer_id = %self.id, ?state, "peer remained Not Useful; disconnecting");
+                tracing::warn!(
+                    target: "overlay",
+                    peer_id = %self.id,
+                    ?state,
+                    "peer remained Not Useful; disconnecting"
+                );
                 // rippled calls peerFinder().onFailure(slot_) before fail()
                 // to lower bootcache valence for this endpoint.
                 self.notify_outbound_failure();
@@ -626,11 +652,12 @@ impl PeerImp {
     }
 
     pub fn clear_queued_messages(&self) {
-        self.outbound_state
+        let mut outbound = self
+            .outbound_state
             .lock()
-            .expect("peer queued messages lock")
-            .queued_messages
-            .clear();
+            .expect("peer queued messages lock");
+        outbound.queued_messages.clear();
+        outbound.queued_bytes = 0;
     }
 
     /// Returns a snapshot of resource charges applied through `Peer::charge`.
@@ -640,16 +667,19 @@ impl PeerImp {
 
     pub fn attach_session(
         &self,
-        session_tx: mpsc::UnboundedSender<Message>,
+        session_tx: mpsc::Sender<Message>,
         session_stop: watch::Sender<bool>,
-    ) -> (Vec<Message>, Arc<AtomicUsize>) {
+    ) -> (Vec<Message>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let mut outbound_state = self.outbound_state.lock().expect("peer outbound lock");
         let pending = std::mem::take(&mut outbound_state.queued_messages);
+        let pending_bytes = std::mem::take(&mut outbound_state.queued_bytes);
         let queue_depth = Arc::new(AtomicUsize::new(pending.len()));
+        let queue_bytes = Arc::new(AtomicUsize::new(pending_bytes));
         outbound_state.session_tx = Some(session_tx);
         outbound_state.session_queue_depth = Some(Arc::clone(&queue_depth));
+        outbound_state.session_queue_bytes = Some(Arc::clone(&queue_bytes));
         outbound_state.session_stop = Some(session_stop);
-        (pending, queue_depth)
+        (pending, queue_depth, queue_bytes)
     }
 
     pub fn detach_session(&self) {
@@ -659,6 +689,7 @@ impl PeerImp {
         }
         outbound_state.session_tx = None;
         outbound_state.session_queue_depth = None;
+        outbound_state.session_queue_bytes = None;
     }
 
     pub fn has_dead_session_channel(&self) -> bool {
@@ -845,7 +876,7 @@ impl PeerImp {
         }
     }
 
-    fn request_disconnect(&self) {
+    pub fn request_disconnect(&self) {
         if self.disconnect_requested.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -861,6 +892,43 @@ impl PeerImp {
     }
 }
 
+fn reserve_active_send(
+    depth: &AtomicUsize,
+    bytes: &AtomicUsize,
+    message_bytes: usize,
+) -> Option<usize> {
+    let depth_before = loop {
+        let current = depth.load(Ordering::Acquire);
+        if current >= SEND_QUEUE_CAPACITY {
+            return None;
+        }
+        if depth
+            .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break current;
+        }
+    };
+    loop {
+        let current = bytes.load(Ordering::Acquire);
+        if current.saturating_add(message_bytes) > SEND_QUEUE_BYTE_CAPACITY {
+            depth.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        if bytes
+            .compare_exchange(
+                current,
+                current + message_bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return Some(depth_before);
+        }
+    }
+}
+
 impl Peer for PeerImp {
     fn send(&self, message: Message) {
         if self.disconnect_requested.load(Ordering::Acquire) {
@@ -868,12 +936,26 @@ impl Peer for PeerImp {
         }
 
         let droppable = self.is_droppable_send(&message);
+        let message_bytes = message.get_buffer_size();
+        if message_bytes > MAXIMUM_OUTBOUND_WIRE_FRAME_SIZE {
+            // The transport framing owner rejects any single item outside the
+            // decoder's existing wire-frame maximum before it can invalidate
+            // the derived queue byte envelope.
+            if !droppable {
+                self.request_disconnect();
+            }
+            return;
+        }
         let session = {
             let mut outbound_state = self.outbound_state.lock().expect("peer outbound lock");
             let Some(session_tx) = outbound_state.session_tx.clone() else {
                 let queue_depth_before_push = outbound_state.queued_messages.len();
-                if queue_depth_before_push < SEND_QUEUE_CAPACITY {
+                if queue_depth_before_push < SEND_QUEUE_CAPACITY
+                    && outbound_state.queued_bytes.saturating_add(message_bytes)
+                        <= SEND_QUEUE_BYTE_CAPACITY
+                {
                     outbound_state.queued_messages.push(message);
+                    outbound_state.queued_bytes += message_bytes;
                     // rippled tests sendQueue_.size() before pushing the new
                     // message when deciding whether to reset largeSendq_.
                     if queue_depth_before_push < TARGET_SEND_QUEUE {
@@ -893,26 +975,38 @@ impl Peer for PeerImp {
                 .as_ref()
                 .expect("active session must have queue depth")
                 .clone();
-            let queue_depth_before_push = queue_depth.load(Ordering::Acquire);
-            (session_tx, queue_depth, queue_depth_before_push)
+            let queue_bytes = outbound_state
+                .session_queue_bytes
+                .as_ref()
+                .expect("active session must have queue bytes")
+                .clone();
+            (session_tx, queue_depth, queue_bytes)
         };
 
-        // rippled's send() always pushes to the unbounded queue (PeerImp.cpp:322).
-        // Queue pressure is handled by the per-peer 60s timer (largeSendq_),
-        // not by refusing messages. Increment before sending so a concurrently
-        // waking writer cannot make the depth transiently underflow.
-        session.1.fetch_add(1, Ordering::AcqRel);
-        match session.0.send(message) {
+        let Some(queue_depth_before_push) =
+            reserve_active_send(session.1.as_ref(), session.2.as_ref(), message_bytes)
+        else {
+            // Quaxar's finite queue policy drops reply-like traffic but
+            // disconnects when control/request traffic cannot be retained.
+            if !droppable {
+                self.request_disconnect();
+            }
+            return;
+        };
+        match session.0.try_send(message) {
             Ok(()) => {
                 // The reset decision is based on the queue depth before this
                 // message was pushed, exactly as in rippled.
-                if session.2 < TARGET_SEND_QUEUE {
+                if queue_depth_before_push < TARGET_SEND_QUEUE {
                     self.large_sendq.store(0, Ordering::Release);
                 }
             }
             Err(_) => {
                 session.1.fetch_sub(1, Ordering::AcqRel);
-                self.request_disconnect();
+                session.2.fetch_sub(message_bytes, Ordering::AcqRel);
+                if !droppable {
+                    self.request_disconnect();
+                }
             }
         }
     }
@@ -1210,7 +1304,7 @@ mod tests {
     use basics::base_uint::Uint256;
     use protocol::{KeyType, SecretKey, derive_public_key};
 
-    use super::{PeerImp, Tracking};
+    use super::{PeerImp, SEND_QUEUE_CAPACITY, Tracking};
     use crate::message::ProtocolPayload;
     use crate::peer::{Peer, ProtocolFeature};
     use crate::protocol_version::ProtocolVersion;
@@ -1251,9 +1345,9 @@ mod tests {
             public,
             "queue-depth",
         );
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(SEND_QUEUE_CAPACITY);
         let (stop, _stop_rx) = tokio::sync::watch::channel(false);
-        let (_pending, _depth) = peer.attach_session(sender, stop);
+        let (_pending, _depth, _bytes) = peer.attach_session(sender, stop);
 
         peer.send(crate::Message::new(
             crate::ProtocolMessage::new(ProtocolPayload::Ping(crate::TmPing {
@@ -1280,9 +1374,9 @@ mod tests {
             public,
             "sendq-reset",
         );
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(SEND_QUEUE_CAPACITY);
         let (stop, _stop_rx) = tokio::sync::watch::channel(false);
-        let (_pending, _depth) = peer.attach_session(sender, stop);
+        let (_pending, _depth, _bytes) = peer.attach_session(sender, stop);
 
         for sequence in 0..crate::tuning::TARGET_SEND_QUEUE - 1 {
             peer.send(crate::Message::new(

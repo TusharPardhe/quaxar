@@ -25,6 +25,7 @@ impl BatchWriterState {
 
 pub struct BatchWriter {
     callback: Box<dyn Fn(&Batch) + Send + Sync>,
+    callback_bytes: usize,
     scheduler: Arc<dyn Scheduler>,
     state: Mutex<BatchWriterState>,
     condition: Condvar,
@@ -52,8 +53,10 @@ impl BatchWriter {
     where
         F: Fn(&Batch) + Send + Sync + 'static,
     {
+        let callback_bytes = std::mem::size_of::<F>();
         Arc::new(Self {
             callback: Box::new(callback),
+            callback_bytes,
             scheduler,
             state: Mutex::new(BatchWriterState::new()),
             condition: Condvar::new(),
@@ -142,6 +145,10 @@ impl BatchWriter {
 impl Task for BatchWriter {
     fn perform_scheduled_task(&self) {
         self.write_batch();
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.callback_bytes
     }
 }
 

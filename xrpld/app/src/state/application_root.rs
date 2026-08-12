@@ -8228,7 +8228,12 @@ impl ApplicationRoot {
             .map(|service| service.operating_mode())
     }
 
-    fn inbound_ledger_is_provisional(&self, hash: basics::base_uint::Uint256) -> bool {
+    /// True only while Worker 2's exact inbound acquisition identity remains
+    /// resolver-visible but has not crossed its durable completion fence.
+    /// Consensus, LCL, validation, and publication owners must treat this as
+    /// non-adoptable; the registry revokes the same identity on terminal
+    /// failure so a replacement acquisition cannot be mistaken for it.
+    pub(crate) fn inbound_ledger_is_provisional(&self, hash: basics::base_uint::Uint256) -> bool {
         self.ledger_master_runtime().is_some_and(|runtime| {
             runtime
                 .inbound_ledgers

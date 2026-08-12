@@ -2,14 +2,17 @@ use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Once;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use basics::base_uint::Uint256;
 use http::Request;
+use overlay::inbound::LedgerDataIngressDisposition;
 use overlay::{
-    Clock, ConnectAttemptError, ConnectionStep, Handoff, ManualClock, Overlay, OverlayHandoff,
-    OverlayImpl, Peer, PeerImp, PeerSet, ProtocolPayload, Setup, SimplePeerSet, SlotState,
-    TmProposeSet, TmTransaction,
+    Clock, ConnectAttemptError, ConnectionStep, Handoff, ManualClock, Message, Overlay,
+    OverlayHandoff, OverlayImpl, OverlayInboundHandler, Peer, PeerImp, PeerSet, ProtocolMessage,
+    ProtocolPayload, QueuedOverlayInboundHandler, Setup, SimplePeerSet, SlotState, TmLedgerData,
+    TmPing, TmProposeSet, TmTransaction,
 };
 use protocol::{JsonValue, KeyType, PublicKey, SecretKey, derive_public_key};
 use rcgen::generate_simple_self_signed;
@@ -611,4 +614,138 @@ async fn outbound_connect_reports_service_unavailable_when_listener_peer_limit_i
     std::thread::spawn(move || drop(client_overlay))
         .join()
         .expect("client overlay drop");
+}
+
+#[test]
+fn deferred_ledger_data_has_no_global_peer_cap_and_retries_31_32_33_without_loss() {
+    let handler = QueuedOverlayInboundHandler::default();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    handler.set_ledger_data_router(Box::new({
+        let attempts = Arc::clone(&attempts);
+        move |_, _| {
+            if attempts.fetch_add(1, Ordering::AcqRel) < 33 {
+                LedgerDataIngressDisposition::Deferred
+            } else {
+                LedgerDataIngressDisposition::Delivered
+            }
+        }
+    }));
+
+    let peers = (1..=33)
+        .map(|id| peer(90 + id, 90 + id as u8))
+        .collect::<Vec<_>>();
+    for peer in &peers {
+        assert_eq!(
+            handler.on_ledger_data(peer, TmLedgerData::default()),
+            LedgerDataIngressDisposition::Deferred,
+            "peer {} retains its sole matching frame without a global paused-peer eviction",
+            peer.id()
+        );
+        assert!(!peer.disconnect_requested());
+    }
+    for peer in &peers {
+        assert!(
+            !handler.retry_deferred_ledger_data(peer.id()),
+            "retry must hand the original frame to the admission route exactly once"
+        );
+    }
+    assert_eq!(attempts.load(Ordering::Acquire), 66);
+}
+
+#[test]
+fn duplicate_deferred_ledger_data_disconnects_without_replacing_the_retained_frame() {
+    let handler = QueuedOverlayInboundHandler::default();
+    let peer = peer(124, 124);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    handler.set_ledger_data_router(Box::new({
+        let attempts = Arc::clone(&attempts);
+        move |_, _| {
+            attempts.fetch_add(1, Ordering::AcqRel);
+            LedgerDataIngressDisposition::Deferred
+        }
+    }));
+
+    assert_eq!(
+        handler.on_ledger_data(&peer, TmLedgerData::default()),
+        LedgerDataIngressDisposition::Deferred
+    );
+    assert_eq!(
+        handler.on_ledger_data(&peer, TmLedgerData::default()),
+        LedgerDataIngressDisposition::Delivered,
+        "a duplicate cannot replace the session-owned frame"
+    );
+    assert!(peer.disconnect_requested());
+    assert_eq!(
+        attempts.load(Ordering::Acquire),
+        1,
+        "the duplicate is terminally rejected before Worker 2 admission"
+    );
+
+    handler.discard_deferred_ledger_data(peer.id());
+    assert!(
+        !handler.retry_deferred_ledger_data(peer.id()),
+        "disconnect/stop terminal release leaves no deferred frame or lease"
+    );
+}
+
+#[test]
+fn active_send_item_and_byte_pressure_use_191_192_193_session_boundary() {
+    let peer = peer(125, 125);
+    let (sender, _receiver) = tokio::sync::mpsc::channel(192);
+    let (stop, _stop_rx) = tokio::sync::watch::channel(false);
+    let (_pending, depth, bytes) = peer.attach_session(sender, stop);
+    let large = Message::new(
+        ProtocolMessage::new(ProtocolPayload::Transaction(TmTransaction {
+            raw_transaction: vec![0xA5; 1024 * 1024],
+            status: 1,
+            receive_timestamp: None,
+            deferred: None,
+        })),
+        None,
+    );
+    let large_bytes = large.get_buffer_size();
+    peer.send(large);
+    assert_eq!(depth.load(Ordering::Acquire), 1);
+    assert_eq!(bytes.load(Ordering::Acquire), large_bytes);
+
+    for sequence in 1..=190 {
+        peer.send(Message::new(
+            ProtocolMessage::new(ProtocolPayload::Ping(TmPing {
+                r#type: 0,
+                seq: Some(sequence),
+                ping_time: None,
+                net_time: None,
+            })),
+            None,
+        ));
+    }
+    assert_eq!(depth.load(Ordering::Acquire), 191);
+    assert!(bytes.load(Ordering::Acquire) > large_bytes);
+    assert!(!peer.disconnect_requested());
+
+    peer.send(Message::new(
+        ProtocolMessage::new(ProtocolPayload::Ping(TmPing {
+            r#type: 0,
+            seq: Some(191),
+            ping_time: None,
+            net_time: None,
+        })),
+        None,
+    ));
+    assert_eq!(depth.load(Ordering::Acquire), 192);
+    assert!(!peer.disconnect_requested());
+
+    peer.send(Message::new(
+        ProtocolMessage::new(ProtocolPayload::Ping(TmPing {
+            r#type: 0,
+            seq: Some(192),
+            ping_time: None,
+            net_time: None,
+        })),
+        None,
+    ));
+    assert!(
+        peer.disconnect_requested(),
+        "non-droppable traffic has the explicit terminal disposition at 193"
+    );
 }

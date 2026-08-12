@@ -612,6 +612,14 @@ fn sync_tree_to_rcl_tx_set(
     consensus::RclTxSet::from_parts(sync_tree.root(), Arc::clone(cache), sync_tree.backed(), 0)
 }
 
+/// A resolver-visible inbound ledger is not a consensus parent until its
+/// exact Worker 2 acquisition identity passes the durable fence. Returning it
+/// from `acquire_ledger` would let `handleWrongLedger` start a replacement
+/// round before NetworkOPs can apply its LCL transition gate.
+fn resolved_consensus_ledger_is_adoptable(provisional: bool) -> bool {
+    !provisional
+}
+
 fn should_acquire_consensus_ledger(
     acquiring_ledger: &mut Option<Uint256>,
     ledger_id: Uint256,
@@ -672,20 +680,31 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
     fn acquire_ledger(&self, ledger_id: &Uint256) -> Option<Self::Ledger> {
         let hash = basics::sha_map_hash::SHAMapHash::new(*ledger_id);
         if let Some(ledger) = self.app_root.resolve_ledger_by_hash(hash) {
-            // rippled RCLConsensus::Adaptor::acquireLedger calls
-            // inboundTransactions_.newRound(built->header().seq) before
-            // returning a cached target to generic WrongLedger recovery.
-            // Unlike normal strand starts, `handleWrongLedger` enters
-            // start_round_internal directly, so this reset must live here.
-            reset_inbound_transactions_for_resolved_consensus_ledger(
-                &self.inbound_transactions,
-                ledger.header().seq,
+            let provisional = self.app_root.inbound_ledger_is_provisional(*ledger_id);
+            if resolved_consensus_ledger_is_adoptable(provisional) {
+                // rippled RCLConsensus::Adaptor::acquireLedger calls
+                // inboundTransactions_.newRound(built->header().seq) before
+                // returning a cached target to generic WrongLedger recovery.
+                // Unlike normal strand starts, `handleWrongLedger` enters
+                // start_round_internal directly, so this reset must live here.
+                reset_inbound_transactions_for_resolved_consensus_ledger(
+                    &self.inbound_transactions,
+                    ledger.header().seq,
+                );
+                // A resolved ledger is immediately usable by generic WrongLedger
+                // recovery. `need_network_ledger` is a startup/publication status
+                // flag, not an eligibility gate for an already acquired consensus
+                // LCL.
+                return Some(RclCxLedger::new(ledger));
+            }
+            tracing::info!(
+                target: "lcl_trace",
+                event = "consensus_wrong_ledger_provisional",
+                target_hash = %ledger_id,
+                candidate_hash = %ledger.header().hash,
+                candidate_seq = ledger.header().seq,
+                "LCL trace: generic WrongLedger retained exact-target recovery behind durable fence"
             );
-            // A resolved ledger is immediately usable by generic WrongLedger
-            // recovery. `need_network_ledger` is a startup/publication status
-            // flag, not an eligibility gate for an already acquired consensus
-            // LCL.
-            return Some(RclCxLedger::new(ledger));
         }
 
         let shared = self
@@ -1778,6 +1797,7 @@ mod tests {
         reset_inbound_transactions_for_resolved_consensus_ledger,
         trusted_validation_quorum_reached, update_operating_mode_after_accept,
     };
+    use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers};
     use crate::network::network_ops::{
         AppNetworkOpsModeOwner, NetworkOpsOperatingMode, SharedNetworkOpsState,
     };
@@ -1785,14 +1805,22 @@ mod tests {
     use crate::tx_queue::transaction::TransactionRelayMetadata;
     use crate::validator::validator_keys::ValidatorKeys;
     use basics::base_uint::Uint256;
+    use basics::basic_config::BasicConfig;
     use basics::chrono::NetClockTimePoint;
+    use basics::hardened_hash::HardenedHashBuilder;
+    use basics::tagged_cache::MonotonicClock;
     use consensus::ConsensusParms;
     use consensus::algorithm::ConsensusPhase;
     use consensus::algorithm::types::ConsensusMode;
-    use ledger::Ledger;
+    use ledger::{FetchPackCache, Ledger};
+    use nodestore::{DummyScheduler, ManagerImp, NullJournal, Scheduler};
     use protocol::{AccountID, STAmount, STTx, TxType, get_field_by_symbol};
-    use std::sync::Arc;
+    use shamap::family::FullBelowCacheImpl;
+    use shamap::tree_node_cache::TreeNodeCache;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
+    use tempfile::TempDir;
 
     fn failed_candidate_test_runner(root: &mut ApplicationRoot) -> AppConsensus {
         let ledger_master_runtime = root.attach_default_ledger_master_runtime();
@@ -1823,6 +1851,88 @@ mod tests {
             root.clone(),
         );
         AppConsensus::new(adaptor, ConsensusParms::default())
+    }
+
+    /// Construct an actual resident inbound acquisition and leave it at the
+    /// public completion handoff before its durability state is marked complete.
+    /// The resolver insertion mirrors bootstrap's `storeLedger` callback; this
+    /// test deliberately does not call any acquisition/registry internals.
+    fn install_real_provisional_inbound_candidate(
+        root: &mut ApplicationRoot,
+        ledger: Arc<Ledger>,
+    ) -> (TempDir, Arc<InboundLedgers>) {
+        let runtime = root.attach_default_ledger_master_runtime();
+        let dir = TempDir::new().expect("temporary inbound store");
+        let mut config = BasicConfig::new();
+        config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
+        let node_db = config.section_mut("node_db");
+        node_db.set("type", "Memory");
+        node_db.set("path", dir.path().join("node").to_string_lossy());
+        let store = crate::bootstrap_shamap_store(
+            &config,
+            false,
+            128,
+            1,
+            8,
+            64,
+            2,
+            &ManagerImp::new(),
+            Arc::new(DummyScheduler) as Arc<dyn Scheduler>,
+            Arc::new(NullJournal),
+        )
+        .expect("memory node store");
+        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+        let inbound = Arc::new(InboundLedgers::new(
+            Arc::new(TreeNodeCache::new(
+                "rcl-provisional-candidate",
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            Arc::new(FullBelowCacheImpl::new(
+                1,
+                MonotonicClock::default(),
+                HardenedHashBuilder::default(),
+                8,
+            )),
+            Arc::new(FetchPackCache::new(
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            completed_tx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        inbound.set_node_store(store.node_store);
+        let master = runtime.ledger_master();
+        inbound.set_completed_ledger_store(Arc::new(move |completed| {
+            master.ledger_history().insert(completed, false);
+        }));
+        *runtime
+            .inbound_ledgers
+            .lock()
+            .expect("inbound registry slot") = Some(Arc::clone(&inbound));
+
+        let hash = *ledger.header().hash.as_uint256();
+        assert!(
+            inbound
+                .acquire(hash, ledger.header().seq, AcquireReason::Consensus)
+                .is_none()
+        );
+        // `on_complete` is the public external/sweep completion handoff. The
+        // state remains incomplete, so it is exactly the registry's
+        // resolver-visible provisional interval.
+        inbound.on_complete(hash, Arc::clone(&ledger));
+        runtime
+            .ledger_master()
+            .ledger_history()
+            .insert(ledger, false);
+        assert!(inbound.is_provisional(&hash));
+        assert!(
+            root.resolve_ledger_by_hash(basics::sha_map_hash::SHAMapHash::new(hash))
+                .is_some()
+        );
+        (dir, inbound)
     }
 
     fn failed_candidate_work(parent_ledger: Arc<Ledger>) -> PendingAcceptWork {
@@ -1931,6 +2041,58 @@ mod tests {
         assert!(AppRclConsensusAdaptor::round_validation_eligible(
             true, 100, 100, false, true, 1, None, 1_000,
         ));
+    }
+
+    #[test]
+    fn provisional_inbound_candidate_drives_actual_acquire_ledger_without_adoption() {
+        use consensus::algorithm::ConsensusAdaptor as _;
+
+        let mut root = ApplicationRoot::new(0).expect("root should build");
+        let candidate = Arc::new(Ledger::from_ledger_seq_and_close_time(10, 1_000, false));
+        let target = *candidate.header().hash.as_uint256();
+        let (_store_dir, inbound) =
+            install_real_provisional_inbound_candidate(&mut root, Arc::clone(&candidate));
+        let stale_set = Uint256::from_u64(0xA11CE);
+        {
+            let mut transactions = root
+                .inbound_transactions()
+                .lock()
+                .expect("inbound transactions mutex");
+            assert!(transactions.acquire(stale_set).is_some());
+            assert!(transactions.stored_hashes().contains(&stale_set));
+        }
+
+        let mut runner = failed_candidate_test_runner(&mut root);
+        assert!(runner.adaptor.acquire_ledger(&target).is_none());
+
+        assert!(inbound.is_provisional(&target));
+        assert!(inbound.contains(&target));
+        assert_eq!(
+            *runner
+                .adaptor
+                .acquiring_ledger
+                .lock()
+                .expect("acquiring ledger mutex"),
+            Some(target),
+            "provisional WrongLedger recovery must retain the exact target"
+        );
+        assert!(
+            root.inbound_transactions()
+                .lock()
+                .expect("inbound transactions mutex")
+                .stored_hashes()
+                .contains(&stale_set),
+            "a provisional resolver hit must not reset TxQ/inbound transaction round state"
+        );
+        assert!(root.closed_ledger().is_none());
+        assert!(root.published_ledger().is_none());
+        assert!(
+            inbound
+                .acquire(target, candidate.header().seq, AcquireReason::Consensus)
+                .is_some(),
+            "the exact target remains recoverable until its durable completion"
+        );
+        inbound.stop();
     }
 
     #[test]
@@ -2189,7 +2351,10 @@ impl ConsensusRunner for AppConsensus {
 
 #[cfg(test)]
 mod sync_tree_conversion_tests {
-    use super::{should_acquire_consensus_ledger, sync_tree_to_rcl_tx_set};
+    use super::{
+        resolved_consensus_ledger_is_adoptable, should_acquire_consensus_ledger,
+        sync_tree_to_rcl_tx_set,
+    };
     use basics::hardened_hash::HardenedHashBuilder;
     use basics::tagged_cache::MonotonicClock;
     use protocol::{STAmount, STTx, TxType, get_field_by_symbol, serialize_blob};
@@ -2243,6 +2408,15 @@ mod sync_tree_conversion_tests {
         );
         tree.set_full();
         tree
+    }
+
+    #[test]
+    fn provisional_resolver_ledger_is_not_adoptable_by_wrong_ledger_recovery() {
+        assert!(resolved_consensus_ledger_is_adoptable(false));
+        assert!(
+            !resolved_consensus_ledger_is_adoptable(true),
+            "a provisional identity must not reset TxQ or start a generic replacement round"
+        );
     }
 
     #[test]

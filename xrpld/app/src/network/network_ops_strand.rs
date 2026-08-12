@@ -77,7 +77,13 @@ impl LclAuditSampler {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreferredLclReconciliation {
     NoChange,
+    /// An exact target is absent or incomplete and recovery started a
+    /// WrongLedger replacement round for that target.
     Pending,
+    /// The exact target is resolver-visible but still belongs to Worker 2's
+    /// provisional acquisition identity. It may be re-requested, but may not
+    /// mutate LCL, TxQ, open/closed ledger, status, mode, or round state.
+    Provisional,
     Switched,
 }
 
@@ -469,8 +475,11 @@ fn strand_loop(
             consensus_started = true;
             last_round_ledger_id = Some(prev_id);
             last_timer_tick = Instant::now();
-            tracing::info!(target: "consensus", seq = closed.header().seq,
-            "Consensus started on closed ledger (matching rippled beginConsensus)");
+            tracing::info!(
+                target: "consensus",
+                seq = closed.header().seq,
+                "Consensus started on closed ledger (matching rippled beginConsensus)"
+            );
         }
     }
 
@@ -577,7 +586,12 @@ fn strand_loop(
             if num_peers < min_peers {
                 if current_mode != NetworkOpsOperatingMode::Disconnected {
                     root.set_network_ops_operating_mode(NetworkOpsOperatingMode::Disconnected);
-                    tracing::warn!(target: "consensus", num_peers, min_peers, "Peer count below minimum — mode set to DISCONNECTED");
+                    tracing::warn!(
+                        target: "consensus",
+                        num_peers,
+                        min_peers,
+                        "Peer count below minimum — mode set to DISCONNECTED"
+                    );
                 }
                 // Skip consensus timer when disconnected (matching rippled)
                 root.wait_consensus_or_timeout(Duration::from_millis(500));
@@ -591,7 +605,11 @@ fn strand_loop(
                 // normalize it in either direction.
                 root.set_network_ops_operating_mode(mode_to_reassert);
                 if current_mode == NetworkOpsOperatingMode::Disconnected {
-                    tracing::info!(target: "consensus", num_peers, "Peer count sufficient — mode set to CONNECTED");
+                    tracing::info!(
+                        target: "consensus",
+                        num_peers,
+                        "Peer count sufficient — mode set to CONNECTED"
+                    );
                 }
             }
         }
@@ -861,8 +879,7 @@ fn strand_loop(
         // round. A missing preferred target already began generic consensus
         // with that target (WrongLedger); a switch already began exactly one
         // replacement round (normal/SwitchedLedger handling stays generic).
-        if reconciliation == PreferredLclReconciliation::NoChange
-            && end_consensus_pass
+        if should_begin_ordinary_round(end_consensus_pass, reconciliation)
             && !scheduler.accept_is_queued()
             && !scheduler.has_pending_accept()
         {
@@ -882,8 +899,11 @@ fn strand_loop(
                     consensus_rt.update_prev_ledger_id(runner.prev_ledger_id());
                     last_round_ledger_id = Some(closed_id);
                     last_timer_tick = Instant::now();
-                    tracing::info!(target: "consensus", seq = closed.header().seq,
-                        "Consensus started next round after checkLastClosedLedger");
+                    tracing::info!(
+                        target: "consensus",
+                        seq = closed.header().seq,
+                        "Consensus started next round after checkLastClosedLedger"
+                    );
                     tracing::info!(
                         target: "lcl_trace",
                         event = "ordinary_consensus_round_started",
@@ -978,6 +998,17 @@ fn should_promote_operating_mode_at_end_consensus(
     end_consensus_pass && reconciliation == PreferredLclReconciliation::NoChange
 }
 
+/// A provisional candidate is deliberately not a no-change outcome: the
+/// ordinary round would replace the current round even though no durable LCL
+/// target was admitted. Keep the predicate separate so its safety contract is
+/// table-testable without a live consensus runner.
+fn should_begin_ordinary_round(
+    end_consensus_pass: bool,
+    reconciliation: PreferredLclReconciliation,
+) -> bool {
+    end_consensus_pass && reconciliation == PreferredLclReconciliation::NoChange
+}
+
 /// Match rippled `checkLastClosedLedger`: choose the preferred LCL only for
 /// this endConsensus pass, switch it if it is resident and admissible, and
 /// otherwise leave generic Consensus to perform WrongLedger/GetConsL1
@@ -990,6 +1021,40 @@ fn reconcile_preferred_lcl(
     consensus_rt: &AppConsensusRuntime,
     last_round_ledger_id: &mut Option<Uint256>,
     audit_sampler: &mut LclAuditSampler,
+) -> PreferredLclReconciliation {
+    reconcile_preferred_lcl_with_status_broadcaster(
+        root,
+        shared_inbound,
+        runner,
+        consensus_rt,
+        last_round_ledger_id,
+        audit_sampler,
+        &broadcast_switched_ledger_status,
+    )
+}
+
+/// Production uses `broadcast_switched_ledger_status`; tests inject a counter
+/// so the provisional fence observes status suppression independently of the
+/// closed-LCL, round, and TxQ state assertions.
+type SwitchedLedgerStatusBroadcaster = dyn Fn(&ApplicationRoot, &ledger::Ledger, i32, bool);
+
+fn broadcast_switched_ledger_status(
+    root: &ApplicationRoot,
+    ledger: &ledger::Ledger,
+    event: i32,
+    have_correct_lcl: bool,
+) {
+    root.broadcast_consensus_status_change(ledger, event, have_correct_lcl);
+}
+
+fn reconcile_preferred_lcl_with_status_broadcaster(
+    root: &ApplicationRoot,
+    shared_inbound: &Arc<InboundLedgers>,
+    runner: &mut dyn ConsensusRunner,
+    consensus_rt: &AppConsensusRuntime,
+    last_round_ledger_id: &mut Option<Uint256>,
+    audit_sampler: &mut LclAuditSampler,
+    status_broadcaster: &SwitchedLedgerStatusBroadcaster,
 ) -> PreferredLclReconciliation {
     if !should_reconcile_preferred_lcl(runner.phase()) {
         return PreferredLclReconciliation::NoChange;
@@ -1110,6 +1175,16 @@ fn reconcile_preferred_lcl(
     // Rippled does not switch back to its immediate predecessor. A zero
     // preference is likewise not an actionable recovery target.
     if preferred_hash.is_zero() || preferred_hash == parent_hash {
+        shared_inbound.record_recovery_lcl_decision(
+            preferred_hash,
+            None,
+            "check_last_closed_ledger",
+            if preferred_hash.is_zero() {
+                "ignored_zero"
+            } else {
+                "ignored_parent"
+            },
+        );
         tracing::info!(
             target: "lcl_trace",
             event = "preferred_lcl_not_actionable",
@@ -1120,6 +1195,12 @@ fn reconcile_preferred_lcl(
         return PreferredLclReconciliation::NoChange;
     }
     if preferred_hash == our_hash {
+        shared_inbound.record_recovery_lcl_decision(
+            preferred_hash,
+            Some(our_closed.as_ref()),
+            "check_last_closed_ledger",
+            "ignored_local",
+        );
         tracing::info!(
             target: "lcl_trace",
             event = "preferred_lcl_already_local",
@@ -1155,6 +1236,13 @@ fn reconcile_preferred_lcl(
         "LCL trace: preferred target lookup completed"
     );
     let Some(candidate) = candidate else {
+        let disposition = if shared_inbound.is_failure(&preferred_hash) {
+            "failed"
+        } else if shared_inbound.contains(&preferred_hash) {
+            "registry_active"
+        } else {
+            "resolver_miss"
+        };
         // Rippled re-invokes InboundLedgers::acquire(hash, 0, CONSENSUS) on
         // every endConsensus pass (NetworkOPs.cpp:1979-1981) unconditionally.
         // Deduplication happens INSIDE acquire(): ledgers_.find(hash) returns
@@ -1165,15 +1253,16 @@ fn reconcile_preferred_lcl(
             event = "preferred_lcl_resolver_miss",
             preferred_lcl_hash = %preferred_hash,
             candidate_source,
+            disposition,
             local_lcl_hash = %our_hash,
             local_lcl_seq = our_closed.header().seq,
-            "LCL trace: preferred LCL is unavailable after resolver and registry lookup"
+            "LCL trace: preferred LCL has an explicit non-adopted disposition"
         );
         shared_inbound.record_recovery_lcl_decision(
             preferred_hash,
             None,
             "check_last_closed_ledger",
-            "requested",
+            disposition,
         );
         if emit_audit {
             tracing::info!(
@@ -1224,6 +1313,38 @@ fn reconcile_preferred_lcl(
         return PreferredLclReconciliation::Pending;
     }
 
+    if shared_inbound.is_provisional(&candidate_hash) {
+        // Worker 2 has registered this exact hash/acquisition identity and
+        // made it resolver-visible, but its durable callback has not cleared
+        // the identity. Do not call restart_preferred_lcl_recovery here: that
+        // would demote mode and replace the round from a non-durable candidate.
+        // Retain only the exact target acquisition; a durable callback wakes a
+        // later serialized pass, while revocation leaves the target retryable.
+        shared_inbound.record_recovery_lcl_decision(
+            preferred_hash,
+            Some(candidate.as_ref()),
+            "check_last_closed_ledger",
+            "provisional",
+        );
+        shared_inbound.acquire_closed_ledger_async(preferred_hash, AcquireReason::Consensus);
+        tracing::info!(
+            target: "lcl_trace",
+            event = "preferred_lcl_provisional",
+            preferred_lcl_hash = %preferred_hash,
+            candidate_hash = %candidate_hash,
+            candidate_seq = candidate.header().seq,
+            candidate_source,
+            "LCL trace: provisional preferred candidate retained behind durable fence"
+        );
+        return PreferredLclReconciliation::Provisional;
+    }
+
+    shared_inbound.record_recovery_lcl_decision(
+        preferred_hash,
+        Some(candidate.as_ref()),
+        "check_last_closed_ledger",
+        "durable",
+    );
     let state_complete = !candidate.state_map().is_synching();
     let tx_complete = candidate.header().tx_hash.is_zero() || !candidate.tx_map().is_synching();
     let can_be_current = lm.can_be_current(candidate.as_ref(), root.current_close_time_seconds());
@@ -1323,6 +1444,7 @@ fn reconcile_preferred_lcl(
         last_round_ledger_id,
         preferred_hash,
         candidate,
+        status_broadcaster,
     );
     PreferredLclReconciliation::Switched
 }
@@ -1376,6 +1498,7 @@ fn switch_last_closed_ledger(
     last_round_ledger_id: &mut Option<Uint256>,
     target: Uint256,
     ledger: Arc<ledger::Ledger>,
+    status_broadcaster: &SwitchedLedgerStatusBroadcaster,
 ) {
     let new_hash = *ledger.header().hash.as_uint256();
     debug_assert_eq!(new_hash, target);
@@ -1424,7 +1547,7 @@ fn switch_last_closed_ledger(
     // LedgerMaster::switchLCL, whose non-standalone branch runs
     // checkAccept(lastClosed) after installing the new closed ledger.
     root.check_accept_after_lcl_switch(Arc::clone(&ledger));
-    root.broadcast_consensus_status_change(ledger.as_ref(), 3, true);
+    status_broadcaster(root, ledger.as_ref(), 3, true);
     let proposing = root.network_ops_operating_mode() == NetworkOpsOperatingMode::Full;
     let now = root.shared_time_keeper().close_time();
     let prev_cx = crate::consensus_ledger_from_ledger(&ledger);
@@ -1442,8 +1565,12 @@ fn switch_last_closed_ledger(
         "check_last_closed_ledger",
         "installed",
     );
-    tracing::info!(target: "consensus", new_seq, %new_hash,
-        "switchLastClosedLedger installed current preferred LCL");
+    tracing::info!(
+        target: "consensus",
+        new_seq,
+        %new_hash,
+        "switchLastClosedLedger installed current preferred LCL"
+    );
 }
 
 // ─── checkAccept + tryAdvance + operating mode + history ─────────────────────
@@ -1943,14 +2070,21 @@ fn persist_completed_inbound_ledger(
                     // write cannot make history look complete or suppress a
                     // later retry.
                     lm.clear_ledger(normalized_seq);
-                    tracing::warn!(target: "ledger", "trusted history ledger was not durably saved");
+                    tracing::warn!(
+                        target: "ledger",
+                        "trusted history ledger was not durably saved"
+                    );
                     CompletionPersistence {
                         inserted: false,
                         acknowledged: false,
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(target: "ledger", ?error, "failed to materialize trusted history ledger");
+                    tracing::warn!(
+                        target: "ledger",
+                        ?error,
+                        "failed to materialize trusted history ledger"
+                    );
                     CompletionPersistence {
                         inserted: false,
                         acknowledged: false,
@@ -2016,8 +2150,13 @@ fn request_history_fetch_pack(
         None,
     ));
     *in_flight = Some((missing, Instant::now()));
-    tracing::debug!(target: "history", missing, %have_hash, peer = peer.id(),
-        "requested history fetch pack");
+    tracing::debug!(
+        target: "history",
+        missing,
+        %have_hash,
+        peer = peer.id(),
+        "requested history fetch pack"
+    );
 }
 
 /// Resolve a canonical hash from one locally trusted history reference.
@@ -2169,27 +2308,44 @@ fn should_acquire_history(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsensusJobScheduler, MAX_LEDGER_COMPLETIONS_PER_TURN, MAX_PROPOSALS_PER_TURN,
-        PreferredLclReconciliation, drain_bounded, heartbeat_operating_mode_reassertion,
-        history_acquire_allowed, history_fetch_pack_requested, persist_completed_inbound_ledger,
+        ConsensusJobScheduler, LclAuditSampler, MAX_LEDGER_COMPLETIONS_PER_TURN,
+        MAX_PROPOSALS_PER_TURN, PreferredLclReconciliation, drain_bounded,
+        heartbeat_operating_mode_reassertion, history_acquire_allowed,
+        history_fetch_pack_requested, persist_completed_inbound_ledger, reconcile_preferred_lcl,
         record_completed_inbound_ledger, same_history_fetch_pack_is_suppressed,
         should_promote_operating_mode_at_end_consensus, should_reconcile_preferred_lcl,
         should_run_end_consensus_reconciliation,
     };
-    use crate::consensus::rcl_consensus::PendingAcceptWork;
+    use crate::consensus::rcl_consensus::{ConsensusRunner, PendingAcceptWork, RclCxLedger};
+    use crate::consensus::rcl_cx_peer_pos::RclCxPeerPos;
+    use crate::consensus::rcl_validation::RclValidation;
     use crate::job::job_queue::JobQueue;
     use crate::job::job_types::JobType;
-    use crate::ledger::inbound_ledgers::AcquireReason;
-    use crate::runtime::component_runtime::ConsensusCommand;
+    use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers};
+    use crate::runtime::component_runtime::{AppConsensusRuntime, ConsensusCommand};
     use crate::{ApplicationRoot, NetworkOpsOperatingMode};
     use basics::base_uint::Uint256;
+    use basics::basic_config::BasicConfig;
+    use basics::chrono::NetClockTimePoint;
+    use basics::hardened_hash::HardenedHashBuilder;
     use basics::sha_map_hash::SHAMapHash;
     use basics::tagged_cache::MonotonicClock;
     use consensus::algorithm::ConsensusPhase;
-    use ledger::{Ledger, LedgerHeader, LedgerMaster, LedgerMasterConfig, calculate_ledger_hash};
-    use std::sync::Arc;
-    use std::sync::mpsc;
+    use ledger::{
+        FetchPackCache, Ledger, LedgerHeader, LedgerMaster, LedgerMasterConfig,
+        calculate_ledger_hash,
+    };
+    use nodestore::{DummyScheduler, ManagerImp, NullJournal, Scheduler};
+    use protocol::{
+        KeyType, STValidation, calc_node_id, derive_public_key, generate_secret_key,
+        get_field_by_symbol, random_seed,
+    };
+    use shamap::family::FullBelowCacheImpl;
+    use shamap::tree_node_cache::TreeNodeCache;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Arc, mpsc};
     use std::time::{Duration, Instant};
+    use tempfile::TempDir;
 
     fn immutable_ledger(seq: u32, parent_fill: u8) -> Arc<Ledger> {
         let mut header = LedgerHeader {
@@ -2227,6 +2383,143 @@ mod tests {
         );
         ledger.set_immutable(true);
         Arc::new(ledger)
+    }
+
+    fn install_real_provisional_lcl_candidate(
+        root: &mut ApplicationRoot,
+        ledger: Arc<Ledger>,
+    ) -> (TempDir, Arc<InboundLedgers>) {
+        let runtime = root.attach_default_ledger_master_runtime();
+        let dir = TempDir::new().expect("temporary inbound store");
+        let mut config = BasicConfig::new();
+        config.set_legacy("database_path", dir.path().join("sql").to_string_lossy());
+        let node_db = config.section_mut("node_db");
+        node_db.set("type", "Memory");
+        node_db.set("path", dir.path().join("node").to_string_lossy());
+        let store = crate::bootstrap_shamap_store(
+            &config,
+            false,
+            128,
+            1,
+            8,
+            64,
+            2,
+            &ManagerImp::new(),
+            Arc::new(DummyScheduler) as Arc<dyn Scheduler>,
+            Arc::new(NullJournal),
+        )
+        .expect("memory node store");
+        let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+        let inbound = Arc::new(InboundLedgers::new(
+            Arc::new(TreeNodeCache::new(
+                "network-ops-provisional-candidate",
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            Arc::new(FullBelowCacheImpl::new(
+                1,
+                MonotonicClock::default(),
+                HardenedHashBuilder::default(),
+                8,
+            )),
+            Arc::new(FetchPackCache::new(
+                8,
+                time::Duration::seconds(60),
+                MonotonicClock::default(),
+            )),
+            completed_tx,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        inbound.set_node_store(store.node_store);
+        let master = runtime.ledger_master();
+        inbound.set_completed_ledger_store(Arc::new(move |completed| {
+            master.ledger_history().insert(completed, false);
+        }));
+        *runtime
+            .inbound_ledgers
+            .lock()
+            .expect("inbound registry slot") = Some(Arc::clone(&inbound));
+
+        let hash = *ledger.header().hash.as_uint256();
+        assert!(
+            inbound
+                .acquire(hash, ledger.header().seq, AcquireReason::Consensus)
+                .is_none()
+        );
+        inbound.on_complete(hash, Arc::clone(&ledger));
+        runtime
+            .ledger_master()
+            .ledger_history()
+            .insert(ledger, false);
+        assert!(inbound.is_provisional(&hash));
+        (dir, inbound)
+    }
+
+    fn preferred_validation(hash: Uint256, seq: u32) -> (protocol::NodeID, RclValidation) {
+        let seed = random_seed();
+        let secret_key =
+            generate_secret_key(KeyType::Secp256k1, &seed).expect("validation signing key");
+        let public_key =
+            derive_public_key(KeyType::Secp256k1, &secret_key).expect("validation public key");
+        let node_id = calc_node_id(&public_key);
+        let validation =
+            STValidation::new_signed(1_000, &public_key, node_id, &secret_key, |value| {
+                value.set_field_h256(get_field_by_symbol("sfLedgerHash"), hash);
+                value.set_field_u32(get_field_by_symbol("sfLedgerSequence"), seq);
+            })
+            .expect("signed preferred validation");
+        (node_id, RclValidation::new(Arc::new(validation)))
+    }
+
+    struct RecordingRunner {
+        phase: ConsensusPhase,
+        prev: Uint256,
+        start_rounds: usize,
+    }
+
+    impl RecordingRunner {
+        fn accepted(prev: Uint256) -> Self {
+            Self {
+                phase: ConsensusPhase::Accepted,
+                prev,
+                start_rounds: 0,
+            }
+        }
+    }
+
+    impl ConsensusRunner for RecordingRunner {
+        fn peer_proposal(&mut self, _now: NetClockTimePoint, _peer_pos: &RclCxPeerPos) -> bool {
+            false
+        }
+
+        fn timer_tick(&mut self, _now: NetClockTimePoint) -> Option<PendingAcceptWork> {
+            None
+        }
+
+        fn start_round(
+            &mut self,
+            _now: NetClockTimePoint,
+            prev_ledger_id: Uint256,
+            _prev_ledger: RclCxLedger,
+            _proposing: bool,
+        ) {
+            self.start_rounds += 1;
+            self.prev = prev_ledger_id;
+            self.phase = ConsensusPhase::Open;
+        }
+
+        fn got_tx_set(&mut self, _now: NetClockTimePoint, _tx_set: consensus::RclTxSet) {}
+
+        fn execute_accept(&mut self, _now: NetClockTimePoint, _work: PendingAcceptWork) {}
+
+        fn phase(&self) -> ConsensusPhase {
+            self.phase
+        }
+
+        fn prev_ledger_id(&self) -> Uint256 {
+            self.prev
+        }
     }
 
     #[test]
@@ -2342,7 +2635,136 @@ mod tests {
             true,
             PreferredLclReconciliation::Switched,
         ));
+        assert!(!should_promote_operating_mode_at_end_consensus(
+            true,
+            PreferredLclReconciliation::Provisional,
+        ));
         assert!(should_promote_operating_mode_at_end_consensus(
+            true,
+            PreferredLclReconciliation::NoChange,
+        ));
+    }
+
+    #[test]
+    fn provisional_real_inbound_candidate_reconciles_without_switch_side_effects() {
+        let mut root = ApplicationRoot::new(0).expect("root should build");
+        let local = immutable_ledger(10, 0x10);
+        let target = immutable_ledger(12, 0x20);
+        let target_hash = *target.header().hash.as_uint256();
+        root.attach_default_ledger_master_runtime();
+        root.on_closed_ledger(Arc::clone(&local));
+        root.set_network_ops_operating_mode(NetworkOpsOperatingMode::Full);
+        root.set_need_network_ledger(true);
+        let (_store_dir, inbound) =
+            install_real_provisional_lcl_candidate(&mut root, Arc::clone(&target));
+        root.validations().register_ledger(target.as_ref());
+        let (node_id, validation) = preferred_validation(target_hash, target.header().seq);
+        root.validations()
+            .validations()
+            .lock()
+            .expect("validations mutex")
+            .add(node_id, validation);
+
+        let preference = root.validations().preferred_lcl_diagnostic(
+            &crate::consensus::rcl_validation::RclValidatedLedger::from_ledger(local.as_ref()),
+            root.ledger_master_runtime()
+                .expect("ledger master runtime")
+                .ledger_master()
+                .valid_ledger_seq(),
+            &std::collections::BTreeMap::new(),
+        );
+        assert_eq!(
+            preference.selected, target_hash,
+            "test validation selects target"
+        );
+        let closed_before = root.closed_ledger().expect("local LCL");
+        let open_before = root.open_ledger().current();
+        let txq_before = root.tx_q_rpc_report();
+        let published_before = root.published_ledger().map(|ledger| ledger.header().hash);
+        let mut runner = RecordingRunner::accepted(*local.header().hash.as_uint256());
+        let consensus_rt = AppConsensusRuntime::new();
+        let mut last_round = None;
+        let mut sampler = LclAuditSampler::new();
+        let status_broadcasts = AtomicUsize::new(0);
+        let observe_status_broadcast =
+            |_root: &ApplicationRoot, _ledger: &Ledger, _event: i32, _have_correct_lcl: bool| {
+                status_broadcasts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            };
+
+        assert_eq!(
+            reconcile_preferred_lcl_with_status_broadcaster(
+                &root,
+                &inbound,
+                &mut runner,
+                &consensus_rt,
+                &mut last_round,
+                &mut sampler,
+                &observe_status_broadcast,
+            ),
+            PreferredLclReconciliation::Provisional,
+        );
+
+        assert!(inbound.is_provisional(&target_hash));
+        assert_eq!(
+            status_broadcasts.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "provisional reconciliation must not invoke the switched-ledger status broadcast"
+        );
+        assert_eq!(
+            root.closed_ledger()
+                .expect("closed LCL remains local")
+                .header()
+                .hash,
+            closed_before.header().hash,
+            "no switch_last_closed_ledger closed-LCL mutation before durability"
+        );
+        let open_after = root.open_ledger().current();
+        assert_eq!(
+            open_after.ledger_current_index,
+            open_before.ledger_current_index
+        );
+        assert_eq!(open_after.parent_hash, open_before.parent_hash);
+        assert_eq!(
+            root.tx_q_rpc_report(),
+            txq_before,
+            "no TxQ/open-ledger mutation"
+        );
+        assert_eq!(
+            root.network_ops_operating_mode(),
+            NetworkOpsOperatingMode::Full
+        );
+        assert!(
+            root.need_network_ledger(),
+            "no switch clears needNetworkLedger"
+        );
+        assert_eq!(
+            root.published_ledger().map(|ledger| ledger.header().hash),
+            published_before,
+            "no publication/history advance",
+        );
+        assert_eq!(runner.start_rounds, 0, "no replacement or ordinary round");
+        assert_eq!(runner.phase(), ConsensusPhase::Accepted);
+        assert_eq!(last_round, None);
+        assert!(
+            inbound
+                .acquire(target_hash, target.header().seq, AcquireReason::Consensus)
+                .is_some(),
+            "the provisional reconciliation retains the exact target recovery"
+        );
+        inbound.stop();
+    }
+
+    #[test]
+    fn provisional_lcl_candidate_blocks_mode_promotion_and_replacement_round() {
+        assert!(!should_begin_ordinary_round(
+            true,
+            PreferredLclReconciliation::Provisional,
+        ));
+        assert!(!should_begin_ordinary_round(
+            false,
+            PreferredLclReconciliation::NoChange,
+        ));
+        assert!(should_begin_ordinary_round(
             true,
             PreferredLclReconciliation::NoChange,
         ));

@@ -17,6 +17,17 @@ use crate::peer::{Peer, PeerId};
 use crate::peer_imp::PeerImp;
 use crate::tuning::{READ_ACTIVITY_DEADLINE, WRITE_DEADLINE};
 
+/// The wire decoder already rejects a declared payload or decompressed size
+/// above `MAXIMUM_MESSAGE_SIZE`. This independent raw accumulator bound also
+/// limits partial/fragmented framing retained before a complete header/frame.
+const SESSION_RAW_BUFFER_CAPACITY: usize = crate::MAXIMUM_MESSAGE_SIZE + 10;
+/// Retry a transport-retained matching reply on rippled's documented
+/// `InboundLedger::kLedgerAcquireTimeout` cadence (3 seconds), rather than
+/// spinning at an invented one-millisecond transport interval. This is a
+/// retry cadence adaptation only: the matching frame remains session-owned
+/// until Worker 2 admits it or the session reaches terminal close/stop.
+const DEFERRED_LEDGER_DATA_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub trait PeerSessionStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> PeerSessionStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -26,12 +37,21 @@ pub type BoxPeerSessionStream = Box<dyn PeerSessionStream>;
 pub trait PeerSessionHooks: Send + Sync {
     fn on_message_begin(&self, _peer: &Arc<PeerImp>, _header: &MessageHeader, _compressed: bool) {}
     fn on_message(&self, _peer: &Arc<PeerImp>, _message: &ProtocolMessage) {}
+    /// Returns true only when one bounded ledger-data frame was retained for
+    /// later admission. The session then pauses further reads from this peer.
     fn on_message_end(
         &self,
         _peer: &Arc<PeerImp>,
         _header: &MessageHeader,
         _message: &ProtocolMessage,
-    ) {
+    ) -> bool {
+        false
+    }
+    /// Retry the one transport-owned deferred frame for this peer. Returning
+    /// true preserves the read pause; false releases it or observes a
+    /// terminal route disposition.
+    fn retry_deferred_ledger_data(&self, _peer: &Arc<PeerImp>) -> bool {
+        false
     }
     fn on_message_unknown(&self, _peer: &Arc<PeerImp>, _message_type: u16) {}
     fn on_session_closed(&self, _peer: &Arc<PeerImp>) {}
@@ -46,6 +66,7 @@ impl PeerSessionHooks for NoopPeerSessionHooks {}
 pub struct PeerSessionStarter {
     stream: Option<BoxPeerSessionStream>,
     initial_buffer: Vec<u8>,
+    initial_buffer_rejected: bool,
     stop_requested: watch::Receiver<bool>,
 }
 
@@ -62,13 +83,22 @@ impl PeerSessionStarter {
         Self {
             stream: Some(stream),
             initial_buffer: Vec::new(),
+            initial_buffer_rejected: false,
             stop_requested,
         }
     }
 
     /// Seed the session decoder with bytes read after the HTTP upgrade.
     pub fn with_initial_buffer(mut self, initial_buffer: Vec<u8>) -> Self {
-        self.initial_buffer = initial_buffer;
+        // Upgrade read-ahead must enter through the same finite raw-frame
+        // envelope as subsequent socket reads. Drop excess immediately; the
+        // started session takes the normal terminal disconnect path.
+        if initial_buffer.len() > SESSION_RAW_BUFFER_CAPACITY {
+            self.initial_buffer_rejected = true;
+            self.initial_buffer.clear();
+        } else {
+            self.initial_buffer = initial_buffer;
+        }
         self
     }
 
@@ -90,13 +120,15 @@ impl PeerSessionStarter {
     ) -> JoinHandle<Result<(), OverlayError>> {
         let stream = self.stream.take().expect("peer session stream must exist");
         let initial_buffer = std::mem::take(&mut self.initial_buffer);
+        let initial_buffer_rejected = self.initial_buffer_rejected;
         let stop_requested = self.stop_requested.clone();
         let (session_stop_tx, session_stop_rx) = watch::channel(false);
-        // rippled's sendQueue_ is unbounded (PeerImp.cpp:322 always pushes).
-        // Disconnection for sustained large queues is handled by the per-peer
-        // 60s timer (largeSendq_ over 4 ticks), not by refusing messages.
-        let (sender, receiver) = mpsc::unbounded_channel();
-        let (pending, outbound_queue_depth) = peer.attach_session(sender.clone(), session_stop_tx);
+        // The bounded sender preserves one owner per accepted message. Sustained
+        // large queues still use PeerImp's timer; immediate saturation follows
+        // the peer's explicit drop/disconnect policy.
+        let (sender, receiver) = mpsc::channel(crate::peer_imp::SEND_QUEUE_CAPACITY);
+        let (pending, outbound_queue_depth, outbound_queue_bytes) =
+            peer.attach_session(sender.clone(), session_stop_tx);
         tracing::debug!(
             target: "overlay",
             peer_id = %peer.id(),
@@ -108,9 +140,11 @@ impl PeerSessionStarter {
                 peer,
                 stream,
                 initial_buffer,
+                initial_buffer_rejected,
                 receiver,
                 pending,
                 outbound_queue_depth,
+                outbound_queue_bytes,
                 stop_requested,
                 session_stop_rx,
                 hooks,
@@ -125,9 +159,11 @@ struct PeerSession {
     peer: Arc<PeerImp>,
     stream: Option<BoxPeerSessionStream>,
     initial_buffer: Vec<u8>,
-    outbound: mpsc::UnboundedReceiver<Message>,
+    initial_buffer_rejected: bool,
+    outbound: mpsc::Receiver<Message>,
     pending_outbound: Vec<Message>,
     outbound_queue_depth: Arc<std::sync::atomic::AtomicUsize>,
+    outbound_queue_bytes: Arc<std::sync::atomic::AtomicUsize>,
     stop_requested: watch::Receiver<bool>,
     session_stop: watch::Receiver<bool>,
     hooks: Arc<dyn PeerSessionHooks>,
@@ -183,9 +219,11 @@ impl PeerSession {
         peer: Arc<PeerImp>,
         stream: BoxPeerSessionStream,
         initial_buffer: Vec<u8>,
-        outbound: mpsc::UnboundedReceiver<Message>,
+        initial_buffer_rejected: bool,
+        outbound: mpsc::Receiver<Message>,
         pending_outbound: Vec<Message>,
         outbound_queue_depth: Arc<std::sync::atomic::AtomicUsize>,
+        outbound_queue_bytes: Arc<std::sync::atomic::AtomicUsize>,
         stop_requested: watch::Receiver<bool>,
         session_stop: watch::Receiver<bool>,
         hooks: Arc<dyn PeerSessionHooks>,
@@ -195,9 +233,11 @@ impl PeerSession {
             peer,
             stream: Some(stream),
             initial_buffer,
+            initial_buffer_rejected,
             outbound,
             pending_outbound,
             outbound_queue_depth,
+            outbound_queue_bytes,
             stop_requested,
             session_stop,
             hooks,
@@ -211,6 +251,12 @@ impl PeerSession {
             Arc::clone(&self.hooks),
             Arc::clone(&self.on_close),
         );
+        if self.initial_buffer_rejected {
+            self.peer.request_disconnect();
+            return Err(OverlayError::InvalidRequest(
+                "initial read-ahead exceeded session raw frame capacity".to_owned(),
+            ));
+        }
         tracing::info!(
             target: "overlay",
             peer_id = %self.peer.id(),
@@ -265,6 +311,10 @@ impl PeerSession {
                 write_message_with_deadline(&mut writer, &message, compression).await;
             self.outbound_queue_depth
                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            self.outbound_queue_bytes.fetch_sub(
+                message.get_buffer_size(),
+                std::sync::atomic::Ordering::AcqRel,
+            );
             write_result?;
         }
 
@@ -274,12 +324,13 @@ impl PeerSession {
         // messages, both running concurrently on the tokio runtime.
         let mut outbound_rx = std::mem::replace(
             &mut self.outbound,
-            mpsc::unbounded_channel().1, // placeholder — won't be used
+            mpsc::channel(1).1, // placeholder — won't be used
         );
         let mut writer_stop = self.stop_requested.clone();
         let mut writer_session_stop = self.session_stop.clone();
         let (writer_dead_tx, mut writer_dead_rx) = watch::channel(false);
         let outbound_queue_depth = Arc::clone(&self.outbound_queue_depth);
+        let outbound_queue_bytes = Arc::clone(&self.outbound_queue_bytes);
         let writer_task = tokio::spawn(async move {
             let mut write_failed = false;
             loop {
@@ -296,6 +347,7 @@ impl PeerSession {
                     Some(message) = outbound_rx.recv() => {
                         let write_result = write_message_with_deadline(&mut writer, &message, compression).await;
                         outbound_queue_depth.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                        outbound_queue_bytes.fetch_sub(message.get_buffer_size(), std::sync::atomic::Ordering::AcqRel);
                         if write_result.is_err() {
                             write_failed = true;
                             break;
@@ -305,6 +357,7 @@ impl PeerSession {
                         while let Ok(message) = outbound_rx.try_recv() {
                             let write_result = write_message_with_deadline(&mut writer, &message, compression).await;
                             outbound_queue_depth.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                            outbound_queue_bytes.fetch_sub(message.get_buffer_size(), std::sync::atomic::Ordering::AcqRel);
                             if write_result.is_err() {
                                 write_failed = true;
                                 break;
@@ -331,8 +384,17 @@ impl PeerSession {
         // Reads from the socket, parses messages, dispatches to handlers.
         let read_result = async {
             loop {
-                while let Some(consumed) = dispatch_available(&buffer, &mut handler)? {
-                    buffer.drain(..consumed);
+                while let Some(dispatch) = dispatch_available(&buffer, &mut handler)? {
+                    buffer.drain(..dispatch.consumed);
+                    if dispatch.deferred_ledger_data {
+                        wait_for_deferred_ledger_data(
+                            &self.peer,
+                            self.hooks.as_ref(),
+                            &mut self.stop_requested,
+                            &mut self.session_stop,
+                        )
+                        .await;
+                    }
                 }
 
                 if *self.stop_requested.borrow() || *self.session_stop.borrow() {
@@ -390,11 +452,20 @@ enum ReadOutcome {
 struct PeerSessionDispatch {
     peer: Arc<PeerImp>,
     hooks: Arc<dyn PeerSessionHooks>,
+    deferred_ledger_data: bool,
 }
 
 impl PeerSessionDispatch {
     fn new(peer: Arc<PeerImp>, hooks: Arc<dyn PeerSessionHooks>) -> Self {
-        Self { peer, hooks }
+        Self {
+            peer,
+            hooks,
+            deferred_ledger_data: false,
+        }
+    }
+
+    fn take_deferred_ledger_data(&mut self) -> bool {
+        std::mem::take(&mut self.deferred_ledger_data)
     }
 }
 
@@ -419,7 +490,7 @@ impl ProtocolMessageHandler for PeerSessionDispatch {
     }
 
     fn on_message_end(&mut self, header: &MessageHeader, message: &ProtocolMessage) {
-        self.hooks.on_message_end(&self.peer, header, message);
+        self.deferred_ledger_data = self.hooks.on_message_end(&self.peer, header, message);
     }
 
     fn on_message_unknown(&mut self, message_type: u16) {
@@ -433,17 +504,25 @@ impl ProtocolMessageHandler for PeerSessionDispatch {
     }
 }
 
+struct DispatchOutcome {
+    consumed: usize,
+    deferred_ledger_data: bool,
+}
+
 fn dispatch_available(
     buffer: &[u8],
     handler: &mut PeerSessionDispatch,
-) -> Result<Option<usize>, OverlayError> {
+) -> Result<Option<DispatchOutcome>, OverlayError> {
     let mut hint = 0usize;
     match invoke_protocol_message(buffer, handler, &mut hint) {
         Ok(consumed) => {
             if consumed == 0 {
                 Ok(None)
             } else {
-                Ok(Some(consumed))
+                Ok(Some(DispatchOutcome {
+                    consumed,
+                    deferred_ledger_data: handler.take_deferred_ledger_data(),
+                }))
             }
         }
         Err(e) => {
@@ -458,6 +537,28 @@ fn dispatch_available(
     }
 }
 
+async fn wait_for_deferred_ledger_data(
+    peer: &Arc<PeerImp>,
+    hooks: &dyn PeerSessionHooks,
+    stop_requested: &mut watch::Receiver<bool>,
+    session_stop: &mut watch::Receiver<bool>,
+) {
+    while hooks.retry_deferred_ledger_data(peer) {
+        tokio::select! {
+            biased;
+            changed = stop_requested.changed() => {
+                let _ = changed;
+                return;
+            }
+            changed = session_stop.changed() => {
+                let _ = changed;
+                return;
+            }
+            _ = tokio::time::sleep(DEFERRED_LEDGER_DATA_RETRY_INTERVAL) => {}
+        }
+    }
+}
+
 async fn read_message<R>(reader: &mut R, buffer: &mut Vec<u8>) -> Result<ReadOutcome, OverlayError>
 where
     R: AsyncRead + Unpin,
@@ -468,6 +569,11 @@ where
         return Ok(ReadOutcome::EndOfStream);
     }
     tracing::trace!(target: "overlay", bytes = read, "Raw bytes received");
+    if buffer.len().saturating_add(read) > SESSION_RAW_BUFFER_CAPACITY {
+        return Err(OverlayError::InvalidRequest(
+            "session raw frame buffer exceeded its bounded capacity".to_owned(),
+        ));
+    }
     buffer.extend_from_slice(&chunk[..read]);
     Ok(ReadOutcome::Progress)
 }
@@ -532,21 +638,26 @@ fn session_error(error: ProtocolMessageError) -> OverlayError {
 
 #[cfg(test)]
 mod tests {
-    use super::{NoopPeerSessionHooks, PeerSessionHooks, PeerSessionStarter};
+    use super::{
+        NoopPeerSessionHooks, PeerSessionHooks, PeerSessionStarter, wait_for_deferred_ledger_data,
+    };
     use protocol::{KeyType, SecretKey, derive_public_key};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
     use tokio::sync::watch;
     use tokio::time::{Duration, timeout};
 
     use crate::Compressed;
+    use crate::inbound::{
+        LedgerDataIngressDisposition, OverlayInboundHandler, QueuedOverlayInboundHandler,
+    };
     use crate::message::{
-        Message, ProtocolMessage, ProtocolMessageType, ProtocolPayload, TmPing, TmTransaction,
-        decode_protocol_message,
+        Message, ProtocolMessage, ProtocolMessageType, ProtocolPayload, TmLedgerData, TmPing,
+        TmTransaction, decode_protocol_message,
     };
     use crate::peer::{Peer, PeerId};
     use crate::peer_imp::PeerImp;
@@ -589,6 +700,78 @@ mod tests {
         fn on_session_closed(&self, _peer: &Arc<PeerImp>) {
             self.closed.store(true, Ordering::SeqCst);
         }
+    }
+
+    struct RetryThenAdmitHooks {
+        attempts: AtomicUsize,
+    }
+
+    impl PeerSessionHooks for RetryThenAdmitHooks {
+        fn retry_deferred_ledger_data(&self, _peer: &Arc<PeerImp>) -> bool {
+            self.attempts.fetch_add(1, Ordering::AcqRel) == 0
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_deferred_ledger_data_retries_until_admission_without_frame_loss() {
+        let peer = peer(70);
+        let hooks = RetryThenAdmitHooks {
+            attempts: AtomicUsize::new(0),
+        };
+        let (_stop_tx, mut stop_requested) = watch::channel(false);
+        let (_session_stop_tx, mut session_stop) = watch::channel(false);
+
+        wait_for_deferred_ledger_data(&peer, &hooks, &mut stop_requested, &mut session_stop).await;
+
+        assert_eq!(
+            hooks.attempts.load(Ordering::Acquire),
+            2,
+            "the retained frame is retried once and then released only by admission"
+        );
+    }
+
+    struct StopReleaseHooks {
+        handler: Arc<QueuedOverlayInboundHandler>,
+    }
+
+    impl PeerSessionHooks for StopReleaseHooks {
+        fn on_session_closed(&self, peer: &Arc<PeerImp>) {
+            self.handler.discard_deferred_ledger_data(peer.id());
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_session_stop_releases_transport_owned_deferred_frame() {
+        let peer = peer(71);
+        let handler = Arc::new(QueuedOverlayInboundHandler::default());
+        handler.set_ledger_data_router(Box::new(|_, _| LedgerDataIngressDisposition::Deferred));
+        assert_eq!(
+            handler.on_ledger_data(&peer, TmLedgerData::default()),
+            LedgerDataIngressDisposition::Deferred
+        );
+
+        let (local, _remote) = duplex(4096);
+        let (_stop_requested, stop_rx) = watch::channel(false);
+        let session = PeerSessionStarter::new(Box::new(local), stop_rx);
+        let handle = session.start(
+            Arc::clone(&peer),
+            Arc::new(StopReleaseHooks {
+                handler: Arc::clone(&handler),
+            }),
+            Arc::new(move |_peer_id: PeerId| {}),
+        );
+        tokio::task::yield_now().await;
+        peer.detach_session();
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("session stop")
+            .expect("session join")
+            .expect("session result");
+
+        assert!(
+            !handler.retry_deferred_ledger_data(peer.id()),
+            "session close is terminal release for the transport-owned frame"
+        );
     }
 
     #[tokio::test]

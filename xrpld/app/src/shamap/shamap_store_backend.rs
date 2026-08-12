@@ -28,6 +28,16 @@ impl SHAMapStoreNodeStore {
         }
     }
 
+    /// Stable nonzero NodeStore generation observed by local-read admission.
+    /// Rotating stores advance it before cache invalidation/copy-forward;
+    /// callers must include it in `ReadKey` and durable callback identities.
+    pub fn store_generation(&self) -> u64 {
+        match self {
+            Self::Single(database) => database.store_generation(),
+            Self::Rotating(database) => database.store_generation(),
+        }
+    }
+
     pub fn schedule_write(&self, write: nodestore::ScheduledWrite) {
         match self {
             Self::Single(database) => database.schedule_write(write),

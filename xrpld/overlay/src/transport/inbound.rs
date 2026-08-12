@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+
+use crate::{HEADER_BYTES, MAXIMUM_MESSAGE_SIZE};
 
 use basics::base_uint::Uint256;
 use protocol::{HashPrefix, PublicKey, STValidation, sha512_half, verify_digest};
@@ -19,6 +22,15 @@ use crate::peer_imp::PeerImp;
 /// unbounded memory growth if a router is never installed or is cleared.
 const FALLBACK_QUEUE_CAP: usize = 10_000;
 
+/// One paused session simultaneously retains decoded protobuf containers and
+/// the raw/decompression envelope from which they were accepted. Both maxima
+/// are existing decoder bounds; this is a finite Rust representation bound,
+/// not a new XRPL protocol value.
+const DEFERRED_LEDGER_DATA_FRAME_CAPACITY: usize = MAXIMUM_MESSAGE_SIZE
+    .saturating_mul(2)
+    .saturating_add(HEADER_BYTES)
+    .saturating_add(std::mem::size_of::<TmLedgerData>());
+
 fn push_bounded<T>(queue: &mut Vec<T>, message: T, _family: &'static str) -> bool {
     if queue.len() >= FALLBACK_QUEUE_CAP {
         return false;
@@ -36,6 +48,16 @@ fn extend_bounded<T>(queue: &mut Vec<T>, messages: Vec<T>, _family: &'static str
 pub struct PeerMessage<T> {
     pub peer_id: PeerId,
     pub message: T,
+}
+
+/// Result of the direct ledger-data transport handoff. `Deferred` means the
+/// matching acquisition has not reserved its bounded mailbox yet; the
+/// transport retains exactly this decoded frame and pauses this peer's reads
+/// until `retry_deferred_ledger_data` admits or terminally classifies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerDataIngressDisposition {
+    Delivered,
+    Deferred,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +162,13 @@ pub trait OverlayInboundHandler: Send + Sync {
     fn on_endpoints(&self, _peer: &Arc<PeerImp>, _message: QueuedEndpoints) {}
     fn on_transaction(&self, _peer: &Arc<PeerImp>, _message: QueuedTransaction) {}
     fn on_get_ledger(&self, _peer: &Arc<PeerImp>, _message: TmGetLedger) {}
-    fn on_ledger_data(&self, _peer: &Arc<PeerImp>, _message: TmLedgerData) {}
+    fn on_ledger_data(
+        &self,
+        _peer: &Arc<PeerImp>,
+        _message: TmLedgerData,
+    ) -> LedgerDataIngressDisposition {
+        LedgerDataIngressDisposition::Delivered
+    }
     fn on_propose_ledger(&self, _peer: &Arc<PeerImp>, _message: QueuedProposal) {}
     fn on_validation(&self, _peer: &Arc<PeerImp>, _message: QueuedValidation) {}
     fn on_validator_list(&self, _peer: &Arc<PeerImp>, _message: TmValidatorList) {}
@@ -170,7 +198,17 @@ pub struct QueuedOverlayInboundHandler {
     /// acquisition threads without any channel hop. This is the fastest path,
     /// matching reference where gotLedgerData dispatches directly from the network thread.
     #[allow(clippy::type_complexity)]
-    ledger_data_router: Mutex<Option<Arc<dyn Fn(PeerId, TmLedgerData) + Send + Sync>>>,
+    ledger_data_router: Mutex<
+        Option<Arc<dyn Fn(PeerId, TmLedgerData) -> LedgerDataIngressDisposition + Send + Sync>>,
+    >,
+    /// One decoder-owned frame per paused peer. The session pauses reads for
+    /// that peer until this entry reaches a non-deferred terminal disposition.
+    /// The map is additionally byte-accounted at admission: every retained
+    /// entry reserves the maximum of its decoded payload and the already
+    /// decoder-bounded wire/decompression frame envelope.  OverlayImpl sets
+    /// the aggregate limit from the configured finite peer/session limit.
+    ledger_data_deferred: Mutex<BTreeMap<PeerId, DeferredLedgerData>>,
+    deferred_ledger_data_bytes: Mutex<DeferredLedgerDataBytes>,
     /// Serializes fallback drain with all direct ledger-data delivery. A
     /// router installed during startup must replay older packets before any
     /// concurrent ingress can overtake them.
@@ -220,12 +258,58 @@ pub struct QueuedOverlayInboundHandler {
     get_objects_router: Mutex<Option<Arc<dyn Fn(PeerId, TmGetObjectByHash) + Send + Sync>>>,
 }
 
+#[derive(Debug)]
+struct DeferredLedgerData {
+    message: TmLedgerData,
+    reserved_bytes: usize,
+}
+
+#[derive(Debug)]
+struct DeferredLedgerDataBytes {
+    current: usize,
+    limit: usize,
+}
+
+impl Default for DeferredLedgerDataBytes {
+    fn default() -> Self {
+        // A handler constructed outside OverlayImpl can still retain one
+        // decoder-bounded frame. Production replaces this with the finite
+        // active-session derivation before peer sessions start.
+        Self {
+            current: 0,
+            limit: DEFERRED_LEDGER_DATA_FRAME_CAPACITY,
+        }
+    }
+}
+
+fn deferred_ledger_data_bytes(message: &TmLedgerData) -> usize {
+    let decoded = std::mem::size_of::<TmLedgerData>()
+        .saturating_add(message.ledger_hash.capacity())
+        .saturating_add(
+            message
+                .nodes
+                .capacity()
+                .saturating_mul(message.nodes.first().map_or(0, std::mem::size_of_val)),
+        )
+        .saturating_add(message.nodes.iter().fold(0usize, |total, node| {
+            total
+                .saturating_add(node.nodeid.as_ref().map_or(0, |id: &Vec<u8>| id.capacity()))
+                .saturating_add(node.nodedata.capacity())
+        }));
+    // The session has not yet crossed its retry/cancel boundary, so raw and
+    // decompressed ownership coexist with the decoded container graph. Charge
+    // both envelopes rather than choosing the larger one.
+    decoded.saturating_add(MAXIMUM_MESSAGE_SIZE.saturating_add(HEADER_BYTES))
+}
+
 impl Default for QueuedOverlayInboundHandler {
     fn default() -> Self {
         Self {
             inner: Mutex::new(OverlayInboundSnapshot::default()),
             ledger_data_tx: Mutex::new(None),
             ledger_data_router: Mutex::new(None),
+            ledger_data_deferred: Mutex::new(BTreeMap::new()),
+            deferred_ledger_data_bytes: Mutex::new(DeferredLedgerDataBytes::default()),
             ledger_data_delivery_gate: Mutex::new(()),
             replay_delta_response_router: Mutex::new(None),
             proof_path_request_router: Mutex::new(None),
@@ -256,8 +340,112 @@ impl QueuedOverlayInboundHandler {
         snapshot
     }
 
+    /// Set the finite aggregate deferred-frame limit before sessions start.
+    /// `active_session_limit` comes from OverlayImpl's configured peer limit;
+    /// each session can retain at most one frame whose raw/decompressed bound
+    /// is `MAXIMUM_MESSAGE_SIZE + HEADER_BYTES`.
+    pub fn set_deferred_ledger_data_session_limit(&self, active_session_limit: usize) {
+        let _delivery_gate = self
+            .ledger_data_delivery_gate
+            .lock()
+            .expect("ledger_data_delivery_gate lock");
+        let mut bytes = self
+            .deferred_ledger_data_bytes
+            .lock()
+            .expect("deferred_ledger_data_bytes lock");
+        bytes.limit = active_session_limit.saturating_mul(DEFERRED_LEDGER_DATA_FRAME_CAPACITY);
+    }
+
+    pub fn deferred_ledger_data_byte_snapshot(&self) -> (usize, usize) {
+        let bytes = self
+            .deferred_ledger_data_bytes
+            .lock()
+            .expect("deferred_ledger_data_bytes lock");
+        (bytes.current, bytes.limit)
+    }
+
     pub fn clear(&self) {
+        let _delivery_gate = self
+            .ledger_data_delivery_gate
+            .lock()
+            .expect("ledger_data_delivery_gate lock");
         *self.inner.lock().expect("overlay inbound lock") = OverlayInboundSnapshot::default();
+        self.ledger_data_deferred
+            .lock()
+            .expect("ledger_data_deferred lock")
+            .clear();
+        self.deferred_ledger_data_bytes
+            .lock()
+            .expect("deferred_ledger_data_bytes lock")
+            .current = 0;
+    }
+
+    /// Terminally discard the one transport-owned frame for a peer whose
+    /// session has closed. The frame was never admitted to Worker 2, so no
+    /// admission lease exists to release here.
+    pub fn discard_deferred_ledger_data(&self, peer_id: PeerId) {
+        let _delivery_gate = self
+            .ledger_data_delivery_gate
+            .lock()
+            .expect("ledger_data_delivery_gate lock");
+        let removed = self
+            .ledger_data_deferred
+            .lock()
+            .expect("ledger_data_deferred lock")
+            .remove(&peer_id);
+        if let Some(frame) = removed {
+            let mut bytes = self
+                .deferred_ledger_data_bytes
+                .lock()
+                .expect("deferred_ledger_data_bytes lock");
+            bytes.current = bytes.current.saturating_sub(frame.reserved_bytes);
+        }
+    }
+
+    /// Retain exactly one decoded matching frame for the peer session which
+    /// owns it. There is intentionally no process-global paused-peer cap:
+    /// live peer/session admission owns the number of peers, while the wire
+    /// decoder owns the per-frame `MAXIMUM_MESSAGE_SIZE` bound. A second
+    /// deferred frame cannot arise from a paused session; treat it as a
+    /// protocol/session violation, keep the original frame intact, and stop
+    /// that peer so `on_session_closed` performs terminal release.
+    fn defer_ledger_data(
+        &self,
+        peer: &Arc<PeerImp>,
+        message: TmLedgerData,
+    ) -> LedgerDataIngressDisposition {
+        let mut deferred = self
+            .ledger_data_deferred
+            .lock()
+            .expect("ledger_data_deferred lock");
+        if deferred.contains_key(&peer.id()) {
+            drop(deferred);
+            peer.request_disconnect();
+            return LedgerDataIngressDisposition::Delivered;
+        }
+        let reserved_bytes = deferred_ledger_data_bytes(&message);
+        let mut bytes = self
+            .deferred_ledger_data_bytes
+            .lock()
+            .expect("deferred_ledger_data_bytes lock");
+        if bytes.current.saturating_add(reserved_bytes) > bytes.limit {
+            drop(bytes);
+            drop(deferred);
+            // This matching reply cannot be retained without exceeding the
+            // finite configured active-session envelope. It was not admitted
+            // to Worker 2, so disconnect is the terminal transport owner.
+            peer.request_disconnect();
+            return LedgerDataIngressDisposition::Delivered;
+        }
+        bytes.current += reserved_bytes;
+        deferred.insert(
+            peer.id(),
+            DeferredLedgerData {
+                message,
+                reserved_bytes,
+            },
+        );
+        LedgerDataIngressDisposition::Deferred
     }
 
     /// Register a channel for immediate TmLedgerData delivery.
@@ -279,13 +467,22 @@ impl QueuedOverlayInboundHandler {
     /// Set a direct routing callback for TmLedgerData. When set, this is
     /// called FIRST (before the channel), directly from the network thread.
     /// This eliminates the router thread channel hop for maximum throughput.
-    pub fn set_ledger_data_router(&self, router: Box<dyn Fn(PeerId, TmLedgerData) + Send + Sync>) {
+    pub fn set_ledger_data_router(
+        &self,
+        router: Box<dyn Fn(PeerId, TmLedgerData) -> LedgerDataIngressDisposition + Send + Sync>,
+    ) {
         let _delivery_gate = self
             .ledger_data_delivery_gate
             .lock()
             .expect("ledger_data_delivery_gate lock");
-        tracing::info!(target: "consensus", handler_ptr = format!("{:p}", self), "set_ledger_data_router: SETTING router");
-        let router: Arc<dyn Fn(PeerId, TmLedgerData) + Send + Sync> = Arc::from(router);
+        tracing::info!(
+            target: "consensus",
+            handler_ptr = format!("{:p}", self),
+            "set_ledger_data_router: SETTING router"
+        );
+        let router: Arc<
+            dyn Fn(PeerId, TmLedgerData) -> LedgerDataIngressDisposition + Send + Sync,
+        > = Arc::from(router);
         let queued = {
             // Keep router -> inbound lock ordering consistent with incoming
             // fallback. No packet can enqueue after this drain begins.
@@ -298,7 +495,68 @@ impl QueuedOverlayInboundHandler {
             std::mem::take(&mut inbound.ledger_data)
         };
         for packet in queued {
-            router(packet.peer_id, packet.message);
+            let _ = router(packet.peer_id, packet.message);
+        }
+    }
+
+    /// Retry the exactly-one deferred decoded frame for `peer_id`. `true`
+    /// keeps the peer's session read-paused; `false` means the frame was
+    /// admitted, terminally classified, or no longer exists.
+    pub fn retry_deferred_ledger_data(&self, peer_id: PeerId) -> bool {
+        let _delivery_gate = self
+            .ledger_data_delivery_gate
+            .lock()
+            .expect("ledger_data_delivery_gate lock");
+        let frame = self
+            .ledger_data_deferred
+            .lock()
+            .expect("ledger_data_deferred lock")
+            .remove(&peer_id);
+        let Some(frame) = frame else {
+            return false;
+        };
+        {
+            let mut bytes = self
+                .deferred_ledger_data_bytes
+                .lock()
+                .expect("deferred_ledger_data_bytes lock");
+            bytes.current = bytes.current.saturating_sub(frame.reserved_bytes);
+        }
+        let message = frame.message;
+        let router = self
+            .ledger_data_router
+            .lock()
+            .expect("ledger_data_router lock")
+            .as_ref()
+            .map(Arc::clone);
+        let Some(router) = router else {
+            // Router teardown is a terminal transport condition. Never retain
+            // a decoded frame without a route owner.
+            return false;
+        };
+        if router(peer_id, message.clone()) == LedgerDataIngressDisposition::Deferred {
+            let reserved_bytes = deferred_ledger_data_bytes(&message);
+            let mut bytes = self
+                .deferred_ledger_data_bytes
+                .lock()
+                .expect("deferred_ledger_data_bytes lock");
+            if bytes.current.saturating_add(reserved_bytes) > bytes.limit {
+                return false;
+            }
+            bytes.current += reserved_bytes;
+            self.ledger_data_deferred
+                .lock()
+                .expect("ledger_data_deferred lock")
+                .insert(
+                    peer_id,
+                    DeferredLedgerData {
+                        message,
+                        reserved_bytes,
+                    },
+                );
+            true
+        } else {
+            false
         }
     }
 
@@ -334,7 +592,7 @@ impl QueuedOverlayInboundHandler {
         };
         let count = packets.len();
         for packet in packets {
-            router(packet.peer_id, packet.message);
+            let _ = router(packet.peer_id, packet.message);
         }
         count
     }
@@ -752,7 +1010,11 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
         }
     }
 
-    fn on_ledger_data(&self, peer: &Arc<PeerImp>, message: TmLedgerData) {
+    fn on_ledger_data(
+        &self,
+        peer: &Arc<PeerImp>,
+        message: TmLedgerData,
+    ) -> LedgerDataIngressDisposition {
         let _delivery_gate = self
             .ledger_data_delivery_gate
             .lock()
@@ -765,8 +1027,23 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
             .as_ref()
             .map(Arc::clone);
         if let Some(router) = router {
-            router(peer.id(), message.take().expect("message present"));
-            return;
+            if self
+                .ledger_data_deferred
+                .lock()
+                .expect("ledger_data_deferred lock")
+                .contains_key(&peer.id())
+            {
+                // Reads are paused after the first defer, so a second frame is
+                // not a routable reply. Preserve the original frame and make
+                // session close its explicit terminal disposition.
+                peer.request_disconnect();
+                return LedgerDataIngressDisposition::Delivered;
+            }
+            let message = message.take().expect("message present");
+            if router(peer.id(), message.clone()) == LedgerDataIngressDisposition::Deferred {
+                return self.defer_ledger_data(peer, message);
+            }
+            return LedgerDataIngressDisposition::Delivered;
         }
 
         let router = {
@@ -792,14 +1069,29 @@ impl OverlayInboundHandler for QueuedOverlayInboundHandler {
                     .unwrap_or(false);
                 if !sent_direct {
                     let mut inbound = self.inner.lock().expect("overlay inbound lock");
-                    push_bounded(&mut inbound.ledger_data, pm, "ledger_data");
+                    if !push_bounded(&mut inbound.ledger_data, pm, "ledger_data") {
+                        peer.request_disconnect();
+                    }
                 }
                 None
             }
         };
         if let Some(router) = router {
-            router(peer.id(), message.take().expect("message present"));
+            if self
+                .ledger_data_deferred
+                .lock()
+                .expect("ledger_data_deferred lock")
+                .contains_key(&peer.id())
+            {
+                peer.request_disconnect();
+                return LedgerDataIngressDisposition::Delivered;
+            }
+            let message = message.take().expect("message present");
+            if router(peer.id(), message.clone()) == LedgerDataIngressDisposition::Deferred {
+                return self.defer_ledger_data(peer, message);
+            }
         }
+        LedgerDataIngressDisposition::Delivered
     }
 
     fn on_propose_ledger(&self, _peer: &Arc<PeerImp>, message: QueuedProposal) {
@@ -1185,7 +1477,8 @@ mod tests {
                 received
                     .lock()
                     .expect("ledger-data replay lock")
-                    .push(peer_id)
+                    .push(peer_id);
+                LedgerDataIngressDisposition::Delivered
             }
         }));
         handler.set_get_objects_router(Box::new({

@@ -166,6 +166,18 @@ impl TreePlan {
         self.continuation.pending_edges()
     }
 
+    /// Fixed-size retained edge payload still owned by this plan. This is
+    /// intentionally separate from broker ticket accounting.
+    pub fn pending_edge_bytes(&self) -> usize {
+        self.continuation.pending_edge_bytes()
+    }
+
+    /// True when the continuation reached its retained-edge owner bound and
+    /// must wait for a read or peer result rather than another CPU turn.
+    pub fn is_pending_edge_limited(&self) -> bool {
+        self.continuation.is_pending_edge_limited()
+    }
+
     /// True only while an actor CPU turn can make progress without a broker
     /// completion or peer response. Pending read/network edges intentionally
     /// do not make a plan runnable.
@@ -3564,3 +3576,114 @@ where
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tree_plan_facade_tests {
+    use super::*;
+    use basics::intrusive_pointer::{SharedIntrusive, make_shared_intrusive};
+    use shamap::sync::{MissingNodeResidentLookup, SyncState};
+
+    struct NoResident;
+
+    impl MissingNodeResidentLookup for NoResident {
+        fn load_resident(
+            &mut self,
+            _hash: SHAMapHash,
+            _ledger_seq: u32,
+        ) -> Option<SharedIntrusive<SHAMapTreeNode>> {
+            None
+        }
+    }
+
+    #[test]
+    fn tree_plan_facade_forwards_retained_edges_and_wait_state_without_ownership() {
+        let child = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        child.update_hash();
+        let child_hash = child.get_hash();
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(1, child_hash);
+        root.set_child_hash(2, child_hash);
+        root.update_hash();
+        let tree = SyncTree::from_root_with_type(
+            root.clone(),
+            SHAMapType::State,
+            true,
+            77,
+            SyncState::Synching,
+        );
+        let mut first_child = || 0;
+        let mut plan = TreePlan::new(
+            TreePlanId::new(93),
+            TreeKind::State,
+            &tree,
+            root.get_hash(),
+            16,
+            0,
+            &mut first_child,
+        );
+        let mut resident = NoResident;
+
+        let TreeAdvance::NeedsReads(reads) = plan.advance(32, 4, &mut resident, &mut first_child)
+        else {
+            panic!("expected the continuation's deduplicated read result");
+        };
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].hash(), child_hash);
+        assert_eq!(plan.pending_hashes(), 1);
+        assert_eq!(plan.pending_edges(), 2);
+        assert!(plan.pending_edge_bytes() > 0);
+        assert!(!plan.is_pending_edge_limited());
+        assert!(
+            !plan.has_runnable_frontier(),
+            "after forwarding the bounded read result, only the retained broker edge remains"
+        );
+        assert!(
+            plan.take_read_admission_batch(1).is_empty(),
+            "the facade retains no second admission queue after forwarding NeedsReads"
+        );
+
+        assert_eq!(
+            plan.apply_read_result(
+                TreePlanId::new(94),
+                child_hash,
+                MissingNodeReadOutcome::Miss,
+            ),
+            MissingNodeReadApply::StalePlan
+        );
+        assert_eq!(plan.pending_hashes(), 1);
+        assert_eq!(plan.pending_edges(), 2);
+        assert_eq!(
+            plan.apply_read_result(plan.id(), child_hash, MissingNodeReadOutcome::Miss),
+            MissingNodeReadApply::Applied {
+                attached_edges: 0,
+                missing_edges: 1,
+            }
+        );
+        let candidates = plan.take_network_candidates();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].1, *child_hash.as_uint256());
+        assert_eq!(plan.pending_hashes(), 0);
+        assert_eq!(plan.pending_edges(), 2);
+        assert!(
+            !plan.has_runnable_frontier(),
+            "after forwarding the bounded peer candidate, only continuation-owned edges wait"
+        );
+
+        assert_eq!(
+            plan.apply_network_node(plan.id(), child_hash, child.clone()),
+            MissingNodeReadApply::Applied {
+                attached_edges: 2,
+                missing_edges: 0,
+            }
+        );
+        assert!(matches!(
+            plan.advance(32, 4, &mut resident, &mut first_child),
+            TreeAdvance::Complete
+        ));
+        assert_eq!(
+            plan.apply_network_node(plan.id(), child_hash, child,),
+            MissingNodeReadApply::UnknownRead,
+            "the facade has no second terminal settlement after continuation completion"
+        );
+    }
+}

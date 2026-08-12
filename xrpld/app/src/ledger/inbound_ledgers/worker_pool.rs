@@ -10,7 +10,32 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use super::acquisition::AcquisitionState;
+
 type Job = Box<dyn FnOnce() + Send>;
+
+/// Production timer work is a fixed record: it retains only the acquisition
+/// identity through a weak Arc. Test callbacks remain behind cfg(test) and
+/// never participate in the production ownership boundary.
+enum TimerWork {
+    AcquisitionTimeout(std::sync::Weak<AcquisitionState>),
+    #[cfg(test)]
+    Test(Job),
+}
+
+impl TimerWork {
+    fn run(self) {
+        match self {
+            Self::AcquisitionTimeout(state) => {
+                if let Some(state) = state.upgrade() {
+                    state.on_acquisition_timer_fired();
+                }
+            }
+            #[cfg(test)]
+            Self::Test(callback) => callback(),
+        }
+    }
+}
 
 struct QueueState {
     ledger_data: VecDeque<Job>,
@@ -32,16 +57,27 @@ impl QueueState {
 /// discarded during shutdown.
 struct LedgerDataReservation {
     count: Arc<AtomicUsize>,
+    bytes: Arc<AtomicUsize>,
+    charged_bytes: usize,
 }
 
 impl Drop for LedgerDataReservation {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::AcqRel);
+        self.bytes.fetch_sub(self.charged_bytes, Ordering::AcqRel);
     }
 }
 
-fn reserve_ledger_data_job(job: Job, count: Arc<AtomicUsize>) -> Job {
-    let reservation = LedgerDataReservation { count };
+fn reserve_ledger_data_job(job: Job, count: Arc<AtomicUsize>, bytes: Arc<AtomicUsize>) -> Job {
+    // Measure the concrete FnOnce object while it is still typed behind the
+    // trait object. The reservation, not the queue/container, owns release on
+    // run, panic unwind, executor rejection, or WorkerPool stop/drop.
+    let charged_bytes = std::mem::size_of_val(&*job).saturating_add(std::mem::size_of::<Job>());
+    let reservation = LedgerDataReservation {
+        count,
+        bytes,
+        charged_bytes,
+    };
     Box::new(move || {
         let _reservation = reservation;
         job();
@@ -53,13 +89,14 @@ fn reserve_ledger_data_job(job: Job, count: Arc<AtomicUsize>) -> Job {
 pub struct WorkerPoolSnapshot {
     pub queued_jobs: usize,
     pub outstanding_ledger_data_jobs: usize,
+    pub outstanding_ledger_data_job_bytes: usize,
     pub worker_count: usize,
 }
 
 struct TimerTask {
     due: Instant,
     delay: Duration,
-    callback: Job,
+    work: TimerWork,
 }
 
 struct TimerState {
@@ -109,10 +146,10 @@ impl TimerService {
                                 state = next;
                                 continue;
                             }
-                            break state.tasks.swap_remove(index).callback;
+                            break state.tasks.swap_remove(index).work;
                         }
                     };
-                    callback();
+                    callback.run();
                 }
             })
             .expect("acquisition timer thread should spawn");
@@ -123,20 +160,31 @@ impl TimerService {
         }
     }
 
-    fn schedule(&self, delay: Duration, callback: Job) {
+    fn schedule_acquisition_timeout(&self, delay: Duration, state: &Arc<AcquisitionState>) {
+        self.schedule(delay, TimerWork::AcquisitionTimeout(Arc::downgrade(state)));
+    }
+
+    fn schedule(&self, delay: Duration, work: TimerWork) {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("acquisition timer lock");
+        // Serialize stopped observation with queue insertion. A caller that
+        // raced stop either inserts before stop (and is cleared after join) or
+        // observes stopped while holding this same lock and retains nothing.
         if self.stopped.load(Ordering::Acquire) {
             return;
         }
-        let (lock, wake) = &*self.state;
-        lock.lock()
-            .expect("acquisition timer lock")
-            .tasks
-            .push(TimerTask {
-                due: Instant::now() + delay,
-                delay,
-                callback,
-            });
+        state.tasks.push(TimerTask {
+            due: Instant::now() + delay,
+            delay,
+            work,
+        });
+        drop(state);
         wake.notify_one();
+    }
+
+    #[cfg(test)]
+    fn schedule_for_test(&self, delay: Duration, callback: Job) {
+        self.schedule(delay, TimerWork::Test(callback));
     }
 
     #[cfg(test)]
@@ -165,7 +213,7 @@ impl TimerService {
             state.tasks.swap_remove(index)
         };
         let delay = task.delay;
-        (task.callback)();
+        (task.work).run();
         Some(delay)
     }
 
@@ -175,6 +223,15 @@ impl TimerService {
         if let Some(thread) = self.thread.lock().expect("timer thread lock").take() {
             let _ = thread.join();
         }
+        // The timer thread exits without consuming delayed work. Drop every
+        // queued record after join so callback/reservation ownership has no
+        // stop-race survivor.
+        self.state
+            .0
+            .lock()
+            .expect("acquisition timer lock")
+            .tasks
+            .clear();
     }
 }
 
@@ -190,6 +247,7 @@ pub struct WorkerPool {
     stop: Arc<AtomicBool>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     ledger_data_jobs: Arc<AtomicUsize>,
+    ledger_data_job_bytes: Arc<AtomicUsize>,
     timers: TimerService,
 }
 
@@ -253,6 +311,7 @@ impl WorkerPool {
             stop,
             workers: Mutex::new(workers),
             ledger_data_jobs: Arc::new(AtomicUsize::new(0)),
+            ledger_data_job_bytes: Arc::new(AtomicUsize::new(0)),
             timers: TimerService::new(),
         }
     }
@@ -265,9 +324,13 @@ impl WorkerPool {
         }
 
         self.ledger_data_jobs.fetch_add(1, Ordering::AcqRel);
+        let charged_bytes = std::mem::size_of_val(&*job).saturating_add(std::mem::size_of::<Job>());
+        self.ledger_data_job_bytes
+            .fetch_add(charged_bytes, Ordering::AcqRel);
         jobs.ledger_data.push_back(reserve_ledger_data_job(
             job,
             Arc::clone(&self.ledger_data_jobs),
+            Arc::clone(&self.ledger_data_job_bytes),
         ));
         wake.notify_all();
     }
@@ -287,11 +350,21 @@ impl WorkerPool {
         self.submit_reserved_turn(job);
     }
 
-    /// Schedule one delayed timer callback. The callback must decide whether
-    /// to re-arm itself, exactly as `TimeoutCounter::invokeOnTimer` does.
-    pub fn schedule_after(&self, delay: Duration, callback: Job) {
+    /// Schedule the fixed typed timeout record owned by an acquisition.
+    pub(crate) fn schedule_acquisition_timeout(
+        &self,
+        delay: Duration,
+        state: &Arc<AcquisitionState>,
+    ) {
         if !self.stop.load(Ordering::Acquire) {
-            self.timers.schedule(delay, callback);
+            self.timers.schedule_acquisition_timeout(delay, state);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn schedule_after_for_test(&self, delay: Duration, callback: Job) {
+        if !self.stop.load(Ordering::Acquire) {
+            self.timers.schedule_for_test(delay, callback);
         }
     }
 
@@ -303,6 +376,7 @@ impl WorkerPool {
         WorkerPoolSnapshot {
             queued_jobs,
             outstanding_ledger_data_jobs: self.ledger_data_jobs.load(Ordering::Acquire),
+            outstanding_ledger_data_job_bytes: self.ledger_data_job_bytes.load(Ordering::Acquire),
             worker_count,
         }
     }
@@ -378,13 +452,36 @@ mod tests {
     }
 
     #[test]
+    fn timer_stop_drops_queued_work_and_refuses_a_racing_late_schedule() {
+        let pool = WorkerPool::new(0);
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retained = Arc::clone(&dropped);
+        pool.schedule_after_for_test(
+            Duration::from_secs(60),
+            Box::new(move || {
+                retained.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }),
+        );
+        assert_eq!(pool.scheduled_timer_delays_for_test().len(), 1);
+
+        pool.stop();
+        assert!(pool.scheduled_timer_delays_for_test().is_empty());
+        pool.schedule_after_for_test(
+            Duration::from_secs(60),
+            Box::new(|| panic!("stopped timer must not retain or run work")),
+        );
+        assert!(pool.scheduled_timer_delays_for_test().is_empty());
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn manual_timer_fires_callback_before_manually_drained_worker_job() {
         let pool = Arc::new(WorkerPool::new(0));
         let events = Arc::new(Mutex::new(Vec::new()));
         let callback_pool = Arc::clone(&pool);
         let callback_events = Arc::clone(&events);
 
-        pool.schedule_after(
+        pool.schedule_after_for_test(
             Duration::from_secs(3),
             Box::new(move || {
                 callback_events

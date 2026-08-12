@@ -1,7 +1,7 @@
 use basics::base_uint::Uint256;
 use basics::basic_config::Section;
 use nodestore::{
-    BATCH_WRITE_PREALLOCATION_SIZE, Backend, DatabaseDelegate, DatabaseRotatingImp,
+    AsyncReadWork, BATCH_WRITE_PREALLOCATION_SIZE, Backend, DatabaseDelegate, DatabaseRotatingImp,
     DatabaseRuntime, DatabaseSource, DecodedBlob, DummyScheduler, EncodedBlob, Factory,
     FetchReport, JournalLevel, Manager, ManagerImp, MemoryFactory, NodeObject, NodeObjectType,
     NodeStoreJournal, NullJournal, Status, filter_inner, nodeobject_compress,
@@ -350,6 +350,22 @@ fn import_internal_keeps_the_batch_intact_after_a_failed_store_batch() {
     database.stop();
 }
 
+struct BlobChannelReadWork {
+    sender: mpsc::Sender<Option<Vec<u8>>>,
+    panic_after_send: bool,
+}
+
+impl AsyncReadWork for BlobChannelReadWork {
+    fn complete(&mut self, object: Option<Arc<NodeObject>>) {
+        self.sender
+            .send(object.map(|node| node.data().clone()))
+            .expect("typed async read channel send must succeed");
+        if self.panic_after_send {
+            panic!("async fetch work panic");
+        }
+    }
+}
+
 #[test]
 fn database_async_fetch_uses_backend_object_and_updates_metrics() {
     let manager = ManagerImp::new();
@@ -370,9 +386,9 @@ fn database_async_fetch_uses_backend_object_and_updates_metrics() {
     database.async_fetch(
         item_hash,
         1,
-        Box::new(move |object| {
-            tx.send(object.map(|node| node.data().clone()))
-                .expect("channel send must succeed");
+        Box::new(BlobChannelReadWork {
+            sender: tx,
+            panic_after_send: false,
         }),
     );
     let async_fetched = rx
@@ -403,20 +419,17 @@ fn database_async_fetch_does_not_swallow_panicking_callbacks() {
     database.async_fetch(
         item_hash,
         1,
-        Box::new(move |object| {
-            first_tx
-                .send(object.map(|node| node.data().clone()))
-                .expect("first channel send must succeed");
-            panic!("async fetch callback panic");
+        Box::new(BlobChannelReadWork {
+            sender: first_tx,
+            panic_after_send: true,
         }),
     );
     database.async_fetch(
         item_hash,
         1,
-        Box::new(move |object| {
-            second_tx
-                .send(object.map(|node| node.data().clone()))
-                .expect("second channel send must succeed");
+        Box::new(BlobChannelReadWork {
+            sender: second_tx,
+            panic_after_send: false,
         }),
     );
 

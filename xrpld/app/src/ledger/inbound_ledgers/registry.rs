@@ -25,7 +25,8 @@ use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 use super::acquisition::{
     AcquisitionBuilder, AcquisitionCompletionRecorder, AcquisitionDurableCompletionRecorder,
     AcquisitionFailureRecorder, AcquisitionLedgerStore, AcquisitionPeerProvider,
-    AcquisitionSequencePromoter, AcquisitionSnapshot, AcquisitionState, PacketEnqueue,
+    AcquisitionSequencePromoter, AcquisitionSnapshot, AcquisitionState,
+    InboundPacketAdmissionLease, PacketAdmissionReservation, PacketEnqueue,
     ProvisionalLedgerIdentity,
 };
 #[cfg(test)]
@@ -214,7 +215,22 @@ pub enum LedgerDataRouteDisposition {
     Unmatched,
     Terminal,
     SequenceMismatch,
+    /// Legacy direct routing observed actor pressure after decode. Worker 1
+    /// must use `reserve_response_admission` and `route_admitted_response_with_seq`
+    /// instead, so a matching decoded reply is transport-deferred before this
+    /// disposition can occur.
     MailboxFull,
+    AdmissionLeaseInvalid,
+}
+
+/// Actor-side pre-routing admission result. `Deferred` retains no decoded
+/// packet in this registry; Worker 1 owns one peer-scoped decoder frame and
+/// pauses/defer transport until it can retry reservation or reaches terminal.
+pub enum LedgerDataAdmission {
+    Admitted(InboundPacketAdmissionLease),
+    Unmatched,
+    Terminal,
+    Deferred,
 }
 
 impl LedgerDataRouteDisposition {
@@ -876,7 +892,12 @@ impl InboundLedgers {
             && reason != AcquireReason::Generic
             && reason != AcquireReason::Consensus
         {
-            tracing::info!(target: "inbound_ledger", %hash, seq, "acquire: REJECTED need_network_ledger");
+            tracing::info!(
+                target: "inbound_ledger",
+                %hash,
+                seq,
+                "acquire: REJECTED need_network_ledger"
+            );
             return None;
         }
 
@@ -995,7 +1016,12 @@ impl InboundLedgers {
             match guard.as_ref() {
                 Some(ns) => ns.clone(),
                 None => {
-                    tracing::warn!(target: "inbound_ledger", %hash, seq, "acquire: REJECTED node_store not attached");
+                    tracing::warn!(
+                        target: "inbound_ledger",
+                        %hash,
+                        seq,
+                        "acquire: REJECTED node_store not attached"
+                    );
                     return None;
                 }
             }
@@ -1221,7 +1247,14 @@ impl InboundLedgers {
                 "LCL trace: started a new preferred-target inbound acquisition"
             );
         }
-        tracing::info!(target: "inbound_ledger", seq, %hash, reason = ?reason, acquisition_id, "Acquisition started");
+        tracing::info!(
+            target: "inbound_ledger",
+            seq,
+            %hash,
+            reason = ?reason,
+            acquisition_id,
+            "Acquisition started"
+        );
         self.lifecycle
             .acquisition_starts
             .fetch_add(1, Ordering::Relaxed);
@@ -1255,6 +1288,92 @@ impl InboundLedgers {
         self.acquire_async(hash, 0, reason);
     }
 
+    /// Reserve exactly one actor-owned packet/byte lease before handing a
+    /// decoded matching reply to `route_admitted_response_with_seq`. This
+    /// performs no overlay work and retains no packet on `Deferred`.
+    pub fn reserve_response_admission(
+        &self,
+        hash: &Uint256,
+        packet: &InboundLedgerPacket,
+    ) -> LedgerDataAdmission {
+        let state = {
+            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            let Some(entry) = inner.entries.get(hash) else {
+                return LedgerDataAdmission::Unmatched;
+            };
+            if entry.failed
+                || entry.state.failed.load(Ordering::Acquire)
+                || entry.state.stopped.load(Ordering::Acquire)
+            {
+                return LedgerDataAdmission::Terminal;
+            }
+            Arc::clone(&entry.state)
+        };
+        let bytes = packet
+            .nodes
+            .iter()
+            .map(|node| node.node_data.len() + node.node_id.as_ref().map_or(0, Vec::len))
+            .sum();
+        match state.reserve_packet_admission(bytes) {
+            Ok(lease) => LedgerDataAdmission::Admitted(lease),
+            Err(PacketAdmissionReservation::Terminal) => LedgerDataAdmission::Terminal,
+            Err(PacketAdmissionReservation::Deferred) => LedgerDataAdmission::Deferred,
+        }
+    }
+
+    /// Consume a previously admitted response lease. The lease itself carries
+    /// the actor identity; stale/swept leases become terminal or invalid and
+    /// cannot fill a replacement acquisition's mailbox.
+    pub fn route_admitted_response_with_seq(
+        &self,
+        hash: &Uint256,
+        lease: InboundPacketAdmissionLease,
+        peer_id: u64,
+        response_seq: Option<u32>,
+        packet: InboundLedgerPacket,
+    ) -> LedgerDataRouteDisposition {
+        self.lifecycle
+            .route_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        let state = {
+            let inner = self.inner.lock().expect("inbound_ledgers lock");
+            let Some(entry) = inner.entries.get(hash) else {
+                return LedgerDataRouteDisposition::Unmatched;
+            };
+            if entry.failed
+                || entry.state.failed.load(Ordering::Acquire)
+                || entry.state.stopped.load(Ordering::Acquire)
+            {
+                return LedgerDataRouteDisposition::Terminal;
+            }
+            Arc::clone(&entry.state)
+        };
+        match state.enqueue_packet_with_admission(lease, peer_id, response_seq, packet) {
+            Err(_) => {
+                self.lifecycle
+                    .route_sequence_mismatch
+                    .fetch_add(1, Ordering::Relaxed);
+                LedgerDataRouteDisposition::SequenceMismatch
+            }
+            Ok(PacketEnqueue::Accepted) => {
+                self.lifecycle
+                    .route_accepted
+                    .fetch_add(1, Ordering::Relaxed);
+                LedgerDataRouteDisposition::Accepted
+            }
+            Ok(PacketEnqueue::Terminal) => {
+                self.lifecycle
+                    .route_terminal
+                    .fetch_add(1, Ordering::Relaxed);
+                LedgerDataRouteDisposition::Terminal
+            }
+            Ok(PacketEnqueue::InvalidLease) => LedgerDataRouteDisposition::AdmissionLeaseInvalid,
+            Ok(PacketEnqueue::Full) => {
+                unreachable!("a consumed packet admission lease reserves mailbox capacity")
+            }
+        }
+    }
+
     /// Route a TMLedgerData response to the correct acquisition.
     pub fn route_response(&self, hash: &Uint256, peer_id: u64, packet: InboundLedgerPacket) {
         let _ = self.route_response_with_seq(hash, peer_id, None, packet);
@@ -1280,7 +1399,12 @@ impl InboundLedgers {
             let mut inner = self.inner.lock().expect("inbound_ledgers lock");
             let Some(entry) = inner.entries.get_mut(hash) else {
                 self.lifecycle.route_misses.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: registry miss");
+                tracing::debug!(
+                    target: "inbound_ledger",
+                    %hash,
+                    peer_id,
+                    "route_response: registry miss"
+                );
                 return LedgerDataRouteDisposition::Unmatched;
             };
             if entry.failed
@@ -1290,7 +1414,12 @@ impl InboundLedgers {
                 self.lifecycle
                     .route_terminal
                     .fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: ignored terminal acquisition");
+                tracing::debug!(
+                    target: "inbound_ledger",
+                    %hash,
+                    peer_id,
+                    "route_response: ignored terminal acquisition"
+                );
                 return LedgerDataRouteDisposition::Terminal;
             }
             let state = Arc::clone(&entry.state);
@@ -1333,24 +1462,27 @@ impl InboundLedgers {
                 self.lifecycle
                     .route_accepted
                     .fetch_add(1, Ordering::Relaxed);
-                self.scheduler.wake(
-                    AcquisitionKey {
-                        hash: *hash,
-                        id: state.acquisition_id,
-                    },
-                    &state,
-                    ReadyCause::WIRE,
+                tracing::debug!(
+                    target: "inbound_ledger",
+                    %hash,
+                    peer_id,
+                    "route_response: registry hit"
                 );
-                tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: registry hit");
                 LedgerDataRouteDisposition::Accepted
             }
             Ok(PacketEnqueue::Terminal) => {
                 self.lifecycle
                     .route_terminal
                     .fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(target: "inbound_ledger", %hash, peer_id, "route_response: terminal acquisition");
+                tracing::debug!(
+                    target: "inbound_ledger",
+                    %hash,
+                    peer_id,
+                    "route_response: terminal acquisition"
+                );
                 LedgerDataRouteDisposition::Terminal
             }
+            Ok(PacketEnqueue::InvalidLease) => LedgerDataRouteDisposition::AdmissionLeaseInvalid,
             Ok(PacketEnqueue::Full) => {
                 // This packet matched a live acquisition. Do not recategorize
                 // it as stale/fetch-pack material: the caller must apply its
@@ -1358,7 +1490,12 @@ impl InboundLedgers {
                 self.lifecycle
                     .route_terminal
                     .fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(target: "inbound_ledger", %hash, peer_id, "route_response: acquisition mailbox full");
+                tracing::warn!(
+                    target: "inbound_ledger",
+                    %hash,
+                    peer_id,
+                    "route_response: acquisition mailbox full"
+                );
                 LedgerDataRouteDisposition::MailboxFull
             }
         }
@@ -1793,9 +1930,10 @@ impl InboundLedgers {
     pub fn finish_fetch_pack_pass(&self) {
         let generation = {
             let mut wakes = self.fetch_pack_wakes.lock().expect("fetch-pack wake lock");
-            if wakes.pending_hashes.is_empty() {
-                return;
-            }
+            // `InboundLedgersImp::gotFetchPack` snapshots every active entry
+            // and calls checkLocal for each fetch-pack completion. An empty or
+            // late cache insertion is still that event; suppressing it leaves
+            // retained descendants asleep indefinitely.
             wakes.next_generation = wakes.next_generation.wrapping_add(1).max(1);
             wakes.pending_hashes.clear();
             wakes.next_generation
@@ -2284,7 +2422,9 @@ impl std::fmt::Debug for InboundLedgers {
 
 #[cfg(test)]
 mod tests {
-    use super::super::acquisition::AcquisitionSnapshot;
+    use super::super::acquisition::{
+        ACQ_MAILBOX_BYTE_CAPACITY, ACQ_MAILBOX_PACKET_CAPACITY, AcquisitionSnapshot,
+    };
     use super::super::worker_pool::WorkerPool;
     use super::{
         AcquireReason, AcquisitionLifecycleCounters, AcquisitionLifecycleSnapshot, InboundLedgers,
@@ -2364,6 +2504,274 @@ mod tests {
         );
         registry.set_node_store(node_store);
         (dir, registry)
+    }
+
+    fn packet_with_exact_payload_bytes(bytes: usize) -> InboundLedgerPacket {
+        InboundLedgerPacket::new(
+            InboundLedgerDataType::StateNode,
+            vec![ledger::InboundLedgerNodeData::new(None, vec![0xA5; bytes])],
+        )
+    }
+
+    fn active_state(
+        registry: &InboundLedgers,
+        hash: &Uint256,
+    ) -> Arc<super::super::acquisition::AcquisitionState> {
+        let inner = registry.inner.lock().expect("registry lock");
+        Arc::clone(&inner.entries.get(hash).expect("active acquisition").state)
+    }
+
+    #[test]
+    fn response_admission_127_128_129_and_byte_boundaries_route_and_release_exactly_once() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let hash = Uint256::from_array([0xC2; 32]);
+        assert!(registry.acquire(hash, 1, AcquireReason::Generic).is_none());
+        let state = active_state(&registry, &hash);
+        let empty = InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new());
+
+        let mut leases = Vec::with_capacity(ACQ_MAILBOX_PACKET_CAPACITY);
+        for count in 1..=ACQ_MAILBOX_PACKET_CAPACITY {
+            let lease = match registry.reserve_response_admission(&hash, &empty) {
+                super::LedgerDataAdmission::Admitted(lease) => lease,
+                _ => panic!("reservation {count} must fit the live mailbox"),
+            };
+            if count == ACQ_MAILBOX_PACKET_CAPACITY - 1 {
+                assert_eq!(leases.len() + 1, 127, "the 127th lease remains admitted");
+            }
+            leases.push(lease);
+        }
+        assert_eq!(leases.len(), 128, "the 128th lease remains admitted");
+        assert!(
+            matches!(
+                registry.reserve_response_admission(&hash, &empty),
+                super::LedgerDataAdmission::Deferred
+            ),
+            "the 129th matching reply is explicit local backpressure, not a terminal reply"
+        );
+
+        drop(leases.pop().expect("one live reservation"));
+        let routed_lease = match registry.reserve_response_admission(&hash, &empty) {
+            super::LedgerDataAdmission::Admitted(lease) => lease,
+            _ => panic!("one dropped lease must release exactly one slot"),
+        };
+        assert_eq!(
+            registry.route_admitted_response_with_seq(
+                &hash,
+                routed_lease,
+                77,
+                Some(1),
+                empty.clone()
+            ),
+            super::LedgerDataRouteDisposition::Accepted,
+            "the replacement lease is consumed by the live route exactly once"
+        );
+        assert!(
+            matches!(
+                registry.reserve_response_admission(&hash, &empty),
+                super::LedgerDataAdmission::Deferred
+            ),
+            "queued routed work plus unconsumed leases still occupies all 128 slots"
+        );
+
+        assert!(
+            state.clear_terminal_work().is_empty(),
+            "the count-boundary terminal clear owns no read tickets"
+        );
+        drop(leases);
+        let mut fresh = Vec::with_capacity(ACQ_MAILBOX_PACKET_CAPACITY);
+        for _ in 0..ACQ_MAILBOX_PACKET_CAPACITY {
+            fresh.push(
+                state
+                    .reserve_packet_admission(0)
+                    .expect("stale lease drops must not release a fresh reservation"),
+            );
+        }
+        assert!(
+            matches!(
+                state.reserve_packet_admission(0),
+                Err(super::super::acquisition::PacketAdmissionReservation::Deferred)
+            ),
+            "fresh 129th reservation remains deferred"
+        );
+        assert!(
+            state.clear_terminal_work().is_empty(),
+            "the fresh lease cleanup is idempotent and owns no read tickets"
+        );
+        drop(fresh);
+
+        let below = packet_with_exact_payload_bytes(ACQ_MAILBOX_BYTE_CAPACITY - 1);
+        let one_byte = packet_with_exact_payload_bytes(1);
+        let below_lease = match registry.reserve_response_admission(&hash, &below) {
+            super::LedgerDataAdmission::Admitted(lease) => lease,
+            _ => panic!("4 MiB minus one byte must fit"),
+        };
+        let final_byte_lease = match registry.reserve_response_admission(&hash, &one_byte) {
+            super::LedgerDataAdmission::Admitted(lease) => lease,
+            _ => panic!("the final byte must fit the exact byte boundary"),
+        };
+        assert!(
+            matches!(
+                registry.reserve_response_admission(&hash, &one_byte),
+                super::LedgerDataAdmission::Deferred
+            ),
+            "one byte above 4 MiB is explicit deferred backpressure"
+        );
+        drop((below_lease, final_byte_lease));
+
+        let exact = packet_with_exact_payload_bytes(ACQ_MAILBOX_BYTE_CAPACITY);
+        let exact_lease = match registry.reserve_response_admission(&hash, &exact) {
+            super::LedgerDataAdmission::Admitted(lease) => lease,
+            _ => panic!("an exact 4 MiB payload must fit"),
+        };
+        assert!(
+            matches!(
+                registry.reserve_response_admission(&hash, &one_byte),
+                super::LedgerDataAdmission::Deferred
+            ),
+            "the next byte above an exact 4 MiB reservation is deferred"
+        );
+        drop(exact_lease);
+        registry.stop();
+    }
+
+    #[test]
+    fn admitted_lease_cancel_sweep_stop_and_drop_are_terminal_not_capacity_replies() {
+        let empty = || InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new());
+
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let cancelled_hash = Uint256::from_array([0xC1; 32]);
+        assert!(
+            registry
+                .acquire(cancelled_hash, 1, AcquireReason::Generic)
+                .is_none()
+        );
+        let cancelled_state = active_state(&registry, &cancelled_hash);
+        let cancelled_lease = match registry.reserve_response_admission(&cancelled_hash, &empty()) {
+            super::LedgerDataAdmission::Admitted(lease) => lease,
+            _ => panic!("active acquisition admits its first response"),
+        };
+        cancelled_state.cancel();
+        assert_eq!(
+            registry.route_admitted_response_with_seq(
+                &cancelled_hash,
+                cancelled_lease,
+                77,
+                Some(1),
+                empty(),
+            ),
+            super::LedgerDataRouteDisposition::Terminal,
+            "a cancelled acquisition is terminal, never a capacity or stale-data reply"
+        );
+        assert!(cancelled_state.reserve_packet_admission(0).is_err());
+        registry.stop();
+
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let swept_hash = Uint256::from_array([0xC0; 32]);
+        assert!(
+            registry
+                .acquire(swept_hash, 1, AcquireReason::Generic)
+                .is_none()
+        );
+        let swept_state = active_state(&registry, &swept_hash);
+        let swept_lease = match registry.reserve_response_admission(&swept_hash, &empty()) {
+            super::LedgerDataAdmission::Admitted(lease) => lease,
+            _ => panic!("active acquisition admits its first response"),
+        };
+        {
+            let mut inner = registry.inner.lock().expect("registry lock");
+            inner
+                .entries
+                .get_mut(&swept_hash)
+                .expect("active entry")
+                .last_touched = Instant::now() - SWEEP_IDLE_TIMEOUT - Duration::from_secs(1);
+        }
+        registry.sweep();
+        assert!(matches!(
+            registry.reserve_response_admission(&swept_hash, &empty()),
+            super::LedgerDataAdmission::Unmatched
+        ));
+        assert_eq!(
+            registry.route_admitted_response_with_seq(
+                &swept_hash,
+                swept_lease,
+                77,
+                Some(1),
+                empty()
+            ),
+            super::LedgerDataRouteDisposition::Unmatched,
+            "a swept stale lease cannot be converted into a capacity or cancelled reply"
+        );
+        assert!(swept_state.reserve_packet_admission(0).is_err());
+        registry.stop();
+
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let stopped_hash = Uint256::from_array([0xBF; 32]);
+        assert!(
+            registry
+                .acquire(stopped_hash, 1, AcquireReason::Generic)
+                .is_none()
+        );
+        let stopped_state = active_state(&registry, &stopped_hash);
+        let stopped_lease = match registry.reserve_response_admission(&stopped_hash, &empty()) {
+            super::LedgerDataAdmission::Admitted(lease) => lease,
+            _ => panic!("active acquisition admits its first response"),
+        };
+        registry.stop();
+        assert_eq!(
+            registry.route_admitted_response_with_seq(
+                &stopped_hash,
+                stopped_lease,
+                77,
+                Some(1),
+                empty()
+            ),
+            super::LedgerDataRouteDisposition::Unmatched,
+            "registry stop detaches and terminally clears the lease before its later drop"
+        );
+        assert!(stopped_state.reserve_packet_admission(0).is_err());
+    }
+
+    #[test]
+    fn admitted_response_lease_consumes_one_actor_reservation_before_route() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let hash = Uint256::from_array([0xC4; 32]);
+        assert!(registry.acquire(hash, 1, AcquireReason::Generic).is_none());
+        let packet = InboundLedgerPacket::new(InboundLedgerDataType::Base, Vec::new());
+        let lease = match registry.reserve_response_admission(&hash, &packet) {
+            super::LedgerDataAdmission::Admitted(lease) => lease,
+            _ => panic!("live acquisition must reserve its bounded actor lease"),
+        };
+        assert_eq!(
+            registry.route_admitted_response_with_seq(&hash, lease, 77, Some(1), packet),
+            super::LedgerDataRouteDisposition::Accepted,
+            "a consumed lease cannot be re-admitted or require a second scheduler reservation"
+        );
+        assert_eq!(registry.lifecycle_snapshot().route_accepted, 1);
+        registry.stop();
+    }
+
+    #[test]
+    fn empty_fetch_pack_pass_wakes_active_acquisitions() {
+        let worker_pool = Arc::new(WorkerPool::new(0));
+        let (_dir, registry) = registry_with_manual_worker_pool(worker_pool);
+        let hash = Uint256::from_array([0xC3; 32]);
+        assert!(registry.acquire(hash, 1, AcquireReason::Generic).is_none());
+        let state = {
+            let inner = registry.inner.lock().expect("registry lock");
+            Arc::clone(&inner.entries.get(&hash).expect("active entry").state)
+        };
+        assert!(!state.fetch_pack_ready.load(Ordering::Acquire));
+        registry.finish_fetch_pack_pass();
+        assert!(
+            state.fetch_pack_ready.load(Ordering::Acquire),
+            "every fetch-pack completion, including an empty one, wakes checkLocal"
+        );
+        registry.stop();
     }
 
     #[test]

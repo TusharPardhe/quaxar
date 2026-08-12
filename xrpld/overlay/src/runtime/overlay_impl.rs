@@ -37,9 +37,9 @@ use crate::handshake::{
     negotiate_inbound_peer_upgrade, parse_http_request, serialize_response, verify_handshake,
 };
 use crate::inbound::{
-    OverlayInboundHandler, OverlayInboundSnapshot, QueuedEndpoint, QueuedEndpoints,
-    QueuedHaveTransactions, QueuedOverlayInboundHandler, QueuedProposal, QueuedTransaction,
-    QueuedValidation,
+    LedgerDataIngressDisposition, OverlayInboundHandler, OverlayInboundSnapshot, QueuedEndpoint,
+    QueuedEndpoints, QueuedHaveTransactions, QueuedOverlayInboundHandler, QueuedProposal,
+    QueuedTransaction, QueuedValidation,
 };
 use crate::message::{
     Message, ProtocolMessage, ProtocolMessageType, ProtocolPayload, TmProposeSet, TmSquelch,
@@ -475,11 +475,19 @@ impl PeerSessionHooks for OverlayPeerSessionHooks {
         peer: &Arc<PeerImp>,
         header: &crate::message::MessageHeader,
         message: &ProtocolMessage,
-    ) {
+    ) -> bool {
         let bytes = self
             .take_inbound_bytes()
             .unwrap_or_else(|| u64::from(header.total_wire_size));
-        self.overlay.observe_inbound_message(peer, message, bytes);
+        self.overlay.observe_inbound_message(peer, message, bytes)
+    }
+
+    fn retry_deferred_ledger_data(&self, peer: &Arc<PeerImp>) -> bool {
+        self.overlay.retry_deferred_ledger_data(peer.id())
+    }
+
+    fn on_session_closed(&self, peer: &Arc<PeerImp>) {
+        self.overlay.discard_deferred_ledger_data(peer.id());
     }
 
     fn on_message_unknown(&self, _peer: &Arc<PeerImp>, _message_type: u16) {
@@ -514,6 +522,7 @@ fn proposal_unique_id(
 struct OverlayInboundRouter<'a> {
     overlay: &'a OverlayImpl,
     peer: &'a Arc<PeerImp>,
+    ledger_data_deferred: bool,
 }
 
 impl OverlayInboundRouter<'_> {
@@ -796,7 +805,11 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         message: &crate::message::TmGetLedger,
     ) -> crate::router::RouteAction {
         if !(0..=3).contains(&message.itype) {
-            tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid get_ledger itype");
+            tracing::trace!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Invalid get_ledger itype"
+            );
             return self.reject_malformed("invalid get_ledger type");
         }
         // Verify ledger type (ltACCEPTED through ltCLOSED).
@@ -869,9 +882,15 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             return self.reject_malformed("ledger_data invalid node count");
         }
 
-        self.overlay
+        if self
+            .overlay
             .inbound_handler
-            .on_ledger_data(self.peer, message.clone());
+            .on_ledger_data(self.peer, message.clone())
+            == LedgerDataIngressDisposition::Deferred
+        {
+            self.ledger_data_deferred = true;
+            return crate::router::RouteAction::Stop;
+        }
         crate::router::RouteAction::Continue
     }
 
@@ -886,7 +905,11 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             prev_ledger_len = message.previousledger.len(),
         );
         if !(64..=72).contains(&message.signature.len()) {
-            tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid proposal signature length");
+            tracing::trace!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Invalid proposal signature length"
+            );
             return self.reject_malformed("proposal invalid signature length");
         }
         let Ok(public_key) = PublicKey::from_slice(&message.node_pub_key) else {
@@ -967,7 +990,11 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         if message.status == 1
             && let Some(hash) = Uint256::from_slice(&message.hash)
         {
-            tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Peer has transaction set");
+            tracing::trace!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Peer has transaction set"
+            );
             self.peer.record_tx_set(hash);
         }
         crate::router::RouteAction::Continue
@@ -977,9 +1004,18 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         &mut self,
         message: &crate::message::TmValidation,
     ) -> crate::router::RouteAction {
-        tracing::trace!(target: "overlay", peer_id = %self.peer.id(), len = message.validation.len(), "on_validation: received TMValidation from peer");
+        tracing::trace!(
+            target: "overlay",
+            peer_id = %self.peer.id(),
+            len = message.validation.len(),
+            "on_validation: received TMValidation from peer"
+        );
         if message.validation.len() < 50 {
-            tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Validation too short, ignoring");
+            tracing::trace!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Validation too short, ignoring"
+            );
             return self.reject_malformed("validation too short");
         }
         let suppression = sha512_half(&message.validation);
@@ -1006,7 +1042,11 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             return crate::router::RouteAction::Continue;
         }
         if message.manifest.is_empty() || message.blob.is_empty() || message.signature.is_empty() {
-            tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid validator list message");
+            tracing::trace!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Invalid validator list message"
+            );
             return self.reject_malformed("validator list missing payload");
         }
         tracing::debug!(target: "overlay", peer_id = %self.peer.id(), "Validator list received");
@@ -1029,7 +1069,11 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         if message.version < 2 || message.manifest.is_empty() || message.blobs.is_empty() {
             return self.reject_malformed("validator list collection malformed");
         }
-        tracing::debug!(target: "overlay", peer_id = %self.peer.id(), "Validator list collection received");
+        tracing::debug!(
+            target: "overlay",
+            peer_id = %self.peer.id(),
+            "Validator list collection received"
+        );
         self.overlay
             .inbound_handler
             .on_validator_list_collection(self.peer, message.clone());
@@ -1063,7 +1107,11 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             .as_deref()
             .is_some_and(|hash| Uint256::from_slice(hash).is_none())
         {
-            tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid get_objects ledger hash");
+            tracing::trace!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Invalid get_objects ledger hash"
+            );
             return self.reject_malformed("get_objects malformed ledger hash");
         }
         tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Get objects request");
@@ -1086,7 +1134,11 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             .map(|hash| Uint256::from_slice(hash))
             .collect::<Option<Vec<_>>>();
         let Some(hashes) = hashes else {
-            tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid have_transactions hash");
+            tracing::trace!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Invalid have_transactions hash"
+            );
             return self.reject_malformed("have_transactions malformed hash");
         };
 
@@ -1131,7 +1183,11 @@ impl MessageRouter for OverlayInboundRouter<'_> {
 
     fn on_squelch(&mut self, message: &crate::message::TmSquelch) -> crate::router::RouteAction {
         let Ok(validator) = PublicKey::from_slice(&message.validator_pub_key) else {
-            tracing::debug!(target: "overlay", peer_id = %self.peer.id(), "Invalid squelch public key");
+            tracing::debug!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Invalid squelch public key"
+            );
             return self.reject_malformed("squelch malformed public key");
         };
 
@@ -1160,10 +1216,18 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             || Uint256::from_slice(&message.ledger_hash).is_none()
             || !(1..=2).contains(&message.r#type)
         {
-            tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid proof path request");
+            tracing::trace!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Invalid proof path request"
+            );
             return self.reject_malformed("proof path request malformed");
         }
-        tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Proof path request received");
+        tracing::trace!(
+            target: "overlay",
+            peer_id = %self.peer.id(),
+            "Proof path request received"
+        );
         self.overlay
             .inbound_handler
             .on_proof_path_request(self.peer, message.clone());
@@ -1178,10 +1242,18 @@ impl MessageRouter for OverlayInboundRouter<'_> {
             || Uint256::from_slice(&message.ledger_hash).is_none()
             || !(1..=2).contains(&message.r#type)
         {
-            tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid proof path response");
+            tracing::trace!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Invalid proof path response"
+            );
             return self.reject_malformed("proof path response malformed");
         }
-        tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Proof path response received");
+        tracing::trace!(
+            target: "overlay",
+            peer_id = %self.peer.id(),
+            "Proof path response received"
+        );
         self.overlay
             .inbound_handler
             .on_proof_path_response(self.peer, message.clone());
@@ -1193,10 +1265,18 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         message: &crate::message::TmReplayDeltaRequest,
     ) -> crate::router::RouteAction {
         if Uint256::from_slice(&message.ledger_hash).is_none() {
-            tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid replay delta request hash");
+            tracing::trace!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Invalid replay delta request hash"
+            );
             return self.reject_malformed("replay delta request malformed hash");
         }
-        tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Replay delta request received");
+        tracing::trace!(
+            target: "overlay",
+            peer_id = %self.peer.id(),
+            "Replay delta request received"
+        );
         self.overlay
             .inbound_handler
             .on_replay_delta_request(self.peer, message.clone());
@@ -1208,10 +1288,18 @@ impl MessageRouter for OverlayInboundRouter<'_> {
         message: &crate::message::TmReplayDeltaResponse,
     ) -> crate::router::RouteAction {
         if Uint256::from_slice(&message.ledger_hash).is_none() {
-            tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Invalid replay delta response hash");
+            tracing::trace!(
+                target: "overlay",
+                peer_id = %self.peer.id(),
+                "Invalid replay delta response hash"
+            );
             return self.reject_malformed("replay delta response malformed hash");
         }
-        tracing::trace!(target: "overlay", peer_id = %self.peer.id(), "Replay delta response received");
+        tracing::trace!(
+            target: "overlay",
+            peer_id = %self.peer.id(),
+            "Replay delta response received"
+        );
         self.overlay
             .inbound_handler
             .on_replay_delta_response(self.peer, message.clone());
@@ -1332,6 +1420,10 @@ impl OverlayImpl {
         clock: Arc<dyn Clock>,
         inbound_handler: Arc<QueuedOverlayInboundHandler>,
     ) -> Result<Self, OverlayError> {
+        // Each live session may retain exactly one decoded ledger-data frame.
+        // Derive the handler's aggregate byte envelope from the existing
+        // configured peer limit rather than adding an unrelated global cap.
+        inbound_handler.set_deferred_ledger_data_session_limit(setup.peer_limits().max_peers);
         let _client_config = setup
             .client_config
             .clone()
@@ -1749,7 +1841,12 @@ impl OverlayImpl {
         // HTTP API interception
         let path = request.uri().path();
         if path == "/health" || path == "/crawl" || path.starts_with("/vl/") {
-            tracing::info!(target: "overlay", ip = %remote_address, path = %path, "HTTP API request received");
+            tracing::info!(
+                target: "overlay",
+                ip = %remote_address,
+                path = %path,
+                "HTTP API request received"
+            );
             let body = format!("{{\"status\": \"ok\", \"path\": \"{}\"}}", path);
             let response_str = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1816,7 +1913,12 @@ impl OverlayImpl {
                 let peer = match self.peer_from_request(&request, remote_address) {
                     Ok(peer) => peer,
                     Err(error) => {
-                        tracing::warn!(target: "overlay", ip = %remote_address, %error, "Inbound peer rejected");
+                        tracing::warn!(
+                            target: "overlay",
+                            ip = %remote_address,
+                            %error,
+                            "Inbound peer rejected"
+                        );
                         let response = Response::builder()
                             .status(http::StatusCode::FORBIDDEN)
                             .header("Connection", "close")
@@ -1884,7 +1986,11 @@ impl OverlayImpl {
                         match self.identity.sign_session(&sv) {
                             Ok(sig) => handshake_ctx.session_signature = sig,
                             Err(err) => {
-                                tracing::warn!(target: "overlay", %err, "Failed to sign inbound session");
+                                tracing::warn!(
+                                    target: "overlay",
+                                    %err,
+                                    "Failed to sign inbound session"
+                                );
                                 return Ok(());
                             }
                         }
@@ -2033,7 +2139,11 @@ impl OverlayImpl {
         // atomic, rather than allowing two independent maps to race.
         let mut by_public_key = self.by_public_key.write().expect("overlay public-key lock");
         if by_public_key.contains_key(&peer.node_public()) {
-            tracing::warn!(target: "overlay", peer_id = %peer.id(), "Duplicate node public key rejected");
+            tracing::warn!(
+                target: "overlay",
+                peer_id = %peer.id(),
+                "Duplicate node public key rejected"
+            );
             return false;
         }
         let mut active_peers = self.active_peers.write().expect("overlay peers lock");
@@ -2336,7 +2446,16 @@ impl OverlayImpl {
         self.queued_inbound.set_ledger_data_channel(tx);
     }
 
-    /// Drain accepted endpoint advertisements for the live PeerFinder cache.
+    pub fn retry_deferred_ledger_data(&self, peer_id: PeerId) -> bool {
+        self.queued_inbound.retry_deferred_ledger_data(peer_id)
+    }
+
+    /// Session-close terminal disposition for a transport-retained matching
+    /// reply. No Worker 2 lease exists until a retry is admitted.
+    pub fn discard_deferred_ledger_data(&self, peer_id: PeerId) {
+        self.queued_inbound.discard_deferred_ledger_data(peer_id);
+    }
+
     pub fn take_endpoints(&self) -> Vec<crate::QueuedEndpoints> {
         self.queued_inbound.take_endpoints()
     }
@@ -2714,7 +2833,11 @@ impl OverlayImpl {
     }
 
     fn broadcast_validator_message(&self, protocol: ProtocolMessage, validator: PublicKey) {
-        tracing::debug!(target: "overlay", msg_type = ?protocol.message_type, "Broadcasting validator message");
+        tracing::debug!(
+            target: "overlay",
+            msg_type = ?protocol.message_type,
+            "Broadcasting validator message"
+        );
         let message = Message::new(protocol, Some(validator));
         for peer in self.active_peers_snapshot() {
             let _ = self.send_runtime_message(&peer, message.clone(), false);
@@ -2756,7 +2879,12 @@ impl OverlayImpl {
         true
     }
 
-    fn observe_inbound_message(&self, peer: &Arc<PeerImp>, message: &ProtocolMessage, bytes: u64) {
+    fn observe_inbound_message(
+        &self,
+        peer: &Arc<PeerImp>,
+        message: &ProtocolMessage,
+        bytes: u64,
+    ) -> bool {
         let category = TrafficCategory::categorize(message, true);
         self.traffic.add_count(TrafficCategory::Total, true, bytes);
         self.traffic.add_count(category, true, bytes);
@@ -2774,8 +2902,10 @@ impl OverlayImpl {
         let mut router = OverlayInboundRouter {
             overlay: self,
             peer,
+            ledger_data_deferred: false,
         };
         let _ = route_message(&mut router, message);
+        router.ledger_data_deferred
     }
 
     fn observe_inbound_unknown(&self, bytes: u64) {
@@ -3001,7 +3131,11 @@ impl OverlayImpl {
             .and_then(protocol::parse_base58_node_public)
             .and_then(|bytes| PublicKey::from_slice(&bytes).ok())
             .ok_or_else(|| {
-                tracing::warn!(target: "overlay", ip = %remote_address, "Missing peer public key in request");
+                tracing::warn!(
+                    target: "overlay",
+                    ip = %remote_address,
+                    "Missing peer public key in request"
+                );
                 OverlayError::InvalidRequest("missing peer public key".to_owned())
             })?;
         if public_key == self.identity.public_key() {
@@ -3019,7 +3153,12 @@ impl OverlayImpl {
             remote_address.to_string(),
         );
         peer.set_listener_check_state(false, false);
-        tracing::debug!(target: "overlay", peer_id = %peer.id(), ip = %remote_address, "Inbound peer created");
+        tracing::debug!(
+            target: "overlay",
+            peer_id = %peer.id(),
+            ip = %remote_address,
+            "Inbound peer created"
+        );
         Ok(peer)
     }
 
@@ -3031,7 +3170,11 @@ impl OverlayImpl {
         let consumer = self.resource_manager.new_inbound_endpoint(remote_address);
         if consumer.disposition() == Disposition::Drop {
             let _ = consumer.disconnect_with_manager_journal();
-            tracing::warn!(target: "overlay", ip = %remote_address, "Inbound resource consumer rejected peer handoff");
+            tracing::warn!(
+                target: "overlay",
+                ip = %remote_address,
+                "Inbound resource consumer rejected peer handoff"
+            );
             return None;
         }
 
@@ -3099,7 +3242,11 @@ impl OverlayImpl {
             .values()
             .any(|peer| canonical_peer_ip(peer.remote_address().ip()) == ip)
         {
-            tracing::debug!(target: "overlay", ip = %address, "Duplicate outbound attempt blocked — already connected");
+            tracing::debug!(
+                target: "overlay",
+                ip = %address,
+                "Duplicate outbound attempt blocked — already connected"
+            );
             return None;
         }
         let inserted = self

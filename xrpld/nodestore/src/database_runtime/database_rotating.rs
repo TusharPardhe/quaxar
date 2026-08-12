@@ -3,7 +3,7 @@ use crate::database::{
     DatabaseRotating as DatabaseRotatingTrait, DatabaseRuntime, DatabaseSource,
 };
 use crate::{
-    AsyncFetchCallback, Backend, FetchReport, FetchType, JournalLevel, NodeObject, NodeObjectType,
+    AsyncReadWork, Backend, FetchReport, FetchType, JournalLevel, NodeObject, NodeObjectType,
     NodeStoreJournal, ScheduledWrite, Scheduler, Status,
 };
 use basics::base_uint::Uint256;
@@ -277,9 +277,13 @@ impl DatabaseRotatingImp {
     /// Call with `true` before starting the copy phase, `false` after
     /// rotate() completes. Matches rippled's setRotationInFlight().
     pub fn set_rotation_in_flight(&self, in_flight: bool) {
-        self.rotation_in_flight
-            .store(in_flight, std::sync::atomic::Ordering::Release);
-        if in_flight {
+        let was_in_flight = self
+            .rotation_in_flight
+            .swap(in_flight, std::sync::atomic::Ordering::AcqRel);
+        if in_flight && !was_in_flight {
+            // Publish the new identity before cache invalidation or any
+            // archive read can be admitted into a rotating exposure window.
+            self.database.advance_store_generation();
             // Archive-resident entries must not hide copy-forward reads while
             // the old archive is being retired.
             self.database.invalidate_node_object_cache();
@@ -299,6 +303,9 @@ impl DatabaseRotatingImp {
         let already_in_flight = self
             .rotation_in_flight
             .swap(true, std::sync::atomic::Ordering::AcqRel);
+        if !already_in_flight {
+            self.database.advance_store_generation();
+        }
         self.database.invalidate_node_object_cache();
 
         let new_writable_backend_name = new_backend.get_name();
@@ -422,8 +429,8 @@ impl DatabaseRotatingImp {
             .fetch_node_object(hash, ledger_seq, fetch_type, duplicate)
     }
 
-    pub fn async_fetch(&self, hash: Uint256, ledger_seq: u32, callback: AsyncFetchCallback) {
-        self.database.async_fetch(hash, ledger_seq, callback);
+    pub fn async_fetch(&self, hash: Uint256, ledger_seq: u32, work: Box<dyn AsyncReadWork>) {
+        self.database.async_fetch(hash, ledger_seq, work);
     }
 
     pub fn stop(&self) {
@@ -483,6 +490,10 @@ impl DatabaseRotatingImp {
 
     pub fn fd_required(&self) -> i32 {
         self.fd_required
+    }
+
+    pub fn store_generation(&self) -> u64 {
+        self.database.store_generation()
     }
 }
 
@@ -546,6 +557,10 @@ impl DatabaseTrait for DatabaseRotatingImp {
         self.database.schedule_write(write);
     }
 
+    fn store_generation(&self) -> u64 {
+        DatabaseRotatingImp::store_generation(self)
+    }
+
     fn fetch_node_object(
         &self,
         hash: &Uint256,
@@ -556,8 +571,8 @@ impl DatabaseTrait for DatabaseRotatingImp {
         DatabaseRotatingImp::fetch_node_object(self, hash, ledger_seq, fetch_type, duplicate)
     }
 
-    fn async_fetch(&self, hash: Uint256, ledger_seq: u32, callback: AsyncFetchCallback) {
-        DatabaseRotatingImp::async_fetch(self, hash, ledger_seq, callback);
+    fn async_fetch(&self, hash: Uint256, ledger_seq: u32, work: Box<dyn AsyncReadWork>) {
+        DatabaseRotatingImp::async_fetch(self, hash, ledger_seq, work);
     }
 
     fn stop(&self) {
@@ -840,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn rotation_in_flight_invalidates_cache_and_copies_archive_reads_forward() {
+    fn rotation_fences_late_callback_identity_invalidates_cache_and_copies_archive_reads_forward() {
         let writable = Arc::new(TestBackend::new("writable"));
         let archive = Arc::new(TestBackend::new("archive"));
         let object = sample_object(0x46);
@@ -864,8 +879,36 @@ mod tests {
                 .is_some()
         );
         assert_eq!(writable.store_count.load(Ordering::Relaxed), 0);
+        assert_eq!(database.store_generation(), 1);
 
+        let pre_rotation_generation = database.store_generation();
+        let before_identity = crate::database::PersistenceIdentity {
+            acquisition_id: 99,
+            persistence_generation: 7,
+            store_generation: pre_rotation_generation,
+        };
         database.set_rotation_in_flight(true);
+        let rotation_generation = database.store_generation();
+        let after_identity = crate::database::PersistenceIdentity {
+            acquisition_id: 99,
+            persistence_generation: 7,
+            store_generation: rotation_generation,
+        };
+        assert_ne!(
+            before_identity, after_identity,
+            "a late persistence callback stamped before rotation cannot settle the replacement owner"
+        );
+        assert_ne!(
+            pre_rotation_generation, rotation_generation,
+            "a callback stamped before rotation cannot observe the current store identity"
+        );
+        assert!(rotation_generation > 1);
+        database.set_rotation_in_flight(true);
+        assert_eq!(
+            database.store_generation(),
+            rotation_generation,
+            "one rotation window advances generation once"
+        );
         assert!(
             database
                 .fetch_node_object(object.hash(), 0, FetchType::Synchronous, false)
@@ -875,6 +918,11 @@ mod tests {
         assert_eq!(database.take_copy_forward_count(), 1);
 
         database.set_rotation_in_flight(false);
+        database.rotate(Box::new(TestBackend::new("next")), |_, _| {});
+        assert!(
+            database.store_generation() > rotation_generation,
+            "a direct rotation must also fence pre-rotation callbacks"
+        );
         database.stop();
     }
 

@@ -6,7 +6,7 @@
 //! receives [`ReadReady`] through a mailbox sink after the broker settles.
 
 use basics::base_uint::Uint256;
-use nodestore::NodeObject;
+use nodestore::{AsyncReadWork, NodeObject};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +18,32 @@ use crate::shamap::shamap_store_backend::SHAMapStoreNodeStore;
 /// Quaxar preserves that progression while making the physical-read limit
 /// global, so coalesced acquisitions never multiply database I/O.
 pub const ACQ_READS_GLOBAL: usize = 512;
+
+/// Bounded retained logical ownership for the global Rust broker.
+///
+/// Rippled's 512 limit is call-local to one `getMissingNodes()` pass; it does
+/// not define a global broker queue, a 513th successor, or a cancellation
+/// event on admission pressure. Quaxar has a shared physical-read broker, so
+/// its one retained logical-subscription budget is the already-configured
+/// physical limit itself. One subscription owns one ticket and one waiter, so
+/// it bounds retained tickets, waiters, and queued keys without inventing an
+/// independent successor limit. A cancelled dispatched callback may outlive
+/// its subscriber, but remains within the existing physical in-flight limit.
+/// A request at the retained-subscription bound is returned as non-terminal
+/// `Deferred` with no broker record or sink event, leaving the actor's
+/// retained missing edge available for peer fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadBrokerLimits {
+    pub max_retained_logical_subscriptions: usize,
+}
+
+impl ReadBrokerLimits {
+    const fn from_physical_limit(global_in_flight: usize) -> Self {
+        Self {
+            max_retained_logical_subscriptions: global_in_flight,
+        }
+    }
+}
 
 /// One database identity. The generation makes a rotation boundary explicit:
 /// equal hashes from different backing generations never share a read.
@@ -112,8 +138,11 @@ pub enum ReadRejectReason {
     Stopped,
 }
 
-/// Result of a submission attempt. Deferred requests retain their ticket and
-/// wait in the broker FIFO; the actor can cancel that ticket before admission.
+/// Result of a submission attempt. `Deferred` can retain a broker ticket
+/// while physical dispatch is occupied. At the retained-subscription bound it
+/// has no broker record and produces no terminal sink event: that admission
+/// signal leaves the caller's missing edge available for peer fallback.
+/// Cancelling an unretained ticket is harmless and returns `false`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadAdmission {
     Accepted(ReadTicket),
@@ -144,6 +173,13 @@ impl ReadBrokerConfig {
         }
         Ok(self)
     }
+
+    /// Stable Worker 3 handoff for Worker 2: admission observes this finite
+    /// budget before creating a ticket, and the `ReadKey` generation supplied
+    /// by Worker 2 must be the store generation observed at that same point.
+    pub const fn logical_limits(self) -> ReadBrokerLimits {
+        ReadBrokerLimits::from_physical_limit(self.global_in_flight)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -157,17 +193,28 @@ pub struct ReadBrokerMetrics {
     pub misses: u64,
     pub faults: u64,
     pub cancelled: u64,
+    /// Capacity was exhausted before another broker-owned subscription was
+    /// retained. The request is returned as non-terminal `Deferred`; no
+    /// `ReadOutcome::Cancelled` actor event is fabricated.
+    pub capacity_deferred: u64,
     pub stale_completions: u64,
     pub queue_high_water: usize,
     pub in_flight_high_water: usize,
     pub waiter_high_water: usize,
+    pub logical_ticket_high_water: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadBrokerSnapshot {
     pub stopped: bool,
     pub queued_keys: usize,
+    pub queued_key_bytes: usize,
     pub in_flight_keys: usize,
+    pub logical_tickets: usize,
+    pub logical_ticket_bytes: usize,
+    pub waiters: usize,
+    pub waiter_bytes: usize,
+    pub limits: ReadBrokerLimits,
     pub metrics: ReadBrokerMetrics,
 }
 
@@ -276,6 +323,25 @@ impl NodeReadBroker {
             });
         }
 
+        let limits = self.inner.config.logical_limits();
+        if state.tickets.len() >= limits.max_retained_logical_subscriptions {
+            let ticket_id = ReadTicketId(state.next_ticket);
+            state.next_ticket = state
+                .next_ticket
+                .checked_add(1)
+                .expect("read ticket id overflow");
+            let ticket = ReadTicket {
+                id: ticket_id,
+                key,
+                acquisition_id,
+                plan_id,
+            };
+            state.metrics.submitted += 1;
+            state.metrics.deferred += 1;
+            state.metrics.capacity_deferred += 1;
+            return ReadAdmission::Deferred(ticket);
+        }
+
         let dispatched = state
             .flights
             .get(&key)
@@ -320,6 +386,10 @@ impl NodeReadBroker {
             flight.subscribers.len()
         };
         state.metrics.waiter_high_water = state.metrics.waiter_high_water.max(waiter_count);
+        state.metrics.logical_ticket_high_water = state
+            .metrics
+            .logical_ticket_high_water
+            .max(state.tickets.len());
         if is_new_flight {
             state.fifo.push_back(key);
             let queued_keys = state.fifo.len();
@@ -508,13 +578,13 @@ impl NodeReadBroker {
         for dispatch in dispatches {
             let key = dispatch.key();
             let completion = dispatch.into_completion();
-            let callback = Box::new(move |object| completion.complete_from_node_store(object));
+            let work: Box<dyn AsyncReadWork> = Box::new(completion);
             match store {
                 SHAMapStoreNodeStore::Single(database) => {
-                    database.async_fetch(key.hash, key.ledger_seq, callback)
+                    database.async_fetch(key.hash, key.ledger_seq, work)
                 }
                 SHAMapStoreNodeStore::Rotating(database) => {
-                    database.async_fetch(key.hash, key.ledger_seq, callback)
+                    database.async_fetch(key.hash, key.ledger_seq, work)
                 }
             }
         }
@@ -526,11 +596,32 @@ impl NodeReadBroker {
         ReadBrokerSnapshot {
             stopped: state.stopped,
             queued_keys: state.fifo.len(),
+            queued_key_bytes: state
+                .fifo
+                .len()
+                .saturating_mul(std::mem::size_of::<ReadKey>()),
             in_flight_keys: state
                 .flights
                 .values()
                 .filter(|flight| flight.state == Some(FlightState::Dispatched))
                 .count(),
+            logical_tickets: state.tickets.len(),
+            logical_ticket_bytes: state
+                .tickets
+                .len()
+                .saturating_mul(std::mem::size_of::<TicketRecord>()),
+            waiters: state
+                .flights
+                .values()
+                .map(|flight| flight.subscribers.len())
+                .sum(),
+            waiter_bytes: state
+                .flights
+                .values()
+                .map(|flight| flight.subscribers.len())
+                .sum::<usize>()
+                .saturating_mul(std::mem::size_of::<Subscriber>()),
+            limits: self.inner.config.logical_limits(),
             metrics: state.metrics,
         }
     }
@@ -627,9 +718,15 @@ struct ReadCompletion {
 }
 
 impl ReadCompletion {
-    fn complete_from_node_store(mut self, object: Option<Arc<NodeObject>>) {
+    fn complete_from_node_store(&mut self, object: Option<Arc<NodeObject>>) {
         self.settled = true;
         self.broker.complete_from_node_store(self.key, object);
+    }
+}
+
+impl AsyncReadWork for ReadCompletion {
+    fn complete(&mut self, object: Option<Arc<NodeObject>>) {
+        self.complete_from_node_store(object);
     }
 }
 
@@ -824,6 +921,228 @@ mod tests {
         dispatch.complete(ReadOutcome::Miss);
         assert_eq!(events.lock().expect("event sink").len(), 2);
         assert_eq!(broker.snapshot().metrics.rejected, 0);
+    }
+
+    #[test]
+    fn request_at_real_512_513_514_boundary_preserves_peer_fallback_without_cancelled_actor_event()
+    {
+        let broker = broker(ReadBrokerConfig::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut tickets = Vec::with_capacity(ACQ_READS_GLOBAL);
+        for sequence in 0..ACQ_READS_GLOBAL as u32 {
+            let admission = broker.request(
+                key((sequence % u8::MAX as u32) as u8, sequence),
+                u64::from(sequence) + 1,
+                1,
+                sink(Arc::clone(&events)),
+            );
+            let ReadAdmission::Accepted(ticket) = admission else {
+                panic!("request {sequence} must fit the real 512-read boundary: {admission:?}");
+            };
+            tickets.push(ticket);
+        }
+
+        let deferred_513 = broker.request(
+            key(0xFE, ACQ_READS_GLOBAL as u32),
+            513,
+            1,
+            sink(Arc::clone(&events)),
+        );
+        let deferred_514 = broker.request(
+            key(0xFD, ACQ_READS_GLOBAL as u32 + 1),
+            514,
+            1,
+            sink(Arc::clone(&events)),
+        );
+        let ReadAdmission::Deferred(ticket_513) = deferred_513 else {
+            panic!("513th distinct request must be capacity deferred");
+        };
+        let ReadAdmission::Deferred(ticket_514) = deferred_514 else {
+            panic!("514th distinct request must be capacity deferred");
+        };
+
+        let snapshot = broker.snapshot();
+        assert_eq!(snapshot.limits.max_retained_logical_subscriptions, 512);
+        assert_eq!(snapshot.logical_tickets, 512);
+        assert_eq!(snapshot.in_flight_keys, 512);
+        assert_eq!(snapshot.queued_keys, 0);
+        assert_eq!(snapshot.metrics.capacity_deferred, 2);
+        assert_eq!(snapshot.metrics.cancelled, 0);
+        assert!(events.lock().expect("event sink").is_empty());
+        assert!(!broker.cancel(ticket_513));
+        assert!(!broker.cancel(ticket_514));
+
+        let dispatches = broker.take_ready_dispatches();
+        assert_eq!(dispatches.len(), 512);
+        for dispatch in dispatches {
+            dispatch.complete(ReadOutcome::Miss);
+        }
+        let events = events.lock().expect("event sink");
+        assert_eq!(events.len(), 512);
+        assert!(
+            events
+                .iter()
+                .all(|ready| ready.outcome == ReadOutcome::Miss)
+        );
+    }
+
+    #[test]
+    fn cancellation_is_the_only_cancelled_actor_event_and_reopens_capacity_after_settlement() {
+        let broker = broker(ReadBrokerConfig {
+            global_in_flight: 1,
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ticket = match broker.request(key(12, 10), 1, 1, sink(Arc::clone(&events))) {
+            ReadAdmission::Accepted(ticket) => ticket,
+            other => panic!("expected accepted ticket, got {other:?}"),
+        };
+        let dispatch = broker
+            .take_ready_dispatches()
+            .into_iter()
+            .next()
+            .expect("dispatch");
+        let deferred = match broker.request(key(13, 10), 2, 1, sink(Arc::clone(&events))) {
+            ReadAdmission::Deferred(ticket) => ticket,
+            other => panic!("expected capacity defer, got {other:?}"),
+        };
+        assert!(!broker.cancel(deferred));
+        assert!(broker.cancel(ticket));
+        dispatch.complete(ReadOutcome::Miss);
+        assert_eq!(
+            events.lock().expect("event sink").as_slice(),
+            &[ReadReady {
+                ticket,
+                outcome: ReadOutcome::Cancelled,
+            }]
+        );
+
+        let replacement = match broker.request(key(14, 10), 3, 1, sink(Arc::clone(&events))) {
+            ReadAdmission::Accepted(ticket) => ticket,
+            other => panic!("expected post-settlement admission, got {other:?}"),
+        };
+        let replacement_dispatch = broker
+            .take_ready_dispatches()
+            .into_iter()
+            .next()
+            .expect("replacement dispatch");
+        replacement_dispatch.complete(ReadOutcome::Miss);
+        assert_eq!(
+            events.lock().expect("event sink").last(),
+            Some(&ReadReady {
+                ticket: replacement,
+                outcome: ReadOutcome::Miss,
+            })
+        );
+    }
+
+    #[test]
+    fn pre_and_post_store_generation_settle_independently_without_capacity_cancellation() {
+        let broker = broker(ReadBrokerConfig {
+            global_in_flight: 1,
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let hash = Uint256::from_array([0xD4; 32]);
+        let before_rotation = ReadKey::new(hash, 44, 7);
+        let after_rotation = ReadKey::new(hash, 44, 8);
+        let before_ticket = match broker.request(before_rotation, 1, 1, sink(Arc::clone(&events))) {
+            ReadAdmission::Accepted(ticket) => ticket,
+            other => panic!("expected pre-rotation admission, got {other:?}"),
+        };
+        let before_dispatch = broker
+            .take_ready_dispatches()
+            .into_iter()
+            .next()
+            .expect("pre-rotation dispatch");
+        let deferred_after_rotation =
+            match broker.request(after_rotation, 2, 1, sink(Arc::clone(&events))) {
+                ReadAdmission::Deferred(ticket) => ticket,
+                other => panic!("expected post-rotation capacity defer, got {other:?}"),
+            };
+        assert!(events.lock().expect("event sink").is_empty());
+        assert!(!broker.cancel(deferred_after_rotation));
+
+        before_dispatch.complete(ReadOutcome::Miss);
+        let after_ticket = match broker.request(after_rotation, 2, 1, sink(Arc::clone(&events))) {
+            ReadAdmission::Accepted(ticket) => ticket,
+            other => panic!("expected post-rotation retry admission, got {other:?}"),
+        };
+        let after_dispatch = broker
+            .take_ready_dispatches()
+            .into_iter()
+            .next()
+            .expect("post-rotation dispatch");
+        after_dispatch.complete(ReadOutcome::Miss);
+
+        assert_eq!(
+            events.lock().expect("event sink").as_slice(),
+            &[
+                ReadReady {
+                    ticket: before_ticket,
+                    outcome: ReadOutcome::Miss,
+                },
+                ReadReady {
+                    ticket: after_ticket,
+                    outcome: ReadOutcome::Miss,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn late_pre_rotation_completion_cannot_settle_the_replacement_generation_ticket() {
+        let broker = broker(ReadBrokerConfig {
+            global_in_flight: 2,
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let hash = Uint256::from_array([0xE1; 32]);
+        let before = ReadKey::new(hash, 77, 41);
+        let after = ReadKey::new(hash, 77, 42);
+        let before_ticket = match broker.request(before, 1, 9, sink(Arc::clone(&events))) {
+            ReadAdmission::Accepted(ticket) => ticket,
+            other => panic!("expected old-generation admission, got {other:?}"),
+        };
+        let after_ticket = match broker.request(after, 1, 10, sink(Arc::clone(&events))) {
+            ReadAdmission::Accepted(ticket) => ticket,
+            other => panic!("expected replacement-generation admission, got {other:?}"),
+        };
+        let mut dispatches = broker.take_ready_dispatches();
+        assert_eq!(dispatches.len(), 2);
+        let before_dispatch = dispatches
+            .iter()
+            .position(|dispatch| dispatch.key() == before)
+            .map(|index| dispatches.remove(index))
+            .expect("old-generation dispatch");
+        let after_dispatch = dispatches
+            .into_iter()
+            .next()
+            .expect("replacement-generation dispatch");
+
+        // The old backend lifetime remains valid until this callback settles,
+        // but its key cannot complete the replacement owner.
+        before_dispatch.complete(ReadOutcome::Miss);
+        assert_eq!(
+            events.lock().expect("event sink").as_slice(),
+            &[ReadReady {
+                ticket: before_ticket,
+                outcome: ReadOutcome::Miss,
+            }]
+        );
+        assert_eq!(broker.snapshot().logical_tickets, 1);
+        after_dispatch.complete(ReadOutcome::Miss);
+        assert_eq!(
+            events.lock().expect("event sink").as_slice(),
+            &[
+                ReadReady {
+                    ticket: before_ticket,
+                    outcome: ReadOutcome::Miss,
+                },
+                ReadReady {
+                    ticket: after_ticket,
+                    outcome: ReadOutcome::Miss,
+                },
+            ]
+        );
+        assert_eq!(broker.snapshot().logical_tickets, 0);
     }
 
     #[test]

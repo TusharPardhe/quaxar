@@ -23,6 +23,7 @@ use ledger::{
 };
 use nodestore::{FetchType, ManagerImp, NodeObjectType as NodeStoreObjectType};
 use overlay::Overlay;
+use overlay::inbound::LedgerDataIngressDisposition;
 use protocol::{
     JsonValue, REGISTERED_FEATURES, STLedgerEntry, STParsedJSONObject, STTx, SerialIter, TxMeta,
     feature_id,
@@ -1142,6 +1143,93 @@ fn ledger_data_nodes_are_admissible(node_count: usize) -> bool {
     (1..=HARD_MAX_REPLY_NODES).contains(&node_count)
 }
 
+/// Result of the bootstrap-owned, non-candidate `TMLedgerData` handoff.
+/// `charge_unsolicited` is kept separate from the transport disposition so a
+/// deferred frame stays exclusively transport-owned and never reaches the
+/// peer-resource path before Worker 2 has admitted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BootstrapLedgerDataRouting {
+    disposition: LedgerDataIngressDisposition,
+    charge_unsolicited: bool,
+}
+
+/// Route one parsed Base/transaction/state reply through the same live
+/// bootstrap admission branch installed below. This preserves Worker 2's
+/// ownership boundary: an admitted lease is consumed exactly once by actor
+/// routing, while `Deferred` creates no actor route or lease ownership.
+fn route_bootstrap_ledger_data(
+    inbound: &Arc<crate::ledger::inbound_ledgers::InboundLedgers>,
+    hash: Uint256,
+    peer_id: overlay::PeerId,
+    message: &overlay::TmLedgerData,
+) -> BootstrapLedgerDataRouting {
+    let packet_type = match message.r#type {
+        0 => ledger::InboundLedgerDataType::Base,
+        1 => ledger::InboundLedgerDataType::TransactionNode,
+        2 => ledger::InboundLedgerDataType::StateNode,
+        _ => unreachable!("bootstrap ledger-data helper only accepts non-candidate types"),
+    };
+    let nodes = message
+        .nodes
+        .iter()
+        .map(|node| ledger::InboundLedgerNodeData::new(node.nodeid.clone(), node.nodedata.clone()))
+        .collect::<Vec<_>>();
+    inbound.note_wire_ledger_data(nodes.len());
+    let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
+    let stale_packet =
+        (packet.packet_type == ledger::InboundLedgerDataType::StateNode).then(|| packet.clone());
+
+    // An admission lease is the only authority to enqueue actor-owned work.
+    // On Deferred, this function returns before route/stale/charge handling;
+    // the overlay transport retains exactly its decoded frame for retry.
+    let routed = match inbound.reserve_response_admission(&hash, &packet) {
+        crate::ledger::inbound_ledgers::LedgerDataAdmission::Admitted(lease) => inbound
+            .route_admitted_response_with_seq(
+                &hash,
+                lease,
+                peer_id as u64,
+                Some(message.ledger_seq),
+                packet,
+            ),
+        crate::ledger::inbound_ledgers::LedgerDataAdmission::Deferred => {
+            return BootstrapLedgerDataRouting {
+                disposition: LedgerDataIngressDisposition::Deferred,
+                charge_unsolicited: false,
+            };
+        }
+        crate::ledger::inbound_ledgers::LedgerDataAdmission::Unmatched => {
+            crate::ledger::inbound_ledgers::LedgerDataRouteDisposition::Unmatched
+        }
+        crate::ledger::inbound_ledgers::LedgerDataAdmission::Terminal => {
+            crate::ledger::inbound_ledgers::LedgerDataRouteDisposition::Terminal
+        }
+    };
+    if routed == crate::ledger::inbound_ledgers::LedgerDataRouteDisposition::Accepted {
+        return BootstrapLedgerDataRouting {
+            disposition: LedgerDataIngressDisposition::Delivered,
+            charge_unsolicited: false,
+        };
+    }
+    if routed.may_stash_as_stale()
+        && let Some(packet) = stale_packet
+    {
+        // `InboundLedgersImp::gotStaleData` remains the terminal treatment for
+        // a valid untracked state-node reply. Base/transaction replies fall
+        // through to the source-equivalent useless-data peer charge below.
+        let stored = inbound.stash_stale_packet(&packet);
+        inbound.note_stale_packet_result(stored);
+        return BootstrapLedgerDataRouting {
+            disposition: LedgerDataIngressDisposition::Delivered,
+            charge_unsolicited: false,
+        };
+    }
+    BootstrapLedgerDataRouting {
+        disposition: LedgerDataIngressDisposition::Delivered,
+        charge_unsolicited: routed
+            != crate::ledger::inbound_ledgers::LedgerDataRouteDisposition::AdmissionLeaseInvalid,
+    }
+}
+
 /// Mirrors `InboundTransactionsImp::gotData`: candidate-set data is charged by
 /// its delivery outcome, rather than silently discarding an unknown or bad set.
 fn candidate_ledger_data_charge(
@@ -1620,7 +1708,7 @@ fn run_start_mode_consensus_loop(
                             "TMLedgerData invalid ledger sequence".to_owned(),
                         );
                     }
-                    return;
+                    return overlay::inbound::LedgerDataIngressDisposition::Delivered;
                 }
 
                 // PeerImp validates the node vector before cookie relaying.
@@ -1634,7 +1722,7 @@ fn run_start_mode_consensus_loop(
                             "TMLedgerData invalid node count".to_owned(),
                         );
                     }
-                    return;
+                    return LedgerDataIngressDisposition::Delivered;
                 }
 
                 // Request-cookie relay (matching rippled PeerImp::onMessage TMLedgerData)
@@ -1649,12 +1737,12 @@ fn run_start_mode_consensus_loop(
                         );
                         requesting_peer.send(overlay::Message::new(relay_msg, None));
                     }
-                    return; // Don't process relayed responses locally
+                    return LedgerDataIngressDisposition::Delivered; // Don't process relayed responses locally
                 }
 
                 let Some(hash) = Uint256::from_slice(&message.ledger_hash) else {
                     router_shared_inbound.note_wire_ledger_data_invalid_hash();
-                    return;
+                    return LedgerDataIngressDisposition::Delivered;
                 };
                 match message.r#type {
                     3 => {
@@ -1682,74 +1770,29 @@ fn run_start_mode_consensus_loop(
                         }
                     }
                     0 | 1 | 2 => {
-                        let packet_type = match message.r#type {
-                            0 => ledger::InboundLedgerDataType::Base,
-                            1 => ledger::InboundLedgerDataType::TransactionNode,
-                            _ => ledger::InboundLedgerDataType::StateNode,
-                        };
-                        let nodes: Vec<ledger::InboundLedgerNodeData> = message
-                            .nodes
-                            .iter()
-                            .map(|n| {
-                                ledger::InboundLedgerNodeData::new(
-                                    n.nodeid.clone(),
-                                    n.nodedata.clone(),
-                                )
-                            })
-                            .collect();
-                        router_shared_inbound.note_wire_ledger_data(nodes.len());
-                        let packet = ledger::InboundLedgerPacket::new(packet_type, nodes);
-                        let stale_packet = (packet.packet_type
-                            == ledger::InboundLedgerDataType::StateNode)
-                            .then(|| packet.clone());
-                        let routed = router_shared_inbound.route_response_with_seq(
-                            &hash,
-                            peer_id as u64,
-                            Some(message.ledger_seq),
-                            packet,
+                        let routing = route_bootstrap_ledger_data(
+                            &router_shared_inbound,
+                            hash,
+                            peer_id,
+                            &message,
                         );
-                        if routed
-                            == crate::ledger::inbound_ledgers::LedgerDataRouteDisposition::Accepted
+                        // AdmissionLeaseInvalid is a stale lease after
+                        // terminal/sweep cleanup, never stale fetch-pack data.
+                        // Base and transaction-node unmatched replies remain
+                        // source-equivalent useless peer work.
+                        if routing.charge_unsolicited
+                            && let Some(peer) = router_overlay.find_peer_by_short_id(peer_id)
                         {
-                            return;
-                        }
-                        if routed.may_stash_as_stale() {
-                            if let Some(packet) = stale_packet {
-                                // Rippled routes valid untracked liAS_NODE
-                                // data through InboundLedgers::gotStaleData
-                                // for later fetch-pack recovery. It is useful
-                                // peer work, not an unsolicited-data charge.
-                                let stored = router_shared_inbound.stash_stale_packet(&packet);
-                                router_shared_inbound.note_stale_packet_result(stored);
-                                return;
-                            }
-                        }
-                        if routed
-                            == crate::ledger::inbound_ledgers::LedgerDataRouteDisposition::MailboxFull
-                        {
-                            // The data matched an active acquisition but its
-                            // bounded ingress is full. Apply explicit peer
-                            // backpressure; never change it into stale cache
-                            // content for a different acquisition.
-                            if let Some(peer) = router_overlay.find_peer_by_short_id(peer_id) {
-                                peer.charge(
-                                    (*resource::FEE_HEAVY_BURDEN_PEER).clone(),
-                                    "Inbound ledger acquisition mailbox full".to_owned(),
-                                );
-                            }
-                            return;
-                        }
-                        // Base and transaction-node responses with no active
-                        // acquisition remain unsolicited.
-                        if let Some(peer) = router_overlay.find_peer_by_short_id(peer_id) {
                             peer.charge(
                                 (*resource::FEE_USELESS_DATA).clone(),
                                 "Unsolicited TmLedgerData response".to_owned(),
                             );
                         }
+                        return routing.disposition;
                     }
                     _ => {}
                 }
+                LedgerDataIngressDisposition::Delivered
             }));
         let drained = overlay_rt
             .overlay()
@@ -5306,9 +5349,14 @@ mod tests {
     use crate::state::manifest::{ManifestDisposition, ManifestRateLimitCapPolicy};
     use crate::{ApplicationRoot, ValidatorListBroadcastBlob, ValidatorListCollectionForBroadcast};
     use basics::base_uint::Uint256;
+    use basics::hardened_hash::HardenedHashBuilder;
+    use basics::tagged_cache::MonotonicClock;
+    use ledger::FetchPackCache;
+    use shamap::family::FullBelowCacheImpl;
+    use shamap::tree_node_cache::TreeNodeCache;
     use std::collections::BTreeSet;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
     use xrpl_core::HashRouter;
 
@@ -5861,5 +5909,136 @@ mod tests {
         assert_eq!(resource::FEE_USELESS_DATA.cost(), 150);
         assert_eq!(resource::FEE_MALFORMED_REQUEST.cost(), 200);
         assert_eq!(resource::FEE_MODERATE_BURDEN_PEER.cost(), 250);
+    }
+
+    #[test]
+    fn bootstrap_ledger_data_router_maps_all_admission_dispositions_without_deferred_actor_route() {
+        use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers};
+
+        fn registry() -> Arc<InboundLedgers> {
+            let (completed_tx, _completed_rx) = mpsc::sync_channel(1);
+            Arc::new(InboundLedgers::new(
+                Arc::new(TreeNodeCache::new(
+                    "bootstrap-ledger-data-router-test",
+                    8,
+                    time::Duration::seconds(60),
+                    MonotonicClock::default(),
+                )),
+                Arc::new(FullBelowCacheImpl::new(
+                    1,
+                    MonotonicClock::default(),
+                    HardenedHashBuilder::default(),
+                    8,
+                )),
+                Arc::new(FetchPackCache::new(
+                    8,
+                    time::Duration::seconds(60),
+                    MonotonicClock::default(),
+                )),
+                completed_tx,
+                Arc::new(AtomicBool::new(false)),
+            ))
+        }
+
+        fn base_reply(hash: Uint256) -> overlay::TmLedgerData {
+            overlay::TmLedgerData {
+                ledger_hash: hash.data().to_vec(),
+                ledger_seq: 1,
+                r#type: 0,
+                nodes: vec![overlay::message::wire::TmLedgerNode {
+                    nodeid: None,
+                    nodedata: vec![0],
+                }],
+                request_cookie: None,
+                error: None,
+            }
+        }
+
+        let admitted = registry();
+        let admitted_hash = Uint256::from_array([0xA1; 32]);
+        assert!(
+            admitted
+                .acquire(admitted_hash, 1, AcquireReason::Generic)
+                .is_none()
+        );
+        assert_eq!(
+            route_bootstrap_ledger_data(&admitted, admitted_hash, 7, &base_reply(admitted_hash)),
+            BootstrapLedgerDataRouting {
+                disposition: LedgerDataIngressDisposition::Delivered,
+                charge_unsolicited: false,
+            },
+            "LedgerDataAdmission::Admitted consumes exactly one lease into actor routing"
+        );
+        let admitted_lifecycle = admitted.lifecycle_snapshot();
+        assert_eq!(admitted_lifecycle.route_attempts, 1);
+        assert_eq!(admitted_lifecycle.route_accepted, 1);
+        admitted.stop();
+
+        let deferred = registry();
+        let deferred_hash = Uint256::from_array([0xD2; 32]);
+        assert!(
+            deferred
+                .acquire(deferred_hash, 1, AcquireReason::Generic)
+                .is_none()
+        );
+        let reservation_packet =
+            ledger::InboundLedgerPacket::new(ledger::InboundLedgerDataType::Base, Vec::new());
+        let mut leases =
+            Vec::with_capacity(crate::ledger::inbound_ledgers::ACQ_MAILBOX_PACKET_CAPACITY);
+        for _ in 0..crate::ledger::inbound_ledgers::ACQ_MAILBOX_PACKET_CAPACITY {
+            let crate::ledger::inbound_ledgers::LedgerDataAdmission::Admitted(lease) =
+                deferred.reserve_response_admission(&deferred_hash, &reservation_packet)
+            else {
+                panic!("every mailbox reservation through the exact capacity must admit");
+            };
+            leases.push(lease);
+        }
+        assert_eq!(
+            route_bootstrap_ledger_data(&deferred, deferred_hash, 8, &base_reply(deferred_hash)),
+            BootstrapLedgerDataRouting {
+                disposition: LedgerDataIngressDisposition::Deferred,
+                charge_unsolicited: false,
+            },
+            "LedgerDataAdmission::Deferred retains the frame in transport and does not charge or route it"
+        );
+        let deferred_lifecycle = deferred.lifecycle_snapshot();
+        assert_eq!(deferred_lifecycle.route_attempts, 0);
+        assert_eq!(deferred_lifecycle.route_accepted, 0);
+        drop(leases);
+        deferred.stop();
+
+        let unmatched = registry();
+        let unmatched_hash = Uint256::from_array([0xC3; 32]);
+        assert_eq!(
+            route_bootstrap_ledger_data(&unmatched, unmatched_hash, 9, &base_reply(unmatched_hash)),
+            BootstrapLedgerDataRouting {
+                disposition: LedgerDataIngressDisposition::Delivered,
+                charge_unsolicited: true,
+            },
+            "LedgerDataAdmission::Unmatched is terminally delivered as unsolicited Base data"
+        );
+        assert_eq!(unmatched.lifecycle_snapshot().route_attempts, 0);
+        unmatched.stop();
+
+        let terminal = registry();
+        let terminal_hash = Uint256::from_array([0xE4; 32]);
+        assert!(
+            terminal
+                .acquire(terminal_hash, 1, AcquireReason::Generic)
+                .is_none()
+        );
+        terminal.on_failed(terminal_hash);
+        assert_eq!(
+            route_bootstrap_ledger_data(&terminal, terminal_hash, 10, &base_reply(terminal_hash)),
+            BootstrapLedgerDataRouting {
+                disposition: LedgerDataIngressDisposition::Delivered,
+                charge_unsolicited: true,
+            },
+            "LedgerDataAdmission::Terminal does not defer or enqueue a failed acquisition reply"
+        );
+        let terminal_lifecycle = terminal.lifecycle_snapshot();
+        assert_eq!(terminal_lifecycle.route_attempts, 0);
+        assert_eq!(terminal_lifecycle.route_accepted, 0);
+        terminal.stop();
     }
 }

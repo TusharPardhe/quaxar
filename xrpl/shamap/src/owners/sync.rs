@@ -1079,7 +1079,11 @@ impl SyncTree {
                 return SHAMapAddNode::invalid();
             };
             if child_hash != new_node.get_hash() {
-                tracing::warn!(target: "shamap", expected = %child_hash, "Node hash mismatch — corrupt data");
+                tracing::warn!(
+                    target: "shamap",
+                    expected = %child_hash,
+                    "Node hash mismatch — corrupt data"
+                );
                 report_event(AddKnownNodeEvent::CorruptNode);
                 return SHAMapAddNode::invalid();
             }
@@ -2882,6 +2886,41 @@ struct PendingReadEdges {
     edges: Vec<PendingDeferredFetch>,
 }
 
+/// Finite retained-work budget for one async missing-node continuation.
+///
+/// Rippled keeps at most 512 deferred reads in one `getMissingNodes()` pass.
+/// The Rust continuation survives asynchronous actor turns, so it uses that
+/// same source-mapped pass ceiling independently for unique pending hashes,
+/// retained parent edges, and their fixed-size edge payload. A caller that
+/// needs a smaller owner budget may use [`MissingNodeContinuation::new_with_bounds`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingNodeContinuationBounds {
+    pub max_pending_hashes: usize,
+    pub max_pending_edges: usize,
+    pub max_pending_edge_bytes: usize,
+}
+
+impl Default for MissingNodeContinuationBounds {
+    fn default() -> Self {
+        let max_pending_edges = DEFAULT_MAX_DEFERRED_MISSING_NODE_READS;
+        Self {
+            max_pending_hashes: DEFAULT_MAX_DEFERRED_MISSING_NODE_READS,
+            max_pending_edges,
+            max_pending_edge_bytes: max_pending_edges
+                .saturating_mul(std::mem::size_of::<PendingDeferredFetch>()),
+        }
+    }
+}
+
+impl MissingNodeContinuationBounds {
+    fn can_retain_edge(self, pending_hashes: usize, pending_edges: usize) -> bool {
+        pending_hashes <= self.max_pending_hashes
+            && pending_edges <= self.max_pending_edges
+            && pending_edges.saturating_mul(std::mem::size_of::<PendingDeferredFetch>())
+                <= self.max_pending_edge_bytes
+    }
+}
+
 /// Pure retained traversal for state and transaction acquisition.
 ///
 /// This intentionally does not depend on `SHAMapFamily`, `SHAMapNodeFetcher`,
@@ -2903,6 +2942,11 @@ pub struct MissingNodeContinuation {
     pending_network_by_hash: BTreeMap<SHAMapHash, Vec<PendingDeferredFetch>>,
     unannounced_reads: BTreeSet<SHAMapHash>,
     deferred_resumes: BTreeMap<usize, DeferredResume>,
+    bounds: MissingNodeContinuationBounds,
+    /// A full retained-edge budget is a genuine external-work wait, not a
+    /// runnable CPU frontier. It clears only when a read or peer result frees
+    /// an edge, preventing repeated Ready turns from spinning.
+    pending_edge_limit_reached: bool,
     stats: DeferredMissingNodeScanStats,
     invalid: bool,
 }
@@ -2920,6 +2964,31 @@ impl MissingNodeContinuation {
     where
         R: FnMut() -> u8,
     {
+        Self::new_with_bounds(
+            plan_id,
+            root,
+            max_missing,
+            backed,
+            ledger_seq,
+            full_below_generation,
+            MissingNodeContinuationBounds::default(),
+            next_first_child,
+        )
+    }
+
+    pub fn new_with_bounds<R>(
+        plan_id: MissingNodePlanId,
+        root: &SharedIntrusive<SHAMapTreeNode>,
+        max_missing: i32,
+        backed: bool,
+        ledger_seq: u32,
+        full_below_generation: u32,
+        bounds: MissingNodeContinuationBounds,
+        next_first_child: &mut R,
+    ) -> Self
+    where
+        R: FnMut() -> u8,
+    {
         assert!(
             root.get_hash().is_non_zero(),
             "missing-node continuations require a non-zero root hash"
@@ -2927,6 +2996,12 @@ impl MissingNodeContinuation {
         assert!(
             max_missing > 0,
             "missing-node continuations require a positive missing-node bound"
+        );
+        assert!(
+            bounds.max_pending_hashes > 0
+                && bounds.max_pending_edges > 0
+                && bounds.max_pending_edge_bytes >= std::mem::size_of::<PendingDeferredFetch>(),
+            "missing-node continuation retained-edge bounds must admit one edge"
         );
 
         let mut stack = Vec::new();
@@ -2953,6 +3028,8 @@ impl MissingNodeContinuation {
             pending_network_by_hash: BTreeMap::new(),
             unannounced_reads: BTreeSet::new(),
             deferred_resumes: BTreeMap::new(),
+            bounds,
+            pending_edge_limit_reached: false,
             stats: DeferredMissingNodeScanStats::default(),
             invalid: false,
         }
@@ -2976,6 +3053,7 @@ impl MissingNodeContinuation {
     /// `pending_*` alone must not manufacture another worker turn.
     pub fn has_runnable_frontier(&self) -> bool {
         !self.invalid
+            && !self.pending_edge_limit_reached
             && ((!self.stack.is_empty() && self.remaining > 0)
                 || !self.deferred_resumes.is_empty()
                 || !self.unannounced_reads.is_empty()
@@ -2996,6 +3074,22 @@ impl MissingNodeContinuation {
                 .values()
                 .map(Vec::len)
                 .sum::<usize>()
+    }
+
+    /// Fixed-size retained edge payload currently owned by this continuation.
+    /// This excludes allocator metadata but bounds every payload-bearing edge
+    /// and is paired with the independent item limit above.
+    pub fn pending_edge_bytes(&self) -> usize {
+        self.pending_edges()
+            .saturating_mul(std::mem::size_of::<PendingDeferredFetch>())
+    }
+
+    pub const fn bounds(&self) -> MissingNodeContinuationBounds {
+        self.bounds
+    }
+
+    pub const fn is_pending_edge_limited(&self) -> bool {
+        self.pending_edge_limit_reached
     }
 
     /// Current verified network frontier. This remains available after the
@@ -3129,6 +3223,10 @@ impl MissingNodeContinuation {
         }
 
         let mut branch_steps = 0usize;
+        // This advance slice only adds retained edges. Keep an exact local
+        // count so edge admission never borrows all of `self` while `state`
+        // mutably borrows the current stack entry.
+        let mut retained_pending_edges = self.pending_edges();
         while let Some(state) = self.stack.last_mut() {
             if branch_steps >= max_branch_steps || self.remaining <= 0 || should_yield() {
                 break;
@@ -3191,6 +3289,17 @@ impl MissingNodeContinuation {
             }
 
             state.full_below = false;
+            let is_new_hash = !self.pending_by_hash.contains_key(&child_hash);
+            let pending_hashes = self.pending_by_hash.len() + usize::from(is_new_hash);
+            let pending_edges = retained_pending_edges.saturating_add(1);
+            if !self.bounds.can_retain_edge(pending_hashes, pending_edges) {
+                // The branch cursor was advanced before this ownership check.
+                // Restore it so a later read/peer completion retries this
+                // exact child rather than silently skipping a verified edge.
+                state.current_child = state.current_child.saturating_sub(1);
+                self.pending_edge_limit_reached = true;
+                break;
+            }
             let edge = PendingDeferredFetch {
                 parent: state.node.clone(),
                 parent_id: state.node_id,
@@ -3212,6 +3321,7 @@ impl MissingNodeContinuation {
                 }
             });
             pending.edges.push(edge);
+            retained_pending_edges = pending_edges;
             self.stats.max_pending_reads = self
                 .stats
                 .max_pending_reads
@@ -3249,6 +3359,7 @@ impl MissingNodeContinuation {
         let Some(pending) = self.pending_by_hash.remove(&hash) else {
             return MissingNodeReadApply::UnknownRead;
         };
+        self.pending_edge_limit_reached = false;
         self.unannounced_reads.remove(&hash);
 
         match outcome {
@@ -3346,6 +3457,7 @@ impl MissingNodeContinuation {
         let Some(edges) = self.pending_network_by_hash.remove(&hash) else {
             return MissingNodeReadApply::UnknownRead;
         };
+        self.pending_edge_limit_reached = false;
         self.missing_hashes.remove(&hash);
         self.missing_nodes
             .retain(|(_, candidate)| candidate != hash.as_uint256());
@@ -6330,6 +6442,77 @@ mod native_missing_node_continuation_tests {
         };
         assert_eq!(needs.len(), 1);
         assert_eq!(needs[0].hash(), grandchild_hash);
+    }
+
+    #[test]
+    fn retained_edge_bound_blocks_cpu_until_a_result_releases_capacity() {
+        let first = make_shared_intrusive(SHAMapTreeNode::new_leaf(
+            crate::tree_node::SHAMapNodeType::AccountState,
+            SHAMapItem::new(Uint256::from_array([0x71; 32]), vec![0x71; 12]),
+            1,
+        ));
+        let second_hash = hash(0x72);
+        let root = make_shared_intrusive(SHAMapTreeNode::new_inner(1));
+        root.set_child_hash(0, first.get_hash());
+        root.set_child_hash(1, second_hash);
+        root.update_hash();
+        let bounds = MissingNodeContinuationBounds {
+            max_pending_hashes: 1,
+            max_pending_edges: 1,
+            max_pending_edge_bytes: std::mem::size_of::<PendingDeferredFetch>(),
+        };
+        let mut continuation = MissingNodeContinuation::new_with_bounds(
+            MissingNodePlanId::new(71),
+            &root,
+            16,
+            true,
+            77,
+            9,
+            bounds,
+            &mut || 0,
+        );
+        let mut resident = EmptyResident;
+
+        let MissingNodeAdvance::NeedsReads(needs) =
+            continuation.advance(32, 16, &mut resident, &mut || 0)
+        else {
+            panic!("expected the bounded first read");
+        };
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].hash(), first.get_hash());
+        assert_eq!(needs[0].ledger_seq(), 77);
+        assert_eq!(needs[0].node_id(), SHAMapNodeId::default());
+        assert_eq!(needs[0].branch(), 0);
+        assert!(continuation.is_pending_edge_limited());
+        assert_eq!(continuation.pending_edges(), 1);
+        assert_eq!(
+            continuation.pending_edge_bytes(),
+            std::mem::size_of::<PendingDeferredFetch>()
+        );
+        assert!(
+            !continuation.has_runnable_frontier(),
+            "a full retained-edge owner must wait instead of requeueing CPU work"
+        );
+
+        assert_eq!(
+            continuation.apply_read_result(
+                MissingNodePlanId::new(71),
+                first.get_hash(),
+                MissingNodeReadOutcome::Found(first),
+            ),
+            MissingNodeReadApply::Applied {
+                attached_edges: 1,
+                missing_edges: 0,
+            }
+        );
+        assert!(!continuation.is_pending_edge_limited());
+        let MissingNodeAdvance::NeedsReads(needs) =
+            continuation.advance(32, 16, &mut resident, &mut || 0)
+        else {
+            panic!("released edge capacity should admit the next retained read");
+        };
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].hash(), second_hash);
     }
 
     #[test]

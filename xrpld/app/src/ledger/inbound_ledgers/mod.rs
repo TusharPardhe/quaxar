@@ -18,14 +18,15 @@ mod scheduler;
 mod worker_pool;
 
 pub(crate) use self::acquisition::ProvisionalLedgerIdentity;
-pub use self::acquisition::{AcquisitionState, stash_stale_packet};
+pub use self::acquisition::{AcquisitionState, InboundPacketAdmissionLease, stash_stale_packet};
 pub use self::read_broker::{
     ACQ_READS_GLOBAL, NodeReadBroker, ReadAdmission, ReadBrokerConfig, ReadBrokerMetrics,
     ReadBrokerSnapshot, ReadDispatch, ReadKey, ReadOutcome, ReadReady, ReadRejectReason,
     ReadTicket, ReadTicketId,
 };
 pub use self::registry::{
-    AcquireReason, CompletedInboundLedger, InboundLedgers, LedgerDataRouteDisposition,
+    AcquireReason, CompletedInboundLedger, InboundLedgers, LedgerDataAdmission,
+    LedgerDataRouteDisposition,
 };
 pub use self::worker_pool::WorkerPool;
 

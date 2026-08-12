@@ -18,6 +18,7 @@ use ledger::{
     TreeKind, TreePlan, TreePlanId, make_get_ledger_with_node_ids,
     make_inbound_needed_by_hash_request, select_inbound_ledger_reply_peers,
 };
+use nodestore::database::{PersistenceIdentity, PersistenceOutcome, PersistenceWork};
 use overlay::{Peer, PeerSet as _};
 use shamap::family::{FullBelowCache, FullBelowCacheImpl, NullMissingNodeReporter, SHAMapFamily};
 use shamap::sync::{
@@ -75,7 +76,20 @@ struct LocalProbe {
 /// The broker owns the single global physical-read boundary; this is not an
 /// actor-local per-turn or per-acquisition cap.
 const ACQ_DEFERRED_READS_PER_PASS: usize = DEFAULT_MAX_DEFERRED_MISSING_NODE_READS;
+/// Fixed Rust actor-admission adaptation, not a rippled numeric-parity value
+/// and not a configurable or wire-protocol limit. The acquisition mailbox
+/// owns at most this many queued packets plus unconsumed transport leases.
+/// `Deferred` transfers no packet ownership and is never a cancelled reply;
+/// Worker 1 retains or terminally discards its transport frame. Accepted
+/// leases transfer once to `enqueue_packet_with_admission`; `Drop` releases
+/// only an unconsumed reservation. `clear_terminal_work` clears every queued
+/// packet and reservation during terminal cancellation, sweep, failure, or
+/// stop, so later lease drops are stale no-ops.
 pub const ACQ_MAILBOX_PACKET_CAPACITY: usize = 128;
+/// Fixed Rust actor-admission adaptation paired with
+/// `ACQ_MAILBOX_PACKET_CAPACITY`, not a rippled numeric-parity value and not
+/// a configurable or wire-protocol limit. It bounds decoded node-id and
+/// node-data bytes owned by queued packets and unconsumed leases.
 pub const ACQ_MAILBOX_BYTE_CAPACITY: usize = 4 * 1024 * 1024;
 
 #[cfg(test)]
@@ -530,20 +544,21 @@ struct PersistenceWrite {
 #[derive(Clone)]
 enum PersistenceCommand {
     /// One bounded packet/scan batch owned by the NodeStore write scheduler.
-    /// A single completion settles every accepted key in this batch.
+    /// A single immutable storage identity settles every accepted key in this
+    /// batch, even if a callback arrives after cancellation or rotation.
     WriteBatch {
-        id: u64,
+        identity: PersistenceIdentity,
         writes: Vec<PersistenceWrite>,
     },
     DurabilityBarrier {
-        id: u64,
+        identity: PersistenceIdentity,
     },
 }
 
 impl PersistenceCommand {
-    fn id(&self) -> u64 {
+    fn identity(&self) -> PersistenceIdentity {
         match self {
-            Self::WriteBatch { id, .. } | Self::DurabilityBarrier { id } => *id,
+            Self::WriteBatch { identity, .. } | Self::DurabilityBarrier { identity } => *identity,
         }
     }
 
@@ -554,8 +569,8 @@ impl PersistenceCommand {
 
 #[derive(Clone)]
 struct PersistenceReady {
-    id: u64,
-    result: Result<(), Arc<str>>,
+    identity: PersistenceIdentity,
+    outcome: PersistenceOutcome,
     durability_barrier: bool,
 }
 
@@ -568,22 +583,28 @@ struct PersistenceCompletionGuard {
 }
 
 impl PersistenceCompletionGuard {
-    fn new(state: Arc<AcquisitionState>, id: u64, durability_barrier: bool) -> Self {
+    fn new(
+        state: Arc<AcquisitionState>,
+        identity: PersistenceIdentity,
+        durability_barrier: bool,
+    ) -> Self {
         Self {
             state,
             ready: Some(PersistenceReady {
-                id,
-                result: Err(Arc::from("NodeStore persistence callback dropped")),
+                identity,
+                outcome: PersistenceOutcome::Fault(Arc::from(
+                    "NodeStore persistence callback dropped",
+                )),
                 durability_barrier,
             }),
         }
     }
 
-    fn settle(&mut self, result: Result<(), Arc<str>>) {
+    fn settle(&mut self, outcome: PersistenceOutcome) {
         let Some(mut ready) = self.ready.take() else {
             return;
         };
-        ready.result = result;
+        ready.outcome = outcome;
         self.state.enqueue_persistence_ready(ready);
     }
 }
@@ -596,12 +617,90 @@ impl Drop for PersistenceCompletionGuard {
     }
 }
 
+/// Typed NodeStore work owned after an acquisition actor releases its mutable
+/// packet state. Its reservation is the actual `Vec<PersistenceWrite>` record
+/// capacity plus every retained `data` buffer capacity; `Arc` identities and
+/// fixed enum/key fields live in this fixed-size record and are accounted by
+/// the scheduler task itself. No erased closure shell participates in this
+/// accounting.
+struct AcquisitionPersistenceWork {
+    node_store: SHAMapStoreNodeStore,
+    command: PersistenceCommand,
+    completion: PersistenceCompletionGuard,
+}
+
+impl AcquisitionPersistenceWork {
+    fn payload_bytes(command: &PersistenceCommand) -> usize {
+        match command {
+            PersistenceCommand::WriteBatch { writes, .. } => writes
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PersistenceWrite>())
+                .saturating_add(
+                    writes
+                        .iter()
+                        .map(|write| write.data.capacity())
+                        .sum::<usize>(),
+                ),
+            PersistenceCommand::DurabilityBarrier { .. } => 0,
+        }
+    }
+}
+
+impl PersistenceWork for AcquisitionPersistenceWork {
+    fn retained_payload_bytes(&self) -> usize {
+        Self::payload_bytes(&self.command)
+    }
+
+    fn run(self: Box<Self>) {
+        let Self {
+            node_store,
+            command,
+            mut completion,
+        } = *self;
+        let identity = command.identity();
+        let outcome = if node_store.store_generation() != identity.store_generation {
+            PersistenceOutcome::Cancelled
+        } else {
+            let result = match command {
+                PersistenceCommand::WriteBatch { writes, .. } => {
+                    writes.into_iter().try_for_each(|write| match &node_store {
+                        SHAMapStoreNodeStore::Single(database) => database.store(
+                            write.object_type,
+                            write.data,
+                            write.key.hash,
+                            write.key.ledger_seq,
+                        ),
+                        SHAMapStoreNodeStore::Rotating(database) => database.store(
+                            write.object_type,
+                            write.data,
+                            write.key.hash,
+                            write.key.ledger_seq,
+                        ),
+                    })
+                }
+                PersistenceCommand::DurabilityBarrier { .. } => match &node_store {
+                    SHAMapStoreNodeStore::Single(database) => database.sync_result(),
+                    SHAMapStoreNodeStore::Rotating(database) => database.sync_result(),
+                },
+            };
+            match result {
+                Ok(()) if node_store.store_generation() == identity.store_generation => {
+                    PersistenceOutcome::Durable
+                }
+                Ok(()) => PersistenceOutcome::Cancelled,
+                Err(error) => PersistenceOutcome::Fault(Arc::from(error)),
+            }
+        };
+        completion.settle(outcome);
+    }
+}
+
 /// Actor-external, per-acquisition FIFO persistence owner. Exactly one command
 /// is in flight, so a successful durability barrier is ordered after every
 /// accepted write. The actor observes the acknowledgement before the next
 /// command is dispatched.
 struct PersistenceQueue {
-    next_id: u64,
+    next_generation: u64,
     queued: VecDeque<PersistenceCommand>,
     in_flight: Option<PersistenceCommand>,
     accepted: BTreeSet<PersistenceKey>,
@@ -613,7 +712,7 @@ struct PersistenceQueue {
 impl Default for PersistenceQueue {
     fn default() -> Self {
         Self {
-            next_id: 1,
+            next_generation: 1,
             queued: VecDeque::new(),
             in_flight: None,
             accepted: BTreeSet::new(),
@@ -625,7 +724,25 @@ impl Default for PersistenceQueue {
 }
 
 impl PersistenceQueue {
-    fn enqueue_writes(&mut self, writes: Vec<PersistenceWrite>) {
+    fn next_identity(&mut self, acquisition_id: u64, store_generation: u64) -> PersistenceIdentity {
+        let persistence_generation = self.next_generation;
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .expect("persistence generation overflow");
+        PersistenceIdentity {
+            acquisition_id,
+            persistence_generation,
+            store_generation,
+        }
+    }
+
+    fn enqueue_writes(
+        &mut self,
+        acquisition_id: u64,
+        store_generation: u64,
+        writes: Vec<PersistenceWrite>,
+    ) {
         let mut accepted = Vec::with_capacity(writes.len());
         for write in writes {
             if self.accepted.insert(write.key) {
@@ -635,29 +752,21 @@ impl PersistenceQueue {
         if accepted.is_empty() {
             return;
         }
-        let id = self.next_id;
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .expect("persistence command id overflow");
+        let identity = self.next_identity(acquisition_id, store_generation);
         self.queued.push_back(PersistenceCommand::WriteBatch {
-            id,
+            identity,
             writes: accepted,
         });
     }
 
-    fn enqueue_barrier(&mut self) {
+    fn enqueue_barrier(&mut self, acquisition_id: u64, store_generation: u64) {
         if self.barrier_enqueued {
             return;
         }
         self.barrier_enqueued = true;
-        let id = self.next_id;
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .expect("persistence command id overflow");
+        let identity = self.next_identity(acquisition_id, store_generation);
         self.queued
-            .push_back(PersistenceCommand::DurabilityBarrier { id });
+            .push_back(PersistenceCommand::DurabilityBarrier { identity });
     }
 
     /// Transition at most one queued command into the one in-flight slot.
@@ -675,17 +784,22 @@ impl PersistenceQueue {
         let Some(command) = self.in_flight.take() else {
             return false;
         };
-        if command.id() != ready.id || command.is_durability_barrier() != ready.durability_barrier {
+        if command.identity() != ready.identity
+            || command.is_durability_barrier() != ready.durability_barrier
+        {
             self.in_flight = Some(command);
             return false;
         }
-        match &ready.result {
-            Ok(()) => {
+        match &ready.outcome {
+            PersistenceOutcome::Durable => {
                 if ready.durability_barrier {
                     self.barrier_acknowledged = true;
                 }
             }
-            Err(error) => self.failed = Some(Arc::clone(error)),
+            PersistenceOutcome::Fault(error) => self.failed = Some(Arc::clone(error)),
+            PersistenceOutcome::Cancelled => {
+                self.failed = Some(Arc::from("NodeStore persistence cancelled"));
+            }
         }
         true
     }
@@ -813,6 +927,45 @@ pub(crate) enum PacketEnqueue {
     Accepted,
     Terminal,
     Full,
+    InvalidLease,
+}
+
+pub(crate) enum PacketAdmissionReservation {
+    Terminal,
+    Deferred,
+}
+
+/// Byte accounting shared by lease reservation and the consuming enqueue so a
+/// caller cannot reserve one payload size and insert another.
+fn packet_bytes(packet: &InboundLedgerPacket) -> usize {
+    packet
+        .nodes
+        .iter()
+        .map(|node| node.node_data.len() + node.node_id.as_ref().map_or(0, Vec::len))
+        .sum()
+}
+
+/// Opaque actor-owned reservation for one decoded matching reply. Transport
+/// owns this token only until it hands the packet to the matching acquisition;
+/// terminal teardown clears the mailbox reservation and a later drop becomes a
+/// harmless stale release. The token never takes an overlay lock.
+pub struct InboundPacketAdmissionLease {
+    state: Arc<AcquisitionState>,
+    acquisition_id: u64,
+    reservation_id: u64,
+    bytes: usize,
+}
+
+impl InboundPacketAdmissionLease {
+    fn belongs_to(&self, state: &AcquisitionState) -> bool {
+        self.acquisition_id == state.acquisition_id
+    }
+}
+
+impl Drop for InboundPacketAdmissionLease {
+    fn drop(&mut self) {
+        self.state.release_packet_admission(self.reservation_id);
+    }
 }
 
 /// One packet remains exclusively owned by this acquisition until all of its
@@ -979,6 +1132,11 @@ fn select_tree_network_candidates(
 struct AcquisitionMailbox {
     packets: VecDeque<PacketWork>,
     packet_bytes: usize,
+    /// Transport-held leases reserve this capacity before a decoded matching
+    /// reply enters the actor. Terminal cleanup drops the map so every later
+    /// lease drop is stale and cannot double-release capacity.
+    packet_admissions: BTreeMap<u64, usize>,
+    next_packet_admission_id: u64,
     /// Broker completions retain ticket ownership until this actor reduces
     /// them. The broker's global physical-read boundary bounds I/O; mailbox
     /// delivery is never rejected after admission.
@@ -1003,6 +1161,8 @@ impl Default for AcquisitionMailbox {
         Self {
             packets: VecDeque::new(),
             packet_bytes: 0,
+            packet_admissions: BTreeMap::new(),
+            next_packet_admission_id: 1,
             events: VecDeque::new(),
             persistence_events: VecDeque::new(),
             local_probes: BTreeMap::new(),
@@ -1098,6 +1258,7 @@ impl AcquisitionMailbox {
         tickets.extend(self.local_probes.values().map(|probe| probe.ticket));
         self.packets.clear();
         self.packet_bytes = 0;
+        self.packet_admissions.clear();
         self.events.clear();
         self.persistence_events.clear();
         self.local_probes.clear();
@@ -1241,6 +1402,130 @@ impl AcquisitionState {
         }
     }
 
+    /// Reserve the actor's bounded packet and byte capacity before a decoded
+    /// matching response is handed to routing. Worker 1 owns the peer-scoped
+    /// transport pause/defer policy for `Deferred`; this actor retains no
+    /// decoded packet on that outcome.
+    pub(crate) fn reserve_packet_admission(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Result<InboundPacketAdmissionLease, PacketAdmissionReservation> {
+        if self.is_done() || self.draining.load(Ordering::Acquire) {
+            return Err(PacketAdmissionReservation::Terminal);
+        }
+        let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+        if self.is_done() || self.draining.load(Ordering::Acquire) {
+            return Err(PacketAdmissionReservation::Terminal);
+        }
+        let reserved_bytes = mailbox.packet_admissions.values().sum::<usize>();
+        if mailbox
+            .packets
+            .len()
+            .saturating_add(mailbox.packet_admissions.len())
+            >= ACQ_MAILBOX_PACKET_CAPACITY
+            || mailbox
+                .packet_bytes
+                .saturating_add(reserved_bytes)
+                .saturating_add(bytes)
+                > ACQ_MAILBOX_BYTE_CAPACITY
+        {
+            mailbox.overload_rejections += 1;
+            return Err(PacketAdmissionReservation::Deferred);
+        }
+        let reservation_id = mailbox.next_packet_admission_id;
+        mailbox.next_packet_admission_id = mailbox
+            .next_packet_admission_id
+            .checked_add(1)
+            .expect("packet admission id overflow");
+        mailbox.packet_admissions.insert(reservation_id, bytes);
+        Ok(InboundPacketAdmissionLease {
+            state: Arc::clone(self),
+            acquisition_id: self.acquisition_id,
+            reservation_id,
+            bytes,
+        })
+    }
+
+    fn release_packet_admission(&self, reservation_id: u64) {
+        self.mailbox
+            .lock()
+            .expect("acquisition mailbox lock")
+            .packet_admissions
+            .remove(&reservation_id);
+    }
+
+    /// Consume a reservation while holding the sequence gate. The reservation
+    /// has already accounted for this exact decoded packet, so neither a
+    /// concurrent ingress nor an actor packet can overcommit the mailbox.
+    pub(crate) fn enqueue_packet_with_admission(
+        self: &Arc<Self>,
+        lease: InboundPacketAdmissionLease,
+        peer_id: u64,
+        response_seq: Option<u32>,
+        packet: InboundLedgerPacket,
+    ) -> Result<PacketEnqueue, u32> {
+        let _sequence_gate = self
+            .sequence_gate
+            .lock()
+            .expect("acquisition sequence gate");
+        let expected_seq = self.seq();
+        if let Some(response_seq) = response_seq
+            && !super::registry::response_sequence_matches_request(expected_seq, response_seq)
+        {
+            return Err(expected_seq);
+        }
+        if !lease.belongs_to(self) {
+            return Ok(PacketEnqueue::InvalidLease);
+        }
+        Ok(self.enqueue_admitted_packet(lease, peer_id, packet))
+    }
+
+    fn enqueue_admitted_packet(
+        self: &Arc<Self>,
+        lease: InboundPacketAdmissionLease,
+        peer_id: u64,
+        packet: InboundLedgerPacket,
+    ) -> PacketEnqueue {
+        let bytes = packet_bytes(&packet);
+        let should_enqueue = {
+            let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
+            let Some(reserved_bytes) = mailbox.packet_admissions.remove(&lease.reservation_id)
+            else {
+                return PacketEnqueue::InvalidLease;
+            };
+            if reserved_bytes != lease.bytes || reserved_bytes != bytes {
+                return PacketEnqueue::InvalidLease;
+            }
+            if self.is_done() || self.draining.load(Ordering::Acquire) {
+                return PacketEnqueue::Terminal;
+            }
+            mailbox.packet_bytes += bytes;
+            mailbox.packets.push_back(PacketWork {
+                peer_id,
+                packet,
+                bytes,
+            });
+            mailbox.buffered_packets_high_water = mailbox
+                .buffered_packets_high_water
+                .max(mailbox.buffered_packet_count());
+            mailbox.buffered_bytes_high_water =
+                mailbox.buffered_bytes_high_water.max(mailbox.packet_bytes);
+            if mailbox.token == AcquisitionWorkToken::Idle {
+                mailbox.token = AcquisitionWorkToken::Queued;
+                true
+            } else {
+                self.lifecycle
+                    .data_jobs_coalesced
+                    .fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        };
+        if should_enqueue {
+            self.enqueue_acquisition_turn();
+        }
+        PacketEnqueue::Accepted
+    }
+
     /// Validate a wire sequence and enqueue the packet under the same gate
     /// used by zero-to-nonzero sequence promotion. A response that validated
     /// while the sequence was unknown therefore enters before promotion, or
@@ -1286,15 +1571,20 @@ impl AcquisitionState {
         if self.is_done() || self.draining.load(Ordering::Acquire) {
             return PacketEnqueue::Terminal;
         }
-        let bytes = packet
-            .nodes
-            .iter()
-            .map(|node| node.node_data.len() + node.node_id.as_ref().map_or(0, Vec::len))
-            .sum::<usize>();
+        let bytes = packet_bytes(&packet);
         let should_enqueue = {
             let mut mailbox = self.mailbox.lock().expect("acquisition mailbox lock");
-            if mailbox.packets.len() >= ACQ_MAILBOX_PACKET_CAPACITY
-                || mailbox.packet_bytes.saturating_add(bytes) > ACQ_MAILBOX_BYTE_CAPACITY
+            let reserved_bytes = mailbox.packet_admissions.values().sum::<usize>();
+            if mailbox
+                .packets
+                .len()
+                .saturating_add(mailbox.packet_admissions.len())
+                >= ACQ_MAILBOX_PACKET_CAPACITY
+                || mailbox
+                    .packet_bytes
+                    .saturating_add(reserved_bytes)
+                    .saturating_add(bytes)
+                    > ACQ_MAILBOX_BYTE_CAPACITY
             {
                 mailbox.overload_rejections += 1;
                 return PacketEnqueue::Full;
@@ -1509,7 +1799,10 @@ impl AcquisitionState {
                 None
             }
         };
-        candidate.map(|(kind, hash, seq)| (kind, ReadKey::new(hash, seq, 0)))
+        candidate.map(|(kind, hash, seq)| {
+            let store_generation = self.node_store.store_generation();
+            (kind, ReadKey::new(hash, seq, store_generation))
+        })
     }
 
     /// Returns true when a local probe is in flight, so callers must not issue
@@ -1611,10 +1904,11 @@ impl AcquisitionState {
         if writes.is_empty() || self.is_done() {
             return;
         }
+        let store_generation = self.node_store.store_generation();
         self.persistence
             .lock()
             .expect("persistence queue lock")
-            .enqueue_writes(writes);
+            .enqueue_writes(self.acquisition_id, store_generation, writes);
         self.dispatch_next_persistence_command();
     }
 
@@ -1622,10 +1916,11 @@ impl AcquisitionState {
         if self.is_done() {
             return;
         }
+        let store_generation = self.node_store.store_generation();
         self.persistence
             .lock()
             .expect("persistence queue lock")
-            .enqueue_barrier();
+            .enqueue_barrier(self.acquisition_id, store_generation);
         self.dispatch_next_persistence_command();
     }
 
@@ -1640,41 +1935,16 @@ impl AcquisitionState {
         };
         let state = Arc::clone(self);
         let node_store = state.node_store.clone();
-        let execution_node_store = node_store.clone();
+        let identity = command.identity();
         let completion = PersistenceCompletionGuard::new(
             Arc::clone(&state),
-            command.id(),
+            identity,
             command.is_durability_barrier(),
         );
-        node_store.schedule_write(Box::new(move || {
-            let mut completion = completion;
-            let result = match command {
-                PersistenceCommand::WriteBatch { writes, .. } => writes
-                    .into_iter()
-                    .try_for_each(|write| match &execution_node_store {
-                        SHAMapStoreNodeStore::Single(database) => database.store(
-                            write.object_type,
-                            write.data,
-                            write.key.hash,
-                            write.key.ledger_seq,
-                        ),
-                        SHAMapStoreNodeStore::Rotating(database) => database.store(
-                            write.object_type,
-                            write.data,
-                            write.key.hash,
-                            write.key.ledger_seq,
-                        ),
-                    })
-                    .map_err(|error| Arc::from(error.as_str())),
-                PersistenceCommand::DurabilityBarrier { .. } => {
-                    let result = match &execution_node_store {
-                        SHAMapStoreNodeStore::Single(database) => database.sync_result(),
-                        SHAMapStoreNodeStore::Rotating(database) => database.sync_result(),
-                    };
-                    result.map_err(|error| Arc::from(error.as_str()))
-                }
-            };
-            completion.settle(result);
+        node_store.schedule_write(Box::new(AcquisitionPersistenceWork {
+            node_store: node_store.clone(),
+            command,
+            completion,
         }));
     }
 
@@ -1923,6 +2193,11 @@ impl AcquisitionState {
         self.record_admitted_timeout();
     }
 
+    pub(crate) fn on_acquisition_timer_fired(self: &Arc<Self>) {
+        self.timer_armed.store(false, Ordering::Release);
+        self.queue_timeout_job();
+    }
+
     fn arm_timer(self: &Arc<Self>) {
         if self.is_done()
             || self
@@ -1932,14 +2207,8 @@ impl AcquisitionState {
         {
             return;
         }
-        let state = Arc::clone(self);
-        self.worker_pool.schedule_after(
-            ACQUIRE_TIMEOUT,
-            Box::new(move || {
-                state.timer_armed.store(false, Ordering::Release);
-                state.queue_timeout_job();
-            }),
-        );
+        self.worker_pool
+            .schedule_acquisition_timeout(ACQUIRE_TIMEOUT, self);
     }
 
     fn refresh_peers(&self) {
@@ -2154,10 +2423,7 @@ impl AcquisitionState {
                 .lock()
                 .expect("persistence queue lock")
                 .cancel();
-            self.mailbox
-                .lock()
-                .expect("acquisition mailbox lock")
-                .clear_terminal_work()
+            self.clear_terminal_work()
         };
         for ticket in tickets {
             self.read_broker.cancel(ticket);
@@ -2168,6 +2434,17 @@ impl AcquisitionState {
         self.stopped.load(Ordering::Acquire)
             || self.completed.load(Ordering::Acquire)
             || self.failed.load(Ordering::Acquire)
+    }
+
+    /// Settle mailbox-owned packet work and transport leases at the actor
+    /// boundary. The caller cancels returned broker tickets after releasing
+    /// any lifecycle gate; a cleared reservation cannot be released again by
+    /// a later lease drop.
+    pub(crate) fn clear_terminal_work(&self) -> Vec<ReadTicket> {
+        self.mailbox
+            .lock()
+            .expect("acquisition mailbox lock")
+            .clear_terminal_work()
     }
 
     /// A resolver-visible ledger may remain in ordered persistence after the
@@ -2229,10 +2506,7 @@ impl AcquisitionState {
             // a persistence acknowledgement or a poisoned mutable guard). Settle
             // all retained tree and local-probe subscriptions here rather than
             // relying on a later sweep or callback to reclaim broker capacity.
-            self.mailbox
-                .lock()
-                .expect("acquisition mailbox lock")
-                .clear_terminal_work()
+            self.clear_terminal_work()
         };
         for ticket in tickets {
             self.read_broker.cancel(ticket);
@@ -3041,9 +3315,17 @@ fn fail_actor_plan(state: &AcquisitionState, actor_plan: ActorTreePlan) {
 }
 
 fn process_persistence_event(state: &Arc<AcquisitionState>) {
-    let Some(ready) = state.take_persistence_event() else {
+    let Some(mut ready) = state.take_persistence_event() else {
         return;
     };
+    // PersistenceIdentity is immutable across the schedule/callback boundary.
+    // A callback from a retired store is terminally cancelled before it can
+    // acknowledge a replacement-generation command.
+    if ready.identity.acquisition_id != state.acquisition_id
+        || ready.identity.store_generation != state.node_store.store_generation()
+    {
+        ready.outcome = PersistenceOutcome::Cancelled;
+    }
     let (acknowledged, failed) = {
         let mut queue = state.persistence.lock().expect("persistence queue lock");
         let acknowledged = queue.acknowledge(&ready);
@@ -3188,6 +3470,17 @@ fn process_one_read_event(state: &Arc<AcquisitionState>) -> bool {
     };
     if ready.ticket.acquisition_id() != state.acquisition_id {
         state.record_stale_event();
+        return true;
+    }
+    // Agent 1's typed work is admitted with this exact store generation.
+    // Never let a late callback from a retired NodeStore generation mutate an
+    // acquisition that may now be represented by replacement work.
+    if ready.ticket.key().database_generation != state.node_store.store_generation() {
+        state.record_stale_event();
+        // The old broker work has already released Agent 1's typed permit;
+        // terminally clear this actor's ticket/plan ownership rather than
+        // retaining a stale edge that could route after replacement.
+        state.mark_failed();
         return true;
     }
     if let Some(probe) = state.take_local_probe(&ready) {
@@ -3356,7 +3649,12 @@ fn submit_read_admission_backlog(state: &Arc<AcquisitionState>, mut actor_plan: 
     let plan_id = actor_plan.plan.id();
     let mut deferred_fallback_hashes = BTreeSet::new();
     while let Some(need) = actor_plan.read_admission_backlog.pop_front() {
-        let key = ReadKey::new(*need.hash().as_uint256(), need.ledger_seq(), 0);
+        let store_generation = state.node_store.store_generation();
+        let key = ReadKey::new(
+            *need.hash().as_uint256(),
+            need.ledger_seq(),
+            store_generation,
+        );
         let weak = Arc::downgrade(state);
         let sink: ReadReadySink = Arc::new(move |ready| {
             if let Some(state) = weak.upgrade() {
@@ -5034,21 +5332,21 @@ mod actor_mailbox_tests {
             object_type: nodestore::NodeObjectType::Ledger,
             data: vec![7],
         };
-        queue.enqueue_writes(vec![write.clone()]);
+        queue.enqueue_writes(42, 7, vec![write.clone()]);
         let first = queue.take_next().expect("first write dispatch");
-        queue.enqueue_writes(vec![write]);
-        queue.enqueue_barrier();
+        queue.enqueue_writes(42, 7, vec![write]);
+        queue.enqueue_barrier(42, 7);
         assert!(
             queue.take_next().is_none(),
             "an in-flight command cannot dispatch twice"
         );
         assert_eq!(
-            queue.in_flight.as_ref().map(PersistenceCommand::id),
-            Some(first.id())
+            queue.in_flight.as_ref().map(PersistenceCommand::identity),
+            Some(first.identity())
         );
         assert!(queue.acknowledge(&PersistenceReady {
-            id: first.id(),
-            result: Ok(()),
+            identity: first.identity(),
+            outcome: PersistenceOutcome::Durable,
             durability_barrier: false,
         }));
         assert!(matches!(
@@ -5060,24 +5358,28 @@ mod actor_mailbox_tests {
     #[test]
     fn terminal_cancellation_discards_in_flight_and_queued_persistence() {
         let mut queue = PersistenceQueue::default();
-        queue.enqueue_writes(vec![PersistenceWrite {
-            key: PersistenceKey {
-                hash: Uint256::from_array([6; 32]),
-                ledger_seq: 13,
-                object_type: 3,
-            },
-            object_type: nodestore::NodeObjectType::Ledger,
-            data: vec![9],
-        }]);
-        queue.enqueue_barrier();
+        queue.enqueue_writes(
+            43,
+            8,
+            vec![PersistenceWrite {
+                key: PersistenceKey {
+                    hash: Uint256::from_array([6; 32]),
+                    ledger_seq: 13,
+                    object_type: 3,
+                },
+                object_type: nodestore::NodeObjectType::Ledger,
+                data: vec![9],
+            }],
+        );
+        queue.enqueue_barrier(43, 8);
         let in_flight = queue.take_next().expect("write dispatch");
         queue.cancel();
         assert!(queue.in_flight.is_none());
         assert!(queue.queued.is_empty());
         assert!(
             !queue.acknowledge(&PersistenceReady {
-                id: in_flight.id(),
-                result: Ok(()),
+                identity: in_flight.identity(),
+                outcome: PersistenceOutcome::Durable,
                 durability_barrier: false,
             }),
             "late worker completion cannot overwrite terminal cancellation"
@@ -5088,17 +5390,17 @@ mod actor_mailbox_tests {
     fn completed_ledger_fetcher_is_cache_only() {
         let source = include_str!("acquisition.rs");
         let start = source
-            .find("fn finalize_durable_acquisition")
-            .expect("durable finalizer source");
-        let finalizer = &source[start
+            .find("fn build_resolver_visible_ledger")
+            .expect("resolver-visible ledger builder source");
+        let builder = &source[start
             ..source[start..]
-                .find("\n/// Stash state nodes")
+                .find("\nfn finalize_acquisition")
                 .map(|offset| start + offset)
-                .expect("durable finalizer boundary")];
-        assert!(finalizer.contains("snapshot_durable_completed_ledger(state)"));
-        assert!(finalizer.contains("tree_cache.fetch(hash.as_uint256())"));
-        assert!(!finalizer.contains("fetch_node_object("));
-        assert!(!finalizer.contains("FetchType::Synchronous"));
+                .expect("resolver-visible ledger builder boundary")];
+        assert!(builder.contains("snapshot_completed_ledger(state)"));
+        assert!(builder.contains("tree_cache.fetch(hash.as_uint256())"));
+        assert!(!builder.contains("fetch_node_object("));
+        assert!(!builder.contains("FetchType::Synchronous"));
     }
 
     #[test]
@@ -5113,13 +5415,13 @@ mod actor_mailbox_tests {
             object_type: nodestore::NodeObjectType::Ledger,
             data: vec![1, 2, 3],
         };
-        queue.enqueue_writes(vec![write]);
-        queue.enqueue_barrier();
+        queue.enqueue_writes(44, 9, vec![write]);
+        queue.enqueue_barrier(44, 9);
         let first = queue.take_next().expect("write command");
         assert!(matches!(first, PersistenceCommand::WriteBatch { .. }));
         assert!(queue.acknowledge(&PersistenceReady {
-            id: first.id(),
-            result: Ok(()),
+            identity: first.identity(),
+            outcome: PersistenceOutcome::Durable,
             durability_barrier: false,
         }));
         let second = queue.take_next().expect("barrier command");
@@ -5128,8 +5430,8 @@ mod actor_mailbox_tests {
             PersistenceCommand::DurabilityBarrier { .. }
         ));
         assert!(queue.acknowledge(&PersistenceReady {
-            id: second.id(),
-            result: Ok(()),
+            identity: second.identity(),
+            outcome: PersistenceOutcome::Durable,
             durability_barrier: true,
         }));
         assert!(queue.barrier_acknowledged);
@@ -5138,21 +5440,25 @@ mod actor_mailbox_tests {
     #[test]
     fn persistence_fault_cancels_queued_barrier_before_publication_can_proceed() {
         let mut queue = PersistenceQueue::default();
-        queue.enqueue_writes(vec![PersistenceWrite {
-            key: PersistenceKey {
-                hash: Uint256::from_array([7; 32]),
-                ledger_seq: 11,
-                object_type: 3,
-            },
-            object_type: nodestore::NodeObjectType::Ledger,
-            data: vec![4, 5, 6],
-        }]);
-        queue.enqueue_barrier();
+        queue.enqueue_writes(
+            45,
+            10,
+            vec![PersistenceWrite {
+                key: PersistenceKey {
+                    hash: Uint256::from_array([7; 32]),
+                    ledger_seq: 11,
+                    object_type: 3,
+                },
+                object_type: nodestore::NodeObjectType::Ledger,
+                data: vec![4, 5, 6],
+            }],
+        );
+        queue.enqueue_barrier(45, 10);
         let write = queue.take_next().expect("write command");
         assert!(matches!(write, PersistenceCommand::WriteBatch { .. }));
         assert!(queue.acknowledge(&PersistenceReady {
-            id: write.id(),
-            result: Err(Arc::from("store fault")),
+            identity: write.identity(),
+            outcome: PersistenceOutcome::Fault(Arc::from("store fault")),
             durability_barrier: false,
         }));
         assert!(
@@ -5168,6 +5474,68 @@ mod actor_mailbox_tests {
             queue.take_next().is_none(),
             "no barrier can acknowledge after a write fault"
         );
+    }
+
+    #[test]
+    fn packet_admission_reservations_are_bounded_and_terminal_clear_settles_them() {
+        let mut mailbox = AcquisitionMailbox::default();
+        mailbox.packet_admissions.insert(1, 64);
+        mailbox
+            .packet_admissions
+            .insert(2, ACQ_MAILBOX_BYTE_CAPACITY - 64);
+        assert_eq!(mailbox.packet_admissions.len(), 2);
+        assert_eq!(
+            mailbox.packet_admissions.values().sum::<usize>(),
+            ACQ_MAILBOX_BYTE_CAPACITY,
+            "leases account for byte capacity before decoded packets enter FIFO ownership"
+        );
+
+        mailbox.clear_terminal_work();
+        assert!(
+            mailbox.packet_admissions.is_empty(),
+            "terminal cleanup settles every actor-owned transport reservation exactly once"
+        );
+    }
+
+    #[test]
+    fn persistence_identity_mismatch_remains_in_flight_until_its_exact_acknowledgement() {
+        let mut queue = PersistenceQueue::default();
+        queue.enqueue_writes(
+            71,
+            19,
+            vec![PersistenceWrite {
+                key: PersistenceKey {
+                    hash: Uint256::from_array([0x71; 32]),
+                    ledger_seq: 19,
+                    object_type: 3,
+                },
+                object_type: nodestore::NodeObjectType::Ledger,
+                data: vec![1],
+            }],
+        );
+        let command = queue.take_next().expect("admitted persistence command");
+        let identity = command.identity();
+        let stale = PersistenceIdentity {
+            store_generation: identity.store_generation.saturating_add(1),
+            ..identity
+        };
+        assert!(
+            !queue.acknowledge(&PersistenceReady {
+                identity: stale,
+                outcome: PersistenceOutcome::Durable,
+                durability_barrier: false,
+            }),
+            "a rotation-mismatched acknowledgement cannot settle the active command"
+        );
+        assert_eq!(
+            queue.in_flight.as_ref().map(PersistenceCommand::identity),
+            Some(identity)
+        );
+        assert!(queue.acknowledge(&PersistenceReady {
+            identity,
+            outcome: PersistenceOutcome::Durable,
+            durability_barrier: false,
+        }));
     }
 
     #[test]
