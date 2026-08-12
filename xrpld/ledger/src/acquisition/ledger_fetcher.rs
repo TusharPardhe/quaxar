@@ -23,11 +23,7 @@ use overlay::{ProtocolMessage, ProtocolPayload, TmGetLedger, TmGetObjectByHash};
 use protocol::JsonValue;
 use shamap::family::{FullBelowCache, MissingNodeReporter, SHAMapFamily, SHAMapNodeFetcher};
 use shamap::fetch::SHAMapSyncFilter;
-use shamap::sync::{
-    DeferredMissingNodeScanStats, MissingNodeAdvance, MissingNodeContinuation, MissingNodePlanId,
-    MissingNodeReadApply, MissingNodeReadOutcome, MissingNodeRef, MissingNodeResidentLookup,
-    ReadNeed, SHAMapAddNode, SHAMapMissingNode, SHAMapType, SyncTree,
-};
+use shamap::sync::{MissingNodeRef, SHAMapAddNode, SHAMapMissingNode, SHAMapType, SyncTree};
 use std::collections::BTreeMap;
 use std::hash::BuildHasher;
 use time::Duration;
@@ -72,189 +68,18 @@ pub const fn uses_aggressive_by_hash_timeout(timeouts: u32) -> bool {
     timeouts > INBOUND_LEDGER_BECOME_AGGRESSIVE
 }
 const MISSING_NODES_FIND: i32 = 256;
-/// Canonical cap for ordinary inbound-tree node requests.
-pub const INBOUND_LEDGER_NORMAL_NODE_REQUEST_CAP: usize = 12;
-/// Canonical cap for reply-triggered inbound-tree node requests.
-pub const INBOUND_LEDGER_REPLY_NODE_REQUEST_CAP: usize = 128;
 
-/// Stable identity of one tree traversal. A replacement header/root gets a
-/// new ID; ordinary yields, packets, and timer events retain the same ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TreePlanId(u64);
-
-impl TreePlanId {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
+/// Identifies the state or transaction tree for the direct SHAMap traversal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TreeKind {
     State,
     Transaction,
 }
 
-/// Actor-neutral result from one bounded tree-plan CPU turn. It deliberately
-/// contains work commands, never a NodeStore callback or peer send.
-#[derive(Debug, Clone)]
-pub enum TreeAdvance {
-    Ready,
-    NeedsReads(Vec<ReadNeed>),
-    NeedsNetwork(Vec<(shamap::node_id::SHAMapNodeId, Uint256)>),
-    Complete,
-    Invalid,
-}
-
-/// Retained plan state used by the inbound actor. It owns no database or
-/// network reference, so callers must submit its returned work only after
-/// releasing actor/planner mutation.
-#[derive(Debug, Clone)]
-pub struct TreePlan {
-    id: TreePlanId,
-    kind: TreeKind,
-    root_hash: SHAMapHash,
-    continuation: MissingNodeContinuation,
-    requested_recent: std::collections::BTreeSet<Uint256>,
-}
-
-impl TreePlan {
-    pub fn new<R>(
-        id: TreePlanId,
-        kind: TreeKind,
-        tree: &SyncTree,
-        root_hash: SHAMapHash,
-        max_missing: i32,
-        full_below_generation: u32,
-        next_first_child: &mut R,
-    ) -> Self
-    where
-        R: FnMut() -> u8,
-    {
-        Self {
-            id,
-            kind,
-            root_hash,
-            continuation: tree.start_missing_node_continuation(
-                MissingNodePlanId::new(id.get()),
-                max_missing,
-                full_below_generation,
-                next_first_child,
-            ),
-            requested_recent: std::collections::BTreeSet::new(),
-        }
-    }
-
-    pub const fn id(&self) -> TreePlanId {
-        self.id
-    }
-
-    pub const fn kind(&self) -> TreeKind {
-        self.kind
-    }
-
-    pub fn root_hash(&self) -> SHAMapHash {
-        self.root_hash
-    }
-
-    pub fn pending_hashes(&self) -> usize {
-        self.continuation.pending_hashes()
-    }
-
-    pub fn pending_edges(&self) -> usize {
-        self.continuation.pending_edges()
-    }
-
-    /// True only while an actor CPU turn can make progress without a broker
-    /// completion or peer response. Pending read/network edges intentionally
-    /// do not make a plan runnable.
-    pub fn has_runnable_frontier(&self) -> bool {
-        self.continuation.has_runnable_frontier()
-    }
-
-    /// Total branch selections consumed by the retained continuation. Actor
-    /// scheduling uses this to reject a `Ready` result that made no CPU
-    /// progress instead of manufacturing another worker turn.
-    pub fn branch_steps(&self) -> u64 {
-        self.continuation.stats().branch_steps
-    }
-
-    /// Immutable cumulative diagnostics for the retained continuation. The
-    /// acquisition actor samples this around every bounded turn and publishes
-    /// deltas through `fetch_info` without walking the tree.
-    pub fn scan_stats(&self) -> DeferredMissingNodeScanStats {
-        self.continuation.stats()
-    }
-
-    pub fn advance<L, R>(
-        &mut self,
-        max_branch_steps: usize,
-        max_new_reads: usize,
-        resident: &mut L,
-        next_first_child: &mut R,
-    ) -> TreeAdvance
-    where
-        L: MissingNodeResidentLookup,
-        R: FnMut() -> u8,
-    {
-        match self
-            .continuation
-            .advance(max_branch_steps, max_new_reads, resident, next_first_child)
-        {
-            MissingNodeAdvance::Ready => TreeAdvance::Ready,
-            MissingNodeAdvance::NeedsReads(reads) => TreeAdvance::NeedsReads(reads),
-            MissingNodeAdvance::NeedsNetwork(nodes) => TreeAdvance::NeedsNetwork(nodes),
-            MissingNodeAdvance::Complete => TreeAdvance::Complete,
-            MissingNodeAdvance::Invalid => TreeAdvance::Invalid,
-        }
-    }
-
-    /// Take a bounded batch of read needs previously discovered by an earlier
-    /// scan without consuming another branch-selection turn.
-    pub fn take_read_admission_batch(&mut self, max_new_reads: usize) -> Vec<ReadNeed> {
-        self.continuation.take_unannounced_reads(max_new_reads)
-    }
-
-    pub fn apply_read_result(
-        &mut self,
-        plan_id: TreePlanId,
-        hash: SHAMapHash,
-        outcome: MissingNodeReadOutcome,
-    ) -> MissingNodeReadApply {
-        self.continuation
-            .apply_read_result(MissingNodePlanId::new(plan_id.get()), hash, outcome)
-    }
-
-    pub fn apply_network_node(
-        &mut self,
-        plan_id: TreePlanId,
-        hash: SHAMapHash,
-        node: basics::intrusive_pointer::SharedIntrusive<SHAMapTreeNode>,
-    ) -> MissingNodeReadApply {
-        self.continuation
-            .apply_network_node(MissingNodePlanId::new(plan_id.get()), hash, node)
-    }
-
-    pub fn network_candidates(&self) -> Vec<(shamap::node_id::SHAMapNodeId, Uint256)> {
-        self.continuation.network_candidates()
-    }
-
-    pub fn retry_network_candidate(&mut self, hash: SHAMapHash) -> bool {
-        self.continuation.retry_network_candidate(hash)
-    }
-
-    /// Recent-request suppression belongs to the plan, not a global scan epoch.
-    pub fn mark_request_candidate(&mut self, hash: Uint256) -> bool {
-        self.requested_recent.insert(hash)
-    }
-
-    pub fn clear_recent_requests(&mut self) {
-        self.requested_recent.clear();
-    }
-}
+/// Canonical cap for ordinary inbound-tree node requests.
+pub const INBOUND_LEDGER_NORMAL_NODE_REQUEST_CAP: usize = 12;
+/// Canonical cap for reply-triggered inbound-tree node requests.
+pub const INBOUND_LEDGER_REPLY_NODE_REQUEST_CAP: usize = 128;
 
 fn full_sync_debug_enabled() -> bool {
     std::env::var("XRPLD_FULL_SYNC_DEBUG")
@@ -682,8 +507,8 @@ where
 /// Result of `prepare_trigger` — it emits peer commands and identifies which
 /// retained actor-owned tree plan may begin after local probe resolution.
 pub struct TriggerSetup {
-    /// The state tree has a locally installed root and must start one actor
-    /// owned `TreePlan`; it is never a detached synchronous scan.
+    /// The state tree has a locally installed root and must start direct
+    /// SHAMap traversal; it is never a detached synchronous scan.
     pub state_plan: bool,
     pub tx_plan: bool,
     pub messages_to_send: Vec<ProtocolMessage>,
@@ -791,45 +616,6 @@ impl InboundLedgerLocal {
         self.planner_state
     }
 
-    /// Create one retained, actor-owned traversal for a tree that is already
-    /// rooted locally. The plan owns only traversal state; NodeStore reads and
-    /// peer requests are deliberately emitted by the application actor after
-    /// it has released its ledger mutation borrow.
-    pub fn start_tree_plan(
-        &self,
-        kind: TreeKind,
-        id: TreePlanId,
-        full_below_generation: u32,
-    ) -> Option<TreePlan> {
-        if self.failed || self.complete {
-            return None;
-        }
-        let ledger = self.ledger.as_ref()?;
-        let (tree, root_hash, already_complete) = match kind {
-            TreeKind::State => (
-                ledger.state_map(),
-                ledger.header().account_hash,
-                self.planner_state.have_state,
-            ),
-            TreeKind::Transaction => (
-                ledger.tx_map(),
-                ledger.header().tx_hash,
-                self.planner_state.have_transactions,
-            ),
-        };
-        (!already_complete && !root_hash.is_zero()).then(|| {
-            TreePlan::new(
-                id,
-                kind,
-                tree,
-                root_hash,
-                MISSING_NODES_FIND,
-                full_below_generation,
-                &mut next_missing_scan_first_child,
-            )
-        })
-    }
-
     /// Commit a completed actor plan only after its retained traversal has
     /// verified that there are no missing descendants. This is intentionally
     /// independent of ordinary packet receipt, so an old plan cannot make a
@@ -933,7 +719,7 @@ impl InboundLedgerLocal {
 
     /// Whether this timeout cycle must use the aggressive by-hash protocol.
     /// This is intentionally the one predicate shared by ordinary trigger
-    /// setup and the retained TreePlan timeout path.
+    /// setup and direct SHAMap timeout recovery.
     pub fn should_use_aggressive_by_hash(&self) -> bool {
         self.timeouts > 0
             && !self.progress
@@ -1329,13 +1115,6 @@ impl InboundLedgerLocal {
         if stats.is_useful() {
             self.progress = true;
         }
-    }
-
-    /// Mark verified non-packet work, such as a matching brokered local read,
-    /// as timeout progress. Callers must invoke this only after the result has
-    /// been hash-validated and attached to the retained plan.
-    pub fn record_verified_progress(&mut self) {
-        self.progress = true;
     }
 
     pub fn record_packet_stats_with_family_and_config<CLOCK, S, C, F, MR, NS, J>(
@@ -1985,10 +1764,10 @@ impl InboundLedgerLocal {
             let node = &packet.nodes[index];
             let malformed = match node.node_id.as_deref() {
                 None => Some(InboundLedgerPacketError::MissingNodeId),
-                Some(_) if node.node_data.is_empty() => Some(InboundLedgerPacketError::EmptyNodeData),
-                Some(node_id)
-                    if shamap::node_id::deserialize_shamap_node_id(node_id).is_none() =>
-                {
+                Some(_) if node.node_data.is_empty() => {
+                    Some(InboundLedgerPacketError::EmptyNodeData)
+                }
+                Some(node_id) if shamap::node_id::deserialize_shamap_node_id(node_id).is_none() => {
                     Some(InboundLedgerPacketError::InvalidNodeId)
                 }
                 Some(_) => None,
@@ -2243,26 +2022,6 @@ impl InboundLedgerLocal {
             self.complete = true;
             self.finish_if_done_with_family_and_config(journal, config, family);
         }
-    }
-
-    /// Apply a header returned by the acquisition read broker. The caller owns
-    /// hash/plan identity and invokes this before any peer header request.
-    pub fn apply_brokered_header<DB, J>(
-        &mut self,
-        data: Blob,
-        config: &LedgerConfig,
-        store: &mut DB,
-        journal: &J,
-    ) -> bool
-    where
-        DB: InboundLedgerStore,
-        J: InboundLedgerJournal,
-    {
-        if self.planner_state.have_header || self.failed || self.complete {
-            return false;
-        }
-        self.try_load_header_from_bytes(data, config, store, false, journal);
-        self.planner_state.have_header && !self.failed
     }
 
     fn try_load_header_from_bytes<DB, J>(
@@ -3024,7 +2783,7 @@ impl InboundLedgerLocal {
 
     /// Prepare the trigger and emit any immediate header or root-node requests.
     ///
-    /// The caller starts the actor-native tree plans indicated by `TriggerSetup`
+    /// The caller starts the direct SHAMap traversal indicated by `TriggerSetup`
     /// and then sends `messages_to_send`.
     pub fn prepare_trigger<CLOCK, S, C, F, MR, NS, DB, FP, J>(
         &mut self,

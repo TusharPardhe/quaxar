@@ -18,18 +18,26 @@ const LEDGER_DATA_JOB_LIMIT: usize = 5;
 type Job = Box<dyn FnOnce() + Send>;
 
 struct QueueState {
+    /// Logical `JtLedgerData` work: coalesced receive drains and admitted
+    /// timeout callbacks. Only these jobs participate in TimeoutCounter's
+    /// waiting-plus-running admission count.
     ledger_data: VecDeque<Job>,
+    /// Actor-external NodeStore writes and durability barriers. They use the
+    /// same bounded worker set, but are not separate logical receive jobs.
+    /// Logical work dequeues first so persistence cannot delay peer recovery.
+    persistence: VecDeque<Job>,
 }
 
 impl QueueState {
     fn is_empty(&self) -> bool {
-        self.ledger_data.is_empty()
+        self.ledger_data.is_empty() && self.persistence.is_empty()
     }
 
     fn dequeue(&mut self) -> Job {
         self.ledger_data
             .pop_front()
-            .expect("non-empty ledger-data queue")
+            .or_else(|| self.persistence.pop_front())
+            .expect("non-empty acquisition queue")
     }
 }
 
@@ -208,6 +216,7 @@ impl WorkerPool {
         let queue = Arc::new((
             Mutex::new(QueueState {
                 ledger_data: VecDeque::new(),
+                persistence: VecDeque::new(),
             }),
             Condvar::new(),
         ));
@@ -284,6 +293,17 @@ impl WorkerPool {
         wake.notify_all();
     }
 
+    fn enqueue_persistence(&self, job: Job) {
+        let (lock, wake) = &*self.queue;
+        let mut jobs = lock.lock().expect("acquisition queue lock");
+        if self.stop.load(Ordering::Acquire) {
+            return;
+        }
+
+        jobs.persistence.push_back(job);
+        wake.notify_all();
+    }
+
     /// Queue a response-processing job. rippled queues this whenever
     /// `InboundLedger::gotData` transitions its dispatch flag to true. This
     /// must not wait for queue capacity: the coalesced dispatch remains live
@@ -291,6 +311,16 @@ impl WorkerPool {
     pub fn submit_ledger_data(&self, job: Job) {
         if !self.stop.load(Ordering::Acquire) {
             self.enqueue_ledger_data(job);
+        }
+    }
+
+    /// Queue actor-external persistence on the acquisition workers without
+    /// consuming a logical `JtLedgerData` reservation. Ordering remains owned
+    /// by `PersistenceQueue`; queue priority keeps this I/O from blocking
+    /// receive drains or TimeoutCounter retry delivery.
+    pub fn submit_persistence(&self, job: Job) {
+        if !self.stop.load(Ordering::Acquire) {
+            self.enqueue_persistence(job);
         }
     }
 
@@ -336,7 +366,7 @@ impl WorkerPool {
     /// Read the current queue pressure without mutating scheduling state.
     pub fn snapshot(&self) -> WorkerPoolSnapshot {
         let jobs = self.queue.0.lock().expect("acquisition queue lock");
-        let queued_jobs = jobs.ledger_data.len();
+        let queued_jobs = jobs.ledger_data.len() + jobs.persistence.len();
         let worker_count = self.workers.lock().expect("acquisition workers lock").len();
         WorkerPoolSnapshot {
             queued_jobs,
@@ -383,6 +413,7 @@ impl WorkerPool {
             // Workers stop without consuming queued work. Drop it now so each
             // queued reservation is released.
             jobs.ledger_data.clear();
+            jobs.persistence.clear();
         }
         wake.notify_all();
         for worker in self

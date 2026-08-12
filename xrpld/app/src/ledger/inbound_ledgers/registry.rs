@@ -25,7 +25,6 @@ use super::acquisition::{
     AcquisitionBuilder, AcquisitionCompletionRecorder, AcquisitionFailureRecorder,
     AcquisitionPeerProvider, AcquisitionSnapshot, AcquisitionState,
 };
-use super::read_broker::{NodeReadBroker, ReadBrokerConfig};
 use super::worker_pool::WorkerPool;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -315,40 +314,6 @@ fn acquisition_snapshot_json(
     is_current_preferred_target: bool,
     snapshot: AcquisitionSnapshot,
 ) -> JsonValue {
-    let broker_tree_cache_reuse_ppm = (snapshot.broker_tree_nodes_decoded != 0).then(|| {
-        snapshot
-            .broker_tree_cache_reused
-            .saturating_mul(1_000_000)
-            .saturating_div(snapshot.broker_tree_nodes_decoded)
-    });
-    let broker_reads_per_new_shared_tree_node_ppm = (snapshot.broker_tree_cache_inserted != 0)
-        .then(|| {
-            snapshot
-                .broker_tree_nodes_decoded
-                .saturating_mul(1_000_000)
-                .saturating_div(snapshot.broker_tree_cache_inserted)
-        });
-    let broker_tree_nodes_decoded_per_second = (snapshot.age_ms != 0).then(|| {
-        snapshot
-            .broker_tree_nodes_decoded
-            .saturating_mul(1_000)
-            .saturating_div(snapshot.age_ms)
-    });
-    let new_shared_tree_nodes_per_second = (snapshot.age_ms != 0).then(|| {
-        snapshot
-            .broker_tree_cache_inserted
-            .saturating_mul(1_000)
-            .saturating_div(snapshot.age_ms)
-    });
-    let lookup_total = snapshot
-        .node_store_fetch_hits
-        .saturating_add(snapshot.node_store_fetch_misses);
-    let lookup_hit_rate_ppm = (lookup_total != 0).then(|| {
-        snapshot
-            .node_store_fetch_hits
-            .saturating_mul(1_000_000)
-            .saturating_div(lookup_total)
-    });
     let average_worker_queue_wait_us = (snapshot.worker_jobs != 0).then(|| {
         snapshot
             .worker_queue_wait_us
@@ -499,40 +464,8 @@ fn acquisition_snapshot_json(
             JsonValue::Unsigned(snapshot.state_scan_loaded_or_cached_children),
         ),
         (
-            "broker_tree_nodes_decoded".to_owned(),
-            JsonValue::Unsigned(snapshot.broker_tree_nodes_decoded),
-        ),
-        (
-            "broker_tree_cache_reused".to_owned(),
-            JsonValue::Unsigned(snapshot.broker_tree_cache_reused),
-        ),
-        (
-            "broker_tree_cache_inserted".to_owned(),
-            JsonValue::Unsigned(snapshot.broker_tree_cache_inserted),
-        ),
-        (
             "state_scan_pending_reads".to_owned(),
             JsonValue::Unsigned(snapshot.state_scan_pending_reads),
-        ),
-        (
-            "state_scan_read_slot_full".to_owned(),
-            JsonValue::Unsigned(snapshot.state_scan_read_slot_full),
-        ),
-        (
-            "state_scan_read_admission_accepted".to_owned(),
-            JsonValue::Unsigned(snapshot.state_scan_read_admission_accepted),
-        ),
-        (
-            "state_scan_read_admission_deferred".to_owned(),
-            JsonValue::Unsigned(snapshot.state_scan_read_admission_deferred),
-        ),
-        (
-            "state_scan_read_admission_attached".to_owned(),
-            JsonValue::Unsigned(snapshot.state_scan_read_admission_attached),
-        ),
-        (
-            "state_scan_read_broker_rejected".to_owned(),
-            JsonValue::Unsigned(snapshot.state_scan_read_broker_rejected),
         ),
         (
             "state_scan_max_pending_reads".to_owned(),
@@ -563,10 +496,6 @@ fn acquisition_snapshot_json(
             JsonValue::Unsigned(snapshot.timeout_dispatches),
         ),
         (
-            "state_scan_max_buffered_packets".to_owned(),
-            JsonValue::Unsigned(snapshot.state_scan_max_buffered_packets),
-        ),
-        (
             "data_drain_runs".to_owned(),
             JsonValue::Unsigned(snapshot.data_drain_runs),
         ),
@@ -593,14 +522,6 @@ fn acquisition_snapshot_json(
         (
             "worker_queue_wait_us".to_owned(),
             JsonValue::Unsigned(snapshot.worker_queue_wait_us),
-        ),
-        (
-            "node_store_lookup_hits".to_owned(),
-            JsonValue::Unsigned(snapshot.node_store_fetch_hits),
-        ),
-        (
-            "node_store_lookup_misses".to_owned(),
-            JsonValue::Unsigned(snapshot.node_store_fetch_misses),
         ),
         (
             "tracked_peers".to_owned(),
@@ -635,36 +556,6 @@ fn acquisition_snapshot_json(
         "header_after_ms".to_owned(),
         snapshot
             .header_after_ms
-            .map(JsonValue::Unsigned)
-            .unwrap_or(JsonValue::Null),
-    );
-    values.insert(
-        "node_store_lookup_hit_rate_ppm".to_owned(),
-        lookup_hit_rate_ppm
-            .map(JsonValue::Unsigned)
-            .unwrap_or(JsonValue::Null),
-    );
-    values.insert(
-        "broker_tree_cache_reuse_ppm".to_owned(),
-        broker_tree_cache_reuse_ppm
-            .map(JsonValue::Unsigned)
-            .unwrap_or(JsonValue::Null),
-    );
-    values.insert(
-        "broker_reads_per_new_shared_tree_node_ppm".to_owned(),
-        broker_reads_per_new_shared_tree_node_ppm
-            .map(JsonValue::Unsigned)
-            .unwrap_or(JsonValue::Null),
-    );
-    values.insert(
-        "broker_tree_nodes_decoded_per_second".to_owned(),
-        broker_tree_nodes_decoded_per_second
-            .map(JsonValue::Unsigned)
-            .unwrap_or(JsonValue::Null),
-    );
-    values.insert(
-        "new_shared_tree_nodes_per_second".to_owned(),
-        new_shared_tree_nodes_per_second
             .map(JsonValue::Unsigned)
             .unwrap_or(JsonValue::Null),
     );
@@ -717,7 +608,6 @@ fn recovery_lcl_decision_json(decision: Option<RecoveryLclDecision>) -> JsonValu
 pub struct InboundLedgers {
     inner: Arc<Mutex<RegistryInner>>,
     worker_pool: Arc<WorkerPool>,
-    read_broker: NodeReadBroker,
     // Shared resources for creating acquisitions
     node_store: Arc<RwLock<Option<SHAMapStoreNodeStore>>>,
     tree_cache: Arc<TreeNodeCache<MonotonicClock>>,
@@ -774,8 +664,6 @@ impl InboundLedgers {
                 completed_ready: VecDeque::new(),
             })),
             worker_pool,
-            read_broker: NodeReadBroker::new(ReadBrokerConfig::default())
-                .expect("default inbound read broker bounds are valid"),
             node_store: Arc::new(RwLock::new(None)),
             tree_cache,
             full_below,
@@ -1050,7 +938,6 @@ impl InboundLedgers {
             seq,
             reason,
             node_store: ns,
-            read_broker: self.read_broker.clone(),
             tree_cache: Arc::clone(&self.tree_cache),
             fetch_pack: Arc::clone(&self.fetch_pack),
             failure_recorder,
@@ -1695,7 +1582,6 @@ impl InboundLedgers {
         for (_, entry) in entries {
             entry.state.cancel();
         }
-        self.read_broker.stop();
         self.worker_pool.stop();
     }
 
@@ -2123,8 +2009,8 @@ mod tests {
     use shamap::tree_node_cache::TreeNodeCache;
     use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
@@ -2710,15 +2596,7 @@ mod tests {
             state_scan_duplicate_missing_hashes: 0,
             state_scan_full_below_hits: 0,
             state_scan_loaded_or_cached_children: 0,
-            broker_tree_nodes_decoded: 0,
-            broker_tree_cache_reused: 0,
-            broker_tree_cache_inserted: 0,
             state_scan_pending_reads: 0,
-            state_scan_read_slot_full: 0,
-            state_scan_read_admission_accepted: 0,
-            state_scan_read_admission_deferred: 0,
-            state_scan_read_admission_attached: 0,
-            state_scan_read_broker_rejected: 0,
             state_scan_max_pending_reads: 0,
             state_scan_pending_hits: 0,
             state_scan_pending_misses: 0,
@@ -2726,7 +2604,6 @@ mod tests {
             state_scan_yields: 0,
             state_scan_continuations: 0,
             timeout_dispatches: 0,
-            state_scan_max_buffered_packets: 0,
             data_drain_runs: 0,
             data_drain_us: 0,
             data_drain_max_us: 0,
@@ -2734,22 +2611,9 @@ mod tests {
             tx_scan_us: 0,
             worker_jobs: 0,
             worker_queue_wait_us: 7,
-            node_store_fetch_hits: 0,
-            node_store_fetch_misses: 0,
             tracked_peers: 0,
             buffered_packets: 0,
             buffered_packets_high_water: 0,
-            mailbox_bytes: 0,
-            mailbox_bytes_high_water: 0,
-            mailbox_events: 0,
-            stale_events: 0,
-            overload_rejections: 0,
-            active_plan_id: None,
-            active_plan_kind: None,
-            plan_pending_hashes: 0,
-            plan_pending_edges: 0,
-            broker_queued_keys: 0,
-            broker_in_flight_keys: 0,
             mailbox_token: "idle",
             scan_continuation_pending: false,
             pending_admitted_timeouts: 0,
@@ -2785,24 +2649,8 @@ mod tests {
         );
         assert_eq!(values.get("data_drain_runs"), Some(&JsonValue::Unsigned(0)));
         assert_eq!(
-            values.get("broker_tree_nodes_decoded"),
-            Some(&JsonValue::Unsigned(0))
-        );
-        assert_eq!(
-            values.get("broker_tree_cache_reuse_ppm"),
-            Some(&JsonValue::Null)
-        );
-        assert_eq!(
-            values.get("broker_reads_per_new_shared_tree_node_ppm"),
-            Some(&JsonValue::Null)
-        );
-        assert_eq!(
             values.get("is_current_preferred_target"),
             Some(&JsonValue::Bool(false))
-        );
-        assert_eq!(
-            values.get("node_store_lookup_hit_rate_ppm"),
-            Some(&JsonValue::Null)
         );
         assert_eq!(
             values.get("average_worker_queue_wait_us"),
