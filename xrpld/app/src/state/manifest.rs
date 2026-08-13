@@ -5,10 +5,11 @@ use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use basics::base_uint::Uint256;
 use basics::base64::base64_decode;
+use basics::basic_config::BasicConfig;
 use basics::string_utilities::{is_properly_formed_toml_domain, str_unhex};
 use protocol::{
     HashPrefix, PublicKey, SOEStyle, SOElement, SOTemplate, STObject, SecretKey, SerialIter,
@@ -105,7 +106,57 @@ pub struct ValidatorToken {
     pub validation_secret: SecretKey,
 }
 
-pub const MAX_UNTRUSTED_MANIFESTS: usize = 100;
+pub const MAX_UNTRUSTED_MANIFESTS: usize = 300;
+pub const MAX_TRUSTED_MANIFESTS: usize = 300;
+pub const MIN_MANIFEST_COUNT: usize = 50;
+pub const MAX_MANIFEST_COUNT: usize = 1000;
+
+/// Resolved `[overlay]` manifest limits. Both settings default to 300 and are
+/// constrained to the same 50–1000 range as rippled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManifestLimits {
+    pub max_untrusted_count: usize,
+    pub max_trusted_count: usize,
+}
+
+impl Default for ManifestLimits {
+    fn default() -> Self {
+        Self {
+            max_untrusted_count: MAX_UNTRUSTED_MANIFESTS,
+            max_trusted_count: MAX_TRUSTED_MANIFESTS,
+        }
+    }
+}
+
+impl ManifestLimits {
+    pub fn from_config(config: &BasicConfig) -> Result<Self, String> {
+        let overlay = config.section("overlay");
+        let parse = |key: &str, default: usize| -> Result<usize, String> {
+            let count = overlay.get::<usize>(key).map_err(|_| {
+                format!("invalid [overlay] {key}: must be an integer count of manifests")
+            })?;
+            let count = count.unwrap_or(default);
+            if !(MIN_MANIFEST_COUNT..=MAX_MANIFEST_COUNT).contains(&count) {
+                return Err(format!(
+                    "invalid [overlay] {key}: must be between {MIN_MANIFEST_COUNT} and {MAX_MANIFEST_COUNT}, inclusive"
+                ));
+            }
+            Ok(count)
+        };
+
+        Ok(Self {
+            max_untrusted_count: parse("max_untrusted_count", MAX_UNTRUSTED_MANIFESTS)?,
+            max_trusted_count: parse("max_trusted_count", MAX_TRUSTED_MANIFESTS)?,
+        })
+    }
+
+    pub const fn maximum_message_size(self) -> usize {
+        overlay::message::maximum_manifests_message_size(
+            self.max_trusted_count,
+            self.max_untrusted_count,
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestRateLimitCapPolicy {
@@ -134,6 +185,7 @@ struct ManifestCacheState {
 pub struct ManifestCache {
     state: RwLock<ManifestCacheState>,
     sequence: AtomicU32,
+    max_untrusted_count: AtomicUsize,
 }
 
 impl Default for ManifestCache {
@@ -152,6 +204,7 @@ impl Clone for ManifestCache {
                 untrusted_master_keys: state.untrusted_master_keys.clone(),
             }),
             sequence: AtomicU32::new(self.sequence.load(Ordering::Relaxed)),
+            max_untrusted_count: AtomicUsize::new(self.max_untrusted_count.load(Ordering::Relaxed)),
         }
     }
 }
@@ -161,7 +214,16 @@ impl ManifestCache {
         Self {
             state: RwLock::new(ManifestCacheState::default()),
             sequence: AtomicU32::new(0),
+            max_untrusted_count: AtomicUsize::new(MAX_UNTRUSTED_MANIFESTS),
         }
+    }
+
+    /// Set the cap for newly admitted untrusted master keys. Existing entries
+    /// and uncapped configured, wallet, and validator-list manifests are not
+    /// affected.
+    pub fn set_max_untrusted_count(&self, max_untrusted_count: usize) {
+        self.max_untrusted_count
+            .store(max_untrusted_count, Ordering::Relaxed);
     }
 
     pub fn sequence(&self) -> u32 {
@@ -309,8 +371,8 @@ impl ManifestCache {
     }
 
     /// Apply a manifest under rippled's trusted-gossip capacity policy. New
-    /// untrusted keys consume one of 100 slots; configured, wallet-loaded, and
-    /// listed keys are uncapped and release any prior untrusted slot.
+    /// untrusted keys consume one configured slot; configured, wallet-loaded,
+    /// and listed keys are uncapped and release any prior untrusted slot.
     pub fn apply_manifest_with_policy(
         &self,
         manifest: Manifest,
@@ -320,7 +382,7 @@ impl ManifestCache {
         let is_new = !state.manifests.contains_key(&manifest.master_key);
         if is_new
             && matches!(policy, ManifestRateLimitCapPolicy::Capped)
-            && state.untrusted_master_keys.len() >= MAX_UNTRUSTED_MANIFESTS
+            && state.untrusted_master_keys.len() >= self.max_untrusted_count.load(Ordering::Relaxed)
         {
             return ManifestDisposition::UntrustedCapacity;
         }

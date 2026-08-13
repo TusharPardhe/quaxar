@@ -49,7 +49,7 @@ use crate::state::candidate_diagnostics::{
     CandidateAdmissionDiagnostic, CandidateDiagnosticDecision, emit_candidate_admission_diagnostic,
 };
 use crate::state::collector_manager::{CollectorManager, CollectorParams};
-use crate::state::manifest::ManifestCache;
+use crate::state::manifest::{ManifestCache, ManifestLimits};
 use crate::state::node_store_scheduler::NodeStoreScheduler;
 use crate::state::overlay_status::OverlayStatusSource;
 use crate::state::snapshot_export_state::{SnapshotExportState, SnapshotExportStatus};
@@ -497,6 +497,7 @@ impl Default for PublicationAdvanceState {
 #[derive(Clone)]
 pub struct ApplicationRoot {
     registry: ApplicationRegistryOwners,
+    manifest_limits: ManifestLimits,
     basic_app: Arc<BasicApp>,
     job_queue: Arc<JobQueue>,
     /// Shared, persistent ledger persistence runtime -- constructed once so
@@ -4119,6 +4120,7 @@ impl ApplicationRoot {
             fee_vote_setup: fee_setup,
             fee_change_reporter,
             registry,
+            manifest_limits: ManifestLimits::default(),
             node_store_scheduler: Arc::new(NodeStoreScheduler::new(job_queue)),
             node_family: None,
             resolver_runtime: None,
@@ -5719,23 +5721,55 @@ impl ApplicationRoot {
         self.overlay_status.replace(overlay_status)
     }
 
+    pub fn manifest_limits(&self) -> ManifestLimits {
+        self.manifest_limits
+    }
+
+    pub fn configure_manifest_limits(&mut self, manifest_limits: ManifestLimits) {
+        self.registry
+            .validator_manifest_cache
+            .set_max_untrusted_count(manifest_limits.max_untrusted_count);
+        self.registry
+            .publisher_manifest_cache
+            .set_max_untrusted_count(manifest_limits.max_untrusted_count);
+        self.manifest_limits = manifest_limits;
+    }
+
     pub fn attach_overlay_runtime(
         &mut self,
         overlay_runtime: Arc<AppOverlayRuntime>,
     ) -> Option<Arc<AppOverlayRuntime>> {
         let overlay = overlay_runtime.overlay();
+        let manifest_limits = self.manifest_limits;
+        overlay.set_max_manifests_message_size(manifest_limits.maximum_message_size());
         let manifests = Arc::clone(&self.registry.validator_manifest_cache);
+        let validators = self.validators();
         overlay.set_manifests_message_provider(move || {
-            // rippled 3.2.1: kMaxManifestsPerMessage = 200, kMaxManifestBytes = 358.
-            // Cap outgoing manifest messages to prevent oversized TMManifests
-            // that updated peers would drop (manifest cache poisoning mitigation).
-            const MAX_MANIFESTS_PER_MESSAGE: usize = 200;
             const MAX_MANIFEST_BYTES: usize = 358;
-            let list = manifests
-                .serialized_manifests()
+            let mut trusted = Vec::new();
+            let mut untrusted = Vec::new();
+            for serialized in manifests.serialized_manifests() {
+                if serialized.len() > MAX_MANIFEST_BYTES {
+                    continue;
+                }
+                let Some(manifest) = crate::state::manifest::deserialize_manifest(&serialized)
+                else {
+                    continue;
+                };
+                if validators.listed(manifest.master_key) {
+                    trusted.push(serialized);
+                } else {
+                    untrusted.push(serialized);
+                }
+            }
+            trusted.truncate(manifest_limits.max_trusted_count);
+            trusted.extend(
+                untrusted
+                    .into_iter()
+                    .take(manifest_limits.max_untrusted_count),
+            );
+            let list = trusted
                 .into_iter()
-                .filter(|m| m.len() <= MAX_MANIFEST_BYTES)
-                .take(MAX_MANIFESTS_PER_MESSAGE)
                 .map(|stobject| overlay::message::wire::TmManifest { stobject })
                 .collect::<Vec<_>>();
             (!list.is_empty()).then(|| {

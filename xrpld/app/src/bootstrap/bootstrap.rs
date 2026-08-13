@@ -6,6 +6,7 @@
 //! `MainRuntime` shell.
 
 use crate::state::app_registry::RelayUntrustedPolicy;
+use crate::state::manifest::ManifestLimits;
 use crate::{
     ApplicationRoot, ApplicationRootOptions, BootstrapOverlayHandoff, DescriptorLimitProvider,
     MainRuntime, PendingReplayStartup, SHAMapStoreComponent, SHAMapStoreComponentRuntime,
@@ -626,6 +627,7 @@ pub fn build_bootstrap_root(
     config: &BasicConfig,
     options: &AppBootstrapOptions,
 ) -> Result<AppBootstrapRoot, String> {
+    let manifest_limits = ManifestLimits::from_config(config)?;
     let mut effective_options = options.clone();
     let fast_load = node_db_fast_load(config);
     if fast_load
@@ -683,6 +685,7 @@ pub fn build_bootstrap_root(
         ..ApplicationRootOptions::default()
     })
     .map_err(|error| error.to_string())?;
+    root.configure_manifest_limits(manifest_limits);
 
     root.set_path_search_levels(path_search_old, path_search, path_search_fast);
     let _ = root.set_path_search_max(path_search_max);
@@ -2596,14 +2599,10 @@ fn run_start_mode_consensus_loop(
                     for inbound in manifests {
                         let mut relay_list = Vec::new();
                         let mut trusted_manifest_accepted = false;
-                        // Snapshot the cache before this TMManifests message.
-                        // A new untrusted key may be admitted for processing,
-                        // but it is relayable only when it was already known
-                        // before this message arrived.
-                        let known_master_keys = root.manifest_cache().known_master_keys();
-                        // rippled bounds untrusted work to 200 per message but
-                        // never drops a trusted validator manifest merely
+                        // Bound untrusted work to the configured per-message cap,
+                        // but never drop a trusted validator manifest merely
                         // because it follows untrusted gossip.
+                        let max_untrusted_count = root.manifest_limits().max_untrusted_count;
                         let mut untrusted_processed = 0usize;
                         let mut skipped_untrusted = false;
 
@@ -2624,10 +2623,10 @@ fn run_start_mode_consensus_loop(
 
                             let master_key = manifest.master_key;
                             let is_trusted = root.validators().listed(master_key);
-                            let known_before_message = known_master_keys.contains(&master_key);
                             let Some(policy) = manifest_rate_limit_policy(
                                 is_trusted,
                                 &mut untrusted_processed,
+                                max_untrusted_count,
                             ) else {
                                 skipped_untrusted = true;
                                 continue;
@@ -2636,20 +2635,13 @@ fn run_start_mode_consensus_loop(
                             let disposition = root
                                 .manifest_cache()
                                 .apply_manifest_with_policy(manifest, policy);
-                            if relay_accepted_manifest(
-                                disposition,
-                                is_trusted,
-                                known_before_message,
-                            ) {
+                            if relay_accepted_manifest(disposition) {
                                 if is_trusted {
                                     root.manifest_cache().promote_to_trusted(&master_key);
                                     trusted_manifest_accepted = true;
                                 }
-                                // Relay only newly accepted trusted manifests, or
-                                // accepted untrusted updates to masters already
-                                // known before this message. Never relay a
-                                // first-seen untrusted key, stale cache entry, or
-                                // rejected admission.
+                                // Relay every newly accepted manifest. Stale cache
+                                // entries and rejected admissions are not relayed.
                                 relay_list.push(wire_manifest);
                             }
                         }
@@ -2822,7 +2814,6 @@ where
 }
 
 const MAX_MANIFEST_BYTES: usize = 358;
-const MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE: usize = 200;
 
 /// Select startup manifest gossip like rippled OverlayImpl::getManifestsMessage:
 /// every listed (trusted) manifest precedes an independently capped tail of
@@ -2830,6 +2821,7 @@ const MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE: usize = 200;
 /// ValidatorList, avoiding manifest-cache/validator-list lock inversion.
 fn trusted_first_manifest_payloads(
     entries: impl IntoIterator<Item = (bool, Vec<u8>)>,
+    manifest_limits: ManifestLimits,
 ) -> Vec<Vec<u8>> {
     let mut trusted = Vec::new();
     let mut untrusted = Vec::new();
@@ -2840,10 +2832,11 @@ fn trusted_first_manifest_payloads(
             untrusted.push(serialized);
         }
     }
+    trusted.truncate(manifest_limits.max_trusted_count);
     trusted.extend(
         untrusted
             .into_iter()
-            .take(MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE),
+            .take(manifest_limits.max_untrusted_count),
     );
     trusted
 }
@@ -2858,6 +2851,7 @@ fn install_trusted_first_manifest_provider(root: &crate::ApplicationRoot) {
     };
     let manifests = Arc::clone(root.manifest_cache());
     let validators = root.validators();
+    let manifest_limits = root.manifest_limits();
     overlay_rt
         .overlay()
         .set_manifests_message_provider(move || {
@@ -2871,7 +2865,7 @@ fn install_trusted_first_manifest_provider(root: &crate::ApplicationRoot) {
                     let manifest = crate::state::manifest::deserialize_manifest(&serialized)?;
                     Some((validators.listed(manifest.master_key), serialized))
                 });
-            let list = trusted_first_manifest_payloads(entries)
+            let list = trusted_first_manifest_payloads(entries, manifest_limits)
                 .into_iter()
                 .map(|stobject| overlay::message::wire::TmManifest { stobject })
                 .collect::<Vec<_>>();
@@ -3126,28 +3120,24 @@ fn take_validator_list_inbound(
 
 /// Apply rippled's trust-first `TMManifests` admission rule. Trusted entries
 /// never consume the untrusted-work budget, so they remain processable after
-/// a peer has sent its 200th untrusted manifest.
+/// a peer has sent its 300th untrusted manifest.
 fn manifest_rate_limit_policy(
     is_trusted: bool,
     untrusted_processed: &mut usize,
+    max_untrusted_count: usize,
 ) -> Option<crate::state::manifest::ManifestRateLimitCapPolicy> {
     if is_trusted {
         return Some(crate::state::manifest::ManifestRateLimitCapPolicy::Uncapped);
     }
-    if *untrusted_processed >= MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE {
+    if *untrusted_processed >= max_untrusted_count {
         return None;
     }
     *untrusted_processed += 1;
     Some(crate::state::manifest::ManifestRateLimitCapPolicy::Capped)
 }
 
-fn relay_accepted_manifest(
-    disposition: crate::state::manifest::ManifestDisposition,
-    is_trusted: bool,
-    known_before_message: bool,
-) -> bool {
+fn relay_accepted_manifest(disposition: crate::state::manifest::ManifestDisposition) -> bool {
     disposition == crate::state::manifest::ManifestDisposition::Accepted
-        && (is_trusted || known_before_message)
 }
 
 /// Matches PeerImp::processLedgerRequest: every non-candidate request is
@@ -5333,12 +5323,11 @@ fn should_schedule_relayed_transaction(
 #[cfg(test)]
 mod tests {
     use super::{
-        ENDPOINT_HANDOUT_LIMIT, FetchPackAdmission, GenericGetObjectAdmission,
-        MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE, MainRuntime, StartUpType, amendments_from_config,
-        build_endpoint_handout, build_validator_list_collection_messages,
-        candidate_ledger_data_charge, classify_fetch_pack_request,
-        classify_generic_get_object_request, configured_feature_ids, configured_sweep_interval,
-        fetch_pack_failure_charge, get_ledger_send_queue_is_admissible,
+        ENDPOINT_HANDOUT_LIMIT, FetchPackAdmission, GenericGetObjectAdmission, MainRuntime,
+        StartUpType, amendments_from_config, build_endpoint_handout,
+        build_validator_list_collection_messages, candidate_ledger_data_charge,
+        classify_fetch_pack_request, classify_generic_get_object_request, configured_feature_ids,
+        configured_sweep_interval, fetch_pack_failure_charge, get_ledger_send_queue_is_admissible,
         get_object_query_send_queue_is_admissible, ledger_data_nodes_are_admissible,
         ledger_data_sequence_is_admissible, manifest_rate_limit_policy, parse_basic_config_text,
         relay_accepted_manifest, requested_transaction_envelope, sequence_is_fetchable_at_floor,
@@ -5346,7 +5335,9 @@ mod tests {
         transaction_object_request_is_admissible, trusted_first_manifest_payloads,
         validator_list_collection_blobs, validator_list_threshold_from_config,
     };
-    use crate::state::manifest::{ManifestDisposition, ManifestRateLimitCapPolicy};
+    use crate::state::manifest::{
+        MAX_UNTRUSTED_MANIFESTS, ManifestDisposition, ManifestLimits, ManifestRateLimitCapPolicy,
+    };
     use crate::{ApplicationRoot, ValidatorListBroadcastBlob, ValidatorListCollectionForBroadcast};
     use basics::base_uint::Uint256;
     use basics::hardened_hash::HardenedHashBuilder;
@@ -5505,16 +5496,59 @@ mod tests {
     }
 
     #[test]
-    fn startup_manifest_gossip_is_trusted_first_with_bounded_untrusted_tail() {
+    fn manifest_limits_parse_defaults_independently_and_enforce_bounds() {
+        let defaults = parse_basic_config_text("[overlay]\n").expect("config parses");
+        assert_eq!(
+            ManifestLimits::from_config(&defaults),
+            Ok(ManifestLimits::default())
+        );
+
+        let configured = parse_basic_config_text(
+            "[overlay]\nmax_untrusted_count = 50\nmax_trusted_count = 1000\n",
+        )
+        .expect("config parses");
+        assert_eq!(
+            ManifestLimits::from_config(&configured),
+            Ok(ManifestLimits {
+                max_untrusted_count: 50,
+                max_trusted_count: 1000,
+            })
+        );
+
+        for config in [
+            "[overlay]\nmax_untrusted_count = 49\n",
+            "[overlay]\nmax_trusted_count = 1001\n",
+            "[overlay]\nmax_untrusted_count = invalid\n",
+        ] {
+            let config = parse_basic_config_text(config).expect("config parses");
+            assert!(ManifestLimits::from_config(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn startup_manifest_gossip_is_trusted_first_with_independent_bounded_suffix() {
         let entries = std::iter::once((true, vec![1]))
             .chain(std::iter::once((true, vec![2])))
+            .chain(std::iter::once((true, vec![3])))
             .chain(
-                (0..MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE + 1)
+                (0..MAX_UNTRUSTED_MANIFESTS + 1)
                     .map(|n| (false, vec![u8::try_from(n % 255).expect("bounded byte")])),
             );
-        let selected = trusted_first_manifest_payloads(entries);
-        assert_eq!(selected.len(), MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE + 2);
-        assert_eq!(&selected[..2], &[vec![1], vec![2]]);
+        let selected = trusted_first_manifest_payloads(entries, ManifestLimits::default());
+        assert_eq!(selected.len(), MAX_UNTRUSTED_MANIFESTS + 3);
+        assert_eq!(&selected[..3], &[vec![1], vec![2], vec![3]]);
+
+        let entries = [(true, vec![1]), (true, vec![2]), (true, vec![3])]
+            .into_iter()
+            .chain([(false, vec![4]), (false, vec![5]), (false, vec![6])]);
+        let selected = trusted_first_manifest_payloads(
+            entries,
+            ManifestLimits {
+                max_untrusted_count: 2,
+                max_trusted_count: 2,
+            },
+        );
+        assert_eq!(selected, vec![vec![1], vec![2], vec![4], vec![5]]);
     }
 
     #[test]
@@ -5673,46 +5707,34 @@ mod tests {
     #[test]
     fn manifest_gossip_processes_trusted_after_untrusted_cap_and_relays_only_accepts() {
         let mut untrusted_processed = 0;
-        for _ in 0..MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE {
+        for _ in 0..MAX_UNTRUSTED_MANIFESTS {
             assert_eq!(
-                manifest_rate_limit_policy(false, &mut untrusted_processed),
+                manifest_rate_limit_policy(
+                    false,
+                    &mut untrusted_processed,
+                    MAX_UNTRUSTED_MANIFESTS
+                ),
                 Some(ManifestRateLimitCapPolicy::Capped)
             );
         }
         assert_eq!(
-            manifest_rate_limit_policy(false, &mut untrusted_processed),
+            manifest_rate_limit_policy(false, &mut untrusted_processed, MAX_UNTRUSTED_MANIFESTS),
             None,
-            "the 201st untrusted manifest must not consume work"
+            "the 301st untrusted manifest must not consume work"
         );
         assert_eq!(
-            manifest_rate_limit_policy(true, &mut untrusted_processed),
+            manifest_rate_limit_policy(true, &mut untrusted_processed, MAX_UNTRUSTED_MANIFESTS),
             Some(ManifestRateLimitCapPolicy::Uncapped),
             "trusted manifests remain processable beyond the untrusted cap"
         );
-        assert_eq!(untrusted_processed, MAX_UNTRUSTED_MANIFESTS_PER_MESSAGE);
-        assert!(relay_accepted_manifest(
-            ManifestDisposition::Accepted,
-            true,
-            false,
-        ));
-        assert!(relay_accepted_manifest(
-            ManifestDisposition::Accepted,
-            false,
-            true,
-        ));
+        assert_eq!(untrusted_processed, MAX_UNTRUSTED_MANIFESTS);
+        assert!(relay_accepted_manifest(ManifestDisposition::Accepted));
         assert!(
-            !relay_accepted_manifest(ManifestDisposition::Accepted, false, false),
-            "a first-seen untrusted master must not be relayed"
+            !relay_accepted_manifest(ManifestDisposition::Stale),
+            "stale cache entries must not be relayed"
         );
         assert!(!relay_accepted_manifest(
-            ManifestDisposition::Stale,
-            true,
-            true,
-        ));
-        assert!(!relay_accepted_manifest(
             ManifestDisposition::UntrustedCapacity,
-            false,
-            true,
         ));
     }
 

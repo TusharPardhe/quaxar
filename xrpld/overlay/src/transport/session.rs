@@ -35,6 +35,10 @@ impl<T> PeerSessionStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {
 pub type BoxPeerSessionStream = Box<dyn PeerSessionStream>;
 
 pub trait PeerSessionHooks: Send + Sync {
+    fn max_manifests_message_size(&self) -> usize {
+        crate::message::MAXIMUM_MANIFESTS_MESSAGE_SIZE
+    }
+
     fn on_message_begin(&self, _peer: &Arc<PeerImp>, _header: &MessageHeader, _compressed: bool) {}
     fn on_message(&self, _peer: &Arc<PeerImp>, _message: &ProtocolMessage) {}
     /// Returns true only when one bounded ledger-data frame was retained for
@@ -472,6 +476,10 @@ impl PeerSessionDispatch {
 impl ProtocolMessageHandler for PeerSessionDispatch {
     fn compression_enabled(&self) -> bool {
         self.peer.compression_enabled()
+    }
+
+    fn max_manifests_message_size(&self) -> usize {
+        self.hooks.max_manifests_message_size()
     }
 
     fn on_message_begin(&mut self, header: &MessageHeader, compressed: bool) {

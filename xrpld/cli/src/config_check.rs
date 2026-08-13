@@ -337,6 +337,13 @@ fn validate_overlay(config: &BasicConfig, report: &mut ConfigValidationReport) {
     {
         report.errors.push(format!("[overlay] ip_limit {error}"));
     }
+    for key in ["max_untrusted_count", "max_trusted_count"] {
+        if let Some(raw) = optional_string(section, key)
+            && let Err(error) = parse_usize_range(&raw, 50, 1_000)
+        {
+            report.errors.push(format!("[overlay] {key} {error}"));
+        }
+    }
     if let Some(raw) = optional_string(section, "verify_endpoints")
         && parse_bool_value(&raw).is_err()
     {
@@ -630,6 +637,25 @@ maybe
                 "missing expected error '{expected}' in:\n{errors}"
             );
         }
+    }
+
+    #[test]
+    fn config_validation_enforces_manifest_count_bounds() {
+        let valid = validate_config_content(
+            "[overlay]\nmax_untrusted_count = 50\nmax_trusted_count = 1000\n",
+        );
+        assert!(
+            valid.errors.is_empty(),
+            "unexpected errors for inclusive bounds: {:?}",
+            valid.errors
+        );
+
+        let invalid = validate_config_content(
+            "[overlay]\nmax_untrusted_count = 49\nmax_trusted_count = 1001\n",
+        );
+        let errors = invalid.errors.join("\n");
+        assert!(errors.contains("[overlay] max_untrusted_count"));
+        assert!(errors.contains("[overlay] max_trusted_count"));
     }
 
     #[test]

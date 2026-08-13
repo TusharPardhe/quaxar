@@ -13,6 +13,28 @@ use crate::traffic_count::TrafficCategory;
 
 pub const MAXIMUM_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
+// A TMManifests frame carries every trusted manifest plus the bounded
+// untrusted tail. Bound it before decompression and protobuf decoding so an
+// oversized peer frame is consumed without penalizing the connection.
+pub const MAX_MANIFEST_BYTES: usize = 358;
+pub const MANIFEST_FRAMING_BYTES: usize = 8;
+pub const DEFAULT_MAX_TRUSTED_MANIFESTS: usize = 300;
+pub const DEFAULT_MAX_UNTRUSTED_MANIFESTS: usize = 300;
+pub const MAX_CONFIGURED_MANIFESTS: usize = 1000;
+
+pub const fn maximum_manifests_message_size(trusted_count: usize, untrusted_count: usize) -> usize {
+    (trusted_count + untrusted_count) * (MAX_MANIFEST_BYTES + MANIFEST_FRAMING_BYTES)
+}
+
+pub const MAXIMUM_MANIFESTS_MESSAGE_SIZE: usize = maximum_manifests_message_size(
+    DEFAULT_MAX_TRUSTED_MANIFESTS,
+    DEFAULT_MAX_UNTRUSTED_MANIFESTS,
+);
+const _: () = assert!(
+    maximum_manifests_message_size(MAX_CONFIGURED_MANIFESTS, MAX_CONFIGURED_MANIFESTS)
+        < MAXIMUM_MESSAGE_SIZE
+);
+
 pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/protocol.rs"));
 }
@@ -326,6 +348,7 @@ pub struct DecodedProtocolMessage {
     pub message: Option<ProtocolMessage>,
     pub consumed: usize,
     pub hint: usize,
+    pub dropped: bool,
 }
 
 #[derive(Debug)]
@@ -364,6 +387,10 @@ impl std::error::Error for ProtocolMessageError {}
 pub trait ProtocolMessageHandler {
     fn compression_enabled(&self) -> bool {
         true
+    }
+
+    fn max_manifests_message_size(&self) -> usize {
+        MAXIMUM_MANIFESTS_MESSAGE_SIZE
     }
 
     fn on_message_begin(&mut self, _header: &MessageHeader, _compressed: bool) {}
@@ -463,6 +490,18 @@ pub fn decode_protocol_message(
     bytes: &[u8],
     compression_enabled: bool,
 ) -> Result<DecodedProtocolMessage, ProtocolMessageError> {
+    decode_protocol_message_with_manifests_limit(
+        bytes,
+        compression_enabled,
+        MAXIMUM_MANIFESTS_MESSAGE_SIZE,
+    )
+}
+
+fn decode_protocol_message_with_manifests_limit(
+    bytes: &[u8],
+    compression_enabled: bool,
+    max_manifests_message_size: usize,
+) -> Result<DecodedProtocolMessage, ProtocolMessageError> {
     let Some(header) = parse_message_header(bytes)? else {
         return Ok(DecodedProtocolMessage {
             header: MessageHeader {
@@ -476,6 +515,7 @@ pub fn decode_protocol_message(
             message: None,
             consumed: 0,
             hint: 0,
+            dropped: false,
         });
     };
 
@@ -495,6 +535,20 @@ pub fn decode_protocol_message(
             message: None,
             consumed: 0,
             hint: header.total_wire_size as usize - bytes.len(),
+            dropped: false,
+        });
+    }
+
+    if header.message_type == ProtocolMessageType::MtManifests as u16
+        && (header.payload_wire_size as usize > max_manifests_message_size
+            || header.uncompressed_size as usize > max_manifests_message_size)
+    {
+        return Ok(DecodedProtocolMessage {
+            header,
+            message: None,
+            consumed: header.total_wire_size as usize,
+            hint: 0,
+            dropped: true,
         });
     }
 
@@ -522,6 +576,7 @@ pub fn decode_protocol_message(
         message,
         consumed: header.total_wire_size as usize,
         hint: 0,
+        dropped: false,
     })
 }
 
@@ -530,10 +585,17 @@ pub fn invoke_protocol_message<H: ProtocolMessageHandler>(
     handler: &mut H,
     hint: &mut usize,
 ) -> Result<usize, ProtocolMessageError> {
-    let decoded = decode_protocol_message(bytes, handler.compression_enabled())?;
+    let decoded = decode_protocol_message_with_manifests_limit(
+        bytes,
+        handler.compression_enabled(),
+        handler.max_manifests_message_size(),
+    )?;
     *hint = decoded.hint;
     if decoded.consumed == 0 {
         return Ok(0);
+    }
+    if decoded.dropped {
+        return Ok(decoded.consumed);
     }
 
     if let Some(message) = decoded.message.as_ref() {
@@ -676,6 +738,25 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn oversized_manifests_frame_is_silently_consumed_before_decode() {
+        let manifests = TmManifests {
+            list: vec![wire::TmManifest {
+                stobject: vec![0; super::MAXIMUM_MANIFESTS_MESSAGE_SIZE + 1],
+            }],
+            ..Default::default()
+        };
+        let message = Message::new(
+            ProtocolMessage::new(ProtocolPayload::Manifests(manifests)),
+            None,
+        );
+        let decoded = decode_protocol_message(message.get_buffer(Compressed::Off), true)
+            .expect("oversized manifests frame is dropped, not rejected");
+        assert!(decoded.dropped);
+        assert!(decoded.message.is_none());
+        assert_eq!(decoded.consumed, message.get_buffer_size());
     }
 
     #[test]

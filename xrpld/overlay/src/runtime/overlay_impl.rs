@@ -6,7 +6,7 @@ use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -42,8 +42,8 @@ use crate::inbound::{
     QueuedTransaction, QueuedValidation,
 };
 use crate::message::{
-    Message, ProtocolMessage, ProtocolMessageType, ProtocolPayload, TmProposeSet, TmSquelch,
-    TmTransaction, TmValidation,
+    MAXIMUM_MANIFESTS_MESSAGE_SIZE, Message, ProtocolMessage, ProtocolMessageType, ProtocolPayload,
+    TmProposeSet, TmSquelch, TmTransaction, TmValidation,
 };
 use crate::overlay::{Handoff, Overlay, Setup, stats_to_json};
 use crate::peer::status_change::{build_peer_status_event, lost_sync_event};
@@ -460,6 +460,10 @@ impl OverlayPeerSessionHooks {
 }
 
 impl PeerSessionHooks for OverlayPeerSessionHooks {
+    fn max_manifests_message_size(&self) -> usize {
+        self.overlay.max_manifests_message_size()
+    }
+
     fn on_message_begin(
         &self,
         _peer: &Arc<PeerImp>,
@@ -1383,6 +1387,8 @@ pub struct OverlayImpl {
     handshake_ledgers: Arc<RwLock<Option<(Uint256, Uint256)>>>,
     /// Cached manifest message provider installed by the app state owner.
     manifests_message_provider: Arc<RwLock<Option<ManifestsMessageProvider>>>,
+    /// Per-node [overlay] manifests frame limit, read before decompression.
+    max_manifests_message_size: Arc<AtomicUsize>,
     /// App-owned PeerFinder failure sink for outbound peers that remain Not
     /// Useful. Overlay retains only this callback, never PeerFinder state.
     outbound_peer_failure_handler: Arc<RwLock<Option<OutboundPeerFailureHandler>>>,
@@ -1491,6 +1497,7 @@ impl OverlayImpl {
             peer_status_publisher: Arc::new(RwLock::new(None)),
             handshake_ledgers: Arc::new(RwLock::new(None)),
             manifests_message_provider: Arc::new(RwLock::new(None)),
+            max_manifests_message_size: Arc::new(AtomicUsize::new(MAXIMUM_MANIFESTS_MESSAGE_SIZE)),
             outbound_peer_failure_handler: Arc::new(RwLock::new(None)),
             outbound_peer_close_handler: Arc::new(RwLock::new(None)),
             session_tasks: Arc::new(SessionTaskTracker::default()),
@@ -1506,6 +1513,15 @@ impl OverlayImpl {
             .manifests_message_provider
             .write()
             .expect("manifest message provider lock") = Some(Arc::new(provider));
+    }
+
+    pub fn set_max_manifests_message_size(&self, max_manifests_message_size: usize) {
+        self.max_manifests_message_size
+            .store(max_manifests_message_size, Ordering::Relaxed);
+    }
+
+    fn max_manifests_message_size(&self) -> usize {
+        self.max_manifests_message_size.load(Ordering::Relaxed)
     }
 
     pub fn set_outbound_peer_failure_handler(
@@ -2108,6 +2124,7 @@ impl OverlayImpl {
             peer_status_publisher: Arc::clone(&self.peer_status_publisher),
             handshake_ledgers: Arc::clone(&self.handshake_ledgers),
             manifests_message_provider: Arc::clone(&self.manifests_message_provider),
+            max_manifests_message_size: Arc::clone(&self.max_manifests_message_size),
             outbound_peer_failure_handler: Arc::clone(&self.outbound_peer_failure_handler),
             outbound_peer_close_handler: Arc::clone(&self.outbound_peer_close_handler),
             session_tasks: Arc::clone(&self.session_tasks),
