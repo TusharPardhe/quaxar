@@ -1148,25 +1148,39 @@ impl InboundLedgers {
         let durable_completion_recorder: AcquisitionDurableCompletionRecorder = {
             let inner = Arc::clone(&self.inner);
             let publication_advance_notifier = Arc::clone(&self.publication_advance_notifier);
-            Arc::new(move |completed_hash| {
+            Arc::new(move |identity| {
                 let ready = {
                     let mut inner = inner
                         .lock()
                         .expect("inbound_ledgers durable completion recorder lock");
-                    if let Some(entry) = inner.entries.get_mut(&completed_hash)
-                        && entry.id == acquisition_id
+                    if let Some(entry) = inner.entries.get_mut(&identity.target_hash)
+                        && entry.id == identity.acquisition_id
                         && !entry.failed
                         && entry.completed_ledger.is_some()
+                        && entry.provisional_identity == Some(identity)
                     {
                         entry.provisional_identity = None;
                         inner
                             .completed_ready
-                            .push_back((completed_hash, acquisition_id));
+                            .push_back((identity.target_hash, identity.acquisition_id));
                         true
                     } else {
                         false
                     }
                 };
+                if ready {
+                    tracing::debug!(
+                        target: "inbound_ledger",
+                        event = "provisional_durable_ready",
+                        target_hash = %identity.target_hash,
+                        ledger_hash = %identity.ledger_hash,
+                        ledger_seq = identity.ledger_seq,
+                        acquisition_id = identity.acquisition_id,
+                        store_generation = identity.store_generation,
+                        persistence_generation = identity.persistence_generation,
+                        "exact provisional inbound identity crossed durability fence"
+                    );
+                }
                 if ready
                     && let Some(notify) = publication_advance_notifier
                         .read()
@@ -1763,7 +1777,10 @@ impl InboundLedgers {
             .count()
     }
 
-    /// Notify that a ledger was completed (called externally or by sweep).
+    /// Unit-test-only completion shortcut. Production terminal acquisition
+    /// completion must cross the exact NodeStore durability barrier and record
+    /// a `ProvisionalLedgerIdentity`; this helper intentionally cannot do so.
+    #[cfg(test)]
     pub fn on_complete(&self, hash: Uint256, ledger: Arc<Ledger>) {
         let completion_id = {
             let mut inner = self.inner.lock().expect("inbound_ledgers lock");
@@ -1811,6 +1828,20 @@ impl InboundLedgers {
             record_recent_failure(&mut inner, hash, None);
         }
         self.notify_publication_advance();
+    }
+
+    /// Return the exact resolver-visible lifecycle identity while its final
+    /// NodeStore barrier remains provisional. Callers may use it only as a
+    /// wait key; it never grants adoption authority outside NetworkOps.
+    pub(crate) fn provisional_identity(&self, hash: &Uint256) -> Option<ProvisionalLedgerIdentity> {
+        let inner = self.inner.lock().expect("inbound_ledgers lock");
+        inner.entries.get(hash).and_then(|entry| {
+            (!entry.failed
+                && entry.completed_ledger.is_some()
+                && !entry.state.completed.load(Ordering::Acquire))
+            .then_some(entry.provisional_identity)
+            .flatten()
+        })
     }
 
     /// True only while a completed ledger is resolver-visible but its final
@@ -1975,16 +2006,20 @@ impl InboundLedgers {
         // Cancellation must happen while the exact registry entry is still
         // present so its recorder can revoke a provisional resolver result.
         if let Some(state) = state {
+            let acquisition_id = state.acquisition_id;
             state.cancel();
             let removed = {
                 let mut inner = self.inner.lock().expect("inbound_ledgers lock");
-                let removed = inner.entries.remove(hash).is_some();
-                if removed {
-                    inner
-                        .completed_ready
-                        .retain(|(ready_hash, _)| ready_hash != hash);
+                let exact_entry = inner.entries.get(hash).is_some_and(|entry| {
+                    entry.id == acquisition_id && Arc::ptr_eq(&entry.state, &state)
+                });
+                if exact_entry {
+                    inner.entries.remove(hash);
+                    inner.completed_ready.retain(|(ready_hash, ready_id)| {
+                        ready_hash != hash || *ready_id != acquisition_id
+                    });
                 }
-                removed
+                exact_entry
             };
             if removed {
                 self.notify_publication_advance();
@@ -2149,20 +2184,24 @@ impl InboundLedgers {
                         && entry.state.seq() > 1
                         && entry.state.seq() < min_seq
                 })
-                .map(|(hash, entry)| (*hash, Arc::clone(&entry.state)))
+                .map(|(hash, entry)| (*hash, entry.id, Arc::clone(&entry.state)))
                 .collect::<Vec<_>>()
         };
-        for (_, state) in &candidates {
+        for (_, _, state) in &candidates {
             state.cancel();
         }
         let count = {
             let mut inner = self.inner.lock().expect("inbound_ledgers lock");
             let mut count = 0;
-            for (hash, _) in &candidates {
-                if inner.entries.remove(hash).is_some() {
-                    inner
-                        .completed_ready
-                        .retain(|(ready_hash, _)| ready_hash != hash);
+            for (hash, acquisition_id, state) in &candidates {
+                let exact_entry = inner.entries.get(hash).is_some_and(|entry| {
+                    entry.id == *acquisition_id && Arc::ptr_eq(&entry.state, state)
+                });
+                if exact_entry {
+                    inner.entries.remove(hash);
+                    inner.completed_ready.retain(|(ready_hash, ready_id)| {
+                        ready_hash != hash || *ready_id != *acquisition_id
+                    });
                     count += 1;
                 }
             }

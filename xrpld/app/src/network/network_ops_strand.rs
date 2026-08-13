@@ -28,7 +28,7 @@ use crate::consensus::rcl_consensus::{ConsensusRunner, PendingAcceptWork};
 use crate::consensus::rcl_validation::RclValidatedLedger;
 use crate::job::job_queue::JobQueue;
 use crate::job::job_types::JobType;
-use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers};
+use crate::ledger::inbound_ledgers::{AcquireReason, InboundLedgers, ProvisionalLedgerIdentity};
 use crate::network::network_ops::NetworkOpsOperatingMode;
 use crate::runtime::component_runtime::{AppConsensusRuntime, ConsensusCommand};
 
@@ -39,6 +39,10 @@ use overlay::inbound::QueuedProposal;
 // request is not repeatedly touched and a sparse skip list cannot fan out
 // acquisitions between heartbeats.
 const HISTORY_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// A retained provisional preferred-LCL waiter is checked immediately on its
+/// exact lifecycle wake and otherwise rechecks the moving preferred target at
+/// the ordinary heartbeat cadence, never once per strand wake.
+const PROVISIONAL_LCL_RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 // A polling turn must always return to the heartbeat scheduler. The overlay
 // channels can be continuously non-empty under peer load; draining either one
 // without a budget would otherwise defer the next JtNetopTimer forever.
@@ -56,6 +60,16 @@ const LCL_AUDIT_SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
 
 struct LclAuditSampler {
     last_emitted: Instant,
+}
+
+/// One NetworkOps-owned wait key for a resolver-visible preferred LCL. It is
+/// not an adoption token: it suppresses only repeated Accepted-phase planning
+/// while Worker 2 still exposes this exact durable-fence lifecycle.
+#[derive(Clone, Copy)]
+struct ProvisionalLclWaiter {
+    identity: ProvisionalLedgerIdentity,
+    suppression_logged: bool,
+    last_preference_recheck: Instant,
 }
 
 impl LclAuditSampler {
@@ -456,6 +470,9 @@ fn strand_loop(
     // Sample repeating LCL diagnostics while leaving recovery decisions and
     // state-transition logs complete.
     let mut lcl_audit_sampler = LclAuditSampler::new();
+    // The strand owns this state and observes it only from endConsensus.
+    // Callbacks merely wake the strand through the coalesced owner event.
+    let mut provisional_lcl_waiter: Option<ProvisionalLclWaiter> = None;
 
     // Detect startup: always start consensus immediately on the closed
     // ledger, matching rippled's Application::run() which calls
@@ -844,6 +861,7 @@ fn strand_loop(
                 &consensus_rt,
                 &mut last_round_ledger_id,
                 &mut lcl_audit_sampler,
+                &mut provisional_lcl_waiter,
             )
         } else {
             PreferredLclReconciliation::NoChange
@@ -1021,6 +1039,7 @@ fn reconcile_preferred_lcl(
     consensus_rt: &AppConsensusRuntime,
     last_round_ledger_id: &mut Option<Uint256>,
     audit_sampler: &mut LclAuditSampler,
+    provisional_waiter: &mut Option<ProvisionalLclWaiter>,
 ) -> PreferredLclReconciliation {
     reconcile_preferred_lcl_with_status_broadcaster(
         root,
@@ -1029,6 +1048,7 @@ fn reconcile_preferred_lcl(
         consensus_rt,
         last_round_ledger_id,
         audit_sampler,
+        provisional_waiter,
         &broadcast_switched_ledger_status,
     )
 }
@@ -1054,6 +1074,7 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     consensus_rt: &AppConsensusRuntime,
     last_round_ledger_id: &mut Option<Uint256>,
     audit_sampler: &mut LclAuditSampler,
+    provisional_waiter: &mut Option<ProvisionalLclWaiter>,
     status_broadcaster: &SwitchedLedgerStatusBroadcaster,
 ) -> PreferredLclReconciliation {
     if !should_reconcile_preferred_lcl(runner.phase()) {
@@ -1068,6 +1089,59 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     let Some(our_closed) = root.closed_ledger() else {
         return PreferredLclReconciliation::NoChange;
     };
+
+    // A Worker-2 durable callback never adopts a ledger. It only wakes this
+    // strand. Before doing another peer/validation selection pass, inspect a
+    // retained exact wait key. If it remains provisional, this Accepted pass
+    // has no new safe action and must not repeat resolver/acquire/replan work.
+    // If the identity changed, the one serialized retry below re-evaluates the
+    // current preferred target normally.
+    if let Some(waiter) = provisional_waiter.as_ref().copied() {
+        match shared_inbound.provisional_identity(&waiter.identity.target_hash) {
+            Some(identity) if identity == waiter.identity => {
+                if waiter.last_preference_recheck.elapsed() >= PROVISIONAL_LCL_RECHECK_INTERVAL {
+                    // Preserve a moving-target escape hatch at the normal
+                    // heartbeat cadence. The subsequent selection may release
+                    // this waiter if the network now prefers another hash.
+                } else {
+                    if let Some(waiter) = provisional_waiter.as_mut()
+                        && !waiter.suppression_logged
+                    {
+                        waiter.suppression_logged = true;
+                        tracing::debug!(
+                            target: "lcl_trace",
+                            event = "provisional_lcl_wait_suppressed",
+                            target_hash = %identity.target_hash,
+                            ledger_hash = %identity.ledger_hash,
+                            ledger_seq = identity.ledger_seq,
+                            acquisition_id = identity.acquisition_id,
+                            store_generation = identity.store_generation,
+                            persistence_generation = identity.persistence_generation,
+                            "LCL trace: repeated Accepted-phase reconciliation suppressed for exact provisional identity"
+                        );
+                    }
+                    return PreferredLclReconciliation::Provisional;
+                }
+            }
+            observed => {
+                let previous = provisional_waiter
+                    .take()
+                    .expect("checked provisional waiter must remain present");
+                tracing::debug!(
+                    target: "lcl_trace",
+                    event = "provisional_lcl_wait_woken",
+                    wake_reason = if observed.is_some() { "acquisition_replaced" } else { "durable_or_terminal_transition" },
+                    target_hash = %previous.identity.target_hash,
+                    ledger_hash = %previous.identity.ledger_hash,
+                    ledger_seq = previous.identity.ledger_seq,
+                    acquisition_id = previous.identity.acquisition_id,
+                    store_generation = previous.identity.store_generation,
+                    persistence_generation = previous.identity.persistence_generation,
+                    "LCL trace: exact provisional wait released for one serialized retry"
+                );
+            }
+        }
+    }
 
     let our_hash = *our_closed.header().hash.as_uint256();
     let parent_hash = *our_closed.header().parent_hash.as_uint256();
@@ -1103,6 +1177,47 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
         &peer_counts,
     );
     let preferred_hash = preference_diagnostic.selected;
+    if let Some(waiter) = provisional_waiter.as_ref().copied()
+        && waiter.identity.target_hash == preferred_hash
+        && shared_inbound.provisional_identity(&preferred_hash) == Some(waiter.identity)
+    {
+        if let Some(waiter) = provisional_waiter.as_mut() {
+            waiter.last_preference_recheck = Instant::now();
+        }
+        tracing::debug!(
+            target: "lcl_trace",
+            event = "provisional_lcl_wait_rechecked",
+            target_hash = %waiter.identity.target_hash,
+            ledger_hash = %waiter.identity.ledger_hash,
+            ledger_seq = waiter.identity.ledger_seq,
+            acquisition_id = waiter.identity.acquisition_id,
+            store_generation = waiter.identity.store_generation,
+            persistence_generation = waiter.identity.persistence_generation,
+            "LCL trace: exact provisional wait remains current after heartbeat recheck"
+        );
+        return PreferredLclReconciliation::Provisional;
+    }
+    if provisional_waiter
+        .as_ref()
+        .is_some_and(|waiter| waiter.identity.target_hash != preferred_hash)
+    {
+        let previous = provisional_waiter
+            .take()
+            .expect("checked provisional waiter must remain present");
+        tracing::debug!(
+            target: "lcl_trace",
+            event = "provisional_lcl_wait_woken",
+            wake_reason = "preferred_target_replaced",
+            target_hash = %previous.identity.target_hash,
+            ledger_hash = %previous.identity.ledger_hash,
+            ledger_seq = previous.identity.ledger_seq,
+            acquisition_id = previous.identity.acquisition_id,
+            store_generation = previous.identity.store_generation,
+            persistence_generation = previous.identity.persistence_generation,
+            replacement_target_hash = %preferred_hash,
+            "LCL trace: exact provisional wait released after heartbeat selected another target"
+        );
+    }
     // Do not resolve before rippled's no-switch predicates below. Keep this
     // pre-check diagnostic provider-free so an already-local/parent preference
     // cannot create serialized-strand lookup work.
@@ -1314,6 +1429,27 @@ fn reconcile_preferred_lcl_with_status_broadcaster(
     }
 
     if shared_inbound.is_provisional(&candidate_hash) {
+        // A legacy external completion has no Worker-2 fence identity. Keep
+        // its existing non-adoption behavior, but never fabricate an exact
+        // waiter key for it.
+        if let Some(identity) = shared_inbound.provisional_identity(&candidate_hash) {
+            *provisional_waiter = Some(ProvisionalLclWaiter {
+                identity,
+                suppression_logged: false,
+                last_preference_recheck: Instant::now(),
+            });
+            tracing::debug!(
+                target: "lcl_trace",
+                event = "provisional_lcl_wait_set",
+                target_hash = %identity.target_hash,
+                ledger_hash = %identity.ledger_hash,
+                ledger_seq = identity.ledger_seq,
+                acquisition_id = identity.acquisition_id,
+                store_generation = identity.store_generation,
+                persistence_generation = identity.persistence_generation,
+                "LCL trace: retained exact provisional preferred-LCL wait key"
+            );
+        }
         // Worker 2 has registered this exact hash/acquisition identity and
         // made it resolver-visible, but its durable callback has not cleared
         // the identity. Do not call restart_preferred_lcl_recovery here: that
@@ -1601,16 +1737,24 @@ fn check_accept_and_advance(
     // Generic work below.
 
     // ── tryAdvance publication ────────────────────────────────────────────
+    let published_before = root
+        .published_ledger()
+        .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
     root.try_advance_publication();
-    // rippled LedgerMaster::doAdvance clears needNetworkLedger_ unconditionally
-    // after finding/publishing new validated ledgers (LedgerMaster.cpp:1945-1966).
-    // Clear whenever we have a validated published ledger, not only when this
-    // specific strand pass observed a publication delta (eliminates race with
-    // external validation paths publishing before the strand snapshots).
+    let published_after = root
+        .published_ledger()
+        .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq));
+    // Match rippled LedgerMaster::doAdvance: clear recovery only after this
+    // pass actually publishes a newly found ledger, never merely because an
+    // older published ledger remains behind a provisional/missing frontier.
+    let publication_advanced = match (published_before, published_after) {
+        (None, Some(_)) => true,
+        (Some(before), Some(after)) => before != after,
+        _ => false,
+    };
     if root.need_network_ledger()
-        && root
-            .published_ledger()
-            .is_some_and(|ledger| ledger.header().seq <= lm.valid_ledger_seq())
+        && publication_advanced
+        && published_after.is_some_and(|(_, seq)| seq <= lm.valid_ledger_seq())
     {
         root.set_need_network_ledger(false);
     }
@@ -2685,6 +2829,7 @@ mod tests {
         let consensus_rt = AppConsensusRuntime::new();
         let mut last_round = None;
         let mut sampler = LclAuditSampler::new();
+        let mut provisional_waiter = None;
         let status_broadcasts = AtomicUsize::new(0);
         let observe_status_broadcast =
             |_root: &ApplicationRoot, _ledger: &Ledger, _event: i32, _have_correct_lcl: bool| {
@@ -2699,6 +2844,7 @@ mod tests {
                 &consensus_rt,
                 &mut last_round,
                 &mut sampler,
+                &mut provisional_waiter,
                 &observe_status_broadcast,
             ),
             PreferredLclReconciliation::Provisional,

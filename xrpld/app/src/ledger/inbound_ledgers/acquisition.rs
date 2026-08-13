@@ -279,6 +279,11 @@ pub(crate) struct ProvisionalLedgerIdentity {
     pub target_hash: Uint256,
     pub ledger_hash: Uint256,
     pub ledger_seq: u32,
+    /// The NodeStore generation captured by the final fence. This prevents a
+    /// replacement store from being mistaken for the resolver-visible result.
+    pub store_generation: u64,
+    /// The per-acquisition FIFO generation of the final durability barrier.
+    pub persistence_generation: u64,
 }
 
 /// Registry-owned callback invoked exactly once after a successful terminal
@@ -290,7 +295,8 @@ pub(crate) type AcquisitionCompletionRecorder =
 
 /// Registry-owned callback that makes an already resolver-visible entry ready
 /// for the single AcqDone-equivalent consumer only after its NodeStore fence.
-pub(crate) type AcquisitionDurableCompletionRecorder = Arc<dyn Fn(Uint256) + Send + Sync + 'static>;
+pub(crate) type AcquisitionDurableCompletionRecorder =
+    Arc<dyn Fn(ProvisionalLedgerIdentity) + Send + Sync + 'static>;
 
 /// Application-owned `LedgerMaster::storeLedger` equivalent for completed
 /// non-history acquisitions. It must run before the registry-ready handoff,
@@ -541,6 +547,12 @@ struct PersistenceWrite {
     data: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+struct PersistenceTiming {
+    enqueued_at: Instant,
+    dispatched_at: Instant,
+}
+
 #[derive(Clone)]
 enum PersistenceCommand {
     /// One bounded packet/scan batch owned by the NodeStore write scheduler.
@@ -548,17 +560,27 @@ enum PersistenceCommand {
     /// batch, even if a callback arrives after cancellation or rotation.
     WriteBatch {
         identity: PersistenceIdentity,
+        timing: PersistenceTiming,
         writes: Vec<PersistenceWrite>,
     },
     DurabilityBarrier {
         identity: PersistenceIdentity,
+        timing: PersistenceTiming,
     },
 }
 
 impl PersistenceCommand {
     fn identity(&self) -> PersistenceIdentity {
         match self {
-            Self::WriteBatch { identity, .. } | Self::DurabilityBarrier { identity } => *identity,
+            Self::WriteBatch { identity, .. } | Self::DurabilityBarrier { identity, .. } => {
+                *identity
+            }
+        }
+    }
+
+    fn timing(&self) -> PersistenceTiming {
+        match self {
+            Self::WriteBatch { timing, .. } | Self::DurabilityBarrier { timing, .. } => *timing,
         }
     }
 
@@ -658,6 +680,40 @@ impl PersistenceWork for AcquisitionPersistenceWork {
             mut completion,
         } = *self;
         let identity = command.identity();
+        let timing = command.timing();
+        let (target_hash, ledger_hash, ledger_seq) = completion
+            .state
+            .completed_ledger
+            .lock()
+            .expect("acquisition completed ledger lock")
+            .as_ref()
+            .map(|ledger| {
+                (
+                    *completion.state.hash.as_uint256(),
+                    *ledger.header().hash.as_uint256(),
+                    ledger.header().seq,
+                )
+            })
+            .unwrap_or((
+                *completion.state.hash.as_uint256(),
+                *completion.state.hash.as_uint256(),
+                completion.state.seq(),
+            ));
+        if command.is_durability_barrier() {
+            tracing::debug!(
+                target: "inbound_ledger",
+                event = "durability_scheduler_start",
+                target_hash = %target_hash,
+                ledger_hash = %ledger_hash,
+                ledger_seq,
+                acquisition_id = identity.acquisition_id,
+                store_generation = identity.store_generation,
+                persistence_generation = identity.persistence_generation,
+                scheduler_dispatch_to_start_us = timing.dispatched_at.elapsed().as_micros() as u64,
+                queue_elapsed_us = timing.enqueued_at.elapsed().as_micros() as u64,
+                "inbound durability barrier started by NodeStore scheduler"
+            );
+        }
         let outcome = if node_store.store_generation() != identity.store_generation {
             PersistenceOutcome::Cancelled
         } else {
@@ -705,6 +761,7 @@ struct PersistenceQueue {
     in_flight: Option<PersistenceCommand>,
     accepted: BTreeSet<PersistenceKey>,
     barrier_enqueued: bool,
+    barrier_identity: Option<PersistenceIdentity>,
     barrier_acknowledged: bool,
     failed: Option<Arc<str>>,
 }
@@ -717,6 +774,7 @@ impl Default for PersistenceQueue {
             in_flight: None,
             accepted: BTreeSet::new(),
             barrier_enqueued: false,
+            barrier_identity: None,
             barrier_acknowledged: false,
             failed: None,
         }
@@ -753,20 +811,40 @@ impl PersistenceQueue {
             return;
         }
         let identity = self.next_identity(acquisition_id, store_generation);
+        let now = Instant::now();
         self.queued.push_back(PersistenceCommand::WriteBatch {
             identity,
+            timing: PersistenceTiming {
+                enqueued_at: now,
+                dispatched_at: now,
+            },
             writes: accepted,
         });
     }
 
-    fn enqueue_barrier(&mut self, acquisition_id: u64, store_generation: u64) {
+    fn enqueue_barrier(
+        &mut self,
+        acquisition_id: u64,
+        store_generation: u64,
+    ) -> PersistenceIdentity {
         if self.barrier_enqueued {
-            return;
+            return self
+                .barrier_identity
+                .expect("enqueued durability barrier must retain its identity");
         }
         self.barrier_enqueued = true;
         let identity = self.next_identity(acquisition_id, store_generation);
+        self.barrier_identity = Some(identity);
+        let now = Instant::now();
         self.queued
-            .push_back(PersistenceCommand::DurabilityBarrier { identity });
+            .push_back(PersistenceCommand::DurabilityBarrier {
+                identity,
+                timing: PersistenceTiming {
+                    enqueued_at: now,
+                    dispatched_at: now,
+                },
+            });
+        identity
     }
 
     /// Transition at most one queued command into the one in-flight slot.
@@ -775,21 +853,28 @@ impl PersistenceQueue {
         if self.in_flight.is_some() {
             return None;
         }
-        let command = self.queued.pop_front()?;
+        let mut command = self.queued.pop_front()?;
+        match &mut command {
+            PersistenceCommand::WriteBatch { timing, .. }
+            | PersistenceCommand::DurabilityBarrier { timing, .. } => {
+                timing.dispatched_at = Instant::now();
+            }
+        }
         self.in_flight = Some(command.clone());
         Some(command)
     }
 
-    fn acknowledge(&mut self, ready: &PersistenceReady) -> bool {
+    fn acknowledge(&mut self, ready: &PersistenceReady) -> Option<PersistenceTiming> {
         let Some(command) = self.in_flight.take() else {
-            return false;
+            return None;
         };
         if command.identity() != ready.identity
             || command.is_durability_barrier() != ready.durability_barrier
         {
             self.in_flight = Some(command);
-            return false;
+            return None;
         }
+        let timing = command.timing();
         match &ready.outcome {
             PersistenceOutcome::Durable => {
                 if ready.durability_barrier {
@@ -801,7 +886,24 @@ impl PersistenceQueue {
                 self.failed = Some(Arc::from("NodeStore persistence cancelled"));
             }
         }
-        true
+        Some(timing)
+    }
+
+    fn provisional_identity(
+        &self,
+        target_hash: Uint256,
+        ledger_hash: Uint256,
+        ledger_seq: u32,
+    ) -> Option<ProvisionalLedgerIdentity> {
+        self.barrier_identity
+            .map(|identity| ProvisionalLedgerIdentity {
+                acquisition_id: identity.acquisition_id,
+                target_hash,
+                ledger_hash,
+                ledger_seq,
+                store_generation: identity.store_generation,
+                persistence_generation: identity.persistence_generation,
+            })
     }
 
     /// Drop all still-owned commands during a terminal transition. A late
@@ -1915,16 +2017,34 @@ impl AcquisitionState {
         self.dispatch_next_persistence_command();
     }
 
-    fn request_durability_barrier(self: &Arc<Self>) {
+    /// Reserve the final FIFO fence before resolver visibility so the
+    /// provisional identity names the exact durable operation that releases it.
+    fn enqueue_durability_barrier(
+        self: &Arc<Self>,
+        ledger_hash: Uint256,
+        ledger_seq: u32,
+    ) -> Option<PersistenceIdentity> {
         if self.is_done() {
-            return;
+            return None;
         }
         let store_generation = self.node_store.store_generation();
-        self.persistence
+        let identity = self
+            .persistence
             .lock()
             .expect("persistence queue lock")
             .enqueue_barrier(self.acquisition_id, store_generation);
-        self.dispatch_next_persistence_command();
+        tracing::debug!(
+            target: "inbound_ledger",
+            event = "durability_barrier_enqueued",
+            target_hash = %self.hash,
+            ledger_hash = %ledger_hash,
+            ledger_seq,
+            acquisition_id = identity.acquisition_id,
+            store_generation = identity.store_generation,
+            persistence_generation = identity.persistence_generation,
+            "inbound durability barrier enqueued behind accepted writes"
+        );
+        Some(identity)
     }
 
     fn dispatch_next_persistence_command(self: &Arc<Self>) {
@@ -1939,6 +2059,28 @@ impl AcquisitionState {
         let state = Arc::clone(self);
         let node_store = state.node_store.clone();
         let identity = command.identity();
+        let (ledger_hash, ledger_seq) = state
+            .completed_ledger
+            .lock()
+            .expect("acquisition completed ledger lock")
+            .as_ref()
+            .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq))
+            .unwrap_or((*state.hash.as_uint256(), state.seq()));
+        if command.is_durability_barrier() {
+            let timing = command.timing();
+            tracing::debug!(
+                target: "inbound_ledger",
+                event = "durability_scheduler_dispatch",
+                target_hash = %state.hash,
+                ledger_hash = %ledger_hash,
+                ledger_seq,
+                acquisition_id = identity.acquisition_id,
+                store_generation = identity.store_generation,
+                persistence_generation = identity.persistence_generation,
+                queue_elapsed_us = timing.enqueued_at.elapsed().as_micros() as u64,
+                "inbound durability barrier dispatched to NodeStore scheduler"
+            );
+        }
         let completion = PersistenceCompletionGuard::new(
             Arc::clone(&state),
             identity,
@@ -3328,14 +3470,45 @@ fn process_persistence_event(state: &Arc<AcquisitionState>) {
     {
         ready.outcome = PersistenceOutcome::Cancelled;
     }
-    let (acknowledged, failed) = {
+    let (timing, failed) = {
         let mut queue = state.persistence.lock().expect("persistence queue lock");
-        let acknowledged = queue.acknowledge(&ready);
-        (acknowledged, queue.failed.clone())
+        let timing = queue.acknowledge(&ready);
+        (timing, queue.failed.clone())
     };
-    if !acknowledged {
+    let Some(timing) = timing else {
         state.record_stale_event();
         return;
+    };
+    if ready.durability_barrier {
+        let outcome = match &ready.outcome {
+            PersistenceOutcome::Durable => "durable",
+            PersistenceOutcome::Fault(_) => "fault",
+            PersistenceOutcome::Cancelled => "cancelled",
+        };
+        let (ledger_hash, ledger_seq) = state
+            .completed_ledger
+            .lock()
+            .expect("acquisition completed ledger lock")
+            .as_ref()
+            .map(|ledger| (*ledger.header().hash.as_uint256(), ledger.header().seq))
+            .unwrap_or((*state.hash.as_uint256(), state.seq()));
+        tracing::debug!(
+            target: "inbound_ledger",
+            event = "durability_barrier_settled",
+            target_hash = %state.hash,
+            ledger_hash = %ledger_hash,
+            ledger_seq,
+            acquisition_id = ready.identity.acquisition_id,
+            store_generation = ready.identity.store_generation,
+            persistence_generation = ready.identity.persistence_generation,
+            outcome,
+            queue_elapsed_us = timing
+                .dispatched_at
+                .duration_since(timing.enqueued_at)
+                .as_micros() as u64,
+            total_elapsed_us = timing.enqueued_at.elapsed().as_micros() as u64,
+            "inbound durability barrier settled"
+        );
     }
     if let Some(error) = failed {
         tracing::error!(target: "inbound_ledger", seq = state.seq(), hash = %state.hash, %error,
@@ -4106,7 +4279,7 @@ fn record_resolver_visible_ledger(
 
 fn publish_resolver_visible_ledger(
     hash: Uint256,
-    acquisition_id: u64,
+    durability_identity: PersistenceIdentity,
     completion_recorder: &AcquisitionCompletionRecorder,
     resolver_published: &AtomicBool,
     completed_ledger: &Mutex<Option<Arc<Ledger>>>,
@@ -4120,17 +4293,19 @@ fn publish_resolver_visible_ledger(
     // separately dispatched AcqDone job does.
     if !completion_recorder(
         ProvisionalLedgerIdentity {
-            acquisition_id,
+            acquisition_id: durability_identity.acquisition_id,
             target_hash: hash,
             ledger_hash: *ledger.header().hash.as_uint256(),
             ledger_seq: ledger.header().seq,
+            store_generation: durability_identity.store_generation,
+            persistence_generation: durability_identity.persistence_generation,
         },
         Arc::clone(&ledger),
     ) {
         return false;
     }
     record_resolver_visible_ledger(
-        acquisition_id,
+        durability_identity.acquisition_id,
         resolver_published,
         completed_ledger,
         store_tx,
@@ -4201,12 +4376,17 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
     let ledger_seq = ledger.header().seq;
     let ledger_hash = *ledger.header().hash.as_uint256();
     let target_hash = *state.hash.as_uint256();
+    let Some(durability_identity) = state.enqueue_durability_barrier(ledger_hash, ledger_seq)
+    else {
+        state.mark_failed();
+        return;
+    };
     let state_synching = ledger.state_map().is_synching();
     let tx_synching = ledger.tx_map().is_synching();
     state.provisional_registered.store(true, Ordering::Release);
     if !publish_resolver_visible_ledger(
         target_hash,
-        state.acquisition_id,
+        durability_identity,
         &state.completion_recorder,
         &state.resolver_published,
         &state.completed_ledger,
@@ -4225,6 +4405,8 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
         target_matches_header = target_hash == ledger_hash,
         ledger_seq,
         acquisition_id = state.acquisition_id,
+        store_generation = durability_identity.store_generation,
+        persistence_generation = durability_identity.persistence_generation,
         reason = ?state.reason,
         state_synching,
         tx_synching,
@@ -4235,7 +4417,7 @@ fn finalize_acquisition(state: &Arc<AcquisitionState>) {
     // released. Keep the original FIFO barrier so durability is still tracked
     // and persistence failures remain terminal; it simply no longer delays
     // validation-trie and LedgerHistory resolver visibility.
-    state.request_durability_barrier();
+    state.dispatch_next_persistence_command();
 }
 
 fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
@@ -4261,6 +4443,20 @@ fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
         return;
     };
 
+    let Some(provisional_identity) = state
+        .persistence
+        .lock()
+        .expect("persistence queue lock")
+        .provisional_identity(
+            *state.hash.as_uint256(),
+            *ledger.header().hash.as_uint256(),
+            ledger.header().seq,
+        )
+    else {
+        state.mark_failed();
+        return;
+    };
+
     {
         let _outbound = state
             .outbound_gate
@@ -4271,7 +4467,7 @@ fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
         }
         state.completed.store(true, Ordering::Release);
     }
-    (state.durable_completion_recorder)(*state.hash.as_uint256());
+    (state.durable_completion_recorder)(provisional_identity);
     state
         .lifecycle
         .terminal_completed
@@ -4284,6 +4480,8 @@ fn finalize_durable_acquisition(state: &Arc<AcquisitionState>) {
         target_matches_header = state.hash == ledger.header().hash,
         ledger_seq = ledger.header().seq,
         acquisition_id = state.acquisition_id,
+        store_generation = provisional_identity.store_generation,
+        persistence_generation = provisional_identity.persistence_generation,
         reason = ?state.reason,
         "LCL trace: inbound acquisition durability barrier acknowledged"
     );
@@ -5343,11 +5541,15 @@ mod actor_mailbox_tests {
             queue.in_flight.as_ref().map(PersistenceCommand::identity),
             Some(first.identity())
         );
-        assert!(queue.acknowledge(&PersistenceReady {
-            identity: first.identity(),
-            outcome: PersistenceOutcome::Durable,
-            durability_barrier: false,
-        }));
+        assert!(
+            queue
+                .acknowledge(&PersistenceReady {
+                    identity: first.identity(),
+                    outcome: PersistenceOutcome::Durable,
+                    durability_barrier: false,
+                })
+                .is_some()
+        );
         assert!(matches!(
             queue.take_next(),
             Some(PersistenceCommand::DurabilityBarrier { .. })
@@ -5376,11 +5578,13 @@ mod actor_mailbox_tests {
         assert!(queue.in_flight.is_none());
         assert!(queue.queued.is_empty());
         assert!(
-            !queue.acknowledge(&PersistenceReady {
-                identity: in_flight.identity(),
-                outcome: PersistenceOutcome::Durable,
-                durability_barrier: false,
-            }),
+            queue
+                .acknowledge(&PersistenceReady {
+                    identity: in_flight.identity(),
+                    outcome: PersistenceOutcome::Durable,
+                    durability_barrier: false,
+                })
+                .is_none(),
             "late worker completion cannot overwrite terminal cancellation"
         );
     }

@@ -470,6 +470,15 @@ struct PublicationAdvanceState {
     requested_epoch: u64,
     planned_epoch: u64,
     last_plan: Option<PublicationPlanIdentity>,
+    /// One exact Worker-2 lifecycle may block its own publication. This does
+    /// not suppress unrelated validated or publication planning work.
+    provisional_deferral: Option<PublicationDeferral>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PublicationDeferral {
+    identity: crate::ledger::inbound_ledgers::ProvisionalLedgerIdentity,
+    suppression_logged: bool,
 }
 
 impl Default for PublicationAdvanceState {
@@ -480,6 +489,7 @@ impl Default for PublicationAdvanceState {
             requested_epoch: 1,
             planned_epoch: 0,
             last_plan: None,
+            provisional_deferral: None,
         }
     }
 }
@@ -7725,12 +7735,101 @@ impl ApplicationRoot {
         self.ledger_master_state.published_ledger_seq()
     }
 
+    fn retain_publication_provisional_deferral(
+        &self,
+        identity: crate::ledger::inbound_ledgers::ProvisionalLedgerIdentity,
+    ) {
+        let mut advance = self
+            .publication_advance
+            .lock()
+            .expect("publication advance state lock");
+        match advance.provisional_deferral.as_mut() {
+            Some(existing) if existing.identity == identity => {
+                if !existing.suppression_logged {
+                    existing.suppression_logged = true;
+                    tracing::debug!(
+                        target: "ledger",
+                        event = "publication_provisional_suppressed",
+                        target_hash = %identity.target_hash,
+                        ledger_hash = %identity.ledger_hash,
+                        ledger_seq = identity.ledger_seq,
+                        acquisition_id = identity.acquisition_id,
+                        store_generation = identity.store_generation,
+                        persistence_generation = identity.persistence_generation,
+                        "publication remains coalesced behind exact provisional identity"
+                    );
+                }
+            }
+            _ => {
+                advance.provisional_deferral = Some(PublicationDeferral {
+                    identity,
+                    suppression_logged: false,
+                });
+                tracing::debug!(
+                    target: "ledger",
+                    event = "publication_provisional_deferred",
+                    target_hash = %identity.target_hash,
+                    ledger_hash = %identity.ledger_hash,
+                    ledger_seq = identity.ledger_seq,
+                    acquisition_id = identity.acquisition_id,
+                    store_generation = identity.store_generation,
+                    persistence_generation = identity.persistence_generation,
+                    "publication deferred behind exact provisional identity"
+                );
+            }
+        }
+    }
+
+    /// Clear a retained publication deferral only when its exact Worker-2
+    /// lifecycle is no longer visible. The durable callback merely requests
+    /// this serialized pass; it never publishes directly.
+    fn refresh_publication_provisional_deferral(&self) {
+        let retained = self
+            .publication_advance
+            .lock()
+            .expect("publication advance state lock")
+            .provisional_deferral;
+        let Some(retained) = retained else {
+            return;
+        };
+        let observed = self.inbound_provisional_identity(retained.identity.target_hash);
+        if observed == Some(retained.identity) {
+            return;
+        }
+        let mut advance = self
+            .publication_advance
+            .lock()
+            .expect("publication advance state lock");
+        if advance
+            .provisional_deferral
+            .is_some_and(|current| current.identity == retained.identity)
+        {
+            advance.provisional_deferral = None;
+            tracing::debug!(
+                target: "ledger",
+                event = "publication_provisional_woken",
+                wake_reason = if observed.is_some() { "acquisition_replaced" } else { "durable_or_terminal_transition" },
+                target_hash = %retained.identity.target_hash,
+                ledger_hash = %retained.identity.ledger_hash,
+                ledger_seq = retained.identity.ledger_seq,
+                acquisition_id = retained.identity.acquisition_id,
+                store_generation = retained.identity.store_generation,
+                persistence_generation = retained.identity.persistence_generation,
+                "publication deferral released after matching lifecycle transition"
+            );
+        }
+    }
+
     fn publish_full_ledger(
         &self,
         lm: &crate::AppLedgerMaster,
         ledger: Arc<Ledger>,
-    ) -> Result<Arc<Ledger>, String> {
+    ) -> Result<Option<Arc<Ledger>>, String> {
         let hash = *ledger.header().hash.as_uint256();
+        if let Some(identity) = self.inbound_provisional_identity(hash) {
+            self.retain_publication_provisional_deferral(identity);
+            return Ok(None);
+        }
         if self.inbound_ledger_is_provisional(hash) {
             return Err(format!(
                 "publication deferred for provisional inbound ledger {hash}"
@@ -7755,7 +7854,7 @@ impl ApplicationRoot {
             Arc::new(NullOrderBookDBRuntime),
             Arc::new(NullOrderBookDBJournal),
         );
-        Ok(full)
+        Ok(Some(full))
     }
 
     /// Matches rippled's `tryAdvance()` → `doAdvance()` →
@@ -7792,6 +7891,7 @@ impl ApplicationRoot {
             return;
         };
         let lm = lm_rt.ledger_master();
+        self.refresh_publication_provisional_deferral();
         let epoch = {
             let advance = self
                 .publication_advance
@@ -7838,11 +7938,12 @@ impl ApplicationRoot {
                         seq = ledger.header().seq,
                         "tryAdvance: publishing first validated ledger"
                     );
-                    if let Err(error) =
-                        self.publish_full_ledger(lm_rt.ledger_master().as_ref(), Arc::clone(ledger))
+                    match self
+                        .publish_full_ledger(lm_rt.ledger_master().as_ref(), Arc::clone(ledger))
                     {
-                        tracing::error!(target: "ledger", %error,
-                            "tryAdvance: failed to publish first full ledger");
+                        Ok(Some(_)) | Ok(None) => {}
+                        Err(error) => tracing::error!(target: "ledger", %error,
+                            "tryAdvance: failed to publish first full ledger"),
                     }
                 }
             }
@@ -7853,11 +7954,12 @@ impl ApplicationRoot {
                         seq = ledger.header().seq,
                         "tryAdvance: gap too large, jumping to validated ledger"
                     );
-                    if let Err(error) =
-                        self.publish_full_ledger(lm_rt.ledger_master().as_ref(), Arc::clone(ledger))
+                    match self
+                        .publish_full_ledger(lm_rt.ledger_master().as_ref(), Arc::clone(ledger))
                     {
-                        tracing::error!(target: "ledger", %error,
-                            "tryAdvance: failed to publish gap ledger");
+                        Ok(Some(_)) | Ok(None) => {}
+                        Err(error) => tracing::error!(target: "ledger", %error,
+                            "tryAdvance: failed to publish gap ledger"),
                     }
                 }
             }
@@ -7868,12 +7970,16 @@ impl ApplicationRoot {
                         seq = ledger.header().seq,
                         "tryAdvance: publishing sequential ledger"
                     );
-                    if let Err(error) =
-                        self.publish_full_ledger(lm_rt.ledger_master().as_ref(), Arc::clone(ledger))
+                    match self
+                        .publish_full_ledger(lm_rt.ledger_master().as_ref(), Arc::clone(ledger))
                     {
-                        tracing::error!(target: "ledger", %error,
-                            "tryAdvance: failed to publish sequential full ledger");
-                        break;
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::error!(target: "ledger", %error,
+                                "tryAdvance: failed to publish sequential full ledger");
+                            break;
+                        }
                     }
                 }
                 if !report.published.is_empty() {}
@@ -8226,6 +8332,20 @@ impl ApplicationRoot {
         self.shamap_store_service
             .as_ref()
             .map(|service| service.operating_mode())
+    }
+
+    pub(crate) fn inbound_provisional_identity(
+        &self,
+        hash: basics::base_uint::Uint256,
+    ) -> Option<crate::ledger::inbound_ledgers::ProvisionalLedgerIdentity> {
+        self.ledger_master_runtime().and_then(|runtime| {
+            runtime
+                .inbound_ledgers
+                .lock()
+                .expect("inbound_ledgers mutex")
+                .as_ref()
+                .and_then(|inbound| inbound.provisional_identity(&hash))
+        })
     }
 
     /// True only while Worker 2's exact inbound acquisition identity remains
