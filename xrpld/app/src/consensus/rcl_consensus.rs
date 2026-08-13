@@ -1125,7 +1125,10 @@ impl consensus::algorithm::ConsensusAdaptor for AppRclConsensusAdaptor {
                 )
             })
             .collect::<Vec<_>>();
-        tracing::info!(
+        // The complete canonical set can contain every transaction in a busy
+        // ledger. It is useful for forensic debugging, but must never be an
+        // always-on production journal payload on the consensus path.
+        tracing::debug!(
             target: "lcl_audit",
             parent_hash = %prev_ledger.id(),
             parent_seq = prev_ledger.seq(),

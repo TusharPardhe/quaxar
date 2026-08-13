@@ -8572,7 +8572,11 @@ impl ApplicationRoot {
             validation_count = val_count;
             let quorum = validator_quorum;
             if val_count >= quorum {
-                tracing::info!(
+                // A validator's repeated vote for a quorum-backed ledger is
+                // expected high-frequency traffic, not an operator event.
+                // Keep the fields for opt-in diagnosis without writing every
+                // duplicate observation to the production journal.
+                tracing::debug!(
                     target: "lcl_trace",
                     event = "validation_quorum_observed",
                     observed_hash = %hash,
@@ -8631,7 +8635,7 @@ impl ApplicationRoot {
                 .building_ledger()
                 .is_some_and(|building| building == seq);
             if already_validated || building_same_seq {
-                tracing::info!(
+                tracing::debug!(
                     target: "lcl_trace",
                     event = "validation_adoption_deferred",
                     observed_hash = %hash,
@@ -8770,7 +8774,7 @@ impl ApplicationRoot {
 
         let current_valid_seq = lm.valid_ledger_seq();
         if ledger.header().seq <= current_valid_seq {
-            tracing::info!(
+            tracing::debug!(
                 target: "lcl_trace",
                 event = "validation_adoption_skipped_nonadvancing",
                 candidate_hash = %ledger.header().hash,
@@ -9741,7 +9745,7 @@ impl ApplicationRoot {
                         decision,
                         None,
                     ));
-                    tracing::info!(
+                    tracing::debug!(
                         target: "lcl_audit",
                         closed_seq,
                         pass,
@@ -9784,7 +9788,7 @@ impl ApplicationRoot {
                 completed_transaction_ids.insert(transaction_id);
 
                 let index = accepted_entries.len();
-                tracing::info!(
+                tracing::debug!(
                     target: "lcl_audit",
                     closed_seq,
                     pass,

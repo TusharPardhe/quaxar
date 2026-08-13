@@ -837,7 +837,11 @@ fn strand_loop(
             );
         }
         if end_consensus_pass {
-            tracing::info!(
+            // This branch may run every strand wake while consensus remains
+            // Accepted. Keep its detailed lifecycle trace opt-in: emitting it
+            // at INFO previously produced hundreds of journal writes/second
+            // and starved the same strand that must make consensus progress.
+            tracing::debug!(
                 target: "lcl_trace",
                 event = "end_consensus_reconcile_enter",
                 runner_phase = ?runner.phase(),
@@ -867,7 +871,7 @@ fn strand_loop(
             PreferredLclReconciliation::NoChange
         };
         if end_consensus_pass {
-            tracing::info!(
+            tracing::debug!(
                 target: "lcl_trace",
                 event = "end_consensus_reconcile_outcome",
                 reconciliation = ?reconciliation,
