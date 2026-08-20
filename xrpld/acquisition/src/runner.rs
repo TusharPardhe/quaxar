@@ -57,6 +57,12 @@ use crate::timer::{TimerKind, TimerRequest};
 /// it avoids immediate retry loops while keeping failed delivery responsive.
 pub const HANDOFF_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+/// rippled `InboundLedger::addPeers` begins acquisition through this many
+/// scored peers (`kPeerCountStart` in `InboundLedger.cpp`). Keep the
+/// coordinator's peer policy at that protocol boundary without reintroducing
+/// a second peer-set lifecycle owner.
+const INITIAL_PEER_REQUEST_FANOUT: usize = 5;
+
 /// Coordinator-owned budgets for the acquisition domain.
 ///
 /// `Default` reproduces the existing per-ledger mailbox semantics (`128`
@@ -832,7 +838,19 @@ impl CoordinatorRunner {
             self.state.ids.next_id(),
             self.state.storage_generation,
         );
-        let peer = self.state.peer_view.peers()[0];
+        // rippled `InboundLedger::addPeers` starts through five scored peers
+        // and triggers each selected peer. The coordinator's availability
+        // snapshot is already ordered by the overlay adapter, so retain its
+        // order and establish the same bounded initial fanout.
+        let initial_peers = self
+            .state
+            .peer_view
+            .peers()
+            .iter()
+            .copied()
+            .take(INITIAL_PEER_REQUEST_FANOUT)
+            .collect::<Vec<_>>();
+        let peer = initial_peers[0];
         let admission = self.state.budgets.admission;
         self.state.sessions.insert(
             session,
@@ -844,22 +862,29 @@ impl CoordinatorRunner {
         // was created by a deferred demand replay.
         effects.push(AcquisitionEffect::SessionStarted(session));
 
-        // Request the Base/header ledger packet. An unknown sequence remains a
-        // header request with `None`; target hashes are never misframed as
-        // tree-node requests.
-        let request = LedgerDataRequest::GetLedger {
-            sequence: target.sequence(),
-        };
-        let operation = OperationRef::new(
-            session,
-            OperationKind::PeerRequest,
-            self.state.ids.next_id(),
-            self.state.ids.next_id(),
-        );
-        self.stats.peer_requests += 1;
-        effects.push(AcquisitionEffect::SendLedgerRequest(PeerRequest::new(
-            session, operation, peer, request,
-        )));
+        // Request the Base/header ledger packet from each initially acquired
+        // peer. An unknown sequence remains a header request with `None`;
+        // target hashes are never misframed as tree-node requests.
+        for peer in initial_peers {
+            if let Some(session_state) = self.state.sessions.get_mut(&session) {
+                session_state.sent_peers.insert(peer);
+            }
+            let operation = OperationRef::new(
+                session,
+                OperationKind::PeerRequest,
+                self.state.ids.next_id(),
+                self.state.ids.next_id(),
+            );
+            self.stats.peer_requests += 1;
+            effects.push(AcquisitionEffect::SendLedgerRequest(PeerRequest::new(
+                session,
+                operation,
+                peer,
+                LedgerDataRequest::GetLedger {
+                    sequence: target.sequence(),
+                },
+            )));
+        }
 
         // Arm the acquisition deadline. The wakeup returns as a typed
         // `TimerFired` matched exactly against this operation.
@@ -909,13 +934,14 @@ impl CoordinatorRunner {
         // the `AdmissionGate`, but a misconfigured or replaying ingress must
         // not overflow coordinator state. The plan's mailbox enforces the same
         // `128`-packet / `4 MiB` semantics.
+        let packet_peer = packet.peer_id();
         if !session_state.plan.push_packet(packet) {
             self.stats.packets_dropped += 1;
             return Vec::new();
         }
         self.stats.packets_admitted += 1;
         session_state.plan.note_progress();
-        self.run_plan_turn(session, &mut effects);
+        self.run_plan_turn(session, Some(packet_peer), &mut effects);
         effects
     }
 
@@ -1007,7 +1033,7 @@ impl CoordinatorRunner {
                     TimerKind::AcquireTimeout,
                     self.state.budgets.acquire_timeout,
                 )));
-                self.run_plan_turn(session, &mut effects);
+                self.run_plan_turn(session, None, &mut effects);
                 effects
             }
             PlanTimeout::Fail => {
@@ -1038,7 +1064,7 @@ impl CoordinatorRunner {
         match outcome {
             PlanReadOutcome::Applied => {
                 let mut effects = Vec::new();
-                self.run_plan_turn(session, &mut effects);
+                self.run_plan_turn(session, None, &mut effects);
                 effects
             }
             PlanReadOutcome::Stale => {
@@ -1347,7 +1373,7 @@ impl CoordinatorRunner {
                 continue;
             }
             self.stats.fetch_pack_advances += 1;
-            self.run_plan_turn(session, &mut effects);
+            self.run_plan_turn(session, None, &mut effects);
         }
         effects
     }
@@ -1372,7 +1398,12 @@ impl CoordinatorRunner {
     /// Runs one bounded plan turn for `session` and appends its work effects.
     /// The tree engine is advanced only on this owner task; work commands are
     /// returned after state mutation and executed by adapters.
-    fn run_plan_turn(&mut self, session: SessionRef, effects: &mut Vec<AcquisitionEffect>) {
+    fn run_plan_turn(
+        &mut self,
+        session: SessionRef,
+        reply_peer: Option<PeerId>,
+        effects: &mut Vec<AcquisitionEffect>,
+    ) {
         self.stats.plan_turns += 1;
         let turn = {
             let CoordinatorState { sessions, ids, .. } = &mut self.state;
@@ -1403,8 +1434,18 @@ impl CoordinatorRunner {
                     .sessions
                     .get(&session)
                     .and_then(|state| state.plan.ledger_sequence());
-                let Some(&peer) = self.state.peer_view.peers().first() else {
-                    return;
+                // Rippled's normal trigger pins reply-driven follow-up work
+                // to the responding peer. A local/read/fetch-pack wake has no
+                // responding peer, so its `PeerSet::sendRequest(..., nullptr)`
+                // equivalent broadcasts only to the session's acquired peers.
+                let peers = match reply_peer {
+                    Some(peer) => vec![peer],
+                    None => self
+                        .state
+                        .sessions
+                        .get(&session)
+                        .map(|state| state.sent_peers.iter().copied().collect::<Vec<_>>())
+                        .unwrap_or_default(),
                 };
                 // Rippled's normal trigger requests the missing SHAMap
                 // locations through TMGetLedger. Generic by-hash requests are
@@ -1421,26 +1462,28 @@ impl CoordinatorRunner {
                     if node_ids.is_empty() {
                         continue;
                     }
-                    let operation = OperationRef::new(
-                        session,
-                        OperationKind::PeerRequest,
-                        self.state.ids.next_id(),
-                        self.state.ids.next_id(),
-                    );
-                    if let Some(session_state) = self.state.sessions.get_mut(&session) {
-                        session_state.sent_peers.insert(peer);
+                    for peer in &peers {
+                        let operation = OperationRef::new(
+                            session,
+                            OperationKind::PeerRequest,
+                            self.state.ids.next_id(),
+                            self.state.ids.next_id(),
+                        );
+                        if let Some(session_state) = self.state.sessions.get_mut(&session) {
+                            session_state.sent_peers.insert(*peer);
+                        }
+                        self.stats.peer_requests += 1;
+                        effects.push(AcquisitionEffect::SendLedgerRequest(PeerRequest::new(
+                            session,
+                            operation,
+                            *peer,
+                            LedgerDataRequest::GetLedgerNodes {
+                                kind,
+                                node_ids: node_ids.clone(),
+                                sequence,
+                            },
+                        )));
                     }
-                    self.stats.peer_requests += 1;
-                    effects.push(AcquisitionEffect::SendLedgerRequest(PeerRequest::new(
-                        session,
-                        operation,
-                        peer,
-                        LedgerDataRequest::GetLedgerNodes {
-                            kind,
-                            node_ids,
-                            sequence,
-                        },
-                    )));
                 }
             }
             PlanTurn::Persist(batch) => {
@@ -1653,6 +1696,15 @@ mod tests {
         gate_budget: AdmissionBudget,
         bytes: u64,
     ) -> AdmittedLedgerPacket {
+        admitted_packet_from_peer(session, PeerId::new(1), gate_budget, bytes)
+    }
+
+    fn admitted_packet_from_peer(
+        session: SessionRef,
+        peer: PeerId,
+        gate_budget: AdmissionBudget,
+        bytes: u64,
+    ) -> AdmittedLedgerPacket {
         let gate = Arc::new(AdmissionGate::new(gate_budget, session));
         let lease = match gate.try_reserve(1, bytes) {
             BackpressureOutcome::Admitted(lease) => lease,
@@ -1661,7 +1713,7 @@ mod tests {
         AdmittedLedgerPacket::new(
             lease,
             session,
-            PeerId::new(1),
+            peer,
             ledger::InboundLedgerPacket::new(
                 ledger::InboundLedgerDataType::Base,
                 vec![ledger::InboundLedgerNodeData::new(
@@ -2379,13 +2431,21 @@ mod tests {
     }
 
     #[test]
-    fn unseeded_base_timeout_retries_an_untried_available_peer() {
+    fn unseeded_base_timeout_cycles_after_initial_peer_fanout() {
         let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
         let _ = runner.handle_event(AcquisitionEvent::Connectivity(
             PeerAvailabilitySnapshot::new(vec![PeerId::new(1), PeerId::new(2)]),
         ));
         let initial = acquire_with_effects(&mut runner, 10);
         let session = peer_request_session(&initial);
+        let initial_peers = initial
+            .iter()
+            .filter_map(|effect| match effect {
+                AcquisitionEffect::SendLedgerRequest(request) => Some(request.peer_id()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(initial_peers, vec![PeerId::new(1), PeerId::new(2)]);
         let timer = timer_operation(&initial);
 
         let effects = runner.handle_event(AcquisitionEvent::TimerFired {
@@ -2400,16 +2460,51 @@ mod tests {
             })
             .expect("timeout must retry the unseeded Base request");
         assert_eq!(retry.session(), session);
-        assert_eq!(retry.peer_id(), PeerId::new(2));
+        assert_eq!(retry.peer_id(), PeerId::new(1));
         assert_eq!(
             retry.request(),
             &LedgerDataRequest::GetLedger { sequence: Some(10) }
         );
-        assert_eq!(runner.snapshot().peer_requests(), 2);
+        assert_eq!(runner.snapshot().peer_requests(), 3);
         assert_eq!(
             runner.session(session).expect("live session").sent_peers(),
             &BTreeSet::from([PeerId::new(1), PeerId::new(2)])
         );
+    }
+
+    #[test]
+    fn reply_driven_network_request_uses_the_replying_peer() {
+        let budget = BudgetState::new(8, AdmissionBudget::new(4, 1024), Duration::from_secs(1));
+        let mut runner = CoordinatorRunner::with_plan_seed(
+            RunEpoch::new(1),
+            budget,
+            Box::new(ScriptedSeed::new(vec![ScriptedStep::NeedsNetwork(vec![(
+                SHAMapNodeId::default(),
+                Uint256::from(3),
+            )])])),
+        );
+        let _ = runner.handle_event(AcquisitionEvent::Connectivity(
+            PeerAvailabilitySnapshot::new(vec![PeerId::new(1), PeerId::new(2), PeerId::new(3)]),
+        ));
+        let initial = acquire_with_effects(&mut runner, 10);
+        let session = peer_request_session(&initial);
+
+        let effects = runner.handle_event(AcquisitionEvent::PacketAdmitted(
+            admitted_packet_from_peer(session, PeerId::new(3), AdmissionBudget::new(1, 256), 8),
+        ));
+        let requests = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                AcquisitionEffect::SendLedgerRequest(request) => Some(request),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].peer_id(), PeerId::new(3));
+        assert!(matches!(
+            requests[0].request(),
+            LedgerDataRequest::GetLedgerNodes { .. }
+        ));
     }
 
     #[test]
