@@ -927,14 +927,14 @@ impl CoordinatorRunner {
         let header = packet.packet().clone();
         let needs_seed = packet.packet().packet_type == ledger::InboundLedgerDataType::Base
             && session_state.plan.engine().is_none();
-        if needs_seed {
-            let seeded = self
-                .plan_seed
+        let seeded = if needs_seed {
+            self.plan_seed
                 .build(session, &header)
                 .map(|engine| session_state.plan.install_engine(engine))
-                .unwrap_or(false);
-            let _ = seeded;
-        }
+                .unwrap_or(false)
+        } else {
+            false
+        };
         // Defensive mailbox bounds: ingress already reserved capacity through
         // the `AdmissionGate`, but a misconfigured or replaying ingress must
         // not overflow coordinator state. The plan's mailbox enforces the same
@@ -945,7 +945,12 @@ impl CoordinatorRunner {
             return Vec::new();
         }
         self.stats.packets_admitted += 1;
-        session_state.plan.note_progress();
+        // A Base packet only earns progress after the seed has verified and
+        // retained its header/root data. Ordinary nodes earn progress later,
+        // only when the engine reports a useful SHAMap addition.
+        if seeded {
+            session_state.plan.note_progress();
+        }
         self.run_plan_turn(session, Some(packet_peer), &mut effects);
         effects
     }
@@ -1100,7 +1105,10 @@ impl CoordinatorRunner {
         };
         let mut effects = Vec::new();
         match outcome {
-            PlanWriteOutcome::Accepted => {}
+            PlanWriteOutcome::IncrementalAccepted => {
+                self.run_plan_turn(session, None, &mut effects)
+            }
+            PlanWriteOutcome::FinalAccepted => {}
             PlanWriteOutcome::Failed(reason) => self.fail_session(session, reason, &mut effects),
             PlanWriteOutcome::Stale => self.stats.stale_events += 1,
         }
@@ -1517,14 +1525,17 @@ impl CoordinatorRunner {
                 }
             }
             PlanTurn::Persist(batch) => {
-                // Active -> Persisting: the tree is structurally complete and
-                // the session must persist and pass its durability fence before
-                // any handoff.
-                let persisting = SessionPhase::Persisting;
-                if let Some(session_state) = self.state.sessions.get_mut(&session)
-                    && session_phase_transition(&session_state.phase, &persisting)
-                {
-                    session_state.phase = persisting;
+                if batch.requires_fence() {
+                    // Active -> Persisting: the tree is structurally complete
+                    // and the final batch must pass its durability fence before
+                    // any handoff. Incremental accepted-node batches leave the
+                    // session active and carry no fence.
+                    let persisting = SessionPhase::Persisting;
+                    if let Some(session_state) = self.state.sessions.get_mut(&session)
+                        && session_phase_transition(&session_state.phase, &persisting)
+                    {
+                        session_state.phase = persisting;
+                    }
                 }
                 effects.push(AcquisitionEffect::SubmitWrite(batch));
             }
@@ -3354,7 +3365,10 @@ mod tests {
         let effects = runner.handle_event(AcquisitionEvent::PacketAdmitted(packet));
         let batch = write_batch(&effects);
         assert_eq!(batch.operation().kind(), OperationKind::Write);
-        assert_eq!(batch.fence().kind(), OperationKind::DurabilityFence);
+        assert_eq!(
+            batch.fence().expect("final batch fence").kind(),
+            OperationKind::DurabilityFence
+        );
         assert!(matches!(
             runner.session(session).expect("live").phase(),
             SessionPhase::Persisting
@@ -3396,7 +3410,10 @@ mod tests {
         // one PublishDurable handoff: a unique id plus the durable ledger. The
         // ledger is never normal-adoptable before this fence.
         let effects = runner.handle_event(AcquisitionEvent::DurabilityFenced(
-            DurabilityCompletion::new(batch.fence(), crate::io::DurabilityOutcome::Passed),
+            DurabilityCompletion::new(
+                batch.fence().expect("final batch fence"),
+                crate::io::DurabilityOutcome::Passed,
+            ),
         ));
         let published = durable_handoff(&effects);
         assert!(Arc::ptr_eq(published.ledger(), &ledger));
@@ -3446,7 +3463,10 @@ mod tests {
             WriteOutcome::Accepted,
         )));
         let effects = runner.handle_event(AcquisitionEvent::DurabilityFenced(
-            DurabilityCompletion::new(batch.fence(), crate::io::DurabilityOutcome::Passed),
+            DurabilityCompletion::new(
+                batch.fence().expect("final batch fence"),
+                crate::io::DurabilityOutcome::Passed,
+            ),
         ));
         let published = durable_handoff(&effects);
         assert!(matches!(
@@ -3569,13 +3589,16 @@ mod tests {
 
         // A late fence for the cancelled session is stale.
         runner.handle_event(AcquisitionEvent::DurabilityFenced(
-            DurabilityCompletion::new(batch.fence(), crate::io::DurabilityOutcome::Passed),
+            DurabilityCompletion::new(
+                batch.fence().expect("final batch fence"),
+                crate::io::DurabilityOutcome::Passed,
+            ),
         ));
         assert_eq!(runner.snapshot().stale_events(), 1);
     }
 
     #[test]
-    fn packet_progress_resets_the_acquisition_timeout_budget() {
+    fn unseeded_base_packet_does_not_reset_the_acquisition_timeout_budget() {
         let mut runner = CoordinatorRunner::new(RunEpoch::new(1));
         connect(&mut runner);
         let effects = acquire_with_effects(&mut runner, 10);
@@ -3583,8 +3606,8 @@ mod tests {
         let mut timer = timer_operation(&effects);
 
         // Consume five no-progress retries, leaving only the final failure
-        // tick. A real admitted Base packet then resets this no-progress
-        // budget, just as rippled's wasProgress timer path does.
+        // tick. An unseeded/invalid Base packet is merely admitted; it must
+        // not reset this budget because no verified header was retained.
         for _ in 0..5 {
             let effects = runner.handle_event(AcquisitionEvent::TimerFired {
                 operation: timer,
@@ -3599,11 +3622,14 @@ mod tests {
             operation: timer,
             timer: TimerKind::AcquireTimeout,
         });
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
-            AcquisitionEffect::ArmTimer(request) if request.timer() == TimerKind::AcquireTimeout
-        )));
-        assert!(!runner.session(session).expect("live").phase().is_terminal());
+        assert!(effects.contains(&AcquisitionEffect::CancelSession(session)));
+        assert!(
+            runner
+                .session(session)
+                .expect("session")
+                .phase()
+                .is_terminal()
+        );
     }
 
     #[test]

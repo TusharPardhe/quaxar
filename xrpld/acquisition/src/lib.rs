@@ -69,9 +69,10 @@ pub use crate::phase::{SyncPhase, TransitionError, TransitionFact, phase_transit
 pub use crate::plan::{
     DEFAULT_MAX_ACQUIRE_TIMEOUTS, LedgerTreePlanEngine, MAX_NEW_READS_PER_PASS,
     MAX_PACKETS_FED_PER_TURN, MAX_PENDING_READS, MAX_TURNS_PER_EVENT, NullPlanSeed, NullResident,
-    PlanDurabilityOutcome, PlanNetworkNeed, PlanReadApply, PlanReadNeed, PlanReadOutcome, PlanSeed,
-    PlanStepOutcome, PlanTimeout, PlanTurn, PlanWriteOutcome, ScriptedEngine, ScriptedStep,
-    SessionMailbox, SessionPersistence, SessionPlan, TreeEngine, TurnContext,
+    PlanDurabilityOutcome, PlanNetworkApply, PlanNetworkNeed, PlanReadApply, PlanReadNeed,
+    PlanReadOutcome, PlanSeed, PlanStepOutcome, PlanTimeout, PlanTurn, PlanWriteOutcome,
+    ScriptedEngine, ScriptedStep, SessionMailbox, SessionPersistence, SessionPlan, TreeEngine,
+    TurnContext,
 };
 pub use crate::port::{
     CancellationPort, CoordinatorPorts, HandoffPort, LedgerRequestPort, PhasePort, ReadPort,

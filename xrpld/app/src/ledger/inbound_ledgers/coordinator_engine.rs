@@ -35,8 +35,8 @@ use shamap::tree_node::SHAMapTreeNode;
 use shamap::tree_node_cache::TreeNodeCache;
 
 use acquisition::{
-    PersistNode, PlanNetworkNeed, PlanReadApply, PlanReadNeed, PlanSeed, PlanStepOutcome,
-    ReadOutcome, SessionRef, TreeEngine,
+    PersistNode, PlanNetworkApply, PlanNetworkNeed, PlanReadApply, PlanReadNeed, PlanSeed,
+    PlanStepOutcome, ReadOutcome, SessionRef, TreeEngine,
 };
 
 use super::acquisition::{ActorNodeFetcher, WorkerFetchPack, WorkerJournal, WorkerStore};
@@ -107,12 +107,6 @@ pub(crate) struct AppLedgerPlanEngine {
     full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
     active_kind: Option<TreeKind>,
     active_plan: Option<TreePlan>,
-    persistable: Vec<PersistNode>,
-    persistable_taken: bool,
-    /// Successful fetch-pack root installations made outside an active
-    /// `TreePlan`. Exposed through `branch_steps` so the coordinator treats
-    /// this as session-local structural progress rather than resetting every
-    /// session on a global cache wakeup.
     cached_root_steps: u64,
 }
 
@@ -148,8 +142,6 @@ impl AppLedgerPlanEngine {
             full_below,
             active_kind: None,
             active_plan: None,
-            persistable: Vec::new(),
-            persistable_taken: false,
             cached_root_steps: 0,
         }
     }
@@ -238,14 +230,11 @@ impl AppLedgerPlanEngine {
             .is_ok_and(|stats| !stats.is_invalid())
     }
 
-    /// Drains the worker store's accepted writes exactly once, at the moment
-    /// the engine reports complete, so the coordinator's single
-    /// `persistable_nodes` call observes the full state + transaction set.
-    fn drain_persistable(&mut self) {
-        if !self.persistable_taken {
-            self.persistable = self.store.take_pending_write_nodes();
-            self.persistable_taken = true;
-        }
+    /// Drains accepted filter writes once per coordinator turn. The worker
+    /// store only collects commands; physical NuDB I/O remains outside this
+    /// engine through the coordinator write port.
+    fn take_accepted_writes(&mut self) -> Vec<PersistNode> {
+        self.store.take_pending_write_nodes()
     }
 
     fn map_apply(apply: MissingNodeReadApply) -> PlanReadApply {
@@ -277,12 +266,10 @@ impl TreeEngine for AppLedgerPlanEngine {
                 return PlanStepOutcome::Invalid;
             }
             if self.inbound.is_complete() {
-                self.drain_persistable();
                 return PlanStepOutcome::Complete;
             }
             if self.active_plan.is_none() {
                 let Some(kind) = self.next_tree_kind() else {
-                    self.drain_persistable();
                     return PlanStepOutcome::Complete;
                 };
                 if let Some((node_id, hash)) = self.missing_root_node(kind) {
@@ -308,7 +295,6 @@ impl TreeEngine for AppLedgerPlanEngine {
                     if self.inbound.is_failed() {
                         return PlanStepOutcome::Invalid;
                     }
-                    self.drain_persistable();
                     return PlanStepOutcome::Complete;
                 };
                 self.active_kind = Some(kind);
@@ -394,7 +380,7 @@ impl TreeEngine for AppLedgerPlanEngine {
         &mut self,
         kind: TreeKind,
         node: &InboundLedgerNodeData,
-    ) -> PlanReadApply {
+    ) -> PlanNetworkApply {
         // Apply the node to its ledger map through the ordinary packet
         // admission path so the SHAMap, the worker store, and the fetch-pack
         // cache observe exactly the same node application as the actor. The
@@ -408,33 +394,37 @@ impl TreeEngine for AppLedgerPlanEngine {
         );
         let journal = WorkerJournal;
         let config = LedgerConfig::default();
-        let applied = self
-            .inbound
-            .process_packet_with_family_and_config(
-                &packet,
-                &journal,
-                &config,
-                &mut self.store,
-                &mut self.fetch_pack,
-                &self.family,
-            )
-            .is_ok_and(|stats| !stats.is_invalid());
-        if !applied {
-            return PlanReadApply::UnknownRead;
+        let stats = match self.inbound.process_packet_with_family_and_config(
+            &packet,
+            &journal,
+            &config,
+            &mut self.store,
+            &mut self.fetch_pack,
+            &self.family,
+        ) {
+            Ok(stats) => stats,
+            Err(_) => return PlanNetworkApply::new(PlanReadApply::UnknownRead, false),
+        };
+        let useful = stats.is_useful();
+        if stats.is_invalid() {
+            return PlanNetworkApply::new(PlanReadApply::UnknownRead, useful);
         }
         if self.active_kind != Some(kind) {
             // The node belongs to the other tree; the map cached it and it will
             // attach when that tree's plan becomes active.
-            return PlanReadApply::StalePlan;
+            return PlanNetworkApply::new(PlanReadApply::StalePlan, useful);
         }
         let Some(plan) = self.active_plan.as_mut() else {
-            return PlanReadApply::StalePlan;
+            return PlanNetworkApply::new(PlanReadApply::StalePlan, useful);
         };
         let Ok(Some(decoded)) = SHAMapTreeNode::make_from_wire(&node.node_data) else {
-            return PlanReadApply::UnknownRead;
+            return PlanNetworkApply::new(PlanReadApply::UnknownRead, useful);
         };
         let hash = decoded.get_hash();
-        Self::map_apply(plan.apply_network_node(self.plan_id, hash, decoded))
+        PlanNetworkApply::new(
+            Self::map_apply(plan.apply_network_node(self.plan_id, hash, decoded)),
+            useful,
+        )
     }
 
     fn has_runnable_frontier(&self) -> bool {
@@ -458,8 +448,8 @@ impl TreeEngine for AppLedgerPlanEngine {
             .filter(|sequence| *sequence != 0)
     }
 
-    fn persistable_nodes(&self) -> Vec<PersistNode> {
-        self.persistable.clone()
+    fn take_persistable_nodes(&mut self) -> Vec<PersistNode> {
+        self.take_accepted_writes()
     }
 
     fn persistence_sequence(&self) -> Option<u32> {
@@ -900,22 +890,25 @@ mod tests {
         expect_root_request(engine.as_mut(), root.get_hash());
 
         let applied = engine.apply_network_node(TreeKind::State, &root_node_data(&root));
-        assert_eq!(applied, PlanReadApply::StalePlan, "no plan is active yet");
+        assert_eq!(
+            applied.attachment(),
+            PlanReadApply::StalePlan,
+            "no plan is active yet"
+        );
 
         match engine.advance(10) {
             PlanStepOutcome::Complete => {}
             other => panic!("expected complete after rooted state plan, got {other:?}"),
         }
 
-        let persistable = engine.persistable_nodes();
+        let persistable = engine.take_persistable_nodes();
         assert!(
             !persistable.is_empty(),
             "header and accepted nodes persist together"
         );
-        assert_eq!(
-            engine.persistable_nodes(),
-            persistable,
-            "store drains exactly once"
+        assert!(
+            engine.take_persistable_nodes().is_empty(),
+            "accepted writes drain incrementally and are never replayed"
         );
     }
 
@@ -934,7 +927,9 @@ mod tests {
         expect_root_request(engine.as_mut(), root.get_hash());
 
         assert_eq!(
-            engine.apply_network_node(TreeKind::State, &root_node_data(&root)),
+            engine
+                .apply_network_node(TreeKind::State, &root_node_data(&root))
+                .attachment(),
             PlanReadApply::StalePlan,
             "root is installed before the retained traversal starts"
         );
@@ -1120,7 +1115,7 @@ mod tests {
         // A transaction root arrives before its tree's plan exists; the map
         // caches it and the engine reports the attach as stale.
         let applied = engine.apply_network_node(TreeKind::Transaction, &root_node_data(&tx_root));
-        assert_eq!(applied, PlanReadApply::StalePlan);
+        assert_eq!(applied.attachment(), PlanReadApply::StalePlan);
 
         engine.apply_network_node(TreeKind::State, &root_node_data(&state_root));
 

@@ -187,11 +187,14 @@ impl PersistenceWork for CoordinatorPersistenceWork {
             tx,
         } = *self;
         let session = batch.operation().session();
-        let (write_outcome, fence_outcome) =
+        let (write_outcome, fence_outcome): (WriteOutcome, Option<DurabilityOutcome>) =
             if node_store.store_generation() != batch.store_generation().get() {
                 // A store rotation between admission and execution invalidates
                 // this generation-scoped batch.
-                (WriteOutcome::Cancelled, DurabilityOutcome::Stale)
+                (
+                    WriteOutcome::Cancelled,
+                    batch.fence().map(|_| DurabilityOutcome::Stale),
+                )
             } else {
                 let mut write_failed = None;
                 for node in batch.nodes() {
@@ -213,18 +216,20 @@ impl PersistenceWork for CoordinatorPersistenceWork {
                         break;
                     }
                 }
-                let fence = if write_failed.is_none() {
-                    match &node_store {
-                        SHAMapStoreNodeStore::Single(database) => database.sync_result(),
-                        SHAMapStoreNodeStore::Rotating(database) => database.sync_result(),
+                match (write_failed, batch.fence()) {
+                    (Some(_), Some(_)) => (WriteOutcome::Failed, Some(DurabilityOutcome::Failed)),
+                    (Some(_), None) => (WriteOutcome::Failed, None),
+                    (None, Some(_)) => {
+                        let fence = match &node_store {
+                            SHAMapStoreNodeStore::Single(database) => database.sync_result(),
+                            SHAMapStoreNodeStore::Rotating(database) => database.sync_result(),
+                        };
+                        match fence {
+                            Ok(()) => (WriteOutcome::Accepted, Some(DurabilityOutcome::Passed)),
+                            Err(_) => (WriteOutcome::Failed, Some(DurabilityOutcome::Failed)),
+                        }
                     }
-                } else {
-                    Err("write failed; fence not attempted".to_owned())
-                };
-                match (write_failed, fence) {
-                    (None, Ok(())) => (WriteOutcome::Accepted, DurabilityOutcome::Passed),
-                    (Some(_), _) => (WriteOutcome::Failed, DurabilityOutcome::Failed),
-                    (None, Err(_)) => (WriteOutcome::Failed, DurabilityOutcome::Failed),
+                    (None, None) => (WriteOutcome::Accepted, None),
                 }
             };
         // Retain the exact ordered pair before releasing the FIFO. `try_send`
@@ -240,11 +245,13 @@ impl PersistenceWork for CoordinatorPersistenceWork {
                     .push_back(acquisition::AcquisitionEvent::WriteCompleted(
                         WriteCompletion::new(batch.operation(), write_outcome),
                     ));
-                entry
-                    .completions
-                    .push_back(acquisition::AcquisitionEvent::DurabilityFenced(
-                        DurabilityCompletion::new(batch.fence(), fence_outcome),
-                    ));
+                if let (Some(fence), Some(fence_outcome)) = (batch.fence(), fence_outcome) {
+                    entry
+                        .completions
+                        .push_back(acquisition::AcquisitionEvent::DurabilityFenced(
+                            DurabilityCompletion::new(fence, fence_outcome),
+                        ));
+                }
                 was_empty
             };
             if was_empty {

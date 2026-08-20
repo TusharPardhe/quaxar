@@ -169,17 +169,13 @@ impl PersistNode {
 }
 
 /// A write batch submitted to the NodeStore write adapter. The write adapter
-/// owns physical write submission only.
-///
-/// A batch also carries the `fence` operation: the durability barrier that the
-/// adapter must run after the batch and report as one `DurabilityFenced`
-/// event. Carrying both identities lets a single adapter submission produce the
-/// write completion and the fence completion without a second coordinator
-/// effect.
+/// owns physical write submission only. Incremental batches persist accepted
+/// nodes while acquisition continues; only a final batch carries a fence and
+/// may authorize a durable handoff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteBatch {
     operation: OperationRef,
-    fence: OperationRef,
+    fence: Option<OperationRef>,
     store_generation: StoreGeneration,
     /// The verified ledger header sequence that owns every record in this batch.
     /// It is never inferred from a NodeStore key or an untrusted peer node.
@@ -188,8 +184,9 @@ pub struct WriteBatch {
 }
 
 impl WriteBatch {
-    /// Builds a write batch. `operation.kind()` must be [`OperationKind::Write`]
-    /// and `fence.kind()` must be [`OperationKind::DurabilityFence`].
+    /// Builds a final write batch. `operation.kind()` must be
+    /// [`OperationKind::Write`] and `fence.kind()` must be
+    /// [`OperationKind::DurabilityFence`].
     pub fn new(
         operation: OperationRef,
         fence: OperationRef,
@@ -201,22 +198,44 @@ impl WriteBatch {
         debug_assert_eq!(fence.kind(), OperationKind::DurabilityFence);
         Self {
             operation,
-            fence,
+            fence: Some(fence),
             store_generation,
             ledger_sequence,
             nodes,
         }
     }
 
-    /// The exact operation identity of this write.
+    /// Builds an accepted-node batch that is persisted immediately but does
+    /// not run a durability barrier. The final batch remains responsible for
+    /// the fence and all normal adoption/handoff authority.
+    pub fn incremental(
+        operation: OperationRef,
+        store_generation: StoreGeneration,
+        ledger_sequence: u32,
+        nodes: Vec<PersistNode>,
+    ) -> Self {
+        debug_assert_eq!(operation.kind(), OperationKind::Write);
+        Self {
+            operation,
+            fence: None,
+            store_generation,
+            ledger_sequence,
+            nodes,
+        }
+    }
+
     pub const fn operation(&self) -> OperationRef {
         self.operation
     }
 
-    /// The exact operation identity of the durability barrier to run after the
-    /// batch. The adapter reports its completion as a `DurabilityFenced` event.
-    pub const fn fence(&self) -> OperationRef {
+    /// The final durability-barrier identity, if this is the terminal batch.
+    pub const fn fence(&self) -> Option<OperationRef> {
         self.fence
+    }
+
+    /// Whether this batch must be followed by the terminal durability fence.
+    pub const fn requires_fence(&self) -> bool {
+        self.fence.is_some()
     }
 
     /// The database generation this batch targets.
@@ -388,7 +407,7 @@ mod tests {
             ],
         );
         assert_eq!(batch.operation(), operation);
-        assert_eq!(batch.fence(), fence);
+        assert_eq!(batch.fence(), Some(fence));
         assert_eq!(batch.ledger_sequence(), 42);
         assert_eq!(batch.payload_bytes(), 5);
         assert_eq!(

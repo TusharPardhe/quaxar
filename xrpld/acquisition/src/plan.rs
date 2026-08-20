@@ -185,6 +185,40 @@ pub enum PlanReadApply {
     UnknownRead,
 }
 
+/// Result of routing one peer-supplied node through the ledger map and the
+/// retained traversal. `useful` is deliberately separate from `attachment`:
+/// rippled resets an inbound ledger timeout only when `SHAMapAddNode` credits
+/// useful data, while the retained traversal may still need a duplicate node
+/// to wake a previously announced frontier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanNetworkApply {
+    attachment: PlanReadApply,
+    useful: bool,
+}
+
+impl PlanNetworkApply {
+    /// Builds an application result from the retained-frontier outcome and the
+    /// map-level useful-data accounting.
+    pub const fn new(attachment: PlanReadApply, useful: bool) -> Self {
+        Self { attachment, useful }
+    }
+
+    /// The retained-frontier attachment outcome.
+    pub const fn attachment(self) -> PlanReadApply {
+        self.attachment
+    }
+
+    /// True only when the ledger map accepted useful peer data.
+    pub const fn is_useful(self) -> bool {
+        self.useful
+    }
+
+    /// True when the retained continuation attached at least one edge.
+    pub const fn attached(self) -> bool {
+        matches!(self.attachment, PlanReadApply::Applied { .. })
+    }
+}
+
 /// The uniquely owned tree engine of one session plan. This is the only place
 /// shamap tree types cross into the crate; adapters implement it, the
 /// coordinator owns it, and it is never advanced concurrently.
@@ -203,8 +237,11 @@ pub trait TreeEngine: std::fmt::Debug {
     /// distinguishes state from transaction nodes so an app engine can route
     /// each node to its ledger map; `node` carries the raw wire bytes and
     /// node-id that the engine deserializes and attaches.
-    fn apply_network_node(&mut self, kind: TreeKind, node: &InboundLedgerNodeData)
-    -> PlanReadApply;
+    fn apply_network_node(
+        &mut self,
+        kind: TreeKind,
+        node: &InboundLedgerNodeData,
+    ) -> PlanNetworkApply;
 
     /// True only while a CPU turn can make progress without a broker completion
     /// or peer response.
@@ -220,10 +257,10 @@ pub trait TreeEngine: std::fmt::Debug {
         None
     }
 
-    /// The nodes to persist once the tree is structurally complete. M4.1
-    /// returns the adapter-supplied set; full node materialization lands with
-    /// the app wiring in M4.2.
-    fn persistable_nodes(&self) -> Vec<PersistNode>;
+    /// Drains accepted NodeStore writes accumulated since the prior call.
+    /// Nodes are written incrementally while acquisition continues; only the
+    /// final batch is followed by a durability fence and durable handoff.
+    fn take_persistable_nodes(&mut self) -> Vec<PersistNode>;
 
     /// The verified ledger-header sequence that scopes persistence. A missing
     /// value makes completion invalid: NodeStore records must never use an
@@ -371,9 +408,15 @@ impl SessionMailbox {
 pub enum SessionPersistence {
     /// Nothing to persist yet.
     None,
-    /// A write batch was dispatched; `operation` is its write identity and
-    /// `fence` is the durability-barrier operation the adapter will report.
-    WritePending {
+    /// An accepted-node batch was dispatched while acquisition continues.
+    /// It has no durability fence and must settle before another plan turn.
+    IncrementalWritePending {
+        /// The dispatched write operation.
+        operation: OperationRef,
+    },
+    /// The final write batch was dispatched; `operation` is its write identity
+    /// and `fence` is the durability-barrier operation the adapter will report.
+    FinalWritePending {
         /// The dispatched write operation.
         operation: OperationRef,
         /// The fence operation to match the later durability completion.
@@ -398,7 +441,8 @@ impl SessionPersistence {
     pub const fn label(&self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::WritePending { .. } => "write_pending",
+            Self::IncrementalWritePending { .. } => "incremental_write_pending",
+            Self::FinalWritePending { .. } => "final_write_pending",
             Self::FencePending { .. } => "fence_pending",
             Self::Durable => "durable",
             Self::Failed { .. } => "failed",
@@ -418,8 +462,10 @@ pub enum PlanReadOutcome {
 /// The outcome of a write completion applied to the plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanWriteOutcome {
-    /// The exact in-flight write was accepted; the fence is now in flight.
-    Accepted,
+    /// The accepted-node write completed; planning may resume.
+    IncrementalAccepted,
+    /// The final write completed and its durability fence is now in flight.
+    FinalAccepted,
     /// The write failed; the session must terminalize.
     Failed(FailureReason),
     /// No in-flight write matches the operation; stale.
@@ -472,6 +518,21 @@ pub enum PlanTurn {
     Persist(WriteBatch),
     /// The plan is invalid; the session must fail.
     Invalid,
+}
+
+/// Packet-level application summary. Attachment controls whether another
+/// bounded CPU turn is useful; useful data alone controls timeout progress.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PacketFeed {
+    attached: bool,
+    useful: bool,
+}
+
+impl PacketFeed {
+    fn merge(&mut self, other: Self) {
+        self.attached |= other.attached;
+        self.useful |= other.useful;
+    }
 }
 
 /// The coordinator-owned plan of one session (M4.1).
@@ -669,7 +730,7 @@ impl SessionPlan {
             if turns > MAX_TURNS_PER_EVENT {
                 return PlanTurn::Continue;
             }
-            let mut fed = false;
+            let mut fed = PacketFeed::default();
             for _ in 0..MAX_PACKETS_FED_PER_TURN {
                 let Some(engine) = self.engine.as_mut() else {
                     break;
@@ -677,23 +738,57 @@ impl SessionPlan {
                 let Some(packet) = self.mailbox.pop_front() else {
                     break;
                 };
-                fed |= Self::feed_packet(packet, &mut **engine);
+                fed.merge(Self::feed_packet(packet, &mut **engine));
             }
-            let (outcome, made_progress, ready_continues) = {
+            let (outcome, useful_peer_data, ready_continues, pending_writes, ledger_sequence) = {
                 let Some(engine) = self.engine.as_mut() else {
                     // No rooted plan yet; queued packets wait in the mailbox.
                     return PlanTurn::Continue;
                 };
                 let before = engine.branch_steps();
+                let useful_peer_data = fed.useful;
                 let outcome = engine.advance(MAX_NEW_READS_PER_PASS);
-                let made_progress = fed || engine.branch_steps() > before;
-                let ready_continues =
-                    fed || (engine.has_runnable_frontier() && engine.branch_steps() > before);
-                (outcome, made_progress, ready_continues)
+                let ready_continues = fed.attached
+                    || (engine.has_runnable_frontier() && engine.branch_steps() > before);
+                let pending_writes = if matches!(outcome, PlanStepOutcome::Complete) {
+                    Vec::new()
+                } else {
+                    engine.take_persistable_nodes()
+                };
+                (
+                    outcome,
+                    useful_peer_data,
+                    ready_continues,
+                    pending_writes,
+                    engine.ledger_sequence(),
+                )
             };
             self.runs += 1;
-            if made_progress {
+            // Matches rippled `InboundLedger::processData`: only useful peer
+            // data resets the no-progress timeout. A duplicate, stale, or
+            // unattached but decodable packet may wake the frontier but cannot
+            // conceal an acquisition stall.
+            if useful_peer_data {
                 self.note_progress();
+            }
+            if !pending_writes.is_empty() {
+                let Some(ledger_sequence) = ledger_sequence.filter(|sequence| *sequence != 0)
+                else {
+                    return PlanTurn::Invalid;
+                };
+                let operation = OperationRef::new(
+                    ctx.session,
+                    OperationKind::Write,
+                    ctx.ids.next_id(),
+                    ctx.ids.next_id(),
+                );
+                self.persistence = SessionPersistence::IncrementalWritePending { operation };
+                return PlanTurn::Persist(WriteBatch::incremental(
+                    operation,
+                    ctx.store_generation,
+                    ledger_sequence,
+                    pending_writes,
+                ));
             }
             match outcome {
                 PlanStepOutcome::Ready => {
@@ -742,21 +837,37 @@ impl SessionPlan {
         PlanReadOutcome::Applied
     }
 
-    /// Applies one write completion. `WritePending` moves to `FencePending` on
-    /// acceptance; a failure terminalizes persistence intent.
+    /// Applies one write completion. An incremental accepted-node write
+    /// returns the plan to active work; only a final write advances to its
+    /// durability fence.
     pub fn on_write(&mut self, operation: OperationRef, outcome: WriteOutcome) -> PlanWriteOutcome {
         if operation.kind() != OperationKind::Write {
             return PlanWriteOutcome::Stale;
         }
         match &self.persistence {
-            SessionPersistence::WritePending {
+            SessionPersistence::IncrementalWritePending {
+                operation: expected,
+            } if expected.is_expected_for(&operation) => match outcome {
+                WriteOutcome::Accepted => {
+                    self.persistence = SessionPersistence::None;
+                    PlanWriteOutcome::IncrementalAccepted
+                }
+                WriteOutcome::Failed => {
+                    self.persistence = SessionPersistence::Failed {
+                        reason: FailureReason::WriteFailure,
+                    };
+                    PlanWriteOutcome::Failed(FailureReason::WriteFailure)
+                }
+                WriteOutcome::Stale | WriteOutcome::Cancelled => PlanWriteOutcome::Stale,
+            },
+            SessionPersistence::FinalWritePending {
                 operation: expected,
                 fence,
             } if expected.is_expected_for(&operation) => match outcome {
                 WriteOutcome::Accepted => {
                     let fence = *fence;
                     self.persistence = SessionPersistence::FencePending { operation: fence };
-                    PlanWriteOutcome::Accepted
+                    PlanWriteOutcome::FinalAccepted
                 }
                 WriteOutcome::Failed => {
                     self.persistence = SessionPersistence::Failed {
@@ -815,20 +926,20 @@ impl SessionPlan {
         }
     }
 
-    /// Deserializes and attaches the nodes of one decoded packet to the
-    /// engine's retained frontier. Returns true when at least one node was
-    /// attached.
-    fn feed_packet(mut packet: AdmittedLedgerPacket, engine: &mut dyn TreeEngine) -> bool {
+    /// Deserializes and routes one packet through the ledger map and retained
+    /// frontier. Useful-data credit is separate from attachment so only the
+    /// former resets the inbound timeout, matching rippled.
+    fn feed_packet(mut packet: AdmittedLedgerPacket, engine: &mut dyn TreeEngine) -> PacketFeed {
         let kind = match packet.packet().packet_type {
             InboundLedgerDataType::StateNode => TreeKind::State,
             InboundLedgerDataType::TransactionNode => TreeKind::Transaction,
             InboundLedgerDataType::Base => {
                 // The header packet seeded the engine; it is not a tree node.
                 let _ = packet.settle();
-                return false;
+                return PacketFeed::default();
             }
         };
-        let mut fed = false;
+        let mut fed = PacketFeed::default();
         for node in &packet.packet().nodes {
             let decoded = match SHAMapTreeNode::make_from_wire(&node.node_data) {
                 Ok(Some(decoded)) => decoded,
@@ -846,8 +957,9 @@ impl SessionPlan {
             if decoded.get_hash().is_zero() {
                 continue;
             }
-            engine.apply_network_node(kind, node);
-            fed = true;
+            let applied = engine.apply_network_node(kind, node);
+            fed.attached |= applied.attached();
+            fed.useful |= applied.is_useful();
         }
         let _ = packet.settle();
         fed
@@ -883,7 +995,9 @@ impl SessionPlan {
         requests
     }
 
-    /// Transitions to the persistence intent once the tree is complete.
+    /// Transitions to final persistence once the tree is complete. Earlier
+    /// accepted writes were already submitted incrementally; this final batch
+    /// drains the remainder and is the only one carrying a durability fence.
     fn on_complete(&mut self, ctx: &mut TurnContext) -> PlanTurn {
         let Some(ledger_sequence) = self
             .engine
@@ -895,8 +1009,8 @@ impl SessionPlan {
         };
         let nodes = self
             .engine
-            .as_ref()
-            .map(|engine| engine.persistable_nodes())
+            .as_mut()
+            .map(|engine| engine.take_persistable_nodes())
             .unwrap_or_default();
         let write_op = OperationRef::new(
             ctx.session,
@@ -910,7 +1024,7 @@ impl SessionPlan {
             ctx.ids.next_id(),
             ctx.ids.next_id(),
         );
-        self.persistence = SessionPersistence::WritePending {
+        self.persistence = SessionPersistence::FinalWritePending {
             operation: write_op,
             fence: fence_op,
         };
@@ -1042,14 +1156,17 @@ impl TreeEngine for ScriptedEngine {
         &mut self,
         _kind: TreeKind,
         _node: &InboundLedgerNodeData,
-    ) -> PlanReadApply {
+    ) -> PlanNetworkApply {
         self.applied_nodes += 1;
         self.branch_steps += 1;
         self.runnable_frontier = !self.steps.is_empty();
-        PlanReadApply::Applied {
-            attached_edges: 1,
-            missing_edges: 0,
-        }
+        PlanNetworkApply::new(
+            PlanReadApply::Applied {
+                attached_edges: 1,
+                missing_edges: 0,
+            },
+            true,
+        )
     }
 
     fn has_runnable_frontier(&self) -> bool {
@@ -1064,8 +1181,8 @@ impl TreeEngine for ScriptedEngine {
         self.persistence_sequence
     }
 
-    fn persistable_nodes(&self) -> Vec<PersistNode> {
-        self.persistable.clone()
+    fn take_persistable_nodes(&mut self) -> Vec<PersistNode> {
+        std::mem::take(&mut self.persistable)
     }
 
     fn persistence_sequence(&self) -> Option<u32> {
@@ -1159,15 +1276,20 @@ impl TreeEngine for LedgerTreePlanEngine {
         &mut self,
         kind: TreeKind,
         node: &InboundLedgerNodeData,
-    ) -> PlanReadApply {
+    ) -> PlanNetworkApply {
         if self.plan.kind() != kind {
-            return PlanReadApply::StalePlan;
+            return PlanNetworkApply::new(PlanReadApply::StalePlan, false);
         }
         let Ok(Some(decoded)) = SHAMapTreeNode::make_from_wire(&node.node_data) else {
-            return PlanReadApply::UnknownRead;
+            return PlanNetworkApply::new(PlanReadApply::UnknownRead, false);
         };
         let hash = decoded.get_hash();
-        Self::map_apply(self.plan.apply_network_node(self.plan.id(), hash, decoded))
+        let attachment =
+            Self::map_apply(self.plan.apply_network_node(self.plan.id(), hash, decoded));
+        PlanNetworkApply::new(
+            attachment,
+            matches!(attachment, PlanReadApply::Applied { .. }),
+        )
     }
 
     fn has_runnable_frontier(&self) -> bool {
@@ -1178,8 +1300,8 @@ impl TreeEngine for LedgerTreePlanEngine {
         self.plan.branch_steps()
     }
 
-    fn persistable_nodes(&self) -> Vec<PersistNode> {
-        self.persistable.clone()
+    fn take_persistable_nodes(&mut self) -> Vec<PersistNode> {
+        std::mem::take(&mut self.persistable)
     }
 
     fn persistence_sequence(&self) -> Option<u32> {
@@ -1405,26 +1527,32 @@ mod tests {
             panic!("expected persist, got {turn:?}");
         };
         assert_eq!(batch.operation().kind(), OperationKind::Write);
-        assert_eq!(batch.fence().kind(), OperationKind::DurabilityFence);
+        assert_eq!(
+            batch.fence().expect("final batch fence").kind(),
+            OperationKind::DurabilityFence
+        );
         assert_eq!(
             plan.persistence(),
-            &SessionPersistence::WritePending {
+            &SessionPersistence::FinalWritePending {
                 operation: batch.operation(),
-                fence: batch.fence(),
+                fence: batch.fence().expect("final batch fence"),
             }
         );
 
         // A fence completion before the write is stale.
-        let stale = plan.on_durability(batch.fence(), DurabilityOutcome::Passed);
+        let stale = plan.on_durability(
+            batch.fence().expect("final batch fence"),
+            DurabilityOutcome::Passed,
+        );
         assert_eq!(stale, PlanDurabilityOutcome::Stale);
 
         // The exact write acceptance arms the fence.
         let accepted = plan.on_write(batch.operation(), WriteOutcome::Accepted);
-        assert_eq!(accepted, PlanWriteOutcome::Accepted);
+        assert_eq!(accepted, PlanWriteOutcome::FinalAccepted);
         assert_eq!(
             plan.persistence(),
             &SessionPersistence::FencePending {
-                operation: batch.fence(),
+                operation: batch.fence().expect("final batch fence"),
             }
         );
 
@@ -1442,12 +1570,15 @@ mod tests {
         assert_eq!(
             plan.persistence(),
             &SessionPersistence::FencePending {
-                operation: batch.fence(),
+                operation: batch.fence().expect("final batch fence"),
             }
         );
 
         // The passed fence makes the ledger durable.
-        let durable = plan.on_durability(batch.fence(), DurabilityOutcome::Passed);
+        let durable = plan.on_durability(
+            batch.fence().expect("final batch fence"),
+            DurabilityOutcome::Passed,
+        );
         assert_eq!(durable, PlanDurabilityOutcome::Durable);
         assert_eq!(plan.persistence(), &SessionPersistence::Durable);
 
@@ -1484,9 +1615,12 @@ mod tests {
         };
         assert_eq!(
             plan.on_write(batch.operation(), WriteOutcome::Accepted),
-            PlanWriteOutcome::Accepted
+            PlanWriteOutcome::FinalAccepted
         );
-        let failed = plan.on_durability(batch.fence(), DurabilityOutcome::Failed);
+        let failed = plan.on_durability(
+            batch.fence().expect("final batch fence"),
+            DurabilityOutcome::Failed,
+        );
         assert_eq!(
             failed,
             PlanDurabilityOutcome::Failed(FailureReason::DurabilityFenceFailed)
