@@ -98,6 +98,7 @@ impl MissingNodeResidentLookup for AppResident<'_> {
 /// Composite engine that acquires the state tree and then the transaction tree
 /// of one `InboundLedgerLocal`, retaining exactly one `TreePlan` at a time.
 pub(crate) struct AppLedgerPlanEngine {
+    session: SessionRef,
     plan_id: TreePlanId,
     inbound: InboundLedgerLocal,
     store: WorkerStore,
@@ -108,6 +109,7 @@ pub(crate) struct AppLedgerPlanEngine {
     active_kind: Option<TreeKind>,
     active_plan: Option<TreePlan>,
     cached_root_steps: u64,
+    idle_ready_logged: bool,
 }
 
 impl std::fmt::Debug for AppLedgerPlanEngine {
@@ -124,6 +126,7 @@ impl std::fmt::Debug for AppLedgerPlanEngine {
 #[allow(dead_code)] // wired in sub-slice M4.2-B
 impl AppLedgerPlanEngine {
     pub(crate) fn new(
+        session: SessionRef,
         plan_id: TreePlanId,
         inbound: InboundLedgerLocal,
         store: WorkerStore,
@@ -133,6 +136,7 @@ impl AppLedgerPlanEngine {
         full_below: Arc<FullBelowCacheImpl<MonotonicClock, HardenedHashBuilder>>,
     ) -> Self {
         Self {
+            session,
             plan_id,
             inbound,
             store,
@@ -143,7 +147,77 @@ impl AppLedgerPlanEngine {
             active_kind: None,
             active_plan: None,
             cached_root_steps: 0,
+            idle_ready_logged: false,
         }
+    }
+
+    /// Emits one causal record when traversal reports `Ready` but has no
+    /// runnable frontier. This is the terminally relevant no-effect decision
+    /// between an accepted incremental write and a read/network request.
+    fn trace_idle_ready(&mut self) {
+        if self.idle_ready_logged {
+            return;
+        }
+        self.idle_ready_logged = true;
+        let state = self.inbound.planner_state();
+        let (state_map_hash, state_root_hash, tx_map_hash, tx_root_hash) = self
+            .inbound
+            .ledger_mut()
+            .map(|ledger| {
+                (
+                    ledger.state_map_mut().hash(),
+                    ledger.header().account_hash,
+                    ledger.tx_map_mut().hash(),
+                    ledger.header().tx_hash,
+                )
+            })
+            .unwrap_or_default();
+        let (
+            active_kind,
+            runnable,
+            branch_steps,
+            pending_hashes,
+            pending_edges,
+            pending_edge_bytes,
+        ) = self
+            .active_plan
+            .as_ref()
+            .map(|plan| {
+                (
+                    self.active_kind,
+                    plan.has_runnable_frontier(),
+                    plan.branch_steps(),
+                    plan.pending_hashes(),
+                    plan.pending_edges(),
+                    plan.pending_edge_bytes(),
+                )
+            })
+            .unwrap_or((None, false, 0, 0, 0, 0));
+        tracing::info!(
+            target: "acquisition_trace",
+            event = "planner_ready_without_work",
+            run_epoch = self.session.run_epoch().get(),
+            session_id = self.session.session_id().get(),
+            target_hash = %self.session.target_hash(),
+            plan_epoch = self.session.plan_epoch().get(),
+            store_generation = self.session.store_generation().get(),
+            active_kind = ?active_kind,
+            have_header = state.have_header,
+            have_state = state.have_state,
+            have_transactions = state.have_transactions,
+            state_map_hash = %state_map_hash,
+            state_root_hash = %state_root_hash,
+            transaction_map_hash = %tx_map_hash,
+            transaction_root_hash = %tx_root_hash,
+            runnable,
+            branch_steps,
+            pending_hashes,
+            pending_edges,
+            pending_edge_bytes,
+            treenode_cache_entries = self.cache.get_cache_size(),
+            full_below_cache_entries = self.full_below.size(),
+            "acquisition trace: planner returned Ready without a runnable SHAMap frontier"
+        );
     }
 
     /// The next tree that still needs acquisition, in rippled order: state
@@ -318,7 +392,12 @@ impl TreeEngine for AppLedgerPlanEngine {
                 )
             };
             match advance {
-                TreeAdvance::Ready => return PlanStepOutcome::Ready,
+                TreeAdvance::Ready => {
+                    if !self.has_runnable_frontier() {
+                        self.trace_idle_ready();
+                    }
+                    return PlanStepOutcome::Ready;
+                }
                 TreeAdvance::NeedsReads(reads) => {
                     return PlanStepOutcome::NeedsReads(
                         reads
@@ -566,6 +645,7 @@ fn build_app_engine(
     }
     let plan_id = TreePlanId::new(session.session_id().get() + 1);
     Some(Box::new(AppLedgerPlanEngine::new(
+        session,
         plan_id,
         inbound,
         store,
